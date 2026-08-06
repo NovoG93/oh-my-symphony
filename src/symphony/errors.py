@@ -136,3 +136,16 @@ class TurnInputRequired(SymphonyError):
 # §6.3
 class ConfigValidationError(SymphonyError):
     code = "config_validation_error"
+
+
+# operator chat (symphony.chat)
+class ChatBusyError(SymphonyError):
+    code = "chat_busy"
+
+
+class ChatSessionExistsError(SymphonyError):
+    code = "chat_session_exists"
+
+
+class ChatNoSessionError(SymphonyError):
+    code = "chat_no_session"
