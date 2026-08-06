@@ -58,7 +58,7 @@ def test_web_git_page_contract() -> None:
     html = (STATIC_ROOT / "index.html").read_text(encoding="utf-8")
 
     assert 'data-route="git"' in html
-    assert "const ROUTES = ['board', 'stats', 'workflow', 'git', 'settings']" in js
+    assert "'git'" in js.split("const ROUTES = ", 1)[1].split("\n", 1)[0]
     assert "function renderGitPage(container)" in js
     assert "getGitLog: ({ branch, limit } = {})" in js
     assert "getTaskBranches: () => apiRequest('/git/task-branches')" in js
@@ -96,3 +96,27 @@ def test_web_git_diff_panel_contract() -> None:
     assert ".diff-line.diff-add" in css
     assert ".diff-line.diff-del" in css
     assert ".diff-line.diff-hunk" in css
+
+
+def test_web_chat_page_contract() -> None:
+    js = (STATIC_ROOT / "app.js").read_text(encoding="utf-8")
+    css = (STATIC_ROOT / "style.css").read_text(encoding="utf-8")
+    html = (STATIC_ROOT / "index.html").read_text(encoding="utf-8")
+
+    assert 'data-route="chat"' in html
+    assert "const ROUTES = ['board', 'stats', 'workflow', 'git', 'chat', 'settings']" in js
+    assert "function renderChatPage(container)" in js
+    assert "getChatSession: () => apiRequest('/chat/session')" in js
+    assert "createChatSession: (payload)" in js
+    assert "patchChatSession: (payload)" in js
+    assert "deleteChatSession: ()" in js
+    assert "postChatMessage: (payload)" in js
+    assert "function connectChatSocket(view)" in js
+    assert "new WebSocket(`${proto}://${location.host}/api/v1/chat/ws`)" in js
+    assert "function closeChatSocket()" in js
+    assert "function buildChatMessageNode(msg)" in js
+    assert "read-only not enforced" in js
+    assert ".chat-transcript" in css
+    assert ".chat-bubble" in css
+    assert ".chat-mode-toggle" in css
+    assert ".chat-composer" in css
