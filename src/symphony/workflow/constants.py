@@ -98,6 +98,10 @@ DEFAULT_BACKEND_STALL_TIMEOUT_MS = 300_000
 
 DEFAULT_AUTO_MERGE_EXCLUDE_PATHS: tuple[str, ...] = ()
 
+# Feature branches are named `symphony/<identifier>`. Mirrored in
+# scripts/symphony-setup-worktree.sh, which cannot import this module.
+SYMPHONY_BRANCH_PREFIX = "symphony/"
+
 _AFTER_DONE_FAILURE_POLICIES = ("warn", "block")
 
 _VAR_PATTERN = re.compile(r"^\$([A-Za-z_][A-Za-z0-9_]*)$")

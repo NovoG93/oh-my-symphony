@@ -15,6 +15,7 @@ set -euo pipefail
 ISSUE_ID="$(basename "$PWD")"
 HOST_REPO="${SYMPHONY_WORKFLOW_DIR:?SYMPHONY_WORKFLOW_DIR not set}"
 WORKTREE_PATH="$PWD"
+# Prefix mirrors SYMPHONY_BRANCH_PREFIX in src/symphony/workflow/constants.py.
 BRANCH="symphony/${ISSUE_ID}"
 # Symphony pre-creates the workspace dir; git worktree add refuses to
 # populate an existing path, so drop the empty dir first.
