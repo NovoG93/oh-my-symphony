@@ -33,9 +33,10 @@ from .skills import normalize_skill_names
 from .stats import StatsStore, stats_store_for
 from .trackers.file import FileBoardTracker, parse_ticket_file
 from .utils import git_inspect
+from .utils.auto_merge import auto_merge_on_done_best_effort
 from .orchestrator import Orchestrator
 from .orchestrator.run_registry import clamp_run_history_limit
-from .workflow import SUPPORTED_AGENT_KINDS, ServiceConfig
+from .workflow import SUPPORTED_AGENT_KINDS, SYMPHONY_BRANCH_PREFIX, ServiceConfig
 from .workflow.mutate import (
     StateSpec,
     WorkflowMutationError,
@@ -974,10 +975,108 @@ def _register_git_routes(
             return _json_error(400, code, message)
         return web.json_response(payload)
 
+    merge_lock = asyncio.Lock()
+
+    async def handle_git_merge(request: web.Request) -> web.Response:
+        body = await _read_json(request)
+        branch = _check_branch(body.get("branch"))
+        if not branch.startswith(SYMPHONY_BRANCH_PREFIX):
+            raise WorkflowMutationError(
+                f"merge is limited to {SYMPHONY_BRANCH_PREFIX}* task branches"
+            )
+        identifier = _check_identifier(branch[len(SYMPHONY_BRANCH_PREFIX) :])
+        raw_target = body.get("target")
+        target = (
+            _check_branch(raw_target, key="target")
+            if raw_target not in (None, "")
+            else None
+        )
+        cfg = ctx.config()
+        workflow_dir = cfg.workflow_path.parent
+        if orchestrator.find_running_issue_id(identifier) is not None:
+            return _json_error(
+                409,
+                "state_in_use",
+                f"{identifier} has a running worker; pause or wait before merging",
+            )
+        if merge_lock.locked():
+            return _json_error(
+                409, "merge_in_progress", "another merge is already running"
+            )
+        async with merge_lock:
+            resolved_target = target or await asyncio.to_thread(
+                _effective_target, cfg, workflow_dir
+            )
+            if not resolved_target:
+                return _json_error(
+                    400,
+                    "no_target",
+                    "no target branch; set auto_merge_target_branch or pass target",
+                )
+            issue: Issue | None = None
+            if cfg.tracker.kind == "file":
+                try:
+                    issue = await asyncio.to_thread(
+                        ctx.file_tracker().fetch_issue_full_by_id, identifier
+                    )
+                except Exception as exc:
+                    log.warning(
+                        "git_merge_ticket_lookup_failed",
+                        identifier=identifier,
+                        error=str(exc),
+                    )
+            # Same engine and policy as the automatic Verify merge gate:
+            # exclude_paths, --no-ff, conflict preflight, dirty-host guard.
+            result = await auto_merge_on_done_best_effort(
+                workflow_dir=workflow_dir,
+                branch=branch,
+                identifier=identifier,
+                title=issue.title if issue is not None else identifier,
+                target_branch=resolved_target,
+                exclude_paths=cfg.agent.auto_merge_exclude_paths,
+                capture_untracked=cfg.agent.auto_merge_capture_untracked,
+            )
+        if not result.ok:
+            return _json_error(
+                409, f"merge_{result.status}", result.detail or result.status
+            )
+        note_appended = False
+        if issue is not None:
+            note_body = (
+                f"Operator merged `{branch}` into `{resolved_target}` from "
+                "the web UI's Git page.\n\n"
+                f"- status: `{result.status}`"
+            )
+            if result.detail.strip():
+                note_body = f"{note_body}\n- detail: {result.detail.strip()[:1000]}"
+            try:
+                await asyncio.to_thread(
+                    ctx.file_tracker().append_note, issue, "Manual Merge", note_body
+                )
+                note_appended = True
+            except Exception as exc:
+                log.warning(
+                    "git_merge_note_append_failed",
+                    identifier=identifier,
+                    error=str(exc),
+                )
+        orchestrator.request_refresh()
+        return web.json_response(
+            {
+                "ok": True,
+                "status": result.status,
+                "detail": result.detail,
+                "branch": branch,
+                "target": resolved_target,
+                "ticket_note_appended": note_appended,
+            }
+        )
+
     app.router.add_get("/api/v1/git/branches", _wrap(handle_git_branches))
     app.router.add_get("/api/v1/git/log", _wrap(handle_git_log))
     app.router.add_get("/api/v1/git/task-branches", _wrap(handle_git_task_branches))
     app.router.add_get("/api/v1/git/compare", _wrap(handle_git_compare))
+    app.router.add_post("/api/v1/git/merge", _wrap(handle_git_merge))
 
 
 # ---------------------------------------------------------------------------

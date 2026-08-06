@@ -6,6 +6,7 @@ stub orchestrator for the live-run surface.
 
 from __future__ import annotations
 
+import asyncio
 import subprocess
 from pathlib import Path
 from typing import Any, AsyncIterator, cast
@@ -16,6 +17,7 @@ from aiohttp.test_utils import TestClient, TestServer
 
 from symphony.orchestrator import Orchestrator
 from symphony.server import build_app
+from symphony.utils.auto_merge import AutoMergeResult
 from symphony.workflow import WorkflowState
 
 WORKFLOW_TEXT = """---
@@ -882,3 +884,111 @@ async def test_git_compare_defaults_target_to_current_branch(
     )
     assert resp.status == 400
     assert (await resp.json())["error"]["code"] == "unknown_ref"
+
+
+async def test_git_merge_validates_branch(client: TestClient) -> None:
+    resp = await client.post("/api/v1/git/merge", json={})
+    assert resp.status == 400
+
+    resp = await client.post("/api/v1/git/merge", json={"branch": "main"})
+    assert resp.status == 400
+    assert "task branches" in (await resp.json())["error"]["message"]
+
+    resp = await client.post(
+        "/api/v1/git/merge", json={"branch": "symphony/../escape"}
+    )
+    assert resp.status == 400
+
+
+async def test_git_merge_blocks_running_worker(
+    git_repo: Path, client: TestClient
+) -> None:
+    client.stub.running_identifiers["SEED-1"] = "id-SEED-1"  # type: ignore[attr-defined]
+    resp = await client.post(
+        "/api/v1/git/merge", json={"branch": "symphony/SEED-1"}
+    )
+    assert resp.status == 409
+    assert (await resp.json())["error"]["code"] == "state_in_use"
+
+
+async def test_git_merge_merges_branch_and_appends_note(
+    git_repo: Path, client: TestClient
+) -> None:
+    resp = await client.post(
+        "/api/v1/git/merge", json={"branch": "symphony/SEED-1"}
+    )
+    assert resp.status == 200
+    payload = await resp.json()
+    assert payload["ok"] is True
+    assert payload["status"] == "merged"
+    assert payload["branch"] == "symphony/SEED-1"
+    assert payload["target"] == "main"
+    assert payload["ticket_note_appended"] is True
+
+    log_out = subprocess.run(
+        ["git", "log", "--oneline", "main"],
+        cwd=str(git_repo),
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout
+    assert "SEED-1" in log_out
+    assert (git_repo / "feature.py").exists()
+    assert "Manual Merge" in (git_repo / "kanban" / "SEED-1.md").read_text()
+    assert client.stub.refresh_calls >= 1  # type: ignore[attr-defined]
+
+    resp = await client.get("/api/v1/git/task-branches")
+    (row,) = (await resp.json())["branches"]
+    assert row["merged"] is True
+
+
+async def test_git_merge_maps_failure_statuses_to_409(
+    git_repo: Path, client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    async def failing_merge(**_kwargs: Any) -> AutoMergeResult:
+        return AutoMergeResult(
+            ok=False, status="dirty_overlap", detail="host has overlapping dirty files"
+        )
+
+    monkeypatch.setattr(
+        "symphony.webapi.auto_merge_on_done_best_effort", failing_merge
+    )
+    resp = await client.post(
+        "/api/v1/git/merge", json={"branch": "symphony/SEED-1"}
+    )
+    assert resp.status == 409
+    error = (await resp.json())["error"]
+    assert error["code"] == "merge_dirty_overlap"
+    assert "dirty" in error["message"]
+
+
+async def test_git_merge_rejects_concurrent_requests(
+    git_repo: Path, client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    started = asyncio.Event()
+    release = asyncio.Event()
+
+    async def slow_merge(**_kwargs: Any) -> AutoMergeResult:
+        started.set()
+        await release.wait()
+        return AutoMergeResult(ok=True, status="merged", detail="")
+
+    monkeypatch.setattr("symphony.webapi.auto_merge_on_done_best_effort", slow_merge)
+
+    async def post() -> tuple[int, dict[str, Any]]:
+        resp = await client.post(
+            "/api/v1/git/merge", json={"branch": "symphony/SEED-1"}
+        )
+        return resp.status, await resp.json()
+
+    first = asyncio.create_task(post())
+    await asyncio.wait_for(started.wait(), timeout=5)
+
+    status, payload = await post()
+    assert status == 409
+    assert payload["error"]["code"] == "merge_in_progress"
+
+    release.set()
+    status, payload = await first
+    assert status == 200
+    assert payload["ok"] is True
