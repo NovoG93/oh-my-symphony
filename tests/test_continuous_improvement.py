@@ -11,6 +11,7 @@ from typing import Any
 import pytest
 
 from symphony.continuous_improvement import (
+    CHECK_PYTHON,
     BaselineProof,
     CheckResult,
     CheckSpec,
@@ -401,9 +402,9 @@ async def test_run_continuous_improvement_writes_report_and_registers_failed_che
                 128,
                 "no upstream",
             ),
-            ("python", "-m", "pytest", "-q"): (1, "FAILED tests/test_demo.py\n"),
-            ("python", "-m", "ruff", "check", "src", "tests"): (0, "ok\n"),
-            ("python", "-m", "pyright"): (0, "0 errors\n"),
+            (CHECK_PYTHON, "-m", "pytest", "-q"): (1, "FAILED tests/test_demo.py\n"),
+            (CHECK_PYTHON, "-m", "ruff", "check", "src", "tests"): (0, "ok\n"),
+            (CHECK_PYTHON, "-m", "pyright"): (0, "0 errors\n"),
         }
         rc, output = outputs[key]
         return CommandExecution(key, rc, output, False, False)
@@ -441,9 +442,9 @@ async def test_run_continuous_improvement_required_check_not_proven_marks_run(
                 "no upstream",
                 False,
             ),
-            ("python", "-m", "pytest", "-q"): (None, "", True),
-            ("python", "-m", "ruff", "check", "src", "tests"): (0, "ok\n", False),
-            ("python", "-m", "pyright"): (0, "0 errors\n", False),
+            (CHECK_PYTHON, "-m", "pytest", "-q"): (None, "", True),
+            (CHECK_PYTHON, "-m", "ruff", "check", "src", "tests"): (0, "ok\n", False),
+            (CHECK_PYTHON, "-m", "pyright"): (0, "0 errors\n", False),
         }
         rc, output, timed_out = outputs[key]
         return CommandExecution(key, rc, output, timed_out, False)
@@ -495,12 +496,12 @@ async def test_run_continuous_improvement_uses_temp_worktree_for_target_branch(
                 128,
                 "no upstream",
             ),
-            ("python", "-m", "pytest", "-q"): (0, "ok\n"),
-            ("python", "-m", "ruff", "check", "src", "tests"): (0, "ok\n"),
-            ("python", "-m", "pyright"): (0, "0 errors\n"),
+            (CHECK_PYTHON, "-m", "pytest", "-q"): (0, "ok\n"),
+            (CHECK_PYTHON, "-m", "ruff", "check", "src", "tests"): (0, "ok\n"),
+            (CHECK_PYTHON, "-m", "pyright"): (0, "0 errors\n"),
         }
         rc, output = outputs[key]
-        if key[0] == "python":
+        if key[0] == CHECK_PYTHON:
             check_cwds.append(cwd_path)
         return CommandExecution(key, rc, output, False, False)
 
