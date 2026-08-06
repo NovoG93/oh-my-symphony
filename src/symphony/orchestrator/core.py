@@ -71,6 +71,7 @@ from ..workflow import (
     DEFAULT_TERMINAL_STATES,
     ServiceConfig,
     SUPPORTED_AGENT_KINDS,
+    SYMPHONY_BRANCH_PREFIX,
     WorkflowState,
     validate_for_dispatch,
 )
@@ -1863,7 +1864,7 @@ class Orchestrator:
         result: AutoMergeResult,
         debug_target: "_IssueDebug | None",
     ) -> None:
-        branch = f"symphony/{issue.identifier}"
+        branch = f"{SYMPHONY_BRANCH_PREFIX}{issue.identifier}"
         target = cfg.agent.auto_merge_target_branch or "(current branch)"
         detail = result.detail.strip()
         note_body = (
@@ -1925,7 +1926,7 @@ class Orchestrator:
             return True
         result = await auto_merge_on_done_best_effort(
             workflow_dir=cfg.workflow_path.parent,
-            branch=f"symphony/{issue.identifier}",
+            branch=f"{SYMPHONY_BRANCH_PREFIX}{issue.identifier}",
             identifier=issue.identifier,
             title=issue.title,
             target_branch=cfg.agent.auto_merge_target_branch,
@@ -6157,7 +6158,7 @@ class Orchestrator:
                     )
                     continue
                 if state == "done":
-                    branch = f"symphony/{issue.identifier}"
+                    branch = f"{SYMPHONY_BRANCH_PREFIX}{issue.identifier}"
                     already_merged = False
                     if cfg.agent.auto_merge_on_done:
                         already_merged = await _branch_already_merged_into_target(
