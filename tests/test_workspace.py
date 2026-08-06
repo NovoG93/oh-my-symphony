@@ -15,9 +15,15 @@ from symphony.errors import InvalidWorkspaceCwd, SymphonyError
 from symphony.workflow import HooksConfig
 from symphony.workflow import build_service_config, load_workflow
 from symphony.workspace import (
+    HISTORY_COMMIT_FAILED,
+    HISTORY_LOCAL_ONLY,
+    HISTORY_OK,
+    HISTORY_PUSH_FAILED,
     WorkspaceManager,
     commit_workspace_on_done,
+    finalize_delivery_history,
     validate_agent_cwd,
+    verify_branch_history,
 )
 
 
@@ -1280,3 +1286,146 @@ async def test_commit_workspace_on_done_tags_abnormal_exit(tmp_path, monkeypatch
     )
     log = _git(ws, "log", "--oneline")
     assert "OLV-7: leftover [state: In Progress]" in log.stdout
+
+
+# ---------------------------------------------------------------------------
+# host-side Final History Gate — finalize_delivery_history / verify_branch_history
+#
+# The gate exists so a sandboxed agent can never strand a finished ticket on a
+# housekeeping commit. These tests drive real repos: the failure it replaces
+# was a permissions detail no mock would have reproduced.
+# ---------------------------------------------------------------------------
+
+
+def _seeded_repo(path: Path) -> Path:
+    path.mkdir(parents=True, exist_ok=True)
+    _git(path, "init", "-q", "-b", "main")
+    (path / "seed.txt").write_text("seed")
+    _git(path, "add", "seed.txt")
+    _git(path, "commit", "-qm", "seed")
+    return path
+
+
+@pytest.mark.skipif(not _HAS_GIT, reason="git CLI required")
+@pytest.mark.asyncio
+async def test_history_gate_records_locally_without_an_upstream(
+    tmp_path, monkeypatch
+):
+    _git_id_env(monkeypatch, tmp_path)
+    ws = _seeded_repo(tmp_path / "ws")
+    (ws / "delivery.md").write_text("learn artefact")
+
+    result = await finalize_delivery_history(
+        ws, identifier="OLV-9", title="record delivery", state="Done"
+    )
+
+    assert result.status == HISTORY_LOCAL_ONLY
+    assert result.durable is True
+    assert result.branch == "main"
+    assert result.local_sha
+    assert "OLV-9: record delivery" in _git(ws, "log", "--oneline").stdout
+
+
+@pytest.mark.skipif(not _HAS_GIT, reason="git CLI required")
+@pytest.mark.asyncio
+async def test_history_gate_publishes_and_verifies_the_remote_tip(
+    tmp_path, monkeypatch
+):
+    """Success means the remote actually has the commit, not that push exited 0."""
+    _git_id_env(monkeypatch, tmp_path)
+    source = _seeded_repo(tmp_path / "source")
+    _git(tmp_path, "clone", "-q", "--bare", str(source), str(tmp_path / "remote.git"))
+    _git(tmp_path, "clone", "-q", str(tmp_path / "remote.git"), str(tmp_path / "ws"))
+    ws = tmp_path / "ws"
+    (ws / "delivery.md").write_text("learn artefact")
+
+    result = await finalize_delivery_history(
+        ws, identifier="OLV-10", title="record delivery", state="Done"
+    )
+
+    assert result.status == HISTORY_OK
+    assert result.local_sha == result.remote_sha != ""
+    assert result.durable is True
+
+
+@pytest.mark.skipif(not _HAS_GIT, reason="git CLI required")
+@pytest.mark.asyncio
+async def test_history_gate_keeps_the_commit_when_publishing_fails(
+    tmp_path, monkeypatch
+):
+    """An unreachable remote must not cost the delivery record."""
+    _git_id_env(monkeypatch, tmp_path)
+    source = _seeded_repo(tmp_path / "source")
+    _git(tmp_path, "clone", "-q", "--bare", str(source), str(tmp_path / "remote.git"))
+    _git(tmp_path, "clone", "-q", str(tmp_path / "remote.git"), str(tmp_path / "ws"))
+    ws = tmp_path / "ws"
+    _git(ws, "remote", "set-url", "origin", str(tmp_path / "gone.git"))
+    (ws / "delivery.md").write_text("learn artefact")
+
+    result = await finalize_delivery_history(
+        ws, identifier="OLV-11", title="record delivery", state="Done"
+    )
+
+    assert result.status == HISTORY_PUSH_FAILED
+    # Durable: the card downgrades to Human Review, it does not lose work.
+    assert result.durable is True
+    assert result.retryable is False
+    assert "OLV-11: record delivery" in _git(ws, "log", "--oneline").stdout
+
+
+@pytest.mark.skipif(not _HAS_GIT, reason="git CLI required")
+@pytest.mark.asyncio
+async def test_history_gate_commits_a_linked_worktree_to_its_ticket_branch(
+    tmp_path, monkeypatch
+):
+    """The production topology: blobs land in the host repo's object database."""
+    _git_id_env(monkeypatch, tmp_path)
+    host = _seeded_repo(tmp_path / "host")
+    ws = tmp_path / "ws"
+    _git(host, "worktree", "add", "-q", str(ws), "-b", "symphony/OLV-12")
+    (ws / "delivery.md").write_text("learn artefact")
+
+    result = await finalize_delivery_history(
+        ws, identifier="OLV-12", title="record delivery", state="Done"
+    )
+
+    assert result.durable is True
+    assert result.branch == "symphony/OLV-12"
+    assert "OLV-12: record delivery" in _git(
+        host, "log", "--oneline", "symphony/OLV-12"
+    ).stdout
+
+
+@pytest.mark.skipif(not _HAS_GIT, reason="git CLI required")
+@pytest.mark.asyncio
+async def test_verify_branch_history_reads_a_branch_after_the_worktree_is_gone(
+    tmp_path, monkeypatch
+):
+    """Blocked-ticket recovery runs when the workspace has already been reaped."""
+    _git_id_env(monkeypatch, tmp_path)
+    host = _seeded_repo(tmp_path / "host")
+    ws = tmp_path / "ws"
+    _git(host, "worktree", "add", "-q", str(ws), "-b", "symphony/OLV-13")
+    (ws / "delivery.md").write_text("learn artefact")
+    await finalize_delivery_history(
+        ws, identifier="OLV-13", title="record delivery", state="Done"
+    )
+    _git(host, "worktree", "remove", "--force", str(ws))
+
+    result = await verify_branch_history(host, branch="symphony/OLV-13")
+
+    assert result.durable is True
+    assert result.local_sha
+
+
+@pytest.mark.skipif(not _HAS_GIT, reason="git CLI required")
+@pytest.mark.asyncio
+async def test_verify_branch_history_reports_a_missing_branch(tmp_path, monkeypatch):
+    """No branch means no delivery record — recovery must decline, not invent one."""
+    _git_id_env(monkeypatch, tmp_path)
+    host = _seeded_repo(tmp_path / "host")
+
+    result = await verify_branch_history(host, branch="symphony/NOPE-1")
+
+    assert result.status == HISTORY_COMMIT_FAILED
+    assert result.durable is False

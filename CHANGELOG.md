@@ -10,7 +10,39 @@ Versioning: [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
-No unreleased changes.
+### Fixed
+
+- A ticket can no longer be parked in `Blocked` because its agent lacked
+  permission to write git objects. The default workspace is a linked git
+  worktree, which keeps the object database in the host repo's `.git` while
+  the per-worktree admin dir lives in `.git/worktrees/<ID>`. Symphony granted
+  only the latter, so `git add` took the index lock and then died with
+  `failed to insert into database`. Both directories are now granted.
+- The `Blocked` recovery loop no longer dead-ends. An RCA ticket inherits the
+  same sandbox as the ticket it is rescuing and cannot open a further RCA, so
+  a permission failure stopped the board permanently. Symphony now re-checks a
+  blocked ticket's history against the real repository first, and reopens it
+  for one automated retry when the delivery commit is actually present.
+
+### Changed
+
+- The Final History Gate moved from the agent to the orchestrator. The agent
+  writes artefacts and sets state; the host commits the workspace, publishes
+  the branch when it has an upstream, and re-reads the remote tip with
+  `git ls-remote`. The host runs unsandboxed, so the delivery record is
+  recorded whatever the agent's CLI is allowed to do. A commit that cannot be
+  verified on the remote moves the card to `Human Review` — never `Blocked`,
+  since the work is committed and only publishing is outstanding.
+
+### Added
+
+- Every backend (`agy`, `claude`, `codex`, `gemini`, `kiro`, `opencode`,
+  `pi`) exports `SYMPHONY_GIT_WRITABLE_ROOTS` so wrapper scripts can widen
+  their own sandbox; `codex` and `claude` additionally receive the roots as
+  CLI flags when Symphony can see the CLI token.
+- `symphony doctor` gained `git history writable`, which probes the object
+  database the host-side gate depends on, and `agent git grant`, which warns
+  when a wrapper-script command hides the CLI token that flag injection needs.
 
 ## [0.16.0] - 2026-08-06 - Streaming chat, concurrent sessions, branch actions
 

@@ -26,7 +26,7 @@ import os
 import shlex
 import time
 from collections import deque
-from typing import Any
+from typing import Any, Sequence
 
 from .._shell import resolve_bash, safe_proc_wait, terminate_process_tree
 from ..errors import (
@@ -36,6 +36,7 @@ from ..errors import (
     TurnTimeout,
 )
 from ..logging import get_logger
+from ..utils.git_sandbox import GIT_ROOTS_ENV_VAR, git_roots_outside
 from ..workspace import validate_agent_cwd
 from . import (
     EVENT_MALFORMED,
@@ -68,6 +69,25 @@ def _utc_iso() -> str:
     return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
 
 
+def _inject_add_dirs(command: str, dirs: Sequence[str]) -> str:
+    """Inject ``--add-dir <path>`` right after a literal ``claude`` token.
+
+    Injecting after the token rather than appending keeps pipelines and
+    redirections in operator-authored commands intact. Non-``claude``
+    commands (wrapper scripts) are returned unchanged; they get the same
+    list through :data:`GIT_ROOTS_ENV_VAR` instead.
+    """
+    if not dirs:
+        return command
+    stripped = command.lstrip()
+    if not (stripped == "claude" or stripped.startswith(("claude ", "claude\t"))):
+        return command
+    leading_ws = command[: len(command) - len(stripped)]
+    rest = stripped[len("claude") :]
+    flags = " ".join(f"--add-dir {shlex.quote(d)}" for d in dirs)
+    return f"{leading_ws}claude {flags}{rest}"
+
+
 class ClaudeCodeBackend(BaseAgentBackend):
     """One subprocess per turn; speaks Claude Code stream-json."""
 
@@ -75,6 +95,11 @@ class ClaudeCodeBackend(BaseAgentBackend):
         validate_agent_cwd(init.cwd, init.workspace_root)
         self._claude = init.cfg.claude
         self._cwd = init.cwd
+        # Resolved once: the worktree layout cannot change mid-run, and
+        # run_turn spawns a fresh subprocess every turn.
+        self._git_roots = git_roots_outside(init.cwd, init.workspace_root)
+        if self._git_roots:
+            log.info("claude_git_roots_granted", roots=self._git_roots)
         self._on_event = init.on_event
         self._session_id: str | None = None
         self._closed = False
@@ -154,7 +179,7 @@ class ClaudeCodeBackend(BaseAgentBackend):
         if self._closed:
             raise ResponseError("backend is closed")
 
-        cmd = self._claude.command
+        cmd = _inject_add_dirs(self._claude.command, self._git_roots)
         if (
             is_continuation
             and self._claude.resume_across_turns
@@ -162,6 +187,10 @@ class ClaudeCodeBackend(BaseAgentBackend):
             and self._session_id != PENDING_SESSION_ID
         ):
             cmd = f"{cmd} --resume {shlex.quote(self._session_id)}"
+
+        env = os.environ.copy()
+        if self._git_roots:
+            env[GIT_ROOTS_ENV_VAR] = os.pathsep.join(self._git_roots)
 
         try:
             proc = await asyncio.create_subprocess_exec(
@@ -172,7 +201,7 @@ class ClaudeCodeBackend(BaseAgentBackend):
                 stdin=asyncio.subprocess.PIPE,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
-                env=os.environ.copy(),
+                env=env,
                 limit=MAX_LINE_BYTES,
                 # Own process group so terminate/kill reaches the agent CLI
                 # behind the bash wrapper (POSIX only).

@@ -27,6 +27,10 @@ live persistent-process event without changing its spawn/reaping contract.
 from __future__ import annotations
 
 import asyncio
+import contextlib
+import os
+import shutil
+import subprocess
 from pathlib import Path
 from typing import Any
 
@@ -47,6 +51,7 @@ from symphony.backends import (
 )
 from symphony.errors import ResponseError, TurnFailed
 from symphony.orchestrator import Orchestrator
+from symphony.utils.git_sandbox import GIT_ROOTS_ENV_VAR
 from tests.test_backends import (
     _BlockingStream,
     _FakeSubprocess,
@@ -354,3 +359,154 @@ class TestPiBackendContract(PerTurnBackendContract):
                 ]
             )
         ]
+
+
+# ---------------------------------------------------------------------------
+# git-root grant — every agent kind, not just the two Symphony can flag-inject
+#
+# The default workspace is a linked git worktree, which puts the object
+# database outside the workspace directory. Whatever sandbox an agent CLI
+# applies, Symphony must hand it the paths a delivery commit needs; every
+# backend does that through the environment, and codex/claude additionally on
+# the command line. A backend that silently skips this reintroduces the
+# `failed to insert into database` block that stalls a board.
+# ---------------------------------------------------------------------------
+
+_SPAWN_MODULES = {
+    "codex": codex_module,
+    "claude": claude_module,
+    "gemini": per_turn_module,
+    "agy": per_turn_module,
+    "kiro": per_turn_module,
+    "opencode": per_turn_module,
+    "pi": pi_module,
+}
+
+
+def _worktree_workspace(tmp_path: Path) -> tuple[Path, Path, Path]:
+    """Host repo + workspace-root + a real linked worktree used as agent cwd."""
+    env = {
+        "HOME": str(tmp_path),
+        "GIT_AUTHOR_NAME": "Test",
+        "GIT_AUTHOR_EMAIL": "test@example.com",
+        "GIT_COMMITTER_NAME": "Test",
+        "GIT_COMMITTER_EMAIL": "test@example.com",
+        "PATH": os.environ.get("PATH", ""),
+    }
+
+    def git(cwd: Path, *args: str) -> None:
+        subprocess.run(
+            ["git", *args], cwd=str(cwd), env=env, check=True, capture_output=True
+        )
+
+    host = tmp_path / "host"
+    host.mkdir()
+    git(host, "init", "-q", "-b", "main")
+    (host / "seed.txt").write_text("seed")
+    git(host, "add", "seed.txt")
+    git(host, "commit", "-qm", "seed")
+    workspace_root = tmp_path / "workspaces"
+    workspace_root.mkdir()
+    cwd = workspace_root / "ws"
+    git(host, "worktree", "add", "-q", str(cwd), "-b", "symphony/T-1")
+    return host, workspace_root, cwd
+
+
+@pytest.mark.parametrize("kind", ALL_KINDS)
+@pytest.mark.asyncio
+async def test_every_backend_grants_the_object_database_of_a_worktree(
+    kind: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    if shutil.which("git") is None:
+        pytest.skip("git CLI required")
+    host, workspace_root, cwd = _worktree_workspace(tmp_path)
+    captured: dict[str, dict[str, str]] = {}
+    module = _SPAWN_MODULES[kind]
+
+    async def fake_create_subprocess_exec(*args: Any, **kwargs: Any):
+        del args
+        captured["env"] = dict(kwargs.get("env") or {})
+        return _FakeSubprocess(stdout_blob=b"", stderr_blob=b"", returncode=0)
+
+    async def fake_safe_proc_wait(proc: Any, *, timeout: Any = None) -> Any:
+        del timeout
+        return proc.returncode
+
+    monkeypatch.setattr(
+        module.asyncio, "create_subprocess_exec", fake_create_subprocess_exec
+    )
+    monkeypatch.setattr(module, "safe_proc_wait", fake_safe_proc_wait, raising=False)
+
+    cfg = _make_cfg(kind, workspace_root=workspace_root)
+    backend = build_backend(
+        BackendInit(
+            cfg=cfg, cwd=cwd, workspace_root=workspace_root, on_event=_async_noop
+        )
+    )
+    await backend.start()
+    if kind != "codex":
+        # Per-turn backends spawn inside run_turn; the canned empty stdout
+        # makes parsing fail, which is irrelevant — the env is already
+        # captured by then.
+        with contextlib.suppress(Exception):
+            await backend.run_turn(prompt="do the thing", is_continuation=False)
+    with contextlib.suppress(Exception):
+        await backend.stop()
+
+    assert "env" in captured, f"{kind} never spawned a subprocess"
+    granted = captured["env"].get(GIT_ROOTS_ENV_VAR, "").split(os.pathsep)
+    common_dir = str((host / ".git").resolve())
+    gitdir = str((host / ".git" / "worktrees" / "ws").resolve())
+    assert common_dir in granted, f"{kind} did not grant the object database"
+    assert gitdir in granted, f"{kind} did not grant the worktree admin dir"
+
+
+@pytest.mark.parametrize("kind", ALL_KINDS)
+@pytest.mark.asyncio
+async def test_no_backend_grants_extra_roots_for_a_plain_repo_workspace(
+    kind: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A workspace that owns its `.git` needs nothing extra — stay quiet."""
+    if shutil.which("git") is None:
+        pytest.skip("git CLI required")
+    workspace_root = tmp_path / "workspaces"
+    cwd = workspace_root / "ws"
+    cwd.mkdir(parents=True)
+    subprocess.run(
+        ["git", "init", "-q"],
+        cwd=str(cwd),
+        env={"HOME": str(tmp_path), "PATH": os.environ.get("PATH", "")},
+        check=True,
+        capture_output=True,
+    )
+    captured: dict[str, dict[str, str]] = {}
+    module = _SPAWN_MODULES[kind]
+
+    async def fake_create_subprocess_exec(*args: Any, **kwargs: Any):
+        del args
+        captured["env"] = dict(kwargs.get("env") or {})
+        return _FakeSubprocess(stdout_blob=b"", stderr_blob=b"", returncode=0)
+
+    async def fake_safe_proc_wait(proc: Any, *, timeout: Any = None) -> Any:
+        del timeout
+        return proc.returncode
+
+    monkeypatch.setattr(
+        module.asyncio, "create_subprocess_exec", fake_create_subprocess_exec
+    )
+    monkeypatch.setattr(module, "safe_proc_wait", fake_safe_proc_wait, raising=False)
+
+    cfg = _make_cfg(kind, workspace_root=workspace_root)
+    backend = build_backend(
+        BackendInit(
+            cfg=cfg, cwd=cwd, workspace_root=workspace_root, on_event=_async_noop
+        )
+    )
+    await backend.start()
+    if kind != "codex":
+        with contextlib.suppress(Exception):
+            await backend.run_turn(prompt="do the thing", is_continuation=False)
+    with contextlib.suppress(Exception):
+        await backend.stop()
+
+    assert captured["env"].get(GIT_ROOTS_ENV_VAR, "") == ""

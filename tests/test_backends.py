@@ -10,8 +10,11 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
+import shutil
 import signal
 import shlex
+import subprocess
 import uuid
 from dataclasses import replace
 from pathlib import Path
@@ -34,7 +37,12 @@ from symphony.backends import (
     BaseAgentBackend,
     build_backend,
 )
-from symphony.backends.claude_code import ClaudeCodeBackend, _extract_text, _is_error_result
+from symphony.backends.claude_code import (
+    ClaudeCodeBackend,
+    _extract_text,
+    _inject_add_dirs,
+    _is_error_result,
+)
 from symphony.backends.codex import (
     CodexAppServerBackend,
     NOTIF_ITEM_COMPLETED,
@@ -1852,6 +1860,86 @@ def test_scan_workspace_symlinks_skips_directory_dot_git(tmp_path: Path) -> None
     (workspace / ".git").mkdir(parents=True)
 
     assert _scan_workspace_symlinks(workspace) == []
+
+
+def test_scan_workspace_symlinks_includes_object_database_of_a_real_worktree(
+    tmp_path: Path,
+) -> None:
+    """The gitdir alone is not enough — blobs go to the shared common dir.
+
+    Built against a real `git worktree add` because the fabricated-pointer
+    tests above cannot show the split: git only writes the `commondir` file
+    that reveals the object database when it creates the worktree itself.
+    """
+    if shutil.which("git") is None:
+        pytest.skip("git CLI required")
+    env = {
+        "HOME": str(tmp_path),
+        "GIT_AUTHOR_NAME": "Test",
+        "GIT_AUTHOR_EMAIL": "test@example.com",
+        "GIT_COMMITTER_NAME": "Test",
+        "GIT_COMMITTER_EMAIL": "test@example.com",
+        "PATH": os.environ.get("PATH", ""),
+    }
+
+    def git(cwd: Path, *args: str) -> None:
+        subprocess.run(
+            ["git", *args], cwd=str(cwd), env=env, check=True, capture_output=True
+        )
+
+    host = tmp_path / "host"
+    host.mkdir()
+    git(host, "init", "-q", "-b", "main")
+    (host / "seed.txt").write_text("seed")
+    git(host, "add", "seed.txt")
+    git(host, "commit", "-qm", "seed")
+    workspace = tmp_path / "ws"
+    git(host, "worktree", "add", "-q", str(workspace), "-b", "symphony/T-1")
+
+    roots = _scan_workspace_symlinks(workspace)
+
+    common_dir = (host / ".git").resolve()
+    gitdir = (host / ".git" / "worktrees" / "ws").resolve()
+    assert str(gitdir) in roots, "index.lock lives here"
+    assert str(common_dir) in roots, "objects/ lives here — the missing grant"
+
+
+def test_scan_workspace_symlinks_omits_git_dir_inside_the_workspace(
+    tmp_path: Path,
+) -> None:
+    """A plain repo workspace needs no extra grant; `.git` is already inside."""
+    if shutil.which("git") is None:
+        pytest.skip("git CLI required")
+    workspace = tmp_path / "ws"
+    workspace.mkdir()
+    subprocess.run(
+        ["git", "init", "-q"],
+        cwd=str(workspace),
+        env={"HOME": str(tmp_path), "PATH": os.environ.get("PATH", "")},
+        check=True,
+        capture_output=True,
+    )
+
+    assert _scan_workspace_symlinks(workspace) == []
+
+
+def test_inject_add_dirs_grants_git_roots_to_a_direct_claude_command() -> None:
+    out = _inject_add_dirs("claude -p --verbose", ["/host/.git"])
+
+    assert out == "claude --add-dir /host/.git -p --verbose"
+    assert shlex.split(out) == ["claude", "--add-dir", "/host/.git", "-p", "--verbose"]
+
+
+def test_inject_add_dirs_quotes_paths_and_preserves_pipelines() -> None:
+    out = _inject_add_dirs("claude -p | tee log.txt", ["/a b/.git"])
+
+    assert out == "claude --add-dir '/a b/.git' -p | tee log.txt"
+
+
+def test_inject_add_dirs_leaves_wrapper_scripts_alone() -> None:
+    """A wrapper hides the CLI token; it reads the env var instead."""
+    assert _inject_add_dirs("./run-claude.sh", ["/host/.git"]) == "./run-claude.sh"
+    assert _inject_add_dirs("claude -p", []) == "claude -p"
 
 
 def test_inject_writable_roots_modifies_direct_codex_command() -> None:

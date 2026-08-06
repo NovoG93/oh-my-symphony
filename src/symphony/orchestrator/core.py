@@ -76,7 +76,15 @@ from ..workflow import (
     validate_for_dispatch,
 )
 from ..utils.auto_merge import AutoMergeResult, auto_merge_on_done_best_effort
-from ..workspace import WorkspaceManager, commit_workspace_on_done
+from ..utils.git_sandbox import SANDBOX_WRITE_DENIED, classify_history_failure
+from ..workspace import (
+    HISTORY_PUSH_FAILED,
+    HistoryGateResult,
+    WorkspaceManager,
+    commit_workspace_on_done,
+    finalize_delivery_history,
+    verify_branch_history,
+)
 from .constants import (
     ARCHIVE_SWEEP_INTERVAL_SEC,
     AUTO_TRIAGE_NOTE,
@@ -387,6 +395,33 @@ _HUMAN_REVIEW_MERGE_FAILURE_RE = re.compile(
 )
 
 
+_HISTORY_FAILURE_HEADING_RE = re.compile(
+    r"^##\s+History\s+Failure\s*$",
+    re.IGNORECASE | re.MULTILINE,
+)
+_HISTORY_RECOVERY_HEADING_RE = re.compile(
+    r"^##\s+History\s+Recovery\s*$",
+    re.IGNORECASE | re.MULTILINE,
+)
+_NEXT_H2_RE = re.compile(r"^##\s+", re.MULTILINE)
+
+
+def _markdown_section(description: str, heading_re: re.Pattern[str]) -> str:
+    """Body under the first heading matching ``heading_re``, up to the next `## `.
+
+    Scoping the read to one section matters for failure classification: a
+    ticket description also carries QA logs and prior-run notes, and matching
+    a phrase like `permission denied` anywhere in the body would mislabel
+    unrelated tickets.
+    """
+    match = heading_re.search(description or "")
+    if match is None:
+        return ""
+    rest = description[match.end() :]
+    nxt = _NEXT_H2_RE.search(rest)
+    return (rest[: nxt.start()] if nxt else rest).strip()
+
+
 def _blocked_rca_already_requested(issue: Issue) -> bool:
     return bool(_BLOCKED_RCA_HEADING_RE.search(issue.description or ""))
 
@@ -527,6 +562,10 @@ class Orchestrator:
         self._last_archive_sweep_monotonic: float | None = None
         self._lease_blocked: dict[str, str] = {}
         self._blocked_rca_source_ids: set[str] = set()
+        # Tickets the host already re-checked for a sandbox-denied history
+        # write. Bounds the extra description fetch to one per ticket per
+        # process instead of one per sweep.
+        self._history_recovery_attempted: set[str] = set()
         # Tickets whose worker-exit handler is mid-flight. `_on_worker_exit`
         # adds the id on entry and clears it in a `finally`, so from the moment
         # a worker leaves `_running` until its terminal-state persist (or retry
@@ -1218,6 +1257,7 @@ class Orchestrator:
         self._turn_budget_exhausted.clear()
         self._lease_blocked.clear()
         self._blocked_rca_source_ids.clear()
+        self._history_recovery_attempted.clear()
         self._issue_debug.clear()
         if self._run_registry is not None:
             self._run_registry.close()
@@ -2073,6 +2113,7 @@ class Orchestrator:
 
         for issue in candidates:
             self._blocked_rca_source_ids.discard(issue.id)
+            self._history_recovery_attempted.discard(issue.id)
 
         for issue in self._sort_with_wait_age_bump(candidates, cfg):
             if await self._auto_triage_todo_if_actionable(issue, cfg):
@@ -2383,6 +2424,151 @@ class Orchestrator:
             manual=True,
         )
 
+    async def _flag_unpublished_history(
+        self, cfg: ServiceConfig, issue: Issue, result: HistoryGateResult
+    ) -> None:
+        """Downgrade a card whose commit landed locally but never reached the remote.
+
+        `Human Review` rather than `Blocked`: the work is committed and cannot
+        be lost, so there is nothing for an RCA agent to root-cause — only a
+        remote an operator has to settle. Blocking here would stall the queue
+        over a publishing problem the pipeline already survived.
+        """
+        note = (
+            "The delivery commit was recorded locally but Symphony could not "
+            "verify it on the remote, so this card is not `Done` yet.\n\n"
+            f"- branch: `{result.branch or '(unknown)'}`\n"
+            f"- local commit: `{result.local_sha[:12] or 'none'}`\n"
+            f"- remote tip: `{result.remote_sha[:12] or 'not found'}`\n"
+            f"- classification: `{result.failure_kind}`\n\n"
+            "Workspace preserved. Publish the branch and move the card to "
+            "`Done`, or say why it should not be published.\n\n"
+            f"```\n{result.detail[:1000]}\n```"
+        )
+        try:
+            await asyncio.to_thread(
+                self._tracker_call_append_note,
+                cfg,
+                issue,
+                "History Not Published",
+                note,
+            )
+            await asyncio.to_thread(
+                self._tracker_call_update_state, cfg, issue, "Human Review"
+            )
+        except Exception as exc:
+            log.warning(
+                "history_gate_downgrade_failed",
+                identifier=issue.identifier,
+                branch=result.branch,
+                error=str(exc),
+            )
+            return
+        log.warning(
+            "history_gate_unpublished",
+            identifier=issue.identifier,
+            branch=result.branch,
+            local_sha=result.local_sha,
+            remote_sha=result.remote_sha,
+        )
+        self.request_refresh()
+
+    async def _recover_blocked_history_gate(
+        self, cfg: ServiceConfig, issue: Issue
+    ) -> bool:
+        """Rescue a ticket blocked on a git write its sandbox never allowed.
+
+        The agent runs the Final History Gate from inside a sandbox that may
+        not reach the object database (``utils.git_sandbox``), so a finished
+        ticket could self-park in ``Blocked`` on a housekeeping commit —
+        while the host's own snapshot commit, running unsandboxed moments
+        later, had already recorded the same work. Opening an RCA ticket for
+        that is worse than useless: the RCA worker inherits the identical
+        sandbox, blocks the same way, and cannot spawn a further RCA, which
+        is where the board stops moving entirely.
+
+        So before any RCA, the host re-checks the claim against real git
+        state. Returns True when the ticket was moved and no RCA is needed.
+        """
+        description = issue.description or ""
+        blocker = _markdown_section(description, _HISTORY_FAILURE_HEADING_RE)
+        if not blocker or classify_history_failure(blocker) != SANDBOX_WRITE_DENIED:
+            return False
+
+        branch = f"{SYMPHONY_BRANCH_PREFIX}{issue.identifier}"
+        # One rescue per ticket. A second identical block means the retry did
+        # not help, and looping a ticket through the pipeline forever is a
+        # worse failure mode than handing it to a human.
+        already_recovered = bool(_HISTORY_RECOVERY_HEADING_RE.search(description))
+        result = await verify_branch_history(cfg.workflow_path.parent, branch=branch)
+
+        if not result.durable:
+            log.info(
+                "history_recovery_declined",
+                identifier=issue.identifier,
+                branch=branch,
+                status=result.status,
+            )
+            return False
+
+        published = (
+            f"remote `{result.remote_sha[:12]}`"
+            if result.remote_sha
+            else "no upstream configured (local history only)"
+        )
+        note = (
+            "Symphony re-checked this ticket's git history from the host repo, "
+            "outside the agent sandbox that produced the failure.\n\n"
+            f"- branch: `{branch}`\n"
+            f"- local commit: `{result.local_sha[:12] or 'none'}`\n"
+            f"- published: {published}\n"
+            f"- host gate status: `{result.status}`\n\n"
+            "The delivery record is in git history, so the reported "
+            "`git add` failure was a sandbox permission limit, not lost work."
+        )
+
+        if result.status == HISTORY_PUSH_FAILED or already_recovered:
+            reason = (
+                "the remote tip could not be verified"
+                if result.status == HISTORY_PUSH_FAILED
+                else "this ticket was already rescued once and blocked again"
+            )
+            target = "Human Review"
+            note = f"{note}\n\nMoved to `Human Review` because {reason}."
+        else:
+            target = _blocked_source_reopen_state(cfg)
+            note = (
+                f"{note}\n\nReopened into `{target}` for one automated retry; "
+                "the history gate now runs on the host, so the same sandbox "
+                "limit cannot block it again."
+            )
+
+        try:
+            await asyncio.to_thread(
+                self._tracker_call_append_note, cfg, issue, "History Recovery", note
+            )
+            await asyncio.to_thread(self._tracker_call_update_state, cfg, issue, target)
+        except Exception as exc:
+            log.warning(
+                "history_recovery_persist_failed",
+                identifier=issue.identifier,
+                branch=branch,
+                error=str(exc),
+            )
+            return False
+
+        log.info(
+            "history_recovery_applied",
+            identifier=issue.identifier,
+            branch=branch,
+            status=result.status,
+            target_state=target,
+            local_sha=result.local_sha,
+            remote_sha=result.remote_sha,
+        )
+        self.request_refresh()
+        return True
+
     async def _open_blocked_rca_for_issue(
         self,
         cfg: ServiceConfig,
@@ -2494,10 +2680,12 @@ class Orchestrator:
                 break
             if normalize_state(issue.state) != "blocked":
                 self._blocked_rca_source_ids.discard(issue.id)
-                continue
-            if _is_blocked_rca_ticket(issue):
+                self._history_recovery_attempted.discard(issue.id)
                 continue
             if issue.id in self._blocked_rca_source_ids:
+                continue
+            recovery_pending = issue.id not in self._history_recovery_attempted
+            if not recovery_pending and _is_blocked_rca_ticket(issue):
                 continue
 
             full_issue = issue
@@ -2509,6 +2697,24 @@ class Orchestrator:
                 )
                 if fetched is not None:
                     full_issue = fetched
+
+            # Host-side rescue runs before any RCA, and deliberately also runs
+            # for RCA tickets: an RCA blocked by the same sandbox limit is the
+            # dead end, because it cannot open a further RCA of its own.
+            if recovery_pending:
+                self._history_recovery_attempted.add(issue.id)
+                try:
+                    if await self._recover_blocked_history_gate(cfg, full_issue):
+                        self._clear_tracker_error(issue.id)
+                        continue
+                except Exception as exc:
+                    log.warning(
+                        "history_recovery_errored",
+                        identifier=issue.identifier,
+                        error=str(exc),
+                    )
+            if _is_blocked_rca_ticket(issue):
+                continue
             if _blocked_rca_already_requested(full_issue):
                 self._blocked_rca_source_ids.add(issue.id)
                 continue
@@ -5177,7 +5383,29 @@ class Orchestrator:
                     )
                 return
             cleanup_started = entry.workspace_cleanup_started
+            # Final History Gate, host-side. The agent cannot be the one to
+            # prove delivery: it runs sandboxed and may not reach the object
+            # database at all (see `utils.git_sandbox`). The orchestrator is
+            # unsandboxed, so it commits, pushes and re-reads the remote tip
+            # itself, and only a genuinely unpublished history downgrades the
+            # card — never a permission limit.
+            history_unpublished = False
             if (
+                cfg is not None
+                and cfg.agent.auto_commit_on_done
+                and not cleanup_started
+                and normalize_state(entry.issue.state) in ("done", "human review")
+            ):
+                history = await finalize_delivery_history(
+                    entry.workspace_path,
+                    identifier=entry.issue.identifier,
+                    title=entry.issue.title,
+                    state=entry.issue.state,
+                )
+                if history.status == HISTORY_PUSH_FAILED:
+                    history_unpublished = True
+                    await self._flag_unpublished_history(cfg, entry.issue, history)
+            elif (
                 cfg is not None
                 and cfg.agent.auto_commit_on_done
                 and not cleanup_started
@@ -5210,6 +5438,12 @@ class Orchestrator:
             )
             is_terminal = normalize_state(entry.issue.state) in terminal_states
             if cleanup_started:
+                pass
+            elif history_unpublished:
+                # Commit exists, remote does not have it. The card is now in
+                # `Human Review`; keep the workspace so an operator can finish
+                # the push by hand, and skip the Done post-processing that
+                # would merge and reap it.
                 pass
             elif is_done and cfg is not None and self._workspace_manager is not None:
                 merge_ok = await self._auto_merge_done_gate_or_block(

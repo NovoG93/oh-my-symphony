@@ -1,6 +1,6 @@
 ### LEARN -- make the next ticket easier
 
-**Allowed tools (advisory).** Read `docs/{{ issue.identifier }}/{work,qa}/`, prior ticket sections, and `docs/llm-wiki/`. Write wiki files and ticket comments only, then run final git history commands from the host repo. Do NOT edit source or run the Merge Gate here; Verify already did it.
+**Allowed tools (advisory).** Read `docs/{{ issue.identifier }}/{work,qa}/`, prior ticket sections, and `docs/llm-wiki/`. Write wiki files and ticket comments only. Do NOT edit source, do NOT run git history commands, and do NOT run the Merge Gate here; Verify already did it and Symphony records the history itself.
 
 Goal for this lane: turn one ticket's evidence into reusable memory and close normal successful work as Done. Use Human Review only when a real critical/manual intervention remains and the agent cannot resolve it locally.
 
@@ -25,12 +25,11 @@ Goal for this lane: turn one ticket's evidence into reusable memory and close no
    - `### Risks` -- residual risks, not-covered areas, follow-ups, or `none`.
    - `### Human Checklist` -- 3-5 quickly verifiable checkboxes.
    - `### Decision Needed` -- exactly one line: `Confirm Done` or `Do not confirm; move back to <state> because <reason>`.
-8. Final History Gate:
-   - Update the ticket frontmatter to `Done` for normal success, or `Human Review` only for the intervention branch, then commit that final delivery record from the host repo.
-   - Stage exact paths only: the ticket file, `docs/llm-wiki/` files you changed, and any `docs/{{ issue.identifier }}/learn/` or `docs/{{ issue.identifier }}/work/` artifact you wrote in Learn; do not use `git add -A`.
-   - If there is a diff, run `git commit` with a message like `chore({{ issue.identifier }}): record delivery completion`.
-   - If the target branch has a remote/upstream, run `git push`, then verify the remote tip with `git ls-remote`. Record the local SHA, remote SHA, branch, and exact commands in `### Evidence`.
-   - If commit, push, or remote-tip verification fails, append `## History Failure`, set state to `Blocked`, name the failing command/stdout/stderr, and stop. Do not leave a card in `Done` or `Human Review` when its final history is only local or dirty.
-9. Set state to `Done` only after the Final History Gate passes. Set state to `Human Review` only for the recorded critical/manual intervention branch.
+8. Final History Gate -- Symphony runs it, not you:
+   - Update the ticket frontmatter to `Done` for normal success, or `Human Review` only for the intervention branch. Do not stage, commit, or publish the delivery record yourself.
+   - After this stage exits, Symphony's orchestrator commits the workspace, publishes the branch when it has an upstream, and re-reads the remote tip with `git ls-remote`. It runs outside your sandbox, so it can write the object database even where you cannot, and it writes the resulting SHAs into the ticket.
+   - In `### Evidence`, record what you produced and where. Leave branch and commit SHAs to the host gate.
+   - Never set `Blocked` because a local git command failed. A sandbox that refuses `.git/objects` writes is an environment limit, not lost work -- the host gate records the same delivery moments later. If the remote genuinely cannot be verified, Symphony moves the card to `Human Review` itself and says why.
+9. Set state to `Done` for normal success. Set state to `Human Review` only for the recorded critical/manual intervention branch.
 
 Operator skip: the TUI/web skip action may append `## Learn Skipped` and move an idle Learn ticket to `Human Review` for explicit operator review. Agents must not simulate that skip themselves.

@@ -35,7 +35,9 @@ from pathlib import Path
 from typing import Iterable, Literal
 
 from .._shell import _is_wsl_launcher, resolve_bash
+from ..backends.codex import _sandbox_uses_workspace_write
 from ..errors import SymphonyError
+from ..utils.git_sandbox import resolve_git_common_dir, writable_git_roots
 from ..service import ProcessRunningPredicate, port_owner_hint
 from ..workflow import (
     ServiceConfig,
@@ -428,6 +430,109 @@ def check_workspace_root(cfg: ServiceConfig) -> CheckResult:
     return CheckResult(name, "pass", f"{root} exists and is writable")
 
 
+def check_git_history_writable(cfg: ServiceConfig) -> CheckResult:
+    """The host must be able to write git objects — the Final History Gate needs it.
+
+    Symphony records every ticket's delivery commit from the orchestrator
+    process precisely because a sandboxed agent may not reach the object
+    database. That safety net only holds if the *host* can write there, so
+    probe it for real rather than assuming.
+
+    Also reports the git roots a sandboxed agent will be granted. With the
+    default worktree workspace these sit outside the workspace directory, and
+    an agent that is not granted them fails `git add` with
+    `failed to insert into database`.
+    """
+    repo = cfg.workflow_path.parent
+    name = "git history writable"
+    common_dir = resolve_git_common_dir(repo)
+    if common_dir is None:
+        return CheckResult(
+            name,
+            "warn",
+            f"{repo} is not a git repository — ticket branches and the "
+            "delivery-commit gate are unavailable",
+        )
+    objects_dir = common_dir / "objects"
+    try:
+        objects_dir.mkdir(parents=True, exist_ok=True)
+        with tempfile.NamedTemporaryFile(
+            dir=objects_dir, prefix=".symphony-doctor-", delete=True
+        ):
+            pass
+    except OSError as exc:
+        return CheckResult(
+            name,
+            "fail",
+            f"cannot write {objects_dir} — {exc}; the host cannot record "
+            "delivery commits, so finished tickets will stall",
+        )
+    roots = writable_git_roots(repo)
+    detail = f"{objects_dir} is writable"
+    if len(roots) > 1:
+        detail = f"{detail}; agents also need {', '.join(roots)}"
+    return CheckResult(name, "pass", detail)
+
+
+# Every supported agent kind and the config field holding its command. Kept
+# exhaustive on purpose: a new backend that Symphony can launch but cannot
+# grant git roots to would reintroduce the sandbox block silently.
+def _agent_commands(cfg: ServiceConfig) -> dict[str, str]:
+    return {
+        "agy": cfg.agy.command,
+        "claude": cfg.claude.command,
+        "codex": cfg.codex.command,
+        "gemini": cfg.gemini.command,
+        "kiro": cfg.kiro.command,
+        "opencode": cfg.opencode.command,
+        "pi": cfg.pi.command,
+    }
+
+# CLIs Symphony can widen on the command line. Every other kind gets the grant
+# through the environment only, which is all those CLIs can consume today.
+_CLI_FLAG_INJECTORS = ("codex", "claude")
+
+
+def check_agent_git_grant(cfg: ServiceConfig) -> CheckResult:
+    """Whether the configured agent will actually receive its git roots.
+
+    All backends export ``SYMPHONY_GIT_WRITABLE_ROOTS``. codex and claude
+    additionally get the roots injected as CLI flags, but only when Symphony
+    can see the literal CLI token at the front of the command — a wrapper
+    script hides it, and then the wrapper has to forward the env var itself
+    or the agent is back to the sandbox that produced `Operation not
+    permitted`.
+    """
+    name = "agent git grant"
+    kind = cfg.agent.kind
+    command = _agent_commands(cfg).get(kind, "").strip()
+    if kind not in _CLI_FLAG_INJECTORS:
+        return CheckResult(
+            name,
+            "pass",
+            f"{kind} receives git roots via $SYMPHONY_GIT_WRITABLE_ROOTS",
+        )
+    if kind == "codex" and not _sandbox_uses_workspace_write(
+        cfg.codex.thread_sandbox, cfg.codex.turn_sandbox_policy
+    ):
+        return CheckResult(
+            name, "pass", "codex sandbox is not workspace-write; no grant needed"
+        )
+    if command == kind or command.startswith((f"{kind} ", f"{kind}\t")):
+        return CheckResult(name, "pass", f"Symphony injects git roots into `{kind}`")
+    env_var = (
+        "SYMPHONY_CODEX_WRITABLE_ROOTS"
+        if kind == "codex"
+        else "SYMPHONY_GIT_WRITABLE_ROOTS"
+    )
+    return CheckResult(
+        name,
+        "warn",
+        f"{kind}.command is a wrapper script, so Symphony cannot inject git "
+        f"roots on the command line; forward ${env_var} from the wrapper",
+    )
+
+
 def check_tracker(cfg: ServiceConfig) -> CheckResult:
     tracker = cfg.tracker
     if tracker.kind == "file":
@@ -550,6 +655,8 @@ def run_checks(cfg: ServiceConfig, host: str = "127.0.0.1") -> list[CheckResult]
         check_prompts(cfg),
         check_after_create_hook(cfg),
         check_workspace_root(cfg),
+        check_git_history_writable(cfg),
+        check_agent_git_grant(cfg),
         check_tracker(cfg),
         check_board_viewer(cfg),
     ]

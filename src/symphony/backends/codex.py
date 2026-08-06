@@ -36,6 +36,7 @@ from ..errors import (
     TurnTimeout,
 )
 from ..logging import get_logger
+from ..utils.git_sandbox import git_roots_env, git_roots_outside
 from ..workspace import validate_agent_cwd
 from . import (
     EVENT_APPROVAL_AUTO_APPROVED,
@@ -158,15 +159,16 @@ def _scan_workspace_symlinks(*roots: Path) -> list[str]:
        silently fail and the worker burns turns repeating "쓰기 불가".
 
     2. ``after_create`` attaches the workspace as a git worktree of the host
-       repo (the default Symphony hook), which stores the worktree's
-       admin state in ``<host_repo>/.git/worktrees/<ID>/``. The worktree's
-       ``.git`` file is a one-liner pointer (``gitdir: <abspath>``), not a
-       directory. Every ``git`` invocation inside the worktree writes
-       ``index.lock``, ``HEAD.lock``, etc. under that admin dir, and the
-       merge-gate's ``git merge-tree`` writes objects to it too. Without
-       the gitdir in ``writable_roots`` the merge gate dies with
-       ``unable to create temporary file: Operation not permitted`` and
-       Symphony surfaces the worker as ``Blocked``.
+       repo (the default Symphony hook), which splits git's writable state
+       across *two* directories outside the workspace: the per-worktree
+       admin dir ``<host_repo>/.git/worktrees/<ID>/`` (index and ref locks)
+       and the shared common dir ``<host_repo>/.git/`` that owns
+       ``objects/``. Granting only the admin dir lets ``git add`` take the
+       index lock and then die writing the blob —
+       ``unable to create temporary file: Operation not permitted`` /
+       ``failed to insert into database`` — which is how a finished ticket
+       ends up ``Blocked`` on a housekeeping commit. ``writable_git_roots``
+       returns both directories; see ``utils.git_sandbox``.
 
     The scan returns resolved targets that the backend passes to codex as
     ``sandbox_workspace_write.writable_roots``, preserving the safer
@@ -191,22 +193,14 @@ def _scan_workspace_symlinks(*roots: Path) -> list[str]:
             except OSError:
                 continue
             seen.add(str(target))
-        # Git-worktree pointer file. Resolving the gitdir target by reading
-        # `.git` is safe: the file is plain text owned by the same user that
-        # ran `git worktree add`, and the worst case is a missing/garbled
-        # pointer (treated as "no extra writable root").
-        git_file = root / ".git"
-        try:
-            if git_file.is_file():
-                content = git_file.read_text(encoding="utf-8", errors="replace")
-                for line in content.splitlines():
-                    if line.startswith("gitdir:"):
-                        target = line[len("gitdir:"):].strip()
-                        if target:
-                            seen.add(target)
-                        break
-        except OSError:
-            pass
+    # Git admin dirs: the per-worktree gitdir *and* the common dir that owns
+    # the object database. Both are needed for `git add`/`commit` and for the
+    # merge gate's `git merge-tree --write-tree`. Computed once against the
+    # first root (the agent cwd, the only directory codex already grants) so
+    # a git dir that happens to sit under the workspace *root* is still
+    # granted explicitly. A plain repo workspace adds nothing here.
+    if roots:
+        seen.update(git_roots_outside(*roots))
     return sorted(seen)
 
 
@@ -336,6 +330,9 @@ class CodexAppServerBackend(BaseAgentBackend):
         No-op when sandbox is not workspace-write or no symlinks exist.
         """
         env = os.environ.copy()
+        # Backend-neutral grant, exported by every Symphony backend so any
+        # wrapper script can widen its own sandbox the same way.
+        env.update(git_roots_env(self._cwd, self._workspace_root))
         command = self._codex.command
         if not _sandbox_uses_workspace_write(self._thread_sandbox, self._sandbox_policy):
             self._writable_roots = []
