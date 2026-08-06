@@ -84,6 +84,14 @@
       if (target) params.set('target', target);
       return apiRequest(`/git/compare?${params.toString()}`);
     },
+    getGitDiff: ({ branch, target, path, commit } = {}) => {
+      const params = new URLSearchParams();
+      if (commit) params.set('commit', commit);
+      if (branch) params.set('branch', branch);
+      if (target) params.set('target', target);
+      if (path) params.set('path', path);
+      return apiRequest(`/git/diff?${params.toString()}`);
+    },
     postGitMerge: (payload) => apiRequest('/git/merge', { method: 'POST', body: JSON.stringify(payload) }),
     getStats: (days) => apiRequest(`/stats?days=${encodeURIComponent(days)}`),
     pause: (id) => apiRequest(`/${encodeURIComponent(id)}/pause`, { method: 'POST' }),
@@ -1690,10 +1698,14 @@
         body.appendChild(el('div', { class: 'empty-state' }, 'The workflow directory is not a git repository.'));
         return;
       }
-      const compareCard = buildGitCompareCard(taskData);
-      body.appendChild(buildTaskBranchesCard(taskData, compareCard));
-      body.appendChild(buildGitHistoryCard());
-      body.appendChild(compareCard.node);
+      const diffPanel = buildDiffPanel();
+      const compareCard = buildGitCompareCard(taskData, diffPanel);
+      body.appendChild(el('div', { class: 'git-left' }, [
+        buildTaskBranchesCard(taskData, compareCard),
+        buildGitHistoryCard(diffPanel),
+        compareCard.node,
+      ]));
+      body.appendChild(diffPanel.node);
     } catch (err) {
       clearNode(body);
       body.appendChild(el('div', { class: 'empty-state' }, `Could not load git info: ${err.message}`));
@@ -1769,13 +1781,13 @@
     });
   }
 
-  function buildGitHistoryCard() {
+  function buildGitHistoryCard(diffPanel) {
     const options = [el('option', { value: '' }, '(all branches)')];
     for (const branch of state.branches) options.push(el('option', { value: branch }, branch));
     const branchSelect = el('select', { class: 'select' }, options);
     const rows = el('div', { class: 'commit-rows' });
-    branchSelect.addEventListener('change', () => loadGitHistory(branchSelect.value, rows));
-    loadGitHistory('', rows);
+    branchSelect.addEventListener('change', () => loadGitHistory(branchSelect.value, rows, diffPanel));
+    loadGitHistory('', rows, diffPanel);
     return el('div', { class: 'card-panel' }, [
       el('h3', null, 'History'),
       field('Branch', branchSelect),
@@ -1783,7 +1795,7 @@
     ]);
   }
 
-  async function loadGitHistory(branch, rows) {
+  async function loadGitHistory(branch, rows, diffPanel) {
     clearNode(rows);
     rows.appendChild(el('div', { class: 'history-muted' }, 'Loading commits...'));
     try {
@@ -1794,16 +1806,22 @@
         rows.appendChild(el('div', { class: 'history-muted' }, 'No commits'));
         return;
       }
-      for (const commit of commits) rows.appendChild(buildCommitRow(commit));
+      for (const commit of commits) rows.appendChild(buildCommitRow(commit, diffPanel));
     } catch (err) {
       clearNode(rows);
       rows.appendChild(el('div', { class: 'history-muted' }, `History unavailable: ${err.message}`));
     }
   }
 
-  function buildCommitRow(commit) {
+  function buildCommitRow(commit, diffPanel) {
     const refs = (commit.refs || []).map((ref) => el('span', { class: 'ref-chip' }, ref));
-    return el('div', { class: 'commit-row' }, [
+    const attrs = { class: 'commit-row' };
+    if (diffPanel) {
+      attrs.class += ' clickable';
+      attrs.title = 'Show file changes';
+      attrs.onClick = () => diffPanel.showCommit(commit);
+    }
+    return el('div', attrs, [
       el('span', { class: 'git-mono commit-sha' }, commit.short_sha),
       el('span', { class: 'commit-subject' }, commit.subject),
       ...refs,
@@ -1811,7 +1829,7 @@
     ]);
   }
 
-  function buildGitCompareCard(data) {
+  function buildGitCompareCard(data, diffPanel) {
     const branchOptions = [el('option', { value: '' }, 'Pick a branch…')];
     for (const branch of state.branches) branchOptions.push(el('option', { value: branch }, branch));
     const branchSelect = el('select', { class: 'select' }, branchOptions);
@@ -1843,14 +1861,15 @@
           cmp.merged ? el('span', { class: 'badge-merged' }, 'merged') : null,
         ]));
         const commits = cmp.commits || [];
-        for (const commit of commits) resultBox.appendChild(buildCommitRow(commit));
+        for (const commit of commits) resultBox.appendChild(buildCommitRow(commit, diffPanel));
         if (cmp.commits_truncated) {
           resultBox.appendChild(el('div', { class: 'history-muted' }, 'Commit list truncated'));
         }
         if (!commits.length) {
           resultBox.appendChild(el('div', { class: 'history-muted' }, 'Nothing to merge'));
         }
-        resultBox.appendChild(buildDiffstatTable(cmp.stat));
+        resultBox.appendChild(buildDiffstatTable(cmp.stat, diffPanel));
+        diffPanel.showCompare(cmp.branch, cmp.target);
       } catch (err) {
         clearNode(resultBox);
         resultBox.appendChild(el('div', { class: 'history-muted' }, `Compare failed: ${err.message}`));
@@ -1867,21 +1886,137 @@
     };
   }
 
-  function buildDiffstatTable(stat) {
+  function buildDiffstatTable(stat, diffPanel) {
     const files = (stat && stat.files) || [];
     if (!files.length) return el('div', { class: 'history-muted' }, 'No file changes');
     const total = stat.total || {};
-    const rows = files.map((f) => el('tr', null, [
-      el('td', { class: 'diffstat-path' }, f.path),
-      el('td', { class: 'stat-add' }, f.binary ? 'bin' : `+${f.insertions}`),
-      el('td', { class: 'stat-del' }, f.binary ? '' : `−${f.deletions}`),
-    ]));
+    const rows = files.map((f) => {
+      const attrs = {};
+      if (diffPanel) {
+        attrs.class = 'clickable';
+        attrs.title = 'Jump to file diff';
+        attrs.onClick = () => diffPanel.scrollToFile(f.path);
+      }
+      return el('tr', attrs, [
+        el('td', { class: 'diffstat-path' }, f.path),
+        el('td', { class: 'stat-add' }, f.binary ? 'bin' : `+${f.insertions}`),
+        el('td', { class: 'stat-del' }, f.binary ? '' : `−${f.deletions}`),
+      ]);
+    });
     rows.push(el('tr', { class: 'diffstat-total' }, [
       el('td', null, `${total.files || 0} files`),
       el('td', { class: 'stat-add' }, `+${total.insertions || 0}`),
       el('td', { class: 'stat-del' }, `−${total.deletions || 0}`),
     ]));
     return el('table', { class: 'diffstat-table' }, [el('tbody', null, rows)]);
+  }
+
+  function buildDiffPanel() {
+    const subtitle = el('div', { class: 'diff-panel-subtitle history-muted' }, 'Load a compare or click a commit to see file changes.');
+    const bodyBox = el('div', { class: 'diff-panel-body' });
+    const node = el('div', { class: 'card-panel git-diff-panel' }, [
+      el('h3', null, 'Changes'),
+      subtitle,
+      bodyBox,
+    ]);
+
+    function setLoading(label) {
+      subtitle.textContent = label;
+      clearNode(bodyBox);
+      bodyBox.appendChild(el('div', { class: 'history-muted' }, 'Loading diff...'));
+    }
+
+    function showError(message) {
+      clearNode(bodyBox);
+      bodyBox.appendChild(el('div', { class: 'history-muted' }, `Diff unavailable: ${message}`));
+    }
+
+    function renderPatch(patch, truncated) {
+      clearNode(bodyBox);
+      if (!patch) {
+        bodyBox.appendChild(el('div', { class: 'history-muted' }, 'No changes'));
+        return;
+      }
+      const parsed = splitPatchByFile(patch);
+      const metaText = parsed.meta.join('\n').trim();
+      if (metaText) bodyBox.appendChild(el('pre', { class: 'diff-commit-meta' }, metaText));
+      for (const file of parsed.files) bodyBox.appendChild(buildDiffFileSection(file));
+      if (truncated) bodyBox.appendChild(el('div', { class: 'history-muted' }, 'Diff truncated — full patch exceeds the size cap'));
+    }
+
+    async function showCompare(branch, target) {
+      setLoading(`${branch} → ${target}`);
+      try {
+        const data = await api.getGitDiff({ branch, target });
+        renderPatch(data.patch, data.truncated);
+      } catch (err) {
+        showError(err.message);
+      }
+    }
+
+    async function showCommit(commit) {
+      setLoading(`commit ${commit.short_sha} — ${commit.subject}`);
+      try {
+        const data = await api.getGitDiff({ commit: commit.sha });
+        renderPatch(data.patch, data.truncated);
+      } catch (err) {
+        showError(err.message);
+      }
+    }
+
+    function scrollToFile(path) {
+      const section = bodyBox.querySelector(`[data-path="${CSS.escape(path)}"]`);
+      if (section) {
+        section.open = true;
+        section.scrollIntoView({ behavior: 'smooth', block: 'start' });
+      }
+    }
+
+    return { node, showCompare, showCommit, scrollToFile };
+  }
+
+  function splitPatchByFile(patch) {
+    const meta = [];
+    const files = [];
+    let current = null;
+    for (const line of patch.split('\n')) {
+      if (line.startsWith('diff --git ')) {
+        current = { path: parseDiffPath(line), lines: [line] };
+        files.push(current);
+      } else if (current) {
+        current.lines.push(line);
+      } else {
+        meta.push(line);
+      }
+    }
+    return { meta, files };
+  }
+
+  function parseDiffPath(header) {
+    const match = header.match(/ b\/(.+)$/);
+    return match ? match[1] : header;
+  }
+
+  function buildDiffFileSection(file) {
+    const lines = file.lines.map((line) => el('div', { class: `diff-line ${diffLineClass(line)}` }, line || ' '));
+    return el('details', { class: 'diff-file', open: true, 'data-path': file.path }, [
+      el('summary', { class: 'diff-file-header' }, file.path),
+      el('div', { class: 'diff-file-body' }, lines),
+    ]);
+  }
+
+  function diffLineClass(line) {
+    if (
+      line.startsWith('diff --git') || line.startsWith('index ') ||
+      line.startsWith('+++') || line.startsWith('---') ||
+      line.startsWith('new file') || line.startsWith('deleted file') ||
+      line.startsWith('similarity') || line.startsWith('rename ') ||
+      line.startsWith('Binary files')
+    ) return 'diff-meta';
+    if (line.startsWith('@@')) return 'diff-hunk';
+    if (line.startsWith('+')) return 'diff-add';
+    if (line.startsWith('-')) return 'diff-del';
+    return 'diff-ctx';
   }
 
   // ------------------------------------------------------------------
