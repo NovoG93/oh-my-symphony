@@ -23,10 +23,17 @@ import re
 from datetime import date, datetime
 from pathlib import Path
 from typing import Any, Awaitable, Callable
+from urllib.parse import urlsplit
 
-from aiohttp import web
+from aiohttp import WSCloseCode, web
 
-from .errors import SymphonyError
+from .chat import ChatManager
+from .errors import (
+    ChatBusyError,
+    ChatNoSessionError,
+    ChatSessionExistsError,
+    SymphonyError,
+)
 from .issue import Issue, registration_order_key
 from .logging import get_logger
 from .skills import normalize_skill_names
@@ -61,6 +68,8 @@ _ALLOWED_HOSTS = {"localhost", "127.0.0.1", "[::1]"}
 _LOOPBACK_BINDS = {"", "localhost", "127.0.0.1", "::1", "[::1]"}
 _CI_EDITABLE_KEYS = {"enabled", "interval_ms", "max_turns", "agent_kind"}
 BIND_HOST_KEY: web.AppKey[str] = web.AppKey("symphony.bind_host", str)
+CHAT_MANAGER_KEY: web.AppKey[ChatManager] = web.AppKey("symphony.chat", ChatManager)
+_MAX_CHAT_MESSAGE = 32_000
 
 
 def _json_error(status: int, code: str, message: str) -> web.Response:
@@ -1133,6 +1142,144 @@ def _register_git_routes(
 
 
 # ---------------------------------------------------------------------------
+# routes: operator chat (REST mutations + one-way WebSocket stream)
+# ---------------------------------------------------------------------------
+
+
+_WS_ALLOWED_ORIGIN_HOSTS = {"localhost", "127.0.0.1", "::1", "[::1]"}
+
+
+def _register_chat_routes(app: web.Application, ctx: _Ctx) -> None:
+    manager = ChatManager(ctx.config)
+    app[CHAT_MANAGER_KEY] = manager
+    websockets: set[web.WebSocketResponse] = set()
+
+    async def handle_chat_session_get(_request: web.Request) -> web.Response:
+        return web.json_response(manager.snapshot())
+
+    async def handle_chat_session_post(request: web.Request) -> web.Response:
+        body = await _read_json(request)
+        mode = body.get("mode", "qa")
+        if not isinstance(mode, str):
+            raise WorkflowMutationError("mode must be a string")
+        agent_kind = None
+        if body.get("agent_kind") not in (None, ""):
+            agent_kind = _check_agent_kind(body.get("agent_kind"))
+        try:
+            snapshot = await manager.start_session(mode, agent_kind)
+        except ChatSessionExistsError as exc:
+            return _json_error(409, exc.code, exc.message)
+        return web.json_response(snapshot, status=201)
+
+    async def handle_chat_session_patch(request: web.Request) -> web.Response:
+        body = await _read_json(request)
+        mode = body.get("mode")
+        if not isinstance(mode, str):
+            raise WorkflowMutationError("mode must be a string")
+        try:
+            result = await manager.set_mode(mode)
+        except ChatNoSessionError as exc:
+            return _json_error(404, exc.code, exc.message)
+        except ChatBusyError as exc:
+            return _json_error(409, exc.code, exc.message)
+        return web.json_response(result)
+
+    async def handle_chat_session_delete(_request: web.Request) -> web.Response:
+        try:
+            await manager.stop_session()
+        except ChatNoSessionError as exc:
+            return _json_error(404, exc.code, exc.message)
+        return web.json_response({"stopped": True})
+
+    async def handle_chat_message_post(request: web.Request) -> web.Response:
+        body = await _read_json(request)
+        text = body.get("text")
+        if not isinstance(text, str) or not text.strip():
+            raise WorkflowMutationError("text is required")
+        if len(text) > _MAX_CHAT_MESSAGE:
+            raise WorkflowMutationError(
+                f"text too long (max {_MAX_CHAT_MESSAGE} chars)"
+            )
+        try:
+            snapshot = await manager.send_message(text)
+        except ChatNoSessionError as exc:
+            return _json_error(404, exc.code, exc.message)
+        except ChatBusyError as exc:
+            return _json_error(409, exc.code, exc.message)
+        return web.json_response(snapshot, status=202)
+
+    def _origin_allowed(request: web.Request) -> bool:
+        # Browsers do not apply CORS to WebSocket upgrades; without this an
+        # arbitrary web page could stream the operator's transcript.
+        origin = request.headers.get("Origin")
+        if not origin:
+            return True
+        host = (urlsplit(origin).hostname or "").strip().lower()
+        return host in _WS_ALLOWED_ORIGIN_HOSTS
+
+    async def _pump(
+        queue: asyncio.Queue[dict[str, Any] | None], ws: web.WebSocketResponse
+    ) -> None:
+        while True:
+            row = await queue.get()
+            try:
+                if row is None:
+                    await ws.close(code=WSCloseCode.GOING_AWAY, message=b"shutdown")
+                    return
+                await ws.send_json(row)
+            except (ConnectionResetError, RuntimeError):
+                return
+
+    async def handle_chat_ws(request: web.Request) -> web.StreamResponse:
+        bind = str(request.app.get(BIND_HOST_KEY) or "127.0.0.1").lower()
+        if bind in _LOOPBACK_BINDS and not _origin_allowed(request):
+            return _json_error(
+                403, "forbidden_origin", "cross-origin websocket rejected"
+            )
+        ws = web.WebSocketResponse(heartbeat=30)
+        await ws.prepare(request)
+        websockets.add(ws)
+        queue = manager.subscribe()
+        pump = asyncio.create_task(_pump(queue, ws))
+        try:
+            await ws.send_json({"type": "hello", "snapshot": manager.snapshot()})
+            # The stream is server->client only; draining detects disconnect.
+            async for _msg in ws:
+                pass
+        finally:
+            pump.cancel()
+            try:
+                await pump
+            except (asyncio.CancelledError, Exception):
+                pass
+            manager.unsubscribe(queue)
+            websockets.discard(ws)
+        return ws
+
+    async def _close_chat(_app: web.Application) -> None:
+        # Close sockets first: an open WS otherwise holds runner.cleanup()
+        # until shutdown_timeout expires.
+        for ws in list(websockets):
+            try:
+                await ws.close(code=WSCloseCode.GOING_AWAY, message=b"shutdown")
+            except Exception:
+                pass
+        websockets.clear()
+        await manager.close()
+
+    app.on_shutdown.append(_close_chat)
+
+    app.router.add_get("/api/v1/chat/session", _wrap(handle_chat_session_get))
+    app.router.add_post("/api/v1/chat/session", _wrap(handle_chat_session_post))
+    app.router.add_patch("/api/v1/chat/session", _wrap(handle_chat_session_patch))
+    app.router.add_delete(
+        "/api/v1/chat/session", _wrap(handle_chat_session_delete)
+    )
+    app.router.add_post("/api/v1/chat/message", _wrap(handle_chat_message_post))
+    app.router.add_get("/api/v1/chat/ws", handle_chat_ws)
+
+
+# ---------------------------------------------------------------------------
 # routes: stats + static SPA
 # ---------------------------------------------------------------------------
 
@@ -1182,4 +1329,5 @@ def register_web_routes(app: web.Application, orchestrator: Orchestrator) -> Non
     _register_issue_routes(app, ctx, orchestrator)
     _register_workflow_routes(app, ctx, orchestrator)
     _register_git_routes(app, ctx, orchestrator)
+    _register_chat_routes(app, ctx)
     _register_meta_routes(app, ctx, orchestrator)
