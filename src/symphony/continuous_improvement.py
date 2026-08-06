@@ -19,6 +19,8 @@ import hashlib
 import json
 import os
 import re
+import shutil
+import sys
 import textwrap
 import time
 from dataclasses import dataclass
@@ -702,10 +704,29 @@ def write_report(path: Path, result: ImprovementRunResult) -> None:
     path.write_text(text, encoding="utf-8")
 
 
+def _check_interpreter() -> str:
+    """The Python the default checks run under.
+
+    Checks are spawned as an argv list with no shell, so a bare ``python``
+    only resolves if a real executable of that name is on PATH. macOS ships
+    none, and most Linux distros ship only ``python3``; a shell *alias* does
+    not apply to a subprocess. The literal ``"python"`` therefore produced
+    `command not found` for every check, and because that is reported as
+    ``not_proven`` rather than ``failed``, continuous improvement quietly
+    proved nothing and opened no tickets instead of failing loudly.
+
+    ``sys.executable`` also pins the checks to the environment Symphony was
+    installed into, which is where its `pytest`, `ruff` and `pyright` live.
+    """
+    return sys.executable or shutil.which("python3") or "python"
+
+
+CHECK_PYTHON = _check_interpreter()
+
 DEFAULT_CHECKS = (
-    CheckSpec("pytest", ("python", "-m", "pytest", "-q")),
-    CheckSpec("ruff", ("python", "-m", "ruff", "check", "src", "tests")),
-    CheckSpec("pyright", ("python", "-m", "pyright")),
+    CheckSpec("pytest", (CHECK_PYTHON, "-m", "pytest", "-q")),
+    CheckSpec("ruff", (CHECK_PYTHON, "-m", "ruff", "check", "src", "tests")),
+    CheckSpec("pyright", (CHECK_PYTHON, "-m", "pyright")),
 )
 
 
