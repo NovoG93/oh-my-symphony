@@ -49,6 +49,7 @@ from ..errors import (
     TurnTimeout,
 )
 from ..logging import get_logger
+from ..utils.git_sandbox import git_roots_env
 from ..workspace import validate_agent_cwd
 from . import (
     EVENT_AGENT_RETRY,
@@ -183,7 +184,7 @@ class PiBackend(BaseAgentBackend):
                 stdin=asyncio.subprocess.PIPE,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
-                env=os.environ.copy(),
+                env={**os.environ, **git_roots_env(self._cwd)},
                 limit=MAX_LINE_BYTES,
                 # Own process group so terminate/kill reaches the agent CLI
                 # behind the bash wrapper (POSIX only).

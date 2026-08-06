@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import asyncio
+import os
+import shutil
 import subprocess
 import sys
 from dataclasses import replace
@@ -28,7 +30,11 @@ from symphony.orchestrator import (
     _sort_for_dispatch_fifo,
 )
 from symphony.orchestrator.run_registry import RunRegistry
-from symphony.workspace import WorkspaceManager
+from symphony.workspace import (
+    HISTORY_LOCAL_ONLY,
+    HistoryGateResult,
+    WorkspaceManager,
+)
 from symphony.workflow import (
     AgentConfig,
     ClaudeConfig,
@@ -3060,10 +3066,15 @@ def _stub_workflow_state_returning(
 ) -> list[dict]:
     """Force `self._workflow_state.current()` to return cfg; capture commit calls.
 
-    Uses monkeypatch so the module-level rebind of commit_workspace_on_done
-    auto-reverts at test teardown — otherwise the stub leaks into other
-    tests that exercise orchestrator paths (observed: TUI integration
-    tests that drive a real worker exit path).
+    Both snapshot entry points feed one list: a Done/Human Review exit runs the
+    host-side Final History Gate (`finalize_delivery_history`, which commits and
+    then verifies the remote), every other exit runs the plain snapshot. Callers
+    assert "the workspace was committed once" without caring which door it came
+    through.
+
+    Uses monkeypatch so the module-level rebinds auto-revert at test teardown —
+    otherwise the stubs leak into other tests that exercise orchestrator paths
+    (observed: TUI integration tests that drive a real worker exit path).
     """
 
     captured: list[dict] = []
@@ -3074,7 +3085,12 @@ def _stub_workflow_state_returning(
             {"path": path, "identifier": identifier, "title": title}
         )
 
+    async def _capture_gate(path, *, identifier, title, **_):
+        await _capture(path, identifier=identifier, title=title)
+        return HistoryGateResult(HISTORY_LOCAL_ONLY)
+
     monkeypatch.setattr(core_module, "commit_workspace_on_done", _capture)
+    monkeypatch.setattr(core_module, "finalize_delivery_history", _capture_gate)
     return captured
 
 
@@ -8343,3 +8359,207 @@ def test_max_turns_exhaustion_does_not_double_dispatch(
         "ticket was re-dispatched while its terminal-state persist was in "
         "flight (double-dispatch race)"
     )
+
+
+# ---------------------------------------------------------------------------
+# Blocked-history recovery — the dead end that stalled a whole board
+#
+# A ticket whose agent could not write `.git/objects` used to self-park in
+# Blocked, and the RCA opened for it inherited the same sandbox and blocked
+# the same way. An RCA ticket cannot open a further RCA, so the board stopped
+# there. The host re-checks the claim against real git before any RCA.
+# ---------------------------------------------------------------------------
+
+_SANDBOX_HISTORY_FAILURE = (
+    "## History Failure\n\n"
+    "failing command: `git add -f docs/RCA-1/learn/details.md`\n"
+    "stderr: error: unable to create temporary file: Operation not permitted; "
+    "error: docs/changelog/changelog-2026-08-06.md: failed to insert into "
+    "database; fatal: updating files failed\n"
+)
+_REMOTE_HISTORY_FAILURE = (
+    "## History Failure\n\n"
+    "stderr: git@github.com: Permission denied (publickey).\n"
+    "fatal: Could not read from remote repository.\n"
+)
+
+
+def _repo_with_ticket_branch(tmp_path: Path, identifier: str) -> Path:
+    """Host repo carrying `symphony/<ID>` — the delivery the agent thought it lost."""
+    env = {
+        "HOME": str(tmp_path),
+        "GIT_AUTHOR_NAME": "Test",
+        "GIT_AUTHOR_EMAIL": "test@example.com",
+        "GIT_COMMITTER_NAME": "Test",
+        "GIT_COMMITTER_EMAIL": "test@example.com",
+        "PATH": os.environ.get("PATH", ""),
+    }
+
+    def git(*args: str) -> None:
+        subprocess.run(
+            ["git", *args], cwd=str(repo), env=env, check=True, capture_output=True
+        )
+
+    repo = tmp_path / "host"
+    repo.mkdir()
+    git("init", "-q", "-b", "main")
+    (repo / "seed.txt").write_text("seed")
+    git("add", "seed.txt")
+    git("commit", "-qm", "seed")
+    git("branch", f"symphony/{identifier}")
+    return repo
+
+
+def _run_blocked_sweep(monkeypatch, orch, cfg, issue):
+    """Drive one tick over a single Blocked ticket; report RCAs and notes."""
+    created: list[str] = []
+    notes: list[tuple[str, str, str]] = []
+    states: list[tuple[str, str]] = []
+
+    async def _fetch_candidates(_cfg):
+        return []
+
+    async def _archive(_cfg):
+        return None
+
+    monkeypatch.setattr(orch._workflow_state, "reload", lambda: (cfg, None))
+    monkeypatch.setattr(orch, "_fetch_candidates", _fetch_candidates)
+    monkeypatch.setattr(orch, "_archive_sweep", _archive)
+    monkeypatch.setattr(orch, "_tracker_call_terminal_issues", lambda _cfg: [issue])
+    monkeypatch.setattr(
+        orch,
+        "_tracker_call_create_blocked_rca_issue",
+        lambda _cfg, i, *_a: (created.append(i.identifier), "RCA-1")[1],
+    )
+    monkeypatch.setattr(
+        orch,
+        "_tracker_call_append_note",
+        lambda _cfg, i, heading, body: notes.append((i.identifier, heading, body)),
+    )
+    monkeypatch.setattr(
+        orch,
+        "_tracker_call_update_state",
+        lambda _cfg, i, state: states.append((i.identifier, state)),
+    )
+    asyncio.run(orch._on_tick())
+    return created, notes, states
+
+
+@pytest.mark.skipif(shutil.which("git") is None, reason="git CLI required")
+def test_tick_recovers_sandbox_history_failure_instead_of_opening_rca(
+    monkeypatch, tmp_path
+):
+    repo = _repo_with_ticket_branch(tmp_path, "MT-BLOCKED")
+    cfg = _make_config(
+        tracker_kind="file",
+        active_states=("Todo", "In Progress"),
+        terminal_states=("Done", "Blocked"),
+        workflow_path=repo / "WORKFLOW.md",
+    )
+    issue = _issue(
+        "MT-BLOCKED", state="Blocked", description=_SANDBOX_HISTORY_FAILURE
+    )
+
+    created, notes, states = _run_blocked_sweep(monkeypatch, _orch(), cfg, issue)
+
+    assert created == [], "a permissions limit must not cost an RCA ticket"
+    assert states == [("MT-BLOCKED", "Todo")]
+    assert notes[0][1] == "History Recovery"
+    assert "The delivery record is in git history" in notes[0][2]
+
+
+@pytest.mark.skipif(shutil.which("git") is None, reason="git CLI required")
+def test_tick_recovers_a_blocked_rca_ticket_that_could_never_open_another_rca(
+    monkeypatch, tmp_path
+):
+    """The exact dead end: the rescuer blocked by the thing it was rescuing."""
+    repo = _repo_with_ticket_branch(tmp_path, "RCA-MT-1")
+    cfg = _make_config(
+        tracker_kind="file",
+        active_states=("Todo", "In Progress"),
+        terminal_states=("Done", "Blocked"),
+        workflow_path=repo / "WORKFLOW.md",
+    )
+    issue = _issue(
+        "RCA-MT-1",
+        state="Blocked",
+        description=_SANDBOX_HISTORY_FAILURE,
+        labels=("blocked-rca",),
+    )
+
+    created, notes, states = _run_blocked_sweep(monkeypatch, _orch(), cfg, issue)
+
+    assert created == []
+    assert states == [("RCA-MT-1", "Todo")]
+    assert notes[0][1] == "History Recovery"
+
+
+@pytest.mark.skipif(shutil.which("git") is None, reason="git CLI required")
+def test_tick_escalates_a_second_identical_block_to_human_review(
+    monkeypatch, tmp_path
+):
+    """One rescue per ticket — looping forever is worse than asking a human."""
+    repo = _repo_with_ticket_branch(tmp_path, "MT-BLOCKED")
+    cfg = _make_config(
+        tracker_kind="file",
+        active_states=("Todo", "In Progress"),
+        terminal_states=("Done", "Blocked"),
+        workflow_path=repo / "WORKFLOW.md",
+    )
+    issue = _issue(
+        "MT-BLOCKED",
+        state="Blocked",
+        description=(
+            "## History Recovery\n\nrescued once already.\n\n"
+            + _SANDBOX_HISTORY_FAILURE
+        ),
+    )
+
+    created, notes, states = _run_blocked_sweep(monkeypatch, _orch(), cfg, issue)
+
+    assert created == []
+    assert states == [("MT-BLOCKED", "Human Review")]
+    assert "already rescued once" in notes[0][2]
+
+
+@pytest.mark.skipif(shutil.which("git") is None, reason="git CLI required")
+def test_tick_still_opens_rca_when_the_blocker_is_not_a_sandbox_limit(
+    monkeypatch, tmp_path
+):
+    """An SSH auth failure is a real blocker; recovery must not swallow it."""
+    repo = _repo_with_ticket_branch(tmp_path, "MT-BLOCKED")
+    cfg = _make_config(
+        tracker_kind="file",
+        active_states=("Todo", "In Progress"),
+        terminal_states=("Done", "Blocked"),
+        workflow_path=repo / "WORKFLOW.md",
+    )
+    issue = _issue(
+        "MT-BLOCKED", state="Blocked", description=_REMOTE_HISTORY_FAILURE
+    )
+
+    created, notes, states = _run_blocked_sweep(monkeypatch, _orch(), cfg, issue)
+
+    assert created == ["MT-BLOCKED"]
+    assert states == []
+    assert notes[0][1] == "Blocked RCA"
+
+
+@pytest.mark.skipif(shutil.which("git") is None, reason="git CLI required")
+def test_tick_declines_recovery_when_no_delivery_branch_exists(monkeypatch, tmp_path):
+    """No branch means work really was lost — hand it to an RCA, do not fake a pass."""
+    repo = _repo_with_ticket_branch(tmp_path, "OTHER-1")
+    cfg = _make_config(
+        tracker_kind="file",
+        active_states=("Todo", "In Progress"),
+        terminal_states=("Done", "Blocked"),
+        workflow_path=repo / "WORKFLOW.md",
+    )
+    issue = _issue(
+        "MT-BLOCKED", state="Blocked", description=_SANDBOX_HISTORY_FAILURE
+    )
+
+    created, notes, states = _run_blocked_sweep(monkeypatch, _orch(), cfg, issue)
+
+    assert created == ["MT-BLOCKED"]
+    assert states == []

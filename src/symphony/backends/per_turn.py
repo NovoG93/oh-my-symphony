@@ -29,6 +29,7 @@ from typing import Any
 from .._shell import resolve_bash, safe_proc_wait, terminate_process_tree
 from ..errors import PortExit, ResponseError, TurnFailed, TurnTimeout
 from ..logging import get_logger
+from ..utils.git_sandbox import git_roots_env
 from ..workspace import validate_agent_cwd
 from . import (
     EVENT_SESSION_STARTED,
@@ -232,7 +233,7 @@ class PerTurnCliBackend(BaseAgentBackend):
                 else asyncio.subprocess.DEVNULL,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
-                env=os.environ.copy(),
+                env={**os.environ, **git_roots_env(self._cwd)},
                 limit=MAX_LINE_BYTES,
                 # Own process group so terminate/kill reaches the agent CLI
                 # behind the bash wrapper (POSIX only).

@@ -529,8 +529,9 @@ def test_run_checks_returns_one_result_per_check(tmp_path: Path) -> None:
     )
     results = run_checks(cfg)
     # port + shell + max_turns + agent + pi_auth + gemini_auth + agy_state + kiro_auth
-    # + prompts + after_create + workspace + tracker + viewer = 13
-    assert len(results) == 13
+    # + prompts + after_create + workspace + git_history + agent_git_grant
+    # + tracker + viewer = 15
+    assert len(results) == 15
     assert {r.name.split("=")[0].split(".")[0] for r in results} >= {
         "agent",
         "hooks",

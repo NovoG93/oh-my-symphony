@@ -70,11 +70,12 @@ LEARN_RULES = (
     "## Wiki Updates",
     "## As-Is -> To-Be Report",
     "Final History Gate",
-    "do not use `git add -A`",
-    "git commit",
-    "git push",
+    # The gate moved to the host: the agent is told to stay out of git, and
+    # told not to self-block when its sandbox refuses a local git write.
+    "Symphony runs it, not you",
+    "Do not stage, commit, or publish the delivery record yourself",
     "git ls-remote",
-    "set state to `Blocked`",
+    "Never set `Blocked` because a local git command failed",
     "## Human Review",
     "Set state to `Done`",
     "Set state to `Human Review` only",
@@ -247,7 +248,7 @@ def test_learn_stage_writes_wiki_and_done_or_intervention_handoff(workflow: str)
         assert phrase in rendered
     for heading in HUMAN_REVIEW_HANDOFF_SHAPE:
         assert heading in rendered
-    assert "Do NOT edit source or run the Merge Gate here" in rendered
+    assert "Do NOT edit source, do NOT run git history commands" in rendered
 
 
 @pytest.mark.parametrize("flavor", ("file", "linear"))

@@ -16,6 +16,12 @@ from ._shell import resolve_bash
 from .errors import InvalidWorkspaceCwd, SymphonyError
 from .issue import workspace_key
 from .logging import get_logger
+from .utils.git_sandbox import (
+    REMOTE_REJECTED,
+    SANDBOX_WRITE_DENIED,
+    UNKNOWN_FAILURE,
+    classify_history_failure,
+)
 from .workflow import HooksConfig
 
 log = get_logger()
@@ -518,6 +524,30 @@ def _coerce_output_bytes(value: bytes | str | None) -> bytes:
     return value.encode("utf-8", errors="replace")
 
 
+COMMIT_OK = "committed"
+COMMIT_NOOP = "nothing_to_commit"
+COMMIT_FAILED = "commit_failed"
+
+
+@dataclass(frozen=True)
+class CommitOutcome:
+    """What the host-side workspace snapshot actually achieved.
+
+    ``failure_kind`` is only meaningful for :data:`COMMIT_FAILED`; it lets the
+    orchestrator tell a sandbox/permission problem it can retry apart from one
+    that needs a human (see ``utils.git_sandbox.classify_history_failure``).
+    """
+
+    status: str
+    detail: str = ""
+    failure_kind: str = UNKNOWN_FAILURE
+
+    @property
+    def durable(self) -> bool:
+        """Whether the workspace's work is safely in git history."""
+        return self.status in (COMMIT_OK, COMMIT_NOOP)
+
+
 async def commit_workspace_on_done(
     path: Path,
     *,
@@ -526,7 +556,7 @@ async def commit_workspace_on_done(
     exit_reason: str | None = None,
     state: str | None = None,
     timeout_s: float = 60.0,
-) -> None:
+) -> CommitOutcome:
     """Snapshot the per-ticket workspace into one git commit on worker exit.
 
     Always called before `WorkspaceManager.remove()` — the goal is that no
@@ -537,10 +567,12 @@ async def commit_workspace_on_done(
     cases so a quick `git log` makes the situation obvious.
 
     Lenient by design — every failure (missing path, no diffs, pre-commit
-    rejection, signing error, timeout) logs a warning and returns. We
-    never raise out of the worker exit path; a failed auto-commit is a
-    housekeeping miss surfaced by the warning, not a regression that
-    blocks the queue.
+    rejection, signing error, timeout) logs a warning and returns a
+    :class:`CommitOutcome` instead of raising. We never raise out of the
+    worker exit path; a failed auto-commit is a housekeeping miss surfaced
+    by the warning, not a regression that blocks the queue. Callers that
+    gate a state transition on durable history inspect the returned
+    outcome; callers that only want the snapshot can ignore it.
 
     Reuses any enclosing git repo (`git -C path rev-parse --git-dir`).
     Only initialises a new repo when the workspace has no git ancestor,
@@ -551,7 +583,7 @@ async def commit_workspace_on_done(
     """
     if not path.exists():
         log.info("auto_commit_skipped_missing_workspace", path=str(path))
-        return
+        return CommitOutcome(COMMIT_FAILED, detail=f"workspace missing: {path}")
 
     safe_title = (title or "").replace("\n", " ").strip()[:200] or "(no title)"
     normalized_state = (state or "").strip().lower()
@@ -660,7 +692,9 @@ async def commit_workspace_on_done(
         result = await asyncio.to_thread(_do_run)
     except subprocess.TimeoutExpired:
         log.warning("auto_commit_timeout", path=str(path), identifier=identifier)
-        return
+        return CommitOutcome(
+            COMMIT_FAILED, detail=f"auto-commit timed out after {timeout_s}s"
+        )
     except Exception as exc:
         log.warning(
             "auto_commit_spawn_failed",
@@ -668,7 +702,7 @@ async def commit_workspace_on_done(
             identifier=identifier,
             error=str(exc),
         )
-        return
+        return CommitOutcome(COMMIT_FAILED, detail=f"spawn failed: {exc}")
 
     rc = result.returncode or 0
     stdout = (result.stdout or b"").decode("utf-8", errors="replace")
@@ -680,7 +714,11 @@ async def commit_workspace_on_done(
             identifier=identifier,
             stdout=_truncate(stdout),
         )
-        return
+        # The script prints this and exits 0 when the tree was already clean
+        # and no commits sit above the recorded fork point.
+        if "auto_commit: nothing to commit" in stdout:
+            return CommitOutcome(COMMIT_NOOP, detail=stdout.strip())
+        return CommitOutcome(COMMIT_OK, detail=stdout.strip())
     log.warning(
         "auto_commit_failed",
         path=str(path),
@@ -688,6 +726,320 @@ async def commit_workspace_on_done(
         returncode=rc,
         stdout=_truncate(stdout),
         stderr=_truncate(stderr),
+    )
+    combined = f"{stdout}\n{stderr}".strip()
+    return CommitOutcome(
+        COMMIT_FAILED,
+        detail=combined,
+        failure_kind=classify_history_failure(combined),
+    )
+
+
+HISTORY_OK = "recorded"
+HISTORY_LOCAL_ONLY = "local_only"
+HISTORY_PUSH_FAILED = "push_failed"
+HISTORY_COMMIT_FAILED = "commit_failed"
+
+# Exit codes of `_PUSH_VERIFY_SCRIPT`, kept in one place so the mapping below
+# reads as a table rather than as scattered magic numbers.
+_PUSH_DETACHED = 10
+_PUSH_NO_UPSTREAM = 11
+_PUSH_REJECTED = 12
+_PUSH_SHA_MISMATCH = 13
+
+# Push only when the branch already has an upstream, exactly like the agent
+# prompt's Final History Gate did. A branch with no upstream is a deliberate
+# local-only ticket; creating a remote branch here would be Symphony making an
+# outward-facing decision the operator never asked for.
+_PUSH_VERIFY_SCRIPT = (
+    'set -u\n'
+    'BRANCH="$(git symbolic-ref --short HEAD 2>/dev/null || true)"\n'
+    'if [ -z "$BRANCH" ]; then echo "detached HEAD"; exit 10; fi\n'
+    'LOCAL_SHA="$(git rev-parse HEAD 2>/dev/null || true)"\n'
+    'printf "BRANCH=%s\\nLOCAL_SHA=%s\\n" "$BRANCH" "$LOCAL_SHA"\n'
+    'UPSTREAM="$(git rev-parse --abbrev-ref --symbolic-full-name '
+    "'@{u}' 2>/dev/null || true)\"\n"
+    'if [ -z "$UPSTREAM" ]; then echo "no upstream configured"; exit 11; fi\n'
+    'REMOTE="${UPSTREAM%%/*}"\n'
+    'git push "$REMOTE" "$BRANCH" || exit 12\n'
+    'REMOTE_SHA="$(git ls-remote "$REMOTE" "refs/heads/$BRANCH" '
+    "| awk '{print $1}')\"\n"
+    'printf "REMOTE_SHA=%s\\n" "$REMOTE_SHA"\n'
+    'if [ "$LOCAL_SHA" != "$REMOTE_SHA" ]; then exit 13; fi\n'
+)
+
+
+@dataclass(frozen=True)
+class HistoryGateResult:
+    """Outcome of the host-side Final History Gate.
+
+    The gate exists because the agent cannot be trusted to write git history:
+    it runs inside a sandbox whose writable roots may exclude the object
+    database (see ``utils.git_sandbox``), and a failed housekeeping commit
+    used to strand a finished ticket in ``Blocked``. The orchestrator runs
+    unsandboxed, so it can always record the delivery — and it maps the three
+    materially different outcomes onto three different ticket states.
+    """
+
+    status: str
+    detail: str = ""
+    branch: str = ""
+    local_sha: str = ""
+    remote_sha: str = ""
+    failure_kind: str = UNKNOWN_FAILURE
+
+    @property
+    def durable(self) -> bool:
+        """Work is in local git history and cannot be lost by a worktree prune."""
+        return self.status in (HISTORY_OK, HISTORY_LOCAL_ONLY, HISTORY_PUSH_FAILED)
+
+    @property
+    def retryable(self) -> bool:
+        """A wider-permission retry could plausibly succeed."""
+        return (
+            self.status == HISTORY_COMMIT_FAILED
+            and self.failure_kind == SANDBOX_WRITE_DENIED
+        )
+
+
+def _parse_push_fields(stdout: str) -> dict[str, str]:
+    fields: dict[str, str] = {}
+    for line in stdout.splitlines():
+        key, sep, value = line.partition("=")
+        if sep and key in ("BRANCH", "LOCAL_SHA", "REMOTE_SHA"):
+            fields[key] = value.strip()
+    return fields
+
+
+async def finalize_delivery_history(
+    path: Path,
+    *,
+    identifier: str,
+    title: str,
+    state: str | None = None,
+    push: bool = True,
+    timeout_s: float = 180.0,
+) -> HistoryGateResult:
+    """Record the ticket's final delivery from the host, then verify the remote.
+
+    Runs the same snapshot commit as :func:`commit_workspace_on_done` and, when
+    the branch has an upstream, pushes and re-reads the remote tip with
+    `git ls-remote` so a silently-refused push cannot pass as recorded.
+
+    Never raises: every failure becomes a :class:`HistoryGateResult` the
+    orchestrator turns into a ticket state.
+    """
+    commit = await commit_workspace_on_done(
+        path,
+        identifier=identifier,
+        title=title,
+        state=state,
+        timeout_s=timeout_s,
+    )
+    if not commit.durable:
+        return HistoryGateResult(
+            HISTORY_COMMIT_FAILED,
+            detail=commit.detail,
+            failure_kind=commit.failure_kind,
+        )
+    if not push:
+        return HistoryGateResult(HISTORY_LOCAL_ONLY, detail="push disabled")
+
+    def _do_push() -> subprocess.CompletedProcess[bytes]:
+        return subprocess.run(
+            [resolve_bash(), "-lc", _PUSH_VERIFY_SCRIPT],
+            cwd=str(path),
+            capture_output=True,
+            timeout=timeout_s if timeout_s > 0 else None,
+            env={**os.environ},
+            check=False,
+        )
+
+    try:
+        result = await asyncio.to_thread(_do_push)
+    except subprocess.TimeoutExpired:
+        log.warning("history_gate_push_timeout", path=str(path), identifier=identifier)
+        return HistoryGateResult(
+            HISTORY_PUSH_FAILED,
+            detail=f"push timed out after {timeout_s}s",
+            failure_kind=REMOTE_REJECTED,
+        )
+    except Exception as exc:
+        log.warning(
+            "history_gate_push_spawn_failed",
+            path=str(path),
+            identifier=identifier,
+            error=str(exc),
+        )
+        return HistoryGateResult(
+            HISTORY_PUSH_FAILED, detail=f"push spawn failed: {exc}"
+        )
+
+    rc = result.returncode or 0
+    stdout = (result.stdout or b"").decode("utf-8", errors="replace")
+    stderr = (result.stderr or b"").decode("utf-8", errors="replace")
+    fields = _parse_push_fields(stdout)
+    branch = fields.get("BRANCH", "")
+    local_sha = fields.get("LOCAL_SHA", "")
+    remote_sha = fields.get("REMOTE_SHA", "")
+    combined = f"{stdout}\n{stderr}".strip()
+
+    if rc == 0:
+        log.info(
+            "history_gate_recorded",
+            identifier=identifier,
+            branch=branch,
+            local_sha=local_sha,
+            remote_sha=remote_sha,
+        )
+        return HistoryGateResult(
+            HISTORY_OK,
+            detail=combined,
+            branch=branch,
+            local_sha=local_sha,
+            remote_sha=remote_sha,
+        )
+    if rc in (_PUSH_DETACHED, _PUSH_NO_UPSTREAM):
+        # Nothing to verify remotely — the commit is the whole delivery record.
+        log.info(
+            "history_gate_local_only",
+            identifier=identifier,
+            branch=branch,
+            local_sha=local_sha,
+            reason="detached" if rc == _PUSH_DETACHED else "no_upstream",
+        )
+        return HistoryGateResult(
+            HISTORY_LOCAL_ONLY,
+            detail=combined,
+            branch=branch,
+            local_sha=local_sha,
+        )
+    reason = (
+        "remote tip does not match the local commit"
+        if rc == _PUSH_SHA_MISMATCH
+        else "push was refused"
+    )
+    log.warning(
+        "history_gate_push_failed",
+        identifier=identifier,
+        branch=branch,
+        returncode=rc,
+        local_sha=local_sha,
+        remote_sha=remote_sha,
+        stderr=_truncate(stderr),
+    )
+    return HistoryGateResult(
+        HISTORY_PUSH_FAILED,
+        detail=f"{reason}\n{combined}".strip(),
+        branch=branch,
+        local_sha=local_sha,
+        remote_sha=remote_sha,
+        failure_kind=(
+            REMOTE_REJECTED if rc == _PUSH_REJECTED else classify_history_failure(combined)
+        ),
+    )
+
+
+_BRANCH_HISTORY_SCRIPT = (
+    'set -u\n'
+    'BRANCH="${SYMPHONY_HISTORY_BRANCH:?}"\n'
+    'LOCAL_SHA="$(git rev-parse --verify --quiet "${BRANCH}^{commit}" || true)"\n'
+    'if [ -z "$LOCAL_SHA" ]; then echo "branch not found: $BRANCH"; exit 20; fi\n'
+    'printf "BRANCH=%s\\nLOCAL_SHA=%s\\n" "$BRANCH" "$LOCAL_SHA"\n'
+    'UPSTREAM="$(git rev-parse --abbrev-ref --symbolic-full-name '
+    '"${BRANCH}@{u}" 2>/dev/null || true)"\n'
+    'if [ -z "$UPSTREAM" ]; then echo "no upstream configured"; exit 11; fi\n'
+    'REMOTE="${UPSTREAM%%/*}"\n'
+    'if [ "${SYMPHONY_HISTORY_PUSH:-1}" = "1" ]; then\n'
+    '  git push "$REMOTE" "$BRANCH" || exit 12\n'
+    'fi\n'
+    'REMOTE_SHA="$(git ls-remote "$REMOTE" "refs/heads/$BRANCH" '
+    "| awk '{print $1}')\"\n"
+    'printf "REMOTE_SHA=%s\\n" "$REMOTE_SHA"\n'
+    'if [ "$LOCAL_SHA" != "$REMOTE_SHA" ]; then exit 13; fi\n'
+)
+
+_BRANCH_MISSING = 20
+
+
+async def verify_branch_history(
+    repo_dir: Path,
+    *,
+    branch: str,
+    push: bool = True,
+    timeout_s: float = 180.0,
+) -> HistoryGateResult:
+    """Check (and optionally publish) a ticket branch's history from the host repo.
+
+    The workspace-scoped gate needs the worktree to still exist. This variant
+    reads the branch directly out of the host repo, so it still works after the
+    worktree has been pruned — which is the situation when a ticket was parked
+    in ``Blocked`` and its workspace was reaped on the way out.
+
+    Never raises; failures come back as a :class:`HistoryGateResult`.
+    """
+
+    def _run() -> subprocess.CompletedProcess[bytes]:
+        return subprocess.run(
+            [resolve_bash(), "-lc", _BRANCH_HISTORY_SCRIPT],
+            cwd=str(repo_dir),
+            capture_output=True,
+            timeout=timeout_s if timeout_s > 0 else None,
+            env={
+                **os.environ,
+                "SYMPHONY_HISTORY_BRANCH": branch,
+                "SYMPHONY_HISTORY_PUSH": "1" if push else "0",
+            },
+            check=False,
+        )
+
+    try:
+        result = await asyncio.to_thread(_run)
+    except subprocess.TimeoutExpired:
+        return HistoryGateResult(
+            HISTORY_PUSH_FAILED,
+            detail=f"branch history check timed out after {timeout_s}s",
+            branch=branch,
+        )
+    except Exception as exc:
+        return HistoryGateResult(
+            HISTORY_COMMIT_FAILED, detail=f"spawn failed: {exc}", branch=branch
+        )
+
+    rc = result.returncode or 0
+    stdout = (result.stdout or b"").decode("utf-8", errors="replace")
+    stderr = (result.stderr or b"").decode("utf-8", errors="replace")
+    fields = _parse_push_fields(stdout)
+    local_sha = fields.get("LOCAL_SHA", "")
+    remote_sha = fields.get("REMOTE_SHA", "")
+    combined = f"{stdout}\n{stderr}".strip()
+
+    if rc == 0:
+        return HistoryGateResult(
+            HISTORY_OK,
+            detail=combined,
+            branch=branch,
+            local_sha=local_sha,
+            remote_sha=remote_sha,
+        )
+    if rc == _BRANCH_MISSING:
+        # No branch means no delivery record at all — not a permissions issue.
+        return HistoryGateResult(
+            HISTORY_COMMIT_FAILED, detail=combined, branch=branch
+        )
+    if rc == _PUSH_NO_UPSTREAM:
+        return HistoryGateResult(
+            HISTORY_LOCAL_ONLY, detail=combined, branch=branch, local_sha=local_sha
+        )
+    return HistoryGateResult(
+        HISTORY_PUSH_FAILED,
+        detail=combined,
+        branch=branch,
+        local_sha=local_sha,
+        remote_sha=remote_sha,
+        failure_kind=(
+            REMOTE_REJECTED if rc == _PUSH_REJECTED else classify_history_failure(combined)
+        ),
     )
 
 
