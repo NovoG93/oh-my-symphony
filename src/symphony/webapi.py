@@ -32,6 +32,7 @@ from .logging import get_logger
 from .skills import normalize_skill_names
 from .stats import StatsStore, stats_store_for
 from .trackers.file import FileBoardTracker, parse_ticket_file
+from .utils import git_inspect
 from .orchestrator import Orchestrator
 from .orchestrator.run_registry import clamp_run_history_limit
 from .workflow import SUPPORTED_AGENT_KINDS, ServiceConfig
@@ -300,6 +301,15 @@ def _check_identifier(raw: str) -> str:
             "identifier must match ^[A-Za-z][A-Za-z0-9_-]{0,63}$"
         )
     return identifier
+
+
+def _check_branch(raw: Any, *, key: str = "branch") -> str:
+    if not isinstance(raw, str) or not raw.strip():
+        raise WorkflowMutationError(f"{key} is required")
+    branch = raw.strip()
+    if not _BRANCH_RE.match(branch):
+        raise WorkflowMutationError(f"invalid branch name {branch!r}")
+    return branch
 
 
 def _check_title(raw: Any) -> str:
@@ -824,26 +834,6 @@ def _register_workflow_routes(
     ) -> web.Response:
         return web.json_response(orchestrator.continuous_improvement_status())
 
-    async def handle_git_branches(_request: web.Request) -> web.Response:
-        import subprocess
-
-        def _branches() -> list[str]:
-            try:
-                proc = subprocess.run(
-                    ["git", "branch", "--format=%(refname:short)"],
-                    cwd=ctx.workflow_dir(),
-                    capture_output=True,
-                    text=True,
-                    timeout=10,
-                )
-            except (OSError, subprocess.TimeoutExpired):
-                return []
-            if proc.returncode != 0:
-                return []
-            return [b.strip() for b in proc.stdout.splitlines() if b.strip()]
-
-        return web.json_response({"branches": await asyncio.to_thread(_branches)})
-
     app.router.add_get("/api/v1/workflow", _wrap(handle_workflow_get))
     app.router.add_put("/api/v1/workflow/states", _wrap(handle_states_put))
     app.router.add_get("/api/v1/workflow/prompts/{state}", _wrap(handle_prompt_get))
@@ -861,7 +851,133 @@ def _register_workflow_routes(
         "/api/v1/continuous-improvement/status",
         _wrap(handle_continuous_improvement_status),
     )
+
+
+# ---------------------------------------------------------------------------
+# routes: git (host-repo history, task branches, manual merge)
+# ---------------------------------------------------------------------------
+
+
+def _register_git_routes(
+    app: web.Application, ctx: _Ctx, orchestrator: Orchestrator
+) -> None:
+    def _effective_target(cfg: ServiceConfig, workflow_dir: Path) -> str | None:
+        return cfg.agent.auto_merge_target_branch or git_inspect.current_branch(
+            workflow_dir
+        )
+
+    async def handle_git_branches(_request: web.Request) -> web.Response:
+        branches = await asyncio.to_thread(
+            git_inspect.list_branches, ctx.workflow_dir()
+        )
+        return web.json_response({"branches": branches})
+
+    async def handle_git_log(request: web.Request) -> web.Response:
+        raw_branch = (request.query.get("branch") or "").strip()
+        branch = _check_branch(raw_branch) if raw_branch else ""
+        raw_limit = (request.query.get("limit") or "").strip()
+        limit = git_inspect.DEFAULT_LOG_LIMIT
+        if raw_limit:
+            try:
+                limit = int(raw_limit)
+            except ValueError:
+                return _json_error(400, "invalid_limit", "limit must be an integer")
+        workflow_dir = ctx.workflow_dir()
+
+        def _load() -> tuple[str | None, list[dict[str, object]] | None]:
+            if not git_inspect.is_git_repo(workflow_dir):
+                return "not_a_git_repo", []
+            if branch and not git_inspect.ref_exists(workflow_dir, branch):
+                return None, None
+            return None, git_inspect.commit_log(
+                workflow_dir, ref=branch or None, limit=limit
+            )
+
+        note, commits = await asyncio.to_thread(_load)
+        if commits is None:
+            return _json_error(400, "unknown_ref", f"unknown ref {branch!r}")
+        return web.json_response(
+            {"branch": branch or None, "commits": commits, "note": note}
+        )
+
+    async def handle_git_task_branches(_request: web.Request) -> web.Response:
+        cfg = ctx.config()
+        workflow_dir = cfg.workflow_path.parent
+
+        def _load() -> tuple[str | None, list[dict[str, object]], str | None]:
+            if not git_inspect.is_git_repo(workflow_dir):
+                return None, [], "not_a_git_repo"
+            target = _effective_target(cfg, workflow_dir)
+            return target, git_inspect.list_task_branches(workflow_dir, target), None
+
+        target, rows, note = await asyncio.to_thread(_load)
+        tickets: dict[str, Issue] = {}
+        if rows and cfg.tracker.kind == "file":
+            try:
+                issues = await asyncio.to_thread(
+                    ctx.file_tracker().fetch_issues_by_states,
+                    [*cfg.tracker.active_states, *cfg.tracker.terminal_states],
+                )
+                tickets = {i.identifier: i for i in issues}
+            except Exception as exc:
+                # Ticket enrichment is best-effort; the git view stays useful.
+                log.warning("git_task_branches_ticket_lookup_failed", error=str(exc))
+        for row in rows:
+            identifier = str(row["identifier"])
+            issue = tickets.get(identifier)
+            row["ticket"] = (
+                {
+                    "identifier": issue.identifier,
+                    "title": issue.title,
+                    "state": issue.state,
+                }
+                if issue is not None
+                else None
+            )
+            row["running"] = (
+                orchestrator.find_running_issue_id(identifier) is not None
+            )
+        return web.json_response(
+            {
+                "target_branch": target,
+                "auto_merge_enabled": cfg.agent.auto_merge_on_done,
+                "branches": rows,
+                "note": note,
+            }
+        )
+
+    async def handle_git_compare(request: web.Request) -> web.Response:
+        branch = _check_branch(request.query.get("branch"))
+        raw_target = (request.query.get("target") or "").strip()
+        target = _check_branch(raw_target, key="target") if raw_target else None
+        cfg = ctx.config()
+        workflow_dir = cfg.workflow_path.parent
+
+        def _load() -> tuple[str, str, None] | tuple[None, None, dict[str, object]]:
+            if not git_inspect.is_git_repo(workflow_dir):
+                return "not_a_git_repo", "workflow dir is not a git repository", None
+            resolved = target or _effective_target(cfg, workflow_dir)
+            if not resolved:
+                return (
+                    "no_target",
+                    "no target branch; set auto_merge_target_branch or pass target",
+                    None,
+                )
+            for ref in (branch, resolved):
+                if not git_inspect.ref_exists(workflow_dir, ref):
+                    return "unknown_ref", f"unknown ref {ref!r}", None
+            return None, None, git_inspect.compare_refs(workflow_dir, branch, resolved)
+
+        code, message, payload = await asyncio.to_thread(_load)
+        if payload is None:
+            assert code is not None and message is not None
+            return _json_error(400, code, message)
+        return web.json_response(payload)
+
     app.router.add_get("/api/v1/git/branches", _wrap(handle_git_branches))
+    app.router.add_get("/api/v1/git/log", _wrap(handle_git_log))
+    app.router.add_get("/api/v1/git/task-branches", _wrap(handle_git_task_branches))
+    app.router.add_get("/api/v1/git/compare", _wrap(handle_git_compare))
 
 
 # ---------------------------------------------------------------------------
@@ -913,4 +1029,5 @@ def register_web_routes(app: web.Application, orchestrator: Orchestrator) -> Non
     app.middlewares.append(_api_guard)
     _register_issue_routes(app, ctx, orchestrator)
     _register_workflow_routes(app, ctx, orchestrator)
+    _register_git_routes(app, ctx, orchestrator)
     _register_meta_routes(app, ctx, orchestrator)
