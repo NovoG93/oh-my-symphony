@@ -23,6 +23,7 @@ _LOG_FORMAT = f"%H{_SEP}%h{_SEP}%an{_SEP}%aI{_SEP}%D{_SEP}%s"
 MAX_LOG_LIMIT = 200
 DEFAULT_LOG_LIMIT = 50
 COMPARE_COMMIT_CAP = 100
+MAX_PATCH_CHARS = 200_000
 
 
 def _run_git(
@@ -231,6 +232,30 @@ def _numstat(workflow_dir: Path, branch: str, target: str) -> dict[str, object]:
             "deletions": deletions,
         },
     }
+
+
+def _capped_patch(proc: subprocess.CompletedProcess[str] | None) -> dict[str, object]:
+    if proc is None or proc.returncode != 0:
+        return {"patch": "", "truncated": False}
+    patch = proc.stdout
+    if len(patch) > MAX_PATCH_CHARS:
+        return {"patch": patch[:MAX_PATCH_CHARS], "truncated": True}
+    return {"patch": patch, "truncated": False}
+
+
+def diff_patch(
+    workflow_dir: Path, branch: str, target: str, path: str | None = None
+) -> dict[str, object]:
+    """Unified diff a merge of `branch` into `target` would apply (three-dot)."""
+    args = ["diff", "--no-color", f"{target}...{branch}"]
+    if path:
+        args += ["--", path]
+    return _capped_patch(_run_git(workflow_dir, *args))
+
+
+def commit_patch(workflow_dir: Path, ref: str) -> dict[str, object]:
+    """Full `git show` output (header + patch) for one commit."""
+    return _capped_patch(_run_git(workflow_dir, "show", "--no-color", ref))
 
 
 def compare_refs(

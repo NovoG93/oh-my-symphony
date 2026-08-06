@@ -162,3 +162,28 @@ def test_compare_refs_flags_binary_files(tmp_path: Path) -> None:
     binary_rows = [f for f in result["stat"]["files"] if f["binary"]]
     assert [f["path"] for f in binary_rows] == ["blob.bin"]
     assert binary_rows[0]["insertions"] == 0
+
+
+def test_diff_patch_and_commit_patch(tmp_path: Path) -> None:
+    repo = _make_repo(tmp_path)
+    _make_task_branch(repo, "T-1")
+
+    diff = git_inspect.diff_patch(repo, "symphony/T-1", "main")
+    assert "diff --git a/T-1.py b/T-1.py" in diff["patch"]
+    assert "+print('hi')" in diff["patch"]
+    assert diff["truncated"] is False
+
+    scoped = git_inspect.diff_patch(repo, "symphony/T-1", "main", path="README.md")
+    assert scoped["patch"] == ""
+
+    entries = git_inspect.commit_log(repo, ref="symphony/T-1", limit=1)
+    shown = git_inspect.commit_patch(repo, str(entries[0]["sha"]))
+    assert "T-1: feature" in shown["patch"]
+    assert "+print('hi')" in shown["patch"]
+
+
+def test_diff_patch_degrades_outside_repo(tmp_path: Path) -> None:
+    plain = tmp_path / "plain"
+    plain.mkdir()
+    assert git_inspect.diff_patch(plain, "a", "b") == {"patch": "", "truncated": False}
+    assert git_inspect.commit_patch(plain, "abcd") == {"patch": "", "truncated": False}
