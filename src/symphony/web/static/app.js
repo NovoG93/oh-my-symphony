@@ -93,6 +93,11 @@
       return apiRequest(`/git/diff?${params.toString()}`);
     },
     postGitMerge: (payload) => apiRequest('/git/merge', { method: 'POST', body: JSON.stringify(payload) }),
+    getChatSession: () => apiRequest('/chat/session'),
+    createChatSession: (payload) => apiRequest('/chat/session', { method: 'POST', body: JSON.stringify(payload) }),
+    patchChatSession: (payload) => apiRequest('/chat/session', { method: 'PATCH', body: JSON.stringify(payload) }),
+    deleteChatSession: () => apiRequest('/chat/session', { method: 'DELETE' }),
+    postChatMessage: (payload) => apiRequest('/chat/message', { method: 'POST', body: JSON.stringify(payload) }),
     getStats: (days) => apiRequest(`/stats?days=${encodeURIComponent(days)}`),
     pause: (id) => apiRequest(`/${encodeURIComponent(id)}/pause`, { method: 'POST' }),
     resume: (id) => apiRequest(`/${encodeURIComponent(id)}/resume`, { method: 'POST' }),
@@ -105,7 +110,7 @@
   // State store
   // ------------------------------------------------------------------
 
-  const ROUTES = ['board', 'stats', 'workflow', 'git', 'settings'];
+  const ROUTES = ['board', 'stats', 'workflow', 'git', 'chat', 'settings'];
 
   const PRIORITY_META = {
     0: { label: 'Urgent', short: 'P0', className: 'p0' },
@@ -720,6 +725,7 @@
     closeModal();
     closeAnyMenu();
     closeDrawer();
+    closeChatSocket();
     switch (state.route) {
       case 'board':
         renderBoardPage(view);
@@ -732,6 +738,9 @@
         break;
       case 'git':
         renderGitPage(view);
+        break;
+      case 'chat':
+        renderChatPage(view);
         break;
       case 'settings':
         renderSettingsPage(view);
@@ -2017,6 +2026,226 @@
     if (line.startsWith('+')) return 'diff-add';
     if (line.startsWith('-')) return 'diff-del';
     return 'diff-ctx';
+  }
+
+  // ------------------------------------------------------------------
+  // Page: Chat
+  // ------------------------------------------------------------------
+
+  const chatState = { snapshot: null, busy: false, socket: null, reconnectDelay: 1000, seqSeen: 0 };
+
+  function closeChatSocket() {
+    if (chatState.socket) {
+      const socket = chatState.socket;
+      chatState.socket = null;
+      socket.onclose = null;
+      socket.close();
+    }
+  }
+
+  function renderChatPage(container) {
+    const page = el('div', { class: 'page page-chat' });
+    const controls = el('div', { class: 'chat-controls' });
+    page.appendChild(el('div', { class: 'topbar' }, [el('h1', { class: 'page-title' }, 'Chat'), controls]));
+    const transcript = el('div', { class: 'chat-transcript' });
+    const typing = el('div', { class: 'chat-typing', style: 'display:none;' }, 'Agent is working…');
+    const input = el('textarea', {
+      class: 'textarea chat-input',
+      rows: 2,
+      placeholder: 'Ask about this repository… (Enter to send, Shift+Enter for newline)',
+    });
+    const sendBtn = el('button', { class: 'btn btn-primary', onClick: () => sendChatMessage(view) }, 'Send');
+    input.addEventListener('keydown', (e) => {
+      if (e.key === 'Enter' && !e.shiftKey) {
+        e.preventDefault();
+        sendChatMessage(view);
+      }
+    });
+    page.appendChild(el('div', { class: 'chat-body' }, [
+      transcript,
+      typing,
+      el('div', { class: 'chat-composer' }, [input, sendBtn]),
+    ]));
+    container.appendChild(page);
+    const view = { controls, transcript, typing, input, sendBtn };
+    connectChatSocket(view);
+  }
+
+  async function sendChatMessage(view) {
+    const text = view.input.value.trim();
+    if (!text) return;
+    try {
+      await api.postChatMessage({ text });
+      view.input.value = '';
+    } catch (err) {
+      showToast(err.message, 'error');
+    }
+  }
+
+  function updateChatComposer(view) {
+    const snap = chatState.snapshot || { active: false };
+    const disabled = !snap.active || chatState.busy;
+    view.input.disabled = disabled;
+    view.sendBtn.disabled = disabled;
+  }
+
+  function renderChatControls(view) {
+    clearNode(view.controls);
+    const snap = chatState.snapshot || { active: false };
+    if (!snap.active) {
+      const modeSelect = el('select', { class: 'select' }, [
+        el('option', { value: 'qa' }, 'Q&A (read-only)'),
+        el('option', { value: 'edit' }, 'Edit (co-working)'),
+      ]);
+      const startBtn = el('button', {
+        class: 'btn btn-primary',
+        onClick: async (e) => {
+          e.target.disabled = true;
+          try {
+            await api.createChatSession({ mode: modeSelect.value });
+            await refreshChatControls(view);
+          } catch (err) {
+            showToast(err.message, 'error');
+          } finally {
+            e.target.disabled = false;
+          }
+        },
+      }, 'Start session');
+      view.controls.appendChild(modeSelect);
+      view.controls.appendChild(startBtn);
+      return;
+    }
+    view.controls.appendChild(el('span', { class: 'chip-label' }, snap.agent_kind));
+    if (!snap.mode_enforced) {
+      view.controls.appendChild(el('span', { class: 'chat-mode-warning' }, 'read-only not enforced'));
+    }
+    const toggle = el('div', { class: 'chat-mode-toggle' }, ['qa', 'edit'].map((mode) => el('button', {
+      class: `chat-mode-btn${snap.mode === mode ? ' active' : ''}`,
+      onClick: async () => {
+        if (snap.mode === mode) return;
+        try {
+          const result = await api.patchChatSession({ mode });
+          if (!result.context_preserved) showToast('Conversation context was reset for the new mode', 'info');
+          await refreshChatControls(view);
+        } catch (err) {
+          showToast(err.message, 'error');
+        }
+      },
+    }, mode === 'qa' ? 'Q&A' : 'Edit')));
+    view.controls.appendChild(toggle);
+    view.controls.appendChild(el('button', {
+      class: 'btn btn-ghost',
+      onClick: async () => {
+        try {
+          await api.deleteChatSession();
+          await refreshChatControls(view);
+        } catch (err) {
+          showToast(err.message, 'error');
+        }
+      },
+    }, 'Stop'));
+  }
+
+  async function refreshChatControls(view) {
+    try {
+      const snap = await api.getChatSession();
+      chatState.snapshot = snap;
+      chatState.busy = Boolean(snap.busy);
+    } catch (_err) {
+      chatState.snapshot = { active: false };
+    }
+    renderChatControls(view);
+    updateChatComposer(view);
+  }
+
+  function applyChatSnapshot(view, snapshot) {
+    chatState.snapshot = snapshot;
+    chatState.busy = Boolean(snapshot.busy);
+    chatState.seqSeen = 0;
+    renderChatControls(view);
+    clearNode(view.transcript);
+    const tail = snapshot.transcript_tail || [];
+    for (const msg of tail) appendChatMessage(view, msg);
+    if (!snapshot.active && !tail.length) {
+      view.transcript.appendChild(el('div', { class: 'empty-state' }, 'Start a session to chat with the connected agent about this repository.'));
+    }
+    updateChatComposer(view);
+  }
+
+  function appendChatMessage(view, msg) {
+    if (msg.seq != null) {
+      if (msg.seq <= chatState.seqSeen) return;
+      chatState.seqSeen = msg.seq;
+    }
+    if (msg.type === 'user_message') {
+      chatState.busy = true;
+      updateChatComposer(view);
+    } else if (msg.type === 'turn_started') {
+      view.typing.style.display = '';
+    } else if (msg.type === 'turn_completed' || msg.type === 'turn_failed') {
+      view.typing.style.display = 'none';
+      chatState.busy = false;
+      updateChatComposer(view);
+    } else if (msg.type === 'session_status') {
+      refreshChatControls(view);
+    }
+    const node = buildChatMessageNode(msg);
+    if (node) {
+      view.transcript.appendChild(node);
+      view.transcript.scrollTop = view.transcript.scrollHeight;
+    }
+  }
+
+  function buildChatMessageNode(msg) {
+    switch (msg.type) {
+      case 'user_message':
+        return el('div', { class: 'chat-msg chat-user' }, [el('div', { class: 'chat-bubble' }, msg.text)]);
+      case 'agent_message': {
+        const bubble = el('div', { class: 'chat-bubble' });
+        bubble.appendChild(renderMarkdown(msg.text));
+        return el('div', { class: 'chat-msg chat-agent' }, [bubble]);
+      }
+      case 'tool_activity': {
+        const detail = msg.meta && msg.meta.detail;
+        return el('div', { class: 'chat-tool' }, [
+          el('span', { class: 'chat-tool-name' }, msg.text),
+          detail ? el('span', { class: 'chat-tool-detail' }, detail) : null,
+        ]);
+      }
+      case 'turn_failed':
+        return el('div', { class: 'chat-msg chat-error' }, msg.text || 'turn failed');
+      case 'session_status':
+        return msg.text ? el('div', { class: 'chat-status' }, msg.text) : null;
+      default:
+        return null;
+    }
+  }
+
+  function connectChatSocket(view) {
+    closeChatSocket();
+    const proto = location.protocol === 'https:' ? 'wss' : 'ws';
+    const socket = new WebSocket(`${proto}://${location.host}/api/v1/chat/ws`);
+    chatState.socket = socket;
+    socket.onopen = () => { chatState.reconnectDelay = 1000; };
+    socket.onmessage = (event) => {
+      let frame = null;
+      try {
+        frame = JSON.parse(event.data);
+      } catch (_err) {
+        return;
+      }
+      if (frame.type === 'hello') applyChatSnapshot(view, frame.snapshot || { active: false });
+      else appendChatMessage(view, frame);
+    };
+    socket.onclose = () => {
+      if (chatState.socket !== socket) return;
+      chatState.socket = null;
+      const delay = chatState.reconnectDelay;
+      chatState.reconnectDelay = Math.min(delay * 2, 10000);
+      setTimeout(() => {
+        if (state.route === 'chat' && !chatState.socket) connectChatSocket(view);
+      }, delay);
+    };
   }
 
   // ------------------------------------------------------------------
