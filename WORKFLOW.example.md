@@ -255,14 +255,14 @@ codex:
   thread_sandbox: workspace-write
   turn_sandbox_policy: {type: workspaceWrite, networkAccess: true}
   turn_timeout_ms: 3600000
-  read_timeout_ms: 5000
+  read_timeout_ms: 20000
   stall_timeout_ms: 300000
 
 claude:
   command: claude -p --output-format stream-json --verbose
   resume_across_turns: true
   turn_timeout_ms: 3600000
-  read_timeout_ms: 5000
+  read_timeout_ms: 20000
   stall_timeout_ms: 300000
 
 gemini:
@@ -272,7 +272,7 @@ gemini:
   command: 'gemini -p ""'
   resume_across_turns: true
   turn_timeout_ms: 3600000
-  read_timeout_ms: 5000
+  read_timeout_ms: 20000
   stall_timeout_ms: 300000
 
 agy:
@@ -283,7 +283,7 @@ agy:
   command: agy --print -
   resume_across_turns: true
   turn_timeout_ms: 3600000
-  read_timeout_ms: 5000
+  read_timeout_ms: 20000
   stall_timeout_ms: 300000
 
 kiro:
@@ -294,7 +294,7 @@ kiro:
   command: 'kiro-cli chat --no-interactive --trust-all-tools "$(cat)"'
   resume_across_turns: true
   turn_timeout_ms: 3600000
-  read_timeout_ms: 5000
+  read_timeout_ms: 20000
   stall_timeout_ms: 300000
 
 opencode:
@@ -304,7 +304,7 @@ opencode:
   command: opencode run --format json --auto
   resume_across_turns: true
   turn_timeout_ms: 3600000
-  read_timeout_ms: 5000
+  read_timeout_ms: 20000
   stall_timeout_ms: 300000
 
 pi:
@@ -316,7 +316,7 @@ pi:
   command: 'pi --mode json -p ""'
   resume_across_turns: true
   turn_timeout_ms: 3600000
-  read_timeout_ms: 5000
+  read_timeout_ms: 20000
   stall_timeout_ms: 300000
 
 server:
