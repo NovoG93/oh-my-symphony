@@ -1149,8 +1149,12 @@ def _register_git_routes(
 _WS_ALLOWED_ORIGIN_HOSTS = {"localhost", "127.0.0.1", "::1", "[::1]"}
 
 
-def _register_chat_routes(app: web.Application, ctx: _Ctx) -> None:
-    manager = ChatManager(ctx.config)
+def _register_chat_routes(
+    app: web.Application, ctx: _Ctx, orchestrator: Orchestrator
+) -> None:
+    # request_refresh lets board tickets the chat agent files in edit mode
+    # dispatch on the next tick instead of waiting out the poll interval.
+    manager = ChatManager(ctx.config, request_refresh=orchestrator.request_refresh)
     app[CHAT_MANAGER_KEY] = manager
     websockets: set[web.WebSocketResponse] = set()
 
@@ -1329,5 +1333,5 @@ def register_web_routes(app: web.Application, orchestrator: Orchestrator) -> Non
     _register_issue_routes(app, ctx, orchestrator)
     _register_workflow_routes(app, ctx, orchestrator)
     _register_git_routes(app, ctx, orchestrator)
-    _register_chat_routes(app, ctx)
+    _register_chat_routes(app, ctx, orchestrator)
     _register_meta_routes(app, ctx, orchestrator)
