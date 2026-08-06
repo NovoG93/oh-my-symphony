@@ -43,7 +43,10 @@ DEFAULT_MAX_RETRY_BACKOFF_MS = 300_000
 DEFAULT_AUTO_RECOVER_BLOCKED = True
 DEFAULT_CODEX_COMMAND = "codex app-server"
 DEFAULT_CODEX_TURN_TIMEOUT_MS = 3_600_000
-DEFAULT_CODEX_READ_TIMEOUT_MS = 5_000
+# Codex `thread/start` sync responses have been measured at ~4.9 s under
+# load, so a 5 s read budget intermittently timed out session creation.
+# 20 s keeps startup hangs detectable while clearing that latency band.
+DEFAULT_CODEX_READ_TIMEOUT_MS = 20_000
 DEFAULT_CODEX_STALL_TIMEOUT_MS = 300_000
 DEFAULT_CODEX_MODEL = "gpt-5.5"
 DEFAULT_CODEX_REASONING_EFFORT = "high"
@@ -88,7 +91,9 @@ DEFAULT_PI_COMMAND = 'pi --mode json -p ""'
 # non-interactive tool permission flow under the user's configured policy.
 DEFAULT_OPENCODE_COMMAND = "opencode run --format json --auto"
 DEFAULT_BACKEND_TURN_TIMEOUT_MS = 3_600_000
-DEFAULT_BACKEND_READ_TIMEOUT_MS = 5_000
+# Matches DEFAULT_CODEX_READ_TIMEOUT_MS: 5 s sat inside the observed
+# startup-response latency band and caused intermittent timeouts.
+DEFAULT_BACKEND_READ_TIMEOUT_MS = 20_000
 DEFAULT_BACKEND_STALL_TIMEOUT_MS = 300_000
 
 DEFAULT_AUTO_MERGE_EXCLUDE_PATHS: tuple[str, ...] = ()

@@ -286,7 +286,7 @@ claude:
   command: 'claude -p --output-format stream-json --verbose --permission-mode acceptEdits --add-dir "$SYMPHONY_WORKFLOW_DIR"'
   resume_across_turns: true
   turn_timeout_ms: 3600000
-  read_timeout_ms: 5000
+  read_timeout_ms: 20000
   stall_timeout_ms: 300000
 
 codex:
@@ -317,7 +317,7 @@ opencode:
   command: opencode run --format json --auto
   resume_across_turns: true
   turn_timeout_ms: 3600000
-  read_timeout_ms: 5000
+  read_timeout_ms: 20000
   stall_timeout_ms: 300000
 
 pi:

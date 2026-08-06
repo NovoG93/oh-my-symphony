@@ -73,7 +73,7 @@ claude:
   command: 'claude -p --output-format stream-json --verbose --permission-mode acceptEdits --add-dir "$SYMPHONY_WORKFLOW_DIR/kanban_smoke"'
   resume_across_turns: true
   turn_timeout_ms: 600000
-  read_timeout_ms: 5000
+  read_timeout_ms: 20000
   stall_timeout_ms: 300000
 
 server:
