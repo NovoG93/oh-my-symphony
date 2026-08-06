@@ -6,8 +6,24 @@ from pathlib import Path
 STATIC_ROOT = Path("src/symphony/web/static")
 
 
+def _script_bundle() -> str:
+    """Every script the board ships, concatenated.
+
+    These are contract tests over what reaches the browser, not over one
+    file's contents. The en/ko i18n split moved user-facing copy out of
+    `app.js` into the `i18n.js` catalogue while the wiring stayed put, so
+    reading `app.js` alone started failing on strings the UI still shows.
+    Reading the bundle keeps both kinds of assertion — code structure and
+    the copy it renders — meaningful wherever the refactor puts them.
+    """
+    return "\n".join(
+        (STATIC_ROOT / name).read_text(encoding="utf-8")
+        for name in ("app.js", "i18n.js")
+    )
+
+
 def test_web_board_defaults_to_active_lanes_with_terminal_group() -> None:
-    js = (STATIC_ROOT / "app.js").read_text(encoding="utf-8")
+    js = _script_bundle()
     css = (STATIC_ROOT / "style.css").read_text(encoding="utf-8")
 
     assert "boardScope: 'active'" in js
@@ -38,7 +54,11 @@ def test_web_board_defaults_to_active_lanes_with_terminal_group() -> None:
     assert "function buildMobileLaneTabs(columns)" in js
     assert "function isMobileBoardViewport()" in js
     assert "Review and parked" in js
-    assert "'aria-label': 'Terminal states'" in js
+    # Screen readers must still hear "Terminal states"; after the i18n split
+    # the label is a catalogue lookup, so assert the wiring and the copy it
+    # resolves to rather than the old inline literal.
+    assert "'aria-label': t('board.terminalStates')" in js
+    assert "'board.terminalStates': 'Terminal states'" in js
     assert ".terminal-section" in css
     assert ".terminal-group" in css
     assert ".terminal-card-list" in css
@@ -53,7 +73,7 @@ def test_web_board_defaults_to_active_lanes_with_terminal_group() -> None:
 
 
 def test_web_git_page_contract() -> None:
-    js = (STATIC_ROOT / "app.js").read_text(encoding="utf-8")
+    js = _script_bundle()
     css = (STATIC_ROOT / "style.css").read_text(encoding="utf-8")
     html = (STATIC_ROOT / "index.html").read_text(encoding="utf-8")
 
@@ -80,7 +100,7 @@ def test_web_git_page_contract() -> None:
 
 
 def test_web_git_diff_panel_contract() -> None:
-    js = (STATIC_ROOT / "app.js").read_text(encoding="utf-8")
+    js = _script_bundle()
     css = (STATIC_ROOT / "style.css").read_text(encoding="utf-8")
 
     assert "getGitDiff: ({ branch, target, path, commit } = {})" in js
@@ -99,7 +119,7 @@ def test_web_git_diff_panel_contract() -> None:
 
 
 def test_web_git_branch_actions_contract() -> None:
-    js = (STATIC_ROOT / "app.js").read_text(encoding="utf-8")
+    js = _script_bundle()
     css = (STATIC_ROOT / "style.css").read_text(encoding="utf-8")
 
     assert "getGitRemoteStatus: () => apiRequest('/git/remote-status')" in js
@@ -118,7 +138,7 @@ def test_web_git_branch_actions_contract() -> None:
 
 
 def test_web_chat_page_contract() -> None:
-    js = (STATIC_ROOT / "app.js").read_text(encoding="utf-8")
+    js = _script_bundle()
     css = (STATIC_ROOT / "style.css").read_text(encoding="utf-8")
     html = (STATIC_ROOT / "index.html").read_text(encoding="utf-8")
 
@@ -142,7 +162,7 @@ def test_web_chat_page_contract() -> None:
 
 
 def test_web_chat_token_streaming_contract() -> None:
-    js = (STATIC_ROOT / "app.js").read_text(encoding="utf-8")
+    js = _script_bundle()
     css = (STATIC_ROOT / "style.css").read_text(encoding="utf-8")
 
     assert "function appendChatDelta(view, text)" in js
@@ -155,7 +175,7 @@ def test_web_chat_token_streaming_contract() -> None:
 
 
 def test_web_chat_multi_session_contract() -> None:
-    js = (STATIC_ROOT / "app.js").read_text(encoding="utf-8")
+    js = _script_bundle()
     css = (STATIC_ROOT / "style.css").read_text(encoding="utf-8")
 
     assert "getChatSessions: () => apiRequest('/chat/sessions')" in js
@@ -177,7 +197,7 @@ def test_web_chat_multi_session_contract() -> None:
 
 
 def test_web_chat_budget_contract() -> None:
-    js = (STATIC_ROOT / "app.js").read_text(encoding="utf-8")
+    js = _script_bundle()
     css = (STATIC_ROOT / "style.css").read_text(encoding="utf-8")
 
     assert "function buildChatBudgetChip(budget)" in js
@@ -188,7 +208,7 @@ def test_web_chat_budget_contract() -> None:
 
 
 def test_web_chat_font_controls_contract() -> None:
-    js = (STATIC_ROOT / "app.js").read_text(encoding="utf-8")
+    js = _script_bundle()
     css = (STATIC_ROOT / "style.css").read_text(encoding="utf-8")
 
     assert "const CHAT_FONT_KEY = 'symphony.chatFontSize'" in js
