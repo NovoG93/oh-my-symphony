@@ -20,6 +20,7 @@ from symphony.backends import (
 from symphony.chat import (
     ChatManager,
     _claude_command_for_mode,
+    _summarize_claude_frame,
     cfg_for_mode,
 )
 from symphony.errors import (
@@ -157,10 +158,12 @@ def fake_backends(monkeypatch: pytest.MonkeyPatch) -> list[_FakeBackend]:
     return built
 
 
-async def _wait_turn(manager: ChatManager) -> None:
-    task = manager._turn_task
-    assert task is not None
-    await task
+async def _wait_turn(manager: ChatManager, session_id: str | None = None) -> None:
+    session = (
+        manager.active_session if session_id is None else manager.session(session_id)
+    )
+    assert session is not None and session.turn_task is not None
+    await session.turn_task
 
 
 # ---------------------------------------------------------------------------
@@ -168,7 +171,7 @@ async def _wait_turn(manager: ChatManager) -> None:
 # ---------------------------------------------------------------------------
 
 
-async def test_start_session_rejects_duplicates_and_stop_clears(
+async def test_start_session_caps_at_max_and_stop_clears(
     tmp_path: Path, fake_backends: list[_FakeBackend]
 ) -> None:
     cfg = _cfg(tmp_path)
@@ -179,12 +182,20 @@ async def test_start_session_rejects_duplicates_and_stop_clears(
     assert snapshot["agent_kind"] == "claude"
     assert snapshot["mode_enforced"] is True
 
+    for _ in range(chat_module.MAX_SESSIONS - 1):
+        await manager.start_session("qa")
+    assert manager.live_count == chat_module.MAX_SESSIONS
     with pytest.raises(ChatSessionExistsError):
         await manager.start_session("qa")
 
+    # Stopping one frees a slot; the newest live session becomes active.
     await manager.stop_session()
+    assert manager.live_count == chat_module.MAX_SESSIONS - 1
+    assert manager.snapshot()["active"] is True
+    for _ in range(chat_module.MAX_SESSIONS - 1):
+        await manager.stop_session()
     assert manager.snapshot() == {"active": False}
-    assert fake_backends[0].stopped is True
+    assert all(b.stopped for b in fake_backends)
     with pytest.raises(ChatNoSessionError):
         await manager.stop_session()
 
@@ -226,7 +237,7 @@ async def test_send_message_preamble_and_continuation(
     assert prompt == "second question"
     assert is_continuation is True
 
-    types = [m.type for m in manager._session.transcript]  # type: ignore[union-attr]
+    types = [m.type for m in manager.active_session.transcript]  # type: ignore[union-attr]
     assert "user_message" in types
     assert "turn_started" in types
     assert "agent_message" in types
@@ -264,7 +275,7 @@ async def test_turn_failure_is_broadcast(
 
     await manager.send_message("hello")
     await _wait_turn(manager)
-    session = manager._session
+    session = manager.active_session
     assert session is not None
     failed = [m for m in session.transcript if m.type == "turn_failed"]
     assert failed and "turn_timeout" in failed[0].text
@@ -407,6 +418,299 @@ async def test_request_refresh_called_after_each_turn(
     prompt, _ = fake_backends[0].turns[0]
     assert "Symphony kanban board at" in prompt
     assert "state: Todo" in prompt
+    await manager.stop_session()
+
+
+# ---------------------------------------------------------------------------
+# token streaming (claude --include-partial-messages)
+# ---------------------------------------------------------------------------
+
+
+def _delta_frame(text: str, *, delta_type: str = "text_delta") -> dict[str, Any]:
+    return {
+        "type": "stream_event",
+        "event": {
+            "type": "content_block_delta",
+            "index": 0,
+            "delta": {"type": delta_type, "text": text},
+        },
+    }
+
+
+def test_summarize_claude_frame_extracts_text_deltas() -> None:
+    assert _summarize_claude_frame(_delta_frame("Hel")) == [
+        ("agent_delta", "Hel", {"index": 0})
+    ]
+    # Reasoning and half-built tool arguments must not reach the bubble.
+    assert _summarize_claude_frame(_delta_frame("hm", delta_type="thinking_delta")) == []
+    assert _summarize_claude_frame({"type": "stream_event", "event": {}}) == []
+    assert _summarize_claude_frame(_delta_frame("")) == []
+
+
+async def test_token_deltas_stream_without_touching_transcript(
+    tmp_path: Path, fake_backends: list[_FakeBackend]
+) -> None:
+    cfg = _cfg(tmp_path)
+    manager = ChatManager(lambda: cfg)
+    snapshot = await manager.start_session("qa")
+    queue = manager.subscribe()
+    backend = fake_backends[0]
+
+    await manager.send_message("stream it")
+    for chunk in ("Hel", "lo"):
+        await backend._emit(EVENT_OTHER_MESSAGE, _delta_frame(chunk))
+    await _wait_turn(manager)
+
+    frames: list[dict[str, Any]] = []
+    while not queue.empty():
+        row = queue.get_nowait()
+        if row is not None:
+            frames.append(row)
+    deltas = [f for f in frames if f["type"] == "agent_delta"]
+    assert [f["text"] for f in deltas] == ["Hel", "lo"]
+    # Ephemeral: no sequence number, no transcript row, no JSONL line.
+    assert all(f["seq"] is None for f in deltas)
+    session = manager.active_session
+    assert session is not None
+    assert "agent_delta" not in [m.type for m in session.transcript]
+
+    path = tmp_path / ".symphony" / "chat" / f"{snapshot['session_id']}.jsonl"
+    for _ in range(50):
+        if path.exists() and "turn_completed" in path.read_text(encoding="utf-8"):
+            break
+        await asyncio.sleep(0.05)
+    assert "agent_delta" not in path.read_text(encoding="utf-8")
+    await manager.stop_session()
+
+
+# ---------------------------------------------------------------------------
+# multiple sessions + reattach
+# ---------------------------------------------------------------------------
+
+
+async def test_sessions_run_independently(
+    tmp_path: Path, fake_backends: list[_FakeBackend]
+) -> None:
+    cfg = _cfg(tmp_path)
+    manager = ChatManager(lambda: cfg)
+    first = (await manager.start_session("qa"))["session_id"]
+    second = (await manager.start_session("edit"))["session_id"]
+    assert first != second
+    fake_backends[0].gate = asyncio.Event()
+
+    # A blocked turn in the first session must not lock the second.
+    await manager.send_message("slow", first)
+    await asyncio.sleep(0)
+    with pytest.raises(ChatBusyError):
+        await manager.send_message("too soon", first)
+    await manager.send_message("fast", second)
+    await _wait_turn(manager, second)
+
+    assert manager.snapshot(second)["turn_count"] == 1
+    assert manager.snapshot(second)["busy"] is False
+    # The first session's turn is counted (it is spending) but still running.
+    assert manager.snapshot(first)["busy"] is True
+    assert not any(
+        m.type == "turn_completed"
+        for m in manager.session(first).transcript  # type: ignore[union-attr]
+    )
+    # Transcripts do not bleed across sessions.
+    assert not any(
+        m.text == "fast" for m in manager.session(first).transcript  # type: ignore[union-attr]
+    )
+
+    listing = manager.list_sessions()
+    assert [s["session_id"] for s in listing["sessions"]] == [first, second]
+    assert listing["active_id"] == second
+    assert listing["max_sessions"] == chat_module.MAX_SESSIONS
+
+    fake_backends[0].gate.set()
+    await _wait_turn(manager, first)
+    await manager.stop_session(second)
+    await manager.stop_session(first)
+
+
+async def test_deltas_only_reach_the_focused_subscriber(
+    tmp_path: Path, fake_backends: list[_FakeBackend]
+) -> None:
+    cfg = _cfg(tmp_path)
+    manager = ChatManager(lambda: cfg)
+    first = (await manager.start_session("qa"))["session_id"]
+    second = (await manager.start_session("qa"))["session_id"]
+    watcher = manager.subscribe(second)
+
+    await manager.send_message("hi", first)
+    await fake_backends[0]._emit(EVENT_OTHER_MESSAGE, _delta_frame("noise"))
+    await _wait_turn(manager, first)
+
+    frames = []
+    while not watcher.empty():
+        row = watcher.get_nowait()
+        if row is not None:
+            frames.append(row)
+    # Numbered frames fan out to everyone (tagged), deltas do not.
+    assert any(f["type"] == "user_message" for f in frames)
+    assert all(f["session_id"] == first for f in frames)
+    assert not any(f["type"] == "agent_delta" for f in frames)
+    await manager.stop_session(first)
+    await manager.stop_session(second)
+
+
+async def test_reattach_restores_transcript_and_resumes_claude(
+    tmp_path: Path, fake_backends: list[_FakeBackend]
+) -> None:
+    cfg = _cfg(tmp_path)
+    manager = ChatManager(lambda: cfg)
+    session_id = (await manager.start_session("qa"))["session_id"]
+    await manager.send_message("remember this")
+    await _wait_turn(manager)
+    await manager.stop_session()
+
+    # A new manager stands in for a server restart: nothing in memory, the
+    # index and the JSONL are all that survive.
+    restarted = ChatManager(lambda: cfg)
+    listing = restarted.list_sessions()
+    assert listing["sessions"] == []
+    resumable = [e["session_id"] for e in listing["resumable"]]
+    assert session_id in resumable
+    assert listing["resumable"][0]["title"] == "remember this"
+
+    snapshot = await restarted.reattach(session_id)
+    assert snapshot["active"] is True
+    assert snapshot["turn_count"] == 1
+    texts = [m["text"] for m in snapshot["transcript_tail"]]
+    assert "remember this" in texts
+    assert "answer 1" in texts
+    # claude rejoins the agent-side conversation instead of starting over.
+    assert "--resume sess-1" in fake_backends[-1].init.cfg.claude.command
+
+    # Continuing the conversation does not repeat the preamble.
+    await restarted.send_message("and now?")
+    await _wait_turn(restarted)
+    prompt, _ = fake_backends[-1].turns[0]
+    assert prompt == "and now?"
+    await restarted.stop_session()
+
+
+async def test_reattach_without_resume_reintroduces_the_repo(
+    tmp_path: Path, fake_backends: list[_FakeBackend]
+) -> None:
+    cfg = _cfg(tmp_path)
+    manager = ChatManager(lambda: cfg)
+    session_id = (await manager.start_session("qa", agent_kind="gemini"))[
+        "session_id"
+    ]
+    await manager.send_message("first")
+    await _wait_turn(manager)
+    await manager.stop_session()
+
+    restarted = ChatManager(lambda: cfg)
+    snapshot = await restarted.reattach(session_id)
+    assert snapshot["agent_kind"] == "gemini"
+    await restarted.send_message("second")
+    await _wait_turn(restarted)
+    prompt, is_continuation = fake_backends[-1].turns[0]
+    assert "do not create, modify or delete" in prompt
+    assert prompt.endswith("second")
+    assert is_continuation is False
+    await restarted.stop_session()
+
+
+async def test_reattach_rejects_unknown_session(tmp_path: Path) -> None:
+    cfg = _cfg(tmp_path)
+    manager = ChatManager(lambda: cfg)
+    with pytest.raises(ChatNoSessionError):
+        await manager.reattach("20260806-000000-abcdef")
+
+
+async def test_stop_with_forget_drops_the_index_entry(
+    tmp_path: Path, fake_backends: list[_FakeBackend]
+) -> None:
+    cfg = _cfg(tmp_path)
+    manager = ChatManager(lambda: cfg)
+    session_id = (await manager.start_session("qa"))["session_id"]
+    await manager.stop_session(forget=True)
+    assert manager.list_sessions()["resumable"] == []
+    # The transcript itself stays on disk as an audit trail.
+    assert (tmp_path / ".symphony" / "chat" / f"{session_id}.jsonl").exists()
+
+
+# ---------------------------------------------------------------------------
+# advisory budget
+# ---------------------------------------------------------------------------
+
+
+async def test_turn_completed_carries_the_current_turn_count(
+    tmp_path: Path, fake_backends: list[_FakeBackend]
+) -> None:
+    """The frame is emitted mid-turn; its budget must not lag a turn behind."""
+    cfg = _cfg(tmp_path)
+    manager = ChatManager(lambda: cfg)
+    await manager.start_session("qa", max_turns=2, max_tokens=0)
+    await manager.send_message("one")
+    await _wait_turn(manager)
+    session = manager.active_session
+    assert session is not None
+    completed = [m for m in session.transcript if m.type == "turn_completed"]
+    assert completed[-1].meta["budget"]["turn_count"] == 1
+    assert completed[-1].meta["budget"]["exceeded"] is False
+
+    await manager.send_message("two")
+    await _wait_turn(manager)
+    completed = [m for m in session.transcript if m.type == "turn_completed"]
+    assert completed[-1].meta["budget"]["turn_count"] == 2
+    assert completed[-1].meta["budget"]["exceeded"] is True
+    await manager.stop_session()
+
+
+async def test_budget_warns_once_and_never_blocks(
+    tmp_path: Path, fake_backends: list[_FakeBackend]
+) -> None:
+    cfg = _cfg(tmp_path)
+    manager = ChatManager(lambda: cfg)
+    await manager.start_session("qa", max_turns=1, max_tokens=0)
+
+    await manager.send_message("first")
+    await _wait_turn(manager)
+    session = manager.active_session
+    assert session is not None
+    assert session.budget_exceeded() is True
+    warnings = [
+        m for m in session.transcript
+        if m.type == "session_status" and "chat budget reached" in m.text
+    ]
+    assert len(warnings) == 1
+    assert warnings[0].meta["budget"]["max_turns"] == 1
+
+    # Advisory only: the next message still runs, and warns only once.
+    await manager.send_message("second")
+    await _wait_turn(manager)
+    assert len(fake_backends[0].turns) == 2
+    assert len([
+        m for m in session.transcript
+        if m.type == "session_status" and "chat budget reached" in m.text
+    ]) == 1
+    assert manager.snapshot()["budget"]["exceeded"] is True
+    await manager.stop_session()
+
+
+async def test_token_totals_survive_a_backend_rebuild(
+    tmp_path: Path, fake_backends: list[_FakeBackend]
+) -> None:
+    """A mode switch drops the backend; its cumulative counter restarts at 0."""
+    cfg = _cfg(tmp_path)
+    manager = ChatManager(lambda: cfg)
+    await manager.start_session("qa", max_turns=0, max_tokens=0)
+    await manager.send_message("q1")
+    await _wait_turn(manager)
+    session = manager.active_session
+    assert session is not None
+    assert session.used_tokens == 7  # _FakeBackend reports 7 cumulative
+
+    await manager.set_mode("edit")
+    await manager.send_message("q2")
+    await _wait_turn(manager)
+    assert session.used_tokens == 14
     await manager.stop_session()
 
 

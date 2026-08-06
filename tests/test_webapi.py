@@ -18,6 +18,7 @@ from aiohttp.test_utils import TestClient, TestServer
 from symphony.orchestrator import Orchestrator
 from symphony.server import build_app
 from symphony.utils.auto_merge import AutoMergeResult
+from symphony.utils.git_ops import GitOpResult
 from symphony.workflow import WorkflowState
 
 WORKFLOW_TEXT = """---
@@ -992,6 +993,194 @@ async def test_git_merge_rejects_concurrent_requests(
     status, payload = await first
     assert status == 200
     assert payload["ok"] is True
+
+
+@pytest.fixture()
+def git_remote(git_repo: Path, tmp_path: Path) -> Path:
+    """Give the repo a real (local, bare) `origin` so pushes actually run."""
+    bare = tmp_path / "origin.git"
+    _git(git_repo, "init", "-q", "--bare", str(bare))
+    _git(git_repo, "remote", "add", "origin", str(bare))
+    return bare
+
+
+async def test_git_remote_status_reports_remotes(
+    git_repo: Path, client: TestClient
+) -> None:
+    resp = await client.get("/api/v1/git/remote-status")
+    assert resp.status == 200
+    payload = await resp.json()
+    assert payload["remotes"] == []
+    assert payload["default_remote"] is None
+    assert payload["current_branch"] == "main"
+    assert payload["target_branch"] == "main"
+    assert isinstance(payload["gh_available"], bool)
+
+
+async def test_git_remote_status_lists_configured_remote(
+    git_remote: Path, client: TestClient
+) -> None:
+    payload = await (await client.get("/api/v1/git/remote-status")).json()
+    assert payload["remotes"] == ["origin"]
+    assert payload["default_remote"] == "origin"
+
+
+async def test_git_branch_delete_needs_force_when_unmerged(
+    git_repo: Path, client: TestClient
+) -> None:
+    resp = await client.post(
+        "/api/v1/git/branch/delete", json={"branch": "symphony/SEED-1"}
+    )
+    assert resp.status == 409
+    error = (await resp.json())["error"]
+    assert error["code"] == "not_merged"
+    assert "main" in error["message"]
+
+    resp = await client.post(
+        "/api/v1/git/branch/delete",
+        json={"branch": "symphony/SEED-1", "force": True},
+    )
+    assert resp.status == 200
+    assert (await resp.json())["status"] == "deleted"
+    branches = (await (await client.get("/api/v1/git/branches")).json())["branches"]
+    assert "symphony/SEED-1" not in branches
+
+
+async def test_git_branch_delete_allows_merged_branch(
+    git_repo: Path, client: TestClient
+) -> None:
+    assert (
+        await client.post("/api/v1/git/merge", json={"branch": "symphony/SEED-1"})
+    ).status == 200
+    resp = await client.post(
+        "/api/v1/git/branch/delete", json={"branch": "symphony/SEED-1"}
+    )
+    assert resp.status == 200
+    assert (await resp.json())["ok"] is True
+
+
+async def test_git_branch_delete_guards(
+    git_repo: Path, client: TestClient
+) -> None:
+    resp = await client.post("/api/v1/git/branch/delete", json={"branch": "main"})
+    assert resp.status == 400
+    assert "task branches" in (await resp.json())["error"]["message"]
+
+    resp = await client.post(
+        "/api/v1/git/branch/delete", json={"branch": "symphony/NOPE-9"}
+    )
+    assert resp.status == 400
+    assert (await resp.json())["error"]["code"] == "unknown_ref"
+
+    client.stub.running_identifiers["SEED-1"] = "id-SEED-1"  # type: ignore[attr-defined]
+    resp = await client.post(
+        "/api/v1/git/branch/delete", json={"branch": "symphony/SEED-1"}
+    )
+    assert resp.status == 409
+    assert (await resp.json())["error"]["code"] == "state_in_use"
+
+
+async def test_git_branch_delete_refuses_checked_out_branch(
+    git_repo: Path, client: TestClient
+) -> None:
+    _git(git_repo, "checkout", "-q", "symphony/SEED-1")
+    resp = await client.post(
+        "/api/v1/git/branch/delete",
+        json={"branch": "symphony/SEED-1", "force": True},
+    )
+    assert resp.status == 409
+    assert (await resp.json())["error"]["code"] == "checked_out"
+
+
+async def test_git_push_sends_task_branch_to_remote(
+    git_remote: Path, client: TestClient
+) -> None:
+    resp = await client.post("/api/v1/git/push", json={"branch": "symphony/SEED-1"})
+    assert resp.status == 200
+    payload = await resp.json()
+    assert payload["ok"] is True and payload["remote"] == "origin"
+
+    refs = subprocess.run(
+        ["git", "branch", "--format=%(refname:short)"],
+        cwd=str(git_remote),
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout
+    assert "symphony/SEED-1" in refs
+
+
+async def test_git_push_of_target_branch_requires_confirmation(
+    git_remote: Path, client: TestClient
+) -> None:
+    resp = await client.post("/api/v1/git/push", json={"branch": "main"})
+    assert resp.status == 400
+    assert (await resp.json())["error"]["code"] == "confirm_required"
+
+    resp = await client.post(
+        "/api/v1/git/push", json={"branch": "main", "confirm": "nope"}
+    )
+    assert resp.status == 400
+
+    resp = await client.post(
+        "/api/v1/git/push", json={"branch": "main", "confirm": "main"}
+    )
+    assert resp.status == 200
+    assert (await resp.json())["status"] == "pushed"
+
+
+async def test_git_push_rejects_unrelated_branch_and_missing_remote(
+    git_repo: Path, client: TestClient
+) -> None:
+    _git(git_repo, "branch", "scratch")
+    resp = await client.post("/api/v1/git/push", json={"branch": "scratch"})
+    assert resp.status == 400
+    assert (await resp.json())["error"]["code"] == "branch_not_pushable"
+
+    # Task branch is in scope, but this repo still has no remote.
+    resp = await client.post("/api/v1/git/push", json={"branch": "symphony/SEED-1"})
+    assert resp.status == 400
+    assert (await resp.json())["error"]["code"] == "no_remote"
+
+
+async def test_git_pr_requires_gh_and_a_pushed_branch(
+    git_remote: Path, client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr("symphony.utils.git_ops.gh_available", lambda: False)
+    resp = await client.post("/api/v1/git/pr", json={"branch": "symphony/SEED-1"})
+    assert resp.status == 400
+    assert (await resp.json())["error"]["code"] == "gh_unavailable"
+
+    monkeypatch.setattr("symphony.utils.git_ops.gh_available", lambda: True)
+    resp = await client.post("/api/v1/git/pr", json={"branch": "symphony/SEED-1"})
+    assert resp.status == 409
+    assert (await resp.json())["error"]["code"] == "branch_not_pushed"
+
+
+async def test_git_pr_creates_pull_request_with_ticket_title(
+    git_remote: Path, client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    calls: list[tuple[str, ...]] = []
+
+    def fake_create(workflow_dir: Path, branch: str, target: str, title: str, body: str):
+        calls.append((branch, target, title, body))
+        return GitOpResult(True, "created", "", url="https://example.test/pr/1")
+
+    monkeypatch.setattr("symphony.utils.git_ops.gh_available", lambda: True)
+    monkeypatch.setattr(
+        "symphony.utils.git_ops.branch_on_remote", lambda *_a, **_k: True
+    )
+    monkeypatch.setattr("symphony.utils.git_ops.create_pull_request", fake_create)
+
+    resp = await client.post("/api/v1/git/pr", json={"branch": "symphony/SEED-1"})
+    assert resp.status == 200
+    payload = await resp.json()
+    assert payload["url"] == "https://example.test/pr/1"
+    assert payload["target"] == "main"
+    branch, target, title, body = calls[0]
+    assert branch == "symphony/SEED-1" and target == "main"
+    assert title.startswith("SEED-1")
+    assert "SEED-1" in body
 
 
 async def test_git_diff_returns_patch_for_branch_and_commit(

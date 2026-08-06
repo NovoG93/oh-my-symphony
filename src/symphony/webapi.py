@@ -19,13 +19,14 @@ explicit operator opt-in to network exposure and disables the Host check.
 from __future__ import annotations
 
 import asyncio
+import json
 import re
 from datetime import date, datetime
 from pathlib import Path
 from typing import Any, Awaitable, Callable
 from urllib.parse import urlsplit
 
-from aiohttp import WSCloseCode, web
+from aiohttp import WSCloseCode, WSMsgType, web
 
 from .chat import ChatManager
 from .errors import (
@@ -39,8 +40,9 @@ from .logging import get_logger
 from .skills import normalize_skill_names
 from .stats import StatsStore, stats_store_for
 from .trackers.file import FileBoardTracker, parse_ticket_file
-from .utils import git_inspect
+from .utils import git_inspect, git_ops
 from .utils.auto_merge import auto_merge_on_done_best_effort
+from .utils.git_ops import GitOpResult
 from .orchestrator import Orchestrator
 from .orchestrator.run_registry import clamp_run_history_limit
 from .workflow import SUPPORTED_AGENT_KINDS, SYMPHONY_BRANCH_PREFIX, ServiceConfig
@@ -61,6 +63,8 @@ STATIC_DIR = Path(__file__).parent / "web" / "static"
 _IDENTIFIER_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_-]{0,63}$")
 _BRANCH_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/-]{0,199}$")
 _COMMIT_RE = re.compile(r"^[0-9a-fA-F]{4,64}$")
+# `ChatManager` mints these as <UTC date>-<UTC time>-<6 hex>.
+_CHAT_SESSION_RE = re.compile(r"^\d{8}-\d{6}-[0-9a-f]{6}$")
 _MAX_TITLE = 300
 _MAX_BODY = 128_000
 _MAX_LABELS = 20
@@ -380,6 +384,25 @@ def _check_agent_kind(raw: Any) -> str:
             f"unknown agent_kind {kind!r}; supported: {sorted(SUPPORTED_AGENT_KINDS)}"
         )
     return kind
+
+
+def _check_chat_session_id(raw: Any) -> str:
+    """Session ids index into `.symphony/chat/<id>.jsonl` — validate strictly."""
+    session_id = raw.strip() if isinstance(raw, str) else ""
+    if not _CHAT_SESSION_RE.match(session_id):
+        raise WorkflowMutationError(f"invalid chat session id {session_id!r}")
+    return session_id
+
+
+def _check_budget(raw: Any, key: str) -> int | None:
+    """Optional advisory chat limit; 0 means unlimited, absent means default."""
+    if raw is None or raw == "":
+        return None
+    if isinstance(raw, bool) or not isinstance(raw, int):
+        raise WorkflowMutationError(f"{key} must be a non-negative integer")
+    if raw < 0:
+        raise WorkflowMutationError(f"{key} must be a non-negative integer")
+    return raw
 
 
 def _parse_ci_settings(body: dict[str, Any]) -> dict[str, Any]:
@@ -1133,7 +1156,209 @@ def _register_git_routes(
             }
         )
 
+    # ---- mutating branch actions ------------------------------------
+    # Scope: task branches always; the merge target only for `push`, and
+    # only when the operator retypes its name. Nothing here ever forces a
+    # push, and a delete only uses `-D` after an explicit force or a
+    # verified merge into the target.
+
+    def _task_branch_identifier(branch: str) -> str:
+        if not branch.startswith(SYMPHONY_BRANCH_PREFIX):
+            raise WorkflowMutationError(
+                f"limited to {SYMPHONY_BRANCH_PREFIX}* task branches"
+            )
+        return _check_identifier(branch[len(SYMPHONY_BRANCH_PREFIX) :])
+
+    def _resolve_remote(workflow_dir: Path, raw: Any) -> str | None:
+        if raw in (None, ""):
+            return git_ops.default_remote(workflow_dir)
+        if not isinstance(raw, str) or not git_ops.is_valid_remote_name(raw.strip()):
+            raise WorkflowMutationError(f"invalid remote name {raw!r}")
+        remote = raw.strip()
+        return remote if remote in git_ops.list_remotes(workflow_dir) else None
+
+    async def handle_git_remote_status(_request: web.Request) -> web.Response:
+        cfg = ctx.config()
+        workflow_dir = cfg.workflow_path.parent
+
+        def _load() -> dict[str, object]:
+            if not git_inspect.is_git_repo(workflow_dir):
+                return {"remotes": [], "note": "not_a_git_repo"}
+            return {
+                "remotes": git_ops.list_remotes(workflow_dir),
+                "default_remote": git_ops.default_remote(workflow_dir),
+                "current_branch": git_inspect.current_branch(workflow_dir),
+                "target_branch": _effective_target(cfg, workflow_dir),
+                "note": None,
+            }
+
+        payload = await asyncio.to_thread(_load)
+        # `gh` presence is a property of the host, not of the repo.
+        payload["gh_available"] = git_ops.gh_available()
+        return web.json_response(payload)
+
+    async def handle_git_branch_delete(request: web.Request) -> web.Response:
+        body = await _read_json(request)
+        branch = _check_branch(body.get("branch"))
+        identifier = _task_branch_identifier(branch)
+        force = bool(body.get("force"))
+        cfg = ctx.config()
+        workflow_dir = cfg.workflow_path.parent
+        if orchestrator.find_running_issue_id(identifier) is not None:
+            return _json_error(
+                409,
+                "state_in_use",
+                f"{identifier} has a running worker; pause or wait before deleting",
+            )
+
+        def _delete() -> tuple[str, str] | GitOpResult:
+            if not git_inspect.is_git_repo(workflow_dir):
+                return "not_a_git_repo", "workflow dir is not a git repository"
+            if not git_inspect.ref_exists(workflow_dir, branch):
+                return "unknown_ref", f"unknown branch {branch!r}"
+            if git_inspect.current_branch(workflow_dir) == branch:
+                return "checked_out", f"{branch} is checked out; switch away first"
+            target = _effective_target(cfg, workflow_dir)
+            merged = bool(target) and git_inspect.is_merged(
+                workflow_dir, branch, target
+            )
+            if not merged and not force:
+                return (
+                    "not_merged",
+                    f"{branch} is not merged into {target or 'the target branch'}; "
+                    "merge it first or repeat with force",
+                )
+            # `-D` only once the merge is proven or the operator forced it;
+            # plain `-d` can still refuse a branch merged into the target
+            # but not into HEAD.
+            return git_ops.delete_branch(workflow_dir, branch, force=True)
+
+        outcome = await asyncio.to_thread(_delete)
+        if isinstance(outcome, tuple):
+            code, message = outcome
+            return _json_error(409 if code != "unknown_ref" else 400, code, message)
+        if not outcome.ok:
+            return _json_error(409, outcome.status, outcome.detail)
+        orchestrator.request_refresh()
+        return web.json_response({**outcome.as_dict(), "branch": branch})
+
+    async def handle_git_push(request: web.Request) -> web.Response:
+        body = await _read_json(request)
+        branch = _check_branch(body.get("branch"))
+        cfg = ctx.config()
+        workflow_dir = cfg.workflow_path.parent
+        target = await asyncio.to_thread(_effective_target, cfg, workflow_dir)
+        is_task_branch = branch.startswith(SYMPHONY_BRANCH_PREFIX)
+        if not is_task_branch:
+            if not target or branch != target:
+                return _json_error(
+                    400,
+                    "branch_not_pushable",
+                    f"push is limited to {SYMPHONY_BRANCH_PREFIX}* task branches "
+                    "and the merge target branch",
+                )
+            # Pushing the shared target moves work other people pull, so it
+            # takes a deliberate second act, not one click.
+            if body.get("confirm") != branch:
+                return _json_error(
+                    400,
+                    "confirm_required",
+                    f"pushing {branch} requires confirm: {branch!r}",
+                )
+        remote = await asyncio.to_thread(_resolve_remote, workflow_dir, body.get("remote"))
+        if not remote:
+            return _json_error(
+                400, "no_remote", "this repository has no matching git remote"
+            )
+        if not await asyncio.to_thread(git_inspect.ref_exists, workflow_dir, branch):
+            return _json_error(400, "unknown_ref", f"unknown branch {branch!r}")
+        result = await asyncio.to_thread(
+            git_ops.push_branch, workflow_dir, branch, remote
+        )
+        if not result.ok:
+            return _json_error(409, result.status, result.detail)
+        return web.json_response(
+            {**result.as_dict(), "branch": branch, "remote": remote}
+        )
+
+    async def handle_git_pull_request(request: web.Request) -> web.Response:
+        body = await _read_json(request)
+        branch = _check_branch(body.get("branch"))
+        identifier = _task_branch_identifier(branch)
+        raw_target = body.get("target")
+        requested_target = (
+            _check_branch(raw_target, key="target")
+            if raw_target not in (None, "")
+            else None
+        )
+        cfg = ctx.config()
+        workflow_dir = cfg.workflow_path.parent
+        target = requested_target or await asyncio.to_thread(
+            _effective_target, cfg, workflow_dir
+        )
+        if not target:
+            return _json_error(
+                400,
+                "no_target",
+                "no target branch; set auto_merge_target_branch or pass target",
+            )
+        if not git_ops.gh_available():
+            return _json_error(
+                400,
+                "gh_unavailable",
+                "the GitHub CLI (gh) is not installed or not on PATH",
+            )
+        remote = await asyncio.to_thread(_resolve_remote, workflow_dir, body.get("remote"))
+        if not remote:
+            return _json_error(
+                400, "no_remote", "this repository has no matching git remote"
+            )
+        if not await asyncio.to_thread(
+            git_ops.branch_on_remote, workflow_dir, remote, branch
+        ):
+            return _json_error(
+                409,
+                "branch_not_pushed",
+                f"{branch} is not on {remote} yet; push it before opening a PR",
+            )
+        issue: Issue | None = None
+        if cfg.tracker.kind == "file":
+            try:
+                issue = await asyncio.to_thread(
+                    ctx.file_tracker().fetch_issue_full_by_id, identifier
+                )
+            except Exception as exc:
+                log.warning(
+                    "git_pr_ticket_lookup_failed", identifier=identifier, error=str(exc)
+                )
+        raw_title = body.get("title")
+        title = (
+            _check_title(raw_title)
+            if raw_title not in (None, "")
+            else f"{identifier}: {issue.title}" if issue is not None else identifier
+        )
+        raw_body = body.get("body")
+        pr_body = (
+            _check_description(raw_body)
+            if raw_body not in (None, "")
+            else f"Symphony task branch for `{identifier}`."
+        )
+        result = await asyncio.to_thread(
+            git_ops.create_pull_request, workflow_dir, branch, target, title, pr_body
+        )
+        if not result.ok:
+            return _json_error(409, result.status, result.detail)
+        return web.json_response(
+            {**result.as_dict(), "branch": branch, "target": target}
+        )
+
     app.router.add_get("/api/v1/git/branches", _wrap(handle_git_branches))
+    app.router.add_get("/api/v1/git/remote-status", _wrap(handle_git_remote_status))
+    app.router.add_post(
+        "/api/v1/git/branch/delete", _wrap(handle_git_branch_delete)
+    )
+    app.router.add_post("/api/v1/git/push", _wrap(handle_git_push))
+    app.router.add_post("/api/v1/git/pr", _wrap(handle_git_pull_request))
     app.router.add_get("/api/v1/git/log", _wrap(handle_git_log))
     app.router.add_get("/api/v1/git/task-branches", _wrap(handle_git_task_branches))
     app.router.add_get("/api/v1/git/compare", _wrap(handle_git_compare))
@@ -1158,45 +1383,49 @@ def _register_chat_routes(
     app[CHAT_MANAGER_KEY] = manager
     websockets: set[web.WebSocketResponse] = set()
 
-    async def handle_chat_session_get(_request: web.Request) -> web.Response:
-        return web.json_response(manager.snapshot())
+    # The singular `/chat/session` routes predate multi-session support and
+    # stay as an alias for "the active session"; everything below shares one
+    # implementation so the two shapes cannot drift.
 
-    async def handle_chat_session_post(request: web.Request) -> web.Response:
-        body = await _read_json(request)
+    async def _start(body: dict[str, Any]) -> web.Response:
         mode = body.get("mode", "qa")
         if not isinstance(mode, str):
             raise WorkflowMutationError("mode must be a string")
         agent_kind = None
         if body.get("agent_kind") not in (None, ""):
             agent_kind = _check_agent_kind(body.get("agent_kind"))
+        max_turns = _check_budget(body.get("max_turns"), "max_turns")
+        max_tokens = _check_budget(body.get("max_tokens"), "max_tokens")
         try:
-            snapshot = await manager.start_session(mode, agent_kind)
+            snapshot = await manager.start_session(
+                mode, agent_kind, max_turns=max_turns, max_tokens=max_tokens
+            )
         except ChatSessionExistsError as exc:
             return _json_error(409, exc.code, exc.message)
         return web.json_response(snapshot, status=201)
 
-    async def handle_chat_session_patch(request: web.Request) -> web.Response:
-        body = await _read_json(request)
+    async def _set_mode(
+        body: dict[str, Any], session_id: str | None
+    ) -> web.Response:
         mode = body.get("mode")
         if not isinstance(mode, str):
             raise WorkflowMutationError("mode must be a string")
         try:
-            result = await manager.set_mode(mode)
+            result = await manager.set_mode(mode, session_id)
         except ChatNoSessionError as exc:
             return _json_error(404, exc.code, exc.message)
         except ChatBusyError as exc:
             return _json_error(409, exc.code, exc.message)
         return web.json_response(result)
 
-    async def handle_chat_session_delete(_request: web.Request) -> web.Response:
+    async def _stop(session_id: str | None, forget: bool = False) -> web.Response:
         try:
-            await manager.stop_session()
+            await manager.stop_session(session_id, forget=forget)
         except ChatNoSessionError as exc:
             return _json_error(404, exc.code, exc.message)
-        return web.json_response({"stopped": True})
+        return web.json_response({"stopped": True, "forgotten": forget})
 
-    async def handle_chat_message_post(request: web.Request) -> web.Response:
-        body = await _read_json(request)
+    async def _send(body: dict[str, Any], session_id: str | None) -> web.Response:
         text = body.get("text")
         if not isinstance(text, str) or not text.strip():
             raise WorkflowMutationError("text is required")
@@ -1205,12 +1434,73 @@ def _register_chat_routes(
                 f"text too long (max {_MAX_CHAT_MESSAGE} chars)"
             )
         try:
-            snapshot = await manager.send_message(text)
+            snapshot = await manager.send_message(text, session_id)
         except ChatNoSessionError as exc:
             return _json_error(404, exc.code, exc.message)
         except ChatBusyError as exc:
             return _json_error(409, exc.code, exc.message)
         return web.json_response(snapshot, status=202)
+
+    async def handle_chat_session_get(_request: web.Request) -> web.Response:
+        return web.json_response(manager.snapshot())
+
+    async def handle_chat_session_post(request: web.Request) -> web.Response:
+        body = await _read_json(request)
+        if manager.live_count:
+            return _json_error(
+                409,
+                "chat_session_exists",
+                "a chat session is already active; stop it first or use "
+                "/api/v1/chat/sessions",
+            )
+        return await _start(body)
+
+    async def handle_chat_session_patch(request: web.Request) -> web.Response:
+        return await _set_mode(await _read_json(request), None)
+
+    async def handle_chat_session_delete(_request: web.Request) -> web.Response:
+        return await _stop(None)
+
+    async def handle_chat_message_post(request: web.Request) -> web.Response:
+        return await _send(await _read_json(request), None)
+
+    async def handle_chat_sessions_get(_request: web.Request) -> web.Response:
+        return web.json_response(manager.list_sessions())
+
+    async def handle_chat_sessions_post(request: web.Request) -> web.Response:
+        return await _start(await _read_json(request))
+
+    async def handle_chat_session_detail(request: web.Request) -> web.Response:
+        session_id = _check_chat_session_id(request.match_info["session_id"])
+        snapshot = manager.snapshot(session_id)
+        if not snapshot.get("active"):
+            return _json_error(
+                404, "chat_no_session", f"no live chat session {session_id!r}"
+            )
+        return web.json_response(snapshot)
+
+    async def handle_chat_session_id_patch(request: web.Request) -> web.Response:
+        session_id = _check_chat_session_id(request.match_info["session_id"])
+        return await _set_mode(await _read_json(request), session_id)
+
+    async def handle_chat_session_id_delete(request: web.Request) -> web.Response:
+        session_id = _check_chat_session_id(request.match_info["session_id"])
+        forget = request.query.get("forget", "").lower() in {"1", "true", "yes"}
+        return await _stop(session_id, forget=forget)
+
+    async def handle_chat_session_id_message(request: web.Request) -> web.Response:
+        session_id = _check_chat_session_id(request.match_info["session_id"])
+        return await _send(await _read_json(request), session_id)
+
+    async def handle_chat_session_reattach(request: web.Request) -> web.Response:
+        session_id = _check_chat_session_id(request.match_info["session_id"])
+        try:
+            snapshot = await manager.reattach(session_id)
+        except ChatNoSessionError as exc:
+            return _json_error(404, exc.code, exc.message)
+        except ChatSessionExistsError as exc:
+            return _json_error(409, exc.code, exc.message)
+        return web.json_response(snapshot)
 
     def _origin_allowed(request: web.Request) -> bool:
         # Browsers do not apply CORS to WebSocket upgrades; without this an
@@ -1240,16 +1530,41 @@ def _register_chat_routes(
             return _json_error(
                 403, "forbidden_origin", "cross-origin websocket rejected"
             )
+        raw_focus = (request.query.get("session") or "").strip()
+        focus = _check_chat_session_id(raw_focus) if raw_focus else None
         ws = web.WebSocketResponse(heartbeat=30)
         await ws.prepare(request)
         websockets.add(ws)
-        queue = manager.subscribe()
+        queue = manager.subscribe(focus)
         pump = asyncio.create_task(_pump(queue, ws))
         try:
-            await ws.send_json({"type": "hello", "snapshot": manager.snapshot()})
-            # The stream is server->client only; draining detects disconnect.
-            async for _msg in ws:
-                pass
+            await ws.send_json(
+                {
+                    "type": "hello",
+                    "snapshot": manager.snapshot(focus),
+                    "sessions": manager.list_sessions(),
+                }
+            )
+            # Server->client stream, except for one client message: which
+            # session's token deltas this socket wants. Draining also
+            # detects disconnect.
+            async for message in ws:
+                if message.type is not WSMsgType.TEXT:
+                    continue
+                try:
+                    frame = json.loads(message.data)
+                except (json.JSONDecodeError, TypeError):
+                    continue
+                if not isinstance(frame, dict) or frame.get("type") != "focus":
+                    continue
+                requested = frame.get("session_id")
+                if requested in (None, ""):
+                    manager.set_focus(queue, None)
+                    continue
+                try:
+                    manager.set_focus(queue, _check_chat_session_id(requested))
+                except WorkflowMutationError:
+                    continue
         finally:
             pump.cancel()
             try:
@@ -1280,6 +1595,25 @@ def _register_chat_routes(
         "/api/v1/chat/session", _wrap(handle_chat_session_delete)
     )
     app.router.add_post("/api/v1/chat/message", _wrap(handle_chat_message_post))
+    app.router.add_get("/api/v1/chat/sessions", _wrap(handle_chat_sessions_get))
+    app.router.add_post("/api/v1/chat/sessions", _wrap(handle_chat_sessions_post))
+    app.router.add_get(
+        "/api/v1/chat/sessions/{session_id}", _wrap(handle_chat_session_detail)
+    )
+    app.router.add_patch(
+        "/api/v1/chat/sessions/{session_id}", _wrap(handle_chat_session_id_patch)
+    )
+    app.router.add_delete(
+        "/api/v1/chat/sessions/{session_id}", _wrap(handle_chat_session_id_delete)
+    )
+    app.router.add_post(
+        "/api/v1/chat/sessions/{session_id}/message",
+        _wrap(handle_chat_session_id_message),
+    )
+    app.router.add_post(
+        "/api/v1/chat/sessions/{session_id}/reattach",
+        _wrap(handle_chat_session_reattach),
+    )
     app.router.add_get("/api/v1/chat/ws", handle_chat_ws)
 
 

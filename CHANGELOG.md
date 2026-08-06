@@ -10,7 +10,38 @@ Versioning: [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
-No unreleased changes.
+### Added
+
+- Chat answers now stream token by token. The Claude CLI already emitted
+  `--include-partial-messages` deltas; chat parses them and pushes them to the
+  focused socket only, without a sequence number, transcript row or JSONL line,
+  so a turn's hundreds of chunks cannot evict the conversation history.
+- Chat sessions carry an advisory turn and token budget chosen when the session
+  starts. Crossing a limit warns once and shows a red chip; it never blocks a
+  turn, because only the operator can judge when a conversation is finished.
+- Up to three chat sessions now run at once, each with its own turn lock,
+  sequence counter and transcript. `/api/v1/chat/sessions` is the new plural
+  surface; the singular `/api/v1/chat/session` routes stay as an alias for the
+  active session and still allow only one session at a time.
+- Chat sessions survive a server restart. Session metadata is mirrored into
+  `.symphony/chat/index.json` after every state change, and
+  `POST /api/v1/chat/sessions/{id}/reattach` rebuilds the backend — resuming the
+  agent-side conversation by id with Claude, and reintroducing the repository
+  through the preamble with backends that cannot resume.
+- The Git page can delete, push and open a pull request for a task branch.
+  Deleting refuses unmerged branches unless forced, pushing covers
+  `symphony/*` plus the merge target (which requires retyping its name) and is
+  never a force push, and `POST /api/v1/git/pr` shells out to `gh` and reports
+  a missing CLI, an unpushed branch or a non-GitHub remote distinctly.
+  `GET /api/v1/git/remote-status` tells the UI which actions are usable.
+
+### Fixed
+
+- The `turn_completed` chat frame reported a turn count one behind, because the
+  event is emitted while the turn is still running. Turns are now counted when
+  the message is sent, so the budget snapshot on that frame is current.
+- Stopping a chat session now flushes its JSONL transcript before the session is
+  released, so an immediate reattach cannot replay a truncated conversation.
 
 ## [0.15.0] - 2026-07-18 - Production boundary hardening
 

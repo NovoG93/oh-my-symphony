@@ -98,6 +98,25 @@ def test_web_git_diff_panel_contract() -> None:
     assert ".diff-line.diff-hunk" in css
 
 
+def test_web_git_branch_actions_contract() -> None:
+    js = (STATIC_ROOT / "app.js").read_text(encoding="utf-8")
+    css = (STATIC_ROOT / "style.css").read_text(encoding="utf-8")
+
+    assert "getGitRemoteStatus: () => apiRequest('/git/remote-status')" in js
+    assert "postGitBranchDelete: (payload)" in js
+    assert "postGitPush: (payload)" in js
+    assert "postGitPullRequest: (payload)" in js
+    assert "async function pushTaskBranch(branch, remote)" in js
+    assert "function openPushTargetModal(branch, remote)" in js
+    assert "function openDeleteBranchModal(row, data)" in js
+    assert "function openPullRequestModal(row, data)" in js
+    assert "state.gitRemote = remoteStatus;" in js
+    assert "confirm: confirmInput.value.trim()" in js
+    assert "The GitHub CLI (gh) is not on PATH" in js
+    assert "No git remote configured" in js
+    assert ".git-push-target" in css
+
+
 def test_web_chat_page_contract() -> None:
     js = (STATIC_ROOT / "app.js").read_text(encoding="utf-8")
     css = (STATIC_ROOT / "style.css").read_text(encoding="utf-8")
@@ -112,7 +131,7 @@ def test_web_chat_page_contract() -> None:
     assert "deleteChatSession: ()" in js
     assert "postChatMessage: (payload)" in js
     assert "function connectChatSocket(view)" in js
-    assert "new WebSocket(`${proto}://${location.host}/api/v1/chat/ws`)" in js
+    assert "new WebSocket(`${proto}://${location.host}/api/v1/chat/ws${query}`)" in js
     assert "function closeChatSocket()" in js
     assert "function buildChatMessageNode(msg)" in js
     assert "read-only not enforced" in js
@@ -120,6 +139,52 @@ def test_web_chat_page_contract() -> None:
     assert ".chat-bubble" in css
     assert ".chat-mode-toggle" in css
     assert ".chat-composer" in css
+
+
+def test_web_chat_token_streaming_contract() -> None:
+    js = (STATIC_ROOT / "app.js").read_text(encoding="utf-8")
+    css = (STATIC_ROOT / "style.css").read_text(encoding="utf-8")
+
+    assert "function appendChatDelta(view, text)" in js
+    assert "function finalizeChatLive(view, finalText)" in js
+    assert "if (msg.type === 'agent_delta')" in js
+    assert "requestAnimationFrame(" in js
+    assert "if (msg.type === 'agent_message' && finalizeChatLive(view, msg.text)) return;" in js
+    assert ".chat-bubble-live" in css
+    assert "white-space: pre-wrap" in css
+
+
+def test_web_chat_multi_session_contract() -> None:
+    js = (STATIC_ROOT / "app.js").read_text(encoding="utf-8")
+    css = (STATIC_ROOT / "style.css").read_text(encoding="utf-8")
+
+    assert "getChatSessions: () => apiRequest('/chat/sessions')" in js
+    assert "createChatSession2: (payload)" in js
+    assert "reattachChatSession: (id)" in js
+    assert "deleteChatSessionById: (id, { forget } = {})" in js
+    assert "postChatMessageTo: (id, payload)" in js
+    assert "async function refreshChatSessions(view)" in js
+    assert "async function selectChatSession(view, sessionId)" in js
+    assert "function renderChatSessionBar(view)" in js
+    assert "function buildChatResumeControl(view, resumable, atLimit)" in js
+    assert "function openNewChatSessionModal(view)" in js
+    assert "function focusChatSocket(sessionId)" in js
+    assert "JSON.stringify({ type: 'focus', session_id: sessionId || null })" in js
+    assert "?session=${encodeURIComponent(chatState.currentId)}" in js
+    assert ".chat-session-bar" in css
+    assert ".chat-tab.active" in css
+    assert ".chat-tab-dot.busy" in css
+
+
+def test_web_chat_budget_contract() -> None:
+    js = (STATIC_ROOT / "app.js").read_text(encoding="utf-8")
+    css = (STATIC_ROOT / "style.css").read_text(encoding="utf-8")
+
+    assert "function buildChatBudgetChip(budget)" in js
+    assert "if (snap.budget) view.controls.appendChild(buildChatBudgetChip(snap.budget));" in js
+    assert "chatState.snapshot.budget = msg.meta.budget;" in js
+    assert ".chat-budget-chip" in css
+    assert ".chat-budget-chip.over" in css
 
 
 def test_web_chat_font_controls_contract() -> None:
