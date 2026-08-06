@@ -16,8 +16,11 @@ Versioning: [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   permission to write git objects. The default workspace is a linked git
   worktree, which keeps the object database in the host repo's `.git` while
   the per-worktree admin dir lives in `.git/worktrees/<ID>`. Symphony granted
-  only the latter, so `git add` took the index lock and then died with
-  `failed to insert into database`. Both directories are now granted.
+  only the latter, so its grant covered the index lock but not the blob
+  write that reports `failed to insert into database`. Both directories are
+  now granted. (Measured afterwards: codex 0.146.0 grants a worktree's git
+  dirs on its own, so the injection is belt-and-braces there; the gap was
+  real for anything that does not.)
 - The `Blocked` recovery loop no longer dead-ends. An RCA ticket inherits the
   same sandbox as the ticket it is rescuing and cannot open a further RCA, so
   a permission failure stopped the board permanently. Symphony now re-checks a

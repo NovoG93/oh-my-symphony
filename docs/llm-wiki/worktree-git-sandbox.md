@@ -34,7 +34,7 @@ dir was writable, the object database was not.
 | date | decision | why |
 |------|----------|-----|
 | 2026-05-17 (SMA-25) | Grant the per-worktree gitdir in codex `writable_roots` | Fixed `index.lock` denials |
-| 2026-08-06 | Also grant the **common dir**; every backend exports `SYMPHONY_GIT_WRITABLE_ROOTS` | The SMA-25 fix only covered locks. Blobs go to `<common>/objects`, so `git add`, `git commit` and `git merge-tree --write-tree` still died. |
+| 2026-08-06 | Also grant the **common dir**; every backend exports `SYMPHONY_GIT_WRITABLE_ROOTS` | The SMA-25 grant covered locks only — blobs go to `<common>/objects`, which Symphony never granted. Belt-and-braces on codex 0.146.0 (see measurement below); the gap is real for anything that does not auto-grant. |
 | 2026-08-06 | Move the Final History Gate from the agent to the orchestrator | The agent is the least privileged actor in the system; making it prove delivery meant a permission limit could park a finished ticket in `Blocked`. |
 | 2026-08-06 | Host re-checks a `Blocked` ticket's history before opening an RCA | An RCA worker inherits the same sandbox and blocks identically, and an RCA ticket cannot open a further RCA — so the board dead-ended. |
 
@@ -53,10 +53,39 @@ dir was writable, the object database was not.
   writable`) and reports whether the configured agent can be handed its roots
   (`agent git grant`).
 
+## Measured, 2026-08-06 — the incident does not reproduce on current CLIs
+
+Live runs against a real host repo + linked worktree **outside `/tmp`**:
+
+| CLI | control write outside the workspace | new-blob `git add` without Symphony's grant |
+|-----|--------------------------------------|--------------------------------------------|
+| codex 0.146.0, `-s workspace-write` | **denied** (`Operation not permitted`) | **succeeded**, blob written to `<host>/.git/objects` |
+| claude 2.1.223, `-p` | n/a — no OS sandbox active | **succeeded**, blob written to `<host>/.git/objects` |
+
+So codex auto-grants a linked worktree's git dirs, and the reported
+`Operation not permitted` could not be attributed to either backend on this
+machine. The grant closes a real gap in Symphony's own logic; the thing that
+actually removes the failure mode is the **host-side gate**, which does not
+depend on what any CLI permits.
+
+Two traps that invalidated earlier attempts — check both before trusting a
+repro:
+
+- codex `workspace-write` grants `[workdir, /tmp, $TMPDIR]` by default. Any
+  experiment staged in `/tmp` is writable by construction and proves nothing.
+- git deduplicates objects. Re-running `git add` on the same *content*
+  succeeds without writing anything, because the blob already exists. Force a
+  new object with unique content per run.
+
+**Always run a control write** that must be denied. Without it, a success
+reads identically whether the sandbox is permissive or the fix worked.
+
 ## Not covered
 
-- Whether Claude Code's own bash sandbox denies `.git` writes was never
-  reproduced directly; the `--add-dir` grant is defensive. The host-side gate
-  is what actually removes the failure mode, and it is backend-independent.
+- Where the original `Operation not permitted` came from — an older codex, a
+  different sandbox configuration, a container, or host file permissions. Not
+  determined.
+- Whether Claude Code's bash sandbox (not enabled here) denies `.git` writes
+  when switched on; the `--add-dir` grant is defensive.
 - Object *alternates* (`objects/info/alternates`) are ignored on purpose:
   they are read-only borrow sources, writes land in the primary database.
