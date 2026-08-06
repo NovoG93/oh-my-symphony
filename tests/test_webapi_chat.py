@@ -269,6 +269,111 @@ async def test_chat_ws_streams_turn_events(client: TestClient) -> None:
     await ws.close()
 
 
+async def test_chat_sessions_plural_crud_and_singular_alias(
+    client: TestClient,
+) -> None:
+    resp = await client.get("/api/v1/chat/sessions")
+    assert resp.status == 200
+    listing = await resp.json()
+    assert listing["sessions"] == [] and listing["resumable"] == []
+    assert listing["max_sessions"] >= 1
+
+    resp = await client.post("/api/v1/chat/sessions", json={"mode": "qa"})
+    assert resp.status == 201
+    first = (await resp.json())["session_id"]
+    resp = await client.post("/api/v1/chat/sessions", json={"mode": "edit"})
+    assert resp.status == 201
+    second = (await resp.json())["session_id"]
+
+    listing = await (await client.get("/api/v1/chat/sessions")).json()
+    assert [s["session_id"] for s in listing["sessions"]] == [first, second]
+    assert listing["active_id"] == second
+
+    # The singular alias still means "one chat session at a time".
+    resp = await client.post("/api/v1/chat/session", json={"mode": "qa"})
+    assert resp.status == 409
+    assert (await resp.json())["error"]["code"] == "chat_session_exists"
+    # ...and points at the active one.
+    assert (await (await client.get("/api/v1/chat/session")).json())[
+        "session_id"
+    ] == second
+
+    resp = await client.post(
+        f"/api/v1/chat/sessions/{first}/message", json={"text": "hello"}
+    )
+    assert resp.status == 202
+    resp = await client.patch(
+        f"/api/v1/chat/sessions/{first}", json={"mode": "edit"}
+    )
+    assert resp.status == 200
+    assert (await resp.json())["mode"] == "edit"
+
+    resp = await client.get(f"/api/v1/chat/sessions/{first}")
+    assert resp.status == 200
+    assert (await resp.json())["turn_count"] == 1
+
+    resp = await client.delete(f"/api/v1/chat/sessions/{first}")
+    assert resp.status == 200
+    resp = await client.get(f"/api/v1/chat/sessions/{first}")
+    assert resp.status == 404
+    listing = await (await client.get("/api/v1/chat/sessions")).json()
+    assert [e["session_id"] for e in listing["resumable"]] == [first]
+
+
+async def test_chat_session_id_is_validated(client: TestClient) -> None:
+    resp = await client.get("/api/v1/chat/sessions/..%2F..%2Fetc%2Fpasswd")
+    assert resp.status == 400
+    resp = await client.post("/api/v1/chat/sessions/nope/reattach", json={})
+    assert resp.status == 400
+    resp = await client.post(
+        "/api/v1/chat/sessions/20260806-000000-abcdef/reattach", json={}
+    )
+    assert resp.status == 404
+    assert (await resp.json())["error"]["code"] == "chat_no_session"
+
+
+async def test_chat_reattach_restores_a_stopped_session(
+    client: TestClient,
+) -> None:
+    resp = await client.post("/api/v1/chat/sessions", json={"mode": "qa"})
+    session_id = (await resp.json())["session_id"]
+    resp = await client.post(
+        f"/api/v1/chat/sessions/{session_id}/message", json={"text": "remember"}
+    )
+    assert resp.status == 202
+    await client.delete(f"/api/v1/chat/sessions/{session_id}")
+
+    resp = await client.post(f"/api/v1/chat/sessions/{session_id}/reattach", json={})
+    assert resp.status == 200
+    payload = await resp.json()
+    assert payload["active"] is True
+    assert "remember" in [m["text"] for m in payload["transcript_tail"]]
+
+    # Forgetting drops it from the resumable list.
+    await client.delete(f"/api/v1/chat/sessions/{session_id}?forget=true")
+    listing = await (await client.get("/api/v1/chat/sessions")).json()
+    assert listing["resumable"] == []
+
+
+async def test_chat_ws_tags_frames_and_accepts_focus(client: TestClient) -> None:
+    resp = await client.post("/api/v1/chat/sessions", json={"mode": "qa"})
+    session_id = (await resp.json())["session_id"]
+    ws = await client.ws_connect(f"/api/v1/chat/ws?session={session_id}")
+    hello = await asyncio.wait_for(ws.receive_json(), timeout=5)
+    assert hello["type"] == "hello"
+    assert hello["snapshot"]["session_id"] == session_id
+    assert [s["session_id"] for s in hello["sessions"]["sessions"]] == [session_id]
+
+    await ws.send_json({"type": "focus", "session_id": session_id})
+    await client.post(
+        f"/api/v1/chat/sessions/{session_id}/message", json={"text": "explain"}
+    )
+    frame = await asyncio.wait_for(ws.receive_json(), timeout=5)
+    assert frame["type"] == "user_message"
+    assert frame["session_id"] == session_id
+    await ws.close()
+
+
 async def test_chat_ws_rejects_cross_origin(client: TestClient) -> None:
     with pytest.raises(aiohttp.WSServerHandshakeError):
         await client.ws_connect(

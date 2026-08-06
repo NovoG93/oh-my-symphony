@@ -93,6 +93,17 @@
       return apiRequest(`/git/diff?${params.toString()}`);
     },
     postGitMerge: (payload) => apiRequest('/git/merge', { method: 'POST', body: JSON.stringify(payload) }),
+    getGitRemoteStatus: () => apiRequest('/git/remote-status'),
+    postGitBranchDelete: (payload) => apiRequest('/git/branch/delete', { method: 'POST', body: JSON.stringify(payload) }),
+    postGitPush: (payload) => apiRequest('/git/push', { method: 'POST', body: JSON.stringify(payload) }),
+    postGitPullRequest: (payload) => apiRequest('/git/pr', { method: 'POST', body: JSON.stringify(payload) }),
+    getChatSessions: () => apiRequest('/chat/sessions'),
+    createChatSession2: (payload) => apiRequest('/chat/sessions', { method: 'POST', body: JSON.stringify(payload) }),
+    getChatSessionById: (id) => apiRequest(`/chat/sessions/${encodeURIComponent(id)}`),
+    patchChatSessionById: (id, payload) => apiRequest(`/chat/sessions/${encodeURIComponent(id)}`, { method: 'PATCH', body: JSON.stringify(payload) }),
+    deleteChatSessionById: (id, { forget } = {}) => apiRequest(`/chat/sessions/${encodeURIComponent(id)}${forget ? '?forget=true' : ''}`, { method: 'DELETE' }),
+    postChatMessageTo: (id, payload) => apiRequest(`/chat/sessions/${encodeURIComponent(id)}/message`, { method: 'POST', body: JSON.stringify(payload) }),
+    reattachChatSession: (id) => apiRequest(`/chat/sessions/${encodeURIComponent(id)}/reattach`, { method: 'POST', body: '{}' }),
     getChatSession: () => apiRequest('/chat/session'),
     createChatSession: (payload) => apiRequest('/chat/session', { method: 'POST', body: JSON.stringify(payload) }),
     patchChatSession: (payload) => apiRequest('/chat/session', { method: 'PATCH', body: JSON.stringify(payload) }),
@@ -125,6 +136,8 @@
     board: null,
     workflow: null,
     branches: [],
+    // Remotes + gh availability decide which Git page actions are usable.
+    gitRemote: null,
     connected: false,
     search: '',
     boardScope: 'active',
@@ -1700,8 +1713,13 @@
 
   async function loadGitPage(body) {
     try {
-      const [taskData, branchesResp] = await Promise.all([api.getTaskBranches(), api.getBranches()]);
+      const [taskData, branchesResp, remoteStatus] = await Promise.all([
+        api.getTaskBranches(),
+        api.getBranches(),
+        api.getGitRemoteStatus().catch(() => ({ remotes: [], gh_available: false })),
+      ]);
       state.branches = branchesResp.branches;
+      state.gitRemote = remoteStatus;
       clearNode(body);
       if (taskData.note === 'not_a_git_repo') {
         body.appendChild(el('div', { class: 'empty-state' }, 'The workflow directory is not a git repository.'));
@@ -1728,13 +1746,25 @@
       rows.appendChild(el('div', { class: 'history-muted' }, 'No symphony/* task branches'));
     }
     for (const row of branches) rows.appendChild(buildTaskBranchRow(row, data, compareCard));
+    const remote = state.gitRemote || {};
+    const targetLine = [
+      el('span', { class: 'history-muted' }, 'Merge target:'),
+      el('span', { class: 'git-mono' }, data.target_branch || '(unknown)'),
+      el('span', { class: 'chip-label' }, data.auto_merge_enabled ? 'auto-merge on' : 'auto-merge off'),
+    ];
+    if (data.target_branch && remote.default_remote) {
+      targetLine.push(el('button', {
+        class: 'btn btn-ghost btn-sm git-push-target',
+        title: `Push ${data.target_branch} to ${remote.default_remote}`,
+        onClick: () => openPushTargetModal(data.target_branch, remote.default_remote),
+      }, 'Push target'));
+    }
     return el('div', { class: 'card-panel' }, [
       el('h3', null, 'Task branches'),
-      el('div', { class: 'git-target-line' }, [
-        el('span', { class: 'history-muted' }, 'Merge target:'),
-        el('span', { class: 'git-mono' }, data.target_branch || '(unknown)'),
-        el('span', { class: 'chip-label' }, data.auto_merge_enabled ? 'auto-merge on' : 'auto-merge off'),
-      ]),
+      el('div', { class: 'git-target-line' }, targetLine),
+      remote.remotes && !remote.remotes.length
+        ? el('div', { class: 'history-muted' }, 'No git remote configured — push and PR are unavailable.')
+        : null,
       rows,
     ]);
   }
@@ -1753,6 +1783,26 @@
       disabled: Boolean(row.merged || row.running),
       onClick: () => openMergeModal(row, data),
     }, 'Merge');
+    const remote = state.gitRemote || {};
+    const hasRemote = Boolean(remote.default_remote);
+    const pushBtn = el('button', {
+      class: 'btn btn-ghost btn-sm',
+      disabled: !hasRemote || Boolean(row.running),
+      title: hasRemote ? `Push to ${remote.default_remote}` : 'No git remote configured',
+      onClick: () => pushTaskBranch(row.branch, remote.default_remote),
+    }, 'Push');
+    const prBtn = el('button', {
+      class: 'btn btn-ghost btn-sm',
+      disabled: !hasRemote || !remote.gh_available,
+      title: remote.gh_available ? 'Open a pull request with gh' : 'The GitHub CLI (gh) is not on PATH',
+      onClick: () => openPullRequestModal(row, data),
+    }, 'PR');
+    const deleteBtn = el('button', {
+      class: 'btn btn-danger-outline btn-sm',
+      disabled: Boolean(row.running),
+      title: row.merged ? 'Delete this merged branch' : 'Delete this branch (not merged — needs force)',
+      onClick: () => openDeleteBranchModal(row, data),
+    }, 'Delete');
     return el('div', { class: 'branch-row' }, [
       el('div', { class: 'branch-row-main' }, [
         el('span', { class: 'git-mono' }, row.branch),
@@ -1765,8 +1815,89 @@
         el('span', { class: 'run-history-time' }, `${row.last_commit.subject} · ${timeAgo(row.last_commit.date)}`),
         compareBtn,
         mergeBtn,
+        pushBtn,
+        prBtn,
+        deleteBtn,
       ]),
     ]);
+  }
+
+  async function pushTaskBranch(branch, remote) {
+    try {
+      const result = await api.postGitPush({ branch });
+      showToast(`Pushed ${branch} to ${result.remote || remote}`, 'success');
+      renderRoute();
+    } catch (err) {
+      showToast(err.message, 'error');
+    }
+  }
+
+  // The merge target is what everyone else pulls, so pushing it asks the
+  // operator to retype the branch name (the API demands the same token).
+  function openPushTargetModal(branch, remote) {
+    const confirmInput = el('input', { class: 'input', placeholder: branch });
+    openFormModal({
+      title: `Push ${branch}`,
+      body: el('div', { class: 'form-stack' }, [
+        el('p', { class: 'confirm-message' },
+          `This pushes the shared merge target ${branch} to ${remote}. It is never a force push — a rejected push stays rejected.`),
+        field(`Type ${branch} to confirm`, confirmInput),
+      ]),
+      submitLabel: 'Push',
+      onSubmit: async () => {
+        const result = await api.postGitPush({ branch, confirm: confirmInput.value.trim() });
+        showToast(`Pushed ${branch} to ${result.remote}`, 'success');
+      },
+    });
+  }
+
+  function openDeleteBranchModal(row, data) {
+    const forceCheckbox = el('input', { type: 'checkbox', id: 'git-delete-force' });
+    forceCheckbox.checked = !row.merged;
+    openFormModal({
+      title: `Delete ${row.branch}`,
+      body: el('div', { class: 'form-stack' }, [
+        el('p', { class: 'confirm-message' }, row.merged
+          ? `${row.branch} is merged into ${data.target_branch || 'the target'}; deleting it only removes the local branch.`
+          : `${row.branch} is NOT merged into ${data.target_branch || 'the target'}. Deleting it discards those commits unless they exist elsewhere.`),
+        el('div', { class: 'form-row-inline' }, [
+          forceCheckbox,
+          el('label', { for: 'git-delete-force' }, 'Force delete unmerged commits'),
+        ]),
+      ]),
+      submitLabel: 'Delete branch',
+      onSubmit: async () => {
+        await api.postGitBranchDelete({ branch: row.branch, force: forceCheckbox.checked });
+        showToast(`Deleted ${row.branch}`, 'success');
+        renderRoute();
+      },
+    });
+  }
+
+  function openPullRequestModal(row, data) {
+    const targetSelect = buildBranchSelect(data.target_branch || '');
+    const titleInput = el('input', {
+      class: 'input',
+      value: row.ticket ? `${row.ticket.identifier}: ${row.ticket.title}` : row.identifier,
+    });
+    const bodyInput = el('textarea', { class: 'textarea', rows: 4 },
+      row.ticket ? `Symphony task branch for \`${row.ticket.identifier}\`.` : '');
+    openFormModal({
+      title: `Pull request for ${row.branch}`,
+      body: el('div', { class: 'form-stack' }, [
+        el('p', { class: 'confirm-message' }, 'Runs gh pr create. The branch must already be pushed to the remote.'),
+        field('Base branch', targetSelect),
+        field('Title', titleInput),
+        field('Body', bodyInput),
+      ]),
+      submitLabel: 'Create PR',
+      onSubmit: async () => {
+        const payload = { branch: row.branch, title: titleInput.value.trim(), body: bodyInput.value };
+        if (targetSelect.value) payload.target = targetSelect.value;
+        const result = await api.postGitPullRequest(payload);
+        showToast(result.url ? `PR created: ${result.url}` : 'PR created', 'success');
+      },
+    });
   }
 
   function openMergeModal(row, data) {
@@ -2032,7 +2163,16 @@
   // Page: Chat
   // ------------------------------------------------------------------
 
-  const chatState = { snapshot: null, busy: false, socket: null, reconnectDelay: 1000, seqSeen: 0, fontSize: 15 };
+  const chatState = {
+    snapshot: null, busy: false, socket: null, reconnectDelay: 1000, seqSeen: 0, fontSize: 15,
+    // Token deltas stream into one live bubble; `liveText` is the source of
+    // truth and DOM writes are coalesced per animation frame so a fast turn
+    // does not thrash layout once per token.
+    liveBubble: null, liveText: '', liveFrame: 0,
+    // Several sessions can run at once; the page shows one at a time and
+    // tells the socket which one so only its deltas are streamed.
+    currentId: null, sessions: null,
+  };
 
   const CHAT_FONT_KEY = 'symphony.chatFontSize';
   const CHAT_FONT_MIN = 12;
@@ -2077,8 +2217,10 @@
 
   function renderChatPage(container) {
     const page = el('div', { class: 'page page-chat' });
+    const topActions = el('div', { class: 'chat-top-actions' });
+    page.appendChild(el('div', { class: 'topbar' }, [el('h1', { class: 'page-title' }, 'Chat'), topActions]));
+    const sessionBar = el('div', { class: 'chat-session-bar' });
     const controls = el('div', { class: 'chat-controls' });
-    page.appendChild(el('div', { class: 'topbar' }, [el('h1', { class: 'page-title' }, 'Chat'), controls]));
     const transcript = el('div', { class: 'chat-transcript' });
     const typing = el('div', { class: 'chat-typing', style: 'display:none;' }, 'Agent is working…');
     const input = el('textarea', {
@@ -2094,26 +2236,146 @@
       }
     });
     page.appendChild(el('div', { class: 'chat-body' }, [
+      sessionBar,
+      controls,
       transcript,
       typing,
       el('div', { class: 'chat-composer' }, [input, sendBtn]),
     ]));
     container.appendChild(page);
-    const view = { controls, transcript, typing, input, sendBtn };
+    const view = { topActions, sessionBar, controls, transcript, typing, input, sendBtn };
     chatState.fontSize = loadChatFontSize();
     applyChatFontSize(view);
     connectChatSocket(view);
+    refreshChatSessions(view);
   }
 
   async function sendChatMessage(view) {
     const text = view.input.value.trim();
     if (!text) return;
     try {
-      await api.postChatMessage({ text });
+      if (chatState.currentId) await api.postChatMessageTo(chatState.currentId, { text });
+      else await api.postChatMessage({ text });
       view.input.value = '';
     } catch (err) {
       showToast(err.message, 'error');
     }
+  }
+
+  // ---- session bar: live tabs + resumable sessions -------------------
+
+  async function refreshChatSessions(view) {
+    try {
+      chatState.sessions = await api.getChatSessions();
+    } catch (_err) {
+      chatState.sessions = { sessions: [], resumable: [], active_id: null, max_sessions: 0 };
+    }
+    const live = chatState.sessions.sessions || [];
+    if (!live.some((s) => s.session_id === chatState.currentId)) {
+      const fallback = chatState.sessions.active_id || (live[0] && live[0].session_id) || null;
+      await selectChatSession(view, fallback);
+      return;
+    }
+    renderChatSessionBar(view);
+  }
+
+  async function selectChatSession(view, sessionId) {
+    chatState.currentId = sessionId;
+    focusChatSocket(sessionId);
+    if (!sessionId) {
+      applyChatSnapshot(view, { active: false });
+      renderChatSessionBar(view);
+      return;
+    }
+    try {
+      applyChatSnapshot(view, await api.getChatSessionById(sessionId));
+    } catch (_err) {
+      applyChatSnapshot(view, { active: false });
+    }
+    renderChatSessionBar(view);
+  }
+
+  function chatSessionLabel(meta) {
+    return truncate(meta.title || `${meta.mode} session`, 28);
+  }
+
+  function renderChatSessionBar(view) {
+    clearNode(view.sessionBar);
+    clearNode(view.topActions);
+    const listing = chatState.sessions || { sessions: [], resumable: [], max_sessions: 0 };
+    const live = listing.sessions || [];
+    const tabs = el('div', { class: 'chat-tabs' }, live.map((meta) => el('button', {
+      class: `chat-tab${meta.session_id === chatState.currentId ? ' active' : ''}`,
+      title: `${meta.agent_kind} · ${meta.mode} · started ${formatShortDateTime(meta.created_at)}`,
+      onClick: () => selectChatSession(view, meta.session_id),
+    }, [
+      el('span', { class: `chat-tab-dot${meta.busy ? ' busy' : ''}` }),
+      chatSessionLabel(meta),
+    ])));
+    view.sessionBar.appendChild(tabs);
+    const atLimit = listing.max_sessions > 0 && live.length >= listing.max_sessions;
+    view.sessionBar.appendChild(el('button', {
+      class: 'btn btn-ghost chat-new-session',
+      disabled: atLimit,
+      title: atLimit ? `Session limit reached (${listing.max_sessions}) — stop one first` : 'Start another chat session',
+      onClick: () => openNewChatSessionModal(view),
+    }, '+ New'));
+    const resumable = listing.resumable || [];
+    if (resumable.length) view.sessionBar.appendChild(buildChatResumeControl(view, resumable, atLimit));
+    view.topActions.appendChild(buildFontControls(view));
+  }
+
+  function buildChatResumeControl(view, resumable, atLimit) {
+    const select = el('select', { class: 'select chat-resume-select' }, [
+      el('option', { value: '' }, `Resume… (${resumable.length})`),
+      ...resumable.map((meta) => el('option', { value: meta.session_id },
+        `${truncate(meta.title || meta.mode, 30)} · ${formatShortDateTime(meta.updated_at || meta.created_at)}`)),
+    ]);
+    select.disabled = atLimit;
+    select.addEventListener('change', async () => {
+      const sessionId = select.value;
+      select.value = '';
+      if (!sessionId) return;
+      try {
+        const snapshot = await api.reattachChatSession(sessionId);
+        showToast('Session reattached', 'success');
+        await refreshChatSessions(view);
+        await selectChatSession(view, snapshot.session_id);
+      } catch (err) {
+        showToast(err.message, 'error');
+      }
+    });
+    return select;
+  }
+
+  function openNewChatSessionModal(view) {
+    const modeSelect = el('select', { class: 'select' }, [
+      el('option', { value: 'qa' }, 'Q&A (read-only)'),
+      el('option', { value: 'edit' }, 'Edit (co-working)'),
+    ]);
+    const turnsInput = el('input', { class: 'input chat-max-turns-input', type: 'number', min: '0', value: '50' });
+    const tokensInput = el('input', { class: 'input chat-max-tokens-input', type: 'number', min: '0', step: '1000', value: '1000000' });
+    openFormModal({
+      title: 'New chat session',
+      body: el('div', { class: 'form-stack' }, [
+        field('Mode', modeSelect),
+        fieldRow([
+          field('Warn after turns (0 = no limit)', turnsInput),
+          field('Warn after tokens (0 = no limit)', tokensInput),
+        ]),
+        el('p', { class: 'form-hint' }, 'Budgets are advisory: the chat warns and keeps running.'),
+      ]),
+      submitLabel: 'Start session',
+      onSubmit: async () => {
+        const snapshot = await api.createChatSession2({
+          mode: modeSelect.value,
+          max_turns: Math.max(0, Number(turnsInput.value) || 0),
+          max_tokens: Math.max(0, Number(tokensInput.value) || 0),
+        });
+        await refreshChatSessions(view);
+        await selectChatSession(view, snapshot.session_id);
+      },
+    });
   }
 
   function updateChatComposer(view) {
@@ -2123,35 +2385,29 @@
     view.sendBtn.disabled = disabled;
   }
 
+  // Advisory only — the chip turns red at the limit but nothing is blocked.
+  function buildChatBudgetChip(budget) {
+    const turns = budget.max_turns ? `${budget.turn_count}/${budget.max_turns} turns` : `${budget.turn_count} turns`;
+    const tokens = budget.max_tokens
+      ? `${formatCompactNumber(budget.used_tokens)}/${formatCompactNumber(budget.max_tokens)} tok`
+      : `${formatCompactNumber(budget.used_tokens)} tok`;
+    return el('span', {
+      class: `chat-budget-chip${budget.exceeded ? ' over' : ''}`,
+      title: budget.exceeded ? 'Chat budget reached — advisory, the session keeps running' : 'Turns and tokens used by this chat session',
+    }, `${turns} · ${tokens}`);
+  }
+
   function renderChatControls(view) {
     clearNode(view.controls);
     const snap = chatState.snapshot || { active: false };
     if (!snap.active) {
-      const modeSelect = el('select', { class: 'select' }, [
-        el('option', { value: 'qa' }, 'Q&A (read-only)'),
-        el('option', { value: 'edit' }, 'Edit (co-working)'),
-      ]);
-      const startBtn = el('button', {
-        class: 'btn btn-primary',
-        onClick: async (e) => {
-          e.target.disabled = true;
-          try {
-            await api.createChatSession({ mode: modeSelect.value });
-            await refreshChatControls(view);
-          } catch (err) {
-            showToast(err.message, 'error');
-          } finally {
-            e.target.disabled = false;
-          }
-        },
-      }, 'Start session');
-      view.controls.appendChild(buildFontControls(view));
-      view.controls.appendChild(modeSelect);
-      view.controls.appendChild(startBtn);
+      // Creating and reattaching sessions lives in the session bar.
+      view.controls.appendChild(el('span', { class: 'chat-hint' },
+        'No session selected — start one with “+ New” or resume a previous one.'));
       return;
     }
-    view.controls.appendChild(buildFontControls(view));
     view.controls.appendChild(el('span', { class: 'chip-label' }, snap.agent_kind));
+    if (snap.budget) view.controls.appendChild(buildChatBudgetChip(snap.budget));
     if (!snap.mode_enforced) {
       view.controls.appendChild(el('span', { class: 'chat-mode-warning' }, 'read-only not enforced'));
     }
@@ -2160,7 +2416,7 @@
       onClick: async () => {
         if (snap.mode === mode) return;
         try {
-          const result = await api.patchChatSession({ mode });
+          const result = await api.patchChatSessionById(snap.session_id, { mode });
           if (!result.context_preserved) showToast('Conversation context was reset for the new mode', 'info');
           await refreshChatControls(view);
         } catch (err) {
@@ -2171,10 +2427,11 @@
     view.controls.appendChild(toggle);
     view.controls.appendChild(el('button', {
       class: 'btn btn-ghost',
+      title: 'Stop the agent process; the transcript stays reattachable',
       onClick: async () => {
         try {
-          await api.deleteChatSession();
-          await refreshChatControls(view);
+          await api.deleteChatSessionById(snap.session_id);
+          await refreshChatSessions(view);
         } catch (err) {
           showToast(err.message, 'error');
         }
@@ -2183,10 +2440,12 @@
   }
 
   async function refreshChatControls(view) {
+    const sessionId = chatState.currentId;
     try {
-      const snap = await api.getChatSession();
-      chatState.snapshot = snap;
-      chatState.busy = Boolean(snap.busy);
+      chatState.snapshot = sessionId
+        ? await api.getChatSessionById(sessionId)
+        : await api.getChatSession();
+      chatState.busy = Boolean(chatState.snapshot.busy);
     } catch (_err) {
       chatState.snapshot = { active: false };
     }
@@ -2196,8 +2455,11 @@
 
   function applyChatSnapshot(view, snapshot) {
     chatState.snapshot = snapshot;
+    if (snapshot.session_id) chatState.currentId = snapshot.session_id;
     chatState.busy = Boolean(snapshot.busy);
     chatState.seqSeen = 0;
+    chatState.liveBubble = null;
+    chatState.liveText = '';
     renderChatControls(view);
     clearNode(view.transcript);
     const tail = snapshot.transcript_tail || [];
@@ -2208,7 +2470,48 @@
     updateChatComposer(view);
   }
 
+  function appendChatDelta(view, text) {
+    if (!text) return;
+    if (!chatState.liveBubble) {
+      const bubble = el('div', { class: 'chat-bubble chat-bubble-live' });
+      view.transcript.appendChild(el('div', { class: 'chat-msg chat-agent' }, [bubble]));
+      chatState.liveBubble = bubble;
+      chatState.liveText = '';
+    }
+    chatState.liveText += text;
+    if (chatState.liveFrame) return;
+    chatState.liveFrame = requestAnimationFrame(() => {
+      chatState.liveFrame = 0;
+      if (!chatState.liveBubble) return;
+      chatState.liveBubble.textContent = chatState.liveText;
+      view.transcript.scrollTop = view.transcript.scrollHeight;
+    });
+  }
+
+  // Deltas are plain text; the finished message is the same content as
+  // markdown, so it replaces the live bubble instead of duplicating it.
+  function finalizeChatLive(view, finalText) {
+    const bubble = chatState.liveBubble;
+    if (!bubble) return false;
+    const text = finalText != null ? finalText : chatState.liveText;
+    chatState.liveBubble = null;
+    chatState.liveText = '';
+    if (chatState.liveFrame) {
+      cancelAnimationFrame(chatState.liveFrame);
+      chatState.liveFrame = 0;
+    }
+    clearNode(bubble);
+    bubble.classList.remove('chat-bubble-live');
+    bubble.appendChild(renderMarkdown(text));
+    view.transcript.scrollTop = view.transcript.scrollHeight;
+    return true;
+  }
+
   function appendChatMessage(view, msg) {
+    if (msg.type === 'agent_delta') {
+      appendChatDelta(view, msg.text);
+      return;
+    }
     if (msg.seq != null) {
       if (msg.seq <= chatState.seqSeen) return;
       chatState.seqSeen = msg.seq;
@@ -2219,12 +2522,21 @@
     } else if (msg.type === 'turn_started') {
       view.typing.style.display = '';
     } else if (msg.type === 'turn_completed' || msg.type === 'turn_failed') {
+      finalizeChatLive(view, null);
       view.typing.style.display = 'none';
       chatState.busy = false;
+      if (msg.meta && msg.meta.budget && chatState.snapshot) {
+        chatState.snapshot.budget = msg.meta.budget;
+        renderChatControls(view);
+      }
       updateChatComposer(view);
     } else if (msg.type === 'session_status') {
       refreshChatControls(view);
+      // Lifecycle notices carry text; the per-turn agent-session echo does
+      // not, and re-listing sessions on every turn would be wasteful.
+      if (msg.text) refreshChatSessions(view);
     }
+    if (msg.type === 'agent_message' && finalizeChatLive(view, msg.text)) return;
     const node = buildChatMessageNode(msg);
     if (node) {
       view.transcript.appendChild(node);
@@ -2257,12 +2569,22 @@
     }
   }
 
+  function focusChatSocket(sessionId) {
+    const socket = chatState.socket;
+    if (!socket || socket.readyState !== WebSocket.OPEN) return;
+    socket.send(JSON.stringify({ type: 'focus', session_id: sessionId || null }));
+  }
+
   function connectChatSocket(view) {
     closeChatSocket();
     const proto = location.protocol === 'https:' ? 'wss' : 'ws';
-    const socket = new WebSocket(`${proto}://${location.host}/api/v1/chat/ws`);
+    const query = chatState.currentId ? `?session=${encodeURIComponent(chatState.currentId)}` : '';
+    const socket = new WebSocket(`${proto}://${location.host}/api/v1/chat/ws${query}`);
     chatState.socket = socket;
-    socket.onopen = () => { chatState.reconnectDelay = 1000; };
+    socket.onopen = () => {
+      chatState.reconnectDelay = 1000;
+      focusChatSocket(chatState.currentId);
+    };
     socket.onmessage = (event) => {
       let frame = null;
       try {
@@ -2270,8 +2592,23 @@
       } catch (_err) {
         return;
       }
-      if (frame.type === 'hello') applyChatSnapshot(view, frame.snapshot || { active: false });
-      else appendChatMessage(view, frame);
+      if (frame.type === 'hello') {
+        chatState.sessions = frame.sessions || chatState.sessions;
+        if (!chatState.currentId && frame.snapshot && frame.snapshot.session_id) {
+          chatState.currentId = frame.snapshot.session_id;
+        }
+        applyChatSnapshot(view, frame.snapshot || { active: false });
+        renderChatSessionBar(view);
+        return;
+      }
+      // Frames from a session the page is not showing only affect the tabs.
+      if (frame.session_id && chatState.currentId && frame.session_id !== chatState.currentId) {
+        if (frame.type === 'session_status' || frame.type === 'turn_completed' || frame.type === 'user_message') {
+          refreshChatSessions(view);
+        }
+        return;
+      }
+      appendChatMessage(view, frame);
     };
     socket.onclose = () => {
       if (chatState.socket !== socket) return;
