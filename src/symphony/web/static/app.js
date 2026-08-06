@@ -2,7 +2,7 @@
  * oh-my-symphony board — vanilla SPA (no build step, no framework).
  * Sections: api / state / dom helpers / markdown / utils / toast /
  * overlays (modal, drawer, popover) / shared form fields / router /
- * pages (board, stats, workflow, settings) / poll loop / bootstrap.
+ * pages (board, stats, workflow, git, settings) / poll loop / bootstrap.
  */
 (function () {
   'use strict';
@@ -70,6 +70,21 @@
     getContinuousImprovementStatus: () => apiRequest('/continuous-improvement/status'),
     resetContinuousImprovementTurns: () => apiRequest('/workflow/continuous-improvement/reset-turns', { method: 'POST' }),
     getBranches: () => apiRequest('/git/branches'),
+    getGitLog: ({ branch, limit } = {}) => {
+      const params = new URLSearchParams();
+      if (branch) params.set('branch', branch);
+      if (limit != null) params.set('limit', String(limit));
+      const query = params.toString();
+      return apiRequest(`/git/log${query ? `?${query}` : ''}`);
+    },
+    getTaskBranches: () => apiRequest('/git/task-branches'),
+    getGitCompare: ({ branch, target } = {}) => {
+      const params = new URLSearchParams();
+      params.set('branch', branch);
+      if (target) params.set('target', target);
+      return apiRequest(`/git/compare?${params.toString()}`);
+    },
+    postGitMerge: (payload) => apiRequest('/git/merge', { method: 'POST', body: JSON.stringify(payload) }),
     getStats: (days) => apiRequest(`/stats?days=${encodeURIComponent(days)}`),
     pause: (id) => apiRequest(`/${encodeURIComponent(id)}/pause`, { method: 'POST' }),
     resume: (id) => apiRequest(`/${encodeURIComponent(id)}/resume`, { method: 'POST' }),
@@ -82,7 +97,7 @@
   // State store
   // ------------------------------------------------------------------
 
-  const ROUTES = ['board', 'stats', 'workflow', 'settings'];
+  const ROUTES = ['board', 'stats', 'workflow', 'git', 'settings'];
 
   const PRIORITY_META = {
     0: { label: 'Urgent', short: 'P0', className: 'p0' },
@@ -706,6 +721,9 @@
         break;
       case 'workflow':
         renderWorkflowPage(view);
+        break;
+      case 'git':
+        renderGitPage(view);
         break;
       case 'settings':
         renderSettingsPage(view);
@@ -1647,6 +1665,223 @@
         kv('Max attempts', String(agent.max_attempts)),
       ]),
     ]);
+  }
+
+  // ------------------------------------------------------------------
+  // Page: Git
+  // ------------------------------------------------------------------
+
+  function renderGitPage(container) {
+    const page = el('div', { class: 'page page-git' });
+    const refreshBtn = el('button', { class: 'btn btn-ghost', onClick: () => renderRoute() }, 'Refresh');
+    page.appendChild(el('div', { class: 'topbar' }, [el('h1', { class: 'page-title' }, 'Git'), refreshBtn]));
+    const body = el('div', { class: 'git-body' }, [buildSkeletonBlock()]);
+    page.appendChild(body);
+    container.appendChild(page);
+    loadGitPage(body);
+  }
+
+  async function loadGitPage(body) {
+    try {
+      const [taskData, branchesResp] = await Promise.all([api.getTaskBranches(), api.getBranches()]);
+      state.branches = branchesResp.branches;
+      clearNode(body);
+      if (taskData.note === 'not_a_git_repo') {
+        body.appendChild(el('div', { class: 'empty-state' }, 'The workflow directory is not a git repository.'));
+        return;
+      }
+      const compareCard = buildGitCompareCard(taskData);
+      body.appendChild(buildTaskBranchesCard(taskData, compareCard));
+      body.appendChild(buildGitHistoryCard());
+      body.appendChild(compareCard.node);
+    } catch (err) {
+      clearNode(body);
+      body.appendChild(el('div', { class: 'empty-state' }, `Could not load git info: ${err.message}`));
+    }
+  }
+
+  function buildTaskBranchesCard(data, compareCard) {
+    const rows = el('div', { class: 'branch-rows' });
+    const branches = data.branches || [];
+    if (!branches.length) {
+      rows.appendChild(el('div', { class: 'history-muted' }, 'No symphony/* task branches'));
+    }
+    for (const row of branches) rows.appendChild(buildTaskBranchRow(row, data, compareCard));
+    return el('div', { class: 'card-panel' }, [
+      el('h3', null, 'Task branches'),
+      el('div', { class: 'git-target-line' }, [
+        el('span', { class: 'history-muted' }, 'Merge target:'),
+        el('span', { class: 'git-mono' }, data.target_branch || '(unknown)'),
+        el('span', { class: 'chip-label' }, data.auto_merge_enabled ? 'auto-merge on' : 'auto-merge off'),
+      ]),
+      rows,
+    ]);
+  }
+
+  function buildTaskBranchRow(row, data, compareCard) {
+    const badges = [];
+    if (row.merged) badges.push(el('span', { class: 'badge-merged' }, 'merged'));
+    else if (row.ahead != null) badges.push(el('span', { class: 'ahead-behind' }, `↑${row.ahead} ↓${row.behind}`));
+    if (row.running) badges.push(el('span', { class: 'badge-running' }, 'running'));
+    const compareBtn = el('button', {
+      class: 'btn btn-ghost btn-sm',
+      onClick: () => compareCard.load(row.branch),
+    }, 'Compare');
+    const mergeBtn = el('button', {
+      class: 'btn btn-primary btn-sm',
+      disabled: Boolean(row.merged || row.running),
+      onClick: () => openMergeModal(row, data),
+    }, 'Merge');
+    return el('div', { class: 'branch-row' }, [
+      el('div', { class: 'branch-row-main' }, [
+        el('span', { class: 'git-mono' }, row.branch),
+        row.ticket
+          ? el('span', { class: 'chip-label' }, `${row.ticket.identifier} · ${row.ticket.state}`)
+          : el('span', { class: 'history-muted' }, 'no ticket'),
+        ...badges,
+      ]),
+      el('div', { class: 'branch-row-side' }, [
+        el('span', { class: 'run-history-time' }, `${row.last_commit.subject} · ${timeAgo(row.last_commit.date)}`),
+        compareBtn,
+        mergeBtn,
+      ]),
+    ]);
+  }
+
+  function openMergeModal(row, data) {
+    const targetSelect = buildBranchSelect(data.target_branch || '');
+    const summary = el('p', { class: 'confirm-message' },
+      `Merge ${row.branch} into the selected target. Uses the same policy as the automatic merge gate (--no-ff, exclude paths, conflict preflight).`);
+    openFormModal({
+      title: `Merge ${row.branch}`,
+      body: el('div', null, [summary, field('Target branch', targetSelect)]),
+      submitLabel: 'Merge',
+      onSubmit: async () => {
+        const payload = { branch: row.branch };
+        if (targetSelect.value) payload.target = targetSelect.value;
+        const result = await api.postGitMerge(payload);
+        showToast(`Merged ${row.branch} into ${result.target}`, 'success');
+        if (row.ticket && isBlockedState(row.ticket.state)) {
+          showToast('Ticket is Blocked — use Recover on the board to unblock it', 'info');
+        }
+        renderRoute();
+      },
+    });
+  }
+
+  function buildGitHistoryCard() {
+    const options = [el('option', { value: '' }, '(all branches)')];
+    for (const branch of state.branches) options.push(el('option', { value: branch }, branch));
+    const branchSelect = el('select', { class: 'select' }, options);
+    const rows = el('div', { class: 'commit-rows' });
+    branchSelect.addEventListener('change', () => loadGitHistory(branchSelect.value, rows));
+    loadGitHistory('', rows);
+    return el('div', { class: 'card-panel' }, [
+      el('h3', null, 'History'),
+      field('Branch', branchSelect),
+      rows,
+    ]);
+  }
+
+  async function loadGitHistory(branch, rows) {
+    clearNode(rows);
+    rows.appendChild(el('div', { class: 'history-muted' }, 'Loading commits...'));
+    try {
+      const data = await api.getGitLog(branch ? { branch, limit: 50 } : { limit: 50 });
+      clearNode(rows);
+      const commits = data.commits || [];
+      if (!commits.length) {
+        rows.appendChild(el('div', { class: 'history-muted' }, 'No commits'));
+        return;
+      }
+      for (const commit of commits) rows.appendChild(buildCommitRow(commit));
+    } catch (err) {
+      clearNode(rows);
+      rows.appendChild(el('div', { class: 'history-muted' }, `History unavailable: ${err.message}`));
+    }
+  }
+
+  function buildCommitRow(commit) {
+    const refs = (commit.refs || []).map((ref) => el('span', { class: 'ref-chip' }, ref));
+    return el('div', { class: 'commit-row' }, [
+      el('span', { class: 'git-mono commit-sha' }, commit.short_sha),
+      el('span', { class: 'commit-subject' }, commit.subject),
+      ...refs,
+      el('span', { class: 'run-history-time' }, `${commit.author} · ${timeAgo(commit.date)}`),
+    ]);
+  }
+
+  function buildGitCompareCard(data) {
+    const branchOptions = [el('option', { value: '' }, 'Pick a branch…')];
+    for (const branch of state.branches) branchOptions.push(el('option', { value: branch }, branch));
+    const branchSelect = el('select', { class: 'select' }, branchOptions);
+    const targetSelect = buildBranchSelect(data.target_branch || '');
+    const resultBox = el('div', { class: 'compare-result' }, [
+      el('div', { class: 'history-muted' }, 'Pick a branch to preview what a merge would apply.'),
+    ]);
+    const loadBtn = el('button', { class: 'btn btn-ghost btn-sm', onClick: () => doLoad() }, 'Load');
+    const node = el('div', { class: 'card-panel' }, [
+      el('h3', null, 'Compare'),
+      fieldRow([field('Branch', branchSelect), field('Target', targetSelect)]),
+      loadBtn,
+      resultBox,
+    ]);
+
+    async function doLoad() {
+      const branch = branchSelect.value;
+      if (!branch) return;
+      clearNode(resultBox);
+      resultBox.appendChild(el('div', { class: 'history-muted' }, 'Comparing...'));
+      try {
+        const params = { branch };
+        if (targetSelect.value) params.target = targetSelect.value;
+        const cmp = await api.getGitCompare(params);
+        clearNode(resultBox);
+        resultBox.appendChild(el('div', { class: 'git-target-line' }, [
+          el('span', { class: 'git-mono' }, `${cmp.branch} → ${cmp.target}`),
+          el('span', { class: 'ahead-behind' }, `↑${cmp.ahead == null ? '?' : cmp.ahead} ↓${cmp.behind == null ? '?' : cmp.behind}`),
+          cmp.merged ? el('span', { class: 'badge-merged' }, 'merged') : null,
+        ]));
+        const commits = cmp.commits || [];
+        for (const commit of commits) resultBox.appendChild(buildCommitRow(commit));
+        if (cmp.commits_truncated) {
+          resultBox.appendChild(el('div', { class: 'history-muted' }, 'Commit list truncated'));
+        }
+        if (!commits.length) {
+          resultBox.appendChild(el('div', { class: 'history-muted' }, 'Nothing to merge'));
+        }
+        resultBox.appendChild(buildDiffstatTable(cmp.stat));
+      } catch (err) {
+        clearNode(resultBox);
+        resultBox.appendChild(el('div', { class: 'history-muted' }, `Compare failed: ${err.message}`));
+      }
+    }
+
+    return {
+      node,
+      load(branch) {
+        branchSelect.value = branch;
+        doLoad();
+        node.scrollIntoView({ behavior: 'smooth', block: 'start' });
+      },
+    };
+  }
+
+  function buildDiffstatTable(stat) {
+    const files = (stat && stat.files) || [];
+    if (!files.length) return el('div', { class: 'history-muted' }, 'No file changes');
+    const total = stat.total || {};
+    const rows = files.map((f) => el('tr', null, [
+      el('td', { class: 'diffstat-path' }, f.path),
+      el('td', { class: 'stat-add' }, f.binary ? 'bin' : `+${f.insertions}`),
+      el('td', { class: 'stat-del' }, f.binary ? '' : `−${f.deletions}`),
+    ]));
+    rows.push(el('tr', { class: 'diffstat-total' }, [
+      el('td', null, `${total.files || 0} files`),
+      el('td', { class: 'stat-add' }, `+${total.insertions || 0}`),
+      el('td', { class: 'stat-del' }, `−${total.deletions || 0}`),
+    ]));
+    return el('table', { class: 'diffstat-table' }, [el('tbody', null, rows)]);
   }
 
   // ------------------------------------------------------------------

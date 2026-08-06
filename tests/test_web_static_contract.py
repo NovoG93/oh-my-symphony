@@ -50,3 +50,30 @@ def test_web_board_defaults_to_active_lanes_with_terminal_group() -> None:
     assert ".ci-status-pill" in css
     assert ".mobile-lane-tabs" in css
     assert ".mobile-lane-tab.active" in css
+
+
+def test_web_git_page_contract() -> None:
+    js = (STATIC_ROOT / "app.js").read_text(encoding="utf-8")
+    css = (STATIC_ROOT / "style.css").read_text(encoding="utf-8")
+    html = (STATIC_ROOT / "index.html").read_text(encoding="utf-8")
+
+    assert 'data-route="git"' in html
+    assert "const ROUTES = ['board', 'stats', 'workflow', 'git', 'settings']" in js
+    assert "function renderGitPage(container)" in js
+    assert "getGitLog: ({ branch, limit } = {})" in js
+    assert "getTaskBranches: () => apiRequest('/git/task-branches')" in js
+    assert "getGitCompare: ({ branch, target } = {})" in js
+    assert "postGitMerge: (payload)" in js
+    assert "function buildTaskBranchesCard(data, compareCard)" in js
+    assert "function openMergeModal(row, data)" in js
+    assert "function buildGitHistoryCard()" in js
+    assert "function buildGitCompareCard(data)" in js
+    assert "not_a_git_repo" in js
+    assert "use Recover on the board" in js
+    assert ".git-body" in css
+    assert ".branch-row" in css
+    assert ".badge-merged" in css
+    assert ".badge-running" in css
+    assert ".commit-row" in css
+    assert ".ref-chip" in css
+    assert ".diffstat-table" in css
