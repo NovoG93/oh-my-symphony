@@ -173,6 +173,10 @@ def run_smoke(
         expect(base_url, "GET", "/api/v1/stats?days=7", 200)
         expect(base_url, "GET", "/api/v1/skills", 404)
         ok("workflow stats skills")
+
+        # Read-degrades to a note on non-git workflow dirs, so 200 always.
+        expect(base_url, "GET", "/api/v1/git/task-branches", 200)
+        ok("git task branches")
     finally:
         for identifier in created:
             request(base_url, "DELETE", f"/api/v1/issues/{identifier}")

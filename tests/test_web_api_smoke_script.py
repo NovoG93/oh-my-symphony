@@ -141,6 +141,7 @@ async def test_smoke_web_api_runs_against_test_server(web_base_url: str) -> None
         "issue patch",
         "refresh",
         "workflow stats skills",
+        "git task branches",
     ]
 
 

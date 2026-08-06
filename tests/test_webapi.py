@@ -6,6 +6,7 @@ stub orchestrator for the live-run surface.
 
 from __future__ import annotations
 
+import subprocess
 from pathlib import Path
 from typing import Any, AsyncIterator, cast
 
@@ -743,3 +744,141 @@ async def test_states_put_preserves_omitted_descriptions(
     board = await (await client.get("/api/v1/board")).json()
     by_name = {c["name"]: c for c in board["columns"]}
     assert by_name["Todo"]["description"] == "triage"
+
+
+# ---------------------------------------------------------------------------
+# git
+# ---------------------------------------------------------------------------
+
+
+def _git(cwd: Path, *args: str) -> None:
+    subprocess.run(
+        ["git", *args],
+        cwd=str(cwd),
+        check=True,
+        capture_output=True,
+        env={
+            "GIT_AUTHOR_NAME": "t",
+            "GIT_AUTHOR_EMAIL": "t@t",
+            "GIT_COMMITTER_NAME": "t",
+            "GIT_COMMITTER_EMAIL": "t@t",
+            "HOME": str(cwd),
+            "PATH": "/usr/bin:/bin:/usr/local/bin:/opt/homebrew/bin",
+        },
+    )
+
+
+@pytest.fixture()
+def git_repo(board_dir: Path) -> Path:
+    """Turn the workflow dir into a git repo with a symphony/SEED-1 branch."""
+    _git(board_dir, "init", "-q", "-b", "main")
+    _git(board_dir, "add", "-A")
+    _git(board_dir, "commit", "-q", "-m", "init board")
+    _git(board_dir, "checkout", "-q", "-b", "symphony/SEED-1")
+    (board_dir / "feature.py").write_text("print('hi')\n")
+    _git(board_dir, "add", "feature.py")
+    _git(board_dir, "commit", "-q", "-m", "SEED-1: feature")
+    _git(board_dir, "checkout", "-q", "main")
+    return board_dir
+
+
+async def test_git_endpoints_degrade_without_repo(client: TestClient) -> None:
+    resp = await client.get("/api/v1/git/log")
+    assert resp.status == 200
+    payload = await resp.json()
+    assert payload["note"] == "not_a_git_repo"
+    assert payload["commits"] == []
+
+    resp = await client.get("/api/v1/git/task-branches")
+    assert resp.status == 200
+    payload = await resp.json()
+    assert payload["note"] == "not_a_git_repo"
+    assert payload["branches"] == []
+
+    resp = await client.get("/api/v1/git/compare?branch=main")
+    assert resp.status == 400
+    assert (await resp.json())["error"]["code"] == "not_a_git_repo"
+
+
+async def test_git_log_lists_commits_and_validates_params(
+    git_repo: Path, client: TestClient
+) -> None:
+    resp = await client.get("/api/v1/git/log")
+    assert resp.status == 200
+    payload = await resp.json()
+    subjects = {c["subject"] for c in payload["commits"]}
+    assert subjects == {"init board", "SEED-1: feature"}
+    assert payload["note"] is None
+
+    resp = await client.get("/api/v1/git/log?branch=main&limit=1")
+    assert resp.status == 200
+    payload = await resp.json()
+    assert payload["branch"] == "main"
+    assert [c["subject"] for c in payload["commits"]] == ["init board"]
+    head = payload["commits"][0]
+    assert set(head) == {"sha", "short_sha", "author", "date", "refs", "subject"}
+
+    resp = await client.get("/api/v1/git/log?branch=no-such-branch")
+    assert resp.status == 400
+    assert (await resp.json())["error"]["code"] == "unknown_ref"
+
+    # Leading dash never reaches git as an option.
+    resp = await client.get("/api/v1/git/log?branch=--all")
+    assert resp.status == 400
+
+    resp = await client.get("/api/v1/git/log?limit=abc")
+    assert resp.status == 400
+    assert (await resp.json())["error"]["code"] == "invalid_limit"
+
+
+async def test_git_task_branches_map_tickets_and_running(
+    git_repo: Path, client: TestClient
+) -> None:
+    resp = await client.get("/api/v1/git/task-branches")
+    assert resp.status == 200
+    payload = await resp.json()
+    assert payload["target_branch"] == "main"
+    assert payload["auto_merge_enabled"] is True
+    assert payload["note"] is None
+    (row,) = payload["branches"]
+    assert row["branch"] == "symphony/SEED-1"
+    assert row["identifier"] == "SEED-1"
+    assert row["ticket"] == {
+        "identifier": "SEED-1",
+        "title": "seeded ticket",
+        "state": "Todo",
+    }
+    assert row["merged"] is False
+    assert row["ahead"] == 1
+    assert row["behind"] == 0
+    assert row["running"] is False
+    assert row["last_commit"]["subject"] == "SEED-1: feature"
+
+    client.stub.running_identifiers["SEED-1"] = "id-SEED-1"  # type: ignore[attr-defined]
+    resp = await client.get("/api/v1/git/task-branches")
+    (row,) = (await resp.json())["branches"]
+    assert row["running"] is True
+
+
+async def test_git_compare_defaults_target_to_current_branch(
+    git_repo: Path, client: TestClient
+) -> None:
+    resp = await client.get("/api/v1/git/compare?branch=symphony/SEED-1")
+    assert resp.status == 200
+    payload = await resp.json()
+    assert payload["target"] == "main"
+    assert payload["ahead"] == 1
+    assert payload["behind"] == 0
+    assert payload["merged"] is False
+    assert [c["subject"] for c in payload["commits"]] == ["SEED-1: feature"]
+    assert payload["stat"]["total"] == {"files": 1, "insertions": 1, "deletions": 0}
+    assert payload["stat"]["files"][0]["path"] == "feature.py"
+
+    resp = await client.get("/api/v1/git/compare")
+    assert resp.status == 400  # branch is required
+
+    resp = await client.get(
+        "/api/v1/git/compare?branch=symphony/SEED-1&target=no-such"
+    )
+    assert resp.status == 400
+    assert (await resp.json())["error"]["code"] == "unknown_ref"
