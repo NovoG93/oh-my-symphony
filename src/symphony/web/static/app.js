@@ -8,6 +8,12 @@
   'use strict';
 
   // ------------------------------------------------------------------
+  // i18n — dictionaries live in i18n.js, which loads before this file.
+  // ------------------------------------------------------------------
+
+  const t = (key, params) => window.i18n.t(key, params);
+
+  // ------------------------------------------------------------------
   // API layer
   // ------------------------------------------------------------------
 
@@ -40,7 +46,7 @@
     if (!res.ok) {
       const err = data && data.error;
       throw new ApiError(
-        (err && err.message) || `request failed (${res.status})`,
+        (err && err.message) || t('api.requestFailed', { status: res.status }),
         (err && err.code) || 'unknown_error',
         res.status
       );
@@ -124,11 +130,11 @@
   const ROUTES = ['board', 'stats', 'workflow', 'git', 'chat', 'settings'];
 
   const PRIORITY_META = {
-    0: { label: 'Urgent', short: 'P0', className: 'p0' },
-    1: { label: 'High', short: 'P1', className: 'p1' },
-    2: { label: 'Medium', short: 'P2', className: 'p2' },
-    3: { label: 'Low', short: 'P3', className: 'p3' },
-    4: { label: 'Minor', short: 'P4', className: 'p4' },
+    0: { label: t('priority.urgent'), short: 'P0', className: 'p0' },
+    1: { label: t('priority.high'), short: 'P1', className: 'p1' },
+    2: { label: t('priority.medium'), short: 'P2', className: 'p2' },
+    3: { label: t('priority.low'), short: 'P3', className: 'p3' },
+    4: { label: t('priority.minor'), short: 'P4', className: 'p4' },
   };
 
   const state = {
@@ -322,20 +328,20 @@
   }
 
   function timeAgo(isoString) {
-    if (!isoString) return 'unknown';
+    if (!isoString) return t('common.unknown');
     const date = new Date(isoString);
-    if (Number.isNaN(date.getTime())) return 'unknown';
+    if (Number.isNaN(date.getTime())) return t('common.unknown');
     const seconds = (Date.now() - date.getTime()) / 1000;
-    if (seconds < 45) return 'just now';
-    if (seconds < 3600) return `${Math.round(seconds / 60)}m ago`;
-    if (seconds < 86400) return `${Math.round(seconds / 3600)}h ago`;
-    return `${Math.round(seconds / 86400)}d ago`;
+    if (seconds < 45) return t('common.justNow');
+    if (seconds < 3600) return t('common.secondsAgo', { n: Math.round(seconds / 60) });
+    if (seconds < 86400) return t('common.hoursAgo', { n: Math.round(seconds / 3600) });
+    return t('common.daysAgo', { n: Math.round(seconds / 86400) });
   }
 
   function formatShortDateTime(isoString) {
-    if (!isoString) return 'open';
+    if (!isoString) return t('common.openEnded');
     const date = new Date(isoString);
-    if (Number.isNaN(date.getTime())) return 'unknown';
+    if (Number.isNaN(date.getTime())) return t('common.unknown');
     return date.toLocaleString([], {
       month: 'short',
       day: 'numeric',
@@ -423,7 +429,7 @@
     }
   }
 
-  function openFormModal({ title, body, submitLabel = 'Save', onSubmit, size }) {
+  function openFormModal({ title, body, submitLabel = t('common.save'), onSubmit, size }) {
     const errorBox = el('div', { class: 'modal-error', style: 'display:none;' });
     const submitBtn = el('button', { class: 'btn btn-primary', type: 'submit' }, submitLabel);
     const form = el(
@@ -438,7 +444,7 @@
             await onSubmit();
             closeModal();
           } catch (err) {
-            errorBox.textContent = err.message || 'Something went wrong';
+            errorBox.textContent = err.message || t('common.somethingWentWrong');
             errorBox.style.display = 'block';
           } finally {
             submitBtn.disabled = false;
@@ -448,11 +454,11 @@
       [
         el('div', { class: 'modal-header' }, [
           el('h2', null, title),
-          el('button', { class: 'btn-icon modal-close', type: 'button', 'aria-label': 'Close', onClick: closeModal }, '✕'),
+          el('button', { class: 'btn-icon modal-close', type: 'button', 'aria-label': t('common.close'), onClick: closeModal }, '✕'),
         ]),
         el('div', { class: 'modal-body' }, [body, errorBox]),
         el('div', { class: 'modal-footer' }, [
-          el('button', { class: 'btn btn-ghost', type: 'button', onClick: closeModal }, 'Cancel'),
+          el('button', { class: 'btn btn-ghost', type: 'button', onClick: closeModal }, t('common.cancel')),
           submitBtn,
         ]),
       ]
@@ -473,13 +479,13 @@
       };
       const content = el('div', { class: 'modal-form' }, [
         el('div', { class: 'modal-header' }, [
-          el('h2', null, 'Are you sure?'),
-          el('button', { class: 'btn-icon modal-close', 'aria-label': 'Close', onClick: () => finish(false) }, '✕'),
+          el('h2', null, t('common.areYouSure')),
+          el('button', { class: 'btn-icon modal-close', 'aria-label': t('common.close'), onClick: () => finish(false) }, '✕'),
         ]),
         el('div', { class: 'modal-body' }, el('p', { class: 'confirm-message' }, message)),
         el('div', { class: 'modal-footer' }, [
-          el('button', { class: 'btn btn-ghost', onClick: () => finish(false) }, 'Cancel'),
-          el('button', { class: 'btn btn-danger', onClick: () => finish(true) }, 'Delete'),
+          el('button', { class: 'btn btn-ghost', onClick: () => finish(false) }, t('common.cancel')),
+          el('button', { class: 'btn btn-danger', onClick: () => finish(true) }, t('common.delete')),
         ]),
       ]);
       openModal(content);
@@ -501,11 +507,11 @@
       style: `top:${rect.bottom + 4}px; left:${Math.max(8, rect.right - 180)}px;`,
     });
     const items = [
-      { label: 'Rename', action: () => openRenameColumnModal(col) },
-      { label: 'Edit description', action: () => openEditDescriptionModal(col) },
+      { label: t('common.rename'), action: () => openRenameColumnModal(col) },
+      { label: t('board.editDescription'), action: () => openEditDescriptionModal(col) },
     ];
-    if (col.has_prompt) items.push({ label: 'Edit prompt', action: () => openPromptEditorModal(col.name) });
-    items.push({ label: 'Delete', danger: true, action: () => deleteColumn(col) });
+    if (col.has_prompt) items.push({ label: t('board.editPrompt'), action: () => openPromptEditorModal(col.name) });
+    items.push({ label: t('common.delete'), danger: true, action: () => deleteColumn(col) });
     for (const item of items) {
       menu.appendChild(
         el(
@@ -558,7 +564,7 @@
   }
 
   function buildPrioritySelect(current) {
-    const options = [el('option', { value: '', selected: current == null }, 'No priority')];
+    const options = [el('option', { value: '', selected: current == null }, t('board.noPriority'))];
     for (const key of Object.keys(PRIORITY_META)) {
       const meta = PRIORITY_META[key];
       options.push(el('option', { value: key, selected: current != null && String(current) === key }, `${meta.short} ${meta.label}`));
@@ -573,7 +579,7 @@
 
   function buildAgentSelect(current) {
     const kinds = (state.board && state.board.board.agent_kinds) || [];
-    const options = [el('option', { value: '', selected: !current }, 'default')];
+    const options = [el('option', { value: '', selected: !current }, t('board.defaultAgent'))];
     for (const kind of kinds) options.push(el('option', { value: kind, selected: kind === current }, kind));
     return el('select', { class: 'select' }, options);
   }
@@ -592,21 +598,21 @@
   function migrationSummary(result) {
     const migratedCount = Object.keys(result.migrated || {}).length;
     const parts = [];
-    if (Object.keys(result.renamed || {}).length) parts.push(`renamed ${Object.keys(result.renamed).length}`);
-    if ((result.removed || []).length) parts.push(`removed ${result.removed.length}`);
-    if ((result.added || []).length) parts.push(`added ${result.added.length}`);
-    if (migratedCount) parts.push(`migrated ${migratedCount} ticket${migratedCount === 1 ? '' : 's'}`);
-    return parts.length ? `Workflow updated: ${parts.join(', ')}` : 'Workflow updated';
+    if (Object.keys(result.renamed || {}).length) parts.push(t('board.migrationRenamed', { n: Object.keys(result.renamed).length }));
+    if ((result.removed || []).length) parts.push(t('board.migrationRemoved', { n: result.removed.length }));
+    if ((result.added || []).length) parts.push(t('board.migrationAdded', { n: result.added.length }));
+    if (migratedCount) parts.push(t(migratedCount === 1 ? 'board.migrationMigratedOne' : 'board.migrationMigrated', { n: migratedCount }));
+    return parts.length ? t('board.workflowUpdatedWith', { summary: parts.join(', ') }) : t('board.workflowUpdated');
   }
 
   function openRenameColumnModal(col) {
     const nameInput = el('input', { class: 'input', type: 'text', value: col.name, required: true });
     openFormModal({
-      title: 'Rename column',
-      body: field('Column name', nameInput),
+      title: t('board.renameColumn'),
+      body: field(t('board.columnName'), nameInput),
       onSubmit: async () => {
         const newName = nameInput.value.trim();
-        if (!newName) throw new Error('Column name is required');
+        if (!newName) throw new Error(t('board.columnNameRequired'));
         if (newName === col.name) return;
         const result = await mutateWorkflowStates((specs) =>
           specs.map((s) => (s.name === col.name ? { ...s, name: newName, previous_name: col.name } : s))
@@ -620,18 +626,18 @@
   function openEditDescriptionModal(col) {
     const textarea = el('textarea', { class: 'textarea', rows: 4 }, col.description || '');
     openFormModal({
-      title: `Edit description — ${col.name}`,
-      body: field('Description', textarea),
+      title: t('board.editDescriptionTitle', { name: col.name }),
+      body: field(t('common.description'), textarea),
       onSubmit: async () => {
         await mutateWorkflowStates((specs) => specs.map((s) => (s.name === col.name ? { ...s, description: textarea.value } : s)));
-        showToast('Column description updated', 'success');
+        showToast(t('board.columnDescriptionUpdated'), 'success');
         await refreshBoard();
       },
     });
   }
 
   async function deleteColumn(col) {
-    const ok = await confirmDialog(`Delete column "${col.name}"? Tickets in it will move to the fallback state.`);
+    const ok = await confirmDialog(t('board.deleteColumnConfirm', { name: col.name }));
     if (!ok) return;
     try {
       const result = await mutateWorkflowStates((specs) => specs.filter((s) => s.name !== col.name));
@@ -643,21 +649,21 @@
   }
 
   function openAddColumnModal() {
-    const nameInput = el('input', { class: 'input', type: 'text', placeholder: 'e.g. In Review', required: true });
-    const descInput = el('textarea', { class: 'textarea', rows: 3, placeholder: 'Optional description' });
+    const nameInput = el('input', { class: 'input', type: 'text', placeholder: t('board.columnNamePlaceholder'), required: true });
+    const descInput = el('textarea', { class: 'textarea', rows: 3, placeholder: t('board.optionalDescription') });
     const terminalCheckbox = el('input', { type: 'checkbox', id: 'new-col-terminal' });
     const body = el('div', { class: 'form-stack' }, [
-      field('Column name', nameInput),
-      field('Description', descInput),
-      el('div', { class: 'form-row-inline' }, [terminalCheckbox, el('label', { for: 'new-col-terminal' }, 'Terminal column (no agent work happens here)')]),
+      field(t('board.columnName'), nameInput),
+      field(t('common.description'), descInput),
+      el('div', { class: 'form-row-inline' }, [terminalCheckbox, el('label', { for: 'new-col-terminal' }, t('board.terminalColumnHint'))]),
     ]);
     openFormModal({
-      title: 'Add column',
-      submitLabel: 'Add column',
+      title: t('board.addColumn'),
+      submitLabel: t('board.addColumn'),
       body,
       onSubmit: async () => {
         const name = nameInput.value.trim();
-        if (!name) throw new Error('Column name is required');
+        if (!name) throw new Error(t('board.columnNameRequired'));
         const result = await mutateWorkflowStates((specs) => [...specs, { name, description: descInput.value, terminal: terminalCheckbox.checked }]);
         showToast(migrationSummary(result), 'success');
         await refreshBoard();
@@ -666,11 +672,11 @@
   }
 
   async function openPromptEditorModal(stateName) {
-    const modalBody = el('div', { class: 'form-hint' }, 'Loading…');
+    const modalBody = el('div', { class: 'form-hint' }, t('common.loading'));
     const content = el('div', { class: 'modal-form prompt-modal-form' }, [
       el('div', { class: 'modal-header' }, [
-        el('h2', null, `Edit prompt — ${stateName}`),
-        el('button', { class: 'btn-icon modal-close', 'aria-label': 'Close', onClick: closeModal }, '✕'),
+        el('h2', null, t('board.editPromptTitle', { name: stateName })),
+        el('button', { class: 'btn-icon modal-close', 'aria-label': t('common.close'), onClick: closeModal }, '✕'),
       ]),
       el('div', { class: 'modal-body prompt-modal-content' }, modalBody),
     ]);
@@ -688,7 +694,7 @@
           errorBox.style.display = 'none';
           try {
             await api.putPrompt(stateName, textarea.value);
-            showToast('Prompt saved', 'success');
+            showToast(t('board.promptSaved'), 'success');
             closeModal();
           } catch (err) {
             errorBox.textContent = err.message;
@@ -697,16 +703,16 @@
             saveBtn.disabled = false;
           }
         },
-      }, 'Save');
+      }, t('common.save'));
       modalBody.appendChild(el('div', { class: 'prompt-path' }, data.path));
-      modalBody.appendChild(el('div', { class: 'banner banner-info' }, 'Agents pick this up on their next dispatch.'));
+      modalBody.appendChild(el('div', { class: 'banner banner-info' }, t('board.promptDispatchHint')));
       modalBody.appendChild(textarea);
       modalBody.appendChild(errorBox);
-      content.appendChild(el('div', { class: 'modal-footer' }, [el('button', { class: 'btn btn-ghost', onClick: closeModal }, 'Cancel'), saveBtn]));
+      content.appendChild(el('div', { class: 'modal-footer' }, [el('button', { class: 'btn btn-ghost', onClick: closeModal }, t('common.cancel')), saveBtn]));
     } catch (err) {
       clearNode(modalBody);
       modalBody.className = 'empty-state';
-      modalBody.appendChild(document.createTextNode(`No prompt configured: ${err.message}`));
+      modalBody.appendChild(document.createTextNode(t('board.noPromptConfigured', { error: err.message })));
     }
   }
 
@@ -781,7 +787,7 @@
     dot.classList.toggle('online', state.connected);
     dot.classList.toggle('offline', !state.connected);
     if (!state.connected) {
-      text.textContent = 'Orchestrator unreachable';
+      text.textContent = t('conn.unreachable');
       return;
     }
     const live = (state.board && state.board.live) || {};
@@ -791,7 +797,7 @@
       if (live[key].status === 'running') running++;
       else if (live[key].status === 'retrying') retrying++;
     }
-    text.textContent = `${running} running · ${retrying} retrying`;
+    text.textContent = t('conn.summary', { running, retrying });
   }
 
   // ------------------------------------------------------------------
@@ -838,7 +844,7 @@
       type: 'text',
       id: 'board-search',
       class: 'input search-input',
-      placeholder: 'Search issues…',
+      placeholder: t('board.searchPlaceholder'),
       value: state.search,
       oninput: (e) => {
         state.search = e.target.value;
@@ -847,21 +853,21 @@
     });
     const rightControls = [];
     if (hasTerminalColumns) rightControls.push(buildBoardScopeToggle());
-    if (!readOnly) rightControls.push(el('button', { class: 'btn btn-primary', onClick: () => openIssueModal() }, '+ New Issue'));
+    if (!readOnly) rightControls.push(el('button', { class: 'btn btn-primary', onClick: () => openIssueModal() }, t('board.newIssueButton')));
     const bar = el('div', { class: 'topbar' }, [
       el('div', { class: 'topbar-left' }, [search]),
       el('div', { class: 'topbar-right' }, rightControls),
     ]);
     if (!readOnly) return bar;
-    return el('div', { class: 'topbar-wrap' }, [el('div', { class: 'banner banner-info' }, 'Linear/Jira boards are read-only here.'), bar]);
+    return el('div', { class: 'topbar-wrap' }, [el('div', { class: 'banner banner-info' }, t('board.readOnlyTracker')), bar]);
   }
 
   function buildBoardScopeToggle() {
     const options = [
-      ['active', 'Active'],
-      ['all', 'All'],
+      ['active', t('common.active')],
+      ['all', t('common.all')],
     ];
-    return el('div', { class: 'segmented board-scope-toggle', role: 'group', 'aria-label': 'Board columns' }, options.map(([value, label]) =>
+    return el('div', { class: 'segmented board-scope-toggle', role: 'group', 'aria-label': t('board.scopeGroupLabel') }, options.map(([value, label]) =>
       el('button', {
         class: `segmented-btn${state.boardScope === value ? ' active' : ''}`,
         type: 'button',
@@ -889,14 +895,17 @@
     return state.boardScope === 'all' ? columns : activeColumns(columns);
   }
 
+  // Must stay in sync with the mobile breakpoint in style.css.
+  const MOBILE_BREAKPOINT = '(max-width: 768px)';
+
   function isMobileBoardViewport() {
-    return window.matchMedia('(max-width: 720px)').matches;
+    return window.matchMedia(MOBILE_BREAKPOINT).matches;
   }
 
   function buildMobileLaneTabs(columns) {
     const maxIndex = Math.max(columns.length - 1, 0);
     if (state.mobileColumnIndex > maxIndex) state.mobileColumnIndex = maxIndex;
-    return el('div', { class: 'mobile-lane-tabs', role: 'tablist', 'aria-label': 'Active lanes' },
+    return el('div', { class: 'mobile-lane-tabs', role: 'tablist', 'aria-label': t('board.activeLanes') },
       columns.map((col, index) => el('button', {
         class: `mobile-lane-tab${index === state.mobileColumnIndex ? ' active' : ''}`,
         type: 'button',
@@ -934,7 +943,7 @@
       ? visibleColumns.slice(state.mobileColumnIndex, state.mobileColumnIndex + 1)
       : visibleColumns;
     for (const col of columnsToRender) grid.appendChild(buildColumnEl(col, byColumn.get(col.name) || [], live, board.read_only));
-    if (!board.read_only && !mobileSingleLane) grid.appendChild(el('div', { class: 'add-column-ghost', onClick: openAddColumnModal }, '+ Add column'));
+    if (!board.read_only && !mobileSingleLane) grid.appendChild(el('div', { class: 'add-column-ghost', onClick: openAddColumnModal }, t('board.addColumnGhost')));
     layout.appendChild(grid);
     if (state.boardScope !== 'all') {
       const terminalGroups = columns
@@ -948,9 +957,9 @@
 
   function buildTerminalSectionEl(groups, live, readOnly) {
     const total = groups.reduce((sum, row) => sum + row.issues.length, 0);
-    const section = el('section', { class: 'terminal-section', 'aria-label': 'Terminal states' });
+    const section = el('section', { class: 'terminal-section', 'aria-label': t('board.terminalStates') });
     section.appendChild(el('div', { class: 'terminal-section-header' }, [
-      el('div', { class: 'terminal-section-title' }, 'Review and parked'),
+      el('div', { class: 'terminal-section-title' }, t('workflow.reviewAndParked')),
       el('span', { class: 'terminal-total' }, String(total)),
     ]));
     const body = el('div', { class: 'terminal-groups' });
@@ -982,8 +991,8 @@
     const dot = el('span', { class: 'state-dot', style: `background:${hashColor(col.name)}` });
     const actions = [];
     if (!readOnly) {
-      actions.push(el('button', { class: 'btn-icon', title: 'New issue', 'aria-label': `New issue in ${col.name}`, onClick: () => openIssueModal({ state: col.name }) }, '+'));
-      actions.push(el('button', { class: 'btn-icon', title: 'Column menu', 'aria-label': `${col.name} column menu`, onClick: (e) => { e.stopPropagation(); openColumnMenu(col, e.currentTarget); } }, '⋯'));
+      actions.push(el('button', { class: 'btn-icon', title: t('board.newIssue'), 'aria-label': `New issue in ${col.name}`, onClick: () => openIssueModal({ state: col.name }) }, '+'));
+      actions.push(el('button', { class: 'btn-icon', title: t('board.columnMenu'), 'aria-label': `${col.name} column menu`, onClick: (e) => { e.stopPropagation(); openColumnMenu(col, e.currentTarget); } }, '⋯'));
     }
     const header = el('div', { class: 'column-header' }, [
       el('div', { class: 'column-title-wrap' }, [dot, el('span', { class: 'column-title' }, col.name), el('span', { class: 'column-count' }, String(issues.length))]),
@@ -1016,7 +1025,7 @@
     api.patchIssue(identifier, { state: targetState }).catch((err) => {
       issue.state = previousState;
       renderBoardColumns(document.getElementById('board-scroll'));
-      showToast(`Could not move ${identifier}: ${err.message}`, 'error');
+      showToast(t('board.moveFailed', { id: identifier, error: err.message }), 'error');
     });
   }
 
@@ -1024,8 +1033,8 @@
     if (!attention) return null;
     return el('span', {
       class: `chip-attention attention-${attention.kind || 'info'}`,
-      title: attention.message || attention.label || 'Attention required',
-    }, attention.label || 'Attention');
+      title: attention.message || attention.label || t('board.attentionRequired'),
+    }, attention.label || t('board.attention'));
   }
 
   function buildCardEl(issue, liveEntry, readOnly) {
@@ -1058,18 +1067,18 @@
         class: 'btn btn-ghost btn-sm card-action',
         onClick: async (e) => {
           e.stopPropagation();
-          await runControlAction(api.skipLearn, issue.identifier, 'Skipped Learn');
+          await runControlAction(api.skipLearn, issue.identifier, t('issue.skippedLearn'));
         },
-      }, 'Skip Learn'));
+      }, t('issue.skipLearn')));
     }
     if (!readOnly && isBlockedState(issue.state) && !liveEntry) {
       card.appendChild(el('button', {
         class: 'btn btn-ghost btn-sm card-action',
         onClick: async (e) => {
           e.stopPropagation();
-          await runControlAction(api.recoverBlocked, issue.identifier, 'RCA queued');
+          await runControlAction(api.recoverBlocked, issue.identifier, t('issue.rcaQueued'));
         },
-      }, 'Open RCA'));
+      }, t('issue.openRca')));
     }
     if (liveEntry) card.appendChild(buildLiveRow(liveEntry));
     return card;
@@ -1082,40 +1091,40 @@
       statusLine.appendChild(el('span', null, 'retrying'));
     } else {
       statusLine.appendChild(el('span', { class: 'live-dot' }));
-      statusLine.appendChild(el('span', null, `turn ${liveEntry.turn_count ?? 0}`));
+      statusLine.appendChild(el('span', null, t('issue.turnCount', { n: liveEntry.turn_count ?? 0 })));
     }
     const totalTokens = liveEntry.tokens && liveEntry.tokens.total_tokens;
-    if (totalTokens != null) statusLine.appendChild(el('span', null, `${formatCompactNumber(totalTokens)} tok`));
-    if (liveEntry.paused) statusLine.appendChild(el('span', { class: 'badge-paused' }, '⏸ paused'));
+    if (totalTokens != null) statusLine.appendChild(el('span', null, t('issue.tokensShort', { n: formatCompactNumber(totalTokens) })));
+    if (liveEntry.paused) statusLine.appendChild(el('span', { class: 'badge-paused' }, t('common.pausedBadge')));
     const row = el('div', { class: 'card-live' }, [statusLine]);
     if (liveEntry.last_message) row.appendChild(el('div', { class: 'live-message' }, truncate(liveEntry.last_message, 80)));
     return row;
   }
 
   function openIssueModal(defaults = {}) {
-    const titleInput = el('input', { class: 'input', type: 'text', placeholder: 'Issue title', required: true });
-    const descInput = el('textarea', { class: 'textarea', rows: 4, placeholder: 'Description (optional, markdown supported)' });
+    const titleInput = el('input', { class: 'input', type: 'text', placeholder: t('board.issueTitle'), required: true });
+    const descInput = el('textarea', { class: 'textarea', rows: 4, placeholder: t('board.descriptionOptional') });
     const stateSelect = buildStateSelect(defaults.state);
     const prioritySelect = buildPrioritySelect(null);
-    const labelsInput = el('input', { class: 'input', type: 'text', placeholder: 'label-one, label-two' });
+    const labelsInput = el('input', { class: 'input', type: 'text', placeholder: t('board.labelsPlaceholder') });
     const agentSelect = buildAgentSelect('');
     const prefixInput = el('input', { class: 'input', type: 'text', placeholder: 'TASK', maxlength: 16 });
 
     const body = el('div', { class: 'form-stack' }, [
-      field('Title', titleInput),
-      field('Description', descInput),
-      fieldRow([field('State', stateSelect), field('Priority', prioritySelect)]),
-      field('Labels', labelsInput),
-      fieldRow([field('Agent', agentSelect), field('ID prefix', prefixInput)]),
+      field(t('common.title'), titleInput),
+      field(t('common.description'), descInput),
+      fieldRow([field(t('common.state'), stateSelect), field(t('common.priority'), prioritySelect)]),
+      field(t('common.labels'), labelsInput),
+      fieldRow([field(t('common.agent'), agentSelect), field(t('settings.idPrefix'), prefixInput)]),
     ]);
 
     openFormModal({
-      title: 'New issue',
-      submitLabel: 'Create issue',
+      title: t('board.newIssue'),
+      submitLabel: t('board.createIssue'),
       body,
       onSubmit: async () => {
         const title = titleInput.value.trim();
-        if (!title) throw new Error('Title is required');
+        if (!title) throw new Error(t('board.titleRequired'));
         const created = await api.createIssue({
           title,
           description: descInput.value,
@@ -1125,7 +1134,7 @@
           agent_kind: agentSelect.value,
           prefix: prefixInput.value.trim() || 'TASK',
         });
-        showToast(`Created ${created.identifier}`, 'success');
+        showToast(t('board.issueCreated', { id: created.identifier }), 'success');
         await refreshBoard();
       },
     });
@@ -1148,18 +1157,18 @@
     } catch (err) {
       if (state.drawerIssue !== identifier) return;
       clearNode(drawer);
-      drawer.appendChild(el('div', { class: 'drawer-error' }, `Could not load ${identifier}: ${err.message}`));
+      drawer.appendChild(el('div', { class: 'drawer-error' }, t('issue.loadFailed', { id: identifier, error: err.message })));
     }
   }
 
   async function commitField(identifier, fieldName, value, onError, onSuccess) {
     try {
       await api.patchIssue(identifier, { [fieldName]: value });
-      showToast('Saved', 'success');
+      showToast(t('common.saved'), 'success');
       if (onSuccess) onSuccess();
       await refreshBoard();
     } catch (err) {
-      showToast(`Could not save ${fieldName}: ${err.message}`, 'error');
+      showToast(t('issue.saveFailed', { field: fieldName, error: err.message }), 'error');
       if (onError) onError();
     }
   }
@@ -1178,7 +1187,7 @@
 
     const header = el('div', { class: 'drawer-header' }, [
       el('div', { class: 'drawer-id' }, detail.identifier),
-      el('button', { class: 'btn-icon', 'aria-label': 'Close', onClick: closeDrawer }, '✕'),
+      el('button', { class: 'btn-icon', 'aria-label': t('common.close'), onClick: closeDrawer }, '✕'),
     ]);
 
     // Every field passes a revert callback: a failed PATCH must snap the
@@ -1217,34 +1226,34 @@
     labelsInput.addEventListener('keydown', (e) => { if (e.key === 'Enter') labelsInput.blur(); });
 
     const fieldsGrid = el('div', { class: 'drawer-fields' }, [
-      field('State', stateSelect),
-      field('Priority', prioritySelect),
-      field('Agent', agentSelect),
-      field('Labels', labelsInput),
+      field(t('common.state'), stateSelect),
+      field(t('common.priority'), prioritySelect),
+      field(t('common.agent'), agentSelect),
+      field(t('common.labels'), labelsInput),
     ]);
 
     const deleteBtn = el('button', {
       class: 'btn btn-danger-outline',
       onClick: async () => {
-        const ok = await confirmDialog(`Delete ${detail.identifier}? This cannot be undone.`);
+        const ok = await confirmDialog(t('issue.deleteConfirm', { id: detail.identifier }));
         if (!ok) return;
         try {
           await api.deleteIssue(detail.identifier);
-          showToast(`Deleted ${detail.identifier}`, 'success');
+          showToast(t('issue.deleted', { id: detail.identifier }), 'success');
           closeDrawer();
           await refreshBoard();
         } catch (err) {
           showToast(err.message, 'error');
         }
       },
-    }, 'Delete issue');
+    }, t('issue.deleteIssue'));
 
     container.appendChild(header);
     container.appendChild(titleInput);
     container.appendChild(fieldsGrid);
     if (detail.attention) {
       container.appendChild(el('div', { class: `drawer-attention attention-${detail.attention.kind || 'info'}` }, [
-        el('strong', null, detail.attention.label || 'Attention'),
+        el('strong', null, detail.attention.label || t('board.attention')),
         el('span', null, detail.attention.message || ''),
       ]));
     }
@@ -1252,24 +1261,24 @@
       container.appendChild(el('button', {
         class: 'btn btn-ghost',
         onClick: async () => {
-          await runControlAction(api.skipLearn, detail.identifier, 'Skipped Learn');
+          await runControlAction(api.skipLearn, detail.identifier, t('issue.skippedLearn'));
         },
-      }, 'Skip Learn'));
+      }, t('issue.skipLearn')));
     }
     if (!detail.live && isBlockedState(detail.state)) {
       container.appendChild(el('button', {
         class: 'btn btn-ghost',
         onClick: async () => {
-          await runControlAction(api.recoverBlocked, detail.identifier, 'RCA queued');
+          await runControlAction(api.recoverBlocked, detail.identifier, t('issue.rcaQueued'));
         },
-      }, 'Open RCA'));
+      }, t('issue.openRca')));
     }
     if (detail.live) container.appendChild(buildLiveSection(detail));
     container.appendChild(buildRunHistorySection(detail));
     container.appendChild(buildDescriptionSection(detail));
     container.appendChild(el('div', { class: 'drawer-meta' }, [
-      el('div', null, `Created ${timeAgo(detail.created_at)}`),
-      el('div', null, `Updated ${timeAgo(detail.updated_at)}`),
+      el('div', null, t('issue.createdAgo', { ago: timeAgo(detail.created_at) })),
+      el('div', null, t('issue.updatedAgo', { ago: timeAgo(detail.updated_at) })),
     ]));
     container.appendChild(deleteBtn);
     return container;
@@ -1277,10 +1286,10 @@
 
   function buildRunHistorySection(detail) {
     const rows = el('div', { class: 'run-history-rows' }, [
-      el('div', { class: 'history-muted' }, 'Loading run history...'),
+      el('div', { class: 'history-muted' }, t('issue.loadingRunHistory')),
     ]);
     const section = el('div', { class: 'drawer-run-history' }, [
-      el('div', { class: 'section-heading' }, 'Run history'),
+      el('div', { class: 'section-heading' }, t('issue.runHistory')),
       rows,
     ]);
     loadRunHistory(detail.identifier, rows);
@@ -1293,28 +1302,28 @@
       if (state.drawerIssue !== identifier) return;
       clearNode(rows);
       if (data.registry_error) {
-        rows.appendChild(el('div', { class: 'history-muted' }, 'History unavailable'));
+        rows.appendChild(el('div', { class: 'history-muted' }, t('issue.historyUnavailable')));
         return;
       }
       const runs = data.runs || [];
       if (!runs.length) {
-        rows.appendChild(el('div', { class: 'history-muted' }, 'No runs recorded'));
+        rows.appendChild(el('div', { class: 'history-muted' }, t('issue.noRunsRecorded')));
         return;
       }
       for (const run of runs) rows.appendChild(buildRunHistoryRow(run));
     } catch (_err) {
       if (state.drawerIssue !== identifier) return;
       clearNode(rows);
-      rows.appendChild(el('div', { class: 'history-muted' }, 'History unavailable'));
+      rows.appendChild(el('div', { class: 'history-muted' }, t('issue.historyUnavailable')));
     }
   }
 
   function buildRunHistoryRow(run) {
     const attempt = run.attempt_kind || 'run';
     const agent = run.agent_kind || 'agent';
-    const status = run.status || 'unknown';
+    const status = run.status || t('common.unknown');
     const start = formatShortDateTime(run.started_at);
-    const end = run.completed_at ? formatShortDateTime(run.completed_at) : 'open';
+    const end = run.completed_at ? formatShortDateTime(run.completed_at) : t('common.openEnded');
     return el('div', { class: 'run-history-row' }, [
       el('span', { class: 'run-history-main' }, `${attempt} ${agent}`),
       el('span', { class: 'run-history-status' }, status),
@@ -1325,8 +1334,8 @@
   function buildDescriptionSection(detail) {
     let editing = false;
     const section = el('div', { class: 'drawer-description' });
-    const editBtn = el('button', { class: 'btn btn-ghost btn-sm', onClick: toggle }, 'Edit');
-    const heading = el('div', { class: 'section-heading' }, [el('span', null, 'Description'), editBtn]);
+    const editBtn = el('button', { class: 'btn btn-ghost btn-sm', onClick: toggle }, t('common.edit'));
+    const heading = el('div', { class: 'section-heading' }, [el('span', null, t('common.description')), editBtn]);
     const body = el('div', { class: 'description-body' });
     section.appendChild(heading);
     section.appendChild(body);
@@ -1345,28 +1354,28 @@
               await api.patchIssue(detail.identifier, { description: textarea.value });
               detail.description = textarea.value;
               editing = false;
-              editBtn.textContent = 'Edit';
-              showToast('Description saved', 'success');
+              editBtn.textContent = t('common.edit');
+              showToast(t('issue.descriptionSaved'), 'success');
               renderView();
             } catch (err) {
               errorBox.textContent = err.message;
               errorBox.style.display = 'block';
             }
           },
-        }, 'Save');
+        }, t('common.save'));
         body.appendChild(textarea);
         body.appendChild(errorBox);
         body.appendChild(el('div', { class: 'description-actions' }, [saveBtn]));
       } else if (detail.description) {
         body.appendChild(renderMarkdown(detail.description));
       } else {
-        body.appendChild(el('div', { class: 'form-hint' }, 'No description'));
+        body.appendChild(el('div', { class: 'form-hint' }, t('board.noDescription')));
       }
     }
 
     function toggle() {
       editing = !editing;
-      editBtn.textContent = editing ? 'Cancel' : 'Edit';
+      editBtn.textContent = editing ? t('common.cancel') : t('common.edit');
       renderView();
     }
   }
@@ -1379,18 +1388,18 @@
     const live = detail.live;
     const tokens = live.tokens || {};
     const grid = el('div', { class: 'live-grid' }, [
-      liveStat('Status', live.status || 'unknown'),
-      liveStat('Turn', String(live.turn_count ?? 0)),
-      liveStat('Tokens in', formatCompactNumber(tokens.input_tokens ?? 0)),
-      liveStat('Tokens out', formatCompactNumber(tokens.output_tokens ?? 0)),
-      liveStat('Tokens total', formatCompactNumber(tokens.total_tokens ?? 0)),
-      liveStat('Last event', live.last_event || '—'),
+      liveStat(t('common.status'), live.status || t('common.unknown')),
+      liveStat(t('common.turn'), String(live.turn_count ?? 0)),
+      liveStat(t('stats.tokensIn'), formatCompactNumber(tokens.input_tokens ?? 0)),
+      liveStat(t('stats.tokensOut'), formatCompactNumber(tokens.output_tokens ?? 0)),
+      liveStat(t('stats.tokensTotal'), formatCompactNumber(tokens.total_tokens ?? 0)),
+      liveStat(t('issue.lastEvent'), live.last_event || '—'),
     ]);
-    const section = el('div', { class: 'drawer-live' }, [el('div', { class: 'section-heading' }, 'Live run'), grid]);
+    const section = el('div', { class: 'drawer-live' }, [el('div', { class: 'section-heading' }, t('issue.liveRun')), grid]);
     if (live.last_message) section.appendChild(el('div', { class: 'live-message-block' }, live.last_message));
     const runControl = live.paused
-      ? el('button', { class: 'btn btn-ghost btn-sm', onClick: async () => { await runControlAction(api.resume, detail.identifier, 'Resumed'); } }, 'Resume')
-      : el('button', { class: 'btn btn-ghost btn-sm', onClick: async () => { await runControlAction(api.pause, detail.identifier, 'Paused'); } }, 'Pause');
+      ? el('button', { class: 'btn btn-ghost btn-sm', onClick: async () => { await runControlAction(api.resume, detail.identifier, t('issue.resumed')); } }, t('issue.resume'))
+      : el('button', { class: 'btn btn-ghost btn-sm', onClick: async () => { await runControlAction(api.pause, detail.identifier, t('common.paused')); } }, t('issue.pause'));
     section.appendChild(el('div', { class: 'live-actions' }, [runControl]));
     return section;
   }
@@ -1432,7 +1441,7 @@
     for (const days of [7, 30, 90]) {
       picker.appendChild(el('button', { class: `segmented-btn${state.statsDays === days ? ' active' : ''}`, onClick: () => { state.statsDays = days; renderRoute(); } }, `${days}d`));
     }
-    page.appendChild(el('div', { class: 'topbar' }, [el('div', { class: 'topbar-left' }, [el('h1', { class: 'page-title' }, 'Stats')]), el('div', { class: 'topbar-right' }, [picker])]));
+    page.appendChild(el('div', { class: 'topbar' }, [el('div', { class: 'topbar-left' }, [el('h1', { class: 'page-title' }, t('nav.stats'))]), el('div', { class: 'topbar-right' }, [picker])]));
     const content = el('div', { class: 'stats-content', id: 'stats-content' }, [buildStatsSkeleton()]);
     page.appendChild(content);
     container.appendChild(page);
@@ -1448,7 +1457,7 @@
       const content = document.getElementById('stats-content');
       if (content) {
         clearNode(content);
-        content.appendChild(el('div', { class: 'empty-state' }, `Could not load stats: ${err.message}`));
+        content.appendChild(el('div', { class: 'empty-state' }, t('stats.loadFailed', { error: err.message })));
       }
     }
   }
@@ -1463,7 +1472,7 @@
 
   function barChart(points, opts = {}) {
     const formatValue = opts.formatValue || formatCompactNumber;
-    if (!points.length) return el('div', { class: 'chart-empty' }, 'No data');
+    if (!points.length) return el('div', { class: 'chart-empty' }, t('common.noData'));
     const maxValue = Math.max(1, ...points.map((p) => p.value || 0));
     const width = 480;
     const height = 150;
@@ -1485,7 +1494,7 @@
 
   function hBarChart(points, opts = {}) {
     const formatValue = opts.formatValue || formatCompactNumber;
-    if (!points.length) return el('div', { class: 'chart-empty' }, 'No data');
+    if (!points.length) return el('div', { class: 'chart-empty' }, t('common.noData'));
     const maxValue = Math.max(1, ...points.map((p) => p.value || 0));
     const rows = points.map((p) => {
       const pct = Math.max(2, Math.round(((p.value || 0) / maxValue) * 100));
@@ -1503,7 +1512,7 @@
   }
 
   function buildAgentTable(rows) {
-    if (!rows.length) return el('div', { class: 'chart-empty' }, 'No agent activity yet');
+    if (!rows.length) return el('div', { class: 'chart-empty' }, t('stats.noAgentActivity'));
     const tbody = el('tbody', null, rows.map((row) => el('tr', null, [
       el('td', null, row.agent),
       el('td', null, formatCompactNumber(row.total_tokens)),
@@ -1511,7 +1520,7 @@
       el('td', null, String(row.runs)),
     ])));
     return el('table', { class: 'data-table' }, [
-      el('thead', null, el('tr', null, ['Agent', 'Tokens', 'Turns', 'Runs'].map((h) => el('th', null, h)))),
+      el('thead', null, el('tr', null, [t('common.agent'), t('common.tokens'), t('common.turns'), t('stats.runs')].map((h) => el('th', null, h)))),
       tbody,
     ]);
   }
@@ -1521,25 +1530,25 @@
     clearNode(content);
     const hasEvents = data.totals.turns > 0 || data.totals.runs > 0 || data.by_day.length > 0;
     if (!hasEvents) {
-      content.appendChild(el('div', { class: 'empty-state' }, 'No run activity recorded yet. Stats populate once agents start working tickets.'));
+      content.appendChild(el('div', { class: 'empty-state' }, t('stats.noActivity')));
       return;
     }
     content.appendChild(el('div', { class: 'stat-grid' }, [
-      statTile('Tickets done', String(data.totals.done)),
-      statTile('Total tokens', formatCompactNumber(data.totals.total)),
-      statTile('Turns', String(data.totals.turns)),
-      statTile('Runs', String(data.totals.runs)),
-      statTile('Avg cycle time', data.cycle.avg_seconds ? humanizeSeconds(data.cycle.avg_seconds) : '—'),
-      statTile('Live running', String(data.live.running)),
+      statTile(t('stats.ticketsDone'), String(data.totals.done)),
+      statTile(t('stats.totalTokens'), formatCompactNumber(data.totals.total)),
+      statTile(t('common.turns'), String(data.totals.turns)),
+      statTile(t('stats.runs'), String(data.totals.runs)),
+      statTile(t('stats.avgCycleTime'), data.cycle.avg_seconds ? humanizeSeconds(data.cycle.avg_seconds) : '—'),
+      statTile(t('issue.liveRunning'), String(data.live.running)),
     ]));
 
     const chartsGrid = el('div', { class: 'charts-grid' });
-    chartsGrid.appendChild(chartCard('Tokens per day', barChart(data.by_day.map((d) => ({ label: d.date.slice(5), value: d.total })))));
-    chartsGrid.appendChild(chartCard('Done per day', barChart(data.by_day.map((d) => ({ label: d.date.slice(5), value: d.done })))));
-    chartsGrid.appendChild(chartCard('Tokens by column', hBarChart(mapStateLabels(data.by_state, (s) => s.total_tokens))));
-    chartsGrid.appendChild(chartCard('Avg time in column', hBarChart(mapStateLabels(data.by_state, (s) => s.avg_dwell_seconds), { formatValue: humanizeSeconds })));
+    chartsGrid.appendChild(chartCard(t('stats.tokensPerDay'), barChart(data.by_day.map((d) => ({ label: d.date.slice(5), value: d.total })))));
+    chartsGrid.appendChild(chartCard(t('stats.donePerDay'), barChart(data.by_day.map((d) => ({ label: d.date.slice(5), value: d.done })))));
+    chartsGrid.appendChild(chartCard(t('stats.tokensByColumn'), hBarChart(mapStateLabels(data.by_state, (s) => s.total_tokens))));
+    chartsGrid.appendChild(chartCard(t('stats.avgTimeInColumn'), hBarChart(mapStateLabels(data.by_state, (s) => s.avg_dwell_seconds), { formatValue: humanizeSeconds })));
     content.appendChild(chartsGrid);
-    content.appendChild(chartCard('By agent', buildAgentTable(data.by_agent)));
+    content.appendChild(chartCard(t('stats.byAgent'), buildAgentTable(data.by_agent)));
   }
 
   // ------------------------------------------------------------------
@@ -1548,7 +1557,7 @@
 
   async function renderWorkflowPage(container) {
     const page = el('div', { class: 'page page-workflow' });
-    page.appendChild(el('div', { class: 'topbar' }, [el('h1', { class: 'page-title' }, 'Workflow')]));
+    page.appendChild(el('div', { class: 'topbar' }, [el('h1', { class: 'page-title' }, t('nav.workflow'))]));
     const body = el('div', { class: 'workflow-body' }, [buildSkeletonBlock()]);
     page.appendChild(body);
     container.appendChild(page);
@@ -1560,7 +1569,7 @@
       body.appendChild(buildWorkflowEditor());
     } catch (err) {
       clearNode(body);
-      body.appendChild(el('div', { class: 'empty-state' }, `Could not load workflow: ${err.message}`));
+      body.appendChild(el('div', { class: 'empty-state' }, t('workflow.loadFailed', { error: err.message })));
     }
   }
 
@@ -1585,9 +1594,9 @@
         state.workflowDraft.push({ name: '', description: '', terminal: false, has_prompt: false });
         state.wfRerender();
       },
-    }, '+ Add column'));
+    }, t('board.addColumnGhost')));
     const saveBar = el('div', { class: 'save-bar', id: 'wf-save-bar', style: 'display:none;' }, [
-      el('span', null, 'You have unsaved changes'),
+      el('span', null, t('workflow.unsavedChanges')),
       el('div', { class: 'save-bar-actions' }, [
         el('button', {
           class: 'btn btn-ghost',
@@ -1595,8 +1604,8 @@
             state.workflowDraft = state.workflow.columns.map((c) => ({ ...c, _originalName: c.name }));
             state.wfRerender();
           },
-        }, 'Discard'),
-        el('button', { class: 'btn btn-primary', onClick: saveWorkflowChanges }, 'Save changes'),
+        }, t('common.discard')),
+        el('button', { class: 'btn btn-primary', onClick: saveWorkflowChanges }, t('common.saveChanges')),
       ]),
     ]);
     wrap.appendChild(saveBar);
@@ -1613,7 +1622,7 @@
 
   function buildWfRow(row) {
     const nameInput = el('input', { class: 'input wf-name', type: 'text', value: row.name, oninput: (e) => { row.name = e.target.value; updateSaveBarVisibility(); } });
-    const descInput = el('input', { class: 'input wf-desc', type: 'text', value: row.description, placeholder: 'Description', oninput: (e) => { row.description = e.target.value; updateSaveBarVisibility(); } });
+    const descInput = el('input', { class: 'input wf-desc', type: 'text', value: row.description, placeholder: t('common.description'), oninput: (e) => { row.description = e.target.value; updateSaveBarVisibility(); } });
     const terminalInput = el('input', { type: 'checkbox', checked: row.terminal, onChange: (e) => { row.terminal = e.target.checked; state.wfRerender(); } });
     const terminalToggle = el('label', { class: 'switch' }, [terminalInput, el('span', { class: 'switch-slider' })]);
 
@@ -1621,15 +1630,15 @@
       el('span', { class: 'drag-handle', 'aria-hidden': 'true' }, '⋮⋮'),
       nameInput,
       descInput,
-      el('div', { class: 'wf-terminal-field' }, [terminalToggle, el('span', { class: 'wf-terminal-label' }, 'Terminal')]),
+      el('div', { class: 'wf-terminal-field' }, [terminalToggle, el('span', { class: 'wf-terminal-label' }, t('common.terminal'))]),
     ];
     if (row.has_prompt && !row.terminal) {
-      rowChildren.push(el('button', { class: 'btn btn-ghost btn-sm', onClick: () => openPromptEditorModal(row.name) }, 'Edit prompt'));
+      rowChildren.push(el('button', { class: 'btn btn-ghost btn-sm', onClick: () => openPromptEditorModal(row.name) }, t('board.editPrompt')));
     }
     rowChildren.push(el('button', {
       class: 'btn-icon danger',
-      title: 'Delete column',
-      'aria-label': `Delete ${row.name || 'column'}`,
+      title: t('board.deleteColumn'),
+      'aria-label': t('workflow.deleteRowAria', { name: row.name || t('workflow.columnFallback') }),
       onClick: () => {
         const idx = state.workflowDraft.indexOf(row);
         if (idx >= 0) state.workflowDraft.splice(idx, 1);
@@ -1659,12 +1668,12 @@
   async function saveWorkflowChanges() {
     const draft = state.workflowDraft;
     if (draft.some((r) => !r.name.trim())) {
-      showToast('Column name cannot be empty', 'error');
+      showToast(t('workflow.columnNameEmpty'), 'error');
       return;
     }
     const lowerNames = draft.map((r) => r.name.trim().toLowerCase());
     if (new Set(lowerNames).size !== lowerNames.length) {
-      showToast('Column names must be unique', 'error');
+      showToast(t('workflow.columnNamesUnique'), 'error');
       return;
     }
     const specs = draft.map((row) => {
@@ -1687,12 +1696,12 @@
 
   function buildAgentPolicyCard(agent) {
     return el('div', { class: 'card-panel agent-policy-card' }, [
-      el('h3', null, 'Agent policy'),
+      el('h3', null, t('settings.agentPolicy')),
       el('div', { class: 'kv-grid' }, [
-        kv('Agent kind', agent.kind),
-        kv('Max turns', String(agent.max_turns)),
-        kv('Max concurrent', String(agent.max_concurrent_agents)),
-        kv('Max attempts', String(agent.max_attempts)),
+        kv(t('issue.agentKind'), agent.kind),
+        kv(t('chat.maxTurns'), String(agent.max_turns)),
+        kv(t('settings.maxConcurrent'), String(agent.max_concurrent_agents)),
+        kv(t('settings.maxAttempts'), String(agent.max_attempts)),
       ]),
     ]);
   }
@@ -1703,8 +1712,8 @@
 
   function renderGitPage(container) {
     const page = el('div', { class: 'page page-git' });
-    const refreshBtn = el('button', { class: 'btn btn-ghost', onClick: () => renderRoute() }, 'Refresh');
-    page.appendChild(el('div', { class: 'topbar' }, [el('h1', { class: 'page-title' }, 'Git'), refreshBtn]));
+    const refreshBtn = el('button', { class: 'btn btn-ghost', onClick: () => renderRoute() }, t('common.refresh'));
+    page.appendChild(el('div', { class: 'topbar' }, [el('h1', { class: 'page-title' }, t('nav.git')), refreshBtn]));
     const body = el('div', { class: 'git-body' }, [buildSkeletonBlock()]);
     page.appendChild(body);
     container.appendChild(page);
@@ -1722,7 +1731,7 @@
       state.gitRemote = remoteStatus;
       clearNode(body);
       if (taskData.note === 'not_a_git_repo') {
-        body.appendChild(el('div', { class: 'empty-state' }, 'The workflow directory is not a git repository.'));
+        body.appendChild(el('div', { class: 'empty-state' }, t('git.notARepo')));
         return;
       }
       const diffPanel = buildDiffPanel();
@@ -1735,7 +1744,7 @@
       body.appendChild(diffPanel.node);
     } catch (err) {
       clearNode(body);
-      body.appendChild(el('div', { class: 'empty-state' }, `Could not load git info: ${err.message}`));
+      body.appendChild(el('div', { class: 'empty-state' }, t('git.loadFailed', { error: err.message })));
     }
   }
 
@@ -1743,27 +1752,27 @@
     const rows = el('div', { class: 'branch-rows' });
     const branches = data.branches || [];
     if (!branches.length) {
-      rows.appendChild(el('div', { class: 'history-muted' }, 'No symphony/* task branches'));
+      rows.appendChild(el('div', { class: 'history-muted' }, t('git.noTaskBranches')));
     }
     for (const row of branches) rows.appendChild(buildTaskBranchRow(row, data, compareCard));
     const remote = state.gitRemote || {};
     const targetLine = [
-      el('span', { class: 'history-muted' }, 'Merge target:'),
+      el('span', { class: 'history-muted' }, t('git.mergeTarget')),
       el('span', { class: 'git-mono' }, data.target_branch || '(unknown)'),
-      el('span', { class: 'chip-label' }, data.auto_merge_enabled ? 'auto-merge on' : 'auto-merge off'),
+      el('span', { class: 'chip-label' }, data.auto_merge_enabled ? t('git.autoMergeOn') : t('git.autoMergeOff')),
     ];
     if (data.target_branch && remote.default_remote) {
       targetLine.push(el('button', {
         class: 'btn btn-ghost btn-sm git-push-target',
-        title: `Push ${data.target_branch} to ${remote.default_remote}`,
+        title: t('git.pushBranchTo', { branch: data.target_branch, remote: remote.default_remote }),
         onClick: () => openPushTargetModal(data.target_branch, remote.default_remote),
-      }, 'Push target'));
+      }, t('git.pushTarget')));
     }
     return el('div', { class: 'card-panel' }, [
-      el('h3', null, 'Task branches'),
+      el('h3', null, t('git.taskBranches')),
       el('div', { class: 'git-target-line' }, targetLine),
       remote.remotes && !remote.remotes.length
-        ? el('div', { class: 'history-muted' }, 'No git remote configured — push and PR are unavailable.')
+        ? el('div', { class: 'history-muted' }, t('git.noRemoteHint'))
         : null,
       rows,
     ]);
@@ -1777,38 +1786,38 @@
     const compareBtn = el('button', {
       class: 'btn btn-ghost btn-sm',
       onClick: () => compareCard.load(row.branch),
-    }, 'Compare');
+    }, t('git.compare'));
     const mergeBtn = el('button', {
       class: 'btn btn-primary btn-sm',
       disabled: Boolean(row.merged || row.running),
       onClick: () => openMergeModal(row, data),
-    }, 'Merge');
+    }, t('git.merge'));
     const remote = state.gitRemote || {};
     const hasRemote = Boolean(remote.default_remote);
     const pushBtn = el('button', {
       class: 'btn btn-ghost btn-sm',
       disabled: !hasRemote || Boolean(row.running),
-      title: hasRemote ? `Push to ${remote.default_remote}` : 'No git remote configured',
+      title: hasRemote ? t('git.pushTo', { remote: remote.default_remote }) : t('git.noRemote'),
       onClick: () => pushTaskBranch(row.branch, remote.default_remote),
-    }, 'Push');
+    }, t('git.push'));
     const prBtn = el('button', {
       class: 'btn btn-ghost btn-sm',
       disabled: !hasRemote || !remote.gh_available,
-      title: remote.gh_available ? 'Open a pull request with gh' : 'The GitHub CLI (gh) is not on PATH',
+      title: remote.gh_available ? t('git.openPrWithGh') : t('git.ghMissing'),
       onClick: () => openPullRequestModal(row, data),
-    }, 'PR');
+    }, t('git.pr'));
     const deleteBtn = el('button', {
       class: 'btn btn-danger-outline btn-sm',
       disabled: Boolean(row.running),
-      title: row.merged ? 'Delete this merged branch' : 'Delete this branch (not merged — needs force)',
+      title: row.merged ? t('git.deleteMergedBranch') : t('git.deleteUnmergedBranch'),
       onClick: () => openDeleteBranchModal(row, data),
-    }, 'Delete');
+    }, t('common.delete'));
     return el('div', { class: 'branch-row' }, [
       el('div', { class: 'branch-row-main' }, [
         el('span', { class: 'git-mono' }, row.branch),
         row.ticket
           ? el('span', { class: 'chip-label' }, `${row.ticket.identifier} · ${row.ticket.state}`)
-          : el('span', { class: 'history-muted' }, 'no ticket'),
+          : el('span', { class: 'history-muted' }, t('git.noTicket')),
         ...badges,
       ]),
       el('div', { class: 'branch-row-side' }, [
@@ -1825,7 +1834,7 @@
   async function pushTaskBranch(branch, remote) {
     try {
       const result = await api.postGitPush({ branch });
-      showToast(`Pushed ${branch} to ${result.remote || remote}`, 'success');
+      showToast(t('git.pushed', { branch, remote: result.remote || remote }), 'success');
       renderRoute();
     } catch (err) {
       showToast(err.message, 'error');
@@ -1837,16 +1846,16 @@
   function openPushTargetModal(branch, remote) {
     const confirmInput = el('input', { class: 'input', placeholder: branch });
     openFormModal({
-      title: `Push ${branch}`,
+      title: t('git.pushTitle', { branch }),
       body: el('div', { class: 'form-stack' }, [
         el('p', { class: 'confirm-message' },
-          `This pushes the shared merge target ${branch} to ${remote}. It is never a force push — a rejected push stays rejected.`),
-        field(`Type ${branch} to confirm`, confirmInput),
+          t('git.pushSharedWarning', { branch, remote })),
+        field(t('git.typeToConfirm', { branch }), confirmInput),
       ]),
-      submitLabel: 'Push',
+      submitLabel: t('git.push'),
       onSubmit: async () => {
         const result = await api.postGitPush({ branch, confirm: confirmInput.value.trim() });
-        showToast(`Pushed ${branch} to ${result.remote}`, 'success');
+        showToast(t('git.pushed', { branch, remote: result.remote }), 'success');
       },
     });
   }
@@ -1855,20 +1864,20 @@
     const forceCheckbox = el('input', { type: 'checkbox', id: 'git-delete-force' });
     forceCheckbox.checked = !row.merged;
     openFormModal({
-      title: `Delete ${row.branch}`,
+      title: t('git.deleteTitle', { branch: row.branch }),
       body: el('div', { class: 'form-stack' }, [
         el('p', { class: 'confirm-message' }, row.merged
-          ? `${row.branch} is merged into ${data.target_branch || 'the target'}; deleting it only removes the local branch.`
-          : `${row.branch} is NOT merged into ${data.target_branch || 'the target'}. Deleting it discards those commits unless they exist elsewhere.`),
+          ? t('git.deleteMergedConfirm', { branch: row.branch, target: data.target_branch || t('git.theTarget') })
+          : t('git.deleteUnmergedConfirm', { branch: row.branch, target: data.target_branch || t('git.theTarget') })),
         el('div', { class: 'form-row-inline' }, [
           forceCheckbox,
-          el('label', { for: 'git-delete-force' }, 'Force delete unmerged commits'),
+          el('label', { for: 'git-delete-force' }, t('git.forceDelete')),
         ]),
       ]),
-      submitLabel: 'Delete branch',
+      submitLabel: t('git.deleteBranch'),
       onSubmit: async () => {
         await api.postGitBranchDelete({ branch: row.branch, force: forceCheckbox.checked });
-        showToast(`Deleted ${row.branch}`, 'success');
+        showToast(t('git.deleted', { branch: row.branch }), 'success');
         renderRoute();
       },
     });
@@ -1881,21 +1890,21 @@
       value: row.ticket ? `${row.ticket.identifier}: ${row.ticket.title}` : row.identifier,
     });
     const bodyInput = el('textarea', { class: 'textarea', rows: 4 },
-      row.ticket ? `Symphony task branch for \`${row.ticket.identifier}\`.` : '');
+      row.ticket ? t('git.prBody', { id: row.ticket.identifier }) : '');
     openFormModal({
-      title: `Pull request for ${row.branch}`,
+      title: t('git.prTitle', { branch: row.branch }),
       body: el('div', { class: 'form-stack' }, [
-        el('p', { class: 'confirm-message' }, 'Runs gh pr create. The branch must already be pushed to the remote.'),
-        field('Base branch', targetSelect),
-        field('Title', titleInput),
-        field('Body', bodyInput),
+        el('p', { class: 'confirm-message' }, t('git.prHint')),
+        field(t('git.baseBranch'), targetSelect),
+        field(t('common.title'), titleInput),
+        field(t('common.body'), bodyInput),
       ]),
-      submitLabel: 'Create PR',
+      submitLabel: t('git.createPr'),
       onSubmit: async () => {
         const payload = { branch: row.branch, title: titleInput.value.trim(), body: bodyInput.value };
         if (targetSelect.value) payload.target = targetSelect.value;
         const result = await api.postGitPullRequest(payload);
-        showToast(result.url ? `PR created: ${result.url}` : 'PR created', 'success');
+        showToast(result.url ? t('git.prCreatedWithUrl', { url: result.url }) : t('git.prCreated'), 'success');
       },
     });
   }
@@ -1903,18 +1912,18 @@
   function openMergeModal(row, data) {
     const targetSelect = buildBranchSelect(data.target_branch || '');
     const summary = el('p', { class: 'confirm-message' },
-      `Merge ${row.branch} into the selected target. Uses the same policy as the automatic merge gate (--no-ff, exclude paths, conflict preflight).`);
+      t('git.mergeHint', { branch: row.branch }));
     openFormModal({
-      title: `Merge ${row.branch}`,
-      body: el('div', null, [summary, field('Target branch', targetSelect)]),
-      submitLabel: 'Merge',
+      title: t('git.mergeTitle', { branch: row.branch }),
+      body: el('div', null, [summary, field(t('git.targetBranch'), targetSelect)]),
+      submitLabel: t('git.merge'),
       onSubmit: async () => {
         const payload = { branch: row.branch };
         if (targetSelect.value) payload.target = targetSelect.value;
         const result = await api.postGitMerge(payload);
-        showToast(`Merged ${row.branch} into ${result.target}`, 'success');
+        showToast(t('git.merged', { branch: row.branch, target: result.target }), 'success');
         if (row.ticket && isBlockedState(row.ticket.state)) {
-          showToast('Ticket is Blocked — use Recover on the board to unblock it', 'info');
+          showToast(t('issue.blockedHint'), 'info');
         }
         renderRoute();
       },
@@ -1922,28 +1931,28 @@
   }
 
   function buildGitHistoryCard(diffPanel) {
-    const options = [el('option', { value: '' }, '(all branches)')];
+    const options = [el('option', { value: '' }, t('git.allBranches'))];
     for (const branch of state.branches) options.push(el('option', { value: branch }, branch));
     const branchSelect = el('select', { class: 'select' }, options);
     const rows = el('div', { class: 'commit-rows' });
     branchSelect.addEventListener('change', () => loadGitHistory(branchSelect.value, rows, diffPanel));
     loadGitHistory('', rows, diffPanel);
     return el('div', { class: 'card-panel' }, [
-      el('h3', null, 'History'),
-      field('Branch', branchSelect),
+      el('h3', null, t('git.history')),
+      field(t('common.branch'), branchSelect),
       rows,
     ]);
   }
 
   async function loadGitHistory(branch, rows, diffPanel) {
     clearNode(rows);
-    rows.appendChild(el('div', { class: 'history-muted' }, 'Loading commits...'));
+    rows.appendChild(el('div', { class: 'history-muted' }, t('git.loadingCommits')));
     try {
       const data = await api.getGitLog(branch ? { branch, limit: 50 } : { limit: 50 });
       clearNode(rows);
       const commits = data.commits || [];
       if (!commits.length) {
-        rows.appendChild(el('div', { class: 'history-muted' }, 'No commits'));
+        rows.appendChild(el('div', { class: 'history-muted' }, t('git.noCommits')));
         return;
       }
       for (const commit of commits) rows.appendChild(buildCommitRow(commit, diffPanel));
@@ -1958,7 +1967,7 @@
     const attrs = { class: 'commit-row' };
     if (diffPanel) {
       attrs.class += ' clickable';
-      attrs.title = 'Show file changes';
+      attrs.title = t('git.showFileChanges');
       attrs.onClick = () => diffPanel.showCommit(commit);
     }
     return el('div', attrs, [
@@ -1970,17 +1979,17 @@
   }
 
   function buildGitCompareCard(data, diffPanel) {
-    const branchOptions = [el('option', { value: '' }, 'Pick a branch…')];
+    const branchOptions = [el('option', { value: '' }, t('git.pickBranch'))];
     for (const branch of state.branches) branchOptions.push(el('option', { value: branch }, branch));
     const branchSelect = el('select', { class: 'select' }, branchOptions);
     const targetSelect = buildBranchSelect(data.target_branch || '');
     const resultBox = el('div', { class: 'compare-result' }, [
-      el('div', { class: 'history-muted' }, 'Pick a branch to preview what a merge would apply.'),
+      el('div', { class: 'history-muted' }, t('git.pickBranchHint')),
     ]);
-    const loadBtn = el('button', { class: 'btn btn-ghost btn-sm', onClick: () => doLoad() }, 'Load');
+    const loadBtn = el('button', { class: 'btn btn-ghost btn-sm', onClick: () => doLoad() }, t('common.load'));
     const node = el('div', { class: 'card-panel' }, [
-      el('h3', null, 'Compare'),
-      fieldRow([field('Branch', branchSelect), field('Target', targetSelect)]),
+      el('h3', null, t('git.compare')),
+      fieldRow([field(t('common.branch'), branchSelect), field(t('common.target'), targetSelect)]),
       loadBtn,
       resultBox,
     ]);
@@ -1989,7 +1998,7 @@
       const branch = branchSelect.value;
       if (!branch) return;
       clearNode(resultBox);
-      resultBox.appendChild(el('div', { class: 'history-muted' }, 'Comparing...'));
+      resultBox.appendChild(el('div', { class: 'history-muted' }, t('git.comparing')));
       try {
         const params = { branch };
         if (targetSelect.value) params.target = targetSelect.value;
@@ -2003,10 +2012,10 @@
         const commits = cmp.commits || [];
         for (const commit of commits) resultBox.appendChild(buildCommitRow(commit, diffPanel));
         if (cmp.commits_truncated) {
-          resultBox.appendChild(el('div', { class: 'history-muted' }, 'Commit list truncated'));
+          resultBox.appendChild(el('div', { class: 'history-muted' }, t('git.commitListTruncated')));
         }
         if (!commits.length) {
-          resultBox.appendChild(el('div', { class: 'history-muted' }, 'Nothing to merge'));
+          resultBox.appendChild(el('div', { class: 'history-muted' }, t('git.nothingToMerge')));
         }
         resultBox.appendChild(buildDiffstatTable(cmp.stat, diffPanel));
         diffPanel.showCompare(cmp.branch, cmp.target);
@@ -2028,13 +2037,13 @@
 
   function buildDiffstatTable(stat, diffPanel) {
     const files = (stat && stat.files) || [];
-    if (!files.length) return el('div', { class: 'history-muted' }, 'No file changes');
+    if (!files.length) return el('div', { class: 'history-muted' }, t('git.noFileChanges'));
     const total = stat.total || {};
     const rows = files.map((f) => {
       const attrs = {};
       if (diffPanel) {
         attrs.class = 'clickable';
-        attrs.title = 'Jump to file diff';
+        attrs.title = t('git.jumpToFileDiff');
         attrs.onClick = () => diffPanel.scrollToFile(f.path);
       }
       return el('tr', attrs, [
@@ -2044,7 +2053,7 @@
       ]);
     });
     rows.push(el('tr', { class: 'diffstat-total' }, [
-      el('td', null, `${total.files || 0} files`),
+      el('td', null, t('git.filesCount', { n: total.files || 0 })),
       el('td', { class: 'stat-add' }, `+${total.insertions || 0}`),
       el('td', { class: 'stat-del' }, `−${total.deletions || 0}`),
     ]));
@@ -2052,10 +2061,10 @@
   }
 
   function buildDiffPanel() {
-    const subtitle = el('div', { class: 'diff-panel-subtitle history-muted' }, 'Load a compare or click a commit to see file changes.');
+    const subtitle = el('div', { class: 'diff-panel-subtitle history-muted' }, t('git.diffPlaceholder'));
     const bodyBox = el('div', { class: 'diff-panel-body' });
     const node = el('div', { class: 'card-panel git-diff-panel' }, [
-      el('h3', null, 'Changes'),
+      el('h3', null, t('git.changes')),
       subtitle,
       bodyBox,
     ]);
@@ -2063,7 +2072,7 @@
     function setLoading(label) {
       subtitle.textContent = label;
       clearNode(bodyBox);
-      bodyBox.appendChild(el('div', { class: 'history-muted' }, 'Loading diff...'));
+      bodyBox.appendChild(el('div', { class: 'history-muted' }, t('git.loadingDiff')));
     }
 
     function showError(message) {
@@ -2074,14 +2083,14 @@
     function renderPatch(patch, truncated) {
       clearNode(bodyBox);
       if (!patch) {
-        bodyBox.appendChild(el('div', { class: 'history-muted' }, 'No changes'));
+        bodyBox.appendChild(el('div', { class: 'history-muted' }, t('git.noChanges')));
         return;
       }
       const parsed = splitPatchByFile(patch);
       const metaText = parsed.meta.join('\n').trim();
       if (metaText) bodyBox.appendChild(el('pre', { class: 'diff-commit-meta' }, metaText));
       for (const file of parsed.files) bodyBox.appendChild(buildDiffFileSection(file));
-      if (truncated) bodyBox.appendChild(el('div', { class: 'history-muted' }, 'Diff truncated — full patch exceeds the size cap'));
+      if (truncated) bodyBox.appendChild(el('div', { class: 'history-muted' }, t('git.diffTruncated')));
     }
 
     async function showCompare(branch, target) {
@@ -2095,7 +2104,7 @@
     }
 
     async function showCommit(commit) {
-      setLoading(`commit ${commit.short_sha} — ${commit.subject}`);
+      setLoading(t('git.commitLabel', { sha: commit.short_sha, subject: commit.subject }));
       try {
         const data = await api.getGitDiff({ commit: commit.sha });
         renderPatch(data.patch, data.truncated);
@@ -2151,7 +2160,7 @@
       line.startsWith('+++') || line.startsWith('---') ||
       line.startsWith('new file') || line.startsWith('deleted file') ||
       line.startsWith('similarity') || line.startsWith('rename ') ||
-      line.startsWith('Binary files')
+      line.startsWith(t('git.binaryFiles'))
     ) return 'diff-meta';
     if (line.startsWith('@@')) return 'diff-hunk';
     if (line.startsWith('+')) return 'diff-add';
@@ -2201,8 +2210,8 @@
 
   function buildFontControls(view) {
     return el('div', { class: 'chat-font-controls' }, [
-      el('button', { class: 'btn-icon', title: 'Smaller text', 'aria-label': 'Decrease chat font size', onClick: () => bumpChatFont(view, -1) }, 'A−'),
-      el('button', { class: 'btn-icon', title: 'Larger text', 'aria-label': 'Increase chat font size', onClick: () => bumpChatFont(view, 1) }, 'A+'),
+      el('button', { class: 'btn-icon', title: t('chat.smallerText'), 'aria-label': t('chat.decreaseFont'), onClick: () => bumpChatFont(view, -1) }, 'A−'),
+      el('button', { class: 'btn-icon', title: t('chat.largerText'), 'aria-label': t('chat.increaseFont'), onClick: () => bumpChatFont(view, 1) }, 'A+'),
     ]);
   }
 
@@ -2218,17 +2227,17 @@
   function renderChatPage(container) {
     const page = el('div', { class: 'page page-chat' });
     const topActions = el('div', { class: 'chat-top-actions' });
-    page.appendChild(el('div', { class: 'topbar' }, [el('h1', { class: 'page-title' }, 'Chat'), topActions]));
+    page.appendChild(el('div', { class: 'topbar' }, [el('h1', { class: 'page-title' }, t('nav.chat')), topActions]));
     const sessionBar = el('div', { class: 'chat-session-bar' });
     const controls = el('div', { class: 'chat-controls' });
     const transcript = el('div', { class: 'chat-transcript' });
-    const typing = el('div', { class: 'chat-typing', style: 'display:none;' }, 'Agent is working…');
+    const typing = el('div', { class: 'chat-typing', style: 'display:none;' }, t('issue.agentWorking'));
     const input = el('textarea', {
       class: 'textarea chat-input',
       rows: 2,
-      placeholder: 'Ask about this repository… (Enter to send, Shift+Enter for newline)',
+      placeholder: t('chat.inputPlaceholder'),
     });
-    const sendBtn = el('button', { class: 'btn btn-primary', onClick: () => sendChatMessage(view) }, 'Send');
+    const sendBtn = el('button', { class: 'btn btn-primary', onClick: () => sendChatMessage(view) }, t('chat.send'));
     input.addEventListener('keydown', (e) => {
       if (e.key === 'Enter' && !e.shiftKey) {
         e.preventDefault();
@@ -2296,7 +2305,7 @@
   }
 
   function chatSessionLabel(meta) {
-    return truncate(meta.title || `${meta.mode} session`, 28);
+    return truncate(meta.title || t('chat.sessionTitleFallback', { mode: meta.mode }), 28);
   }
 
   function renderChatSessionBar(view) {
@@ -2306,7 +2315,7 @@
     const live = listing.sessions || [];
     const tabs = el('div', { class: 'chat-tabs' }, live.map((meta) => el('button', {
       class: `chat-tab${meta.session_id === chatState.currentId ? ' active' : ''}`,
-      title: `${meta.agent_kind} · ${meta.mode} · started ${formatShortDateTime(meta.created_at)}`,
+      title: t('chat.sessionMeta', { agent: meta.agent_kind, mode: meta.mode, time: formatShortDateTime(meta.created_at) }),
       onClick: () => selectChatSession(view, meta.session_id),
     }, [
       el('span', { class: `chat-tab-dot${meta.busy ? ' busy' : ''}` }),
@@ -2317,9 +2326,9 @@
     view.sessionBar.appendChild(el('button', {
       class: 'btn btn-ghost chat-new-session',
       disabled: atLimit,
-      title: atLimit ? `Session limit reached (${listing.max_sessions}) — stop one first` : 'Start another chat session',
+      title: atLimit ? t('chat.sessionLimit', { max: listing.max_sessions }) : t('chat.startAnother'),
       onClick: () => openNewChatSessionModal(view),
-    }, '+ New'));
+    }, t('chat.newSessionShort')));
     const resumable = listing.resumable || [];
     if (resumable.length) view.sessionBar.appendChild(buildChatResumeControl(view, resumable, atLimit));
     view.topActions.appendChild(buildFontControls(view));
@@ -2327,7 +2336,7 @@
 
   function buildChatResumeControl(view, resumable, atLimit) {
     const select = el('select', { class: 'select chat-resume-select' }, [
-      el('option', { value: '' }, `Resume… (${resumable.length})`),
+      el('option', { value: '' }, t('chat.resumeCount', { n: resumable.length })),
       ...resumable.map((meta) => el('option', { value: meta.session_id },
         `${truncate(meta.title || meta.mode, 30)} · ${formatShortDateTime(meta.updated_at || meta.created_at)}`)),
     ]);
@@ -2338,7 +2347,7 @@
       if (!sessionId) return;
       try {
         const snapshot = await api.reattachChatSession(sessionId);
-        showToast('Session reattached', 'success');
+        showToast(t('chat.sessionReattached'), 'success');
         await refreshChatSessions(view);
         await selectChatSession(view, snapshot.session_id);
       } catch (err) {
@@ -2350,22 +2359,22 @@
 
   function openNewChatSessionModal(view) {
     const modeSelect = el('select', { class: 'select' }, [
-      el('option', { value: 'qa' }, 'Q&A (read-only)'),
-      el('option', { value: 'edit' }, 'Edit (co-working)'),
+      el('option', { value: 'qa' }, t('chat.qaReadOnly')),
+      el('option', { value: 'edit' }, t('chat.editCoworking')),
     ]);
     const turnsInput = el('input', { class: 'input chat-max-turns-input', type: 'number', min: '0', value: '50' });
     const tokensInput = el('input', { class: 'input chat-max-tokens-input', type: 'number', min: '0', step: '1000', value: '1000000' });
     openFormModal({
-      title: 'New chat session',
+      title: t('chat.newSession'),
       body: el('div', { class: 'form-stack' }, [
-        field('Mode', modeSelect),
+        field(t('common.mode'), modeSelect),
         fieldRow([
-          field('Warn after turns (0 = no limit)', turnsInput),
-          field('Warn after tokens (0 = no limit)', tokensInput),
+          field(t('chat.warnAfterTurns'), turnsInput),
+          field(t('chat.warnAfterTokens'), tokensInput),
         ]),
-        el('p', { class: 'form-hint' }, 'Budgets are advisory: the chat warns and keeps running.'),
+        el('p', { class: 'form-hint' }, t('chat.budgetHint')),
       ]),
-      submitLabel: 'Start session',
+      submitLabel: t('chat.startSession'),
       onSubmit: async () => {
         const snapshot = await api.createChatSession2({
           mode: modeSelect.value,
@@ -2387,13 +2396,15 @@
 
   // Advisory only — the chip turns red at the limit but nothing is blocked.
   function buildChatBudgetChip(budget) {
-    const turns = budget.max_turns ? `${budget.turn_count}/${budget.max_turns} turns` : `${budget.turn_count} turns`;
+    const turns = budget.max_turns
+      ? t('chat.turnsUsedMax', { used: budget.turn_count, max: budget.max_turns })
+      : t('chat.turnsUsedOnly', { used: budget.turn_count });
     const tokens = budget.max_tokens
-      ? `${formatCompactNumber(budget.used_tokens)}/${formatCompactNumber(budget.max_tokens)} tok`
-      : `${formatCompactNumber(budget.used_tokens)} tok`;
+      ? t('chat.tokensUsedMax', { used: formatCompactNumber(budget.used_tokens), max: formatCompactNumber(budget.max_tokens) })
+      : t('chat.tokensUsedOnly', { used: formatCompactNumber(budget.used_tokens) });
     return el('span', {
       class: `chat-budget-chip${budget.exceeded ? ' over' : ''}`,
-      title: budget.exceeded ? 'Chat budget reached — advisory, the session keeps running' : 'Turns and tokens used by this chat session',
+      title: budget.exceeded ? t('chat.budgetReached') : t('chat.usageHint'),
     }, `${turns} · ${tokens}`);
   }
 
@@ -2403,13 +2414,13 @@
     if (!snap.active) {
       // Creating and reattaching sessions lives in the session bar.
       view.controls.appendChild(el('span', { class: 'chat-hint' },
-        'No session selected — start one with “+ New” or resume a previous one.'));
+        t('chat.noSessionSelected')));
       return;
     }
     view.controls.appendChild(el('span', { class: 'chip-label' }, snap.agent_kind));
     if (snap.budget) view.controls.appendChild(buildChatBudgetChip(snap.budget));
     if (!snap.mode_enforced) {
-      view.controls.appendChild(el('span', { class: 'chat-mode-warning' }, 'read-only not enforced'));
+      view.controls.appendChild(el('span', { class: 'chat-mode-warning' }, t('chat.readOnlyNotEnforced')));
     }
     const toggle = el('div', { class: 'chat-mode-toggle' }, ['qa', 'edit'].map((mode) => el('button', {
       class: `chat-mode-btn${snap.mode === mode ? ' active' : ''}`,
@@ -2417,17 +2428,17 @@
         if (snap.mode === mode) return;
         try {
           const result = await api.patchChatSessionById(snap.session_id, { mode });
-          if (!result.context_preserved) showToast('Conversation context was reset for the new mode', 'info');
+          if (!result.context_preserved) showToast(t('chat.modeResetContext'), 'info');
           await refreshChatControls(view);
         } catch (err) {
           showToast(err.message, 'error');
         }
       },
-    }, mode === 'qa' ? 'Q&A' : 'Edit')));
+    }, mode === 'qa' ? t('chat.qa') : t('common.edit'))));
     view.controls.appendChild(toggle);
     view.controls.appendChild(el('button', {
       class: 'btn btn-ghost',
-      title: 'Stop the agent process; the transcript stays reattachable',
+      title: t('chat.stopHint'),
       onClick: async () => {
         try {
           await api.deleteChatSessionById(snap.session_id);
@@ -2436,7 +2447,7 @@
           showToast(err.message, 'error');
         }
       },
-    }, 'Stop'));
+    }, t('chat.stop')));
   }
 
   async function refreshChatControls(view) {
@@ -2465,7 +2476,7 @@
     const tail = snapshot.transcript_tail || [];
     for (const msg of tail) appendChatMessage(view, msg);
     if (!snapshot.active && !tail.length) {
-      view.transcript.appendChild(el('div', { class: 'empty-state' }, 'Start a session to chat with the connected agent about this repository.'));
+      view.transcript.appendChild(el('div', { class: 'empty-state' }, t('chat.startHint')));
     }
     updateChatComposer(view);
   }
@@ -2561,7 +2572,7 @@
         ]);
       }
       case 'turn_failed':
-        return el('div', { class: 'chat-msg chat-error' }, msg.text || 'turn failed');
+        return el('div', { class: 'chat-msg chat-error' }, msg.text || t('chat.turnFailed'));
       case 'session_status':
         return msg.text ? el('div', { class: 'chat-status' }, msg.text) : null;
       default:
@@ -2626,7 +2637,7 @@
   // ------------------------------------------------------------------
 
   function buildBranchSelect(current) {
-    const options = [el('option', { value: '', selected: !current }, '(current branch)')];
+    const options = [el('option', { value: '', selected: !current }, t('git.currentBranch'))];
     for (const branch of state.branches) options.push(el('option', { value: branch, selected: branch === current }, branch));
     return el('select', { class: 'select' }, options);
   }
@@ -2634,7 +2645,7 @@
   async function saveBranchPolicy(payload) {
     try {
       await api.putBranchPolicy(payload);
-      showToast('Branch policy saved', 'success');
+      showToast(t('workflow.branchPolicySaved'), 'success');
     } catch (err) {
       showToast(err.message, 'error');
     }
@@ -2646,27 +2657,27 @@
     featureSelect.addEventListener('change', () => saveBranchPolicy({ feature_base_branch: featureSelect.value }));
     targetSelect.addEventListener('change', () => saveBranchPolicy({ auto_merge_target_branch: targetSelect.value }));
     return el('div', { class: 'card-panel' }, [
-      el('h3', null, 'Branch policy'),
-      fieldRow([field('Feature base branch', featureSelect), field('Merge target branch', targetSelect)]),
+      el('h3', null, t('workflow.branchPolicy')),
+      fieldRow([field(t('workflow.featureBaseBranch'), featureSelect), field(t('workflow.mergeTargetBranch'), targetSelect)]),
     ]);
   }
 
   function ciStatusView(ci, status) {
-    if (!ci || !ci.enabled) return { label: 'Disabled', className: 'muted' };
-    if (status && status.in_flight) return { label: 'Running', className: 'active' };
+    if (!ci || !ci.enabled) return { label: t('common.disabled'), className: 'muted' };
+    if (status && status.in_flight) return { label: t('common.running'), className: 'active' };
     const reason = status && status.skipped_reason;
-    if (reason === 'board_busy') return { label: 'Board busy', className: 'waiting' };
-    if (reason === 'lease_held') return { label: 'Lease held', className: 'waiting' };
-    if (reason === 'max_turns_reached') return { label: 'Turn budget exhausted', className: 'failed' };
-    if (status && status.last_result === 'failed') return { label: 'Failed', className: 'failed' };
-    if (status && status.last_result === 'not_proven') return { label: 'Not proven', className: 'failed' };
-    if (status && (status.last_result === 'passed' || status.last_result === 'succeeded')) return { label: 'Completed', className: 'ok' };
-    return { label: 'Waiting', className: 'waiting' };
+    if (reason === 'board_busy') return { label: t('board.busy'), className: 'waiting' };
+    if (reason === 'lease_held') return { label: t('issue.leaseHeld'), className: 'waiting' };
+    if (reason === 'max_turns_reached') return { label: t('issue.turnBudgetExhausted'), className: 'failed' };
+    if (status && status.last_result === 'failed') return { label: t('common.failed'), className: 'failed' };
+    if (status && status.last_result === 'not_proven') return { label: t('common.notProven'), className: 'failed' };
+    if (status && (status.last_result === 'passed' || status.last_result === 'succeeded')) return { label: t('common.completed'), className: 'ok' };
+    return { label: t('common.waiting'), className: 'waiting' };
   }
 
   function ciAgentOptions(wf, current) {
     const kinds = (state.board && state.board.board.agent_kinds) || wf.agent_kinds || [];
-    const defaultLabel = `Workflow default (${(wf.agent && wf.agent.kind) || 'default'})`;
+    const defaultLabel = t('settings.workflowDefault', { kind: (wf.agent && wf.agent.kind) || t('board.defaultAgent') });
     const options = [el('option', { value: '', selected: !current }, defaultLabel)];
     for (const kind of kinds) options.push(el('option', { value: kind, selected: kind === current }, kind));
     return options;
@@ -2687,7 +2698,7 @@
         e.target.disabled = true;
         try {
           const result = await api.resetContinuousImprovementTurns();
-          showToast('Heartbeat turn counter reset', 'success');
+          showToast(t('workflow.turnsReset'), 'success');
           renderRoute();
           return result;
         } catch (err) {
@@ -2697,7 +2708,7 @@
           e.target.disabled = false;
         }
       },
-    }, 'Reset turns');
+    }, t('workflow.resetTurns'));
     const saveButton = el('button', {
       class: 'btn btn-primary',
       onClick: async (e) => {
@@ -2711,7 +2722,7 @@
           };
           const result = await api.putContinuousImprovement(payload);
           state.workflow = { ...wf, continuous_improvement: result.continuous_improvement };
-          showToast('Continuous improvement saved', 'success');
+          showToast(t('workflow.continuousImprovementSaved'), 'success');
           renderRoute();
         } catch (err) {
           showToast(err.message, 'error');
@@ -2719,27 +2730,27 @@
           e.target.disabled = false;
         }
       },
-    }, 'Save');
+    }, t('common.save'));
     return el('div', { class: 'card-panel ci-card' }, [
       el('div', { class: 'ci-card-header' }, [
-        el('h3', null, 'Continuous improvement'),
+        el('h3', null, t('workflow.continuousImprovement')),
         el('span', { class: `ci-status-pill ${statusView.className}` }, statusView.label),
       ]),
       fieldRow([
-        field('Enabled', el('label', { class: 'switch' }, [enabledInput, el('span', { class: 'switch-slider' })])),
-        field('Interval (ms)', intervalInput),
+        field(t('common.enabled'), el('label', { class: 'switch' }, [enabledInput, el('span', { class: 'switch-slider' })])),
+        field(t('workflow.intervalMs'), intervalInput),
       ]),
       fieldRow([
-        field('Max turns', maxTurnsInput),
-        field('Ticket agent', agentSelect),
+        field(t('chat.maxTurns'), maxTurnsInput),
+        field(t('issue.ticketAgent'), agentSelect),
       ]),
       el('div', { class: 'ci-status-grid' }, [
-        kv('Turns used', `${status.turns_used == null ? 0 : status.turns_used} / ${ci.max_turns === 0 ? 'unlimited' : ci.max_turns}`),
-        kv('Phase', status.current_phase || '—'),
-        kv('Last result', status.last_result || '—'),
-        kv('Skipped reason', status.skipped_reason || '—'),
-        kv('Tickets created', String(status.tickets_created || 0)),
-        kv('Next due', status.next_due_at || '—'),
+        kv(t('workflow.turnsUsed'), `${status.turns_used == null ? 0 : status.turns_used} / ${ci.max_turns === 0 ? t('workflow.unlimited') : ci.max_turns}`),
+        kv(t('common.phase'), status.current_phase || '—'),
+        kv(t('issue.lastResult'), status.last_result || '—'),
+        kv(t('issue.skippedReason'), status.skipped_reason || '—'),
+        kv(t('stats.ticketsCreated'), String(status.tickets_created || 0)),
+        kv(t('workflow.nextDue'), status.next_due_at || '—'),
       ]),
       el('div', { class: 'ci-actions' }, [saveButton, resetButton]),
     ]);
@@ -2747,14 +2758,29 @@
 
   function buildBoardInfoCard(wf) {
     return el('div', { class: 'card-panel' }, [
-      el('h3', null, 'Board info'),
+      el('h3', null, t('settings.boardInfo')),
       el('div', { class: 'kv-grid' }, [
-        kv('Workflow path', wf.workflow_path),
-        kv('Default agent', (wf.agent && wf.agent.kind) || '—'),
-        kv('Tracker kind', state.board ? state.board.board.tracker_kind : '—'),
-        kv('Polling interval', `${wf.polling_interval_ms} ms`),
+        kv(t('settings.workflowPath'), wf.workflow_path),
+        kv(t('settings.defaultAgent'), (wf.agent && wf.agent.kind) || '—'),
+        kv(t('settings.trackerKind'), state.board ? state.board.board.tracker_kind : '—'),
+        kv(t('settings.pollingInterval'), t('settings.milliseconds', { n: wf.polling_interval_ms })),
       ]),
-      el('a', { href: '/api/v1/state', target: '_blank', rel: 'noopener', class: 'link' }, 'View raw API state'),
+      el('a', { href: '/api/v1/state', target: '_blank', rel: 'noopener', class: 'link' }, t('settings.viewRawApiState')),
+    ]);
+  }
+
+  function buildInterfaceCard() {
+    const select = el(
+      'select',
+      { class: 'select', onChange: (e) => window.i18n.setLang(e.target.value) },
+      window.i18n.languages.map((lang) =>
+        el('option', { value: lang.code, selected: lang.code === window.i18n.lang }, lang.label)
+      )
+    );
+    return el('div', { class: 'card-panel' }, [
+      el('h3', null, t('settings.interface')),
+      field(t('settings.language'), select),
+      el('div', { class: 'form-hint' }, t('settings.languageHint')),
     ]);
   }
 
@@ -2765,20 +2791,20 @@
         e.target.disabled = true;
         try {
           await api.refresh();
-          showToast('Orchestrator refresh requested', 'success');
+          showToast(t('board.refreshRequested'), 'success');
         } catch (err) {
           showToast(err.message, 'error');
         } finally {
           e.target.disabled = false;
         }
       },
-    }, 'Refresh orchestrator now');
-    return el('div', { class: 'card-panel' }, [el('h3', null, 'Manual controls'), btn]);
+    }, t('board.refreshOrchestrator'));
+    return el('div', { class: 'card-panel' }, [el('h3', null, t('settings.manualControls')), btn]);
   }
 
   async function renderSettingsPage(container) {
     const page = el('div', { class: 'page page-settings' });
-    page.appendChild(el('div', { class: 'topbar' }, [el('h1', { class: 'page-title' }, 'Settings')]));
+    page.appendChild(el('div', { class: 'topbar' }, [el('h1', { class: 'page-title' }, t('nav.settings'))]));
     const body = el('div', { class: 'settings-body' }, [buildSkeletonBlock()]);
     page.appendChild(body);
     container.appendChild(page);
@@ -2796,10 +2822,14 @@
       body.appendChild(buildContinuousImprovementCard(wf, ciStatus));
       body.appendChild(buildBranchPolicyCard(wf));
       body.appendChild(buildBoardInfoCard(wf));
+      body.appendChild(buildInterfaceCard());
       body.appendChild(buildRefreshCard());
     } catch (err) {
       clearNode(body);
-      body.appendChild(el('div', { class: 'empty-state' }, `Could not load settings: ${err.message}`));
+      body.appendChild(el('div', { class: 'empty-state' }, t('settings.loadFailed', { error: err.message })));
+      // The language picker is client-side only, so keep it reachable even
+      // when the orchestrator is down.
+      body.appendChild(buildInterfaceCard());
     }
   }
 
@@ -2827,7 +2857,12 @@
         const firstLoad = !state.board;
         state.board = board;
         const nameEl = document.getElementById('board-name');
-        if (nameEl) nameEl.textContent = board.board.name || 'symphony';
+        if (nameEl) {
+          nameEl.textContent = board.board.name || 'symphony';
+          // The board name is data, not copy — drop the placeholder binding so
+          // a later language switch does not reset it to "Loading…".
+          nameEl.removeAttribute('data-i18n');
+        }
         if (state.route === 'board') {
           if (firstLoad || !document.getElementById('board-scroll')) renderRoute();
           else renderBoardColumns(document.getElementById('board-scroll'));
@@ -2873,6 +2908,13 @@
   }
 
   function boot() {
+    // Static markup in index.html is translated once here, then again on every
+    // language change; the SPA views are rebuilt wholesale by renderRoute().
+    window.i18n.applyStaticNodes();
+    window.i18n.onChange(() => {
+      renderRoute();
+      updateConnectionIndicator();
+    });
     wireGlobalShortcuts();
     handleRouteChange();
     pollBoard();
