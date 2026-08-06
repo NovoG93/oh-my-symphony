@@ -53,6 +53,7 @@ STATIC_DIR = Path(__file__).parent / "web" / "static"
 
 _IDENTIFIER_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_-]{0,63}$")
 _BRANCH_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/-]{0,199}$")
+_COMMIT_RE = re.compile(r"^[0-9a-fA-F]{4,64}$")
 _MAX_TITLE = 300
 _MAX_BODY = 128_000
 _MAX_LABELS = 20
@@ -975,6 +976,57 @@ def _register_git_routes(
             return _json_error(400, code, message)
         return web.json_response(payload)
 
+    async def handle_git_diff(request: web.Request) -> web.Response:
+        commit = (request.query.get("commit") or "").strip()
+        cfg = ctx.config()
+        workflow_dir = cfg.workflow_path.parent
+
+        if commit:
+            if not _COMMIT_RE.match(commit):
+                raise WorkflowMutationError(f"invalid commit {commit!r}")
+
+            def _load_commit() -> dict[str, object] | None:
+                if not git_inspect.is_git_repo(workflow_dir):
+                    return None
+                if not git_inspect.ref_exists(workflow_dir, commit):
+                    return None
+                return git_inspect.commit_patch(workflow_dir, commit)
+
+            payload = await asyncio.to_thread(_load_commit)
+            if payload is None:
+                return _json_error(400, "unknown_ref", f"unknown commit {commit!r}")
+            return web.json_response({"commit": commit, **payload})
+
+        branch = _check_branch(request.query.get("branch"))
+        raw_target = (request.query.get("target") or "").strip()
+        target = _check_branch(raw_target, key="target") if raw_target else None
+        path = (request.query.get("path") or "").strip() or None
+        if path is not None and (path.startswith("-") or "\x00" in path):
+            raise WorkflowMutationError(f"invalid path {path!r}")
+
+        def _load() -> tuple[str, str, None] | tuple[None, str, dict[str, object]]:
+            if not git_inspect.is_git_repo(workflow_dir):
+                return "not_a_git_repo", "workflow dir is not a git repository", None
+            resolved = target or _effective_target(cfg, workflow_dir)
+            if not resolved:
+                return (
+                    "no_target",
+                    "no target branch; set auto_merge_target_branch or pass target",
+                    None,
+                )
+            for ref in (branch, resolved):
+                if not git_inspect.ref_exists(workflow_dir, ref):
+                    return "unknown_ref", f"unknown ref {ref!r}", None
+            return None, resolved, git_inspect.diff_patch(
+                workflow_dir, branch, resolved, path
+            )
+
+        code, detail, payload = await asyncio.to_thread(_load)
+        if payload is None:
+            assert code is not None
+            return _json_error(400, code, detail)
+        return web.json_response({"branch": branch, "target": detail, **payload})
+
     merge_lock = asyncio.Lock()
 
     async def handle_git_merge(request: web.Request) -> web.Response:
@@ -1076,6 +1128,7 @@ def _register_git_routes(
     app.router.add_get("/api/v1/git/log", _wrap(handle_git_log))
     app.router.add_get("/api/v1/git/task-branches", _wrap(handle_git_task_branches))
     app.router.add_get("/api/v1/git/compare", _wrap(handle_git_compare))
+    app.router.add_get("/api/v1/git/diff", _wrap(handle_git_diff))
     app.router.add_post("/api/v1/git/merge", _wrap(handle_git_merge))
 
 

@@ -992,3 +992,42 @@ async def test_git_merge_rejects_concurrent_requests(
     status, payload = await first
     assert status == 200
     assert payload["ok"] is True
+
+
+async def test_git_diff_returns_patch_for_branch_and_commit(
+    git_repo: Path, client: TestClient
+) -> None:
+    resp = await client.get("/api/v1/git/diff?branch=symphony/SEED-1")
+    assert resp.status == 200
+    payload = await resp.json()
+    assert payload["target"] == "main"
+    assert "diff --git a/feature.py b/feature.py" in payload["patch"]
+    assert payload["truncated"] is False
+
+    resp = await client.get(
+        "/api/v1/git/diff?branch=symphony/SEED-1&path=feature.py"
+    )
+    assert "feature.py" in (await resp.json())["patch"]
+
+    sha = subprocess.run(
+        ["git", "rev-parse", "symphony/SEED-1"],
+        cwd=str(git_repo),
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    resp = await client.get(f"/api/v1/git/diff?commit={sha}")
+    assert resp.status == 200
+    payload = await resp.json()
+    assert payload["commit"] == sha
+    assert "SEED-1: feature" in payload["patch"]
+
+    resp = await client.get("/api/v1/git/diff?commit=zzzz")
+    assert resp.status == 400
+    resp = await client.get("/api/v1/git/diff?commit=deadbeef")
+    assert resp.status == 400
+    assert (await resp.json())["error"]["code"] == "unknown_ref"
+    resp = await client.get("/api/v1/git/diff?branch=no-such-branch")
+    assert resp.status == 400
+    resp = await client.get("/api/v1/git/diff?branch=symphony/SEED-1&path=--evil")
+    assert resp.status == 400
