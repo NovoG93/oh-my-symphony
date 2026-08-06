@@ -1312,14 +1312,27 @@ a { color: inherit; }
 .diffstat-total td { font-weight: 600; }
 
 /* Chat page */
-.chat-body { display: flex; flex-direction: column; gap: 10px; max-width: 900px; }
-.chat-controls { display: flex; align-items: center; gap: 8px; margin-left: auto; }
+.chat-body {
+  /* Fill exactly the space under the topbar via the .page flex chain —
+     a viewport calc() here clips the composer whenever the topbar wraps. */
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  padding: 16px 24px;
+  width: 100%;
+  max-width: 960px;
+  margin: 0 auto;
+}
+.chat-controls { display: flex; align-items: center; gap: 8px; margin-left: auto; flex-wrap: wrap; }
 .chat-transcript {
+  flex: 1;
+  min-height: 0;
   display: flex;
   flex-direction: column;
   gap: 8px;
   overflow-y: auto;
-  height: calc(100vh - 250px);
   padding: 14px;
   background: var(--surface);
   border: 1px solid var(--border);
