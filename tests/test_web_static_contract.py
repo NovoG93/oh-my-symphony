@@ -120,3 +120,15 @@ def test_web_chat_page_contract() -> None:
     assert ".chat-bubble" in css
     assert ".chat-mode-toggle" in css
     assert ".chat-composer" in css
+
+
+def test_web_chat_font_controls_contract() -> None:
+    js = (STATIC_ROOT / "app.js").read_text(encoding="utf-8")
+    css = (STATIC_ROOT / "style.css").read_text(encoding="utf-8")
+
+    assert "const CHAT_FONT_KEY = 'symphony.chatFontSize'" in js
+    assert "function loadChatFontSize()" in js
+    assert "function bumpChatFont(view, delta)" in js
+    assert "function buildFontControls(view)" in js
+    assert ".chat-font-controls" in css
+    assert "font-size: inherit" in css
