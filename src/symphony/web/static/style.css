@@ -1189,7 +1189,69 @@ a { color: inherit; }
 }
 
 /* Git page */
-.git-body { display: flex; flex-direction: column; gap: 16px; max-width: 980px; }
+.git-body {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+  gap: 16px;
+  align-items: start;
+}
+.git-body > .empty-state { grid-column: 1 / -1; }
+.git-left { display: flex; flex-direction: column; gap: 16px; min-width: 0; }
+.git-diff-panel {
+  position: sticky;
+  top: 16px;
+  max-height: calc(100vh - 32px);
+  overflow: auto;
+  min-width: 0;
+}
+.diff-panel-subtitle {
+  font-family: var(--font-mono);
+  font-size: 11.5px;
+  margin-bottom: 10px;
+  overflow-wrap: anywhere;
+}
+.diff-commit-meta {
+  font-family: var(--font-mono);
+  font-size: 11.5px;
+  color: var(--text-muted);
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  margin: 0 0 10px;
+}
+.diff-file {
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  margin-bottom: 10px;
+  overflow: hidden;
+}
+.diff-file-header {
+  font-family: var(--font-mono);
+  font-size: 12px;
+  font-weight: 600;
+  padding: 6px 10px;
+  background: var(--surface-2);
+  cursor: pointer;
+}
+.diff-file-body { overflow-x: auto; padding: 4px 0; }
+.diff-line {
+  font-family: var(--font-mono);
+  font-size: 11.5px;
+  line-height: 1.45;
+  white-space: pre;
+  padding: 0 10px;
+}
+.diff-line.diff-add { background: var(--success-bg); color: var(--success); }
+.diff-line.diff-del { background: var(--danger-bg); color: var(--danger); }
+.diff-line.diff-hunk { background: var(--surface-2); color: var(--text-muted); }
+.diff-line.diff-meta { color: var(--text-muted); }
+.commit-row.clickable { cursor: pointer; }
+.commit-row.clickable:hover { background: var(--surface-2); }
+.diffstat-table tr.clickable { cursor: pointer; }
+.diffstat-table tr.clickable:hover td { background: var(--surface-2); }
+@media (max-width: 1100px) {
+  .git-body { grid-template-columns: 1fr; }
+  .git-diff-panel { position: static; max-height: none; }
+}
 .git-mono { font-family: var(--font-mono); font-size: 12.5px; }
 .git-target-line { display: flex; align-items: center; gap: 8px; margin-bottom: 10px; flex-wrap: wrap; }
 .branch-rows { display: flex; flex-direction: column; }

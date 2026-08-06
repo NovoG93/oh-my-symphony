@@ -66,8 +66,8 @@ def test_web_git_page_contract() -> None:
     assert "postGitMerge: (payload)" in js
     assert "function buildTaskBranchesCard(data, compareCard)" in js
     assert "function openMergeModal(row, data)" in js
-    assert "function buildGitHistoryCard()" in js
-    assert "function buildGitCompareCard(data)" in js
+    assert "function buildGitHistoryCard(diffPanel)" in js
+    assert "function buildGitCompareCard(data, diffPanel)" in js
     assert "not_a_git_repo" in js
     assert "use Recover on the board" in js
     assert ".git-body" in css
@@ -77,3 +77,22 @@ def test_web_git_page_contract() -> None:
     assert ".commit-row" in css
     assert ".ref-chip" in css
     assert ".diffstat-table" in css
+
+
+def test_web_git_diff_panel_contract() -> None:
+    js = (STATIC_ROOT / "app.js").read_text(encoding="utf-8")
+    css = (STATIC_ROOT / "style.css").read_text(encoding="utf-8")
+
+    assert "getGitDiff: ({ branch, target, path, commit } = {})" in js
+    assert "function buildDiffPanel()" in js
+    assert "function splitPatchByFile(patch)" in js
+    assert "function buildDiffFileSection(file)" in js
+    assert "function diffLineClass(line)" in js
+    assert "diffPanel.showCompare(cmp.branch, cmp.target)" in js
+    assert "diffPanel.showCommit(commit)" in js
+    assert "diffPanel.scrollToFile(f.path)" in js
+    assert ".git-diff-panel" in css
+    assert ".diff-file-header" in css
+    assert ".diff-line.diff-add" in css
+    assert ".diff-line.diff-del" in css
+    assert ".diff-line.diff-hunk" in css
