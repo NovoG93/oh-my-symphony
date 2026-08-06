@@ -163,12 +163,16 @@ def _scan_workspace_symlinks(*roots: Path) -> list[str]:
        across *two* directories outside the workspace: the per-worktree
        admin dir ``<host_repo>/.git/worktrees/<ID>/`` (index and ref locks)
        and the shared common dir ``<host_repo>/.git/`` that owns
-       ``objects/``. Granting only the admin dir lets ``git add`` take the
-       index lock and then die writing the blob —
-       ``unable to create temporary file: Operation not permitted`` /
-       ``failed to insert into database`` — which is how a finished ticket
-       ends up ``Blocked`` on a housekeeping commit. ``writable_git_roots``
-       returns both directories; see ``utils.git_sandbox``.
+       ``objects/``. Granting only the admin dir covers the index lock but
+       not the blob write, which fails with ``unable to create temporary
+       file: Operation not permitted`` / ``failed to insert into database``
+       on any sandbox that does not grant the common dir itself.
+
+       Measured 2026-08-06: codex 0.146.0 grants a linked worktree's git
+       dirs on its own, so this injection is belt-and-braces there — it
+       closes the gap for versions and configurations that do not.
+       ``writable_git_roots`` returns both directories; see
+       ``utils.git_sandbox``.
 
     The scan returns resolved targets that the backend passes to codex as
     ``sandbox_workspace_write.writable_roots``, preserving the safer
