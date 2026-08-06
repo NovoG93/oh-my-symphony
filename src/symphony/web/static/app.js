@@ -2032,7 +2032,39 @@
   // Page: Chat
   // ------------------------------------------------------------------
 
-  const chatState = { snapshot: null, busy: false, socket: null, reconnectDelay: 1000, seqSeen: 0 };
+  const chatState = { snapshot: null, busy: false, socket: null, reconnectDelay: 1000, seqSeen: 0, fontSize: 15 };
+
+  const CHAT_FONT_KEY = 'symphony.chatFontSize';
+  const CHAT_FONT_MIN = 12;
+  const CHAT_FONT_MAX = 20;
+
+  function loadChatFontSize() {
+    try {
+      const raw = Number(localStorage.getItem(CHAT_FONT_KEY));
+      if (raw >= CHAT_FONT_MIN && raw <= CHAT_FONT_MAX) return raw;
+    } catch (_err) { /* storage unavailable */ }
+    return 15;
+  }
+
+  function applyChatFontSize(view) {
+    view.transcript.style.fontSize = `${chatState.fontSize}px`;
+    view.input.style.fontSize = `${chatState.fontSize}px`;
+  }
+
+  function bumpChatFont(view, delta) {
+    chatState.fontSize = Math.min(CHAT_FONT_MAX, Math.max(CHAT_FONT_MIN, chatState.fontSize + delta));
+    try {
+      localStorage.setItem(CHAT_FONT_KEY, String(chatState.fontSize));
+    } catch (_err) { /* storage unavailable */ }
+    applyChatFontSize(view);
+  }
+
+  function buildFontControls(view) {
+    return el('div', { class: 'chat-font-controls' }, [
+      el('button', { class: 'btn-icon', title: 'Smaller text', 'aria-label': 'Decrease chat font size', onClick: () => bumpChatFont(view, -1) }, 'A−'),
+      el('button', { class: 'btn-icon', title: 'Larger text', 'aria-label': 'Increase chat font size', onClick: () => bumpChatFont(view, 1) }, 'A+'),
+    ]);
+  }
 
   function closeChatSocket() {
     if (chatState.socket) {
@@ -2068,6 +2100,8 @@
     ]));
     container.appendChild(page);
     const view = { controls, transcript, typing, input, sendBtn };
+    chatState.fontSize = loadChatFontSize();
+    applyChatFontSize(view);
     connectChatSocket(view);
   }
 
@@ -2111,10 +2145,12 @@
           }
         },
       }, 'Start session');
+      view.controls.appendChild(buildFontControls(view));
       view.controls.appendChild(modeSelect);
       view.controls.appendChild(startBtn);
       return;
     }
+    view.controls.appendChild(buildFontControls(view));
     view.controls.appendChild(el('span', { class: 'chip-label' }, snap.agent_kind));
     if (!snap.mode_enforced) {
       view.controls.appendChild(el('span', { class: 'chat-mode-warning' }, 'read-only not enforced'));
