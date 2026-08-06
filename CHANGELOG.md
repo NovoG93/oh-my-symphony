@@ -10,6 +10,10 @@ Versioning: [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+No unreleased changes.
+
+## [0.16.1] - 2026-08-06 - Delivery commits survive the agent's sandbox
+
 ### Fixed
 
 - A ticket can no longer be parked in `Blocked` because its agent lacked
@@ -21,6 +25,15 @@ Versioning: [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   now granted. (Measured afterwards: codex 0.146.0 grants a worktree's git
   dirs on its own, so the injection is belt-and-braces there; the gap was
   real for anything that does not.)
+- Continuous improvement now actually runs its checks. They were spawned as
+  `python -m pytest` (and `ruff`, `pyright`) with no shell, so on any machine
+  without a real `python` executable on PATH — macOS ships none, most Linux
+  distros ship only `python3`, and a shell alias does not apply to a
+  subprocess — every check returned `command not found`. That is reported as
+  `not_proven` rather than `failed`, so the heartbeat completed every phase,
+  proved nothing and opened no tickets, silently. Checks now run under
+  `sys.executable`, which is also the environment Symphony's own `pytest`,
+  `ruff` and `pyright` are installed into.
 - The `Blocked` recovery loop no longer dead-ends. An RCA ticket inherits the
   same sandbox as the ticket it is rescuing and cannot open a further RCA, so
   a permission failure stopped the board permanently. Symphony now re-checks a
@@ -36,6 +49,9 @@ Versioning: [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   recorded whatever the agent's CLI is allowed to do. A commit that cannot be
   verified on the remote moves the card to `Human Review` — never `Blocked`,
   since the work is committed and only publishing is outstanding.
+- The web board's type and spacing scale is `rem`-based and larger, with the
+  responsive rules cleaned up so lanes, modals and the Git and Chat pages hold
+  their layout down to mobile widths.
 
 ### Added
 
@@ -46,6 +62,9 @@ Versioning: [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - `symphony doctor` gained `git history writable`, which probes the object
   database the host-side gate depends on, and `agent git grant`, which warns
   when a wrapper-script command hides the CLI token that flag injection needs.
+- The web board is available in English and Korean. User-facing copy moved out
+  of `app.js` into an `i18n.js` catalogue, and `scripts/check_i18n.py` guards
+  the two locales against drift.
 
 ## [0.16.0] - 2026-08-06 - Streaming chat, concurrent sessions, branch actions
 
