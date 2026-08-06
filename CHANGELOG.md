@@ -10,6 +10,10 @@ Versioning: [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+No unreleased changes.
+
+## [0.16.0] - 2026-08-06 - Streaming chat, concurrent sessions, branch actions
+
 ### Added
 
 - Chat answers now stream token by token. The Claude CLI already emitted
@@ -42,6 +46,22 @@ Versioning: [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   the message is sent, so the budget snapshot on that frame is current.
 - Stopping a chat session now flushes its JSONL transcript before the session is
   released, so an immediate reattach cannot replay a truncated conversation.
+
+### Verified
+
+- Full suite: 1,494 passed, 5 skipped, with browser E2E enabled; Ruff clean and
+  Pyright at the unchanged 27-error environment baseline. The single failure,
+  `test_run_continuous_improvement_real_git_target_worktree_e2e`, reproduces
+  identically on the release base commit with none of this work applied.
+- Browser E2E now drives the Git and Chat pages end to end: a push to a local
+  bare remote, a delete refused while unmerged and accepted once forced, a
+  target push rejected until its name is retyped, token deltas rendering into a
+  live bubble and being replaced by the finished markdown, an advisory budget
+  warning that leaves the composer usable, two concurrent sessions, and a
+  stopped session reattached from its transcript.
+- Streaming, budget accounting and the session index were additionally checked
+  against a real Claude CLI turn: deltas arrive unnumbered, never reach the
+  JSONL, and a session over its limit still runs.
 
 ## [0.15.0] - 2026-07-18 - Production boundary hardening
 
@@ -1080,7 +1100,8 @@ First public release of the multi-agent fork.
 - Per-state concurrency caps, `$VAR`/`~` expansion, dynamic WORKFLOW
   reload, structured stderr logging, `symphony doctor`.
 
-[Unreleased]: https://github.com/cskwork/oh-my-symphony/compare/v0.15.0...HEAD
+[Unreleased]: https://github.com/cskwork/oh-my-symphony/compare/v0.16.0...HEAD
+[0.16.0]: https://github.com/cskwork/oh-my-symphony/releases/tag/v0.16.0
 [0.15.0]: https://github.com/cskwork/oh-my-symphony/releases/tag/v0.15.0
 [0.14.0]: https://github.com/cskwork/oh-my-symphony/releases/tag/v0.14.0
 [0.13.0]: https://github.com/cskwork/oh-my-symphony/releases/tag/v0.13.0
