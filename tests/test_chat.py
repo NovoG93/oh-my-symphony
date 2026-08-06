@@ -216,6 +216,8 @@ async def test_send_message_preamble_and_continuation(
     prompt, is_continuation = backend.turns[0]
     assert prompt.endswith("what does this repo do?")
     assert "do not create, modify or delete" in prompt
+    assert "Symphony kanban board at" in prompt
+    assert "kanban" in prompt
     assert is_continuation is False
 
     await manager.send_message("second question")
@@ -390,3 +392,43 @@ def test_cfg_for_mode_per_kind(tmp_path: Path) -> None:
     assert enforced is False
     assert gemini_cfg.agent.kind == "gemini"
     assert gemini_cfg.gemini == cfg.gemini
+
+
+async def test_request_refresh_called_after_each_turn(
+    tmp_path: Path, fake_backends: list[_FakeBackend]
+) -> None:
+    cfg = _cfg(tmp_path)
+    calls: list[int] = []
+    manager = ChatManager(lambda: cfg, request_refresh=lambda: calls.append(1))
+    await manager.start_session("edit")
+    await manager.send_message("file a ticket for the flaky test")
+    await _wait_turn(manager)
+    assert calls == [1]
+    prompt, _ = fake_backends[0].turns[0]
+    assert "Symphony kanban board at" in prompt
+    assert "state: Todo" in prompt
+    await manager.stop_session()
+
+
+async def test_mode_switch_prepends_notice_on_next_message(
+    tmp_path: Path, fake_backends: list[_FakeBackend]
+) -> None:
+    cfg = _cfg(tmp_path)
+    manager = ChatManager(lambda: cfg)
+    await manager.start_session("qa")
+    await manager.send_message("q1")
+    await _wait_turn(manager)
+
+    await manager.set_mode("edit")
+    await manager.send_message("now file a ticket")
+    await _wait_turn(manager)
+    prompt, _ = fake_backends[1].turns[0]
+    assert prompt.startswith("[Chat mode changed to edit")
+    assert prompt.endswith("now file a ticket")
+
+    # The notice is one-shot.
+    await manager.send_message("another message")
+    await _wait_turn(manager)
+    prompt, _ = fake_backends[1].turns[1]
+    assert prompt == "another message"
+    await manager.stop_session()

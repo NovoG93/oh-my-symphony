@@ -69,13 +69,49 @@ _RAW_PREVIEW_CHARS = 400
 QA_PREAMBLE = (
     "You are chatting with the operator of the repository at {path}. "
     "Answer questions about this repository by reading its files. "
-    "Q&A mode: do not create, modify or delete any files.\n\n"
+    "Q&A mode: do not create, modify or delete any files. "
+    "If the operator asks you to file a board ticket, explain that they "
+    "should switch the chat to edit mode first.\n{board}\n"
 )
 EDIT_PREAMBLE = (
     "You are pair-working with the operator of the repository at {path}. "
     "You may read and modify files in this working tree as requested. "
-    "Keep changes minimal and report exactly what you changed.\n\n"
+    "Keep changes minimal and report exactly what you changed.\n{board}\n"
 )
+
+_BOARD_PREAMBLE = (
+    "This project runs a Symphony kanban board at {board_root}: one markdown "
+    "file per ticket, YAML front matter with id, identifier, title, state, "
+    "priority (0-4), labels, created_at, updated_at, then the description as "
+    "the body. Active states: {states}. To file a new issue for the "
+    "orchestrator, create {board_root}/<IDENTIFIER>.md with `state: Todo`, a "
+    "clear title and acceptance criteria in the body, using a new identifier "
+    "that does not collide with existing ticket files; Symphony picks it up "
+    "automatically."
+)
+
+
+
+# Prepended to the first message after a mode switch — with claude the
+# conversation is resumed, so the original preamble's rules stick unless
+# explicitly revoked.
+QA_MODE_NOTICE = (
+    "[Chat mode changed to Q&A: from now on, do not create, modify or "
+    "delete any files.]\n\n"
+)
+EDIT_MODE_NOTICE = (
+    "[Chat mode changed to edit: you may now create and modify files in "
+    "this working tree as requested, including filing kanban tickets.]\n\n"
+)
+
+
+def _board_preamble(cfg: ServiceConfig) -> str:
+    if cfg.tracker.kind != "file" or cfg.tracker.board_root is None:
+        return ""
+    return _BOARD_PREAMBLE.format(
+        board_root=cfg.tracker.board_root,
+        states=", ".join(cfg.tracker.active_states),
+    )
 
 _PERMISSION_MODE_RE = re.compile(r"\s--permission-mode(?:[ =]\S+)?")
 
@@ -163,6 +199,7 @@ class ChatSession:
     backend: AgentBackend | None = None
     backend_turns: int = 0  # turns run on the current backend instance
     turn_count: int = 0
+    pending_mode_notice: bool = False
     last_agent_text: str = ""
     transcript: list[ChatMessage] = field(default_factory=list)
 
@@ -205,8 +242,16 @@ class _TranscriptWriter:
 class ChatManager:
     """Single operator chat session against the host repo."""
 
-    def __init__(self, config_provider: Callable[[], ServiceConfig]) -> None:
+    def __init__(
+        self,
+        config_provider: Callable[[], ServiceConfig],
+        request_refresh: Callable[[], object] | None = None,
+    ) -> None:
         self._config_provider = config_provider
+        # Called after each turn so board tickets the agent files (edit mode
+        # writes straight into the file board) dispatch on the next tick
+        # instead of waiting out the poll interval.
+        self._request_refresh = request_refresh
         self._session: ChatSession | None = None
         self._turn_lock = asyncio.Lock()
         self._turn_task: asyncio.Task[None] | None = None
@@ -311,6 +356,7 @@ class ChatManager:
         session.mode = mode
         session.backend = None
         session.backend_turns = 0
+        session.pending_mode_notice = True
         await self._build_backend(cfg, session, resume_session_id=resume_id)
         self._broadcast(
             "session_status",
@@ -331,11 +377,23 @@ class ChatManager:
         text = text.strip()
         if not text:
             raise SymphonyError("message text is required")
-        workflow_dir = self._config_provider().workflow_path.parent
+        cfg = self._config_provider()
         preamble = QA_PREAMBLE if session.mode == "qa" else EDIT_PREAMBLE
         prompt = text
         if session.turn_count == 0:
-            prompt = preamble.format(path=workflow_dir) + text
+            prompt = (
+                preamble.format(
+                    path=cfg.workflow_path.parent, board=_board_preamble(cfg)
+                )
+                + text
+            )
+        elif session.pending_mode_notice:
+            # A resumed conversation keeps obeying the original preamble's
+            # rules; revoke or grant them explicitly on the first message
+            # after a mode switch.
+            notice = QA_MODE_NOTICE if session.mode == "qa" else EDIT_MODE_NOTICE
+            prompt = notice + text
+        session.pending_mode_notice = False
         self._broadcast("user_message", text)
         self._turn_task = asyncio.create_task(self._run_turn(session, prompt))
         return self.snapshot()
@@ -454,6 +512,11 @@ class ChatManager:
             finally:
                 session.backend_turns += 1
                 session.turn_count += 1
+                if self._request_refresh is not None:
+                    try:
+                        self._request_refresh()
+                    except Exception as exc:
+                        log.warning("chat_refresh_failed", error=str(exc))
 
     async def _on_backend_event(self, envelope: dict[str, Any]) -> None:
         session = self._session
