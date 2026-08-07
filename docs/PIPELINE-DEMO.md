@@ -1,7 +1,7 @@
 ---
 id: PIPELINE-DEMO
 identifier: PIPELINE-DEMO
-title: Reference ticket showing the In Progress / Verify / Learn / Done shape
+title: Reference ticket showing the In Progress / Verify / Document / Done shape
 state: Done
 priority: 3
 labels:

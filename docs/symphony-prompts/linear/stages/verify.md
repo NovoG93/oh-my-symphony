@@ -25,4 +25,4 @@ Verify has three jobs: review, QA, and merge preflight/merge. The card must say 
 {% else %}
 8. Merge Gate is disabled (`agent.auto_merge_on_done` is false). Append `## Merge Status` noting this workflow intentionally leaves branch integration to the operator.
 {% endif %}
-9. Set state to `Learn`.
+9. Set state to `Document`.

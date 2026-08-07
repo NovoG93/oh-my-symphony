@@ -145,7 +145,7 @@ def test_multi_stage_workflow_rejects_too_low_max_turns(tmp_path: Path) -> None:
         tracker:
           kind: file
           board_root: ./tickets
-          active_states: [Todo, In Progress, Verify, Learn]
+          active_states: [Todo, In Progress, Verify, Document]
           terminal_states: [Done, Blocked]
         agent:
           max_turns: 1

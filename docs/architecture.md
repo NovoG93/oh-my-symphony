@@ -113,7 +113,7 @@ modules.
 | `helpers.py` | pure helpers (`_sort_for_dispatch_fifo`, `_is_rewind_transition`, and related utilities) |
 | `contracts.py` | stage-contract evaluation for pipeline headings and evidence gates |
 | `run_registry.py` | SQLite WAL run leases, dead-owner reclaim, persisted retry / pause / budget flags |
-| `core.py` | the `Orchestrator` class, tick loop, dispatch, health, pause/resume, Learn skip |
+| `core.py` | the `Orchestrator` class, tick loop, dispatch, health, pause/resume, Document skip |
 | `__init__.py` | re-exports + monkeypatch-target bindings |
 
 ### Monkeypatch indirection — `_pkg` (removed)

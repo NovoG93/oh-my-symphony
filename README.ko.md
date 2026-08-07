@@ -95,7 +95,7 @@
   agent=codex  tracker=linear  workflow=WORKFLOW.md  lang=en   running=2  retrying=1   │  tokens in=84,200 out=27,640 total=111,840
                                                                                        │  rate-limits=requests_remaining=4823, tokens_remaining=1.2M
 
-╭── Todo [1/4] (3) ╮ ╭── In Progress [2/4] ╮ ╭── Verify [3/4] ╮ ╭── Learn [4/4] ╮ ╭── Done (2) ──╮ ╭── detail ───────────────────────╮
+╭── Todo [1/4] (3) ╮ ╭── In Progress [2/4] ╮ ╭── Verify [3/4] ╮ ╭── Document [4/4] ╮ ╭── Done (2) ──╮ ╭── detail ───────────────────────╮
 │  DEMO-120 [1/4]  │ │  DEMO-104 [2/4] ●   │ │  DEMO-122 [3/4]│ │  DEMO-123     │ │  DEMO-088    │ │  DEMO-104 [2/4]                 │
 │  Migrate auth …  │ │  Fix race condi…    │ │  Review + QA   │ │  S skip       │ │  Drop dead-… │ │  Fix race condition in pagina…  │
 │  #backend …      │ │  turn 4  20,180t    │ │  #docs         │ │  Wiki notes   │ │  DEMO-091    │ │                                 │
@@ -109,7 +109,7 @@
 │  blocked by D…   │                                                                                 ╰─────────────────────────────────╯
 ╰──────────────────╯
 
-q quit · r refresh · enter details · n new · e edit · s stats · S skip Learn · P pause/resume · / filter · ?
+q quit · r refresh · enter details · n new · e edit · s stats · S skip Document · P pause/resume · / filter · ?
 ```
 
 </details>
@@ -138,8 +138,8 @@ q quit · r refresh · enter details · n new · e edit · s stats · S skip Lea
    컬럼은 트래커 상태이고, 카드는 현재 에이전트, 턴 수, 마지막 이벤트, 누적
    토큰을 보여준다. 카드는 포커스할 수 있고, 마우스 휠로 각 레인을 스크롤하며,
    카드에서 `enter`를 누르면 전체 상세 모달이, `n`으로 멀티라인 새 티켓 등록,
-   `e`로 포커스 티켓 편집, `S`로 Learn 스킵, `s`로 통계 화면이 열린다.
-3. 오케스트레이터 포트에 내장된 **웹 칸반 앱** — 이슈 CRUD, Learn 스킵,
+   `e`로 포커스 티켓 편집, `S`로 Document 스킵, `s`로 통계 화면이 열린다.
+3. 오케스트레이터 포트에 내장된 **웹 칸반 앱** — 이슈 CRUD, Document 스킵,
    드래그 앤 드롭 상태 이동, 컬럼 추가/삭제/이름변경, 컬럼별 프롬프트
    편집, 브랜치 정책, 전용 통계 페이지.
 4. `.symphony/state.db`의 **단일 노드 신뢰성 ledger** — 활성 실행 lease가
@@ -189,7 +189,7 @@ CLI에서 파일 보드 티켓을 만들 때는
 
 티켓 고정값과 전역 기본값 사이에는 선택적 상태별 라우팅이 있다:
 `agent.stage_kinds`는 보드 상태를 에이전트 kind에 매핑해서, 가벼운 레인은
-저렴하고 빠른 에이전트가(예: `Todo: gemini`, `Learn: gemini`), Plan/Build/Review는
+저렴하고 빠른 에이전트가(예: `Todo: gemini`, `Document: gemini`), Plan/Build/Review는
 강한 기본 에이전트가 맡게 한다. 디스패치별 우선순위: 티켓 `agent_kind` 고정 >
 `agent.stage_kinds[state]` > `agent.kind`. 상태가 바뀐 티켓은 다음 디스패치에서
 새 스테이지의 백엔드를 받는다.
@@ -236,7 +236,7 @@ pip install -e ".[dev]"
 cat > WORKFLOW.md <<'YAML'
 ---
 tracker: { kind: file, board_root: ./kanban,
-           active_states: [Todo, "In Progress", Verify, Learn],
+           active_states: [Todo, "In Progress", Verify, Document],
            terminal_states: ["Human Review", Done, Blocked, Archive] }
 polling: { interval_ms: 5000 }
 workspace: { root: ~/symphony_workspaces }
@@ -341,7 +341,7 @@ cp WORKFLOW.file.example.md WORKFLOW.md
 tracker:
   kind: file
   board_root: ./kanban
-  active_states: [Todo, "In Progress", Verify, Learn]
+  active_states: [Todo, "In Progress", Verify, Document]
   terminal_states: ["Human Review", Done, Blocked, Archive]
 
 workspace:
@@ -585,7 +585,7 @@ symphony board mv TASK-1 Blocked         # forces a state transition
 
 보드는 프리셋에서 시작하고, 이후에도 완전히 커스터마이즈할 수 있다:
 
-- **default** — 간결한 4레인 보드 `Todo → In Progress → Verify → Learn`.
+- **default** — 간결한 4레인 보드 `Todo → In Progress → Verify → Document`.
   짧은 스테이지 프롬프트를 쓰고, `orchestrator/contracts.py`의 스테이지
   계약이 기계적 게이트다. 복잡한 작업은 레인을 늘리는 대신 티켓 DAG
   (`--blocked-by` / `--request`)로 표현한다.
@@ -635,7 +635,7 @@ symphony ./WORKFLOW.md --port 9999
 `/`는 내장 웹 칸반 앱을 서빙한다(빌드 단계 없음, 가입 없음, 루프백 전용):
 
 - **Board** — 이슈 생성/수정/삭제, 드래그로 컬럼 이동, 실행 중 배지(턴 수,
-  토큰), 워커 Pause / Resume, Learn 스킵. 기본 화면은 네 개의 active agent
+  토큰), 워커 Pause / Resume, Document 스킵. 기본 화면은 네 개의 active agent
   lane만 보여주며, `Human Review`, `Done`, `Blocked`, `Archive`는 `All`로
   펼치기 전까지 **Review and parked** 그룹에 작게 표시된다.
 - **Workflow** — 칸반 컬럼 추가/삭제/이름변경/순서변경, 컬럼별 스테이지
@@ -666,7 +666,7 @@ JSON API 엔드포인트:
 | GET    | `/api/v1/stats?days=N`            | 집계된 실행 통계                              |
 | POST   | `/api/v1/refresh`                 | poll + reconcile 즉시 트리거                  |
 | POST   | `/api/v1/{id}/pause` `/resume`    | 실행 중 워커 보류 / 재개                      |
-| POST   | `/api/v1/issues/{id}/skip-learn`  | idle Learn 티켓을 Human Review로 이동         |
+| POST   | `/api/v1/issues/{id}/skip-document` | idle Document 티켓을 Human Review로 이동 (구 별칭: `/skip-learn`) |
 
 ### CLI Kanban TUI (primary UI)
 
@@ -746,7 +746,7 @@ symphony service logs ./WORKFLOW.md
 나타나고 헤더의 refresh 버튼이 오케스트레이터 `poll + reconcile`을 트리거한다.
 헤더는 또한 `agent.feature_base_branch`와 `agent.auto_merge_target_branch`를
 위한 실제 로컬 git 브랜치 드롭다운을 보여주므로, 운영자가 YAML을 손으로
-편집하지 않고도 새 기능 브랜치가 어디서 시작하고 Learn 머지가 어디로 떨어질지
+편집하지 않고도 새 기능 브랜치가 어디서 시작하고 Document 머지가 어디로 떨어질지
 고를 수 있다.
 
 #### One-shot launchers
@@ -883,7 +883,7 @@ CI에 포함하지 않았다 — 로컬에서 실행한다.
 웹 앱은 파일 보드를 위한 전체 브라우저 편집기다. 같은 tracker / workflow 모듈을
 통해 이슈 생성/수정/삭제, 드래그 상태 이동, 컬럼/프롬프트 편집, 브랜치 정책
 갱신을 수행한다. TUI는 키보드 운영에 최적화되어 있으며 터미널을 벗어나지 않고
-티켓 생성/수정, archive, Done gate confirm, Pause / Resume, Learn skip, filter,
+티켓 생성/수정, archive, Done gate confirm, Pause / Resume, Document skip, filter,
 detail 확인을 할 수 있다.
 
 대화형으로 *할 수 있는* 것:

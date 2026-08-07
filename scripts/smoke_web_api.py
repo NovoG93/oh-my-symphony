@@ -99,7 +99,7 @@ def run_smoke(
     base_url: str,
     *,
     prefix: str = "SMOKE",
-    learn_id: str = "",
+    document_id: str = "",
 ) -> list[Check]:
     checks: list[Check] = []
     created: list[str] = []
@@ -161,9 +161,9 @@ def run_smoke(
             raise SmokeFailure("patch did not persist")
         ok("issue patch")
 
-        if learn_id:
-            expect(base_url, "POST", f"/api/v1/{learn_id}/skip-learn", 200)
-            ok("skip learn")
+        if document_id:
+            expect(base_url, "POST", f"/api/v1/{document_id}/skip-document", 200)
+            ok("skip document")
 
         expect(base_url, "GET", "/api/v1/refresh", 405)
         expect(base_url, "POST", "/api/v1/refresh", 202)
@@ -191,13 +191,13 @@ def main() -> int:
     parser.add_argument("--base-url", default="http://127.0.0.1:9999")
     parser.add_argument("--prefix", default="SMOKE")
     parser.add_argument(
-        "--learn-id",
+        "--document-id",
         default="",
-        help="Optional idle Learn issue to exercise skip-learn",
+        help="Optional idle Document issue to exercise skip-document",
     )
     args = parser.parse_args()
 
-    checks = run_smoke(args.base_url, prefix=args.prefix, learn_id=args.learn_id)
+    checks = run_smoke(args.base_url, prefix=args.prefix, document_id=args.document_id)
     for check in checks:
         print(f"ok {check.name}")
     print(json.dumps({"count": len(checks), "checks": [c.name for c in checks]}, indent=2))

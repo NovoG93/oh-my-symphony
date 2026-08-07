@@ -179,7 +179,7 @@ def test_auto_merge_creates_no_ff_merge_commit(tmp_path: Path) -> None:
 def test_auto_merge_pushes_terminal_merge_to_target_upstream(tmp_path: Path) -> None:
     """Done must not leave the target branch ahead of its configured upstream.
 
-    Reproduces a Learn-stage push followed by a late fallback commit: the
+    Reproduces a Document-stage push followed by a late fallback commit: the
     terminal auto-merge creates a newer target commit after the worker's push.
     """
     repo = _make_repo(tmp_path)

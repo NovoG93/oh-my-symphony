@@ -13,6 +13,8 @@ STATE_COLOR = {
     "todo": "bright_black",
     "in progress": "cyan",
     "verify": "yellow",
+    "document": "bright_magenta",
+    # legacy lane name (pre-rename boards)
     "learn": "bright_magenta",
     "human review": "magenta",
     "blocked": "red",

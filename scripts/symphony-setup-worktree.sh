@@ -10,7 +10,7 @@
 # Env vars consumed (Symphony injects these before invoking the hook):
 #   SYMPHONY_WORKFLOW_DIR        Path to the host repo containing WORKFLOW.md.
 #   SYMPHONY_FEATURE_BASE_BRANCH Optional override for the new branch's start point.
-#   SYMPHONY_MERGE_TARGET_BRANCH Optional override for the Learn-gate merge target.
+#   SYMPHONY_MERGE_TARGET_BRANCH Optional override for the Document-gate merge target.
 set -euo pipefail
 ISSUE_ID="$(basename "$PWD")"
 HOST_REPO="${SYMPHONY_WORKFLOW_DIR:?SYMPHONY_WORKFLOW_DIR not set}"

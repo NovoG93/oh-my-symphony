@@ -2,7 +2,7 @@
 tracker:
   kind: file
   board_root: ./kanban
-  active_states: [Todo, "In Progress", Verify, Learn]
+  active_states: [Todo, "In Progress", Verify, Document]
   terminal_states: ["Human Review", Done, Blocked, Archive, Cancelled]
   # Auto-archive sweep: terminal-state issues whose `updated_at` is older
   # than `archive_after_days` move to `archive_state` on the next poll.
@@ -15,7 +15,7 @@ tracker:
     Todo: "Triage; route to In Progress"
     "In Progress": "Plan + TDD implementation + self-critique"
     Verify: "Review + QA + Merge Gate"
-    Learn: "Wiki write-back; Done unless intervention"
+    Document: "Docs + wiki write-back; Done unless intervention"
     "Human Review": "Manual intervention or explicit review before Done"
     Done: "Verified complete"
     Archive: "Auto-archived after 30 days idle"
@@ -43,7 +43,7 @@ hooks:
   # The workspace starts empty. Attach it as a git worktree of the host
   # repo on a per-ticket symphony/<ID> branch so the host working tree
   # stays untouched while the agent works. Product changes and docs/
-  # artefacts stay on the feature branch. The default Learn gate merges
+  # artefacts stay on the feature branch. The default Document gate merges
   # that feature branch into the target branch before the ticket can move
   # to Done.
   #
@@ -238,7 +238,7 @@ agent:
   max_concurrent_agents: 1
   max_turns: 100
   max_retry_backoff_ms: 300000
-  # Soft cap on stage rewinds (Verify/Learn -> In Progress
+  # Soft cap on stage rewinds (Verify/Document -> In Progress
   # combined). Symphony increments this counter at phase-transition time;
   # on the (max_attempts+1)th rewind, it moves the ticket to Blocked
   # instead of starting another In Progress pass. Set to 0 to disable.
@@ -251,21 +251,21 @@ agent:
     Todo: 1
     "In Progress": 1
     Verify: 1
-    Learn: 1
+    Document: 1
   max_total_tokens: 100000000
   max_total_tokens_by_state:
     "In Progress": 500000000
     Verify: 500000000
-  # Merge policy for the Verify -> Learn gate. Verify must merge the
+  # Merge policy for the Verify -> Document gate. Verify must merge the
   # `symphony/<ID>` feature branch into the target branch before setting
-  # Learn. A human later confirms the card to Done from the TUI (`c`) or
+  # Document. A human later confirms the card to Done from the TUI (`c`) or
   # board viewer button.
   auto_merge_on_done: true
   # Branch/ref used as the start point for new `symphony/<ID>` feature
   # branches. Empty string = current host branch. The board viewer can
   # update this from its real git branch dropdown.
   feature_base_branch: ""
-  # Branch to merge into after Learn. Empty string = same as feature base
+  # Branch to merge into after Document. Empty string = same as feature base
   # branch/current host branch. The board viewer can update this too.
   auto_merge_target_branch: ""
   auto_merge_exclude_paths:
@@ -369,7 +369,7 @@ prompts:
     Todo: ./docs/symphony-prompts/file/stages/todo.md
     "In Progress": ./docs/symphony-prompts/file/stages/in-progress.md
     Verify: ./docs/symphony-prompts/file/stages/verify.md
-    Learn: ./docs/symphony-prompts/file/stages/learn.md
+    Document: ./docs/symphony-prompts/file/stages/document.md
     Done: ./docs/symphony-prompts/file/stages/done.md
 
 ---

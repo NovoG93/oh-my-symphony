@@ -106,7 +106,7 @@ class AgentConfig:
     max_state_turns: int = DEFAULT_MAX_STATE_TURNS
     max_state_turns_by_state: dict[str, int] = field(default_factory=dict)
     no_stage_change_action: str = "block"
-    # Soft cap for Verify/Learn rewinds back into In Progress. 0 disables.
+    # Soft cap for Verify/Document rewinds back into In Progress. 0 disables.
     max_attempts: int = DEFAULT_MAX_ATTEMPTS
     # Cap on auto-retries scheduled after a worker exits with a non-normal
     # outcome (timeout, crash, transient backend error). On exhaustion the

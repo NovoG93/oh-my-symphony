@@ -19,7 +19,7 @@ WORKFLOW_TEXT = """---
 tracker:
   kind: file
   board_root: ./kanban
-  active_states: [Todo, "In Progress", Verify, Learn]
+  active_states: [Todo, "In Progress", Verify, Document]
   terminal_states: ["Human Review", Done, Blocked, Archive]
   state_descriptions:
     Todo: "Triage"
@@ -36,7 +36,7 @@ prompts:
     Todo: ./prompts/stages/todo.md
     "In Progress": ./prompts/stages/in-progress.md
     Verify: ./prompts/stages/verify.md
-    Learn: ./prompts/stages/learn.md
+    Document: ./prompts/stages/document.md
 ---
 
 Smoke prompt for {{ issue.identifier }}.
@@ -108,7 +108,7 @@ def board_dir(tmp_path: Path) -> Path:
     (tmp_path / "WORKFLOW.md").write_text(WORKFLOW_TEXT, encoding="utf-8")
     stages = tmp_path / "prompts" / "stages"
     stages.mkdir(parents=True)
-    for name in ("todo", "in-progress", "verify", "learn"):
+    for name in ("todo", "in-progress", "verify", "document"):
         (stages / f"{name}.md").write_text(f"{name} prompt", encoding="utf-8")
     (tmp_path / "kanban").mkdir()
     return tmp_path

@@ -21,7 +21,7 @@ def test_two_presets_ship() -> None:
 
 
 def test_default_preset_matches_shipped_four_lane_board() -> None:
-    assert DEFAULT_PRESET.active_states == ("Todo", "In Progress", "Verify", "Learn")
+    assert DEFAULT_PRESET.active_states == ("Todo", "In Progress", "Verify", "Document")
     assert DEFAULT_PRESET.terminal_states == (
         "Human Review",
         "Done",
@@ -33,7 +33,7 @@ def test_default_preset_matches_shipped_four_lane_board() -> None:
         "Todo",
         "In Progress",
         "Verify",
-        "Learn",
+        "Document",
         "Done",
     }
 
@@ -75,10 +75,10 @@ def test_get_lane_preset_is_case_insensitive_and_raises_on_unknown() -> None:
 
 
 def test_guess_lane_preset_matches_exact_sequences_only() -> None:
-    assert guess_lane_preset(["Todo", "in progress", "Verify", "Learn"]) == "default"
+    assert guess_lane_preset(["Todo", "in progress", "Verify", "Document"]) == "default"
     assert guess_lane_preset(DEEP_PRESET.active_states) == "deep"
     # Customized boards (extra / reordered lanes) match nothing.
-    assert guess_lane_preset(["Todo", "Verify", "In Progress", "Learn"]) is None
+    assert guess_lane_preset(["Todo", "Verify", "In Progress", "Document"]) is None
     assert guess_lane_preset(["Todo"]) is None
 
 

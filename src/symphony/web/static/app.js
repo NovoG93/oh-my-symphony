@@ -120,7 +120,7 @@
     getStats: (days) => apiRequest(`/stats?days=${encodeURIComponent(days)}`),
     pause: (id) => apiRequest(`/${encodeURIComponent(id)}/pause`, { method: 'POST' }),
     resume: (id) => apiRequest(`/${encodeURIComponent(id)}/resume`, { method: 'POST' }),
-    skipLearn: (id) => apiRequest(`/${encodeURIComponent(id)}/skip-learn`, { method: 'POST' }),
+    skipDocument: (id) => apiRequest(`/${encodeURIComponent(id)}/skip-document`, { method: 'POST' }),
     recoverBlocked: (id) => apiRequest(`/issues/${encodeURIComponent(id)}/recover-blocked`, { method: 'POST' }),
     refresh: () => apiRequest('/refresh', { method: 'POST' }),
   };
@@ -379,8 +379,10 @@
     return found ? found.name : lowerName;
   }
 
-  function isLearnState(name) {
-    return String(name || '').trim().toLowerCase() === 'learn';
+  function isDocumentState(name) {
+    const state = String(name || '').trim().toLowerCase();
+    // 'learn' is the legacy name of the Document lane (pre-rename boards).
+    return state === 'document' || state === 'learn';
   }
 
   function isBlockedState(name) {
@@ -1064,14 +1066,14 @@
     const attentionBadge = buildAttentionBadge(issue.attention);
     if (attentionBadge) badges.appendChild(attentionBadge);
     if (badges.childNodes.length) card.appendChild(badges);
-    if (!readOnly && isLearnState(issue.state) && !liveEntry) {
+    if (!readOnly && isDocumentState(issue.state) && !liveEntry) {
       card.appendChild(el('button', {
         class: 'btn btn-ghost btn-sm card-action',
         onClick: async (e) => {
           e.stopPropagation();
-          await runControlAction(api.skipLearn, issue.identifier, t('issue.skippedLearn'));
+          await runControlAction(api.skipDocument, issue.identifier, t('issue.skippedDocument'));
         },
-      }, t('issue.skipLearn')));
+      }, t('issue.skipDocument')));
     }
     if (!readOnly && isBlockedState(issue.state) && !liveEntry) {
       card.appendChild(el('button', {
@@ -1259,13 +1261,13 @@
         el('span', null, detail.attention.message || ''),
       ]));
     }
-    if (!detail.live && isLearnState(detail.state)) {
+    if (!detail.live && isDocumentState(detail.state)) {
       container.appendChild(el('button', {
         class: 'btn btn-ghost',
         onClick: async () => {
-          await runControlAction(api.skipLearn, detail.identifier, t('issue.skippedLearn'));
+          await runControlAction(api.skipDocument, detail.identifier, t('issue.skippedDocument'));
         },
-      }, t('issue.skipLearn')));
+      }, t('issue.skipDocument')));
     }
     if (!detail.live && isBlockedState(detail.state)) {
       container.appendChild(el('button', {

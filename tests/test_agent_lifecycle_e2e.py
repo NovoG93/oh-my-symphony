@@ -2,7 +2,7 @@
 
 Existing tests cover *one* phase transition at a time. This file walks an
 issue through the full canonical 4-active-state pipeline
-(Todo -> In Progress -> Verify -> Learn -> Done) and
+(Todo -> In Progress -> Verify -> Document -> Done) and
 asserts the *expected outputs at each phase boundary*:
 
 1. A fresh backend is built per phase (state changes => session rebuild).
@@ -58,7 +58,7 @@ CANONICAL_ACTIVE_STATES = (
     "Todo",
     "In Progress",
     "Verify",
-    "Learn",
+    "Document",
 )
 TERMINAL_STATES = ("Human Review", "Done", "Cancelled", "Blocked")
 
@@ -135,8 +135,8 @@ class _FileBoardLifecycleBackend:
 
     transitions = {
         "In Progress": "Verify",
-        "Verify": "Learn",
-        "Learn": "Done",
+        "Verify": "Document",
+        "Document": "Done",
     }
 
     def __init__(self, cfg: ServiceConfig, cwd: Path, init_id: int) -> None:
@@ -204,7 +204,7 @@ def _make_lifecycle_config(*, max_turns: int = 12) -> ServiceConfig:
         "todo": "TODO_BODY state={{ issue.state }}",
         "in progress": "INPROGRESS_BODY state={{ issue.state }}",
         "verify": "VERIFY_BODY state={{ issue.state }}",
-        "learn": "LEARN_BODY state={{ issue.state }}",
+        "document": "DOCUMENT_BODY state={{ issue.state }}",
     }
     return ServiceConfig(
         workflow_path=Path("/tmp/WORKFLOW.lifecycle.md"),
@@ -280,14 +280,14 @@ def _make_file_board_lifecycle_config(
             max_concurrent_agents_by_state={
                 "in progress": 1,
                 "verify": 1,
-                "learn": 1,
+                "document": 1,
             },
         ),
     )
 
 
 # A ticket body satisfying the 4-stage contract evaluator. Without these
-# sections every In Progress->Verify or Verify->Learn transition would trip
+# sections every In Progress->Verify or Verify->Document transition would trip
 # `evaluate_contract`. We are testing lifecycle wiring, not contract parsing.
 _CONTRACT_CLEAN_BODY = (
     "## Plan\n"
@@ -403,7 +403,7 @@ def _install_state_walk(monkeypatch: pytest.MonkeyPatch, states: list[str]) -> d
     # the next state-walk step; it must return the *current* state (the
     # value most recently emitted by `_refresh_issue_state`) without
     # consuming the next walk slot. Otherwise the lifecycle silently
-    # skips a phase (Review -> Learn instead of Review -> QA -> Learn).
+    # skips a phase (Review -> Document instead of Review -> QA -> Document).
     counter: dict[str, Any] = {"i": 0, "last": "Todo"}
 
     def _build(state: str) -> Issue:
@@ -453,11 +453,11 @@ def test_full_todo_to_done_pipeline_rebuilds_backend_per_phase(
     instances = _install_backend_factory(monkeypatch)
     # After the first run_turn (Todo), the scripted refresh walks through
     # every remaining canonical state and then exits at Done.
-    _install_state_walk(monkeypatch, ["In Progress", "Verify", "Learn", "Done"])
+    _install_state_walk(monkeypatch, ["In Progress", "Verify", "Document", "Done"])
 
     asyncio.run(o._run_agent_attempt(issue, attempt=None, cfg=cfg))
 
-    # 4 active phases => 4 backends total (Todo, In Progress, Verify, Learn).
+    # 4 active phases => 4 backends total (Todo, In Progress, Verify, Document).
     assert len(instances) == 4, f"expected 4 backends, got {len(instances)}"
 
     # Every backend went through factory -> start -> initialize ->
@@ -483,7 +483,7 @@ def test_full_todo_to_done_pipeline_rebuilds_backend_per_phase(
         "TODO_BODY state=Todo",
         "INPROGRESS_BODY state=In Progress",
         "VERIFY_BODY state=Verify",
-        "LEARN_BODY state=Learn",
+        "DOCUMENT_BODY state=Document",
     ]
     for prompt, marker in zip(first_prompts, expected_stage_markers):
         assert "BASE id=LIFE-1" in prompt, f"missing shared base header in {marker}"
@@ -531,7 +531,7 @@ def test_lifecycle_stops_each_intermediate_backend_exactly_once(
     o = _orch(tmp_path)
     _seed_running(o, issue, tmp_path)
     instances = _install_backend_factory(monkeypatch)
-    _install_state_walk(monkeypatch, ["In Progress", "Verify", "Learn", "Done"])
+    _install_state_walk(monkeypatch, ["In Progress", "Verify", "Document", "Done"])
 
     asyncio.run(o._run_agent_attempt(issue, attempt=None, cfg=cfg))
 
@@ -582,7 +582,7 @@ def test_lifecycle_done_callback_uses_registered_running_id(
     # Walk the lifecycle; the FINAL refresh returns a *different* tracker
     # id alongside the Done state. If cleanup keyed off that id the
     # original running slot would leak.
-    real_walk = ["In Progress", "Verify", "Learn"]
+    real_walk = ["In Progress", "Verify", "Document"]
     counter = {"i": 0}
 
     async def _refresh(self, cfg, issue_id):  # noqa: ANN001
@@ -628,7 +628,7 @@ def test_file_board_e2e_auto_triage_dispatches_and_reaches_done(
 
     This guards the operator-facing flow: a Todo card is triaged by the
     orchestrator, dispatched from the file board, advanced by a worker through
-    Verify and Learn, then released from the running slot at Done.
+    Verify and Document, then released from the running slot at Done.
     """
 
     board_root = tmp_path / "kanban"
@@ -696,7 +696,7 @@ def test_file_board_e2e_auto_triage_dispatches_and_reaches_done(
     assert [state for b in instances for state in b.operated_states] == [
         "In Progress",
         "Verify",
-        "Learn",
+        "Document",
     ]
     assert all(
         call[1]["is_continuation"] is False
