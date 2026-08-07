@@ -344,6 +344,52 @@ server:
 #     icon_emoji: ":robot_face:"
 #     timeout_ms: 5000
 
+# Governed workflow mode — opt-in. Omit this block (or set `enabled: false`)
+# and Symphony behaves exactly as it always has: stage prompts, and the agent
+# moves the ticket between board states itself.
+#
+# When enabled, each ticket run executes a YAML DAG from `directory` instead
+# of the stage loop. The engine — not the model — decides node order, when a
+# node is done, and when the run is finished. Human approval becomes a durable
+# gate that only an explicit `symphony approval resolve` (or the equivalent
+# API call) can clear; moving the card or writing "approved" in a comment does
+# nothing.
+#
+# Workflow files are executable code: they start agents and run shell commands
+# in the ticket workspace. Commit them and review changes the way you review a
+# CI pipeline. `.symphony/artifacts/` holds runtime output and stays out of git.
+#
+# `ticket_state_mapping` is what hands coarse board control to the
+# orchestrator. Omit it entirely to keep the board manual — run progress is
+# still visible in the TUI and web overlay. Every target must be a state your
+# tracker already declares above, or dispatch preflight fails.
+#
+# workflow_engine:
+#   enabled: true
+#   directory: ./.symphony/workflows
+#   artifact_directory: ./.symphony/artifacts
+#   default: ticket-default        # used when a ticket names no workflow
+#   max_parallel_nodes: 1          # service ceiling; a workflow may ask for less
+#   require_explicit_resume: true  # an interrupted run always waits for a human
+#   artifact_retention_days: 30
+#   ticket_state_mapping:
+#     running: "In Progress"
+#     waiting_approval: "Human Review"
+#     succeeded: Done
+#     rejected: Blocked
+#     abandoned: Blocked
+#
+# A single ticket can override the workflow from its own frontmatter:
+#
+#     ---
+#     id: TASK-123
+#     state: Todo
+#     workflow: quick-fix
+#     ---
+#
+# An override naming a workflow that does not exist blocks that ticket and
+# reports the error. It never quietly falls back to the default.
+
 tui:
   language: en               # `en` (default) or `ko`. SYMPHONY_LANG env overrides.
                              # Also drives artefact language: every prompt is
