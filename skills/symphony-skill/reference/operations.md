@@ -21,12 +21,25 @@ symphony board new TASK-1 "Fix flaky pagination test" \
   --labels backend,test \
   --agent-kind claude \
   --description "tests/test_pagination.py::test_cursor_advance is flaky on CI."
+
+# Structured creation: dependencies, request grouping, body from file/stdin.
+symphony board new TASK-2 "Add regression test" \
+  --blocked-by TASK-1 \
+  --request REQ-1 \
+  --label test --label ci \
+  --description-file ./spec.md      # or `-` to read stdin
 ```
 
 Identifiers are free-form strings (`TASK-1`, `BUG-007`, `PROD-2026-05-09`).
 Convention is `<PREFIX>-<NUMBER>` but it is not enforced. The file lands at
 `kanban/<ID>.md`. Omit `--agent-kind` to use the global `agent.kind` from
 `WORKFLOW.md`; set it only for tickets that need a different backend.
+
+`new` validates before writing: unique id, a state from
+`tracker.active_states`/`terminal_states`, every `--blocked-by` target must
+exist on the board, and the added edges must keep the dependency graph
+acyclic (violations print the cycle path and exit non-zero). The web API's
+issue create/update endpoints apply the same rules.
 
 When creating more than one ticket, assign IDs in the same order as the task
 list: `TASK-001`, then `TASK-002`, then `TASK-003`. Symphony uses the stable
@@ -50,6 +63,13 @@ symphony board ls --state "In Progress" # quote multi-word states
 symphony board show TASK-1
 ```
 
+### Inspect the dependency DAG
+
+```bash
+symphony board graph                 # topological, indented
+symphony board graph --request REQ-1 # only one request group
+```
+
 ### Move a ticket (manual override)
 
 ```bash
@@ -63,17 +83,17 @@ Use this only to unstick — the agent normally transitions tickets itself.
 ### Managed service (normal headless mode)
 
 ```bash
-symphony service start ./WORKFLOW.md --port 9999 --viewer-port 8765
+symphony service start ./WORKFLOW.md --port 9999
 symphony service status ./WORKFLOW.md
 symphony service restart ./WORKFLOW.md
 symphony service stop ./WORKFLOW.md
 ```
 
 **"Open the orchestrator" → open the `--port` web app (default 9999).** The
-orchestrator serves a full browsable web app at `http://127.0.0.1:<--port>/`
-(default `9999`), not just the JSON API under `/api/v1/`. This is the default
-page to open. Treat the `--viewer-port` board (default `8765`) as the
-secondary read/write card board. So when the operator says "open the
+orchestrator serves the full built-in admin web app at
+`http://127.0.0.1:<--port>/` (default `9999`), not just the JSON API under
+`/api/v1/`. This is the only board — there is no separate board-viewer
+process or `--viewer-port` flag. When the operator says "open the
 orchestrator", open the service `--port`:
 
 ```bash
@@ -87,25 +107,12 @@ per-workflow run-state file under `.symphony/run/` and refuses to start the
 same `WORKFLOW.md` a second time on another port, which prevents duplicate
 orchestrators from dispatching the same board.
 
-Since v0.4.7 the board viewer at `--viewer-port` is not read-only: running
-cards expose Pause / Resume buttons, the header refresh button triggers an
-orchestrator `poll + reconcile`, and local git branch dropdowns control
-`agent.feature_base_branch` and `agent.auto_merge_target_branch`.
-
-**Always verify the viewer actually started.** `--viewer-port` is opportunistic:
-if `<workflow-dir>/tools/board-viewer/server.py` is missing, the orchestrator
-starts cleanly but silently skips the viewer (no warning, no FAIL in `doctor`).
-After `service start`, confirm one of:
-
-- the start output prints a `started board viewer pid=NNN url=...` line, *or*
-- `cat .symphony/run/*.json | jq '.viewer_pid'` returns a number (not `null`).
-
-If the viewer is missing, copy the bundle from the symphony repo and restart:
-
-```bash
-cp -R <symphony-checkout>/tools/board-viewer ./tools/
-symphony service restart ./WORKFLOW.md --viewer-port 8765
-```
+The admin UI is not read-only: running cards expose Pause / Resume buttons,
+the header refresh button triggers an orchestrator `poll + reconcile`, local
+git branch dropdowns control `agent.feature_base_branch` and
+`agent.auto_merge_target_branch`, the settings page switches lane presets
+(default 4-lane ↔ deep 8-lane), and the Chat page files validated ticket
+DAGs through the board-intake protocol.
 
 ### TUI mode (interactive)
 

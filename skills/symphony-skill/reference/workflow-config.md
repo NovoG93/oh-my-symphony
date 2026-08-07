@@ -91,6 +91,22 @@ and sandbox settings still come from the matching global backend block in
 `WORKFLOW.md`. When creating a ticket from the file-board CLI, use
 `symphony board new TASK-001 "title" --agent-kind codex`.
 
+Between the ticket pin and the global default sits optional per-state
+routing: `agent.stage_kinds` maps board states to agent kinds, so cheap/fast
+agents can own light lanes while a strong default handles the heavy ones:
+
+```yaml
+agent:
+  kind: claude
+  stage_kinds:
+    Todo: gemini
+    Learn: gemini
+```
+
+Resolution per dispatch: ticket `agent_kind` pin > `agent.stage_kinds[state]`
+> `agent.kind`. A ticket that changes state gets the new stage's backend on
+its next dispatch.
+
 ### Codex workspace sandbox and package registries
 
 Keep the thread sandbox confined to the worker workspace. When a Codex worker
@@ -161,7 +177,7 @@ sees each feature branch immediately. `agent.feature_base_branch` selects
 the start point for new `symphony/<ID>` branches; empty means the current
 host branch. The default Learn prompt merges `symphony/<ID>` into
 `agent.auto_merge_target_branch` before the ticket moves to `Done`; empty
-means the feature base/current host branch. The board viewer exposes both
+means the feature base/current host branch. The admin web app exposes both
 values as real local git branch dropdowns, and post-Done auto-merge is only
 a compatibility fallback for older prompt packs. Worktrees share the host's
 object DB so setup is near-instant compared to a full clone, and the branch

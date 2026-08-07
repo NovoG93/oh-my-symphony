@@ -35,6 +35,8 @@ terminal for.
 - [Install](#install)
 - [Try it in 60 seconds](#try-it-in-60-seconds-no-agent-cli-required)
 - [Quickstart](#quickstart--your-first-task-end-to-end)
+- [Lane presets](#lane-presets)
+- [Chat intake](#chat-intake--type-a-request-the-board-delivers)
 - [Run](#run)
 - [Layout](#layout)
 - [Tests](#tests)
@@ -65,11 +67,9 @@ terminal for.
   backends, the TUI/web operator surfaces, SQLite run leases, restart-safe
   issue flags, and locked Markdown ticket writes.
 - **A real web app, not just a viewer.** The orchestrator port serves a
-  Linear-style board: register issues, drag cards
-  between columns, add / delete / rename columns, edit each column's stage
-  prompt, pick feature / merge branches, pause / resume workers, skip Learn
-  when no wiki write-back is needed, and read a dedicated stats page (tokens
-  per day, cycle time per column, per-agent totals). All edits round-trip into
+  Linear-style board: issue CRUD, drag-and-drop columns, per-column stage
+  prompts, branch policy, pause / resume, lane presets, an operator chat that
+  files validated ticket DAGs, and a stats page. All edits round-trip into
   `WORKFLOW.md` with your comments intact.
 - **Operator-grade tooling out of the box.** `symphony doctor` catches the
   five most common first-run failures (port collisions, missing CLIs,
@@ -230,10 +230,10 @@ Make the relevant CLI available on `$PATH`:
 
 ## Try it in 60 seconds (no agent CLI required)
 
-Want to see the TUI move cards around before installing `codex`, `claude`,
-or `gemini`? Use the bundled **mock backend** — it speaks the same JSON-RPC
-protocol as Codex but does no real work, just simulates turns and emits
-token-usage ticks.
+Want to see the TUI move cards around before installing an agent CLI? Use
+the bundled **mock backend** — it speaks the same JSON-RPC protocol as
+Codex but does no real work, just simulates turns and emits token-usage
+ticks.
 
 ```bash
 git clone https://github.com/cskwork/oh-my-symphony.git
@@ -586,24 +586,36 @@ Every artefact a ticket produces lives under `docs/<TICKET-ID>/<stage>/`. See [`
 
 ## Custom prompts
 
-`WORKFLOW.md` can point at editable prompt files under `docs/`:
+`WORKFLOW.md` points at editable prompt files under `docs/` via the
+`prompts.base` + `prompts.stages` map shown in the Quickstart. Symphony
+sends `base` plus only the prompt file for the ticket's current state,
+keeping each turn small. If the `prompts` block is absent, the inline body
+of `WORKFLOW.md` still works as the legacy fallback. Prompts are also
+editable in place from the web app's **Workflow** page — same files, no
+restart needed.
 
-```yaml
-prompts:
-  base: ./docs/symphony-prompts/file/base.md
-  stages:
-    Todo: ./docs/symphony-prompts/file/stages/todo.md
-    "In Progress": ./docs/symphony-prompts/file/stages/in-progress.md
-    Verify: ./docs/symphony-prompts/file/stages/verify.md
-    Learn: ./docs/symphony-prompts/file/stages/learn.md
-    Done: ./docs/symphony-prompts/file/stages/done.md
-```
+## Lane presets
 
-Symphony sends `base` plus only the prompt file for the ticket's current
-state, keeping each turn smaller than the old all-stage prompt. If the
-`prompts` block is absent, the inline body of `WORKFLOW.md` still works as
-the legacy fallback. Prompts are also editable in place from the web app's
-**Workflow** page — same files, no restart needed.
+Boards start from a preset and stay fully customizable:
+
+- **default** — the succinct 4-lane board `Todo → In Progress → Verify →
+  Learn`. Short stage prompts; the stage contracts in
+  `orchestrator/contracts.py` are the mechanical gate. Complex work is
+  expressed as a ticket DAG (`--blocked-by` / `--request`), not extra lanes.
+- **deep** — an optional 8-lane pipeline `Intake → Research → Plan → Review
+  → Build → QA → Verify → Document` for complex deliveries. Each lane
+  carries its own lean gate (Verify/Document run a literal
+  `grep 'verdict: GREEN'` check); the Plan lane spawns the
+  Build/QA/Verify/Document ticket DAG via `symphony board new
+  --blocked-by --request`.
+
+Switch presets from the web app's **Settings** page, or via
+`GET /api/v1/workflow/presets` + `POST /api/v1/workflow/presets/apply`.
+Applying a preset round-trips through the same comment-preserving
+`WORKFLOW.md` machinery as lane CRUD, so your comments and customizations
+survive; tickets in removed lanes migrate to a fallback state. Presets are
+starting points, not cages — lane add/delete/rename and per-column prompt
+editing keep working afterwards.
 
 ## Skills — frontmatter-only power user instructions
 
@@ -625,6 +637,26 @@ first-turn prompt under `## Attached skills`. Skills are no longer exposed in
 the web/TUI issue forms; add them by hand in frontmatter when you need this
 advanced behavior. Unknown skill names are surfaced to the agent as "not
 found" instead of silently dropped.
+
+## Chat intake — type a request, the board delivers
+
+The admin UI ships a **Chat** page backed by the same agent CLIs. Chat is
+not just Q&A: in edit mode the chat agent follows a board-intake protocol.
+Type a request; the agent confirms scope (at most two turns, and only when
+the request is ambiguous), then files tickets through the validated board
+tool — never freehand ticket markdown:
+
+- **simple request** → one ticket in the first active state;
+- **complex request** → a research → plan → plan-review → build → qa →
+  document stage-ticket DAG, chained via `--blocked-by` under one
+  `--request REQ-<n>` group;
+- **deep-preset board** (an `Intake` lane exists) → one Intake ticket; the
+  pipeline itself decomposes the work.
+
+Every ticket passes `symphony board new` validation (unique id, legal
+state, existing blockers, acyclic DAG). In Q&A mode the agent describes
+the tickets it would file and defers filing until you switch the session
+to edit mode. Chat converses; the board delivers.
 
 ---
 
@@ -650,10 +682,12 @@ only). From the browser you can:
   each column's stage prompt. Changes write back into `WORKFLOW.md`
   frontmatter with your comments preserved; tickets in renamed or removed
   columns migrate automatically.
+- **Chat** — operator chat sessions with the board-intake protocol
+  (see [Chat intake](#chat-intake--type-a-request-the-board-delivers)).
 - **Stats** — tokens per day, throughput, per-column dwell time, per-agent
   totals, average cycle time (from `.symphony/stats.jsonl`).
 - **Settings** — branch policy (feature base / merge target) from a real
-  local-branch dropdown.
+  local-branch dropdown, plus the lane-preset switch (default ↔ deep).
 
 JSON API endpoints:
 
@@ -667,6 +701,8 @@ JSON API endpoints:
 | PUT    | `/api/v1/workflow/states`         | Column add / delete / rename / reorder       |
 | GET/PUT| `/api/v1/workflow/prompts/<state>`| Read / edit a column's stage prompt          |
 | PUT    | `/api/v1/workflow/branch-policy`  | Update feature base / merge target branches  |
+| GET/POST | `/api/v1/workflow/presets[...]` | List lane presets / apply one (`/apply`)     |
+| *      | `/api/v1/chat/...`                | Operator chat sessions + WebSocket stream    |
 | GET    | `/api/v1/git/branches`            | Local branch list for branch policy UI       |
 | GET    | `/api/v1/stats?days=N`            | Aggregated run statistics                    |
 | POST   | `/api/v1/refresh`                 | Coalesced trigger of poll + reconcile        |
@@ -710,33 +746,22 @@ runtime indicator:
 - **↻ yellow** — in retry queue, shows `retry #N` and the last error
 - **✓ green** — completed in this session
 
-Key bindings (also auto-listed in the footer):
+Key bindings (`?` shows the full list; also auto-listed in the footer):
 
 | Key                | Action                                       |
 |--------------------|----------------------------------------------|
 | `q`                | Quit (drains active workers cleanly)         |
 | `r`                | Force a refresh + re-poll the tracker        |
-| `?`                | Show all key bindings as a notification      |
 | `tab` / `shift+tab`| Move focus to next / previous card or lane   |
-| `j` / `↓`          | Scroll focused lane down one row             |
-| `k` / `↑`          | Scroll focused lane up one row               |
-| `space` / `pgdn`   | Page down                                    |
-| `b` / `pgup`       | Page up                                      |
-| `g` / `home`       | Jump to top                                  |
-| `G` / `end`        | Jump to bottom                               |
+| `j`/`k`, page keys | Scroll the focused lane                      |
 | `1`–`9` / `0`      | Zoom that lane (others shrink) / reset zoom  |
-| `t` / `T`          | Page lanes forward / back                    |
-| `+` / `-`          | Grow / shrink the visible-lane window        |
-| `d`                | Toggle card density (compact / full)         |
-| `p`                | Toggle the detail pane                        |
-| `]` / `[`          | Park focus in the detail pane / back to board|
-| `L`                | Cycle TUI + doc language                      |
-| `a`                | Archive the focused card                     |
-| `c`                | Confirm a Done-gated card (clears manual gate)|
+| `n` / `e`          | Register a new ticket / edit the focused one |
+| `a` / `c`          | Archive / confirm a Done-gated card          |
+| `S`                | Skip Learn for the focused ticket            |
 | `P`                | Pause / resume the focused running worker    |
+| `L`                | Cycle TUI + doc language                     |
 | `/`                | Open the filter prompt                       |
-| `enter`            | Open the focused card's full-detail modal    |
-| `esc` / `q`        | Close the modal (when one is open)           |
+| `enter` / `esc`    | Open / close the full-detail modal           |
 
 Mouse: clicking a card focuses it, the wheel scrolls its lane.
 
@@ -785,71 +810,52 @@ the alt-screen on top of unreadable preflight output.
 
 ### File-based Kanban tracker
 
-If you don't have Linear, use the local Markdown-file tracker (unchanged from
-upstream):
-
-```yaml
-tracker:
-  kind: file
-  board_root: ./kanban
-```
-
-```bash
-symphony board init ./kanban
-symphony board new DEV-1 "Title" --priority 2
-symphony tui ./WORKFLOW.md
-```
+If you don't have Linear, use the local Markdown-file tracker
+(`tracker: { kind: file, board_root: ./kanban }`) — see the
+[Quickstart](#quickstart--your-first-task-end-to-end).
 
 ## Layout
 
 ```
 src/symphony/
-  backends/
-    __init__.py        AgentBackend Protocol + factory + normalized events
-    codex.py           Codex JSON-RPC stdio backend (was upstream agent.py)
-    claude_code.py     Claude Code stream-json backend
-    gemini.py          Gemini one-shot backend
-    agy.py             AGY / Antigravity one-shot backend
-    kiro.py            Kiro headless chat backend
-    opencode.py        OpenCode run/json backend (per-turn subprocess, --session resume)
-    pi.py              Pi --mode json backend (per-turn subprocess, --session resume)
-  trackers/
-    __init__.py        TrackerClient Protocol + factory
-    _retry.py          retry/backoff wrapper for network trackers
-    file.py            FileBoardTracker (locked Markdown ticket mutations)
-    jira.py            Jira REST tracker
-    linear.py          LinearClient (Linear GraphQL)
+  backends/          AgentBackend Protocol + factory + normalized events;
+                     codex.py, claude_code.py, gemini.py, agy.py, kiro.py,
+                     opencode.py, pi.py adapters
+  trackers/          TrackerClient Protocol + factory; file.py (locked
+                     Markdown ticket mutations), jira.py, linear.py, _retry.py
   workflow/
-    parser.py          WORKFLOW.md frontmatter/body parser
-    config.py          frozen config dataclasses
-    builder.py         ServiceConfig construction + validation
-    mutate.py          comment-preserving workflow edits for the web UI
-    preflight.py       dispatch-time validation
+    parser.py        WORKFLOW.md frontmatter/body parser
+    config.py        frozen config dataclasses (incl. agent.stage_kinds)
+    builder.py       ServiceConfig construction + validation
+    mutate.py        comment-preserving workflow edits for the web UI
+    presets.py       lane presets (4-lane default, 8-lane deep)
+    preflight.py     dispatch-time validation
   orchestrator/
-    core.py            scheduler/state machine
-    run_registry.py    SQLite WAL run leases + issue flags
-    contracts.py       stage-contract validation helpers
+    core.py          scheduler/state machine (blocked_by-aware dispatch)
+    run_registry.py  SQLite WAL run leases + issue flags
+    contracts.py     stage-contract validation helpers
   cli/
-    __init__.py        re-exports `main` for the `symphony` console_script
-    __main__.py        keeps `python -m symphony.cli ...` working for service.py
-    main.py            root dispatch + `symphony [WORKFLOW]`
-    board.py           `symphony board ...` file-tracker helper
-    doctor.py          `symphony doctor` WORKFLOW.md preflight checks
-  utils/
-    archive.py         auto-archive selector
-    auto_merge.py      symphony/<ID> branch → host repo merge
-    keep_awake.py      macOS caffeinate wrapper (no-op on other platforms)
-    wiki_sweep.py      Learn-prompt wiki integrity sweep
-  agent.py             back-compat shim re-exporting backends.* symbols
-  server.py            aiohttp server, health/state/refresh routes
-  webapi.py            web app REST routes + static SPA serving
-  stats.py             .symphony/stats.jsonl aggregation
-  skills.py            SKILL.md discovery + prompt injection
-  tui/                 Textual Kanban TUI package
-  service.py           `symphony service` background lifecycle
-  mock_codex.py        runnable via `python -m symphony.mock_codex` for demos/tests
-  web/static/          built-in browser app assets
-tui-open.sh            cross-platform launcher (macOS / Linux): doctor preflight + open TUI in a new terminal window
+    main.py          root dispatch + `symphony [WORKFLOW]`
+    board.py         `symphony board ...` validated ticket tool + `graph`
+    doctor.py        `symphony doctor` WORKFLOW.md preflight checks
+  utils/             auto_merge.py, git_inspect.py, git_ops.py, git_sandbox.py,
+                     archive.py, keep_awake.py, wiki_sweep.py
+  notifications/     Slack state-transition notifications
+  tui/               Textual Kanban TUI package
+  web/static/        built-in browser app assets (board / workflow / chat /
+                     stats / settings)
+  webapi.py          web app REST routes + static SPA serving
+  server.py          aiohttp server, health/state/refresh routes
+  chat.py            operator chat sessions + board-intake protocol
+  continuous_improvement.py  idle-time improvement-proposal loop
+  i18n.py            TUI/doc language switching
+  stats.py           .symphony/stats.jsonl aggregation
+  skills.py          SKILL.md discovery + prompt injection
+  service.py         `symphony service` background lifecycle
+  progress_md.py     WORKFLOW-PROGRESS.md live mirror
+  mock_codex.py      demo backend via `python -m symphony.mock_codex`
+  agent.py           back-compat shim re-exporting backends.* symbols
+tui-open.sh            launcher (macOS / Linux): doctor preflight + open TUI in a new terminal window
 tui-open.bat           Windows equivalent
 ```
 
@@ -859,51 +865,36 @@ tui-open.bat           Windows equivalent
 pytest -q
 ```
 
-The test suite covers the upstream conformance suite, backend unit tests for
-the factory, event normalization, Claude / Pi usage accumulation, Gemini
-session synthesis, AGY/Kiro command construction, OpenCode command/session
-parsing, Pi failure-reason detection, run-registry persistence, file-tracker
-locking, web API contracts, and Textual `Pilot`-driven smoke tests for the TUI app. Subprocess-driven
-integration tests against real CLIs are intentionally not in CI — run them
-locally.
+The suite (1575 passed, 7 skipped) covers the upstream conformance suite,
+backend unit tests (factory, event normalization, per-CLI command/session
+handling), board-tool DAG validation, run-registry persistence, file-tracker
+locking, web API contracts, chat intake, lane presets, and Textual
+`Pilot`-driven TUI smoke tests. Subprocess-driven integration tests against
+real CLIs are intentionally not in CI — run them locally.
 
 ## Design notes
 
-### Why five different lifecycles behind one Protocol?
+### Why seven different lifecycles behind one Protocol?
 
 - **Codex** opens one `app-server` subprocess per issue and speaks the
-  current `codex app-server` JSON-RPC protocol (`initialize` + `thread/start`
-  + `turn/start` + streamed `turn/completed` and `item/completed`
-  notifications). Multi-turn within one process. Older `v2/initialize`-style
-  releases are not supported — pin to `codex-cli ≥ 0.39` (current upstream).
-- **Claude Code** has no persistent server; sessions are tracked by ID. Each
-  `run_turn` spawns a fresh `claude -p` and uses `--resume <session-id>` from
-  turn 2 onward.
-- **Gemini CLI** is one-shot per invocation with no native session model.
-  Each turn is independent; we synthesize a `gemini-<uuid>` session id so the
-  orchestrator's bookkeeping stays consistent.
-- **AGY / Antigravity CLI** is one-shot per invocation. Symphony sends the
-  rendered prompt on stdin with `agy --print -`, appends
-  `--dangerously-skip-permissions`, and adds
-  `--continue` on continuation turns when `resume_across_turns` is true.
-- **Kiro CLI** runs through headless chat mode. Because Kiro does not treat
-  piped stdin as the first message, Symphony bridges stdin into the positional
-  chat input with `"$(cat)"` and inserts `--resume` before that input on
-  continuation turns. `symphony doctor` accepts either `KIRO_API_KEY` or a
-  successful `kiro-cli whoami` login check.
-- **OpenCode** runs through its documented automation path:
-  `opencode run --format json --auto [message..]`. Symphony passes the prompt
-  as the `message` argument, reads raw JSON events when present, and starts
-  adding `--session <id>` on continuation turns after OpenCode reports a real
-  session id.
-- **Pi** has no persistent server but auto-saves sessions to
-  `~/.pi/agent/sessions/`. Each `run_turn` spawns a fresh `pi --mode json` and
-  passes `--session <id>` from turn 2 onward. The session id is read from the
-  first `{"type":"session"}` JSONL line; per-message `usage` is accumulated
-  off `message_end` events, and `agent_end` is treated as the terminal event.
-  Auth is delegated to Pi: the OAuth/API-key store at `~/.pi/agent/auth.json`
-  populated by `/login` is inherited by the subprocess, so Symphony itself
-  never handles credentials.
+  current `codex app-server` JSON-RPC protocol; multi-turn within one
+  process. Pin to `codex-cli ≥ 0.39` (current upstream).
+- **Claude Code** has no persistent server; each `run_turn` spawns a fresh
+  `claude -p` and uses `--resume <session-id>` from turn 2 onward.
+- **Gemini CLI** is one-shot per invocation with no native session model;
+  we synthesize a `gemini-<uuid>` session id for bookkeeping.
+- **AGY / Antigravity CLI** is one-shot per invocation: prompt on stdin via
+  `agy --print -` (plus `--dangerously-skip-permissions`), `--continue` on
+  continuation turns when `resume_across_turns` is true.
+- **Kiro CLI** runs through headless chat mode. Kiro does not treat piped
+  stdin as the first message, so Symphony bridges stdin into the positional
+  chat input with `"$(cat)"` and inserts `--resume` on continuation turns.
+- **OpenCode** runs `opencode run --format json --auto` with the prompt as
+  the `message` argument, adding `--session <id>` once OpenCode reports a
+  real session id.
+- **Pi** spawns a fresh `pi --mode json` per turn with `--session <id>`
+  from turn 2 onward; usage is accumulated off `message_end` events. Auth
+  is delegated to Pi's own `~/.pi/agent/auth.json` store.
 
 The `AgentBackend` Protocol hides these differences. The orchestrator only
 sees normalized events (`session_started`, `turn_completed`, `turn_failed`,
@@ -917,13 +908,6 @@ and update branch policy through the same tracker/workflow modules the CLI
 uses. The TUI is optimized for keyboard operation: it can create/edit tickets,
 archive, confirm Done-gated cards, pause/resume running workers, skip Learn,
 filter, and inspect details without leaving the terminal.
-
-What you *can* do interactively:
-
-- Focus any card with `tab` / `shift+tab` or by clicking it.
-- Scroll a lane with the mouse wheel, `j` / `k`, or page keys.
-- Open a focused card's full description in a modal with `enter`.
-- Use `n`, `e`, `a`, `c`, `P`, `S`, and `/` for the core TUI write actions.
 
 What is intentionally out of scope:
 

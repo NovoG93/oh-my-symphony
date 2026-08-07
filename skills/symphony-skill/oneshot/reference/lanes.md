@@ -2,6 +2,12 @@
 > source of truth for lane prompts. This file explains the *why* and
 > shows the lane semantics in summary form. If anything here disagrees
 > with the template, the template wins.
+>
+> **Note**: Symphony has since productized this lane model as the built-in
+> 8-lane **deep** preset (`Intake → Research → Plan → Review → Build → QA →
+> Verify → Document`, prompts under `docs/symphony-prompts/file/deep/`).
+> Where this folder contradicts shipped behavior, the deep preset is the
+> current form.
 
 # The seven lanes — definitions + per-state prompts
 
