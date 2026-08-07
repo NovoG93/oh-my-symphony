@@ -10,51 +10,47 @@ Versioning: [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+The "minimal" line: delete duplicate machinery, keep every operator-facing
+feature, and turn chat into a gated ticket-DAG pipeline.
+
+### Removed
+
+- **Governed per-ticket workflow engine** — the `symphony.flow` package, the
+  `symphony workflow`/`symphony run`/`symphony approval` CLIs, the
+  `workflow_engine:` config block, the flow run store, and the earlier
+  Unreleased notes describing them (the feature never shipped in a release).
+  Board-level `blocked_by` ticket DAGs are the one DAG substrate.
+- **`tools/board-viewer/`** standalone web board and the service
+  `--viewer-port` flag. The built-in admin UI on the orchestrator port is
+  the only board.
+- Repo debris: per-ticket dev archives under `docs/`, one-off screenshot and
+  demo scripts, generated progress files, and empty packages.
+
 ### Added
 
-- **Governed workflow mode** — an opt-in, repository-defined workflow engine
-  that runs inside each ticket run. A committed YAML DAG decides node order,
-  completion, and gating; the model supplies judgement and code but no longer
-  decides whether its own work is finished. Enable with `workflow_engine:` in
-  `WORKFLOW.md`. Absent that block, behaviour is unchanged.
-  - Three node types: `agent` (one backend turn), `shell` (deterministic
-    command), and `approval` (a durable human gate that suspends the run).
-  - Per-node backend selection — plan with one agent, implement with another,
-    review with a third, under one audit trail. A node-level override never
-    mutates the ticket's default backend.
-  - A node-level execution ledger in `.symphony/state.db`: every attempt, its
-    output, error class, token usage, and the git revision before and after it.
-    Each state change and the event describing it commit in one transaction.
-  - Human approval that only an explicit, versioned mutation can resolve.
-    Moving a card, editing a ticket, or an agent writing "approved" does not
-    clear a gate. A conflicting second decision returns a conflict rather than
-    overwriting the first.
-  - Crash recovery that never restarts a ticket behind the operator. An
-    interrupted node is recorded as interrupted, the run parks in
-    `needs_attention` holding a durable fence, and `resume` replays the stored
-    definition snapshot, skipping succeeded nodes after verifying their
-    artifacts still hash correctly.
-- Versioned, transactional SQLite migrations for `.symphony/state.db`, with a
-  timestamped backup taken before the first governed-workflow migration.
-- `BackendCapabilities` — explicit per-backend capability metadata, replacing
-  behaviour inferred from the backend's name. Preflight now rejects a workflow
-  asking for a capability its backend lacks, naming the node and the backend.
-- `symphony workflow list|show|validate`, `symphony run show|events|resume|
-  abandon|cancel`, and `symphony approval list|resolve`, plus the matching REST
-  endpoints and a web execution panel.
-- `symphony doctor` validates the workflow directory, compiles every discovered
-  workflow, checks `ticket_state_mapping` against the tracker's states, warns
-  about external side effects with no approval gate, and confirms the database
-  schema is current.
+- **Validated board tool** — `symphony board new` gains `--blocked-by`
+  (repeatable), `--request REQ-<n>` grouping, `--label` (repeatable), and
+  `--description-file PATH|-`. Creation — and the web API's issue
+  create/update — validates unique id, legal state, existing blockers, and
+  an acyclic dependency graph (violations print the cycle path).
+  `symphony board graph [--request REQ-n]` prints the ticket DAG.
+- **Per-stage backend routing** — `agent.stage_kinds` maps board states to
+  agent kinds. Resolution per dispatch: ticket `agent_kind` pin >
+  `agent.stage_kinds[state]` > `agent.kind`.
+- **Lane presets** — a succinct 4-lane default (`Todo → In Progress →
+  Verify → Learn`) and an optional 8-lane deep pipeline (`Intake → Research
+  → Plan → Review → Build → QA → Verify → Document`) ported from the
+  OneShot template. Switchable from the admin UI settings page or
+  `GET /api/v1/workflow/presets` + `POST /api/v1/workflow/presets/apply`,
+  with comments preserved and removed-lane tickets migrated; boards stay
+  fully customizable.
+- **Chat board-intake protocol** — the chat agent files validated ticket
+  DAGs instead of freehand ticket markdown: a simple request becomes one
+  ticket; a complex request becomes a research → plan → plan-review →
+  build → qa → document stage-ticket DAG under one `--request` group; a
+  deep-preset board gets one Intake ticket and the pipeline decomposes.
 
-### Changed
-
-- `.gitignore` narrowed from `.symphony/` to `.symphony/*` with
-  `!.symphony/workflows/`. Workflow definitions are executable code and must be
-  committed and reviewable; runtime state and artifacts stay ignored.
-- Ticket dispatch now also respects a governed run fence, so an issue whose run
-  is waiting on a human gate is not redispatched even though it holds no
-  process lease.
+Suite: 1575 passed, 7 skipped; ruff clean.
 
 ## [0.16.1] - 2026-08-06 - Delivery commits survive the agent's sandbox
 
