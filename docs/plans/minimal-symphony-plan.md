@@ -175,3 +175,26 @@ P3 = lands in Phase 3 connective tissue; PB = post-plan backlog.
 | 8 | Skill routing: trigger descriptions + progressive disclosure (open only the routed reference) | **Auto-attach skills to tickets**: match ticket text/labels against skill trigger phrases; inject only the matched skill body | Leaner worker prompts | PB |
 | 9 | Restricted messaging topology (parent/siblings/direct children only) | **Same-request Q&A file**: tickets in one request group append questions to a shared vault file; Plan-owner ticket answers async | Unblocks workers without human ping-pong | PB |
 | 10 | Goal-level budget accounting | **Per-request budget rollup** across the ticket DAG (extends existing per-ticket token EMA) with early warning in admin UI | Cost visibility per user request | PB |
+
+
+---
+
+## v2.1 owner decisions (lane presets, 2026-02)
+
+1. **Default = 4-lane minimal board** (`Todo → In Progress → Verify → Learn`) with
+   **succinct, short stage prompts** — today's agents are intelligent; keep base.md
+   and stage files lean. Easy to begin.
+2. **8-lane deep pipeline is an optional PRESET** (`Intake → Research → Plan → Review
+   → Build → QA → Verify → Document`), chosen per task complexity. **Switchable in
+   settings** (admin UI settings page / WORKFLOW.md), applied through the existing
+   `workflow/mutate.py` round-trip machinery so user comments/customizations survive.
+3. **Boards stay fully user-customizable** — existing lane CRUD + per-state prompt
+   editing remain first-class; presets are starting points, not cages.
+4. **Complexity routing on the default board** happens through ticket DAGs, not lanes:
+   a simple request = one ticket; a complex request = a DAG of stage-tickets
+   (RESEARCH-x ← PLAN-x ← REVIEW-x ← BUILD-x… via `blocked_by`, created with the
+   validated board tool). Lanes stay minimal; expertise arrives as tickets.
+5. Prompt-authoring rule for all presets: **succinct**. State the contract and the
+   gate; skip narrative hand-holding. Contract validators (orchestrator/contracts.py)
+   define the mechanical floor for the 4-lane preset; the 8-lane preset carries its
+   own lean gates (oneshot-style literal bash where applicable).
