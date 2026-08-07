@@ -8,9 +8,13 @@ import uuid
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Callable, cast
+from typing import TYPE_CHECKING, Callable, cast
 
 from ..issue import Issue
+from .migrations import LATEST_SCHEMA_VERSION, apply_migrations, current_schema_version
+
+if TYPE_CHECKING:  # pragma: no cover - typing only, avoids an import cycle
+    from .flow_store import GovernedRunStore
 
 
 DEFAULT_LEASE_TTL = timedelta(minutes=5)
@@ -95,11 +99,37 @@ class RunRegistry:
         # our own live leases are never self-reclaimed.
         self._owner_pid = owner_pid if owner_pid is not None else os.getpid()
         self._boot_id = boot_id or uuid.uuid4().hex
+        self._applied_migrations: list[int] = []
+        self._governed: "GovernedRunStore | None" = None
         self._ensure_schema()
 
     @property
     def path(self) -> Path:
         return self._path
+
+    @property
+    def applied_migrations(self) -> tuple[int, ...]:
+        """Schema versions this instance applied at open time (doctor uses it)."""
+        return tuple(self._applied_migrations)
+
+    def schema_version(self) -> int:
+        return current_schema_version(self._connect())
+
+    def schema_is_current(self) -> bool:
+        return self.schema_version() >= LATEST_SCHEMA_VERSION
+
+    @property
+    def governed(self) -> "GovernedRunStore":
+        """Node-level ledger sharing this registry's connection.
+
+        Imported lazily because `flow_store` imports this module's time
+        helpers; a top-level import here would close the cycle.
+        """
+        if self._governed is None:
+            from .flow_store import GovernedRunStore
+
+            self._governed = GovernedRunStore(self._connect)
+        return self._governed
 
     def close(self) -> None:
         if self._conn is not None:
@@ -484,69 +514,12 @@ class RunRegistry:
         return self._conn
 
     def _ensure_schema(self) -> None:
-        conn = self._connect()
-        conn.execute(
-            """
-            CREATE TABLE IF NOT EXISTS runs (
-                run_id TEXT PRIMARY KEY,
-                issue_id TEXT NOT NULL,
-                identifier TEXT NOT NULL,
-                title TEXT NOT NULL,
-                state TEXT NOT NULL,
-                attempt INTEGER,
-                attempt_kind TEXT NOT NULL,
-                agent_kind TEXT NOT NULL,
-                workspace_path TEXT NOT NULL,
-                status TEXT NOT NULL,
-                started_at TEXT NOT NULL,
-                updated_at TEXT NOT NULL,
-                lease_expires_at TEXT,
-                last_progress_at TEXT,
-                completed_at TEXT,
-                owner_pid INTEGER,
-                owner_boot_id TEXT,
-                backend_agent_pid INTEGER
-            )
-            """
-        )
-        # Migrate pre-owner databases in place; NULL owners read as
-        # "unknown, presumed dead" in reclaim_dead_owner_leases.
-        existing = {
-            row[1] for row in conn.execute("PRAGMA table_info(runs)").fetchall()
-        }
-        if "owner_pid" not in existing:
-            conn.execute("ALTER TABLE runs ADD COLUMN owner_pid INTEGER")
-        if "owner_boot_id" not in existing:
-            conn.execute("ALTER TABLE runs ADD COLUMN owner_boot_id TEXT")
-        if "backend_agent_pid" not in existing:
-            conn.execute("ALTER TABLE runs ADD COLUMN backend_agent_pid INTEGER")
-        conn.execute(
-            """
-            CREATE INDEX IF NOT EXISTS idx_runs_issue_status_lease
-            ON runs(issue_id, status, lease_expires_at)
-            """
-        )
-        conn.execute(
-            """
-            CREATE TABLE IF NOT EXISTS issue_flags (
-                issue_id TEXT PRIMARY KEY,
-                retry_attempt INTEGER,
-                budget_exhausted INTEGER NOT NULL DEFAULT 0,
-                paused INTEGER NOT NULL DEFAULT 0,
-                pause_reason TEXT,
-                updated_at TEXT NOT NULL
-            )
-            """
-        )
-        issue_flag_columns = {
-            row[1] for row in conn.execute("PRAGMA table_info(issue_flags)").fetchall()
-        }
-        if "pause_reason" not in issue_flag_columns:
-            try:
-                conn.execute("ALTER TABLE issue_flags ADD COLUMN pause_reason TEXT")
-            except sqlite3.OperationalError as exc:
-                if "duplicate column" not in str(exc).lower():
-                    raise
+        """Bring the database up to the latest schema version.
+
+        The DDL itself lives in `migrations.py`; this stays a one-liner so
+        there is exactly one place that decides what the schema looks like.
+        """
+        self._applied_migrations = apply_migrations(self._connect(), self._path)
 
     def _write_issue_flags(
         self,

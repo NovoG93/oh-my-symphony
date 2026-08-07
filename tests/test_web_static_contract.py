@@ -217,3 +217,95 @@ def test_web_chat_font_controls_contract() -> None:
     assert "function buildFontControls(view)" in js
     assert ".chat-font-controls" in css
     assert "font-size: inherit" in css
+
+
+def test_web_governed_run_api_contract() -> None:
+    js = _script_bundle()
+
+    assert "getGovernedRun: (runId) => apiRequest(`/runs/${encodeURIComponent(runId)}`)" in js
+    assert "resumeGovernedRun: (runId)" in js
+    assert "abandonGovernedRun: (runId)" in js
+    assert "cancelGovernedRun: (runId)" in js
+    assert "resolveApproval: (approvalId, payload)" in js
+
+
+def test_web_governed_run_panel_contract() -> None:
+    js = _script_bundle()
+    css = (STATIC_ROOT / "style.css").read_text(encoding="utf-8")
+
+    assert "function openRunPanel(runId)" in js
+    assert "function buildRunPanelContent(detail)" in js
+    assert "function buildRunNodesSection(detail)" in js
+    assert "function buildRunNodeRow(node)" in js
+    assert "function buildRunNodeDetail(node)" in js
+    assert "function buildNodeGitSummary(git)" in js
+    assert "function buildRunArtifactRow(artifact)" in js
+    # The staleness guard from buildRunHistorySection: a slow response for a
+    # panel the operator already closed must never paint over the new one.
+    assert "if (state.runPanelId !== runId) return;" in js
+    # Server order is the executed topological order; nothing re-sorts it.
+    assert "for (const node of nodes) rows.appendChild(buildRunNodeRow(node));" in js
+    assert "href: `${API_BASE}/artifacts/${encodeURIComponent(artifact.artifact_id)}`," in js
+    assert ".run-panel-summary" in css
+    assert ".run-node-row" in css
+    assert ".run-node-output" in css
+    assert ".run-artifact-row" in css
+
+
+def test_web_governed_card_badges_contract() -> None:
+    js = _script_bundle()
+    css = (STATIC_ROOT / "style.css").read_text(encoding="utf-8")
+
+    assert "function buildGovernedBadges(liveEntry)" in js
+    assert "function governedLiveInfo(liveEntry)" in js
+    assert "for (const badge of buildGovernedBadges(liveEntry)) badges.appendChild(badge);" in js
+    # Gate and attention must differ by word/symbol, not colour alone.
+    assert "t('governed.badgeGate')" in js
+    assert "'governed.badgeGate': '⏸ gate'" in js
+    assert "t('governed.badgeAttention')" in js
+    assert "'governed.badgeAttention': '⚠ attention'" in js
+    assert "t('governed.badgeProgress'" in js
+    assert "'governed.badgeProgress': '[{completed}/{total}]'" in js
+    assert ".chip-gate" in css
+    assert ".chip-run-attention" in css
+
+
+def test_web_governed_approval_gate_contract() -> None:
+    js = _script_bundle()
+    css = (STATIC_ROOT / "style.css").read_text(encoding="utf-8")
+
+    assert "function buildApprovalPanel(detail, approval)" in js
+    assert "function buildApprovalEvidence(detail, approval)" in js
+    assert "async function resolveGate(approval, decision, commentInput)" in js
+    # The version rendered is the version sent, so a gate that moved loses the
+    # compare-and-set instead of being overwritten.
+    assert "expected_version: approval.version," in js
+    # A conflict reloads and re-asks; it never marks the gate resolved.
+    assert "if (err instanceof ApiError && err.status === 409) {" in js
+    assert "showRunPanelError(t('governed.gateConflict', { message: err.message }));" in js
+    assert "if (decision === 'rejected' && !comment) {" in js
+    assert "t('governed.commentRequired')" in js
+    assert "'governed.commentRequired': 'A comment is required to reject a gate.'" in js
+    assert ".run-approval-actions" in css
+
+
+def test_web_governed_actions_and_error_rendering_contract() -> None:
+    js = _script_bundle()
+    css = (STATIC_ROOT / "style.css").read_text(encoding="utf-8")
+
+    # `actions` is authoritative — the UI never derives buttons from status.
+    assert "for (const action of detail.actions || []) {" in js
+    assert "function buildRunActionsRow(detail)" in js
+    assert "function buildConfirmedActionControl(detail, action, handler, label)" in js
+    assert "async function runGovernedAction(detail, handler)" in js
+    assert "function buildRunAttentionSection(detail)" in js
+    assert "t('governed.attentionReason'" in js
+    assert "'governed.attentionReason': 'Reason: {reason}'" in js
+    # Every mutation renders the server's code and message (PRD §24.6).
+    assert "function apiErrorText(err)" in js
+    assert "if (err instanceof ApiError) return t('governed.errorWithCode', { code: err.code, message: err.message });" in js
+    assert "showRunPanelError(apiErrorText(err));" in js
+    # Added polling reuses the existing drag/edit hold.
+    assert "function shouldHoldRender()" in js
+    assert "if (!shouldHoldRender() && !state.runPanelHold) await refreshRunPanel();" in js
+    assert ".run-attention" in css

@@ -32,7 +32,7 @@ import sys
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterable, Literal
+from typing import Any, Iterable, Literal
 
 from .._shell import _is_wsl_launcher, resolve_bash
 from ..backends.codex import _sandbox_uses_workspace_write
@@ -642,6 +642,126 @@ def check_stage_turn_budget(cfg: ServiceConfig) -> CheckResult:
     )
 
 
+def check_workflow_engine(cfg: ServiceConfig) -> CheckResult:
+    """Validate governed workflow mode, if the repository opted into it.
+
+    Compiles every discovered workflow rather than only the default: a
+    ticket can name any of them, and finding out at dispatch that one does
+    not compile means the ticket is blocked instead of running.
+    """
+    engine = cfg.workflow_engine
+    if not engine.enabled:
+        return CheckResult(
+            "workflow_engine", "pass", "disabled — legacy stage loop in use"
+        )
+    if engine.directory is None or not engine.directory.is_dir():
+        return CheckResult(
+            "workflow_engine",
+            "fail",
+            f"workflow directory not found: {engine.directory}",
+        )
+
+    from ..flow.loader import WorkflowLoader
+
+    loader = WorkflowLoader(
+        engine.directory,
+        workflow_dir=cfg.workflow_path.parent,
+        max_parallel_nodes=engine.max_parallel_nodes,
+    )
+    entries = loader.list_workflows()
+    if not entries:
+        return CheckResult(
+            "workflow_engine",
+            "fail",
+            f"no workflow files under {engine.directory}",
+        )
+    broken = [entry for entry in entries if not entry.valid]
+    if broken:
+        detail = "; ".join(f"{entry.name}: {entry.error}" for entry in broken[:3])
+        return CheckResult("workflow_engine", "fail", detail)
+    if not any(entry.name == engine.default for entry in entries):
+        return CheckResult(
+            "workflow_engine",
+            "fail",
+            f"default workflow {engine.default!r} is not among "
+            + ", ".join(entry.name for entry in entries),
+        )
+
+    known_states = {
+        state.strip().lower()
+        for state in (*cfg.tracker.active_states, *cfg.tracker.terminal_states)
+        if state
+    }
+    unmapped = [
+        f"{condition}->{target}"
+        for condition, target in engine.ticket_state_mapping.items()
+        if target.strip().lower() not in known_states
+    ]
+    if unmapped:
+        return CheckResult(
+            "workflow_engine",
+            "fail",
+            "ticket_state_mapping targets unknown states: " + ", ".join(unmapped),
+        )
+
+    risky = [
+        entry.name
+        for entry in entries
+        if _workflow_has_ungated_side_effects(loader, entry.name)
+    ]
+    summary = f"{len(entries)} workflow(s) valid; default={engine.default}"
+    if risky:
+        # Not a failure — a repository may legitimately want this — but an
+        # external side effect with no approval ancestor is exactly the
+        # thing an operator should have decided on deliberately.
+        return CheckResult(
+            "workflow_engine",
+            "warn",
+            f"{summary}; external side effects with no approval gate in: "
+            + ", ".join(risky),
+        )
+    return CheckResult("workflow_engine", "pass", summary)
+
+
+def _workflow_has_ungated_side_effects(loader: Any, name: str) -> bool:
+    try:
+        return bool(loader.load(name).risk.ungated_external_node_ids)
+    except Exception:
+        return False
+
+
+def check_workflow_registry(cfg: ServiceConfig) -> CheckResult:
+    """Confirm `.symphony/state.db` is migrated to the current schema."""
+    from ..orchestrator.migrations import LATEST_SCHEMA_VERSION
+    from ..orchestrator.run_registry import RunRegistry, registry_path_for_workflow
+
+    path = registry_path_for_workflow(cfg.workflow_path)
+    if not path.exists():
+        return CheckResult(
+            "state.db", "pass", "no run history yet; will be created on first run"
+        )
+    try:
+        registry = RunRegistry(path)
+    except Exception as exc:
+        return CheckResult("state.db", "fail", f"cannot open {path}: {exc}")
+    try:
+        version = registry.schema_version()
+        applied = registry.applied_migrations
+    finally:
+        registry.close()
+    if version < LATEST_SCHEMA_VERSION:
+        return CheckResult(
+            "state.db",
+            "fail",
+            f"schema version {version} < {LATEST_SCHEMA_VERSION}; migration "
+            "did not complete",
+        )
+    detail = f"schema v{version}"
+    if applied:
+        detail += f" (applied {', '.join(str(v) for v in applied)} just now)"
+    return CheckResult("state.db", "pass", detail)
+
+
 def run_checks(cfg: ServiceConfig, host: str = "127.0.0.1") -> list[CheckResult]:
     return [
         check_port(cfg, host=host),
@@ -659,6 +779,8 @@ def run_checks(cfg: ServiceConfig, host: str = "127.0.0.1") -> list[CheckResult]
         check_agent_git_grant(cfg),
         check_tracker(cfg),
         check_board_viewer(cfg),
+        check_workflow_engine(cfg),
+        check_workflow_registry(cfg),
     ]
 
 

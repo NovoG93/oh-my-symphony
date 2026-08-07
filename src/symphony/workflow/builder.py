@@ -50,6 +50,7 @@ from .config import (
     TrackerConfig,
     TuiConfig,
     WikiConfig,
+    WorkflowEngineConfig,
 )
 from .constants import (
     _AFTER_DONE_FAILURE_POLICIES,
@@ -89,7 +90,13 @@ from .constants import (
     DEFAULT_POLL_INTERVAL_MS,
     DEFAULT_PROMPT,
     DEFAULT_TERMINAL_STATES,
+    DEFAULT_WORKFLOW_ARTIFACT_DIRECTORY,
+    DEFAULT_WORKFLOW_ARTIFACT_RETENTION_DAYS,
+    DEFAULT_WORKFLOW_DIRECTORY,
+    DEFAULT_WORKFLOW_MAX_PARALLEL_NODES,
+    DEFAULT_WORKFLOW_NAME,
     DEFAULT_WORKSPACE_REUSE_POLICY,
+    MAX_WORKFLOW_PARALLEL_NODES,
     JIRA_API_TOKEN_ENV,
     JIRA_EMAIL_ENV,
     LINEAR_API_KEY_ENV,
@@ -653,6 +660,10 @@ def build_service_config(workflow: WorkflowDefinition) -> ServiceConfig:
         cfg.get("continuous_improvement")
     )
 
+    workflow_engine = _build_workflow_engine_config(
+        cfg.get("workflow_engine"), base_dir
+    )
+
     return ServiceConfig(
         workflow_path=workflow.source_path,
         poll_interval_ms=poll_interval_ms,
@@ -675,6 +686,7 @@ def build_service_config(workflow: WorkflowDefinition) -> ServiceConfig:
         wiki=wiki,
         notifications=notifications,
         continuous_improvement=continuous_improvement,
+        workflow_engine=workflow_engine,
         raw=dict(cfg),
         prompt_template=prompt_template,
         workspace_reuse_policy=workspace_reuse_policy,
@@ -832,6 +844,143 @@ def _validated_ci_ticket_prefix(value: Any) -> str:
             value=value,
         )
     return value
+
+
+def _build_workflow_engine_config(raw: Any, base_dir: Path) -> WorkflowEngineConfig:
+    """§governed workflow mode — default-off, every field validated strictly.
+
+    A missing or non-mapping `workflow_engine:` yields the disabled default,
+    which is byte-for-byte today's behavior. Path fields resolve against the
+    WORKFLOW.md directory and are rejected if they escape it: workflow files
+    are executable code, so the set of directories they can be loaded from
+    must stay inside the reviewed repository.
+    """
+    engine_raw = raw or {}
+    if not isinstance(engine_raw, dict):
+        engine_raw = {}
+
+    enabled = _validated_bool(
+        engine_raw.get("enabled"), False, name="workflow_engine.enabled"
+    )
+    directory = _validated_repo_relative_dir(
+        engine_raw.get("directory"),
+        DEFAULT_WORKFLOW_DIRECTORY,
+        base_dir=base_dir,
+        name="workflow_engine.directory",
+    )
+    artifact_directory = _validated_repo_relative_dir(
+        engine_raw.get("artifact_directory"),
+        DEFAULT_WORKFLOW_ARTIFACT_DIRECTORY,
+        base_dir=base_dir,
+        name="workflow_engine.artifact_directory",
+    )
+    default_name = _as_str(engine_raw.get("default")) or DEFAULT_WORKFLOW_NAME
+    default_name = default_name.strip()
+    if not _WORKFLOW_NAME_RE.match(default_name):
+        raise ConfigValidationError(
+            "workflow_engine.default must be lowercase letters, digits, and "
+            "hyphens, starting with a letter",
+            value=default_name,
+        )
+    max_parallel_nodes = _validated_strict_int(
+        engine_raw.get("max_parallel_nodes"),
+        DEFAULT_WORKFLOW_MAX_PARALLEL_NODES,
+        name="workflow_engine.max_parallel_nodes",
+        minimum=1,
+    )
+    if max_parallel_nodes > MAX_WORKFLOW_PARALLEL_NODES:
+        raise ConfigValidationError(
+            f"workflow_engine.max_parallel_nodes must be <= "
+            f"{MAX_WORKFLOW_PARALLEL_NODES}",
+            value=max_parallel_nodes,
+        )
+    require_explicit_resume = _validated_bool(
+        engine_raw.get("require_explicit_resume"),
+        True,
+        name="workflow_engine.require_explicit_resume",
+    )
+    if not require_explicit_resume:
+        raise ConfigValidationError(
+            "workflow_engine.require_explicit_resume cannot be disabled in this "
+            "release; automatic resume of an interrupted governed run is unsafe "
+            "until node-level side effects are provably idempotent",
+            value=require_explicit_resume,
+        )
+    artifact_retention_days = _validated_strict_int(
+        engine_raw.get("artifact_retention_days"),
+        DEFAULT_WORKFLOW_ARTIFACT_RETENTION_DAYS,
+        name="workflow_engine.artifact_retention_days",
+        minimum=0,
+    )
+    ticket_state_mapping = _validated_ticket_state_mapping(
+        engine_raw.get("ticket_state_mapping")
+    )
+
+    return WorkflowEngineConfig(
+        enabled=enabled,
+        directory=directory,
+        artifact_directory=artifact_directory,
+        default=default_name,
+        max_parallel_nodes=max_parallel_nodes,
+        require_explicit_resume=require_explicit_resume,
+        artifact_retention_days=artifact_retention_days,
+        ticket_state_mapping=ticket_state_mapping,
+    )
+
+
+_WORKFLOW_NAME_RE = re.compile(r"^[a-z][a-z0-9-]{0,62}$")
+
+# Runtime conditions a repository may map to a tracker state (PRD §13.2).
+_TICKET_STATE_CONDITIONS = frozenset(
+    {"running", "waiting_approval", "succeeded", "rejected", "abandoned"}
+)
+
+
+def _validated_repo_relative_dir(
+    value: Any, default: str, *, base_dir: Path, name: str
+) -> Path:
+    raw = _as_str(value) or default
+    candidate = Path(expand_path_value(raw.strip()))
+    resolved = (
+        candidate.resolve()
+        if candidate.is_absolute()
+        else (base_dir / candidate).resolve()
+    )
+    root = base_dir.resolve()
+    try:
+        resolved.relative_to(root)
+    except ValueError as exc:
+        raise ConfigValidationError(
+            f"{name} must stay inside the workflow directory", value=raw
+        ) from exc
+    return resolved
+
+
+def _validated_ticket_state_mapping(value: Any) -> dict[str, str]:
+    if value is None:
+        return {}
+    if not isinstance(value, dict):
+        raise ConfigValidationError(
+            "workflow_engine.ticket_state_mapping must be a mapping", value=value
+        )
+    mapping: dict[str, str] = {}
+    for key, target in value.items():
+        condition = str(key).strip().lower()
+        if condition not in _TICKET_STATE_CONDITIONS:
+            raise ConfigValidationError(
+                "workflow_engine.ticket_state_mapping key must be one of "
+                + ", ".join(sorted(_TICKET_STATE_CONDITIONS)),
+                value=key,
+            )
+        target_state = _as_str(target)
+        if not target_state or not target_state.strip():
+            raise ConfigValidationError(
+                f"workflow_engine.ticket_state_mapping.{condition} must name a "
+                "tracker state",
+                value=target,
+            )
+        mapping[condition] = target_state.strip()
+    return mapping
 
 
 def _build_continuous_improvement_config(raw: Any) -> ContinuousImprovementConfig:
