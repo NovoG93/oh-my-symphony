@@ -12,12 +12,8 @@ htmlcov/
 .omc/
 .omx/
 .playwright-mcp/
-# Local runtime state (state.db, token_ema.json, artifacts) stays out of git,
-# but `.symphony/workflows/` holds governed workflow definitions. Those are
-# executable code — they run agents and shell commands — so they must be
-# committed and reviewable like any CI config.
+# Local runtime state (state.db, token_ema.json, chat transcripts) stays out of git.
 .symphony/*
-!.symphony/workflows/
 .domain-agent/
 
 # Auto-generated kanban mirror (regenerated on every TUI launch)
