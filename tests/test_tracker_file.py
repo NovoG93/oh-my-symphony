@@ -1234,3 +1234,87 @@ def test_serialize_round_trip(tmp_path):
     parsed_front, parsed_body = parse_ticket_file(path)
     assert parsed_front["id"] == "X-1"
     assert parsed_body == "hello"
+
+
+# ---------------------------------------------------------------------------
+# request grouping field + dependency-graph load guardrails
+# ---------------------------------------------------------------------------
+
+
+def test_request_field_round_trips_through_create_and_parse(tmp_path):
+    root = tmp_path / "board"
+    fbt = FileBoardTracker(_tracker(root))
+
+    path = fbt.create(
+        identifier="REQ-T-1",
+        title="grouped work",
+        blocked_by=["REQ-T-0"],
+        request="REQ-1",
+    )
+
+    front, _ = parse_ticket_file(path)
+    assert front["request"] == "REQ-1"
+    assert front["blocked_by"] == ["REQ-T-0"]
+    issue = issue_from_file(path)
+    assert issue is not None
+    assert issue.request == "REQ-1"
+    assert issue.to_template_dict()["request"] == "REQ-1"
+    assert [b.identifier for b in issue.blocked_by] == ["REQ-T-0"]
+
+
+def test_request_field_absent_is_none_for_old_tickets(tmp_path):
+    path = _write(
+        tmp_path,
+        "OLD-1.md",
+        "---\nid: OLD-1\ntitle: legacy\nstate: Todo\n---\nbody\n",
+    )
+    issue = issue_from_file(path)
+    assert issue is not None
+    assert issue.request is None
+    assert issue.to_template_dict()["request"] == ""
+
+
+def test_update_fields_sets_and_clears_request_and_blocked_by(tmp_path):
+    root = tmp_path / "board"
+    fbt = FileBoardTracker(_tracker(root))
+    fbt.create(identifier="UPD-1", title="t")
+
+    fbt.update_fields("UPD-1", request="REQ-9", blocked_by=["UPD-0"])
+    front, _ = parse_ticket_file(root / "UPD-1.md")
+    assert front["request"] == "REQ-9"
+    assert front["blocked_by"] == ["UPD-0"]
+
+    fbt.update_fields("UPD-1", request="", blocked_by=[])
+    front, _ = parse_ticket_file(root / "UPD-1.md")
+    assert "request" not in front
+    assert "blocked_by" not in front
+
+
+def test_scan_warns_once_for_dangling_blockers_and_cycles(tmp_path, monkeypatch):
+    root = tmp_path / "board"
+    _write(root, "CYC-1.md", "---\nid: CYC-1\ntitle: a\nstate: Todo\nblocked_by: [CYC-2]\n---\n")
+    _write(root, "CYC-2.md", "---\nid: CYC-2\ntitle: b\nstate: Todo\nblocked_by: [CYC-1]\n---\n")
+    _write(root, "DAN-1.md", "---\nid: DAN-1\ntitle: c\nstate: Todo\nblocked_by: [GHOST-1]\n---\n")
+    warnings: list[tuple[str, dict[str, object]]] = []
+    monkeypatch.setattr(
+        file_tracker_module.log,
+        "warning",
+        lambda message, **fields: warnings.append((message, fields)),
+    )
+    fbt = FileBoardTracker(_tracker(root))
+
+    # Poll loop keeps working: the scan returns all tickets despite the mess.
+    assert len(fbt.fetch_candidate_issues()) == 3
+
+    dangling = [w for w in warnings if w[0] == "dangling_blocked_by"]
+    cycles = [w for w in warnings if w[0] == "dependency_cycle"]
+    assert dangling == [
+        ("dangling_blocked_by", {"identifier": "DAN-1", "missing": "GHOST-1"})
+    ]
+    assert len(cycles) == 1
+    assert "CYC-1" in cycles[0][1]["cycle"] and "CYC-2" in cycles[0][1]["cycle"]
+
+    # Identical findings are not re-logged on the next poll tick.
+    warnings.clear()
+    fbt.fetch_candidate_issues()
+    assert warnings == []

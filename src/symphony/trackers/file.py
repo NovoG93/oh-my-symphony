@@ -62,6 +62,7 @@ from ..logging import get_logger
 from ..skills import normalize_skill_names
 from ..ticket_markdown import parse_body_dependency_ids
 from ..workflow import TrackerConfig
+from .validate import board_edges, dangling_blockers, find_cycle
 
 
 _FRONT_MATTER_DELIM = "---"
@@ -77,6 +78,7 @@ _CANONICAL_FRONT_MATTER_KEYS = {
     "url",
     "labels",
     "blocked_by",
+    "request",
     "agent",
     "agent_kind",
     "skills",
@@ -337,6 +339,7 @@ def issue_from_file(path: Path) -> Issue | None:
         or parse_iso_timestamp(_file_mtime_iso(path)),
         agent_kind=_parse_agent_kind(front),
         skills=normalize_skill_names(front.get("skills")),
+        request=str(front.get("request") or "").strip() or None,
     )
 
 
@@ -421,6 +424,7 @@ def serialize_ticket(front: dict[str, Any], body: str) -> str:
         "url",
         "labels",
         "blocked_by",
+        "request",
         "agent",
         "agent_kind",
         "skills",
@@ -522,6 +526,7 @@ class FileBoardTracker:
         self._active = {s.lower() for s in tracker.active_states}
         self._terminal = {s.lower() for s in tracker.terminal_states}
         self._root.mkdir(parents=True, exist_ok=True)
+        self._last_graph_warning_signature: object = None
         self._sweep_stale_temps()
 
     def _lock_path(self, name: str) -> Path:
@@ -656,7 +661,37 @@ class FileBoardTracker:
                     continue
                 seen[issue.id] = path
                 out.append(issue)
-        return _hydrate_blocker_states(out)
+        issues = _hydrate_blocker_states(out)
+        self._warn_dependency_graph_issues(issues)
+        return issues
+
+    def scan_all(self) -> list[Issue]:
+        """All parseable tickets, blocker states hydrated (any state)."""
+        return self._scan_all()
+
+    def _warn_dependency_graph_issues(self, issues: list[Issue]) -> None:
+        """Load-time guardrail: WARN on dangling blockers / cycles.
+
+        Never raises — degraded visibility beats a dead orchestrator poll
+        loop. Identical findings are logged once until the board changes.
+        """
+        dangling = dangling_blockers(issues)
+        cycle = find_cycle(board_edges(issues))
+        signature = (
+            tuple(sorted((k, tuple(v)) for k, v in dangling.items())),
+            tuple(cycle or ()),
+        )
+        if signature == self._last_graph_warning_signature:
+            return
+        self._last_graph_warning_signature = signature
+        for identifier, missing in sorted(dangling.items()):
+            log.warning(
+                "dangling_blocked_by",
+                identifier=identifier,
+                missing=", ".join(missing),
+            )
+        if cycle:
+            log.warning("dependency_cycle", cycle=" -> ".join(cycle))
 
     # ------------------------------------------------------------------
     # convenience helpers used by board CLI / agent tool
@@ -834,6 +869,8 @@ class FileBoardTracker:
         description: str = "",
         agent_kind: str | None = None,
         skills: list[str] | None = None,
+        blocked_by: list[str] | None = None,
+        request: str | None = None,
     ) -> tuple[str, Path]:
         with _exclusive_lock(self._allocator_lock_path()):
             last_error: Exception | None = None
@@ -849,6 +886,8 @@ class FileBoardTracker:
                         description=description,
                         agent_kind=agent_kind,
                         skills=skills,
+                        blocked_by=blocked_by,
+                        request=request,
                     )
                 except SymphonyError as exc:
                     last_error = exc
@@ -867,6 +906,8 @@ class FileBoardTracker:
         description: str = "",
         agent_kind: str | None = None,
         skills: list[str] | None = None,
+        blocked_by: list[str] | None = None,
+        request: str | None = None,
     ) -> Path:
         path = self._root / f"{identifier}.md"
         with _exclusive_lock(self._ticket_lock_path(identifier)):
@@ -880,6 +921,8 @@ class FileBoardTracker:
                 labels=labels,
                 agent_kind=agent_kind,
                 skills=skills,
+                blocked_by=blocked_by,
+                request=request,
             )
             write_ticket_atomic(path, front, description)
             return path
@@ -894,6 +937,8 @@ class FileBoardTracker:
         labels: list[str] | None,
         agent_kind: str | None,
         skills: list[str] | None,
+        blocked_by: list[str] | None = None,
+        request: str | None = None,
     ) -> dict[str, Any]:
         now = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
         front: dict[str, Any] = {
@@ -906,6 +951,10 @@ class FileBoardTracker:
             "created_at": now,
             "updated_at": now,
         }
+        if blocked_by:
+            front["blocked_by"] = [str(item) for item in blocked_by]
+        if isinstance(request, str) and request.strip():
+            front["request"] = request.strip()
         if isinstance(agent_kind, str) and agent_kind.strip():
             front["agent"] = {"kind": agent_kind.strip().lower()}
         normalized_skills = normalize_skill_names(list(skills or []))
@@ -925,11 +974,15 @@ class FileBoardTracker:
         labels: list[str] | None = None,
         skills: list[str] | None = None,
         agent_kind: str | None = None,
+        blocked_by: list[str] | None = None,
+        request: str | None = None,
     ) -> Path:
         """Partial ticket update from the board UI. None = leave unchanged.
 
         `description` replaces the Markdown body. `agent_kind=""` clears the
         per-ticket agent override; `clear_priority=True` drops priority.
+        `blocked_by=[]` clears the frontmatter blocker list; `request=""`
+        clears the request grouping field.
         """
         def mutate(front: dict[str, Any], body: str) -> tuple[dict[str, Any], str]:
             if title is not None:
@@ -955,6 +1008,17 @@ class FileBoardTracker:
                     front["agent"] = {"kind": cleaned}
                 else:
                     front.pop("agent", None)
+            if blocked_by is not None:
+                if blocked_by:
+                    front["blocked_by"] = [str(item) for item in blocked_by]
+                else:
+                    front.pop("blocked_by", None)
+            if request is not None:
+                cleaned_request = request.strip()
+                if cleaned_request:
+                    front["request"] = cleaned_request
+                else:
+                    front.pop("request", None)
             front["updated_at"] = datetime.now(timezone.utc).strftime(
                 "%Y-%m-%dT%H:%M:%SZ"
             )
