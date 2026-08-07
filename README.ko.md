@@ -570,6 +570,117 @@ Symphony는 `base`와 티켓의 현재 상태에 해당하는 프롬프트 파�
 
 ---
 
+
+## 거버넌스 워크플로 (선택 기능)
+
+Symphony는 기본적으로 프로세스를 **스테이지 프롬프트**로 표현합니다. 에이전트가
+현재 컬럼에 해당하는 프롬프트를 읽고 작업한 뒤, 티켓의 `state` 필드를 직접 고쳐
+다음 단계로 옮깁니다. 단순하고 유연하지만, 모델이 작업자인 동시에 **작업이
+끝났는지를 판정하는 심판**이기도 합니다. 단계를 건너뛰거나, 둘을 합치거나,
+테스트를 돌리지 않고 성공을 선언할 수 있습니다.
+
+**거버넌스 워크플로 모드**는 그 판정 권한을 엔진으로 옮깁니다. 저장소가 YAML
+DAG를 커밋하면, 노드 순서·성공 여부·실행 종료 시점을 모델이 아니라 Symphony가
+결정합니다.
+
+```yaml
+# .symphony/workflows/ticket-default.yaml
+version: 1
+name: ticket-default
+
+nodes:
+  - id: plan
+    type: agent
+    workspace_access: read
+    prompt_file: docs/symphony-prompts/workflows/plan.md
+
+  - id: approve-plan
+    type: approval          # 지속되는 게이트 — 명시적 해제만 통과시킨다
+    depends_on: [plan]
+    title: Approve the implementation plan
+    evidence: [plan]
+
+  - id: implement
+    type: agent
+    depends_on: [approve-plan]
+    workspace_access: write
+    prompt: |
+      Implement the approved plan for ${ticket.identifier}.
+      ${nodes.plan.output}
+
+  - id: test
+    type: shell             # 결정론적 — 모델이 개입하지 않는다
+    depends_on: [implement]
+    run: python -m pytest -q
+```
+
+`WORKFLOW.md`에서 활성화합니다:
+
+```yaml
+workflow_engine:
+  enabled: true
+  directory: ./.symphony/workflows
+  default: ticket-default
+  ticket_state_mapping:
+    running: "In Progress"
+    waiting_approval: "Human Review"
+    succeeded: Done
+    rejected: Blocked
+```
+
+**`workflow_engine` 블록이 없으면 아무것도 달라지지 않습니다.** 기존 티켓,
+스테이지 프롬프트, 보드, 훅, 백엔드, 명령이 전부 그대로 동작합니다.
+
+### 무엇이 달라지나
+
+- **노드 3종.** `agent`는 백엔드 턴 1회, `shell`은 결정론적 명령, `approval`은
+  게이트를 열고 실행을 정지시킵니다.
+- **노드별 백엔드.** 계획은 Codex, 구현은 Claude, 리뷰는 Gemini — 감사 추적은
+  하나로 유지됩니다. 노드 단위 선택이 티켓의 기본 백엔드를 바꾸지 않습니다.
+- **실제 원장.** 모든 노드 시도와 출력, 에러 분류, 토큰 사용량, 실행 전후 git
+  리비전이 `.symphony/state.db`에 남고 `symphony run show`로 읽을 수 있습니다.
+- **의미 있는 승인.** 카드를 *Human Review*로 옮겨도 승인이 아닙니다. 에이전트가
+  코멘트에 "approved"라고 써도 아닙니다. 오직
+  `symphony approval resolve <id> --approve --version N` 또는 동등한 API
+  호출만이 게이트를 해제하며, 두 번째로 들어온 상충하는 결정은 기존 결정을
+  덮어쓰지 않고 충돌로 거부됩니다.
+- **명시적 복구.** 크래시 이후 중단된 노드는 `interrupted`로 표시되고, 실행은
+  지속되는 펜스를 쥔 채 `needs_attention`에 멈춥니다. 일반 폴링이 티켓을 조용히
+  처음부터 다시 돌릴 수 없습니다. `resume`·`abandon`·새로 시작 중에서 사람이
+  고릅니다. resume은 **저장된** 정의 스냅샷을 재생하고, 이미 성공한 노드는
+  건너뛰며, 그 노드들의 아티팩트 해시가 여전히 일치하는지 검증합니다.
+
+### 오퍼레이터 명령
+
+```bash
+symphony workflow list                       # 발견된 파일과 검증 상태
+symphony workflow validate path/to/flow.yaml # file:line 진단
+symphony run show RUN_ID                     # 그래프·시도·사용량·git 요약
+symphony run events RUN_ID --after-seq 12    # 증분 이벤트 스트림
+symphony approval list                       # 사람을 기다리는 항목
+symphony approval resolve APPROVAL_ID --approve --version 1
+symphony run resume RUN_ID
+symphony run abandon RUN_ID --yes
+```
+
+### 활성화 전에 알아야 할 두 가지
+
+**워크플로 파일은 실행 가능한 코드입니다.** 티켓 워크스페이스에서 에이전트를
+띄우고 셸 명령을 실행합니다. `.symphony/workflows/` 변경은 CI 파이프라인 변경을
+리뷰하듯 다루십시오. Symphony는 체크아웃된 저장소 밖의 워크플로를 로드하지
+않습니다.
+
+**티켓 텍스트는 신뢰할 수 없는 입력입니다.** 티켓 설명과 이전 노드 출력은 표시된
+구역으로 감싸여 지시문이 아닌 데이터임이 모델에게 명시됩니다. 셸 명령에는 티켓
+텍스트를 아예 치환하지 않습니다 — 컨텍스트는 환경변수로 전달됩니다. 템플릿으로
+조립한 셸 명령은 어떤 따옴표 처리로도 안전해지지 않기 때문입니다.
+
+현재 거버넌스 모드는 노드를 하나씩 실행합니다. 병렬 읽기 전용 리뷰어는 설계는
+되어 있으나 의도적으로 비활성 상태입니다. 지금은 어떤 백엔드 어댑터도 강제된
+읽기 전용 샌드박스로 기동되지 않으며, 노드가 "쓰지 않겠다"고 **선언**하는 것과
+쓰지 못하도록 **막히는** 것은 다르기 때문입니다.
+
+---
 ## Run
 
 ### Web app + JSON API

@@ -35,6 +35,7 @@ terminal for.
 - [Install](#install)
 - [Try it in 60 seconds](#try-it-in-60-seconds-no-agent-cli-required)
 - [Quickstart](#quickstart--your-first-task-end-to-end)
+- [Governed workflows](#governed-workflows-opt-in)
 - [Run](#run)
 - [Layout](#layout)
 - [Tests](#tests)
@@ -603,6 +604,120 @@ first-turn prompt under `## Attached skills`. Skills are no longer exposed in
 the web/TUI issue forms; add them by hand in frontmatter when you need this
 advanced behavior. Unknown skill names are surfaced to the agent as "not
 found" instead of silently dropped.
+
+---
+
+## Governed workflows (opt-in)
+
+By default Symphony encodes your process as **stage prompts**: the agent reads
+the prompt for the ticket's current column, does the work, and moves the ticket
+itself by editing its `state` field. Simple and flexible — but the model is
+both the worker and the judge of whether the work is done. It can skip a stage,
+merge two, or declare success without running the tests.
+
+**Governed workflow mode** moves that authority into the engine. A repository
+commits a YAML DAG, and Symphony — not the model — decides node order, whether
+a node succeeded, and when the run is finished.
+
+```yaml
+# .symphony/workflows/ticket-default.yaml
+version: 1
+name: ticket-default
+
+nodes:
+  - id: plan
+    type: agent
+    workspace_access: read
+    prompt_file: docs/symphony-prompts/workflows/plan.md
+
+  - id: approve-plan
+    type: approval          # a durable gate; only an explicit resolve clears it
+    depends_on: [plan]
+    title: Approve the implementation plan
+    evidence: [plan]
+
+  - id: implement
+    type: agent
+    depends_on: [approve-plan]
+    workspace_access: write
+    prompt: |
+      Implement the approved plan for ${ticket.identifier}.
+      ${nodes.plan.output}
+
+  - id: test
+    type: shell             # deterministic; no model involved
+    depends_on: [implement]
+    run: python -m pytest -q
+```
+
+Enable it in `WORKFLOW.md`:
+
+```yaml
+workflow_engine:
+  enabled: true
+  directory: ./.symphony/workflows
+  default: ticket-default
+  ticket_state_mapping:
+    running: "In Progress"
+    waiting_approval: "Human Review"
+    succeeded: Done
+    rejected: Blocked
+```
+
+**With no `workflow_engine` block, nothing changes.** Existing tickets, stage
+prompts, boards, hooks, backends, and commands behave exactly as before.
+
+### What you get
+
+- **Three node types.** `agent` runs one backend turn; `shell` runs a
+  deterministic command; `approval` opens a gate and suspends the run.
+- **Per-node backends.** Plan with Codex, implement with Claude, review with
+  Gemini — one audit trail. A node-level choice never changes the ticket's
+  default.
+- **A real ledger.** Every node attempt, its output, its error class, its token
+  use, and the git revision before and after it are stored in
+  `.symphony/state.db` and readable through `symphony run show`.
+- **Approval that means something.** Moving the card to *Human Review* does not
+  approve anything. Neither does an agent writing "approved" in a comment. Only
+  `symphony approval resolve <id> --approve --version N` or the equivalent API
+  call clears a gate, and a second conflicting decision returns a conflict
+  instead of overwriting the first.
+- **Explicit recovery.** After a crash, the interrupted node is marked as such
+  and the run parks in `needs_attention` holding a durable fence, so ordinary
+  polling cannot quietly start the ticket over. You choose `resume`, `abandon`,
+  or start fresh. Resume replays the *stored* definition snapshot, skips nodes
+  that already succeeded, and verifies their artifacts still hash correctly.
+
+### Operator commands
+
+```bash
+symphony workflow list                       # discovered files + validation state
+symphony workflow validate path/to/flow.yaml # diagnostics with file:line
+symphony run show RUN_ID                     # graph, attempts, usage, git summary
+symphony run events RUN_ID --after-seq 12    # incremental event stream
+symphony approval list                       # what is waiting on a human
+symphony approval resolve APPROVAL_ID --approve --version 1
+symphony run resume RUN_ID
+symphony run abandon RUN_ID --yes
+```
+
+### Two things to know before enabling it
+
+**Workflow files are executable code.** They start agents and run shell commands
+in the ticket workspace. Review changes to `.symphony/workflows/` the way you
+review a CI pipeline change. Symphony will not load a workflow from outside the
+checked-out repository.
+
+**Ticket text is untrusted input.** Ticket descriptions and prior node output
+are wrapped in marked regions and announced to the model as data, not
+instructions. Shell commands never interpolate ticket text at all — context
+reaches them through environment variables, because no amount of quoting makes
+a templated shell command safe.
+
+Governed mode runs nodes one at a time today. Parallel read-only reviewers are
+designed for but deliberately not enabled: no backend adapter is currently
+launched with an enforced read-only sandbox, and a node *declaring* it will not
+write is not the same as being prevented from writing.
 
 ---
 
