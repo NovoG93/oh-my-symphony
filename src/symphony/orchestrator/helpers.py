@@ -132,16 +132,21 @@ def _is_auto_triage_todo_candidate(issue: Issue, cfg: ServiceConfig) -> bool:
 
 
 def _config_for_issue_agent(cfg: ServiceConfig, issue: Issue) -> ServiceConfig:
-    """Return a per-worker config with the ticket's backend override applied."""
-    kind = _requested_agent_kind(issue)
-    if kind is None or kind == cfg.agent.kind:
-        return cfg
-    if kind not in SUPPORTED_AGENT_KINDS:
+    """Return a per-worker config with the ticket's backend override applied.
+
+    Precedence: per-ticket `agent_kind` pin > `agent.stage_kinds` entry for
+    the ticket's current state > workflow-level `agent.kind`.
+    """
+    pin = _requested_agent_kind(issue)
+    if pin is not None and pin not in SUPPORTED_AGENT_KINDS:
         raise ConfigValidationError(
             f"ticket agent.kind must be one of {sorted(SUPPORTED_AGENT_KINDS)}",
-            value=kind,
+            value=pin,
             issue=issue.identifier,
         )
+    kind = cfg.agent.kind_for_state(issue.state, pin)
+    if kind == cfg.agent.kind:
+        return cfg
     return replace(cfg, agent=replace(cfg.agent, kind=kind))
 
 

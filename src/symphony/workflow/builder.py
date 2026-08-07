@@ -19,6 +19,7 @@ from pathlib import Path
 from typing import Any
 
 from ..errors import ConfigValidationError
+from ..logging import get_logger
 from ..notifications import build_notifications_config
 from .coercion import (
     _as_int,
@@ -396,6 +397,11 @@ def build_service_config(workflow: WorkflowDefinition) -> ServiceConfig:
         budget_exhausted_state=_as_str(
             agent_raw.get("budget_exhausted_state"), ""
         ) or "",
+        stage_kinds=_validated_stage_kinds(
+            agent_raw.get("stage_kinds"),
+            active_states=tracker.active_states,
+            terminal_states=tracker.terminal_states,
+        ),
     )
 
     codex_raw = cfg.get("codex") or {}
@@ -731,6 +737,51 @@ def _validated_nonnegative_or_default(value: Any, default: int, *, name: str) ->
     if ivalue < 0:
         raise ConfigValidationError(f"{name} must be a non-negative integer", value=value)
     return ivalue
+
+
+def _validated_stage_kinds(
+    value: Any,
+    *,
+    active_states: tuple[str, ...],
+    terminal_states: tuple[str, ...],
+) -> dict[str, str]:
+    """agent.stage_kinds — per-state backend routing, keys lowercased.
+
+    Values must be supported agent kinds (a typo would dispatch nothing, so
+    it is a hard config error). Unknown state keys only warn: states are
+    user-editable through the web UI, and a stale mapping entry should not
+    brick the whole workflow load.
+    """
+    if value is None:
+        return {}
+    if not isinstance(value, dict):
+        raise ConfigValidationError(
+            "agent.stage_kinds must be a map of state name to agent kind",
+            value=value,
+        )
+    known = {state.strip().lower() for state in (*active_states, *terminal_states)}
+    out: dict[str, str] = {}
+    for key, raw in value.items():
+        if not isinstance(key, str):
+            continue
+        normalized_key = key.strip().lower()
+        if not normalized_key:
+            continue
+        kind = _canonical_agent_kind(_as_str(raw).strip().lower())
+        if kind not in SUPPORTED_AGENT_KINDS:
+            raise ConfigValidationError(
+                f"agent.stage_kinds[{key!r}] must be one of "
+                f"{sorted(SUPPORTED_AGENT_KINDS)}",
+                value=raw,
+            )
+        if normalized_key not in known:
+            get_logger().warning(
+                "agent_stage_kinds_unknown_state",
+                state=key,
+                known_states=sorted(known),
+            )
+        out[normalized_key] = kind
+    return out
 
 
 def _validated_after_done_failure_policy(value: Any) -> str:

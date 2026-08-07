@@ -172,6 +172,12 @@ hooks:
 
 agent:
   kind: codex          # codex | claude | gemini | agy | kiro | opencode | pi
+  # Optional per-state backend routing: cheap/fast agents on light lanes,
+  # the default `kind` everywhere else. Precedence per dispatch:
+  # per-ticket `agent_kind` frontmatter pin > stage_kinds > kind.
+  # stage_kinds:
+  #   Todo: gemini
+  #   Learn: gemini
   max_concurrent_agents: 1
   # This is the per-attempt execution cap. In prompt templates,
   # {{ turn_number }}/{{ max_turns }} reports the ticket lifetime position/cap.

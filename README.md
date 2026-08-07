@@ -195,6 +195,13 @@ in `WORKFLOW.md`.
 When creating file-board tickets from the CLI, use
 `symphony board new TASK-2 "title" --agent-kind codex`.
 
+Between the ticket pin and the global default sits optional per-state routing:
+`agent.stage_kinds` maps board states to agent kinds so cheap/fast agents can
+own light lanes (e.g. `Todo: gemini`, `Learn: gemini`) while a strong default
+handles Plan/Build/Review. Resolution per dispatch: ticket `agent_kind` pin >
+`agent.stage_kinds[state]` > `agent.kind`. A ticket that changes state gets the
+new stage's backend on its next dispatch.
+
 For file-board workflows, `agent.auto_triage_actionable_todo` defaults to
 `true`: a Todo ticket with a body and an `Acceptance Criteria` section moves to
 In Progress with a one-line `## Triage` note without spending a model turn. Bug

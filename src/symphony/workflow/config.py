@@ -195,6 +195,29 @@ class AgentConfig:
     # decision survives restart and reaches operators reviewing the
     # board. Must match a state your tracker.kind backend can write to.
     budget_exhausted_state: str = ""
+    # Optional per-state backend routing. Keys are tracker state names
+    # lowercased by the parser (e.g. "research"), values are supported
+    # agent kinds. Lets cheap/fast agents own light lanes (Research,
+    # Document) while a strong default handles heavy ones (Plan, Build,
+    # Review). Resolution order at dispatch: explicit dispatch arg >
+    # per-ticket `agent_kind` frontmatter pin > this map > `kind`.
+    stage_kinds: dict[str, str] = field(default_factory=dict)
+
+    def kind_for_state(self, state: str | None, ticket_pin: str | None = None) -> str:
+        """Resolve the backend for a dispatch of a ticket in `state`.
+
+        Precedence: ticket pin (`agent_kind` frontmatter) > `stage_kinds`
+        entry for the ticket's state > workflow-level `kind`. Explicit
+        dispatch arguments outrank all three and are applied by callers
+        before reaching this helper.
+        """
+        pin = (ticket_pin or "").strip().lower()
+        if pin:
+            return pin
+        stage = self.stage_kinds.get(_normalize_state_key(state or ""))
+        if stage:
+            return stage
+        return self.kind
 
 
 @dataclass(frozen=True)

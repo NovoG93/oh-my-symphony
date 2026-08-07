@@ -391,6 +391,132 @@ def test_build_service_config_reads_state_turn_caps(tmp_path):
     }
 
 
+def test_build_service_config_reads_agent_stage_kinds(tmp_path):
+    path = _write(
+        tmp_path,
+        textwrap.dedent(
+            """\
+            ---
+            tracker:
+              kind: file
+              board_root: ./kanban
+            agent:
+              kind: claude
+              stage_kinds:
+                Todo: gemini
+                " Verify ": Antigravity
+            ---
+            body
+            """
+        ),
+    )
+
+    cfg = build_service_config(load_workflow(path))
+
+    # Keys are lowercased, values canonicalized (antigravity -> agy).
+    assert cfg.agent.stage_kinds == {"todo": "gemini", "verify": "agy"}
+    # Resolution helper: ticket pin > stage map > workflow default.
+    assert cfg.agent.kind_for_state("Todo") == "gemini"
+    assert cfg.agent.kind_for_state(" VERIFY ") == "agy"
+    assert cfg.agent.kind_for_state("In Progress") == "claude"
+    assert cfg.agent.kind_for_state("Todo", "codex") == "codex"
+
+
+def test_agent_stage_kinds_default_empty(tmp_path):
+    path = _write(
+        tmp_path,
+        textwrap.dedent(
+            """\
+            ---
+            tracker:
+              kind: file
+              board_root: ./kanban
+            ---
+            body
+            """
+        ),
+    )
+    cfg = build_service_config(load_workflow(path))
+    assert cfg.agent.stage_kinds == {}
+    assert cfg.agent.kind_for_state("Todo") == cfg.agent.kind
+
+
+def test_agent_stage_kinds_rejects_unsupported_kind(tmp_path):
+    path = _write(
+        tmp_path,
+        textwrap.dedent(
+            """\
+            ---
+            tracker:
+              kind: file
+              board_root: ./kanban
+            agent:
+              stage_kinds:
+                Todo: hal9000
+            ---
+            body
+            """
+        ),
+    )
+    with pytest.raises(ConfigValidationError, match="agent.stage_kinds"):
+        build_service_config(load_workflow(path))
+
+
+def test_agent_stage_kinds_rejects_non_map(tmp_path):
+    path = _write(
+        tmp_path,
+        textwrap.dedent(
+            """\
+            ---
+            tracker:
+              kind: file
+              board_root: ./kanban
+            agent:
+              stage_kinds: gemini
+            ---
+            body
+            """
+        ),
+    )
+    with pytest.raises(ConfigValidationError, match="must be a map"):
+        build_service_config(load_workflow(path))
+
+
+def test_agent_stage_kinds_unknown_state_warns_but_loads(tmp_path):
+    """States are user-editable, so a stale mapping key must not brick the
+    workflow load — it only surfaces a load-time warning."""
+    import io
+
+    from symphony.logging import get_logger
+
+    path = _write(
+        tmp_path,
+        textwrap.dedent(
+            """\
+            ---
+            tracker:
+              kind: file
+              board_root: ./kanban
+            agent:
+              stage_kinds:
+                Nonexistent: pi
+            ---
+            body
+            """
+        ),
+    )
+    buf = io.StringIO()
+    logger = get_logger()
+    logger.add_stream(buf)
+    try:
+        cfg = build_service_config(load_workflow(path))
+    finally:
+        logger._streams.remove(buf)
+
+    assert cfg.agent.stage_kinds == {"nonexistent": "pi"}
+    assert "agent_stage_kinds_unknown_state" in buf.getvalue()
+
+
 def test_max_total_tokens_defaults_disabled_for_reasoning_heavy_work(tmp_path):
     path = _write(
         tmp_path,
