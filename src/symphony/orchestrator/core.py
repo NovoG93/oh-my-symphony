@@ -1604,10 +1604,10 @@ class Orchestrator:
         if entry.agent_kind:
             return entry.agent_kind
         requested = _requested_agent_kind(entry.issue)
-        if requested is not None:
-            return requested
         cfg = self._workflow_state.current()
-        return cfg.agent.kind if cfg is not None else ""
+        if cfg is None:
+            return requested or ""
+        return cfg.agent.kind_for_state(entry.issue.state, requested)
 
     # ------------------------------------------------------------------
     # operator-driven pause / resume
@@ -2606,7 +2606,9 @@ class Orchestrator:
                 )
             rca_state = requested_rca_state
 
-        requested_agent = (agent_kind or issue.agent_kind or cfg.agent.kind).strip().lower()
+        requested_agent = (agent_kind or "").strip().lower() or cfg.agent.kind_for_state(
+            rca_state, issue.agent_kind
+        )
         if requested_agent not in SUPPORTED_AGENT_KINDS:
             requested_agent = cfg.agent.kind
 
@@ -3631,7 +3633,7 @@ class Orchestrator:
         resolved_attempt_kind = attempt_kind or (
             "retry" if attempt is not None else "initial"
         )
-        agent_kind = _requested_agent_kind(issue) or cfg.agent.kind
+        agent_kind = cfg.agent.kind_for_state(issue.state, _requested_agent_kind(issue))
         run_id = self._try_acquire_run_lease(
             issue=issue,
             workspace_path=workspace_path,
@@ -3692,17 +3694,23 @@ class Orchestrator:
         # Persist the resolved backend onto the ticket so downstream
         # consumers (board UIs, audits, Done-state history) can see who
         # ran which ticket without inferring from logs. Idempotent —
-        # adapter preserves any existing override.
-        try:
-            self._tracker_call_record_agent_kind(cfg, issue.identifier, entry.agent_kind)
-        except Exception as exc:
-            log.warning(
-                "record_agent_kind_failed",
-                issue_id=issue.id,
-                identifier=issue.identifier,
-                agent_kind=entry.agent_kind,
-                error=str(exc),
-            )
+        # adapter preserves any existing override. Skipped when
+        # `agent.stage_kinds` routing is active: the stamp is read back as
+        # a per-ticket pin on later dispatches, which would freeze the
+        # first stage's backend and defeat per-state routing.
+        if not cfg.agent.stage_kinds:
+            try:
+                self._tracker_call_record_agent_kind(
+                    cfg, issue.identifier, entry.agent_kind
+                )
+            except Exception as exc:
+                log.warning(
+                    "record_agent_kind_failed",
+                    issue_id=issue.id,
+                    identifier=issue.identifier,
+                    agent_kind=entry.agent_kind,
+                    error=str(exc),
+                )
 
     def _on_worker_task_done(self, issue_id: str, task: asyncio.Task[None]) -> None:
         """Clean a registered worker whose coroutine never ran its cleanup.

@@ -51,7 +51,7 @@ from __future__ import annotations
 
 import asyncio
 import re
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -605,3 +605,42 @@ def test_qa_scorecard_fail_warns_without_rewind(
         "Soft scorecard warning incorrectly rewound the ticket instead of "
         f"advancing past Verify. Final state was {final_front['state']!r}."
     )
+
+
+def test_stage_kinds_route_backend_kind_into_backend_factory(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`agent.stage_kinds` routing must reach `BackendInit.cfg.agent.kind` —
+    the config the worker actually builds its agent process from — not just
+    the bookkeeping fields on the running entry."""
+    board_root = tmp_path / "board"
+    ticket_path = _write_initial_ticket(
+        board_root, state="In Progress", body=_IN_PROGRESS_BODY_COMPLETE
+    )
+    cfg = _make_file_tracker_config(
+        board_root=board_root,
+        active_states=("In Progress", "Verify", "Learn"),
+        max_turns=2,
+    )
+    cfg = replace(
+        cfg, agent=replace(cfg.agent, stage_kinds={"in progress": "claude"})
+    )
+
+    instances = _install_file_tracker_backend(
+        monkeypatch,
+        ticket_path=ticket_path,
+        transitions=[("Verify", _IN_PROGRESS_BODY_COMPLETE)],
+    )
+
+    workspace_path = tmp_path / "workspace"
+    workspace_path.mkdir()
+    (workspace_path / "docs" / "MT-1" / "work").mkdir(parents=True)
+    (workspace_path / "docs" / "MT-1" / "work" / "notes.md").write_text("ok")
+    o = _orch(workspace_path)
+    issue = _make_issue_from_disk("In Progress", _IN_PROGRESS_BODY_COMPLETE)
+    _seed_running_entry(o, issue, workspace_path)
+
+    asyncio.run(o._run_agent_attempt(issue, attempt=None, cfg=cfg))
+
+    assert instances, "backend factory was never called"
+    assert instances[0].calls[0] == ("factory", {"agent_kind": "claude"})

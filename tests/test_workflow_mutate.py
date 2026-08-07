@@ -39,6 +39,9 @@ agent:
     Doing: 1000
   max_state_turns_by_state:
     Doing: 7
+  stage_kinds:
+    Todo: gemini
+    Doing: codex
 
 prompts:
   base: ./prompts/base.md
@@ -134,6 +137,7 @@ def test_rename_column_updates_per_state_maps(workflow: Path) -> None:
     assert "Building: 2" in text
     assert "Building: 1000" in text
     assert "Building: 7" in text
+    assert "Building: codex" in text
 
 
 def test_remove_column_reports_removed_and_fallback(workflow: Path) -> None:
@@ -351,3 +355,41 @@ def test_column_count_cap(workflow: Path) -> None:
     ]
     with pytest.raises(WorkflowMutationError, match="too many columns"):
         apply_states_update(workflow, specs)
+
+
+# ---------------------------------------------------------------------------
+# agent.stage_kinds round-trip
+# ---------------------------------------------------------------------------
+
+
+def test_stage_kinds_survive_states_update_and_follow_renames(workflow: Path) -> None:
+    """`agent.stage_kinds` entries for untouched lanes survive a states
+    update verbatim, renamed lanes carry their mapping, and removed lanes
+    drop theirs — the reloaded config still parses cleanly."""
+    apply_states_update(
+        workflow,
+        [
+            StateSpec(name="Todo"),
+            StateSpec(name="Building", description="build", previous_name="Doing"),
+            StateSpec(name="Done", terminal=True),
+            StateSpec(name="Archive", terminal=True),
+        ],
+    )
+    text = workflow.read_text(encoding="utf-8")
+    assert "Todo: gemini" in text
+    assert "Building: codex" in text
+
+    cfg = build_service_config(load_workflow(workflow))
+    assert cfg.agent.stage_kinds == {"todo": "gemini", "building": "codex"}
+
+    # Removing the renamed lane drops its stage_kinds entry too.
+    apply_states_update(
+        workflow,
+        [
+            StateSpec(name="Todo"),
+            StateSpec(name="Done", terminal=True),
+            StateSpec(name="Archive", terminal=True),
+        ],
+    )
+    cfg = build_service_config(load_workflow(workflow))
+    assert cfg.agent.stage_kinds == {"todo": "gemini"}
