@@ -16,7 +16,6 @@ from symphony.cli.doctor import (
     check_after_create_hook,
     check_agy_state_dir,
     check_agent_cli,
-    check_board_viewer,
     check_gemini_auth,
     check_kiro_auth,
     check_pi_auth,
@@ -333,14 +332,10 @@ def test_port_fail_names_this_workflow_service_when_record_matches(
                 workflow_dir=cfg.workflow_path.parent,
                 host="127.0.0.1",
                 port=bound_port,
-                viewer_port=None,
                 orchestrator_pid=4242,
-                viewer_pid=None,
                 log_path=tmp_path / "log" / "symphony.log",
-                viewer_log_path=None,
                 started_at="2026-07-03T01:00:00Z",
                 orchestrator_command=["symphony", str(cfg.workflow_path)],
-                viewer_command=[],
             )
         )
         result = check_port(cfg, is_running=lambda pid: pid == 4242)
@@ -375,14 +370,10 @@ def test_port_fail_names_stale_record_when_api_still_responds(
                 workflow_dir=cfg.workflow_path.parent,
                 host="127.0.0.1",
                 port=bound_port,
-                viewer_port=None,
                 orchestrator_pid=4242,
-                viewer_pid=None,
                 log_path=tmp_path / "log" / "symphony.log",
-                viewer_log_path=None,
                 started_at="2026-07-03T01:00:00Z",
                 orchestrator_command=["symphony", str(cfg.workflow_path)],
-                viewer_command=[],
             )
         )
         monkeypatch.setattr(
@@ -530,14 +521,13 @@ def test_run_checks_returns_one_result_per_check(tmp_path: Path) -> None:
     results = run_checks(cfg)
     # port + shell + max_turns + agent + pi_auth + gemini_auth + agy_state + kiro_auth
     # + prompts + after_create + workspace + git_history + agent_git_grant
-    # + tracker + viewer + workflow_engine + state.db = 17
-    assert len(results) == 17
+    # + tracker + workflow_engine + state.db = 16
+    assert len(results) == 16
     assert {r.name.split("=")[0].split(".")[0] for r in results} >= {
         "agent",
         "hooks",
         "workspace",
         "tracker",
-        "viewer",
     }
 
 
@@ -851,40 +841,3 @@ def test_format_results_includes_all_statuses() -> None:
         color=False,
     )
     assert "PASS" in text and "WARN" in text and "FAIL" in text
-
-
-def test_board_viewer_pass_when_script_present(tmp_path: Path) -> None:
-    """WARN downgrades to PASS once `tools/board-viewer/server.py` exists."""
-    cfg = _build_cfg(
-        tmp_path,
-        """
-        tracker: { kind: file, board_root: ./kanban }
-        agent: { kind: codex }
-        codex: { command: codex app-server }
-        """,
-    )
-    viewer = tmp_path / "tools" / "board-viewer" / "server.py"
-    viewer.parent.mkdir(parents=True)
-    viewer.write_text("# stub viewer\n")
-
-    result = check_board_viewer(cfg)
-    assert result.status == "pass"
-    assert "server.py" in result.message
-
-
-def test_board_viewer_warns_when_script_missing(tmp_path: Path) -> None:
-    """WARN (not FAIL) so the orchestrator can still launch headless."""
-    cfg = _build_cfg(
-        tmp_path,
-        """
-        tracker: { kind: file, board_root: ./kanban }
-        agent: { kind: codex }
-        codex: { command: codex app-server }
-        """,
-    )
-    result = check_board_viewer(cfg)
-    assert result.status == "warn"
-    # Windows renders the script path with backslashes — compare separator-
-    # agnostically so the assertion holds on every platform.
-    assert "tools/board-viewer/server.py" in result.message.replace("\\", "/")
-    assert "no-op" in result.message

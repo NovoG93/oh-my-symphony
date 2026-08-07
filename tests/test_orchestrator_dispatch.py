@@ -5295,7 +5295,7 @@ def test_running_snapshot_includes_effective_agent_kind():
     assert row["agent_kind"] == "pi"
 
 
-def test_snapshot_includes_branch_policy_for_board_viewer():
+def test_snapshot_includes_branch_policy_for_admin_ui():
     orch = _orch()
     cfg = replace(
         _make_config(),

@@ -5,7 +5,7 @@ Subcommands:
     symphony tui [WORKFLOW]        run orchestrator + Jira-style CLI Kanban TUI
     symphony board ...             file-tracker board helper
     symphony doctor [WORKFLOW]     preflight checks for WORKFLOW.md
-    symphony service ...           managed background orchestrator + viewer
+    symphony service ...           managed background orchestrator
     symphony wiki-sweep ...        scan docs/llm-wiki/ for dup/orphan/stale rows
     symphony runs [WORKFLOW]       recent run-registry attempts
     symphony workflow ...          list / show / validate workflow definitions
@@ -264,7 +264,7 @@ async def _run(args: argparse.Namespace) -> int:
         )
     else:
         # Surfaces the silent-no-HTTP case so the operator immediately sees
-        # why board-viewer / API consumers can't reach this instance.
+        # why the admin UI / API consumers can't reach this instance.
         # Common cause: `server.port` lives outside frontmatter (embedded
         # `---` fence in a YAML literal truncated the workflow header) —
         # see workflow.parse_workflow_text greedy end detection.
