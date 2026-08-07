@@ -24,6 +24,7 @@ from ruamel.yaml.error import YAMLError
 
 from ..errors import SymphonyError
 from .constants import DEFAULT_CI_MIN_INTERVAL_MS, SUPPORTED_AGENT_KINDS
+from .presets import LanePreset, get_lane_preset
 
 _STATE_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9 _/-]{0,39}$")
 _MAX_COLUMNS = 100
@@ -479,3 +480,142 @@ def set_continuous_improvement_settings(
     if normalized_agent_kind is not None:
         ci["agent_kind"] = normalized_agent_kind
     _write_workflow_atomic(workflow_path, data, body)
+
+
+# ---------------------------------------------------------------------------
+# lane presets
+# ---------------------------------------------------------------------------
+
+
+def apply_lane_preset(workflow_path: Path, preset_name: str) -> StatesUpdatePlan:
+    """Apply a shipped lane preset as the board's new starting point.
+
+    Sets `tracker.active_states` to the preset lanes exactly, merges
+    `tracker.terminal_states` (preset lanes first, user extras kept),
+    rewrites `state_descriptions` (preset text for preset lanes, carried
+    text for surviving user lanes), and points `prompts.base` +
+    `prompts.stages` at the preset's prompt files. Everything else in the
+    frontmatter — comments, agent policy, hooks, per-state maps for
+    surviving lanes — is untouched, so a preset is a starting point and
+    the board stays fully customizable afterwards.
+
+    Old active lanes that are not part of the preset are removed (their
+    per-state map entries drop, matching `apply_states_update`); the
+    caller migrates their tickets to `plan.fallback_state`. Preset prompt
+    files ship under `docs/symphony-prompts/file/`; when a mapped file is
+    missing on this board a starter prompt is created so the workflow
+    stays loadable.
+
+    Returns the change plan; the caller migrates board tickets accordingly.
+    """
+    try:
+        preset = get_lane_preset(preset_name)
+    except ValueError as exc:
+        raise WorkflowMutationError(str(exc)) from exc
+
+    data, body = _load_frontmatter(workflow_path)
+    tracker = _ensure_map(data, "tracker")
+    old_active = [str(s) for s in tracker.get("active_states") or []]
+    old_terminal = [str(s) for s in tracker.get("terminal_states") or []]
+    old_names = {n.lower(): n for n in old_active + old_terminal}
+
+    preset_lanes_lower = {
+        s.lower() for s in preset.active_states + preset.terminal_states
+    }
+    extra_terminal = [t for t in old_terminal if t.lower() not in preset_lanes_lower]
+    new_active = list(preset.active_states)
+    new_terminal = list(preset.terminal_states) + extra_terminal
+
+    new_names_lower = {s.lower() for s in new_active + new_terminal}
+    removed = [
+        original
+        for low, original in old_names.items()
+        if low not in new_names_lower
+    ]
+    added = [
+        name
+        for name in new_active + new_terminal
+        if name.lower() not in old_names
+    ]
+
+    tracker["active_states"] = _flow_seq(new_active)
+    tracker["terminal_states"] = _flow_seq(new_terminal)
+
+    old_descriptions = {
+        str(k).lower(): str(v)
+        for k, v in (tracker.get("state_descriptions") or {}).items()
+    }
+    descriptions = CommentedMap()
+    for name in new_active + new_terminal:
+        text = preset.state_descriptions.get(name) or old_descriptions.get(
+            name.lower()
+        )
+        if text:
+            descriptions[name] = text
+    if descriptions or "state_descriptions" in tracker:
+        tracker["state_descriptions"] = descriptions
+
+    prompts = _ensure_map(data, "prompts")
+    prompts["base"] = preset.base_prompt
+    stages = _ensure_map(prompts, "stages")
+    _apply_key_changes(stages, {}, removed)
+    # Keep stage entries only for the preset's lanes and the user's own
+    # extra lanes — a leftover entry from the previous preset (e.g. the
+    # 4-lane Done report prompt on the deep board) would carry the wrong
+    # stage semantics.
+    allowed = {s.lower() for s in preset.stage_prompts} | {
+        t.lower() for t in extra_terminal
+    }
+    for existing in list(stages.keys()):
+        if str(existing).lower() not in allowed:
+            stages.pop(existing)
+    for state, rel in preset.stage_prompts.items():
+        for existing in list(stages.keys()):
+            if str(existing).lower() == state.lower() and str(existing) != state:
+                stages.pop(existing)
+        stages[state] = rel
+
+    agent = data.get("agent")
+    if isinstance(agent, dict):
+        _rename_state_keyed_map(agent, "max_concurrent_agents_by_state", {}, removed)
+        _rename_state_keyed_map(agent, "max_state_turns_by_state", {}, removed)
+        _rename_state_keyed_map(agent, "max_total_tokens_by_state", {}, removed)
+        _rename_state_keyed_map(agent, "stage_kinds", {}, removed)
+
+    _ensure_preset_prompt_files(workflow_path, preset)
+
+    _write_workflow_atomic(workflow_path, data, body)
+    return StatesUpdatePlan(
+        renamed={},
+        removed=removed,
+        added=added,
+        fallback_state=new_active[0],
+    )
+
+
+def _ensure_preset_prompt_files(workflow_path: Path, preset: LanePreset) -> None:
+    """Create starter files for preset prompt paths missing on this board."""
+    workflow_dir = workflow_path.parent.resolve()
+
+    def _resolved(rel: str) -> Path:
+        path = (workflow_dir / rel).resolve()
+        if not path.is_relative_to(workflow_dir):
+            raise WorkflowMutationError(
+                f"prompt path escapes the workflow directory: {rel}"
+            )
+        return path
+
+    base_path = _resolved(preset.base_prompt)
+    if not base_path.exists():
+        base_path.parent.mkdir(parents=True, exist_ok=True)
+        base_path.write_text(
+            "You are working on {{ issue.identifier }}: {{ issue.title }}.\n"
+            "Current state: {{ issue.state }}.\n",
+            encoding="utf-8",
+        )
+    for state, rel in preset.stage_prompts.items():
+        path = _resolved(rel)
+        if not path.exists():
+            path.parent.mkdir(parents=True, exist_ok=True)
+            content = DEFAULT_STAGE_PROMPT.replace("{{ state_name }}", state)
+            path.write_text(content, encoding="utf-8")

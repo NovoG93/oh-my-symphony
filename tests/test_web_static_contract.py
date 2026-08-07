@@ -217,3 +217,14 @@ def test_web_chat_font_controls_contract() -> None:
     assert "function buildFontControls(view)" in js
     assert ".chat-font-controls" in css
     assert "font-size: inherit" in css
+
+
+def test_web_settings_lane_preset_contract() -> None:
+    js = _script_bundle()
+
+    assert "getLanePresets: () => apiRequest('/workflow/presets')" in js
+    assert "applyLanePreset: (name)" in js
+    assert "function buildLanePresetCard(presets)" in js
+    assert "body.appendChild(buildLanePresetCard(lanePresets));" in js
+    assert "'settings.lanePreset': 'Lane preset'" in js
+    assert "'common.apply': 'Apply'" in js

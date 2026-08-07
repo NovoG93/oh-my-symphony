@@ -9,6 +9,7 @@ from __future__ import annotations
 import asyncio
 import subprocess
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any, AsyncIterator, cast
 
 import pytest
@@ -1318,3 +1319,76 @@ async def test_git_diff_returns_patch_for_branch_and_commit(
     assert resp.status == 400
     resp = await client.get("/api/v1/git/diff?branch=symphony/SEED-1&path=--evil")
     assert resp.status == 400
+
+
+# ---------------------------------------------------------------------------
+# workflow: lane presets
+# ---------------------------------------------------------------------------
+
+
+async def test_lane_presets_get_lists_shipped_presets(client: TestClient) -> None:
+    resp = await client.get("/api/v1/workflow/presets")
+    assert resp.status == 200
+    payload = await resp.json()
+    assert [p["name"] for p in payload["presets"]] == ["default", "deep"]
+    deep = payload["presets"][1]
+    assert deep["active_states"][0] == "Intake"
+    assert deep["active_states"][-1] == "Document"
+    # The fixture board (Todo/Doing) matches no shipped preset.
+    assert payload["current"] is None
+
+
+async def test_lane_preset_apply_rewrites_workflow_and_migrates_tickets(
+    client: TestClient, board_dir: Path
+) -> None:
+    await client.patch("/api/v1/issues/SEED-1", json={"state": "Doing"})
+
+    resp = await client.post(
+        "/api/v1/workflow/presets/apply", json={"name": "deep"}
+    )
+    assert resp.status == 200
+    payload = await resp.json()
+    assert payload["applied"] == "deep"
+    assert payload["removed"] == ["Todo", "Doing"]
+    assert payload["fallback_state"] == "Intake"
+    assert payload["migrated"] == {"SEED-1": "Intake"}
+    text = (board_dir / "WORKFLOW.md").read_text(encoding="utf-8")
+    assert (
+        "active_states: [Intake, Research, Plan, Review, Build, QA, Verify, Document]"
+        in text
+    )
+    assert "base: ./docs/symphony-prompts/file/deep/base.md" in text
+    detail = await (await client.get("/api/v1/issues/SEED-1")).json()
+    assert detail["state"] == "Intake"
+
+    # The board now guesses as the deep preset.
+    presets = await (await client.get("/api/v1/workflow/presets")).json()
+    assert presets["current"] == "deep"
+
+
+async def test_lane_preset_apply_rejects_bad_payloads(client: TestClient) -> None:
+    resp = await client.post("/api/v1/workflow/presets/apply", json={})
+    assert resp.status == 400
+    resp = await client.post(
+        "/api/v1/workflow/presets/apply", json={"name": "mystery"}
+    )
+    assert resp.status == 400
+    assert "unknown lane preset" in (await resp.json())["error"]["message"]
+
+
+async def test_lane_preset_apply_blocks_running_worker_in_removed_lane(
+    client: TestClient, board_dir: Path
+) -> None:
+    stub = client.stub  # type: ignore[attr-defined]
+    seed = await (await client.get("/api/v1/issues/SEED-1")).json()
+    running = SimpleNamespace(identifier="SEED-1", state=seed["state"])
+    stub.iter_running_issues = lambda: (running,)
+    before = (board_dir / "WORKFLOW.md").read_bytes()
+
+    resp = await client.post(
+        "/api/v1/workflow/presets/apply", json={"name": "deep"}
+    )
+
+    assert resp.status == 409
+    assert (await resp.json())["error"]["code"] == "state_in_use"
+    assert (board_dir / "WORKFLOW.md").read_bytes() == before

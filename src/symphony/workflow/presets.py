@@ -1,0 +1,143 @@
+"""Lane presets — switchable starting-point board layouts.
+
+Two shipped presets (v2.1 owner decisions, docs/plans/minimal-symphony-plan.md):
+
+- ``default`` — the succinct 4-lane board (Todo → In Progress → Verify →
+  Learn) whose stage contracts `orchestrator/contracts.py` enforces.
+- ``deep`` — the optional 8-lane pipeline (Intake → Research → Plan →
+  Review → Build → QA → Verify → Document) ported from the OneShot
+  template, carrying its own lean bash gates per lane.
+
+A preset is a *starting point*, never a cage: `apply_lane_preset` in
+`workflow.mutate` writes these values into WORKFLOW.md through the same
+comment-preserving round-trip the lane CRUD uses, and every per-column
+prompt edit or lane change afterwards works exactly as before.
+
+Prompt paths are relative to the workflow file's directory and point at
+the prompt sets shipped under ``docs/symphony-prompts/file/``.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from types import MappingProxyType
+from typing import Iterable, Mapping
+
+
+@dataclass(frozen=True)
+class LanePreset:
+    """One switchable board layout: lanes, descriptions, prompt files."""
+
+    name: str
+    label: str
+    active_states: tuple[str, ...]
+    terminal_states: tuple[str, ...]
+    state_descriptions: Mapping[str, str]
+    base_prompt: str
+    stage_prompts: Mapping[str, str]
+
+
+_DEFAULT_STAGE_DIR = "./docs/symphony-prompts/file/stages"
+_DEEP_STAGE_DIR = "./docs/symphony-prompts/file/deep"
+
+DEFAULT_PRESET = LanePreset(
+    name="default",
+    label="4-lane default (Todo → In Progress → Verify → Learn)",
+    active_states=("Todo", "In Progress", "Verify", "Learn"),
+    terminal_states=("Human Review", "Done", "Blocked", "Archive"),
+    state_descriptions=MappingProxyType(
+        {
+            "Todo": "Triage; route to In Progress",
+            "In Progress": "Plan + TDD implementation + self-critique",
+            "Verify": "Review + QA + Merge Gate",
+            "Learn": "Wiki write-back; Done unless intervention",
+            "Human Review": "Manual intervention or explicit review before Done",
+            "Done": "Verified complete",
+        }
+    ),
+    base_prompt="./docs/symphony-prompts/file/base.md",
+    stage_prompts=MappingProxyType(
+        {
+            "Todo": f"{_DEFAULT_STAGE_DIR}/todo.md",
+            "In Progress": f"{_DEFAULT_STAGE_DIR}/in-progress.md",
+            "Verify": f"{_DEFAULT_STAGE_DIR}/verify.md",
+            "Learn": f"{_DEFAULT_STAGE_DIR}/learn.md",
+            "Done": f"{_DEFAULT_STAGE_DIR}/done.md",
+        }
+    ),
+)
+
+DEEP_PRESET = LanePreset(
+    name="deep",
+    label="8-lane deep pipeline (Intake → Research → Plan → Review → Build → QA → Verify → Document)",
+    active_states=(
+        "Intake",
+        "Research",
+        "Plan",
+        "Review",
+        "Build",
+        "QA",
+        "Verify",
+        "Document",
+    ),
+    terminal_states=("Done", "Human Review", "Blocked", "Cancelled"),
+    state_descriptions=MappingProxyType(
+        {
+            "Intake": "Brief + work-type routing",
+            "Research": "Evidence: stack, prior art, data shapes, repro",
+            "Plan": "Decompose into a Build/QA/Verify/Document DAG",
+            "Review": "Adversarial plan red-team; PASS releases builds",
+            "Build": "TDD one slice; append claims.md",
+            "QA": "Black-box behavioral/browser proof",
+            "Verify": "Re-prove every claim; verdict GREEN gate",
+            "Document": "Docs/CHANGELOG + wiki write-back + delivery.md",
+            "Human Review": "Manual intervention or explicit review before Done",
+            "Done": "Lane gate passed",
+        }
+    ),
+    base_prompt=f"{_DEEP_STAGE_DIR}/base.md",
+    stage_prompts=MappingProxyType(
+        {
+            "Intake": f"{_DEEP_STAGE_DIR}/intake.md",
+            "Research": f"{_DEEP_STAGE_DIR}/research.md",
+            "Plan": f"{_DEEP_STAGE_DIR}/plan.md",
+            "Review": f"{_DEEP_STAGE_DIR}/review.md",
+            "Build": f"{_DEEP_STAGE_DIR}/build.md",
+            "QA": f"{_DEEP_STAGE_DIR}/qa.md",
+            "Verify": f"{_DEEP_STAGE_DIR}/verify.md",
+            "Document": f"{_DEEP_STAGE_DIR}/document.md",
+        }
+    ),
+)
+
+LANE_PRESETS: Mapping[str, LanePreset] = MappingProxyType(
+    {preset.name: preset for preset in (DEFAULT_PRESET, DEEP_PRESET)}
+)
+
+
+def preset_names() -> tuple[str, ...]:
+    return tuple(LANE_PRESETS)
+
+
+def get_lane_preset(name: str) -> LanePreset:
+    """Look up a preset by name; raises ValueError with the known names."""
+    key = (name or "").strip().lower()
+    preset = LANE_PRESETS.get(key)
+    if preset is None:
+        raise ValueError(
+            f"unknown lane preset {name!r}; available: {', '.join(LANE_PRESETS)}"
+        )
+    return preset
+
+
+def guess_lane_preset(active_states: Iterable[str]) -> str | None:
+    """Best-effort match of a board's active lanes to a shipped preset.
+
+    Case-insensitive exact sequence match — a customized board (extra,
+    renamed, or reordered lanes) intentionally matches nothing.
+    """
+    current = tuple(str(s).strip().lower() for s in active_states)
+    for preset in LANE_PRESETS.values():
+        if current == tuple(s.lower() for s in preset.active_states):
+            return preset.name
+    return None
