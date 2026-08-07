@@ -570,31 +570,6 @@ def check_tracker(cfg: ServiceConfig) -> CheckResult:
     return CheckResult(f"tracker.kind={tracker.kind}", "warn", "unknown tracker kind")
 
 
-def check_board_viewer(cfg: ServiceConfig) -> CheckResult:
-    """Warn when the web HTML viewer script is absent.
-
-    `symphony service start --viewer-port N` silently skips the viewer if
-    `<workflow-dir>/tools/board-viewer/server.py` is missing (see
-    `service.board_viewer_script_for`). Operators routinely don't notice the
-    omitted "started board viewer" line and end up with `viewer_pid: null`
-    in the run record. This is a WARN (not FAIL) because the orchestrator
-    runs fine without the viewer.
-    """
-    script = cfg.workflow_path.parent / "tools" / "board-viewer" / "server.py"
-    if script.exists():
-        return CheckResult("viewer.board-viewer", "pass", f"{script}")
-    return CheckResult(
-        "viewer.board-viewer",
-        "warn",
-        (
-            f"{script} not found — `--viewer-port` will be a no-op. "
-            "The built-in web app on the orchestrator port (`--port`, default "
-            "9999) replaces it; the legacy `tools/board-viewer/` copy is only "
-            "needed for the separate read-only viewer."
-        ),
-    )
-
-
 def check_shell() -> CheckResult:
     """Hooks and backend subprocesses spawn via ``bash -lc``. On Windows we
     must avoid the WSL launcher (``C:\\Windows\\System32\\bash.exe``) — see
@@ -778,7 +753,6 @@ def run_checks(cfg: ServiceConfig, host: str = "127.0.0.1") -> list[CheckResult]
         check_git_history_writable(cfg),
         check_agent_git_grant(cfg),
         check_tracker(cfg),
-        check_board_viewer(cfg),
         check_workflow_engine(cfg),
         check_workflow_registry(cfg),
     ]

@@ -393,7 +393,7 @@ def write_prompt(workflow_path: Path, state: str, content: str) -> Path:
 
 
 # ---------------------------------------------------------------------------
-# branch policy (ported from tools/board-viewer text surgery, now round-trip)
+# branch policy (ported from legacy board-viewer text surgery, now round-trip)
 # ---------------------------------------------------------------------------
 
 

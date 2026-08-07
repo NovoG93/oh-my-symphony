@@ -778,9 +778,8 @@ symphony ./WORKFLOW.md --tui
 
 The TUI is the primary operator view and the JSON API is the
 programmatic / curl-friendly view. Run both in one process by pinning
-`server.port` in `WORKFLOW.md` and launching with `--tui`
-(`tools/board-viewer/` remains available as an optional in-browser
-kanban, see below):
+`server.port` in `WORKFLOW.md` and launching with `--tui` (the built-in
+web admin UI is served on the same port):
 
 ```yaml
 # WORKFLOW.md
@@ -842,21 +841,21 @@ shell jobs. It records the workflow it started under
 started again on a second port by accident:
 
 ```bash
-symphony service start ./WORKFLOW.md --port 9999 --viewer-port 8765
+symphony service start ./WORKFLOW.md --port 9999
 symphony service status ./WORKFLOW.md
 symphony service restart ./WORKFLOW.md
 symphony service stop ./WORKFLOW.md
 symphony service logs ./WORKFLOW.md
 ```
 
-`service start` runs `symphony doctor` before spawning, starts the
-orchestrator with Python's module runner, and starts `tools/board-viewer/`
-when that folder exists. Commands are launched without a shell, so the same
-path works on macOS, Linux, and Windows.
+`service start` runs `symphony doctor` before spawning and starts the
+orchestrator with Python's module runner; the built-in web admin UI is
+served on the orchestrator port. Commands are launched without a shell, so
+the same path works on macOS, Linux, and Windows.
 
-Since v0.4.7, the board viewer (default `--viewer-port 8765`) is no longer
-read-only: running cards surface **Pause / Resume** buttons and the header
-refresh button triggers an orchestrator `poll + reconcile`. The header also
+The admin UI is not read-only: running cards surface **Pause / Resume**
+buttons and the header refresh button triggers an orchestrator
+`poll + reconcile`. The header also
 shows real local git branch dropdowns for `agent.feature_base_branch` and
 `agent.auto_merge_target_branch`, so operators can choose where new feature
 branches start and where Learn merges land without editing YAML by hand.
