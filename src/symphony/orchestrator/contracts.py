@@ -153,6 +153,22 @@ _NA_RESULT_TOKENS = frozenset({"n/a", "na"})
 _INLINE_CODE_SPAN_RE = re.compile(r"`([^`]+)`")
 
 
+# The stage contracts below encode the DEFAULT preset's prompts
+# (Todo / In Progress / Verify / Document — plus the legacy Learn name).
+# Boards with any other active lane (deep preset's Intake/Research/Plan/
+# Review/Build/QA, or user-defined lanes) carry their own prompt-encoded
+# gates, so enforcing these section lists against them would rewind
+# tickets for sections their prompts never asked for.
+_CONTRACT_LANES = frozenset({"todo", "in progress", "verify", "document", "learn"})
+
+
+def board_uses_default_contracts(active_states: "tuple[str, ...] | list[str]") -> bool:
+    """True when every active lane belongs to the default-preset lane set."""
+    return all(
+        (state or "").strip().lower() in _CONTRACT_LANES for state in active_states
+    )
+
+
 def evaluate_contract(
     producing_state: str,
     ticket_body: str,

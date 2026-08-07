@@ -103,7 +103,7 @@ from .constants import (
     WAIT_AGE_BUMP_MIN,
     _TOKEN_EMA_ALPHA,
 )
-from .contracts import evaluate_contract
+from .contracts import board_uses_default_contracts, evaluate_contract
 from .dispatch_state import DispatchState
 from .entries import RetryEntry, RunningEntry, _CodexTotals, _IssueDebug
 from .executors import LegacyStageExecutor, TicketExecutor, TicketRunContext
@@ -4008,7 +4008,9 @@ class Orchestrator:
                             # Failure note, and treat the situation as
                             # a forced rewind so the rebuild + budget
                             # bookkeeping below still apply.
-                            if not is_rewind:
+                            if not is_rewind and board_uses_default_contracts(
+                                cfg.tracker.active_states
+                            ):
                                 if prev_phase_state in {
                                     "in progress",
                                     "verify",
