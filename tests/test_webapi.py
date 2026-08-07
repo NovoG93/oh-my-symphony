@@ -361,6 +361,104 @@ async def test_create_issue_validation_errors(client: TestClient) -> None:
     ).status == 400
 
 
+async def test_create_issue_with_blocked_by_and_request(
+    client: TestClient,
+) -> None:
+    resp = await client.post(
+        "/api/v1/issues",
+        json={
+            "title": "child work",
+            "identifier": "CHILD-1",
+            "blocked_by": ["SEED-1"],
+            "request": "REQ-1",
+        },
+    )
+    assert resp.status == 201
+    detail = await (await client.get("/api/v1/issues/CHILD-1")).json()
+    assert detail["request"] == "REQ-1"
+    assert [b["identifier"] for b in detail["blocked_by"]] == ["SEED-1"]
+    assert detail["frontmatter"]["request"] == "REQ-1"
+
+
+async def test_create_issue_rejects_unknown_blocker(client: TestClient) -> None:
+    resp = await client.post(
+        "/api/v1/issues",
+        json={"title": "x", "blocked_by": ["GHOST-1"]},
+    )
+    assert resp.status == 400
+    payload = await resp.json()
+    assert payload["error"]["code"] == "board_dependency_error"
+    assert "GHOST-1" in payload["error"]["message"]
+
+
+async def test_create_issue_rejects_cycle_with_path_in_message(
+    client: TestClient, board_dir: Path
+) -> None:
+    # SEED-1 already (danglingly) depends on LOOP-1; creating LOOP-1 <- SEED-1
+    # would close the loop.
+    (board_dir / "kanban" / "SEED-1.md").write_text(
+        TICKET.replace("---\n\nSeed body.", "blocked_by: [LOOP-1]\n---\n\nSeed body."),
+        encoding="utf-8",
+    )
+    resp = await client.post(
+        "/api/v1/issues",
+        json={"title": "loop", "identifier": "LOOP-1", "blocked_by": ["SEED-1"]},
+    )
+    assert resp.status == 400
+    payload = await resp.json()
+    assert payload["error"]["code"] == "board_dependency_error"
+    assert "LOOP-1 -> SEED-1 -> LOOP-1" in payload["error"]["message"]
+    assert not (board_dir / "kanban" / "LOOP-1.md").exists()
+
+
+async def test_create_issue_rejects_malformed_blocked_by_and_request(
+    client: TestClient,
+) -> None:
+    assert (
+        await client.post(
+            "/api/v1/issues", json={"title": "x", "blocked_by": "SEED-1"}
+        )
+    ).status == 400
+    assert (
+        await client.post(
+            "/api/v1/issues", json={"title": "x", "request": "bad request!"}
+        )
+    ).status == 400
+
+
+async def test_patch_updates_blocked_by_and_request(client: TestClient) -> None:
+    created = await client.post(
+        "/api/v1/issues", json={"title": "dep", "identifier": "DEP-1"}
+    )
+    assert created.status == 201
+    resp = await client.patch(
+        "/api/v1/issues/DEP-1",
+        json={"blocked_by": ["SEED-1"], "request": "REQ-2"},
+    )
+    assert resp.status == 200
+    detail = await (await client.get("/api/v1/issues/DEP-1")).json()
+    assert detail["request"] == "REQ-2"
+    assert [b["identifier"] for b in detail["blocked_by"]] == ["SEED-1"]
+
+    cleared = await client.patch(
+        "/api/v1/issues/DEP-1", json={"blocked_by": [], "request": ""}
+    )
+    assert cleared.status == 200
+    detail = await (await client.get("/api/v1/issues/DEP-1")).json()
+    assert detail["request"] == ""
+    assert detail["blocked_by"] == []
+
+
+async def test_patch_rejects_self_blocking_cycle(client: TestClient) -> None:
+    resp = await client.patch(
+        "/api/v1/issues/SEED-1", json={"blocked_by": ["SEED-1"]}
+    )
+    assert resp.status == 400
+    payload = await resp.json()
+    assert payload["error"]["code"] == "board_dependency_error"
+    assert "cycle" in payload["error"]["message"]
+
+
 async def test_patch_moves_state_and_updates_fields(client: TestClient) -> None:
     resp = await client.patch(
         "/api/v1/issues/SEED-1",

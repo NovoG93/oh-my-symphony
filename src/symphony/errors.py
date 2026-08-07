@@ -138,6 +138,11 @@ class ConfigValidationError(SymphonyError):
     code = "config_validation_error"
 
 
+# board dependency DAG (symphony.trackers.validate)
+class BoardDependencyError(SymphonyError):
+    code = "board_dependency_error"
+
+
 # operator chat (symphony.chat)
 class ChatBusyError(SymphonyError):
     code = "chat_busy"

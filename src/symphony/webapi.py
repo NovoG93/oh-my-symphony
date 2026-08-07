@@ -40,6 +40,7 @@ from .logging import get_logger
 from .skills import normalize_skill_names
 from .stats import StatsStore, stats_store_for
 from .trackers.file import FileBoardTracker, parse_ticket_file
+from .trackers.validate import validate_ticket_dependencies
 from .utils import git_inspect, git_ops
 from .utils.auto_merge import auto_merge_on_done_best_effort
 from .utils.git_ops import GitOpResult
@@ -201,6 +202,7 @@ def _issue_card(
         "labels": list(issue.labels),
         "skills": list(issue.skills),
         "agent_kind": issue.agent_kind or "",
+        "request": issue.request or "",
         "blocked_by": [
             {"identifier": b.identifier, "state": b.state} for b in issue.blocked_by
         ],
@@ -373,6 +375,37 @@ def _check_labels(raw: Any) -> list[str]:
     return labels
 
 
+def _check_request(raw: Any) -> str:
+    """Optional request grouping id (e.g. REQ-1); empty string clears."""
+    if raw is None:
+        return ""
+    if not isinstance(raw, str):
+        raise WorkflowMutationError("request must be a string")
+    request = raw.strip()
+    if request and not _IDENTIFIER_RE.match(request):
+        raise WorkflowMutationError(
+            "request must match ^[A-Za-z][A-Za-z0-9_-]{0,63}$"
+        )
+    return request
+
+
+def _check_blocked_by(raw: Any) -> list[str]:
+    if raw is None:
+        return []
+    if not isinstance(raw, list):
+        raise WorkflowMutationError("blocked_by must be a list of ticket identifiers")
+    out: list[str] = []
+    for item in raw:
+        if not isinstance(item, str):
+            raise WorkflowMutationError(
+                "blocked_by must be a list of ticket identifiers"
+            )
+        identifier = _check_identifier(item)
+        if identifier not in out:
+            out.append(identifier)
+    return out
+
+
 def _check_agent_kind(raw: Any) -> str:
     if raw is None:
         return ""
@@ -531,6 +564,7 @@ def _register_issue_routes(
             if body.get("state")
             else (cfg.tracker.active_states[0] if cfg.tracker.active_states else "Todo")
         )
+        blocked_by = _check_blocked_by(body.get("blocked_by"))
         fields = {
             "title": title,
             "state": state,
@@ -539,12 +573,23 @@ def _register_issue_routes(
             "description": _check_description(body.get("description")),
             "agent_kind": _check_agent_kind(body.get("agent_kind")) or None,
             "skills": list(normalize_skill_names(body.get("skills") or [])),
+            "blocked_by": blocked_by or None,
+            "request": _check_request(body.get("request")) or None,
         }
+        def _validate_dependencies(new_identifier: str | None) -> None:
+            validate_ticket_dependencies(
+                tracker.scan_all(),
+                identifier=new_identifier,
+                blocked_by=blocked_by,
+                new_ticket=True,
+            )
+
         raw_identifier = body.get("identifier")
         if raw_identifier:
             if not isinstance(raw_identifier, str):
                 raise WorkflowMutationError("identifier must be a string")
             identifier = _check_identifier(raw_identifier)
+            await asyncio.to_thread(_validate_dependencies, identifier)
             await asyncio.to_thread(tracker.create, identifier=identifier, **fields)
         else:
             prefix_raw = body.get("prefix")
@@ -556,6 +601,7 @@ def _register_issue_routes(
             if not re.match(r"^[A-Za-z][A-Za-z0-9]{0,15}$", prefix):
                 raise WorkflowMutationError("prefix must be 1-16 alphanumeric chars")
 
+            await asyncio.to_thread(_validate_dependencies, None)
             identifier, _ = await asyncio.to_thread(
                 tracker.create_with_next_identifier, prefix, **fields
             )
@@ -622,6 +668,19 @@ def _register_issue_routes(
             ]
         if "agent_kind" in body:
             fields["agent_kind"] = _check_agent_kind(body.get("agent_kind"))
+        if "request" in body:
+            fields["request"] = _check_request(body.get("request"))
+        if "blocked_by" in body:
+            blocked_by = _check_blocked_by(body.get("blocked_by"))
+            await asyncio.to_thread(
+                lambda: validate_ticket_dependencies(
+                    tracker.scan_all(),
+                    identifier=identifier,
+                    blocked_by=blocked_by,
+                    new_ticket=False,
+                )
+            )
+            fields["blocked_by"] = blocked_by
         new_state: str | None = None
         if "state" in body:
             new_state = _check_state(cfg, body.get("state"))

@@ -1,11 +1,15 @@
 """`symphony board ...` — minimal helper to manage a file-based Kanban.
 
 Subcommands:
-    init <root>                       create the board directory + sample
-    ls   [--state STATE]              list tickets (optionally filtered)
-    new  <id> <title> [--state ...]   create a new ticket
-    mv   <id> <new-state>             change a ticket's state
-    show <id>                         print a ticket's contents
+    init  <root>                       create the board directory + sample
+    ls    [--state STATE]              list tickets (optionally filtered)
+    new   <id> <title> [--state ...]   create a validated ticket
+    mv    <id> <new-state>             change a ticket's state
+    show  <id>                         print a ticket's contents
+    graph [--request REQ]              print the dependency DAG
+
+`new` validates before writing: unique id, legal state, existing
+`--blocked-by` targets, and an acyclic board dependency graph.
 
 These commands operate directly on the configured `tracker.board_root` from
 the current `WORKFLOW.md` (or an explicit one passed with --workflow).
@@ -18,7 +22,16 @@ import sys
 from pathlib import Path
 
 from ..errors import SymphonyError
+from ..issue import Issue, normalize_state
 from ..trackers.file import FileBoardTracker, parse_ticket_file
+from ..trackers.validate import (
+    blocker_ids,
+    board_edges,
+    dangling_blockers,
+    find_cycle,
+    topological_order,
+    validate_ticket_dependencies,
+)
 from ..workflow import (
     DEFAULT_BOARD_ROOT_NAME,
     SUPPORTED_AGENT_KINDS,
@@ -106,7 +119,7 @@ def cmd_init(args: argparse.Namespace) -> int:
 def cmd_ls(args: argparse.Namespace) -> int:
     tracker = _get_tracker(args)
     fbt = FileBoardTracker(tracker)
-    issues = fbt._scan_all()  # type: ignore[attr-defined]
+    issues = fbt.scan_all()
     if args.state:
         target = args.state.lower()
         issues = [i for i in issues if i.state.lower() == target]
@@ -124,20 +137,57 @@ def cmd_ls(args: argparse.Namespace) -> int:
     return 0
 
 
+def _read_description(args: argparse.Namespace) -> str:
+    if args.description_file is not None:
+        if args.description is not None:
+            raise SymphonyError("use --description or --description-file, not both")
+        if args.description_file == "-":
+            return sys.stdin.read()
+        return Path(args.description_file).read_text(encoding="utf-8")
+    return args.description or ""
+
+
+def _collect_labels(args: argparse.Namespace) -> list[str] | None:
+    labels = [item.strip() for item in (args.labels or "").split(",") if item.strip()]
+    labels.extend(args.label or [])
+    return labels or None
+
+
 def cmd_new(args: argparse.Namespace) -> int:
     tracker = _get_tracker(args)
     fbt = FileBoardTracker(tracker)
+    legal_states = {
+        s.lower(): s for s in (*tracker.active_states, *tracker.terminal_states)
+    }
+    state = legal_states.get(args.state.lower())
+    if state is None:
+        print(
+            f"error: unknown state {args.state!r}; "
+            f"expected one of {sorted(legal_states.values())}",
+            file=sys.stderr,
+        )
+        return 1
+    blocked_by = list(dict.fromkeys(args.blocked_by or []))
     try:
+        description = _read_description(args)
+        validate_ticket_dependencies(
+            fbt.scan_all(),
+            identifier=args.id,
+            blocked_by=blocked_by,
+            new_ticket=True,
+        )
         path = fbt.create(
             identifier=args.id,
             title=args.title,
-            state=args.state,
+            state=state,
             priority=args.priority,
-            labels=args.labels.split(",") if args.labels else None,
-            description=args.description or "",
+            labels=_collect_labels(args),
+            description=description,
             agent_kind=args.agent_kind,
+            blocked_by=blocked_by or None,
+            request=args.request,
         )
-    except SymphonyError as exc:
+    except (OSError, SymphonyError) as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 1
     print(f"created {path}")
@@ -170,6 +220,8 @@ def cmd_show(args: argparse.Namespace) -> int:
         print(f"priority: {front['priority']}")
     if front.get("labels"):
         print(f"labels: {', '.join(front['labels'])}")
+    if front.get("request"):
+        print(f"request: {front['request']}")
     agent = front.get("agent")
     if isinstance(agent, dict) and agent.get("kind"):
         print(f"agent: {agent['kind']}")
@@ -178,6 +230,53 @@ def cmd_show(args: argparse.Namespace) -> int:
     if body:
         print()
         print(body)
+    return 0
+
+
+def cmd_graph(args: argparse.Namespace) -> int:
+    tracker = _get_tracker(args)
+    fbt = FileBoardTracker(tracker)
+    all_issues = fbt.scan_all()
+    issues = all_issues
+    if args.request:
+        issues = [i for i in all_issues if i.request == args.request]
+    if not issues:
+        print("(no tickets)")
+        return 0
+
+    edges = board_edges(issues)
+    cycle = find_cycle(edges)
+    if cycle is not None:
+        print(f"error: dependency cycle: {' -> '.join(cycle)}", file=sys.stderr)
+        return 1
+
+    by_id: dict[str, Issue] = {i.identifier: i for i in issues}
+    known_on_board = {i.identifier for i in all_issues}
+    order = topological_order(edges)
+    depth: dict[str, int] = {}
+    for identifier in order:
+        parents = [b for b in edges[identifier] if b in depth]
+        depth[identifier] = 1 + max((depth[b] for b in parents), default=-1)
+        issue = by_id[identifier]
+        line = f"{'  ' * depth[identifier]}{identifier} {issue.state} {issue.title}"
+        blockers = blocker_ids(issue)
+        if blockers:
+            line += f" <- {', '.join(blockers)}"
+        print(line)
+
+    for identifier, missing in sorted(dangling_blockers(all_issues).items()):
+        if identifier not in by_id:
+            continue
+        for target in missing:
+            print(f"WARN {identifier}: blocked_by {target} not on board")
+    for issue in issues:
+        for blocker in issue.blocked_by:
+            target = blocker.identifier or blocker.id or ""
+            if (
+                target in known_on_board
+                and normalize_state(blocker.state) == "cancelled"
+            ):
+                print(f"WARN {issue.identifier}: blocker {target} is Cancelled")
     return 0
 
 
@@ -214,9 +313,35 @@ def build_parser() -> argparse.ArgumentParser:
     p_new.add_argument("--state", default="Todo")
     p_new.add_argument("--priority", type=int, default=None)
     p_new.add_argument("--labels", default=None, help="comma-separated labels")
+    p_new.add_argument(
+        "--label",
+        action="append",
+        default=None,
+        help="add one label (repeatable)",
+    )
     p_new.add_argument("--description", default=None)
     p_new.add_argument(
+        "--description-file",
+        default=None,
+        help="read the description from PATH ('-' for stdin)",
+    )
+    p_new.add_argument(
+        "--blocked-by",
+        action="append",
+        default=None,
+        metavar="ID",
+        help="existing ticket this one depends on (repeatable)",
+    )
+    p_new.add_argument(
+        "--request",
+        default=None,
+        metavar="REQ",
+        help="request grouping id (e.g. REQ-1)",
+    )
+    p_new.add_argument(
         "--agent-kind",
+        "--agent",
+        dest="agent_kind",
         choices=sorted(SUPPORTED_AGENT_KINDS),
         default=None,
         help="override backend for this ticket (default: WORKFLOW.md agent.kind)",
@@ -233,6 +358,16 @@ def build_parser() -> argparse.ArgumentParser:
     add_workflow_args(p_show)
     p_show.add_argument("id", help="ticket identifier")
     p_show.set_defaults(func=cmd_show)
+
+    p_graph = sub.add_parser("graph", help="print the dependency DAG")
+    add_workflow_args(p_graph)
+    p_graph.add_argument(
+        "--request",
+        default=None,
+        metavar="REQ",
+        help="only tickets in this request group",
+    )
+    p_graph.set_defaults(func=cmd_graph)
 
     return parser
 

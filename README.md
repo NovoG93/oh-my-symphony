@@ -391,7 +391,20 @@ symphony board new TASK-1 "Fix flaky pagination test" \
   --labels backend,test \
   --description "tests/test_pagination.py::test_cursor_advance is flaky on CI."
 # → created kanban/TASK-1.md
+
+# Structured creation: dependencies, request grouping, body from file/stdin.
+symphony board new TASK-2 "Add regression test" \
+  --blocked-by TASK-1 \
+  --request REQ-1 \
+  --label test --label ci \
+  --description-file ./spec.md      # or `-` to read stdin
 ```
+
+`new` validates before writing: unique id, a state from
+`tracker.active_states`/`terminal_states`, every `--blocked-by` target must
+exist on the board, and the added edges must keep the dependency graph
+acyclic (violations print the cycle path and exit non-zero). The web API's
+issue create/update endpoints apply the same rules.
 
 Inspect:
 
@@ -399,6 +412,8 @@ Inspect:
 symphony board ls                    # all tickets
 symphony board ls --state Todo       # filter by state
 symphony board show TASK-1           # full body
+symphony board graph                 # dependency DAG (topological, indented)
+symphony board graph --request REQ-1 # only one request group
 ```
 
 ### 4. Launch the TUI

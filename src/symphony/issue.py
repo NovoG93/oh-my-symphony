@@ -31,6 +31,7 @@ class Issue:
     updated_at: datetime | None = None
     agent_kind: str | None = None
     skills: tuple[str, ...] = field(default_factory=tuple)
+    request: str | None = None
 
     def to_template_dict(self) -> dict[str, Any]:
         """§12.2 — convert keys to strings, preserve nested arrays/maps."""
@@ -52,6 +53,7 @@ class Issue:
             "updated_at": self.updated_at.isoformat() if self.updated_at else None,
             "agent_kind": self.agent_kind or "",
             "skills": list(self.skills),
+            "request": self.request or "",
         }
 
 
