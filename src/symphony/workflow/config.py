@@ -40,9 +40,6 @@ from .constants import (
     DEFAULT_MAX_STATE_TURNS,
     DEFAULT_MAX_TOTAL_TURNS,
     DEFAULT_OPENCODE_COMMAND,
-    DEFAULT_WORKFLOW_ARTIFACT_RETENTION_DAYS,
-    DEFAULT_WORKFLOW_MAX_PARALLEL_NODES,
-    DEFAULT_WORKFLOW_NAME,
     DEFAULT_WORKSPACE_REUSE_POLICY,
 )
 
@@ -434,39 +431,6 @@ class ContinuousImprovementConfig:
     agent_kind: str = ""
 
 
-@dataclass(frozen=True)
-class WorkflowEngineConfig:
-    """Opt-in governed workflow mode (PRD §7.2).
-
-    A missing `workflow_engine:` section, or `enabled: false`, means the
-    orchestrator keeps using stage prompts and agent-authored ticket
-    transitions exactly as before. Nothing else in this dataclass has any
-    effect until `enabled` is true.
-    """
-
-    enabled: bool = False
-    # Where workflow YAML lives, resolved against the WORKFLOW.md directory.
-    directory: Path | None = None
-    # Runtime artifacts (logs, full node output). Gitignored by default.
-    artifact_directory: Path | None = None
-    # Workflow used when a ticket does not name one.
-    default: str = DEFAULT_WORKFLOW_NAME
-    # Service ceiling on concurrent nodes within one ticket. A workflow may
-    # ask for less, never more.
-    max_parallel_nodes: int = DEFAULT_WORKFLOW_MAX_PARALLEL_NODES
-    # When true (the default), an interrupted run waits for an operator
-    # instead of restarting itself. Turning this off is not supported in v1;
-    # the field exists so the config is explicit about the guarantee.
-    require_explicit_resume: bool = True
-    artifact_retention_days: int = DEFAULT_WORKFLOW_ARTIFACT_RETENTION_DAYS
-    # Runtime condition -> tracker state. Empty means the orchestrator makes
-    # no coarse board transitions and only the live overlay reflects the run.
-    ticket_state_mapping: dict[str, str] = field(default_factory=dict)
-
-    def state_for(self, condition: str) -> str | None:
-        """Target tracker state for a runtime condition, if configured."""
-        return self.ticket_state_mapping.get(condition) or None
-
 
 @dataclass(frozen=True)
 class ServiceConfig:
@@ -493,7 +457,6 @@ class ServiceConfig:
     continuous_improvement: ContinuousImprovementConfig = field(
         default_factory=ContinuousImprovementConfig
     )
-    workflow_engine: WorkflowEngineConfig = field(default_factory=WorkflowEngineConfig)
     raw: dict[str, Any] = field(default_factory=dict)
     prompt_template: str = ""
     workspace_reuse_policy: str = DEFAULT_WORKSPACE_REUSE_POLICY

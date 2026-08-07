@@ -93,10 +93,9 @@ from .config import (
     TrackerConfig,
     TuiConfig,
     WikiConfig,
-    WorkflowEngineConfig,
 )
 from .builder import build_service_config
-from .preflight import validate_for_dispatch, validate_workflow_engine
+from .preflight import validate_for_dispatch
 from .state import WorkflowState
 
 __all__ = [
@@ -124,7 +123,6 @@ __all__ = [
     "ProgressConfig",
     "SystemConfig",
     "WikiConfig",
-    "WorkflowEngineConfig",
     "PromptConfig",
     "ServiceConfig",
     "ContinuousImprovementConfig",
@@ -132,7 +130,6 @@ __all__ = [
     "build_service_config",
     # preflight
     "validate_for_dispatch",
-    "validate_workflow_engine",
     # state
     "WorkflowState",
     # constants used by callers / tests

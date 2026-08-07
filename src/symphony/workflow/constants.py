@@ -62,16 +62,6 @@ DEFAULT_CI_MAX_TURNS = 48
 DEFAULT_CI_TICKET_PREFIX = "CI"
 DEFAULT_CI_MAX_TICKETS_PER_RUN = 5
 
-# Governed workflow engine (default off). Absent config or `enabled: false`
-# keeps the legacy stage loop, byte for byte.
-DEFAULT_WORKFLOW_DIRECTORY = ".symphony/workflows"
-DEFAULT_WORKFLOW_ARTIFACT_DIRECTORY = ".symphony/artifacts"
-DEFAULT_WORKFLOW_NAME = "ticket-default"
-DEFAULT_WORKFLOW_MAX_PARALLEL_NODES = 1
-DEFAULT_WORKFLOW_ARTIFACT_RETENTION_DAYS = 30
-# Upper bound the service will honour regardless of what a workflow asks for.
-MAX_WORKFLOW_PARALLEL_NODES = 8
-
 SUPPORTED_AGENT_KINDS = {"agy", "codex", "claude", "gemini", "kiro", "opencode", "pi"}
 DEFAULT_AGENT_KIND = "codex"
 DEFAULT_CLAUDE_COMMAND = (
