@@ -100,8 +100,9 @@ QA_PREAMBLE = (
     "You are chatting with the operator of the repository at {path}. "
     "Answer questions about this repository by reading its files. "
     "Q&A mode: do not create, modify or delete any files. "
-    "If the operator asks you to file a board ticket, explain that they "
-    "should switch the chat to edit mode first.\n{board}\n"
+    "For a software request, describe the tickets you would file (ids, "
+    "states, blocked-by DAG) and ask the operator to switch the chat to "
+    "edit mode to file them.\n{board}\n"
 )
 EDIT_PREAMBLE = (
     "You are pair-working with the operator of the repository at {path}. "
@@ -109,15 +110,37 @@ EDIT_PREAMBLE = (
     "Keep changes minimal and report exactly what you changed.\n{board}\n"
 )
 
+# Build-request protocol taught to the chat agent. Rendered with the
+# board's ACTUAL active states; the routing paragraph differs between the
+# 4-lane default board (chat files the stage-ticket DAG itself) and a
+# deep-preset board with an Intake lane (the pipeline decomposes).
 _BOARD_PREAMBLE = (
-    "This project runs a Symphony kanban board at {board_root}: one markdown "
-    "file per ticket, YAML front matter with id, identifier, title, state, "
-    "priority (0-4), labels, created_at, updated_at, then the description as "
-    "the body. Active states: {states}. To file a new issue for the "
-    "orchestrator, create {board_root}/<IDENTIFIER>.md with `state: Todo`, a "
-    "clear title and acceptance criteria in the body, using a new identifier "
-    "that does not collide with existing ticket files; Symphony picks it up "
-    "automatically."
+    "This project runs a Symphony kanban board at {board_root} "
+    "(active states: {states}). Questions: just answer. Software requests "
+    "(build/fix/feature/refactor): confirm scope in at most 2 short turns, "
+    "and only if genuinely ambiguous; then file tickets with the validated "
+    "CLI — NEVER hand-write ticket markdown files:\n"
+    '  symphony board new <ID> "<title>" --state <state> --request REQ-<n> '
+    "--blocked-by <ID> --description-file -\n"
+    "(description on stdin; the CLI validates ids, states and DAG "
+    "acyclicity; use the next free REQ-<n> as the request id).\n"
+    "{routing}"
+    "Each description is a self-contained worker prompt: Goal / Scope "
+    "in-out / Acceptance criteria / Evidence expected — succinct. After "
+    "filing, reply with the ticket ids and a one-line DAG summary; the "
+    "orchestrator picks them up automatically."
+)
+
+_DEFAULT_ROUTING = (
+    "SIMPLE task: one ticket in {first_state} with goal + acceptance "
+    "criteria. COMPLEX task (new app, multi-file feature, unclear domain): "
+    "a stage-ticket DAG chained via --blocked-by under one --request — "
+    "research -> plan -> adversarial plan-review -> build ticket(s) -> qa "
+    "-> document, titled accordingly (e.g. 'REQ-3 research: ...').\n"
+)
+_DEEP_ROUTING = (
+    "This board runs the deep pipeline: file ONE Intake ticket per request "
+    "and let the pipeline decompose it.\n"
 )
 
 
@@ -131,16 +154,27 @@ QA_MODE_NOTICE = (
 )
 EDIT_MODE_NOTICE = (
     "[Chat mode changed to edit: you may now create and modify files in "
-    "this working tree as requested, including filing kanban tickets.]\n\n"
+    "this working tree as requested, including filing board tickets with "
+    "`symphony board new`.]\n\n"
 )
 
 
 def _board_preamble(cfg: ServiceConfig) -> str:
     if cfg.tracker.kind != "file" or cfg.tracker.board_root is None:
         return ""
+    states = cfg.tracker.active_states
+    # An Intake lane marks a deep-preset (or deep-shaped custom) board:
+    # the pipeline decomposes there, so chat files one Intake ticket.
+    deep = any(s.strip().lower() == "intake" for s in states)
+    routing = (
+        _DEEP_ROUTING
+        if deep
+        else _DEFAULT_ROUTING.format(first_state=states[0] if states else "Todo")
+    )
     return _BOARD_PREAMBLE.format(
         board_root=cfg.tracker.board_root,
-        states=", ".join(cfg.tracker.active_states),
+        states=", ".join(states),
+        routing=routing,
     )
 
 _PERMISSION_MODE_RE = re.compile(r"\s--permission-mode(?:[ =]\S+)?")
