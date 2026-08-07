@@ -154,3 +154,24 @@ operator involvement. Verify wiki-read step in Research prompt (insight reuse).
 4. *"blocked_by parity on Linear/Jira missing."* — Scoped explicitly as a
    follow-up milestone; lanes work everywhere from day one.
 5. *"Adversarial Review deadlock."* — 2-round cap → Human Review escalation.
+
+
+---
+
+## Appendix: Prime-Agent-inspired feature backlog (owner request, 2026-02)
+
+Mechanisms proven in the Prime Agent harness, mapped to Symphony features.
+P3 = lands in Phase 3 connective tissue; PB = post-plan backlog.
+
+| # | Prime Agent mechanism | Symphony feature | Gain | When |
+|---|---|---|---|---|
+| 1 | Per-task model selection (child inherits model unless overridden) | **Per-stage backend override** in WORKFLOW.md: cheap/fast agent for Intake/Research/Document, strong agent for Plan/Review/Build | Large token-cost cut per request | P3 |
+| 2 | Continual-harness memory: compact one-line summaries injected always, full entry loaded only when relevant; local vs global scoping | **Wiki INDEX injection**: every worker prompt gets only the llm-wiki INDEX (one-liners); worker fetches full entries on demand. Request-vault = local memory, llm-wiki = global memory | Insight reuse without context bloat | P3 (prompt change) |
+| 3 | `refine.run()` discipline: smallest evidence-backed update after a repeated failure or reusable tactic; validate; record | **Document-lane refinement rules**: wiki entries must cite evidence from the ticket (diff, test log); stage-prompt improvements land as small addendum files, never wholesale rewrites | Learning that compounds instead of drifting | P3 (in document.md prompt) |
+| 4 | Admission-return delegation: spawn returns immediately; results only via messages/files | **Any worker may spawn sub-tickets** via the structured ticket tool (not just Plan lane): Build hits hidden complexity -> spawns blocked_by sub-ticket instead of scope-creeping (pairs with existing [scope-expand] marker) | Scope discipline + parallelism | P3 |
+| 5 | Bounded read-only observation of family agents (`agent_observe`) | **Review/Verify agents get bounded transcript access**: last-N run events of the Build ticket as evidence input | Stronger adversarial review, cheap | PB |
+| 6 | Mid-task context compaction (`compact`: summarize, keep working) | **Rolling ticket-state summary**: past N turns, orchestrator injects a compacted "state so far" note into the next turn prompt | Fewer turn-limit stalls on long tickets | PB |
+| 7 | Agent-owned heartbeats (scheduled autonomous work) | **Generalize continuous_improvement into a heartbeat scheduler**: recurring tickets (dep updates, security audit, wiki sweep, i18n sync, UI/UX review) fired through the same Intake routing | All maintenance flows through one gated pipeline | PB |
+| 8 | Skill routing: trigger descriptions + progressive disclosure (open only the routed reference) | **Auto-attach skills to tickets**: match ticket text/labels against skill trigger phrases; inject only the matched skill body | Leaner worker prompts | PB |
+| 9 | Restricted messaging topology (parent/siblings/direct children only) | **Same-request Q&A file**: tickets in one request group append questions to a shared vault file; Plan-owner ticket answers async | Unblocks workers without human ping-pong | PB |
+| 10 | Goal-level budget accounting | **Per-request budget rollup** across the ticket DAG (extends existing per-ticket token EMA) with early warning in admin UI | Cost visibility per user request | PB |
