@@ -72,6 +72,8 @@
     getPrompt: (stateName) => apiRequest(`/workflow/prompts/${encodeURIComponent(stateName)}`),
     putPrompt: (stateName, content) => apiRequest(`/workflow/prompts/${encodeURIComponent(stateName)}`, { method: 'PUT', body: JSON.stringify({ content }) }),
     putBranchPolicy: (payload) => apiRequest('/workflow/branch-policy', { method: 'PUT', body: JSON.stringify(payload) }),
+    getLanePresets: () => apiRequest('/workflow/presets'),
+    applyLanePreset: (name) => apiRequest('/workflow/presets/apply', { method: 'POST', body: JSON.stringify({ name }) }),
     putContinuousImprovement: (payload) => apiRequest('/workflow/continuous-improvement', { method: 'PUT', body: JSON.stringify(payload) }),
     getContinuousImprovementStatus: () => apiRequest('/continuous-improvement/status'),
     resetContinuousImprovementTurns: () => apiRequest('/workflow/continuous-improvement/reset-turns', { method: 'POST' }),
@@ -2757,6 +2759,37 @@
     ]);
   }
 
+  function buildLanePresetCard(presets) {
+    const select = el(
+      'select',
+      { class: 'select' },
+      presets.presets.map((p) =>
+        el('option', { value: p.name, selected: p.name === presets.current }, p.label)
+      )
+    );
+    const applyButton = el('button', {
+      class: 'btn btn-primary',
+      onClick: async (e) => {
+        e.target.disabled = true;
+        try {
+          const result = await api.applyLanePreset(select.value);
+          showToast(t('settings.lanePresetApplied', { name: result.applied }), 'success');
+          renderRoute();
+        } catch (err) {
+          showToast(err.message, 'error');
+        } finally {
+          e.target.disabled = false;
+        }
+      },
+    }, t('common.apply'));
+    return el('div', { class: 'card-panel' }, [
+      el('h3', null, t('settings.lanePreset')),
+      fieldRow([field(t('settings.lanePresetChoose'), select)]),
+      el('div', { class: 'form-hint' }, t('settings.lanePresetHint')),
+      applyButton,
+    ]);
+  }
+
   function buildBoardInfoCard(wf) {
     return el('div', { class: 'card-panel' }, [
       el('h3', null, t('settings.boardInfo')),
@@ -2816,11 +2849,13 @@
         state.board ? Promise.resolve(state.board) : api.getBoard(),
       ]);
       const ciStatus = await api.getContinuousImprovementStatus();
+      const lanePresets = await api.getLanePresets();
       state.workflow = wf;
       state.branches = branchesResp.branches;
       if (!state.board) state.board = board;
       clearNode(body);
       body.appendChild(buildContinuousImprovementCard(wf, ciStatus));
+      body.appendChild(buildLanePresetCard(lanePresets));
       body.appendChild(buildBranchPolicyCard(wf));
       body.appendChild(buildBoardInfoCard(wf));
       body.appendChild(buildInterfaceCard());

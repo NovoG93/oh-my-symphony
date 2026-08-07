@@ -10,6 +10,7 @@ from symphony.workflow import build_service_config, load_workflow
 from symphony.workflow.mutate import (
     StateSpec,
     WorkflowMutationError,
+    apply_lane_preset,
     apply_states_update,
     read_prompt,
     resolve_prompt_path,
@@ -393,3 +394,83 @@ def test_stage_kinds_survive_states_update_and_follow_renames(workflow: Path) ->
     )
     cfg = build_service_config(load_workflow(workflow))
     assert cfg.agent.stage_kinds == {"todo": "gemini"}
+
+
+# ---------------------------------------------------------------------------
+# lane presets
+# ---------------------------------------------------------------------------
+
+
+def test_apply_lane_preset_deep_rewrites_lanes_and_keeps_comments(
+    workflow: Path,
+) -> None:
+    plan = apply_lane_preset(workflow, "deep")
+
+    assert plan.removed == ["Todo", "Doing"]
+    assert plan.fallback_state == "Intake"
+    text = workflow.read_text(encoding="utf-8")
+    assert "# operator note: keep Todo first" in text
+    assert (
+        "active_states: [Intake, Research, Plan, Review, Build, QA, Verify, Document]"
+        in text
+    )
+    # Preset terminals first, user extras (Archive) kept.
+    assert "terminal_states: [Done, Human Review, Blocked, Cancelled, Archive]" in text
+    assert "base: ./docs/symphony-prompts/file/deep/base.md" in text
+    assert "Intake: ./docs/symphony-prompts/file/deep/intake.md" in text
+    # Removed lanes drop from stages and per-state agent maps.
+    assert "./prompts/stages/doing.md" not in text
+    assert "Doing: 2" not in text
+    assert "Body text with {{ issue.identifier }} stays untouched." in text
+
+
+def test_apply_lane_preset_creates_missing_prompt_files(workflow: Path) -> None:
+    apply_lane_preset(workflow, "deep")
+
+    deep_dir = workflow.parent / "docs" / "symphony-prompts" / "file" / "deep"
+    assert (deep_dir / "base.md").is_file()
+    for slug in (
+        "intake",
+        "research",
+        "plan",
+        "review",
+        "build",
+        "qa",
+        "verify",
+        "document",
+    ):
+        assert (deep_dir / f"{slug}.md").is_file(), slug
+
+
+def test_apply_lane_preset_round_trips_back_to_default(workflow: Path) -> None:
+    apply_lane_preset(workflow, "deep")
+    plan = apply_lane_preset(workflow, "default")
+
+    assert plan.fallback_state == "Todo"
+    text = workflow.read_text(encoding="utf-8")
+    assert "# operator note: keep Todo first" in text
+    assert "active_states: [Todo, In Progress, Verify, Learn]" in text
+    # Cancelled arrived with deep and survives as a user extra terminal.
+    assert "terminal_states: [Human Review, Done, Blocked, Archive, Cancelled]" in text
+    assert "Todo: ./docs/symphony-prompts/file/stages/todo.md" in text
+    assert "./docs/symphony-prompts/file/deep/intake.md" not in text
+
+
+def test_apply_lane_preset_preserves_user_extra_terminal_lane(
+    workflow: Path,
+) -> None:
+    text = workflow.read_text(encoding="utf-8").replace(
+        "terminal_states: [Done, Archive]",
+        "terminal_states: [Done, Archive, Parked]",
+    )
+    workflow.write_text(text, encoding="utf-8")
+
+    apply_lane_preset(workflow, "default")
+
+    updated = workflow.read_text(encoding="utf-8")
+    assert "terminal_states: [Human Review, Done, Blocked, Archive, Parked]" in updated
+
+
+def test_apply_lane_preset_rejects_unknown_name(workflow: Path) -> None:
+    with pytest.raises(WorkflowMutationError, match="unknown lane preset"):
+        apply_lane_preset(workflow, "mystery")

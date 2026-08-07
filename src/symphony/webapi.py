@@ -50,12 +50,14 @@ from .workflow import SUPPORTED_AGENT_KINDS, SYMPHONY_BRANCH_PREFIX, ServiceConf
 from .workflow.mutate import (
     StateSpec,
     WorkflowMutationError,
+    apply_lane_preset,
     apply_states_update,
     read_prompt,
     set_branch_policy,
     set_continuous_improvement_settings,
     write_prompt,
 )
+from .workflow.presets import LANE_PRESETS, get_lane_preset, guess_lane_preset
 
 log = get_logger()
 
@@ -887,6 +889,73 @@ def _register_workflow_routes(
         orchestrator.workflow_state.reload()
         return web.json_response({"updated": sorted(updates)})
 
+    async def handle_lane_presets_get(_request: web.Request) -> web.Response:
+        cfg = ctx.config()
+        return web.json_response(
+            {
+                "presets": [
+                    {
+                        "name": preset.name,
+                        "label": preset.label,
+                        "active_states": list(preset.active_states),
+                        "terminal_states": list(preset.terminal_states),
+                    }
+                    for preset in LANE_PRESETS.values()
+                ],
+                "current": guess_lane_preset(cfg.tracker.active_states),
+            }
+        )
+
+    async def handle_lane_preset_apply(request: web.Request) -> web.Response:
+        body = await _read_json(request)
+        name = body.get("name")
+        if not isinstance(name, str) or not name.strip():
+            raise WorkflowMutationError("body must contain string `name`")
+        try:
+            preset = get_lane_preset(name)
+        except ValueError as exc:
+            raise WorkflowMutationError(str(exc)) from exc
+        cfg = ctx.config()
+        tracker = ctx.file_tracker()
+        # Same guard as handle_states_put: a running worker owns its
+        # ticket's state string — refuse to pull a lane out from under it.
+        preset_active = {s.lower() for s in preset.active_states}
+        for issue in orchestrator.iter_running_issues():
+            if issue.state.lower() not in preset_active:
+                return _json_error(
+                    409,
+                    "state_in_use",
+                    f"column {issue.state!r} has a running worker; "
+                    "wait or pause first",
+                )
+
+        plan = await asyncio.to_thread(apply_lane_preset, cfg.workflow_path, name)
+        migrated: dict[str, str] = {}
+        skipped: list[str] = []
+        for old in plan.removed:
+            for issue in await asyncio.to_thread(
+                tracker.fetch_issues_by_states, [old]
+            ):
+                if orchestrator.find_running_issue_id(issue.identifier) is not None:
+                    skipped.append(issue.identifier)
+                    continue
+                await asyncio.to_thread(
+                    tracker.transition, issue.identifier, plan.fallback_state
+                )
+                migrated[issue.identifier] = plan.fallback_state
+        orchestrator.workflow_state.reload()
+        orchestrator.request_refresh()
+        return web.json_response(
+            {
+                "applied": preset.name,
+                "added": plan.added,
+                "removed": plan.removed,
+                "migrated": migrated,
+                "skipped_running": skipped,
+                "fallback_state": plan.fallback_state,
+            }
+        )
+
     async def handle_continuous_improvement_put(
         request: web.Request,
     ) -> web.Response:
@@ -932,6 +1001,10 @@ def _register_workflow_routes(
     app.router.add_get("/api/v1/workflow/prompts/{state}", _wrap(handle_prompt_get))
     app.router.add_put("/api/v1/workflow/prompts/{state}", _wrap(handle_prompt_put))
     app.router.add_put("/api/v1/workflow/branch-policy", _wrap(handle_branch_policy_put))
+    app.router.add_get("/api/v1/workflow/presets", _wrap(handle_lane_presets_get))
+    app.router.add_post(
+        "/api/v1/workflow/presets/apply", _wrap(handle_lane_preset_apply)
+    )
     app.router.add_put(
         "/api/v1/workflow/continuous-improvement",
         _wrap(handle_continuous_improvement_put),
