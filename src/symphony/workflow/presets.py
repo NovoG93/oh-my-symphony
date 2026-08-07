@@ -3,7 +3,7 @@
 Two shipped presets (v2.1 owner decisions, docs/plans/minimal-symphony-plan.md):
 
 - ``default`` — the succinct 4-lane board (Todo → In Progress → Verify →
-  Learn) whose stage contracts `orchestrator/contracts.py` enforces.
+  Document) whose stage contracts `orchestrator/contracts.py` enforces.
 - ``deep`` — the optional 8-lane pipeline (Intake → Research → Plan →
   Review → Build → QA → Verify → Document) ported from the OneShot
   template, carrying its own lean bash gates per lane.
@@ -42,15 +42,15 @@ _DEEP_STAGE_DIR = "./docs/symphony-prompts/file/deep"
 
 DEFAULT_PRESET = LanePreset(
     name="default",
-    label="4-lane default (Todo → In Progress → Verify → Learn)",
-    active_states=("Todo", "In Progress", "Verify", "Learn"),
+    label="4-lane default (Todo → In Progress → Verify → Document)",
+    active_states=("Todo", "In Progress", "Verify", "Document"),
     terminal_states=("Human Review", "Done", "Blocked", "Archive"),
     state_descriptions=MappingProxyType(
         {
             "Todo": "Triage; route to In Progress",
             "In Progress": "Plan + TDD implementation + self-critique",
             "Verify": "Review + QA + Merge Gate",
-            "Learn": "Wiki write-back; Done unless intervention",
+            "Document": "Docs + wiki write-back; Done unless intervention",
             "Human Review": "Manual intervention or explicit review before Done",
             "Done": "Verified complete",
         }
@@ -61,7 +61,7 @@ DEFAULT_PRESET = LanePreset(
             "Todo": f"{_DEFAULT_STAGE_DIR}/todo.md",
             "In Progress": f"{_DEFAULT_STAGE_DIR}/in-progress.md",
             "Verify": f"{_DEFAULT_STAGE_DIR}/verify.md",
-            "Learn": f"{_DEFAULT_STAGE_DIR}/learn.md",
+            "Document": f"{_DEFAULT_STAGE_DIR}/document.md",
             "Done": f"{_DEFAULT_STAGE_DIR}/done.md",
         }
     ),

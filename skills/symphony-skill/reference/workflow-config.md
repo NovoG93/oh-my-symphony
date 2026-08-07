@@ -17,7 +17,7 @@ legacy fallback.
 tracker:
   kind: file
   board_root: ./kanban
-  active_states: [Todo, "In Progress", Verify, Learn]
+  active_states: [Todo, "In Progress", Verify, Document]
   terminal_states: ["Human Review", Done, Blocked, Archive]
 
 workspace:
@@ -100,7 +100,7 @@ agent:
   kind: claude
   stage_kinds:
     Todo: gemini
-    Learn: gemini
+    Document: gemini
 ```
 
 Resolution per dispatch: ticket `agent_kind` pin > `agent.stage_kinds[state]`
@@ -142,7 +142,7 @@ prompts:
     Todo: ./docs/symphony-prompts/file/stages/todo.md
     "In Progress": ./docs/symphony-prompts/file/stages/in-progress.md
     Verify: ./docs/symphony-prompts/file/stages/verify.md
-    Learn: ./docs/symphony-prompts/file/stages/learn.md
+    Document: ./docs/symphony-prompts/file/stages/document.md
     Done: ./docs/symphony-prompts/file/stages/done.md
 ```
 
@@ -175,7 +175,7 @@ worktree** of `$SYMPHONY_WORKFLOW_DIR` on a fresh `symphony/<ID>`
 branch. The host's working tree is never modified, and the operator
 sees each feature branch immediately. `agent.feature_base_branch` selects
 the start point for new `symphony/<ID>` branches; empty means the current
-host branch. The default Learn prompt merges `symphony/<ID>` into
+host branch. The default Document prompt merges `symphony/<ID>` into
 `agent.auto_merge_target_branch` before the ticket moves to `Done`; empty
 means the feature base/current host branch. The admin web app exposes both
 values as real local git branch dropdowns, and post-Done auto-merge is only
@@ -212,7 +212,7 @@ without any repo, use `: noop`.
    - `git commit -m "<ID>: <title>[ <suffix>]"` — single ticket commit
 
 Net result: `git log symphony/<ID>` shows exactly **base + 1 commit**.
-During Learn, that branch is merged into the target branch with a real
+During Document, that branch is merged into the target branch with a real
 merge/PR before the ticket is allowed to move to `Done`.
 
 Commit-message convention:
@@ -346,13 +346,13 @@ from the lane name alone.
 
 ```yaml
 tracker:
-  active_states: [Todo, "In Progress", Verify, Learn]
+  active_states: [Todo, "In Progress", Verify, Document]
   terminal_states: ["Human Review", Done, Blocked, Archive]
   state_descriptions:
     Todo: "Triage: decide if actionable"
     "In Progress": "Plan, implement, and self-critique"
     Verify: "Review, QA, and merge proof"
-    Learn: "Write back docs; Done unless intervention"
+    Document: "Write back docs; Done unless intervention"
     "Human Review": "Manual intervention or explicit review before Done"
 ```
 

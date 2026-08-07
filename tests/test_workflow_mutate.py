@@ -449,7 +449,7 @@ def test_apply_lane_preset_round_trips_back_to_default(workflow: Path) -> None:
     assert plan.fallback_state == "Todo"
     text = workflow.read_text(encoding="utf-8")
     assert "# operator note: keep Todo first" in text
-    assert "active_states: [Todo, In Progress, Verify, Learn]" in text
+    assert "active_states: [Todo, In Progress, Verify, Document]" in text
     # Cancelled arrived with deep and survives as a user extra terminal.
     assert "terminal_states: [Human Review, Done, Blocked, Archive, Cancelled]" in text
     assert "Todo: ./docs/symphony-prompts/file/stages/todo.md" in text

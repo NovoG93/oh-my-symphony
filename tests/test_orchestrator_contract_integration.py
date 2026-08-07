@@ -466,7 +466,7 @@ def test_contract_passes_when_disk_has_required_sections(
     )
     cfg = _make_file_tracker_config(
         board_root=board_root,
-            active_states=("In Progress", "Verify", "Learn"),
+            active_states=("In Progress", "Verify", "Document"),
             max_turns=2,
         )
 
@@ -518,7 +518,7 @@ def test_contract_fails_when_disk_missing_sections(
     )
     cfg = _make_file_tracker_config(
         board_root=board_root,
-        active_states=("In Progress", "Verify", "Learn"),
+        active_states=("In Progress", "Verify", "Document"),
         max_turns=2,
     )
 
@@ -569,14 +569,14 @@ def test_qa_scorecard_fail_warns_without_rewind(
     )
     cfg = _make_file_tracker_config(
         board_root=board_root,
-        active_states=("Verify", "Learn"),
+        active_states=("Verify", "Document"),
         max_turns=2,
     )
 
     _install_file_tracker_backend(
         monkeypatch,
         ticket_path=ticket_path,
-        transitions=[("Learn", _VERIFY_BODY_SCORECARD_FAIL)],
+        transitions=[("Document", _VERIFY_BODY_SCORECARD_FAIL)],
     )
 
     workspace_path = tmp_path / "workspace"
@@ -619,7 +619,7 @@ def test_stage_kinds_route_backend_kind_into_backend_factory(
     )
     cfg = _make_file_tracker_config(
         board_root=board_root,
-        active_states=("In Progress", "Verify", "Learn"),
+        active_states=("In Progress", "Verify", "Document"),
         max_turns=2,
     )
     cfg = replace(

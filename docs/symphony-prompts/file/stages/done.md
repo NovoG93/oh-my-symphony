@@ -1,6 +1,6 @@
 ### DONE -- final readable report
 
-Terminal: Verify passed and recorded `## Merge Status`; Learn wrote wiki updates plus the delivery report. Write ticket comments only; run read-only commands; do NOT edit source.
+Terminal: Verify passed and recorded `## Merge Status`; Document wrote wiki updates plus the delivery report. Write ticket comments only; run read-only commands; do NOT edit source.
 
 1. Append `## As-Is -> To-Be Report` with exactly these subsections:
    - `### Goal` -- user outcome in plain language.

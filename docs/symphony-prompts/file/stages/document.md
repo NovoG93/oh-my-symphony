@@ -1,4 +1,4 @@
-### LEARN -- make the next ticket easier
+### DOCUMENT -- document the change and make the next ticket easier
 
 Read `docs/{{ issue.identifier }}/{work,qa}/`, prior sections, and `docs/llm-wiki/`. Write wiki files and ticket comments only. Do NOT edit source, do NOT run git history commands, and do NOT run the Merge Gate here; Verify already did it.
 
@@ -14,4 +14,4 @@ Read `docs/{{ issue.identifier }}/{work,qa}/`, prior sections, and `docs/llm-wik
    - Never set `Blocked` because a local git command failed -- a sandbox that refuses `.git/objects` writes is an environment limit, not lost work; the host gate records the same delivery moments later.
 8. Set state to `Done` for normal success. Set state to `Human Review` only for the recorded critical/manual intervention branch.
 
-Operator skip: the TUI/web skip action may append `## Learn Skipped` and move an idle Learn ticket to `Human Review`; agents must not simulate that skip themselves.
+Operator skip: the TUI/web skip action may append `## Document Skipped` and move an idle Document ticket to `Human Review`; agents must not simulate that skip themselves.

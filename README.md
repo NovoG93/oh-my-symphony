@@ -99,7 +99,7 @@ terminal for.
   agent=codex  tracker=linear  workflow=WORKFLOW.md  lang=en   running=2  retrying=1   │  tokens in=84,200 out=27,640 total=111,840
                                                                                        │  rate-limits=requests_remaining=4823, tokens_remaining=1.2M
 
-╭── Todo [1/4] (3) ╮ ╭── In Progress [2/4] ╮ ╭── Verify [3/4] ╮ ╭── Learn [4/4] ╮ ╭── Done (2) ──╮ ╭── detail ───────────────────────╮
+╭── Todo [1/4] (3) ╮ ╭── In Progress [2/4] ╮ ╭── Verify [3/4] ╮ ╭── Document [4/4] ╮ ╭── Done (2) ──╮ ╭── detail ───────────────────────╮
 │  DEMO-120 [1/4]  │ │  DEMO-104 [2/4] ●   │ │  DEMO-122 [3/4]│ │  DEMO-123     │ │  DEMO-088    │ │  DEMO-104 [2/4]                 │
 │  Migrate auth …  │ │  Fix race condi…    │ │  Review + QA   │ │  S skip       │ │  Drop dead-… │ │  Fix race condition in pagina…  │
 │  #backend …      │ │  turn 4  20,180t    │ │  #docs         │ │  Wiki notes   │ │  DEMO-091    │ │                                 │
@@ -113,7 +113,7 @@ terminal for.
 │  blocked by D…   │                                                                                 ╰─────────────────────────────────╯
 ╰──────────────────╯
 
-q quit · r refresh · enter details · n new · e edit · s stats · S skip Learn · P pause/resume · / filter · ?
+q quit · r refresh · enter details · n new · e edit · s stats · S skip Document · P pause/resume · / filter · ?
 ```
 
 </details>
@@ -143,10 +143,10 @@ adds:
    Columns are tracker states; cards show the active agent, turn count, last
    event, and accumulated tokens. Cards are focusable, the mouse wheel
    scrolls each lane, `enter` opens a full-detail modal, `n` registers a new
-   ticket with a multiline body, `e` edits the focused ticket, `S` skips Learn,
+   ticket with a multiline body, `e` edits the focused ticket, `S` skips Document,
    and `s` opens the stats screen.
 3. A **built-in web Kanban app** on the orchestrator port — issue CRUD with
-   drag-and-drop state moves, Learn skip, column add/delete/rename, per-column
+   drag-and-drop state moves, Document skip, column add/delete/rename, per-column
    prompt editing, branch policy, and a dedicated stats page.
 4. A **single-node reliability ledger** in `.symphony/state.db` — active run
    leases block duplicate dispatch across restarts, dead-owner leases are
@@ -197,7 +197,7 @@ When creating file-board tickets from the CLI, use
 
 Between the ticket pin and the global default sits optional per-state routing:
 `agent.stage_kinds` maps board states to agent kinds so cheap/fast agents can
-own light lanes (e.g. `Todo: gemini`, `Learn: gemini`) while a strong default
+own light lanes (e.g. `Todo: gemini`, `Document: gemini`) while a strong default
 handles Plan/Build/Review. Resolution per dispatch: ticket `agent_kind` pin >
 `agent.stage_kinds[state]` > `agent.kind`. A ticket that changes state gets the
 new stage's backend on its next dispatch.
@@ -245,7 +245,7 @@ pip install -e ".[dev]"
 cat > WORKFLOW.md <<'YAML'
 ---
 tracker: { kind: file, board_root: ./kanban,
-           active_states: [Todo, "In Progress", Verify, Learn],
+           active_states: [Todo, "In Progress", Verify, Document],
            terminal_states: ["Human Review", Done, Blocked, Archive] }
 polling: { interval_ms: 5000 }
 workspace: { root: ~/symphony_workspaces }
@@ -350,7 +350,7 @@ Four blocks matter for first-run sanity:
 tracker:
   kind: file
   board_root: ./kanban
-  active_states: [Todo, "In Progress", Verify, Learn]
+  active_states: [Todo, "In Progress", Verify, Document]
   terminal_states: ["Human Review", Done, Blocked, Archive]
 
 workspace:
@@ -375,7 +375,7 @@ prompts:
     Todo: ./docs/symphony-prompts/file/stages/todo.md
     "In Progress": ./docs/symphony-prompts/file/stages/in-progress.md
     Verify: ./docs/symphony-prompts/file/stages/verify.md
-    Learn: ./docs/symphony-prompts/file/stages/learn.md
+    Document: ./docs/symphony-prompts/file/stages/document.md
     Done: ./docs/symphony-prompts/file/stages/done.md
 ```
 
@@ -599,7 +599,7 @@ restart needed.
 Boards start from a preset and stay fully customizable:
 
 - **default** — the succinct 4-lane board `Todo → In Progress → Verify →
-  Learn`. Short stage prompts; the stage contracts in
+  Document`. Short stage prompts; the stage contracts in
   `orchestrator/contracts.py` are the mechanical gate. Complex work is
   expressed as a ticket DAG (`--blocked-by` / `--request`), not extra lanes.
 - **deep** — an optional 8-lane pipeline `Intake → Research → Plan → Review
@@ -674,7 +674,7 @@ only). From the browser you can:
 
 - **Board** — create / edit / delete issues, drag cards between columns,
   watch live run badges (turn count, tokens), pause / resume workers, and
-  skip Learn for tickets that do not need wiki write-back. The board defaults
+  skip Document for tickets that do not need wiki write-back. The board defaults
   to the four active agent lanes; `Human Review`, `Done`, `Blocked`, and
   `Archive` stay visible in the compact **Review and parked** group until
   you switch to `All`.
@@ -707,7 +707,7 @@ JSON API endpoints:
 | GET    | `/api/v1/stats?days=N`            | Aggregated run statistics                    |
 | POST   | `/api/v1/refresh`                 | Coalesced trigger of poll + reconcile        |
 | POST   | `/api/v1/{id}/pause` `/resume`    | Hold / release a running worker              |
-| POST   | `/api/v1/issues/{id}/skip-learn`  | Move idle Learn ticket to Human Review       |
+| POST   | `/api/v1/issues/{id}/skip-document` | Move idle Document ticket to Human Review (deprecated alias: `/skip-learn`) |
 
 ### CLI Kanban TUI (primary UI)
 
@@ -757,7 +757,7 @@ Key bindings (`?` shows the full list; also auto-listed in the footer):
 | `1`–`9` / `0`      | Zoom that lane (others shrink) / reset zoom  |
 | `n` / `e`          | Register a new ticket / edit the focused one |
 | `a` / `c`          | Archive / confirm a Done-gated card          |
-| `S`                | Skip Learn for the focused ticket            |
+| `S`                | Skip Document for the focused ticket         |
 | `P`                | Pause / resume the focused running worker    |
 | `L`                | Cycle TUI + doc language                     |
 | `/`                | Open the filter prompt                       |
@@ -790,7 +790,7 @@ buttons and the header refresh button triggers an orchestrator
 `poll + reconcile`. The header also
 shows real local git branch dropdowns for `agent.feature_base_branch` and
 `agent.auto_merge_target_branch`, so operators can choose where new feature
-branches start and where Learn merges land without editing YAML by hand.
+branches start and where Document merges land without editing YAML by hand.
 
 #### One-shot launchers
 
@@ -906,7 +906,7 @@ The web app is the full browser editor for file boards: it can create, patch,
 delete, drag cards between configured states, edit workflow columns/prompts,
 and update branch policy through the same tracker/workflow modules the CLI
 uses. The TUI is optimized for keyboard operation: it can create/edit tickets,
-archive, confirm Done-gated cards, pause/resume running workers, skip Learn,
+archive, confirm Done-gated cards, pause/resume running workers, skip Document,
 filter, and inspect details without leaving the terminal.
 
 What is intentionally out of scope:

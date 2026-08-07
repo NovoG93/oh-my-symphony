@@ -594,9 +594,9 @@ def test_verify_scorecard_fail_row_warns_without_rewind(tmp_path: Path) -> None:
     assert "[contract-warn]" in result.warning_note
 
 
-def test_learn_contract_requires_completion_record_or_human_review() -> None:
+def test_document_contract_requires_completion_record_or_human_review() -> None:
     result = evaluate_contract(
-        producing_state="Learn",
+        producing_state="Document",
         ticket_body="## Wiki Updates\n- docs/llm-wiki/foo.md\n",
         identifier="SMA-1",
     )
@@ -605,9 +605,9 @@ def test_learn_contract_requires_completion_record_or_human_review() -> None:
     assert "one of `## As-Is -> To-Be Report` or `## Human Review`" in result.missing
 
 
-def test_learn_contract_passes_with_completion_record() -> None:
+def test_document_contract_passes_with_completion_record() -> None:
     result = evaluate_contract(
-        producing_state="Learn",
+        producing_state="Document",
         ticket_body="""
 ## Wiki Updates
 - docs/llm-wiki/foo.md
@@ -622,9 +622,9 @@ def test_learn_contract_passes_with_completion_record() -> None:
     assert result.passed is True
 
 
-def test_learn_contract_passes_with_intervention_handoff() -> None:
+def test_document_contract_passes_with_intervention_handoff() -> None:
     result = evaluate_contract(
-        producing_state="Learn",
+        producing_state="Learn",  # legacy lane name stays a supported alias
         ticket_body="""
 ## Wiki Updates
 - docs/llm-wiki/foo.md

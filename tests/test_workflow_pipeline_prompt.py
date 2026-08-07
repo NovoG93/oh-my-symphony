@@ -18,7 +18,7 @@ STAGE_HEADINGS_BY_STATE = {
     "Todo": "### TRIAGE",
     "In Progress": "### IMPLEMENT",
     "Verify": "### VERIFY",
-    "Learn": "### LEARN",
+    "Document": "### DOCUMENT",
     "Done": "### DONE",
 }
 
@@ -61,10 +61,10 @@ VERIFY_RULES = (
     "git merge-tree --write-tree",
     "Do not merge the target branch into the ticket workspace",
     "## Merge Status",
-    "Set state to `Learn`",
+    "Set state to `Document`",
 )
 
-LEARN_RULES = (
+DOCUMENT_RULES = (
     "llm-wiki",
     "INDEX.md",
     "## Wiki Updates",
@@ -153,9 +153,9 @@ def test_active_states_cover_four_stage_pipeline(workflow: str) -> None:
         "Todo",
         "In Progress",
         "Verify",
-        "Learn",
+        "Document",
     )
-    for required in ("Todo", "In Progress", "Verify", "Learn"):
+    for required in ("Todo", "In Progress", "Verify", "Document"):
         assert required.lower() in cfg.prompts.stage_templates
     assert "done" in cfg.prompts.stage_templates
     assert "Human Review" in cfg.tracker.terminal_states
@@ -233,18 +233,18 @@ def test_verify_stage_respects_disabled_auto_merge(workflow: str) -> None:
 
     assert "Merge Gate is disabled" in rendered
     assert "leaves branch integration to the operator" in rendered
-    assert "Set state to `Learn`" in rendered
+    assert "Set state to `Document`" in rendered
 
 
 @pytest.mark.parametrize("workflow", WORKFLOW_FILES)
-def test_learn_stage_writes_wiki_and_done_or_intervention_handoff(workflow: str) -> None:
+def test_document_stage_writes_wiki_and_done_or_intervention_handoff(workflow: str) -> None:
     cfg = _load(workflow)
     rendered = render(
-        cfg.prompt_template_for_state("Learn"),
-        build_prompt_env(_issue("Learn"), attempt=None),
+        cfg.prompt_template_for_state("Document"),
+        build_prompt_env(_issue("Document"), attempt=None),
     )
 
-    for phrase in LEARN_RULES:
+    for phrase in DOCUMENT_RULES:
         assert phrase in rendered
     for heading in HUMAN_REVIEW_HANDOFF_SHAPE:
         assert heading in rendered
@@ -252,7 +252,7 @@ def test_learn_stage_writes_wiki_and_done_or_intervention_handoff(workflow: str)
 
 
 @pytest.mark.parametrize("flavor", ("file", "linear"))
-def test_base_prompt_declares_four_stage_pipeline_and_skip_learn(flavor: str) -> None:
+def test_base_prompt_declares_four_stage_pipeline_and_skip_document(flavor: str) -> None:
     text = (REPO_ROOT / "docs" / "symphony-prompts" / flavor / "base.md").read_text(
         encoding="utf-8"
     )
@@ -260,7 +260,7 @@ def test_base_prompt_declares_four_stage_pipeline_and_skip_learn(flavor: str) ->
     assert "Production pipeline (4 active stages)" in text
     assert "Board card mental model" in text
     assert "Each lane answers one human question" in text
-    assert "Todo  ->  In Progress  ->  Verify  ->  Learn" in text
+    assert "Todo  ->  In Progress  ->  Verify  ->  Document" in text
     assert "critical/manual intervention -> Human Review" in text
     assert "Use `Human Review` only for real critical/manual intervention" in text
     assert "Use `Not proven` when evidence is missing" in text

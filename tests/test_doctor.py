@@ -813,7 +813,7 @@ def test_stage_turn_budget_fails_for_multi_stage_one_turn_workflow(tmp_path: Pat
         tracker:
           kind: file
           board_root: ./kanban
-          active_states: [Todo, In Progress, Verify, Learn]
+          active_states: [Todo, In Progress, Verify, Document]
           terminal_states: [Done, Blocked]
         agent:
           kind: codex

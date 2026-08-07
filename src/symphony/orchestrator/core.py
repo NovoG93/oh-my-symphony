@@ -521,7 +521,7 @@ def _blocked_rca_description(
         f"to `{issue.identifier}` and move that source ticket to `{reopen_state}`.\n"
         "5. Do not skip the source ticket's normal workflow. Once it is back "
         "in Todo, it must pass through the configured Todo/In Progress/Verify/"
-        "Learn review path like any other ticket.\n"
+        "Document review path like any other ticket.\n"
         "6. If the root cause requires credentials, host worktree cleanup, "
         "destructive operations, or external approval, leave the source ticket "
         "Blocked and append `## RCA Blocker` with exact operator action.\n\n"
@@ -1390,7 +1390,7 @@ class Orchestrator:
                 "feature_branch_pattern": "symphony/<ID>",
                 "base_branch": "current branch",
                 "merge_target_branch": "current branch",
-                "merge_timing": "after Learn, before Done",
+                "merge_timing": "after Document, before Done",
                 "auto_merge_enabled": False,
             }
         base = cfg.agent.feature_base_branch or "current branch"
@@ -1399,7 +1399,7 @@ class Orchestrator:
             "feature_branch_pattern": "symphony/<ID>",
             "base_branch": base,
             "merge_target_branch": target,
-            "merge_timing": "after Learn, before Done",
+            "merge_timing": "after Document, before Done",
             "auto_merge_enabled": bool(cfg.agent.auto_merge_on_done),
         }
 
@@ -1724,8 +1724,12 @@ class Orchestrator:
             return identifier
         return None
 
-    async def skip_learn(self, identifier: str) -> tuple[bool, str]:
-        """Move an idle Learn ticket to Human Review with an audit note."""
+    async def skip_document(self, identifier: str) -> tuple[bool, str]:
+        """Move an idle Document ticket to Human Review with an audit note.
+
+        Accepts the legacy `Learn` lane name so pre-rename boards keep the
+        skip control without migration.
+        """
         cfg = self._workflow_state.current()
         if cfg is None:
             cfg, err = self._workflow_state.reload()
@@ -1740,8 +1744,10 @@ class Orchestrator:
         )
         if issue is None:
             return False, f"unknown issue {identifier}"
-        if normalize_state(issue.state) != "learn":
-            return False, f"only Learn tickets can be skipped (state={issue.state})"
+        if normalize_state(issue.state) not in {"document", "learn"}:
+            return False, (
+                f"only Document tickets can be skipped (state={issue.state})"
+            )
         if self.find_running_issue_id(identifier) is not None:
             return False, f"{identifier} started running; retry after it stops"
 
@@ -1749,8 +1755,8 @@ class Orchestrator:
             self._tracker_call_append_note,
             cfg,
             issue,
-            "Learn Skipped",
-            "Operator skipped wiki write-back from the Learn lane.",
+            "Document Skipped",
+            f"Operator skipped documentation write-back from the {issue.state} lane.",
         )
         await asyncio.to_thread(
             self._tracker_call_update_state,
@@ -1760,6 +1766,10 @@ class Orchestrator:
         )
         self.request_refresh()
         return True, f"moved {identifier} to Human Review"
+
+    # Deprecated alias — the lane was renamed Learn -> Document; external
+    # callers using the old method name keep working.
+    skip_learn = skip_document
 
     def _retry_row(self, entry: RetryEntry) -> dict[str, Any]:
         return {
@@ -4002,6 +4012,8 @@ class Orchestrator:
                                 if prev_phase_state in {
                                     "in progress",
                                     "verify",
+                                    "document",
+                                    # legacy lane name (pre-rename boards)
                                     "learn",
                                     "done",
                                 }:

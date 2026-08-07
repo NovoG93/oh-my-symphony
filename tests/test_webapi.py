@@ -66,6 +66,7 @@ class _StubOrchestrator:
         self.run_history_error: str | None = None
         self.reset_ci_calls = 0
         self.recover_calls: list[dict[str, str | None]] = []
+        self.skip_calls: list[str] = []
         self.ci_status: dict[str, Any] = {
             "enabled": True,
             "interval_ms": 60_000,
@@ -107,6 +108,10 @@ class _StubOrchestrator:
 
     def issue_snapshot(self, _identifier: str) -> dict[str, Any] | None:
         return None
+
+    async def skip_document(self, identifier: str) -> tuple[bool, str]:
+        self.skip_calls.append(identifier)
+        return True, f"moved {identifier} to Human Review"
 
     def request_refresh(self) -> bool:
         self.refresh_calls += 1
@@ -539,6 +544,29 @@ async def test_recover_blocked_route_calls_orchestrator(client: TestClient) -> N
             "agent_kind": "codex",
         }
     ]
+
+
+async def test_skip_document_route_and_legacy_skip_learn_alias(
+    client: TestClient,
+) -> None:
+    """`/skip-document` is the route; `/skip-learn` stays a deprecated alias."""
+    stub = client.stub  # type: ignore[attr-defined]
+
+    resp = await client.post("/api/v1/issues/SEED-1/skip-document")
+    assert resp.status == 200
+    payload = await resp.json()
+    assert payload == {
+        "identifier": "SEED-1",
+        "skipped": True,
+        "message": "moved SEED-1 to Human Review",
+    }
+
+    legacy = await client.post("/api/v1/issues/SEED-1/skip-learn")
+    assert legacy.status == 200
+    legacy_payload = await legacy.json()
+    assert legacy_payload["skipped"] is True
+
+    assert stub.skip_calls == ["SEED-1", "SEED-1"]
 
 
 async def test_delete_issue_and_running_guard(client: TestClient) -> None:

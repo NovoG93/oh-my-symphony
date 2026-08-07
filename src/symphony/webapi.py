@@ -751,12 +751,12 @@ def _register_issue_routes(
         orchestrator.request_refresh()
         return web.json_response({"identifier": identifier, "deleted": True})
 
-    async def handle_issue_skip_learn(request: web.Request) -> web.Response:
+    async def handle_issue_skip_document(request: web.Request) -> web.Response:
         identifier = _check_identifier(request.match_info["identifier"])
-        changed, message = await orchestrator.skip_learn(identifier)
+        changed, message = await orchestrator.skip_document(identifier)
         if not changed:
             status = 404 if message.startswith("unknown issue") else 409
-            return _json_error(status, "learn_skip_rejected", message)
+            return _json_error(status, "document_skip_rejected", message)
         return web.json_response(
             {"identifier": identifier, "skipped": True, "message": message}
         )
@@ -772,7 +772,11 @@ def _register_issue_routes(
     )
     app.router.add_delete("/api/v1/issues/{identifier}", _wrap(handle_issue_delete))
     app.router.add_post(
-        "/api/v1/issues/{identifier}/skip-learn", _wrap(handle_issue_skip_learn)
+        "/api/v1/issues/{identifier}/skip-document", _wrap(handle_issue_skip_document)
+    )
+    # Deprecated alias — lane renamed Learn -> Document; old scripts keep working.
+    app.router.add_post(
+        "/api/v1/issues/{identifier}/skip-learn", _wrap(handle_issue_skip_document)
     )
 
 

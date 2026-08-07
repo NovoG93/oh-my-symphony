@@ -5314,7 +5314,7 @@ def test_snapshot_includes_branch_policy_for_admin_ui():
         "feature_branch_pattern": "symphony/<ID>",
         "base_branch": "dev",
         "merge_target_branch": "release",
-        "merge_timing": "after Learn, before Done",
+        "merge_timing": "after Document, before Done",
         "auto_merge_enabled": True,
     }
 
@@ -6034,7 +6034,7 @@ def test_blocked_rca_prompt_reopens_source_to_todo_then_full_workflow():
 
     assert "move that source ticket to `Todo`" in description
     assert "Do not skip the source ticket's normal workflow" in description
-    assert "it must pass through the configured Todo/In Progress/Verify/Learn" in description
+    assert "it must pass through the configured Todo/In Progress/Verify/Document" in description
 
 
 def test_recover_blocked_issue_rejects_non_blocked_ticket(monkeypatch):

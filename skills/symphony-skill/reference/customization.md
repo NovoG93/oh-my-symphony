@@ -5,7 +5,7 @@ workflow. The orchestrator treats state strings opaquely; what columns
 exist and what the agent should do in each is entirely up to the operator.
 
 Before hand-editing lanes, consider the shipped **lane presets**: the
-succinct 4-lane default (`Todo → In Progress → Verify → Learn`) and the
+succinct 4-lane default (`Todo → In Progress → Verify → Document`) and the
 8-lane deep pipeline (`Intake → Research → Plan → Review → Build → QA →
 Verify → Document`). Apply one from the admin UI settings page or
 `POST /api/v1/workflow/presets/apply`; the switch round-trips through the
@@ -129,7 +129,7 @@ files so each turn stays focused and smaller.
 |-----------------------------------------------------|--------|-----------------------------------------------------------------------------|
 | Per-state agent kind (e.g. gemini for Todo, claude for In Progress) | yes | `agent.stage_kinds` maps states to kinds; ticket `agent_kind` pin still wins. See `reference/workflow-config.md`. |
 | Per-state turn limits / timeouts                    | no | Globals (`agent.max_turns`, `<kind>.turn_timeout_ms`). PR territory to add. |
-| Auto-progression without an agent edit              | partial | Only operator controls such as Skip Learn do this. Other lanes require the agent to rewrite `kanban/<ID>.md` `state:`. |
+| Auto-progression without an agent edit              | partial | Only operator controls such as Skip Document do this. Other lanes require the agent to rewrite `kanban/<ID>.md` `state:`. |
 | Hard ordering between tickets                       | yes | `blocked_by` in ticket frontmatter gates dispatch until every blocker resolves; `symphony board new --blocked-by` validates edges and keeps the DAG acyclic. |
 
 ## Available template variables

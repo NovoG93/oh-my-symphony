@@ -19,7 +19,7 @@ LINEAR_API_KEY_ENV = "LINEAR_API_KEY"
 JIRA_API_TOKEN_ENV = "JIRA_API_TOKEN"
 JIRA_EMAIL_ENV = "JIRA_EMAIL"
 
-DEFAULT_ACTIVE_STATES = ("Todo", "In Progress", "Verify", "Learn")
+DEFAULT_ACTIVE_STATES = ("Todo", "In Progress", "Verify", "Document")
 DEFAULT_TERMINAL_STATES = (
     "Human Review",
     "Done",

@@ -47,7 +47,7 @@ references for this router.
   sorts by stable numeric suffix before mutable fields like priority.
 - The default Verify prompt expects the `symphony/<ID>` branch to be merged or
   proven ready against the configured target branch before the ticket moves to
-  `Learn`.
+  `Document`.
 
 ## Board Ticket Quality Gate
 
@@ -104,7 +104,7 @@ unwritable workspaces, and missing board directories.
   leave the operator with only a bare `WORKFLOW.md`; read
   `reference/bootstrapping.md` for the exact bundle.
 - Preserve the shipped four active lanes (`Todo`, `In Progress`, `Verify`,
-  `Learn`) unless the user explicitly requests a custom workflow or the deep
+  `Document`) unless the user explicitly requests a custom workflow or the deep
   pipeline. For the 8-lane deep preset (`Intake → Research → Plan → Review →
   Build → QA → Verify → Document`), apply it via the settings page or
   `POST /api/v1/workflow/presets/apply` instead of hand-editing lanes. If you

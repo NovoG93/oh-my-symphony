@@ -130,7 +130,7 @@ def _make_config(
     *,
     max_turns: int = 5,
     max_attempts: int = 3,
-    active_states: tuple[str, ...] = ("Todo", "In Progress", "Verify", "Learn"),
+    active_states: tuple[str, ...] = ("Todo", "In Progress", "Verify", "Document"),
     prompt_template: str | None = None,
     prompts: PromptConfig | None = None,
     compact_issue_context: bool = False,
@@ -1223,7 +1223,7 @@ def test_phase_transition_resets_token_high_water_marks(
 
 
 # ---------------------------------------------------------------------------
-# Rewind detection - Verify/Learn -> In Progress
+# Rewind detection - Verify/Document -> In Progress
 # ---------------------------------------------------------------------------
 
 
@@ -1232,16 +1232,18 @@ def test_is_rewind_transition_pure_function() -> None:
     from symphony.orchestrator import _is_rewind_transition
 
     assert _is_rewind_transition("verify", "in progress") is True
+    assert _is_rewind_transition("document", "in progress") is True
+    # Legacy lane name (pre-rename boards) keeps its rewind semantics.
     assert _is_rewind_transition("learn", "in progress") is True
     # Forward transitions are NEVER rewinds.
     assert _is_rewind_transition("todo", "in progress") is False
     assert _is_rewind_transition("in progress", "verify") is False
-    assert _is_rewind_transition("verify", "learn") is False
+    assert _is_rewind_transition("verify", "document") is False
     # Same-state self-loops are not transitions at all.
     assert _is_rewind_transition("in progress", "in progress") is False
     # Backward jumps to states OTHER than In Progress are out of scope.
     assert _is_rewind_transition("verify", "todo") is False
-    assert _is_rewind_transition("learn", "verify") is False
+    assert _is_rewind_transition("document", "verify") is False
 
 
 def test_is_rewind_transition_uses_configured_active_state_order() -> None:

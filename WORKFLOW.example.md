@@ -3,7 +3,7 @@ tracker:
   kind: linear
   project_slug: my-team-project
   api_key: $LINEAR_API_KEY
-  active_states: [Todo, "In Progress", Verify, Learn]
+  active_states: [Todo, "In Progress", Verify, Document]
   terminal_states: ["Human Review", Done, Blocked, Archive, Closed, Cancelled, Canceled, Duplicate]
   # Auto-archive sweep — terminal-state issues whose `updated_at` is older
   # than `archive_after_days` move to `archive_state` on each poll tick.
@@ -16,7 +16,7 @@ tracker:
     Todo: "Triage; route to In Progress"
     "In Progress": "Plan + TDD implementation + self-critique"
     Verify: "Review + QA + Merge Gate"
-    Learn: "Wiki write-back; Done unless intervention"
+    Document: "Docs + wiki write-back; Done unless intervention"
     "Human Review": "Manual intervention or explicit review before Done"
     Done: "Verified complete"
     Archive: "Auto-archived after 30 days idle"
@@ -38,7 +38,7 @@ hooks:
   # Default: attach the per-ticket workspace as a git worktree of the
   # host repo on a symphony/<ID> branch. The host working tree is never
   # touched while the ticket is active. The default Verify gate merges the
-  # feature branch into the target branch before the ticket can move to Learn.
+  # feature branch into the target branch before the ticket can move to Document.
   # A human later confirms Done from the TUI (`c`) or board viewer.
   #
   # If your code lives in a *different* remote than where WORKFLOW.md
@@ -177,7 +177,7 @@ agent:
   # per-ticket `agent_kind` frontmatter pin > stage_kinds > kind.
   # stage_kinds:
   #   Todo: gemini
-  #   Learn: gemini
+  #   Document: gemini
   max_concurrent_agents: 1
   # This is the per-attempt execution cap. In prompt templates,
   # {{ turn_number }}/{{ max_turns }} reports the ticket lifetime position/cap.
@@ -186,13 +186,13 @@ agent:
   # active-state ticket from restarting forever and wasting tokens.
   max_total_turns: 200
   # Hard token ceiling by workflow state. The global cap is the default for
-  # Learn; In Progress and Verify get larger build/verification budgets.
+  # Document; In Progress and Verify get larger build/verification budgets.
   max_total_tokens: 100000000
   max_total_tokens_by_state:
     "In Progress": 500000000
     Verify: 500000000
   budget_exhausted_state: Blocked
-  # Soft cap for Verify/Learn rewinds back into In Progress. Set 0 to disable.
+  # Soft cap for Verify/Document rewinds back into In Progress. Set 0 to disable.
   max_attempts: 3
   # Cap on auto-retries scheduled after a worker exits with a non-normal
   # outcome (timeout, crash, transient backend error). On exhaustion the
@@ -210,15 +210,15 @@ agent:
     Todo: 1
     "In Progress": 1
     Verify: 1
-    Learn: 1
+    Document: 1
   # When a ticket reaches Done cleanly, snapshot the workspace into one
   # git commit (`<identifier>: <title>`). If the workspace is nested
   # inside an existing repo, the commit lands there; otherwise `git init`
   # runs first. Set to false if your workspace is an existing repo with
   # strict commit-style rules you don't want auto-touched.
   auto_commit_on_done: true
-  # Merge policy for the Verify -> Learn gate. Verify must merge the
-  # `symphony/<ID>` feature branch into this target before setting Learn.
+  # Merge policy for the Verify -> Document gate. Verify must merge the
+  # `symphony/<ID>` feature branch into this target before setting Document.
   auto_merge_on_done: true
   # Branch/ref used as the start point for new `symphony/<ID>` feature
   # branches. Empty string = current host branch. The board viewer can
@@ -365,7 +365,7 @@ prompts:
     Todo: ./docs/symphony-prompts/linear/stages/todo.md
     "In Progress": ./docs/symphony-prompts/linear/stages/in-progress.md
     Verify: ./docs/symphony-prompts/linear/stages/verify.md
-    Learn: ./docs/symphony-prompts/linear/stages/learn.md
+    Document: ./docs/symphony-prompts/linear/stages/document.md
     Done: ./docs/symphony-prompts/linear/stages/done.md
 
 ---

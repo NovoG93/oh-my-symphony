@@ -1,6 +1,6 @@
 You are picking up ticket {{ issue.identifier }}: {{ issue.title }}.
 Current state: {{ issue.state }}.
-{% if attempt %}Retry attempt {{ attempt }}. Read the previous `## Resolution`, `## Blocker`, `## QA Failure`, or `## Review Findings` section first; fix the root cause, not the symptom.{% endif %}{% if is_rewind %}Rewind turn from a Verify or Learn finding. Read the most recent `## Review Findings`, `## QA Failure`, or `## Learn Defect` section first; fix exactly those items, do NOT open new scope. Agent context is fresh: only the ticket body and `docs/{{ issue.identifier }}/` survive.{% endif %}
+{% if attempt %}Retry attempt {{ attempt }}. Read the previous `## Resolution`, `## Blocker`, `## QA Failure`, or `## Review Findings` section first; fix the root cause, not the symptom.{% endif %}{% if is_rewind %}Rewind turn from a Verify or Document finding. Read the most recent `## Review Findings`, `## QA Failure`, or `## Document Defect` section first; fix exactly those items, do NOT open new scope. Agent context is fresh: only the ticket body and `docs/{{ issue.identifier }}/` survive.{% endif %}
 {% if issue.full_ticket_path %}Full ticket: {{ issue.full_ticket_path }}{% endif %}
 
 {% if issue.description %}
@@ -22,13 +22,13 @@ This ticket depends on:
 Honour the gate matching `{{ issue.state }}`. One stage = one transition; never jump ahead.
 
 ```
-  Todo  ->  In Progress  ->  Verify  ->  Learn  ->  Done
+  Todo  ->  In Progress  ->  Verify  ->  Document  ->  Done
                  ^              |          |
                  |              |          +-> critical/manual intervention -> Human Review
-                 +--------------+------------- Verify/Learn defects rewind here
+                 +--------------+------------- Verify/Document defects rewind here
 ```
 
-- `docs/llm-wiki/` is the reusable knowledge base: In Progress reads it first, Learn writes back.
+- `docs/llm-wiki/` is the reusable knowledge base: In Progress reads it first, Document writes back.
 - `docs/{{ issue.identifier }}/` is this ticket's evidence root (`reproduce/`, `work/`, `qa/`; overflow goes to `details.md` there).
 - Ticket file: `kanban/{{ issue.identifier }}.md`. Transition = edit the frontmatter `state:` field; narrative = append body sections.
 {% if token_budget %}
@@ -37,7 +37,7 @@ Honour the gate matching `{{ issue.state }}`. One stage = one transition; never 
 
 ## Board card mental model
 
-Each lane answers one human question. Todo: is this ready to work? In Progress: what are we changing and how will we prove it? Verify: did it really work and is it safe to merge? Learn: what should the next ticket remember? Done: what changed from As-Is to To-Be?
+Each lane answers one human question. Todo: is this ready to work? In Progress: what are we changing and how will we prove it? Verify: did it really work and is it safe to merge? Document: what should the next ticket remember? Done: what changed from As-Is to To-Be?
 
 Evidence rules: goal in plain language first; before and after condition; every proof says what it proves and does not prove plus the exact re-run command or artifact path. Use `Not proven` when evidence is missing, indirect, or too narrow.
 

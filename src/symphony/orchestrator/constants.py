@@ -79,6 +79,8 @@ WAIT_AGE_BUMP_MIN = 10.0
 _REWIND_TRANSITIONS = frozenset(
     {
         ("verify", "in progress"),
+        ("document", "in progress"),
+        # legacy lane name (pre-rename boards with a Learn lane)
         ("learn", "in progress"),
     }
 )

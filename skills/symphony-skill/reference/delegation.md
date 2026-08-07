@@ -169,7 +169,7 @@ from a clean-ish operator path, waits for readiness, drives the core customer
 flows in a browser or API client, records console/network/server failures, and
 states whether the app is market-ready or which customer-critical gaps remain.
 If the app cannot start (`curl 000`, no listening port, failed build, missing
-env, broken seed data), the ticket blocks delivery instead of moving to Learn.
+env, broken seed data), the ticket blocks delivery instead of moving to Document.
 When this proof finds defects, register new Kanban bug tickets with
 reproduction steps, logs, expected behavior, fix boundary, and verification
 commands; add them to the release ticket's `blocked_by` and loop until the

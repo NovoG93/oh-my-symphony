@@ -7,7 +7,7 @@ Replace placeholders `<...>` with your values. One file per service you want orc
 tracker:
   kind: file
   board_root: ./.symphony/kanban
-  active_states: [Todo, "In Progress", Verify, Learn]
+  active_states: [Todo, "In Progress", Verify, Document]
   terminal_states: [Closed, Cancelled, Canceled, Duplicate, Done, Archive, Blocked]
   archive_state: Archive
   archive_after_days: 30
@@ -15,7 +15,7 @@ tracker:
     Todo: "Triage; route to In Progress"
     "In Progress": "Plan, build, and self-critique"
     Verify: "Review, QA, and merge proof"
-    Learn: "Distill learnings, append to docs/"
+    Document: "Document changes, distill learnings, append to docs/"
     Done: "As-Is -> To-Be report"
     Archive: "Auto-archived after 30 days idle"
 
@@ -72,7 +72,7 @@ prompts:
     Todo: ./.symphony/prompts/stages/todo.md
     "In Progress": ./.symphony/prompts/stages/in-progress.md
     Verify: ./.symphony/prompts/stages/verify.md
-    Learn: ./.symphony/prompts/stages/learn.md
+    Document: ./.symphony/prompts/stages/document.md
     Done: ./.symphony/prompts/stages/done.md
 
 agent:

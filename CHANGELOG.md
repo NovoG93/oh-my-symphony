@@ -38,7 +38,7 @@ feature, and turn chat into a gated ticket-DAG pipeline.
   agent kinds. Resolution per dispatch: ticket `agent_kind` pin >
   `agent.stage_kinds[state]` > `agent.kind`.
 - **Lane presets** — a succinct 4-lane default (`Todo → In Progress →
-  Verify → Learn`) and an optional 8-lane deep pipeline (`Intake → Research
+  Verify → Document`) and an optional 8-lane deep pipeline (`Intake → Research
   → Plan → Review → Build → QA → Verify → Document`) ported from the
   OneShot template. Switchable from the admin UI settings page or
   `GET /api/v1/workflow/presets` + `POST /api/v1/workflow/presets/apply`,
@@ -50,7 +50,14 @@ feature, and turn chat into a gated ticket-DAG pipeline.
   build → qa → document stage-ticket DAG under one `--request` group; a
   deep-preset board gets one Intake ticket and the pipeline decomposes.
 
-Suite: 1575 passed, 7 skipped; ruff clean.
+### Changed
+
+- **Default board: `Learn` lane renamed to `Document`** (existing boards with
+  a `Learn` lane keep working — the orchestrator, contracts, rewinds, and the
+  skip control all accept the legacy name, and `POST .../skip-learn` stays as
+  a deprecated alias of `POST .../skip-document`).
+
+Suite: 1582 passed, 7 skipped; ruff clean.
 
 ## [0.16.1] - 2026-08-06 - Delivery commits survive the agent's sandbox
 
