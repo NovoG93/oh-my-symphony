@@ -7,6 +7,10 @@ Subcommands:
     symphony doctor [WORKFLOW]     preflight checks for WORKFLOW.md
     symphony service ...           managed background orchestrator + viewer
     symphony wiki-sweep ...        scan docs/llm-wiki/ for dup/orphan/stale rows
+    symphony runs [WORKFLOW]       recent run-registry attempts
+    symphony workflow ...          list / show / validate workflow definitions
+    symphony run ...               inspect and steer governed workflow runs
+    symphony approval ...          list and resolve human approval gates
 """
 
 from __future__ import annotations
@@ -418,6 +422,18 @@ def main(argv: list[str] | None = None) -> int:
         return _wiki_sweep_main(raw_argv[1:])
     if raw_argv and raw_argv[0] == "runs":
         return _runs_main(raw_argv[1:])
+    if raw_argv and raw_argv[0] == "workflow":
+        from .flow import workflow_main
+
+        return workflow_main(raw_argv[1:])
+    if raw_argv and raw_argv[0] == "run":
+        from .flow import run_main
+
+        return run_main(raw_argv[1:])
+    if raw_argv and raw_argv[0] == "approval":
+        from .flow import approval_main
+
+        return approval_main(raw_argv[1:])
     if raw_argv and raw_argv[0] == "tui":
         # Rewrite `symphony tui [...args]` as `symphony --tui [...args]`.
         raw_argv = ["--tui", *raw_argv[1:]]

@@ -80,6 +80,7 @@ _CANONICAL_FRONT_MATTER_KEYS = {
     "agent",
     "agent_kind",
     "skills",
+    "workflow",
     "created_at",
     "updated_at",
 }
@@ -337,6 +338,7 @@ def issue_from_file(path: Path) -> Issue | None:
         or parse_iso_timestamp(_file_mtime_iso(path)),
         agent_kind=_parse_agent_kind(front),
         skills=normalize_skill_names(front.get("skills")),
+        workflow=_parse_workflow_name(front),
     )
 
 
@@ -350,6 +352,22 @@ def _parse_agent_kind(front: dict[str, Any]) -> str | None:
         return None
     kind = raw.strip().lower()
     return kind or None
+
+
+def _parse_workflow_name(front: dict[str, Any]) -> str | None:
+    """Per-ticket governed workflow override (PRD §7.3).
+
+    Accepts the same flat/nested pair as `agent`: `workflow: quick-fix` or
+    `workflow: {name: quick-fix}`. A malformed value returns `None` here and
+    is caught by dispatch preflight, which knows which workflows exist.
+    """
+    raw = front.get("workflow")
+    if isinstance(raw, dict):
+        raw = raw.get("name")
+    if not isinstance(raw, str):
+        return None
+    name = raw.strip().lower()
+    return name or None
 
 
 def _parse_blockers(value: Any) -> list[BlockerRef]:
@@ -424,6 +442,7 @@ def serialize_ticket(front: dict[str, Any], body: str) -> str:
         "agent",
         "agent_kind",
         "skills",
+        "workflow",
         "created_at",
         "updated_at",
     ]
@@ -446,6 +465,116 @@ _WARNING_HEADING_RE = re.compile(
     r"^##\s+(?:Conflict|Budget\s+Exceeded|Blocked\s+RCA)\s*$",
     re.IGNORECASE | re.MULTILINE,
 )
+# A warning section ends at the next `##` heading *or* at a run-summary start
+# marker. Without the second alternative, stripping a warning that sits just
+# above a run summary would swallow the summary's opening marker and orphan
+# the section, which would make the next upsert append a duplicate.
+_WARNING_SECTION_END_RE = re.compile(
+    r"^(?:##\s+\S|<!--\s*symphony-run:)", re.MULTILINE
+)
+
+# Mirrors `ticket_markdown._FENCE_RE` — a fenced block may legitimately quote
+# a marker-looking line, and such a line must never be treated as a marker.
+_FENCE_RE = re.compile(r"^\s{0,3}(?P<marker>`{3,}|~{3,})")
+_RUN_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
+_RUN_SUMMARY_HEADING = "## Symphony Run"
+
+
+def _fence_marker(line: str) -> str | None:
+    match = _FENCE_RE.match(line)
+    return None if match is None else match.group("marker")
+
+
+def _run_section_markers(run_id: str) -> tuple[str, str]:
+    """Validate ``run_id`` and return its (start, end) HTML comment markers.
+
+    The id is interpolated into an HTML comment, so anything outside
+    ``[A-Za-z0-9_-]`` is rejected: a value containing ``-->`` would close the
+    comment early and spill raw markup into the ticket body.
+    """
+    if not isinstance(run_id, str) or _RUN_ID_RE.fullmatch(run_id) is None:
+        raise ValueError(
+            "run_id must match ^[A-Za-z0-9_-]{1,64}$, got " + repr(run_id)
+        )
+    return (
+        f"<!-- symphony-run:{run_id}:start -->",
+        f"<!-- symphony-run:{run_id}:end -->",
+    )
+
+
+def _render_run_summary_section(
+    *,
+    run_id: str,
+    workflow_name: str,
+    result: str,
+    artifact_dir: str,
+    branch: str | None,
+    extra_lines: tuple[str, ...],
+) -> str:
+    start, end = _run_section_markers(run_id)
+    lines = [
+        start,
+        _RUN_SUMMARY_HEADING,
+        "",
+        f"- Workflow: `{workflow_name}`",
+        f"- Run: `{run_id}`",
+        f"- Result: {result}",
+        f"- Artifacts: `{artifact_dir}`",
+    ]
+    if branch:
+        lines.append(f"- Branch: `{branch}`")
+    lines.extend(line.rstrip() for line in extra_lines)
+    lines.append(end)
+    return "\n".join(lines)
+
+
+def _find_run_section_bounds(
+    lines: list[str], start: str, end: str
+) -> tuple[int, int] | None:
+    """Return the inclusive line span of an existing run section.
+
+    Marker lines inside a fenced code block are ignored. When a start marker
+    exists without its end marker (a body someone edited by hand), the span
+    collapses to the start line so the caller repairs it in place instead of
+    appending a second copy.
+    """
+    fence: str | None = None
+    first: int | None = None
+    for index, raw_line in enumerate(lines):
+        marker = _fence_marker(raw_line)
+        if fence is not None:
+            if (
+                marker is not None
+                and marker[0] == fence[0]
+                and len(marker) >= len(fence)
+            ):
+                fence = None
+            continue
+        if marker is not None:
+            fence = marker
+            continue
+        stripped = raw_line.strip()
+        if first is None:
+            if stripped == start:
+                first = index
+        elif stripped == end:
+            return first, index
+    if first is None:
+        return None
+    return first, first
+
+
+def _upsert_run_section(body: str, run_id: str, section: str) -> str:
+    """Replace the ``run_id`` section in ``body``, or append it at the end."""
+    start, end = _run_section_markers(run_id)
+    lines = body.splitlines()
+    bounds = _find_run_section_bounds(lines, start, end)
+    if bounds is None:
+        base = body.rstrip()
+        return f"{base}\n\n{section}" if base else section
+    first, last = bounds
+    merged = lines[:first] + section.splitlines() + lines[last + 1 :]
+    return "\n".join(merged).rstrip()
 
 
 def _strip_warning_blocks(body: str) -> str:
@@ -464,8 +593,8 @@ def _strip_warning_blocks(body: str) -> str:
     out = body
     for match in reversed(matches):
         start = match.start()
-        # Find the next `## ` heading after this one.
-        next_heading = re.search(r"^##\s+\S", out[match.end():], re.MULTILINE)
+        # Find the next `## ` heading (or run-summary marker) after this one.
+        next_heading = _WARNING_SECTION_END_RE.search(out[match.end():])
         end = match.end() + next_heading.start() if next_heading else len(out)
         out = out[:start] + out[end:]
     return out.rstrip() + ("\n" if body.endswith("\n") else "")
@@ -745,6 +874,91 @@ class FileBoardTracker:
         if target_state.lower() in self._active:
             self._strip_orchestrator_warning_sections(issue.identifier)
         self.transition(issue.identifier, target_state)
+
+    def governed_transition(self, identifier: str, target_state: str) -> bool:
+        """Orchestrator-owned state write for a governed run.
+
+        Unlike :meth:`update_state` — which takes the ticket lock twice, once
+        to strip warnings and once to write the state, leaving a window where
+        a concurrent reader sees a half-applied change — this folds both into
+        a single :meth:`_mutate_ticket` call, so one lock acquisition covers
+        the whole edit.
+
+        Returns True when the ticket was written. A transition to the state
+        the ticket is already in is a no-op: it returns False and leaves
+        ``updated_at`` alone, because the board sorts on that field and a
+        replayed reconciliation must not reorder the board. An unknown
+        identifier also returns False.
+        """
+        wrote = False
+
+        def mutate(
+            front: dict[str, Any], body: str
+        ) -> tuple[dict[str, Any], str] | None:
+            nonlocal wrote
+            wrote = False
+            current = front.get("state")
+            if isinstance(current, str) and normalize_state(current) == normalize_state(
+                target_state
+            ):
+                return None
+            new_body = body
+            if target_state.lower() in self._active:
+                new_body = _strip_warning_blocks(body)
+            front["state"] = target_state
+            front["updated_at"] = datetime.now(timezone.utc).strftime(
+                "%Y-%m-%dT%H:%M:%SZ"
+            )
+            wrote = True
+            return front, new_body
+
+        self._mutate_ticket(identifier, mutate, missing_ok=True)
+        return wrote
+
+    def upsert_run_summary(
+        self,
+        identifier: str,
+        *,
+        run_id: str,
+        workflow_name: str,
+        result: str,
+        artifact_dir: str,
+        branch: str | None = None,
+        extra_lines: tuple[str, ...] = (),
+    ) -> bool:
+        """Write (or replace) the ``run_id`` summary section in the body.
+
+        The section is delimited by ``<!-- symphony-run:<run_id>:start -->`` /
+        ``:end`` markers, so the write is idempotent: startup reconciliation
+        replays it after a crash and must never leave two copies. Markers are
+        keyed by run id, so several runs on one ticket keep separate sections
+        in write order.
+
+        Returns True when the ticket exists (the section is then in place),
+        False when no ticket matches ``identifier``. Raises ``ValueError`` for
+        a run id that cannot be safely embedded in an HTML comment.
+        """
+        section = _render_run_summary_section(
+            run_id=run_id,
+            workflow_name=workflow_name,
+            result=result,
+            artifact_dir=artifact_dir,
+            branch=branch,
+            extra_lines=tuple(extra_lines),
+        )
+
+        def mutate(
+            front: dict[str, Any], body: str
+        ) -> tuple[dict[str, Any], str] | None:
+            new_body = _upsert_run_section(body, run_id, section)
+            if new_body == body:
+                return None
+            front["updated_at"] = datetime.now(timezone.utc).strftime(
+                "%Y-%m-%dT%H:%M:%SZ"
+            )
+            return front, new_body
+
+        return self._mutate_ticket(identifier, mutate, missing_ok=True) is not None
 
     def _strip_orchestrator_warning_sections(self, identifier: str) -> None:
         def mutate(
