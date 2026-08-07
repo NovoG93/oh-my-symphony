@@ -7,7 +7,11 @@ from pathlib import Path
 import pytest
 
 from symphony.orchestrator.parsing import _parse_findings_rows
-from symphony.orchestrator.contracts import ContractResult, evaluate_contract
+from symphony.orchestrator.contracts import (
+    ContractResult,
+    board_uses_default_contracts,
+    evaluate_contract,
+)
 
 
 def _complete_in_progress_body() -> str:
@@ -727,3 +731,24 @@ def test_contract_result_note_property_combines_heading_and_body() -> None:
     )
     assert result.note.startswith("## Contract Failure\n")
     assert "## Done Signals" in result.note
+
+
+def test_board_uses_default_contracts_accepts_default_and_legacy_lanes() -> None:
+    assert board_uses_default_contracts(("Todo", "In Progress", "Verify", "Document"))
+    assert board_uses_default_contracts(("Todo", "In Progress", "Verify", "Learn"))
+    assert board_uses_default_contracts(["todo", "IN PROGRESS"])
+
+
+def test_board_uses_default_contracts_rejects_deep_and_custom_lanes() -> None:
+    deep = (
+        "Intake",
+        "Research",
+        "Plan",
+        "Review",
+        "Build",
+        "QA",
+        "Verify",
+        "Document",
+    )
+    assert not board_uses_default_contracts(deep)
+    assert not board_uses_default_contracts(("Todo", "In Progress", "Staging"))
