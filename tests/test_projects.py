@@ -130,3 +130,34 @@ def test_lifecycle_commands_delegate_to_service_main(
         ["stop", str(repo / "WORKFLOW.md"), "--timeout", "10.0", "--force"],
         ["status", str(repo / "WORKFLOW.md"), "--port", "10001"],
     ]
+
+
+def test_create_rejects_absolute_workflow_without_overwriting(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source = source_bundle(tmp_path / "symphony-source")
+    sentinel = tmp_path / "outside-workflow.md"
+    sentinel.write_text("keep me\n", encoding="utf-8")
+    monkeypatch.setenv("SYMPHONY_PROJECTS_FILE", str(tmp_path / "projects.json"))
+    monkeypatch.setattr(project_cli, "source_checkout", lambda: source)
+
+    assert project_cli.main([
+        "create", "Unsafe", "--id", "unsafe", "--workflow", str(sentinel)
+    ]) == 1
+    assert sentinel.read_text(encoding="utf-8") == "keep me\n"
+    assert not (tmp_path / "unsafe").exists()
+
+
+def test_add_rejects_workflow_from_another_repository(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    first = init_repo(tmp_path / "first")
+    init_repo(tmp_path / "second")
+    source = init_repo(tmp_path / "source")
+    monkeypatch.setenv("SYMPHONY_PROJECTS_FILE", str(tmp_path / "projects.json"))
+    monkeypatch.setattr(project_cli, "source_checkout", lambda: source)
+
+    assert project_cli.main([
+        "add", str(first), "--id", "first", "--workflow", "../second/WORKFLOW.md"
+    ]) == 1
+    assert ProjectRegistry().load() == []
