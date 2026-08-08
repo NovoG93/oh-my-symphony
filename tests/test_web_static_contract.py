@@ -228,6 +228,14 @@ def test_web_chat_font_controls_contract() -> None:
     assert "font-size: inherit" in css
 
 
+def test_blocked_recovery_ui_uses_fix_ticket_language() -> None:
+    js = _script_bundle()
+
+    assert "'issue.openRca': 'Open fix'" in js
+    assert "'issue.rcaQueued': 'Fix queued'" in js
+    assert "'issue.openRca': '수정 티켓 열기'" in js
+
+
 def test_web_settings_visual_hierarchy_contract() -> None:
     js = _script_bundle()
     css = (STATIC_ROOT / "style.css").read_text(encoding="utf-8")

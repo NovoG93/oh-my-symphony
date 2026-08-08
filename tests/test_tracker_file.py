@@ -775,12 +775,15 @@ def test_g5_strip_conflict_budget_and_blocked_rca_sections_on_active_restore(tmp
     issue = issue_from_file(fbt.find_path("MT-1"))
     fbt.append_note(issue, "Budget Exceeded", "tokens budget exceeded …")
     issue = issue_from_file(fbt.find_path("MT-1"))
-    fbt.append_note(issue, "Blocked RCA", "RCA ticket `RCA-1` opened.")
+    fbt.append_note(issue, "Blocked RCA", "Legacy RCA ticket `RCA-1` opened.")
+    issue = issue_from_file(fbt.find_path("MT-1"))
+    fbt.append_note(issue, "Blocked Fix", "Fix ticket `FIX-MT-1-1` opened.")
     before_path = fbt.find_path("MT-1")
     before_body = before_path.read_text()
     assert "## Conflict" in before_body
     assert "## Budget Exceeded" in before_body
     assert "## Blocked RCA" in before_body
+    assert "## Blocked Fix" in before_body
 
     # Restore via update_state into an active state.
     issue = issue_from_file(before_path)
@@ -795,6 +798,9 @@ def test_g5_strip_conflict_budget_and_blocked_rca_sections_on_active_restore(tmp
     )
     assert "## Blocked RCA" not in after_body, (
         "## Blocked RCA section must be stripped on transition into active state"
+    )
+    assert "## Blocked Fix" not in after_body, (
+        "## Blocked Fix section must be stripped on transition into active state"
     )
     assert "Original body." in after_body, (
         "operator-authored body must survive the strip"

@@ -124,14 +124,14 @@ def build_app(orchestrator: Orchestrator) -> web.Application:
         if body and not isinstance(body, dict):
             return _error_response(400, "invalid_body", "request body must be an object")
         target_state = (
-            body.get("rca_state", body.get("target_state"))
+            body.get("fix_state", body.get("rca_state", body.get("target_state")))
             if isinstance(body, dict)
             else None
         )
         agent_kind = body.get("agent_kind") if isinstance(body, dict) else None
         if target_state is not None and not isinstance(target_state, str):
             return _error_response(
-                400, "invalid_body", "rca_state must be a string"
+                400, "invalid_body", "fix_state must be a string"
             )
         if agent_kind is not None and not isinstance(agent_kind, str):
             return _error_response(400, "invalid_body", "agent_kind must be a string")
@@ -146,6 +146,8 @@ def build_app(orchestrator: Orchestrator) -> web.Application:
         return web.json_response(
             {
                 "issue_identifier": identifier,
+                "fix_created": True,
+                # Deprecated alias retained for API compatibility.
                 "rca_created": True,
                 "message": message,
                 **details,

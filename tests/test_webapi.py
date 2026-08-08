@@ -196,12 +196,14 @@ class _StubOrchestrator:
         agent = agent_kind or "claude"
         return (
             True,
-            f"RCA-1 opened to unblock {identifier}",
+            f"FIX-1 opened to unblock {identifier}",
             {
                 "original_state": "Blocked",
                 "target_state": "Todo",
                 "source_reopen_state": "Todo",
-                "rca_identifier": "RCA-1",
+                "fix_identifier": "FIX-1",
+                "fix_state": rca_state,
+                "rca_identifier": "FIX-1",
                 "rca_state": rca_state,
                 "agent_kind": agent,
             },
@@ -531,16 +533,19 @@ async def test_patch_unknown_issue_404_and_empty_400(client: TestClient) -> None
 async def test_recover_blocked_route_calls_orchestrator(client: TestClient) -> None:
     resp = await client.post(
         "/api/v1/issues/SEED-1/recover-blocked",
-        json={"target_state": "Doing", "agent_kind": "codex"},
+        json={"fix_state": "Doing", "agent_kind": "codex"},
     )
 
     assert resp.status == 200
     payload = await resp.json()
     assert payload["identifier"] == "SEED-1"
-    assert payload["rca_created"] is True
+    assert payload["fix_created"] is True
+    assert payload["rca_created"] is True  # deprecated alias
     assert payload["target_state"] == "Todo"
     assert payload["source_reopen_state"] == "Todo"
-    assert payload["rca_identifier"] == "RCA-1"
+    assert payload["fix_identifier"] == "FIX-1"
+    assert payload["fix_state"] == "Doing"
+    assert payload["rca_identifier"] == "FIX-1"  # deprecated alias
     assert payload["rca_state"] == "Doing"
     assert payload["agent_kind"] == "codex"
     stub = client.stub  # type: ignore[attr-defined]

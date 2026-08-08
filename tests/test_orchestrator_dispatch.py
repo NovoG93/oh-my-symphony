@@ -523,9 +523,9 @@ def test_tick_keeps_blocked_rca_at_human_review_blocked(monkeypatch):
                 core_module._blocked_rca_description(source, reopen_state="Todo")
                 + "\n\n### Decision Needed\nConfirm Done\n"
             ),
-            labels=("blocked-rca", "source-mt-blocked"),
+            labels=("blocked-fix", "source-mt-blocked"),
         ),
-        title="RCA unblock MT-BLOCKED: MT-BLOCKED title",
+        title="Fix and unblock MT-BLOCKED: MT-BLOCKED title",
     )
     orch = _orch()
     monkeypatch.setattr(orch._workflow_state, "reload", lambda: (cfg, None))
@@ -5575,7 +5575,7 @@ def test_issue_attention_reports_blocked_terminal_recovery():
 
     assert attention is not None
     assert attention["kind"] == "blocked_recovery_available"
-    assert attention["label"] == "Blocked RCA"
+    assert attention["label"] == "Blocked fix"
     assert attention["severity"] == "warning"
 
 
@@ -5609,7 +5609,7 @@ def test_tick_auto_opens_blocked_rca_ticket_once(monkeypatch):
         assert rca_state == "In Progress"
         assert reopen_state == "Todo"
         assert agent_kind == "codex"
-        return "RCA-1"
+        return "FIX-MT-BLOCKED-1"
 
     def _append(_cfg, _issue, heading, body):
         notes.append((_issue.identifier, heading, body))
@@ -5617,6 +5617,9 @@ def test_tick_auto_opens_blocked_rca_ticket_once(monkeypatch):
     monkeypatch.setattr(orch, "_fetch_candidates", _fetch_candidates)
     monkeypatch.setattr(orch, "_archive_sweep", _archive)
     monkeypatch.setattr(orch, "_tracker_call_terminal_issues", _terminal_issues)
+    monkeypatch.setattr(
+        orch, "_tracker_call_active_rca_for_source", lambda *_args: None
+    )
     monkeypatch.setattr(orch, "_tracker_call_create_blocked_rca_issue", _create)
     monkeypatch.setattr(orch, "_tracker_call_append_note", _append)
 
@@ -5624,8 +5627,8 @@ def test_tick_auto_opens_blocked_rca_ticket_once(monkeypatch):
     asyncio.run(orch._on_tick())
 
     assert created == ["MT-BLOCKED"]
-    assert notes == [("MT-BLOCKED", "Blocked RCA", notes[0][2])]
-    assert "RCA ticket `RCA-1` opened" in notes[0][2]
+    assert notes == [("MT-BLOCKED", "Blocked Fix", notes[0][2])]
+    assert "Fix ticket `FIX-MT-BLOCKED-1` opened" in notes[0][2]
 
 
 def test_tick_auto_recovery_skips_existing_blocked_rca_note(monkeypatch):
@@ -5637,7 +5640,7 @@ def test_tick_auto_recovery_skips_existing_blocked_rca_note(monkeypatch):
     issue = _issue(
         "MT-BLOCKED",
         state="Blocked",
-        description="## Blocked RCA\n\nRCA ticket `RCA-1` opened.",
+        description="## Blocked Fix\n\nFix ticket `FIX-MT-BLOCKED-1` opened.",
     )
     orch = _orch()
     monkeypatch.setattr(orch._workflow_state, "reload", lambda: (cfg, None))
@@ -5706,28 +5709,39 @@ def test_tick_auto_recovery_respects_disabled_config(monkeypatch):
     assert created == []
 
 
-def test_tick_reopens_blocked_source_after_resolved_rca(monkeypatch):
+@pytest.mark.parametrize("auto_recover", (True, False))
+def test_tick_reopens_blocked_source_after_resolved_rca(monkeypatch, auto_recover):
     cfg = _make_config(
         tracker_kind="file",
         active_states=("Todo", "In Progress"),
         terminal_states=("Human Review", "Done", "Blocked"),
     )
+    cfg = replace(
+        cfg,
+        agent=replace(cfg.agent, auto_recover_blocked=auto_recover),
+    )
     source = _issue(
         "MT-BLOCKED",
         state="Blocked",
-        description="## Blocked RCA\n\nRCA ticket `RCA-1` opened.",
+        description=(
+            "## Blocked Fix\n\nFix ticket `FIX-MT-BLOCKED-1` opened.\n\n"
+            "## Fix Blocker\n\nWaiting for a reproducible command.\n\n"
+            "## Fix Resolution\n\nAcceptance criteria clarified and verified."
+        ),
     )
     rca = replace(
         _issue(
-            "RCA-1",
+            "FIX-MT-BLOCKED-1",
             state="Done",
-            description=core_module._blocked_rca_description(
-                source,
-                reopen_state="Todo",
+            description=(
+                core_module._blocked_rca_description(source, reopen_state="Todo")
+                + "\n\n## Fix Blocker\n\nWaiting for source clarification."
+                + "\n\n## Fix Resolution\n\n"
+                + "Clarified the source acceptance criteria and verified the blocker."
             ),
-            labels=("blocked-rca", "source-mt-blocked"),
+            labels=("blocked-fix", "source-mt-blocked"),
         ),
-        title="RCA unblock MT-BLOCKED: MT-BLOCKED title",
+        title="Fix and unblock MT-BLOCKED: MT-BLOCKED title",
     )
     orch = _orch()
     monkeypatch.setattr(orch._workflow_state, "reload", lambda: (cfg, None))
@@ -5749,13 +5763,16 @@ def test_tick_reopens_blocked_source_after_resolved_rca(monkeypatch):
     monkeypatch.setattr(orch, "_fetch_candidates", _fetch_candidates)
     monkeypatch.setattr(orch, "_archive_sweep", _archive)
     monkeypatch.setattr(orch, "_tracker_call_terminal_issues", lambda _cfg: [rca, source])
+    monkeypatch.setattr(
+        orch, "_tracker_call_active_rca_for_source", lambda *_args: None
+    )
     monkeypatch.setattr(orch, "_tracker_call_append_note", _append)
     monkeypatch.setattr(orch, "_tracker_call_update_state", _move)
 
     asyncio.run(orch._on_tick())
 
-    assert notes == [("MT-BLOCKED", "Blocked RCA Resolved", notes[0][2])]
-    assert "RCA ticket `RCA-1` reached `Done`" in notes[0][2]
+    assert notes == [("MT-BLOCKED", "Blocked Fix Resolved", notes[0][2])]
+    assert "Fix ticket `FIX-MT-BLOCKED-1` reached `Done`" in notes[0][2]
     assert moved == [("MT-BLOCKED", "Todo")]
 
 
@@ -5804,6 +5821,146 @@ def test_tick_does_not_reopen_blocked_source_at_human_review(monkeypatch):
     asyncio.run(orch._on_tick())
 
     assert moved == []
+
+
+def test_tick_holds_proven_fix_when_source_reopen_write_fails(monkeypatch):
+    cfg = _make_config(
+        tracker_kind="file",
+        active_states=("Todo", "In Progress"),
+        terminal_states=("Human Review", "Done", "Blocked"),
+    )
+    source = _issue(
+        "MT-BLOCKED",
+        state="Blocked",
+        description=(
+            "## Blocked Fix\n\nFix ticket `FIX-MT-BLOCKED-1` opened.\n\n"
+            "## Fix Resolution\n\nThe source instructions are actionable."
+        ),
+    )
+    fix = replace(
+        _issue(
+            "FIX-MT-BLOCKED-1",
+            state="Done",
+            description=(
+                core_module._blocked_rca_description(source, reopen_state="Todo")
+                + "\n\n## Fix Resolution\n\nVerified."
+            ),
+            labels=("blocked-fix", "source-mt-blocked"),
+        ),
+        title="Fix and unblock MT-BLOCKED: MT-BLOCKED title",
+    )
+    orch = _orch()
+    monkeypatch.setattr(orch._workflow_state, "reload", lambda: (cfg, None))
+    notes: list[tuple[str, str]] = []
+    moved: list[tuple[str, str]] = []
+
+    async def _fetch_candidates(_cfg):
+        return []
+
+    async def _archive(_cfg):
+        return None
+
+    def _move(_cfg, issue, target):
+        if issue.identifier == "MT-BLOCKED":
+            raise OSError("simulated source write failure")
+        moved.append((issue.identifier, target))
+
+    monkeypatch.setattr(orch, "_fetch_candidates", _fetch_candidates)
+    monkeypatch.setattr(orch, "_archive_sweep", _archive)
+    monkeypatch.setattr(
+        orch, "_tracker_call_terminal_issues", lambda _cfg: [fix, source]
+    )
+    monkeypatch.setattr(
+        orch,
+        "_tracker_call_append_note",
+        lambda _cfg, issue, heading, _body: notes.append(
+            (issue.identifier, heading)
+        ),
+    )
+    monkeypatch.setattr(orch, "_tracker_call_update_state", _move)
+
+    asyncio.run(orch._on_tick())
+
+    assert ("FIX-MT-BLOCKED-1", "Human Review") in moved
+    assert ("FIX-MT-BLOCKED-1", "Fix Completion Blocked") in notes
+
+
+@pytest.mark.parametrize("auto_recover", (True, False))
+@pytest.mark.parametrize(
+    "outcome",
+    (
+        "",
+        "\n\n## Fix Resolution\n\nPartial work only."
+        "\n\n## Fix Blocker\n\nOperator approval is still required.",
+    ),
+)
+def test_tick_moves_unproven_fix_from_done_to_human_review(
+    monkeypatch, outcome, auto_recover
+):
+    cfg = _make_config(
+        tracker_kind="file",
+        active_states=("Todo", "In Progress"),
+        terminal_states=("Human Review", "Done", "Blocked"),
+    )
+    cfg = replace(
+        cfg,
+        agent=replace(cfg.agent, auto_recover_blocked=auto_recover),
+    )
+    source = _issue(
+        "MT-BLOCKED",
+        state="Blocked",
+        description="## Blocked Fix\n\nFix ticket `FIX-MT-BLOCKED-1` opened.",
+    )
+    fix = replace(
+        _issue(
+            "FIX-MT-BLOCKED-1",
+            state="Done",
+            description=(
+                core_module._blocked_rca_description(source, reopen_state="Todo")
+                + outcome
+            ),
+            labels=("blocked-fix", "source-mt-blocked"),
+        ),
+        title="Fix and unblock MT-BLOCKED: MT-BLOCKED title",
+    )
+    orch = _orch()
+    monkeypatch.setattr(orch._workflow_state, "reload", lambda: (cfg, None))
+    notes: list[tuple[str, str, str]] = []
+    moved: list[tuple[str, str]] = []
+
+    async def _fetch_candidates(_cfg):
+        assert moved == [("FIX-MT-BLOCKED-1", "Human Review")], (
+            "FIX completion safety must run before active candidate dispatch"
+        )
+        return []
+
+    async def _archive(_cfg):
+        return None
+
+    monkeypatch.setattr(orch, "_fetch_candidates", _fetch_candidates)
+    monkeypatch.setattr(orch, "_archive_sweep", _archive)
+    monkeypatch.setattr(
+        orch, "_tracker_call_terminal_issues", lambda _cfg: [fix, source]
+    )
+    monkeypatch.setattr(
+        orch,
+        "_tracker_call_append_note",
+        lambda _cfg, issue, heading, body: notes.append(
+            (issue.identifier, heading, body)
+        ),
+    )
+    monkeypatch.setattr(
+        orch,
+        "_tracker_call_update_state",
+        lambda _cfg, issue, target: moved.append((issue.identifier, target)),
+    )
+
+    asyncio.run(orch._on_tick())
+
+    assert moved == [("FIX-MT-BLOCKED-1", "Human Review")]
+    assert notes[0][:2] == ("FIX-MT-BLOCKED-1", "Fix Completion Blocked")
+    assert "## Fix Resolution" in notes[0][2]
+    assert all(identifier != "MT-BLOCKED" for identifier, _state in moved)
 
 
 def test_tick_does_not_reopen_blocked_source_after_failed_rca(monkeypatch):
@@ -5978,8 +6135,143 @@ def test_blocked_rca_create_uses_source_scoped_file_identifier(tmp_path):
         "codex",
     )
 
-    assert first == "RCA-MT-BLOCKED-1"
-    assert second == "RCA-MT-BLOCKED-2"
+    assert first == "FIX-MT-BLOCKED-1"
+    assert second == "FIX-MT-BLOCKED-2"
+    created = (board_root / "FIX-MT-BLOCKED-1.md").read_text(encoding="utf-8")
+    assert "title: 'Fix and unblock MT-BLOCKED: MT-BLOCKED title'" in created
+    assert "blocked-fix" in created
+    assert "`## Clarified Request`" in created
+    assert "append `## Fix Resolution` to both" in created
+
+
+def test_recover_blocked_issue_links_source_to_new_fix(tmp_path):
+    board_root = tmp_path / "board"
+    board_root.mkdir()
+    (board_root / "MT-BLOCKED.md").write_text(
+        "---\n"
+        "id: MT-BLOCKED\n"
+        "identifier: MT-BLOCKED\n"
+        "title: Ambiguous test request\n"
+        "state: Blocked\n"
+        "priority: 2\n"
+        "labels: []\n"
+        "---\n\n"
+        "## Blocker\n\nThe acceptance criteria are ambiguous.\n",
+        encoding="utf-8",
+    )
+    cfg = _make_config(
+        tracker_kind="file",
+        active_states=("Todo", "In Progress"),
+        terminal_states=("Done", "Blocked"),
+    )
+    cfg = replace(cfg, tracker=replace(cfg.tracker, board_root=board_root))
+    orch = _orch()
+    orch._workflow_state._config = cfg
+
+    changed, _message, details = asyncio.run(
+        orch.recover_blocked_issue("MT-BLOCKED")
+    )
+
+    assert changed is True
+    assert details["fix_identifier"] == "FIX-MT-BLOCKED-1"
+    source = (board_root / "MT-BLOCKED.md").read_text(encoding="utf-8")
+    assert "blocked_by:" in source
+    assert "FIX-MT-BLOCKED-1" in source
+    assert (board_root / "FIX-MT-BLOCKED-1.md").is_file()
+
+
+def test_recover_blocked_issue_repairs_partial_fix_link(monkeypatch, tmp_path):
+    board_root = tmp_path / "board"
+    board_root.mkdir()
+    (board_root / "MT-BLOCKED.md").write_text(
+        "---\n"
+        "id: MT-BLOCKED\n"
+        "identifier: MT-BLOCKED\n"
+        "title: Ambiguous test request\n"
+        "state: Blocked\n"
+        "priority: 2\n"
+        "labels: []\n"
+        "---\n\n"
+        "## Blocker\n\nThe acceptance criteria are ambiguous.\n",
+        encoding="utf-8",
+    )
+    cfg = _make_config(
+        tracker_kind="file",
+        active_states=("Todo", "In Progress"),
+        terminal_states=("Done", "Blocked"),
+    )
+    cfg = replace(cfg, tracker=replace(cfg.tracker, board_root=board_root))
+    orch = _orch()
+    orch._workflow_state._config = cfg
+    original_link = Orchestrator._tracker_call_link_blocked_fix
+    calls = 0
+
+    def _flaky_link(_cfg, source, fix_identifier):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            return False
+        return original_link(_cfg, source, fix_identifier)
+
+    monkeypatch.setattr(orch, "_tracker_call_link_blocked_fix", _flaky_link)
+
+    first = asyncio.run(orch.recover_blocked_issue("MT-BLOCKED"))
+    second = asyncio.run(orch.recover_blocked_issue("MT-BLOCKED"))
+
+    assert first[0] is True
+    assert second[0] is False
+    assert second[1] == "blocked fix already opened for MT-BLOCKED"
+    source = (board_root / "MT-BLOCKED.md").read_text(encoding="utf-8")
+    assert "blocked_by:\n- FIX-MT-BLOCKED-1" in source
+    assert len(list(board_root.glob("FIX-MT-BLOCKED-*.md"))) == 1
+    assert calls == 2
+
+
+def test_recover_blocked_issue_repairs_partial_source_note(monkeypatch, tmp_path):
+    board_root = tmp_path / "board"
+    board_root.mkdir()
+    (board_root / "MT-BLOCKED.md").write_text(
+        "---\n"
+        "id: MT-BLOCKED\n"
+        "identifier: MT-BLOCKED\n"
+        "title: Ambiguous test request\n"
+        "state: Blocked\n"
+        "priority: 2\n"
+        "labels: []\n"
+        "---\n\n"
+        "## Blocker\n\nThe acceptance criteria are ambiguous.\n",
+        encoding="utf-8",
+    )
+    cfg = _make_config(
+        tracker_kind="file",
+        active_states=("Todo", "In Progress"),
+        terminal_states=("Done", "Blocked"),
+    )
+    cfg = replace(cfg, tracker=replace(cfg.tracker, board_root=board_root))
+    orch = _orch()
+    orch._workflow_state._config = cfg
+    original_append = Orchestrator._tracker_call_append_note
+    calls = 0
+
+    def _flaky_append(_cfg, issue, heading, body):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise OSError("simulated note write failure")
+        return original_append(_cfg, issue, heading, body)
+
+    monkeypatch.setattr(orch, "_tracker_call_append_note", _flaky_append)
+
+    with pytest.raises(OSError, match="simulated note write failure"):
+        asyncio.run(orch.recover_blocked_issue("MT-BLOCKED"))
+    second = asyncio.run(orch.recover_blocked_issue("MT-BLOCKED"))
+
+    assert second[0] is False
+    source = (board_root / "MT-BLOCKED.md").read_text(encoding="utf-8")
+    assert "## Blocked Fix" in source
+    assert "blocked_by:\n- FIX-MT-BLOCKED-1" in source
+    assert len(list(board_root.glob("FIX-MT-BLOCKED-*.md"))) == 1
+    assert calls == 2
 
 
 def test_recover_blocked_issue_opens_rca_ticket_and_keeps_source_blocked(monkeypatch):
@@ -6015,9 +6307,12 @@ def test_recover_blocked_issue_opens_rca_ticket_and_keeps_source_blocked(monkeyp
                 "agent_kind": agent_kind,
             }
         )
-        return "RCA-1"
+        return "FIX-MT-BLOCKED-1"
 
     monkeypatch.setattr(orch, "_tracker_call_fetch_issue_full_by_id", _fetch)
+    monkeypatch.setattr(
+        orch, "_tracker_call_active_rca_for_source", lambda *_args: None
+    )
     monkeypatch.setattr(orch, "_tracker_call_append_note", _append)
     monkeypatch.setattr(orch, "_tracker_call_update_state", _move)
     monkeypatch.setattr(orch, "_tracker_call_create_blocked_rca_issue", _create)
@@ -6027,12 +6322,15 @@ def test_recover_blocked_issue_opens_rca_ticket_and_keeps_source_blocked(monkeyp
     )
 
     assert changed is True
-    assert message == "RCA-1 opened to unblock MT-BLOCKED; MT-BLOCKED remains Blocked"
+    assert message == "FIX-MT-BLOCKED-1 opened to unblock MT-BLOCKED; MT-BLOCKED remains Blocked"
     assert details == {
         "original_state": "Blocked",
         "target_state": "Todo",
         "source_reopen_state": "Todo",
-        "rca_identifier": "RCA-1",
+        "fix_identifier": "FIX-MT-BLOCKED-1",
+        "fix_state": "In Progress",
+        # Deprecated aliases remain until API consumers migrate.
+        "rca_identifier": "FIX-MT-BLOCKED-1",
         "rca_state": "In Progress",
         "agent_kind": "codex",
     }
@@ -6045,8 +6343,8 @@ def test_recover_blocked_issue_opens_rca_ticket_and_keeps_source_blocked(monkeyp
             "agent_kind": "codex",
         }
     ]
-    assert notes == [("MT-BLOCKED", "Blocked RCA", notes[0][2])]
-    assert "RCA ticket `RCA-1` opened" in notes[0][2]
+    assert notes == [("MT-BLOCKED", "Blocked Fix", notes[0][2])]
+    assert "Fix ticket `FIX-MT-BLOCKED-1` opened" in notes[0][2]
     assert "the source ticket still must pass the normal configured workflow" in notes[0][2]
     assert moved == []
 
@@ -6057,6 +6355,10 @@ def test_blocked_rca_prompt_reopens_source_to_todo_then_full_workflow():
     description = core_module._blocked_rca_description(issue, reopen_state="Todo")
 
     assert "move that source ticket to `Todo`" in description
+    assert "## Clarified Request" in description
+    assert "append `## Fix Resolution` to both" in description
+    assert "concrete, testable acceptance criteria" in description
+    assert "Ambiguity in the request or acceptance criteria is itself a blocker" in description
     assert "Do not skip the source ticket's normal workflow" in description
     assert "it must pass through the configured Todo/In Progress/Verify/Document" in description
 
@@ -6105,7 +6407,7 @@ def test_recover_blocked_issue_rejects_duplicate_rca(monkeypatch):
     changed, message, details = asyncio.run(orch.recover_blocked_issue("MT-BLOCKED"))
 
     assert changed is False
-    assert message == "blocked RCA already opened for MT-BLOCKED"
+    assert message == "blocked fix already opened for MT-BLOCKED"
     assert details == {}
 
 
@@ -6151,7 +6453,7 @@ def test_recover_blocked_issue_finds_active_rca_after_in_memory_loss(
     changed, message, details = asyncio.run(orch.recover_blocked_issue("MT-BLOCKED"))
 
     assert changed is False
-    assert message == "blocked RCA already opened for MT-BLOCKED"
+    assert message == "blocked fix already opened for MT-BLOCKED"
     assert details == {}
     assert created == []
     assert issue.id in orch._blocked_rca_source_ids
@@ -6199,7 +6501,7 @@ def test_recover_blocked_issue_allows_new_rca_for_later_block_episode(
     monkeypatch.setattr(
         orch,
         "_tracker_call_create_blocked_rca_issue",
-        lambda *_args: created.append("MT-BLOCKED") or "RCA-2",
+        lambda *_args: created.append("MT-BLOCKED") or "FIX-MT-BLOCKED-2",
     )
     monkeypatch.setattr(
         orch,
@@ -6210,10 +6512,10 @@ def test_recover_blocked_issue_allows_new_rca_for_later_block_episode(
     changed, message, details = asyncio.run(orch.recover_blocked_issue("MT-BLOCKED"))
 
     assert changed is True
-    assert message == "RCA-2 opened to unblock MT-BLOCKED; MT-BLOCKED remains Blocked"
-    assert details["rca_identifier"] == "RCA-2"
+    assert message == "FIX-MT-BLOCKED-2 opened to unblock MT-BLOCKED; MT-BLOCKED remains Blocked"
+    assert details["fix_identifier"] == "FIX-MT-BLOCKED-2"
     assert created == ["MT-BLOCKED"]
-    assert notes == ["Blocked RCA"]
+    assert notes == ["Blocked Fix"]
 
 
 def test_turn_budget_exhaustion_survives_next_tick_claim_prune(monkeypatch):
@@ -8670,9 +8972,12 @@ def _run_blocked_sweep(monkeypatch, orch, cfg, issue):
     monkeypatch.setattr(orch, "_archive_sweep", _archive)
     monkeypatch.setattr(orch, "_tracker_call_terminal_issues", lambda _cfg: [issue])
     monkeypatch.setattr(
+        orch, "_tracker_call_active_rca_for_source", lambda *_args: None
+    )
+    monkeypatch.setattr(
         orch,
         "_tracker_call_create_blocked_rca_issue",
-        lambda _cfg, i, *_a: (created.append(i.identifier), "RCA-1")[1],
+        lambda _cfg, i, *_a: (created.append(i.identifier), "FIX-MT-BLOCKED-1")[1],
     )
     monkeypatch.setattr(
         orch,
@@ -8785,7 +9090,7 @@ def test_tick_still_opens_rca_when_the_blocker_is_not_a_sandbox_limit(
 
     assert created == ["MT-BLOCKED"]
     assert states == []
-    assert notes[0][1] == "Blocked RCA"
+    assert notes[0][1] == "Blocked Fix"
 
 
 @pytest.mark.skipif(shutil.which("git") is None, reason="git CLI required")

@@ -389,7 +389,7 @@ def _blocked_source_reopen_state(cfg: ServiceConfig) -> str:
 
 def _blocked_rca_labels(issue: Issue) -> list[str]:
     labels: list[str] = []
-    for label in ("blocked-rca", f"source-{issue.identifier.lower()}"):
+    for label in ("blocked-fix", f"source-{issue.identifier.lower()}"):
         normalized = re.sub(r"[^a-z0-9_.-]+", "-", label.lower()).strip("-")
         if normalized and normalized not in labels:
             labels.append(normalized)
@@ -401,15 +401,19 @@ def _blocked_rca_labels(issue: Issue) -> list[str]:
 
 def _blocked_rca_identifier_prefix(issue: Issue) -> str:
     source = re.sub(r"[^A-Za-z0-9]+", "-", issue.identifier).strip("-")
-    return f"RCA-{source or 'SOURCE'}"
+    return f"FIX-{source or 'SOURCE'}"
 
 
 _BLOCKED_RCA_HEADING_RE = re.compile(
-    r"^##\s+Blocked\s+RCA\s*$",
+    r"^##\s+Blocked\s+(?:Fix|RCA)\s*$",
     re.IGNORECASE | re.MULTILINE,
 )
 _BLOCKED_RCA_RESOLVED_HEADING_RE = re.compile(
-    r"^##\s+(?:Blocked\s+RCA\s+Resolved|RCA\s+Resolution)\s*$",
+    r"^##\s+(?:Blocked\s+(?:Fix|RCA)\s+Resolved|(?:Fix|RCA)\s+Resolution)\s*$",
+    re.IGNORECASE | re.MULTILINE,
+)
+_BLOCKED_RCA_HOST_RESOLVED_HEADING_RE = re.compile(
+    r"^##\s+Blocked\s+(?:Fix|RCA)\s+Resolved\s*$",
     re.IGNORECASE | re.MULTILINE,
 )
 _BLOCKED_RCA_SOURCE_IDENTIFIER_RE = re.compile(
@@ -417,11 +421,11 @@ _BLOCKED_RCA_SOURCE_IDENTIFIER_RE = re.compile(
     re.IGNORECASE | re.MULTILINE,
 )
 _BLOCKED_RCA_TITLE_RE = re.compile(
-    r"^RCA\s+unblock\s+(?P<identifier>[^:]+):",
+    r"^(?:RCA\s+unblock|Fix\s+and\s+unblock)\s+(?P<identifier>[^:]+):",
     re.IGNORECASE,
 )
 _BLOCKED_RCA_OPERATOR_BLOCKER_RE = re.compile(
-    r"^##\s+(RCA\s+Blocker|Operator\s+Action|Intervention\s+Required)\s*$",
+    r"^##\s+((?:Fix|RCA)\s+Blocker|Operator\s+Action|Intervention\s+Required)\s*$",
     re.IGNORECASE | re.MULTILINE,
 )
 _HUMAN_REVIEW_INTERVENTION_RE = re.compile(
@@ -490,7 +494,13 @@ def _blocked_rca_already_requested(issue: Issue) -> bool:
 
 
 def _is_blocked_rca_ticket(issue: Issue) -> bool:
-    return any(label.lower() == "blocked-rca" for label in issue.labels)
+    return any(
+        label.lower() in {"blocked-fix", "blocked-rca"} for label in issue.labels
+    )
+
+
+def _is_blocked_fix_ticket(issue: Issue) -> bool:
+    return any(label.lower() == "blocked-fix" for label in issue.labels)
 
 
 def _looks_like_blocked_rca_ticket(issue: Issue) -> bool:
@@ -518,8 +528,22 @@ def _blocked_rca_resolution_already_recorded(issue: Issue) -> bool:
     return bool(_BLOCKED_RCA_RESOLVED_HEADING_RE.search(issue.description or ""))
 
 
+def _blocked_rca_current_episode_resolved(issue: Issue) -> bool:
+    body = issue.description or ""
+    resolutions = list(_BLOCKED_RCA_RESOLVED_HEADING_RE.finditer(body))
+    if not resolutions:
+        return False
+    requests = list(_BLOCKED_RCA_HEADING_RE.finditer(body))
+    return not requests or resolutions[-1].start() > requests[-1].start()
+
+
 def _blocked_rca_requires_operator_intervention(issue: Issue) -> bool:
-    return bool(_BLOCKED_RCA_OPERATOR_BLOCKER_RE.search(issue.description or ""))
+    body = issue.description or ""
+    blockers = list(_BLOCKED_RCA_OPERATOR_BLOCKER_RE.finditer(body))
+    if not blockers:
+        return False
+    resolutions = list(_BLOCKED_RCA_RESOLVED_HEADING_RE.finditer(body))
+    return not resolutions or blockers[-1].start() > resolutions[-1].start()
 
 
 def _human_review_done_state(cfg: ServiceConfig) -> str | None:
@@ -565,31 +589,46 @@ def _blocked_rca_description(
 ) -> str:
     return (
         "## Goal\n\n"
-        f"Resolve the root cause keeping `{issue.identifier}` in `Blocked`.\n\n"
+        f"Make `{issue.identifier}` actionable again and remove the verified blocker "
+        "so automated delivery can continue.\n\n"
         "## Source Ticket\n\n"
         f"- Identifier: `{issue.identifier}`\n"
         f"- Title: {issue.title}\n"
         f"- Current state: `{issue.state}`\n"
-        f"- Reopen target after proven RCA: `{reopen_state}`\n\n"
+        f"- Reopen target after proven fix: `{reopen_state}`\n\n"
         "## Required Sequence\n\n"
-        f"1. Read the source ticket `{issue.identifier}` first, including the latest "
-        "`## Blocker`, `## Budget Exceeded`, `## QA Failure`, "
-        "`## Review Findings`, or `## Blocked RCA` sections.\n"
-        "2. Identify the real root cause with evidence. Do not treat the "
-        "Blocked state itself as the problem.\n"
-        "3. If the root cause is safe for an agent to resolve, fix it and "
-        "verify the fix with concrete commands or artifacts.\n"
-        f"4. Only after the RCA is resolved and verified, append `## RCA Resolution` "
-        f"to `{issue.identifier}` and move that source ticket to `{reopen_state}`.\n"
-        "5. Do not skip the source ticket's normal workflow. Once it is back "
-        "in Todo, it must pass through the configured Todo/In Progress/Verify/"
-        "Document review path like any other ticket.\n"
-        "6. If the root cause requires credentials, host worktree cleanup, "
-        "destructive operations, or external approval, leave the source ticket "
-        "Blocked and append `## RCA Blocker` with exact operator action.\n\n"
+        f"1. Read the source ticket `{issue.identifier}` first, including its title, "
+        "request, description, acceptance criteria, and latest `## Blocker`, "
+        "`## Budget Exceeded`, `## QA Failure`, `## Review Findings`, or "
+        "legacy `## Blocked RCA` sections.\n"
+        "2. Compare the requested outcome and acceptance criteria with the failure "
+        "evidence. Ambiguity in the request or acceptance criteria is itself a blocker; "
+        "do not merely restate it.\n"
+        f"3. When instructions are vague, incomplete, or not testable, append "
+        f"`## Clarified Request` to `{issue.identifier}` with the intended outcome, "
+        "in-scope work, non-goals, constraints, assumptions, concrete, testable "
+        "acceptance criteria, and exact verification commands or artifacts. Preserve "
+        "the operator's intent; do not invent consequential product decisions.\n"
+        "4. Resolve any code, configuration, environment, or process defect that is "
+        "safe for an agent to change, then verify the fix with concrete commands or "
+        "artifacts. If clarification is the only blocker, the improved source "
+        "instructions are the fix.\n"
+        f"5. Only after the blocker is resolved and the source ticket is actionable, "
+        f"append `## Fix Resolution` to both `{issue.identifier}` and this fix ticket, "
+        f"then move that source ticket to `{reopen_state}`. Do not move the fix ticket "
+        "to Done before both updates are persisted.\n"
+        "6. Do not skip the source ticket's normal workflow. Once it is back in Todo, "
+        "it must pass through the configured Todo/In Progress/Verify/Document review "
+        "path like any other ticket.\n"
+        "7. If the blocker requires credentials, destructive operations, external "
+        "approval, or a consequential product decision, leave the source ticket "
+        "Blocked and append `## Fix Blocker` with the exact operator action or "
+        "decision required.\n\n"
         "## Done Evidence\n\n"
         "- Root cause category and evidence.\n"
-        "- Fix or operator action taken.\n"
+        "- Source instructions changed: yes/no, with the resulting acceptance criteria "
+        "or the reason no clarification was needed.\n"
+        "- Fix and verification evidence, or exact operator action required.\n"
         f"- Final state decision for `{issue.identifier}`.\n"
     )
 
@@ -1540,14 +1579,14 @@ class Orchestrator:
                 ):
                     return _attention_signal(
                         "blocked_recovery_pending",
-                        "RCA pending",
-                        "RCA ticket already opened; source stays Blocked until RCA resolves",
+                        "Fix pending",
+                        "Fix ticket already opened; source stays Blocked until the fix resolves",
                         "info",
                     )
                 return _attention_signal(
                     "blocked_recovery_available",
-                    "Blocked RCA",
-                    "RCA ticket will open automatically before this issue returns to an active lane",
+                    "Blocked fix",
+                    "A fix ticket will open automatically before this issue returns to an active lane",
                     "warning",
                 )
             return None
@@ -2207,6 +2246,9 @@ class Orchestrator:
             return
 
         await self._auto_normalize_legacy_human_review_done(cfg)
+        # Validate terminal FIX outcomes before fetching active candidates. A
+        # source whose dependency only looks Done must never dispatch first.
+        await self._auto_reopen_sources_from_resolved_rcas(cfg)
 
         # Fetch candidates.
         try:
@@ -2253,7 +2295,6 @@ class Orchestrator:
                 attempt_kind="retry" if persisted_attempt is not None else None,
             )
 
-        await self._auto_reopen_sources_from_resolved_rcas(cfg)
         if self._available_slots(cfg) > 0:
             await self._auto_recover_blocked_sources(cfg)
 
@@ -2432,6 +2473,44 @@ class Orchestrator:
             client.close()
 
     @staticmethod
+    def _tracker_call_link_blocked_fix(
+        cfg: ServiceConfig, source_issue: Issue, fix_identifier: str
+    ) -> bool:
+        client = build_tracker_client(cfg)
+        try:
+            update_fields = getattr(client, "update_fields", None)
+            fetch_full = getattr(client, "fetch_issue_full_by_id", None)
+            if not callable(update_fields) or not callable(fetch_full):
+                return False
+            persisted = fetch_full(source_issue.identifier)
+            if persisted is None:
+                return False
+            current = [
+                blocker.identifier or blocker.id
+                for blocker in persisted.blocked_by
+                if blocker.identifier or blocker.id
+            ]
+            if fix_identifier not in current:
+                update_fields(
+                    source_issue.identifier,
+                    blocked_by=[*current, fix_identifier],
+                )
+            return True
+        except Exception as exc:
+            # The source remains Blocked and the source-* label still provides
+            # a durable recovery link. Do not orphan an already-created FIX
+            # ticket by turning this best-effort DAG enhancement into a 500.
+            log.warning(
+                "blocked_fix_dependency_link_failed",
+                source_identifier=source_issue.identifier,
+                fix_identifier=fix_identifier,
+                error=str(exc),
+            )
+            return False
+        finally:
+            client.close()
+
+    @staticmethod
     def _tracker_call_fetch_issue_full_by_id(
         cfg: ServiceConfig, identifier: str
     ) -> Issue | None:
@@ -2505,7 +2584,7 @@ class Orchestrator:
                 return None
             created = create_with_next_identifier(
                 _blocked_rca_identifier_prefix(issue),
-                title=f"RCA unblock {issue.identifier}: {issue.title}",
+                title=f"Fix and unblock {issue.identifier}: {issue.title}",
                 state=rca_state,
                 priority=issue.priority,
                 labels=_blocked_rca_labels(issue),
@@ -2723,16 +2802,7 @@ class Orchestrator:
         manual: bool = False,
     ) -> tuple[bool, str, dict[str, str]]:
         if _is_blocked_rca_ticket(issue):
-            return False, f"{issue.identifier} is already an RCA ticket", {}
-        if (
-            _blocked_rca_already_requested(issue)
-            or issue.id in self._blocked_rca_source_ids
-        ):
-            return (
-                False,
-                f"blocked RCA already opened for {issue.identifier}",
-                {},
-            )
+            return False, f"{issue.identifier} is already a fix ticket", {}
 
         reopen_state = _blocked_source_reopen_state(cfg)
         rca_state = _blocked_rca_work_state(cfg)
@@ -2756,28 +2826,56 @@ class Orchestrator:
             requested_agent = cfg.agent.kind
 
         async with self._blocked_rca_creation_lock:
-            # The source note and in-memory set can both be stale or absent
-            # after a restart.  The board is authoritative: inspect every
-            # configured active lane before creating another RCA.
-            if (
-                _blocked_rca_already_requested(issue)
-                or issue.id in self._blocked_rca_source_ids
-            ):
-                return (
-                    False,
-                    f"blocked RCA already opened for {issue.identifier}",
-                    {},
-                )
+            # The board is authoritative. If a previous create succeeded but
+            # its source edge/note did not, reconcile that partial write rather
+            # than suppressing the retry or creating a second FIX ticket.
             active_rca = await asyncio.to_thread(
                 self._tracker_call_active_rca_for_source,
                 cfg,
                 issue.identifier,
             )
             if active_rca is not None:
+                await asyncio.to_thread(
+                    self._tracker_call_link_blocked_fix,
+                    cfg,
+                    issue,
+                    active_rca,
+                )
+                if not _blocked_rca_already_requested(issue):
+                    try:
+                        await asyncio.to_thread(
+                            self._tracker_call_append_note,
+                            cfg,
+                            issue,
+                            "Blocked Fix",
+                            f"Fix ticket `{active_rca}` is already open. Symphony "
+                            "reconciled the source dependency after an interrupted "
+                            "recovery write; the source remains Blocked until the "
+                            "fix is proven.",
+                        )
+                    except Exception as exc:
+                        # Keep deduplication authoritative even if the source was
+                        # concurrently removed or its note cannot yet be repaired.
+                        log.warning(
+                            "blocked_fix_source_note_reconcile_failed",
+                            source_identifier=issue.identifier,
+                            fix_identifier=active_rca,
+                            error=str(exc),
+                        )
                 self._blocked_rca_source_ids.add(issue.id)
                 return (
                     False,
-                    f"blocked RCA already opened for {issue.identifier}",
+                    f"blocked fix already opened for {issue.identifier}",
+                    {},
+                )
+            if (
+                _blocked_rca_already_requested(issue)
+                or issue.id in self._blocked_rca_source_ids
+            ):
+                self._blocked_rca_source_ids.add(issue.id)
+                return (
+                    False,
+                    f"blocked fix already opened for {issue.identifier}",
                     {},
                 )
             rca_identifier = await asyncio.to_thread(
@@ -2791,30 +2889,39 @@ class Orchestrator:
             if rca_identifier is None:
                 return (
                     False,
-                    "blocked RCA creation requires a tracker that can create tickets",
+                    "blocked fix creation requires a tracker that can create tickets",
                     {},
                 )
+
+            body = (
+                f"Fix ticket `{rca_identifier}` opened in `{rca_state}` for "
+                f"`{requested_agent}` worker dispatch.\n\n"
+                f"This source ticket remains `{issue.state}`. The fix worker must "
+                "resolve and verify the root cause before moving this ticket back "
+                f"to `{reopen_state}`. After that reopen, the source ticket still "
+                "must pass the normal configured workflow. If the root cause cannot "
+                "be resolved safely by an agent, the fix worker should leave this "
+                "ticket Blocked with exact operator action."
+            )
+            if not manual:
+                body = "Opened automatically by the orchestrator.\n\n" + body
+            await asyncio.to_thread(
+                self._tracker_call_link_blocked_fix,
+                cfg,
+                issue,
+                rca_identifier,
+            )
+            await asyncio.to_thread(
+                self._tracker_call_append_note,
+                cfg,
+                issue,
+                "Blocked Fix",
+                body,
+            )
+            # Only mark the in-process episode after its durable source note is
+            # present. Partial creates are repaired by the active-board path.
             self._blocked_rca_source_ids.add(issue.id)
 
-        body = (
-            f"RCA ticket `{rca_identifier}` opened in `{rca_state}` for "
-            f"`{requested_agent}` worker dispatch.\n\n"
-            f"This source ticket remains `{issue.state}`. The RCA worker must "
-            "resolve and verify the root cause before moving this ticket back "
-            f"to `{reopen_state}`. After that reopen, the source ticket still "
-            "must pass the normal configured workflow. If the root cause cannot "
-            "be resolved safely by an agent, the RCA worker should leave this "
-            "ticket Blocked with exact operator action."
-        )
-        if not manual:
-            body = "Opened automatically by the orchestrator.\n\n" + body
-        await asyncio.to_thread(
-            self._tracker_call_append_note,
-            cfg,
-            issue,
-            "Blocked RCA",
-            body,
-        )
         self._record_stats_transition(rca_identifier, "", rca_state)
         self.request_refresh()
         return (
@@ -2825,11 +2932,15 @@ class Orchestrator:
                 "original_state": issue.state,
                 "target_state": reopen_state,
                 "source_reopen_state": reopen_state,
+                "fix_identifier": rca_identifier,
+                "fix_state": rca_state,
+                # Deprecated response aliases retained for API compatibility.
                 "rca_identifier": rca_identifier,
                 "rca_state": rca_state,
                 "agent_kind": requested_agent,
             },
         )
+
 
     async def _auto_recover_blocked_sources(self, cfg: ServiceConfig) -> int:
         if not cfg.agent.auto_recover_blocked:
@@ -2852,8 +2963,6 @@ class Orchestrator:
             if normalize_state(issue.state) != "blocked":
                 self._blocked_rca_source_ids.discard(issue.id)
                 self._history_recovery_attempted.discard(issue.id)
-                continue
-            if issue.id in self._blocked_rca_source_ids:
                 continue
             recovery_pending = issue.id not in self._history_recovery_attempted
             if not recovery_pending and _is_blocked_rca_ticket(issue):
@@ -2885,9 +2994,6 @@ class Orchestrator:
                         error=str(exc),
                     )
             if _is_blocked_rca_ticket(issue):
-                continue
-            if _blocked_rca_already_requested(full_issue):
-                self._blocked_rca_source_ids.add(issue.id)
                 continue
 
             try:
@@ -2971,7 +3077,6 @@ class Orchestrator:
         self, cfg: ServiceConfig, rca_issue: Issue, source_issue: Issue
     ) -> bool:
         if normalize_state(source_issue.state) != "blocked":
-            self._blocked_rca_source_ids.discard(source_issue.id)
             return False
         if _is_blocked_rca_ticket(source_issue):
             return False
@@ -2988,17 +3093,19 @@ class Orchestrator:
             return False
         target_state = _blocked_source_reopen_state(cfg)
         body = (
-            f"RCA ticket `{rca_issue.identifier}` reached `{rca_issue.state}`. "
+            f"Fix ticket `{rca_issue.identifier}` reached `{rca_issue.state}`. "
             f"Symphony is moving `{source_issue.identifier}` back to "
             f"`{target_state}` so it can continue through the configured workflow."
         )
         try:
-            if not _blocked_rca_resolution_already_recorded(source_issue):
+            if not _BLOCKED_RCA_HOST_RESOLVED_HEADING_RE.search(
+                source_issue.description or ""
+            ):
                 await asyncio.to_thread(
                     self._tracker_call_append_note,
                     cfg,
                     source_issue,
-                    "Blocked RCA Resolved",
+                    "Blocked Fix Resolved",
                     body,
                 )
             await asyncio.to_thread(
@@ -3016,7 +3123,10 @@ class Orchestrator:
             )
             self._record_tracker_error(source_issue.id, exc)
             return False
-        self._blocked_rca_source_ids.discard(source_issue.id)
+        # Keep the episode guard until the freshly reopened source appears in
+        # the active candidate fetch, which prunes it. This prevents the same
+        # tick's terminal snapshot from opening a second FIX.
+        self._blocked_rca_source_ids.add(source_issue.id)
         self._clear_tracker_error(source_issue.id)
         log.info(
             "blocked_rca_source_reopened",
@@ -3026,11 +3136,107 @@ class Orchestrator:
         )
         return True
 
+    async def _move_blocked_fix_out_of_done(
+        self,
+        cfg: ServiceConfig,
+        fix_issue: Issue,
+        source_issue: Issue,
+        *,
+        reason: str,
+        reason_code: str,
+    ) -> bool:
+        target_state = next(
+            (
+                state
+                for state in cfg.tracker.terminal_states
+                if normalize_state(state) == "human review"
+            ),
+            next(
+                (
+                    state
+                    for state in cfg.tracker.terminal_states
+                    if normalize_state(state) == "blocked"
+                ),
+                "Blocked",
+            ),
+        )
+        body = (
+            f"`{fix_issue.identifier}` cannot remain `Done` because {reason}. "
+            f"Moved to `{target_state}`; the source ticket remains Blocked. "
+            "Clarify the source request and acceptance criteria, verify the fix, "
+            "then append `## Fix Resolution` before completing this ticket."
+        )
+        try:
+            await asyncio.to_thread(
+                self._tracker_call_append_note,
+                cfg,
+                fix_issue,
+                "Fix Completion Blocked",
+                body,
+            )
+            await asyncio.to_thread(
+                self._tracker_call_update_state,
+                cfg,
+                fix_issue,
+                target_state,
+            )
+            if normalize_state(source_issue.state) != "blocked":
+                await asyncio.to_thread(
+                    self._tracker_call_update_state,
+                    cfg,
+                    source_issue,
+                    "Blocked",
+                )
+        except Exception as exc:
+            log.warning(
+                "blocked_fix_completion_hold_failed",
+                fix_identifier=fix_issue.identifier,
+                error=str(exc),
+            )
+            self._record_tracker_error(fix_issue.id, exc)
+            return True
+        self._clear_tracker_error(fix_issue.id)
+        log.warning(
+            "blocked_fix_completion_held",
+            fix_identifier=fix_issue.identifier,
+            target_state=target_state,
+            reason=reason_code,
+        )
+        return True
+
+    async def _hold_unproven_blocked_fix(
+        self, cfg: ServiceConfig, fix_issue: Issue, source_issue: Issue
+    ) -> bool:
+        """Keep a new FIX ticket out of Done until both records prove recovery."""
+        if not _is_blocked_fix_ticket(fix_issue):
+            return False
+        fix_has_resolution = _blocked_rca_current_episode_resolved(fix_issue)
+        source_has_resolution = _blocked_rca_current_episode_resolved(source_issue)
+        needs_operator = _blocked_rca_requires_operator_intervention(
+            fix_issue
+        ) or _blocked_rca_requires_operator_intervention(source_issue)
+        if fix_has_resolution and source_has_resolution and not needs_operator:
+            return False
+        if needs_operator:
+            reason = "it still requires operator action"
+            reason_code = "operator_action"
+        elif not fix_has_resolution:
+            reason = "the FIX ticket has no current `## Fix Resolution`"
+            reason_code = "missing_fix_resolution"
+        else:
+            reason = "the linked source has no current `## Fix Resolution`"
+            reason_code = "missing_source_resolution"
+        return await self._move_blocked_fix_out_of_done(
+            cfg,
+            fix_issue,
+            source_issue,
+            reason=reason,
+            reason_code=reason_code,
+        )
+
     async def _auto_reopen_sources_from_resolved_rcas(
         self, cfg: ServiceConfig
     ) -> int:
-        if not cfg.agent.auto_recover_blocked:
-            return 0
         try:
             terminal_issues = await asyncio.to_thread(
                 self._tracker_call_terminal_issues, cfg
@@ -3053,10 +3259,23 @@ class Orchestrator:
             )
             if source_issue is None:
                 continue
+            if await self._hold_unproven_blocked_fix(
+                cfg, rca_issue, source_issue
+            ):
+                continue
+            source_was_blocked = normalize_state(source_issue.state) == "blocked"
             if await self._reopen_source_for_resolved_rca(
                 cfg, rca_issue, source_issue
             ):
                 reopened += 1
+            elif source_was_blocked and _is_blocked_fix_ticket(rca_issue):
+                await self._move_blocked_fix_out_of_done(
+                    cfg,
+                    rca_issue,
+                    source_issue,
+                    reason="Symphony could not persist the linked source reopen",
+                    reason_code="source_reopen_failed",
+                )
         return reopened
 
     async def _auto_triage_todo_if_actionable(

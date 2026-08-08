@@ -770,9 +770,11 @@ def _register_issue_routes(
     async def handle_issue_recover_blocked(request: web.Request) -> web.Response:
         identifier = _check_identifier(request.match_info["identifier"])
         body = await _read_json(request)
-        raw_target = body.get("rca_state", body.get("target_state"))
+        raw_target = body.get(
+            "fix_state", body.get("rca_state", body.get("target_state"))
+        )
         if raw_target is not None and not isinstance(raw_target, str):
-            raise WorkflowMutationError("rca_state must be a string")
+            raise WorkflowMutationError("fix_state must be a string")
         agent_kind = (
             _check_agent_kind(body.get("agent_kind")) if "agent_kind" in body else None
         )
@@ -787,6 +789,8 @@ def _register_issue_routes(
         return web.json_response(
             {
                 "identifier": identifier,
+                "fix_created": True,
+                # Deprecated alias retained for API compatibility.
                 "rca_created": True,
                 "message": message,
                 **details,

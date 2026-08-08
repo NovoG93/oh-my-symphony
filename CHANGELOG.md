@@ -23,6 +23,11 @@ Versioning: [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- Replace newly generated blocked-recovery `RCA-*` cards with source-linked
+  `FIX-*` tickets. Fix workers now clarify vague requests into concrete,
+  testable acceptance criteria before retrying the source; the source depends
+  on the fix, legacy RCA cards remain compatible, and an unproven fix is moved
+  out of `Done` instead of leaving the parent silently Blocked.
 - Keep the useful rightmost portion of long project paths visible and reveal the
   complete value on hover or keyboard focus without widening the sidebar.
 - Adopt repositories whose ignore rules hide Symphony operator files by
