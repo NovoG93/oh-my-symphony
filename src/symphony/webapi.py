@@ -19,6 +19,7 @@ explicit operator opt-in to network exposure and disables the Host check.
 from __future__ import annotations
 
 import asyncio
+import ipaddress
 import json
 import re
 from functools import partial
@@ -53,6 +54,7 @@ from .utils.auto_merge import auto_merge_on_done_best_effort
 from .utils.git_ops import GitOpResult
 from .orchestrator import Orchestrator
 from .product_preview import ProductPreviewError, ProductPreviewManager
+from .projects import Project, ProjectError, ProjectRegistry, canonical_project_repo
 from .orchestrator.run_registry import clamp_run_history_limit
 from .workflow import (
     SUPPORTED_AGENT_KINDS,
@@ -340,8 +342,7 @@ def _live_by_identifier(orchestrator: Orchestrator) -> dict[str, dict[str, Any]]
 def _valid_states(cfg: ServiceConfig) -> dict[str, str]:
     """lowercase -> canonical casing for every configured state."""
     return {
-        s.lower(): s
-        for s in (*cfg.tracker.active_states, *cfg.tracker.terminal_states)
+        s.lower(): s for s in (*cfg.tracker.active_states, *cfg.tracker.terminal_states)
     }
 
 
@@ -502,8 +503,7 @@ def _parse_ci_settings(body: dict[str, Any]) -> dict[str, Any]:
         updates["modes"] = _check_ci_modes(body["modes"])
     if not updates:
         raise WorkflowMutationError(
-            "body must set enabled, interval_ms, max_turns, modes, "
-            "and/or agent_kind"
+            "body must set enabled, interval_ms, max_turns, modes, and/or agent_kind"
         )
     return updates
 
@@ -583,7 +583,9 @@ def _register_issue_routes(
         if not read_only:
             tracker = FileBoardTracker(cfg.tracker)
             all_states = list(_valid_states(cfg).values())
-            fetched = await asyncio.to_thread(tracker.fetch_issues_by_states, all_states)
+            fetched = await asyncio.to_thread(
+                tracker.fetch_issues_by_states, all_states
+            )
             issues = [
                 _issue_card(i, attention=orchestrator.issue_attention(i))
                 for i in sorted(fetched, key=registration_order_key)
@@ -625,6 +627,7 @@ def _register_issue_routes(
             "blocked_by": blocked_by or None,
             "request": _check_request(body.get("request")) or None,
         }
+
         # F-15: validate and write under the same board lock so concurrent
         # creates cannot jointly introduce a cycle or race the allocator.
         def _validate(issues: list[Issue], resolved: str) -> None:
@@ -767,10 +770,14 @@ def _register_issue_routes(
     async def handle_issue_recover_blocked(request: web.Request) -> web.Response:
         identifier = _check_identifier(request.match_info["identifier"])
         body = await _read_json(request)
-        raw_target = body.get("rca_state", body.get("target_state"))
+        raw_target = body.get(
+            "fix_state", body.get("rca_state", body.get("target_state"))
+        )
         if raw_target is not None and not isinstance(raw_target, str):
-            raise WorkflowMutationError("rca_state must be a string")
-        agent_kind = _check_agent_kind(body.get("agent_kind")) if "agent_kind" in body else None
+            raise WorkflowMutationError("fix_state must be a string")
+        agent_kind = (
+            _check_agent_kind(body.get("agent_kind")) if "agent_kind" in body else None
+        )
         changed, message, details = await orchestrator.recover_blocked_issue(
             identifier,
             target_state=raw_target,
@@ -782,6 +789,8 @@ def _register_issue_routes(
         return web.json_response(
             {
                 "identifier": identifier,
+                "fix_created": True,
+                # Deprecated alias retained for API compatibility.
                 "rca_created": True,
                 "message": message,
                 **details,
@@ -854,9 +863,7 @@ def _register_workflow_routes(
         # that would rename or remove that state under it. (Best-effort:
         # a worker dispatched during the write below is handled by the
         # orchestrator's normal mid-run state reconciliation.)
-        running_states = {
-            i.state.lower() for i in orchestrator.iter_running_issues()
-        }
+        running_states = {i.state.lower() for i in orchestrator.iter_running_issues()}
         new_names = {s.name.lower() for s in specs}
         rename_sources = {
             (s.previous_name or "").lower() for s in specs if s.previous_name
@@ -877,9 +884,7 @@ def _register_workflow_routes(
         moves = [(old, new) for old, new in plan.renamed.items()]
         moves.extend((old, plan.fallback_state) for old in plan.removed)
         for old, target in moves:
-            for issue in await asyncio.to_thread(
-                tracker.fetch_issues_by_states, [old]
-            ):
+            for issue in await asyncio.to_thread(tracker.fetch_issues_by_states, [old]):
                 if orchestrator.find_running_issue_id(issue.identifier) is not None:
                     skipped.append(issue.identifier)
                     continue
@@ -982,17 +987,14 @@ def _register_workflow_routes(
                 return _json_error(
                     409,
                     "state_in_use",
-                    f"column {issue.state!r} has a running worker; "
-                    "wait or pause first",
+                    f"column {issue.state!r} has a running worker; wait or pause first",
                 )
 
         plan = await asyncio.to_thread(apply_lane_preset, cfg.workflow_path, name)
         migrated: dict[str, str] = {}
         skipped: list[str] = []
         for old in plan.removed:
-            for issue in await asyncio.to_thread(
-                tracker.fetch_issues_by_states, [old]
-            ):
+            for issue in await asyncio.to_thread(tracker.fetch_issues_by_states, [old]):
                 if orchestrator.find_running_issue_id(issue.identifier) is not None:
                     skipped.append(issue.identifier)
                     continue
@@ -1006,9 +1008,7 @@ def _register_workflow_routes(
         # or the very next dispatch fails preflight. Report it in the response
         # instead of letting the operator discover it at run time.
         reloaded = orchestrator.workflow_state.current()
-        warning = (
-            stage_turn_budget_error(reloaded) if reloaded is not None else None
-        )
+        warning = stage_turn_budget_error(reloaded) if reloaded is not None else None
         if warning:
             log.warning(
                 "lane_preset_turn_budget_warning", preset=preset.name, detail=warning
@@ -1070,7 +1070,9 @@ def _register_workflow_routes(
     app.router.add_put("/api/v1/workflow/states", _wrap(handle_states_put))
     app.router.add_get("/api/v1/workflow/prompts/{state}", _wrap(handle_prompt_get))
     app.router.add_put("/api/v1/workflow/prompts/{state}", _wrap(handle_prompt_put))
-    app.router.add_put("/api/v1/workflow/branch-policy", _wrap(handle_branch_policy_put))
+    app.router.add_put(
+        "/api/v1/workflow/branch-policy", _wrap(handle_branch_policy_put)
+    )
     app.router.add_get("/api/v1/workflow/presets", _wrap(handle_lane_presets_get))
     app.router.add_post(
         "/api/v1/workflow/presets/apply", _wrap(handle_lane_preset_apply)
@@ -1170,9 +1172,7 @@ def _register_git_routes(
                 if issue is not None
                 else None
             )
-            row["running"] = (
-                orchestrator.find_running_issue_id(identifier) is not None
-            )
+            row["running"] = orchestrator.find_running_issue_id(identifier) is not None
         return web.json_response(
             {
                 "target_branch": target,
@@ -1251,8 +1251,10 @@ def _register_git_routes(
             for ref in (branch, resolved):
                 if not git_inspect.ref_exists(workflow_dir, ref):
                     return "unknown_ref", f"unknown ref {ref!r}", None
-            return None, resolved, git_inspect.diff_patch(
-                workflow_dir, branch, resolved, path
+            return (
+                None,
+                resolved,
+                git_inspect.diff_patch(workflow_dir, branch, resolved, path),
             )
 
         code, detail, payload = await asyncio.to_thread(_load)
@@ -1467,7 +1469,9 @@ def _register_git_routes(
                     "confirm_required",
                     f"pushing {branch} requires confirm: {branch!r}",
                 )
-        remote = await asyncio.to_thread(_resolve_remote, workflow_dir, body.get("remote"))
+        remote = await asyncio.to_thread(
+            _resolve_remote, workflow_dir, body.get("remote")
+        )
         if not remote:
             return _json_error(
                 400, "no_remote", "this repository has no matching git remote"
@@ -1510,7 +1514,9 @@ def _register_git_routes(
                 "gh_unavailable",
                 "the GitHub CLI (gh) is not installed or not on PATH",
             )
-        remote = await asyncio.to_thread(_resolve_remote, workflow_dir, body.get("remote"))
+        remote = await asyncio.to_thread(
+            _resolve_remote, workflow_dir, body.get("remote")
+        )
         if not remote:
             return _json_error(
                 400, "no_remote", "this repository has no matching git remote"
@@ -1537,7 +1543,9 @@ def _register_git_routes(
         title = (
             _check_title(raw_title)
             if raw_title not in (None, "")
-            else f"{identifier}: {issue.title}" if issue is not None else identifier
+            else f"{identifier}: {issue.title}"
+            if issue is not None
+            else identifier
         )
         raw_body = body.get("body")
         pr_body = (
@@ -1556,9 +1564,7 @@ def _register_git_routes(
 
     app.router.add_get("/api/v1/git/branches", _wrap(handle_git_branches))
     app.router.add_get("/api/v1/git/remote-status", _wrap(handle_git_remote_status))
-    app.router.add_post(
-        "/api/v1/git/branch/delete", _wrap(handle_git_branch_delete)
-    )
+    app.router.add_post("/api/v1/git/branch/delete", _wrap(handle_git_branch_delete))
     app.router.add_post("/api/v1/git/push", _wrap(handle_git_push))
     app.router.add_post("/api/v1/git/pr", _wrap(handle_git_pull_request))
     app.router.add_get("/api/v1/git/log", _wrap(handle_git_log))
@@ -1606,9 +1612,7 @@ def _register_chat_routes(
             return _json_error(409, exc.code, exc.message)
         return web.json_response(snapshot, status=201)
 
-    async def _set_mode(
-        body: dict[str, Any], session_id: str | None
-    ) -> web.Response:
+    async def _set_mode(body: dict[str, Any], session_id: str | None) -> web.Response:
         mode = body.get("mode")
         if not isinstance(mode, str):
             raise WorkflowMutationError("mode must be a string")
@@ -1793,9 +1797,7 @@ def _register_chat_routes(
     app.router.add_get("/api/v1/chat/session", _wrap(handle_chat_session_get))
     app.router.add_post("/api/v1/chat/session", _wrap(handle_chat_session_post))
     app.router.add_patch("/api/v1/chat/session", _wrap(handle_chat_session_patch))
-    app.router.add_delete(
-        "/api/v1/chat/session", _wrap(handle_chat_session_delete)
-    )
+    app.router.add_delete("/api/v1/chat/session", _wrap(handle_chat_session_delete))
     app.router.add_post("/api/v1/chat/message", _wrap(handle_chat_message_post))
     app.router.add_get("/api/v1/chat/sessions", _wrap(handle_chat_sessions_get))
     app.router.add_post("/api/v1/chat/sessions", _wrap(handle_chat_sessions_post))
@@ -1928,20 +1930,237 @@ def _register_preview_routes(
         return web.json_response(await payload())
 
     app.router.add_get("/api/v1/preview", _wrap(get_preview))
-    app.router.add_post(
-        "/api/v1/preview/start", _wrap(partial(mutate, action="start"))
-    )
+    app.router.add_post("/api/v1/preview/start", _wrap(partial(mutate, action="start")))
     app.router.add_post(
         "/api/v1/preview/restart", _wrap(partial(mutate, action="restart"))
     )
-    app.router.add_post(
-        "/api/v1/preview/stop", _wrap(partial(mutate, action="stop"))
-    )
+    app.router.add_post("/api/v1/preview/stop", _wrap(partial(mutate, action="stop")))
 
     async def cleanup(_app: web.Application) -> None:
         await manager.close()
 
     app.on_cleanup.append(cleanup)
+
+
+def _status_is_running(status: Any) -> bool:
+    if isinstance(status, bool):
+        return status
+    if isinstance(status, dict):
+        if "running" in status:
+            return bool(status["running"])
+        return str(status.get("state", "")).lower() == "running"
+    return str(getattr(status, "state", "")).lower() == "running"
+
+
+def _project_url(project: Project, status: Any | None = None) -> str:
+    record = getattr(status, "record", None) if status is not None else None
+    host = str(getattr(record, "host", None) or project.host)
+    port = int(getattr(record, "port", None) or project.port)
+    if host in {"", "0.0.0.0", "::", "[::]"}:
+        host = "127.0.0.1"
+    if ":" in host and not host.startswith("["):
+        host = f"[{host}]"
+    return f"http://{host}:{port}/"
+
+
+def _create_or_adopt_registered_project(
+    registry: ProjectRegistry, *, name: str, path: Path
+) -> Project:
+    """Keep the web boundary thin around the shared project setup service."""
+    from .projects import create_or_adopt_project, source_checkout
+
+    return create_or_adopt_project(
+        path, source=source_checkout(), registry=registry, name=name
+    )
+
+
+def _current_project_payload(ctx: _Ctx, projects: list[Project]) -> dict[str, Any]:
+    cfg = ctx.config()
+    workflow = cfg.workflow_path.expanduser().resolve()
+    current = next(
+        (
+            project
+            for project in projects
+            if Path(project.workflow).expanduser().resolve() == workflow
+        ),
+        None,
+    )
+    repo = (
+        Path(current.git_repo).expanduser().resolve()
+        if current is not None
+        else canonical_project_repo(workflow.parent)
+    )
+    board = cfg.tracker.board_root
+    return {
+        "id": current.id if current is not None else None,
+        "name": current.name if current is not None else repo.name,
+        "repo_path": str(repo),
+        "workflow_path": str(workflow),
+        "board_path": str(board.expanduser().resolve()) if board is not None else None,
+        "registered": current is not None,
+    }
+
+
+def _project_mutation_error(request: web.Request) -> web.Response | None:
+    """Project setup can write arbitrary paths, so it is loopback-only."""
+    bind = str(request.app.get(BIND_HOST_KEY) or "127.0.0.1").lower()
+    if bind not in _LOOPBACK_BINDS:
+        return _json_error(
+            403, "project_mutation_forbidden", "project management is loopback-only"
+        )
+    remote = request.remote
+    try:
+        if remote is None or not ipaddress.ip_address(remote).is_loopback:
+            return _json_error(
+                403, "project_mutation_forbidden", "project management is loopback-only"
+            )
+    except ValueError:
+        return _json_error(
+            403, "project_mutation_forbidden", "project management is loopback-only"
+        )
+    origin = request.headers.get("Origin")
+    if origin:
+        parsed = urlsplit(origin)
+        if (
+            parsed.scheme.lower() != request.scheme.lower()
+            or parsed.netloc.lower() != request.host.lower()
+        ):
+            return _json_error(
+                403,
+                "forbidden_origin",
+                "project mutations require same-origin requests",
+            )
+    if request.content_length is not None and request.content_length > 16_384:
+        return _json_error(413, "request_too_large", "project request is too large")
+    return None
+
+
+def _register_project_routes(app: web.Application, ctx: _Ctx) -> None:
+    registry = ProjectRegistry()
+
+    async def handle_projects(_request: web.Request) -> web.Response:
+        try:
+            projects = await asyncio.to_thread(registry.list)
+            statuses = await asyncio.gather(
+                *(
+                    asyncio.to_thread(registry.status, project.id)
+                    for project in projects
+                ),
+                return_exceptions=True,
+            )
+        except ProjectError as exc:
+            return _json_error(409, "project_registry_error", str(exc))
+        current = await asyncio.to_thread(_current_project_payload, ctx, projects)
+        payload = []
+        for project, status in zip(projects, statuses, strict=True):
+            status_error = isinstance(status, BaseException)
+            running = False if status_error else _status_is_running(status)
+            payload.append(
+                {
+                    "id": project.id,
+                    "name": project.name,
+                    "repo_path": str(Path(project.git_repo).expanduser().resolve()),
+                    "workflow_path": str(Path(project.workflow).expanduser().resolve()),
+                    "host": project.host,
+                    "port": project.port,
+                    "running": running,
+                    "status_error": "status unavailable" if status_error else None,
+                    "current": project.id == current["id"],
+                    "url": _project_url(project, None if status_error else status),
+                }
+            )
+        return web.json_response({"projects": payload, "current": current})
+
+    async def handle_current(_request: web.Request) -> web.Response:
+        try:
+            projects = await asyncio.to_thread(registry.list)
+        except ProjectError as exc:
+            return _json_error(409, "project_registry_error", str(exc))
+        current = await asyncio.to_thread(_current_project_payload, ctx, projects)
+        return web.json_response({"current": current})
+
+    async def handle_create(request: web.Request) -> web.Response:
+        denied = _project_mutation_error(request)
+        if denied is not None:
+            return denied
+        body = await _read_json(request)
+        name = body.get("name")
+        raw_path = body.get("path")
+        if not isinstance(name, str) or not name.strip() or len(name) > 100:
+            return _json_error(
+                400, "invalid_project_name", "name must be 1-100 characters"
+            )
+        if (
+            not isinstance(raw_path, str)
+            or not raw_path.strip()
+            or len(raw_path) > 4096
+        ):
+            return _json_error(
+                400, "invalid_project_path", "path must be 1-4096 characters"
+            )
+        try:
+            project = await asyncio.to_thread(
+                _create_or_adopt_registered_project,
+                registry,
+                name=name.strip(),
+                path=Path(raw_path).expanduser(),
+            )
+        except ProjectError as exc:
+            return _json_error(409, "project_setup_failed", str(exc))
+        return web.json_response(
+            {
+                "project": {
+                    "id": project.id,
+                    "name": project.name,
+                    "repo_path": str(Path(project.git_repo).expanduser().resolve()),
+                    "workflow_path": str(Path(project.workflow).expanduser().resolve()),
+                    "url": _project_url(project),
+                }
+            },
+            status=201,
+        )
+
+    async def handle_open(request: web.Request) -> web.Response:
+        if request.content_type != "application/json":
+            return _json_error(
+                415, "unsupported_media_type", "mutations require application/json"
+            )
+        denied = _project_mutation_error(request)
+        if denied is not None:
+            return denied
+        project_id = request.match_info["project_id"]
+        try:
+            project = await asyncio.to_thread(registry.get, project_id)
+            status = await asyncio.to_thread(registry.status, project_id)
+            if not _status_is_running(status):
+                result = await asyncio.to_thread(registry.start, project_id)
+                if isinstance(result, int) and result != 0:
+                    raise ProjectError(f"service command exited with status {result}")
+                status = await asyncio.to_thread(registry.status, project_id)
+            if not _status_is_running(status):
+                raise ProjectError(f"project {project_id!r} did not start")
+        except ProjectError as exc:
+            missing = str(exc).startswith("unknown project ")
+            return _json_error(
+                404 if missing else 409,
+                "project_not_found" if missing else "project_open_failed",
+                str(exc),
+            )
+        except Exception as exc:
+            log.warning("project_open_failed", project_id=project_id, error=str(exc))
+            return _json_error(409, "project_open_failed", "could not open project")
+        return web.json_response(
+            {
+                "project_id": project.id,
+                "running": True,
+                "url": _project_url(project, status),
+            }
+        )
+
+    app.router.add_get("/api/v1/projects", _wrap(handle_projects))
+    app.router.add_get("/api/v1/projects/current", _wrap(handle_current))
+    app.router.add_post("/api/v1/projects", _wrap(handle_create))
+    app.router.add_post("/api/v1/projects/{project_id}/open", _wrap(handle_open))
 
 
 def _register_meta_routes(
@@ -1991,4 +2210,5 @@ def register_web_routes(app: web.Application, orchestrator: Orchestrator) -> Non
     _register_git_routes(app, ctx, orchestrator)
     _register_chat_routes(app, ctx, orchestrator)
     _register_preview_routes(app, ctx, orchestrator)
+    _register_project_routes(app, ctx)
     _register_meta_routes(app, ctx, orchestrator)

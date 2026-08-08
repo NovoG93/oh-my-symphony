@@ -91,7 +91,7 @@ plans, edits or merges the work it proposes.
 ### blocked_fixes
 
 Scans tickets in `Blocked` and `Human Review`, extracts the last blocker-ish
-section (`## Blocker`, `## Blocked RCA`, `## QA Failure`, `## Review
+section (`## Blocker`, `## Blocked Fix` / legacy `## Blocked RCA`, `## QA Failure`, `## Review
 Findings`, `## Budget Exceeded`) as a root-cause note, and files one fix
 ticket per stuck ticket. The source ticket then gains a `blocked_by` edge to
 the fix ticket — an ordinary DAG edge, always acyclic because the fix ticket

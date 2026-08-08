@@ -44,22 +44,35 @@ class _Registry:
 
 
 @pytest_asyncio.fixture
-async def registry() -> _Registry:
+async def registry(tmp_path: Path) -> _Registry:
+    alpha = tmp_path / "alpha"
+    beta = tmp_path / "beta"
+    for repo in (alpha, beta):
+        repo.mkdir()
+        (repo / "WORKFLOW.md").write_text(
+            "---\n"
+            "tracker:\n"
+            "  kind: file\n"
+            "  board_root: ./boards\n"
+            "---\n"
+            "Work on issue: {{ issue.title }}\n"
+        )
+        (repo / "boards").mkdir()
     return _Registry(
         [
             Project(
                 id="alpha",
                 name="Alpha board",
-                git_repo=str(Path("/work/alpha")),
-                workflow=str(Path("/work/alpha/WORKFLOW.md")),
+                git_repo=str(alpha),
+                workflow=str(alpha / "WORKFLOW.md"),
                 host="127.0.0.1",
                 port=9101,
             ),
             Project(
                 id="beta",
                 name="Beta board",
-                git_repo=str(Path("/work/beta")),
-                workflow=str(Path("/work/beta/WORKFLOW.md")),
+                git_repo=str(beta),
+                workflow=str(beta / "WORKFLOW.md"),
                 host="0.0.0.0",
                 port=9102,
             ),
@@ -90,33 +103,38 @@ async def test_index_is_standalone_hub_ui(client: TestClient) -> None:
 
 
 async def test_projects_reports_independent_service_urls(
-    client: TestClient,
+    client: TestClient, registry: _Registry
 ) -> None:
     response = await client.get("/api/v1/projects")
     body = await response.json()
 
     assert response.status == 200
+    alpha, beta = registry.records
     assert body == {
         "projects": [
             {
                 "id": "alpha",
                 "name": "Alpha board",
-                "repo": "/work/alpha",
-                "workflow": "/work/alpha/WORKFLOW.md",
+                "repo": alpha.git_repo,
+                "workflow": alpha.workflow,
+                "board": str(Path(alpha.git_repo) / "boards"),
                 "host": "127.0.0.1",
                 "port": 9101,
                 "running": True,
                 "url": "http://127.0.0.1:9101/",
+                "diagnostics": [],
             },
             {
                 "id": "beta",
                 "name": "Beta board",
-                "repo": "/work/beta",
-                "workflow": "/work/beta/WORKFLOW.md",
+                "repo": beta.git_repo,
+                "workflow": beta.workflow,
+                "board": str(Path(beta.git_repo) / "boards"),
                 "host": "0.0.0.0",
                 "port": 9102,
                 "running": False,
                 "url": None,
+                "diagnostics": [],
             },
         ]
     }
@@ -147,6 +165,104 @@ async def test_unknown_project_mutation_is_json_404(client: TestClient) -> None:
             "message": "unknown project missing",
         }
     }
+
+
+async def test_add_project_uses_setup_boundary(registry: _Registry) -> None:
+    calls = []
+
+    def create_project(target_registry, values):
+        calls.append((target_registry, dict(values)))
+        project = Project(
+            id="gamma",
+            name=values["name"],
+            git_repo=values["path"],
+            workflow=str(Path(values["path"]) / values.get("workflow", "WORKFLOW.md")),
+            host="127.0.0.1",
+            port=9103,
+        )
+        target_registry.records.append(project)
+        return project
+
+    test_client = TestClient(
+        TestServer(build_hub_app(registry, create_project=create_project))
+    )
+    await test_client.start_server()
+    try:
+        response = await test_client.post(
+            "/api/v1/projects",
+            json={"name": "Gamma", "path": "/work/gamma", "id": "gamma"},
+        )
+        body = await response.json()
+    finally:
+        await test_client.close()
+
+    assert response.status == 201
+    assert body["project"]["id"] == "gamma"
+    assert calls == [
+        (
+            registry,
+            {"name": "Gamma", "path": "/work/gamma", "id": "gamma"},
+        )
+    ]
+
+
+async def test_add_project_validates_payload_before_setup(
+    client: TestClient,
+) -> None:
+    response = await client.post("/api/v1/projects", json={"name": "Missing path"})
+    assert response.status == 400
+    assert (await response.json())["error"]["code"] == "invalid_request"
+
+
+async def test_open_starts_only_selected_stopped_project(
+    client: TestClient, registry: _Registry
+) -> None:
+    response = await client.post("/api/v1/projects/beta/open", json={})
+
+    assert response.status == 200
+    assert await response.json() == {
+        "project_id": "beta",
+        "running": True,
+        "url": "http://127.0.0.1:9102/",
+    }
+    assert registry.calls == [("start", "beta")]
+    assert registry.running == {"alpha", "beta"}
+
+    response = await client.post("/api/v1/projects/alpha/open", json={})
+    assert response.status == 200
+    assert registry.calls == [("start", "beta")]
+
+
+async def test_listing_degrades_status_and_board_diagnostics(
+    client: TestClient, registry: _Registry
+) -> None:
+    original_status = registry.status
+
+    def status(project_id: str) -> str:
+        if project_id == "beta":
+            raise RuntimeError("probe failed")
+        return original_status(project_id)
+
+    registry.status = status  # type: ignore[method-assign]
+    Path(registry.records[0].workflow).unlink()
+    response = await client.get("/api/v1/projects")
+    projects = (await response.json())["projects"]
+
+    assert response.status == 200
+    assert projects[0]["board"] is None
+    assert projects[0]["diagnostics"][0].startswith("Board path unavailable:")
+    assert projects[1]["running"] is False
+    assert projects[1]["diagnostics"] == ["Status unavailable: probe failed"]
+
+
+async def test_hub_rejects_cross_origin_mutation(client: TestClient) -> None:
+    response = await client.post(
+        "/api/v1/projects/beta/open",
+        json={},
+        headers={"Origin": "https://evil.example"},
+    )
+    assert response.status == 403
+    assert (await response.json())["error"]["code"] == "forbidden_origin"
 
 
 async def test_run_hub_reports_ephemeral_port(registry: _Registry) -> None:

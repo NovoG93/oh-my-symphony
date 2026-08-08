@@ -56,6 +56,9 @@
 
   const api = {
     getBoard: () => apiRequest('/board'),
+    getProjects: () => apiRequest('/projects'),
+    createOrAdoptProject: (payload) => apiRequest('/projects', { method: 'POST', body: JSON.stringify(payload) }),
+    openProject: (id) => apiRequest(`/projects/${encodeURIComponent(id)}/open`, { method: 'POST', body: '{}' }),
     createIssue: (payload) => apiRequest('/issues', { method: 'POST', body: JSON.stringify(payload) }),
     getIssue: (id) => apiRequest(`/issues/${encodeURIComponent(id)}`),
     patchIssue: (id, fields) => apiRequest(`/issues/${encodeURIComponent(id)}`, { method: 'PATCH', body: JSON.stringify(fields) }),
@@ -146,6 +149,8 @@
   const state = {
     route: 'board',
     board: null,
+    projects: [],
+    currentProject: null,
     workflow: null,
     branches: [],
     // Remotes + gh availability decide which Git page actions are usable.
@@ -545,7 +550,8 @@
   }
 
   function openFormModal({ title, body, submitLabel = t('common.save'), onSubmit, size }) {
-    const errorBox = el('div', { class: 'modal-error', style: 'display:none;' });
+    const titleId = 'form-modal-title';
+    const errorBox = el('div', { class: 'modal-error', style: 'display:none;', role: 'alert', 'aria-live': 'assertive' });
     const submitBtn = el('button', { class: 'btn btn-primary', type: 'submit' }, submitLabel);
     const form = el(
       'form',
@@ -568,7 +574,7 @@
       },
       [
         el('div', { class: 'modal-header' }, [
-          el('h2', null, title),
+          el('h2', { id: titleId }, title),
           el('button', { class: 'btn-icon modal-close', type: 'button', 'aria-label': t('common.close'), onClick: closeModal }, '✕'),
         ]),
         el('div', { class: 'modal-body' }, [body, errorBox]),
@@ -578,7 +584,8 @@
         ]),
       ]
     );
-    openModal(form, size);
+    const modal = openModal(form, size);
+    modal.setAttribute('aria-labelledby', titleId);
     const firstInput = form.querySelector('input, textarea, select');
     if (firstInput) firstInput.focus();
   }
@@ -829,6 +836,111 @@
       modalBody.className = 'empty-state';
       modalBody.appendChild(document.createTextNode(t('board.noPromptConfigured', { error: err.message })));
     }
+  }
+
+
+  // ------------------------------------------------------------------
+  // Project identity and switching
+  // ------------------------------------------------------------------
+
+  function setProjectPath(element, value) {
+    if (!element) return;
+    const displayValue = value || t('projects.notFileBoard');
+    element.textContent = displayValue;
+    element.title = value || '';
+    element.dataset.fullPath = value || '';
+    element.tabIndex = value ? 0 : -1;
+    if (value) element.setAttribute('aria-label', value);
+    else element.removeAttribute('aria-label');
+  }
+
+  function renderProjectSwitcher() {
+    const selector = document.getElementById('project-selector');
+    const pathEl = document.getElementById('project-current-path');
+    const workflowPathEl = document.getElementById('project-workflow-path');
+    const boardPathEl = document.getElementById('project-board-path');
+    if (!selector) return;
+    clearNode(selector);
+    const current = state.currentProject;
+    const registeredCurrent = current && current.id;
+    if (current && !registeredCurrent) {
+      selector.appendChild(el('option', { value: '', selected: true }, current.name));
+    }
+    for (const project of state.projects) {
+      selector.appendChild(el('option', {
+        value: project.id,
+        selected: project.id === (current && current.id),
+      }, project.name));
+    }
+    selector.disabled = state.projects.length === 0;
+    if (current) {
+      setProjectPath(pathEl, current.repo_path);
+      setProjectPath(workflowPathEl, current.workflow_path);
+      setProjectPath(boardPathEl, current.board_path);
+    }
+  }
+
+  async function switchProject(projectId) {
+    if (!projectId || projectId === (state.currentProject && state.currentProject.id)) return;
+    const selector = document.getElementById('project-selector');
+    if (selector) selector.disabled = true;
+    try {
+      const opened = await api.openProject(projectId);
+      window.location.assign(opened.url);
+    } catch (err) {
+      showToast(err.message, 'error');
+      renderProjectSwitcher();
+    }
+  }
+
+  async function loadProjects() {
+    try {
+      const data = await api.getProjects();
+      state.projects = data.projects || [];
+      state.currentProject = data.current || null;
+      renderProjectSwitcher();
+    } catch (err) {
+      showToast(err.message, 'error');
+    }
+  }
+
+  function openManageProjectsDialog() {
+    const nameInput = el('input', {
+      class: 'input',
+      id: 'project-name-input',
+      name: 'name',
+      type: 'text',
+      required: true,
+      autocomplete: 'off',
+      placeholder: t('projects.namePlaceholder'),
+    });
+    const pathInput = el('input', {
+      class: 'input',
+      id: 'project-path-input',
+      name: 'path',
+      type: 'text',
+      required: true,
+      autocomplete: 'off',
+      placeholder: t('projects.pathPlaceholder'),
+    });
+    const body = el('div', { class: 'project-manage-form' }, [
+      el('p', { class: 'form-help' }, t('projects.createOrAdoptHint')),
+      field(t('projects.nameLabel'), nameInput),
+      field(t('projects.pathLabel'), pathInput),
+    ]);
+    openFormModal({
+      title: t('projects.manageTitle'),
+      body,
+      submitLabel: t('projects.createOrAdopt'),
+      onSubmit: async () => {
+        const result = await api.createOrAdoptProject({
+          name: nameInput.value.trim(),
+          path: pathInput.value.trim(),
+        });
+        await loadProjects();
+        showToast(t('projects.added', { name: result.project.name }), 'success');
+      },
+    });
   }
 
   // ------------------------------------------------------------------
@@ -3124,19 +3236,34 @@
     try {
       await api.putBranchPolicy(payload);
       showToast(t('workflow.branchPolicySaved'), 'success');
+      return true;
     } catch (err) {
       showToast(err.message, 'error');
+      return false;
     }
+  }
+
+  function bindBranchPolicyAutosave(select, key) {
+    let savedValue = select.value;
+    select.addEventListener('change', async () => {
+      const nextValue = select.value;
+      select.disabled = true;
+      const saved = await saveBranchPolicy({ [key]: nextValue });
+      if (saved) savedValue = nextValue;
+      else select.value = savedValue;
+      select.disabled = false;
+    });
   }
 
   function buildBranchPolicyCard(wf) {
     const featureSelect = buildBranchSelect(wf.agent.feature_base_branch);
     const targetSelect = buildBranchSelect(wf.agent.auto_merge_target_branch);
-    featureSelect.addEventListener('change', () => saveBranchPolicy({ feature_base_branch: featureSelect.value }));
-    targetSelect.addEventListener('change', () => saveBranchPolicy({ auto_merge_target_branch: targetSelect.value }));
-    return el('div', { class: 'card-panel' }, [
-      el('h3', null, t('workflow.branchPolicy')),
+    bindBranchPolicyAutosave(featureSelect, 'feature_base_branch');
+    bindBranchPolicyAutosave(targetSelect, 'auto_merge_target_branch');
+    return el('div', { class: 'card-panel settings-card' }, [
+      settingsCardHeader(t('workflow.branchPolicy'), t('settings.branchPolicyDescription')),
       fieldRow([field(t('workflow.featureBaseBranch'), featureSelect), field(t('workflow.mergeTargetBranch'), targetSelect)]),
+      el('div', { class: 'form-hint settings-auto-save' }, t('settings.savedAutomatically')),
     ]);
   }
 
@@ -3173,6 +3300,24 @@
         el('span', null, t(`workflow.ciMode.${mode}`)),
       ])
     );
+  }
+
+  function settingsSectionHeading(title, description) {
+    return el('div', { class: 'settings-section-heading' }, [
+      el('h2', { class: 'settings-section-kicker' }, title),
+      el('p', null, description),
+    ]);
+  }
+
+  function settingsCardHeader(title, description, trailing) {
+    const children = [
+      el('div', { class: 'settings-card-header-copy' }, [
+        el('h3', null, title),
+        description ? el('p', null, description) : null,
+      ].filter(Boolean)),
+    ];
+    if (trailing) children.push(trailing);
+    return el('div', { class: 'settings-card-header' }, children);
   }
 
   function buildContinuousImprovementCard(wf, ciStatus) {
@@ -3227,13 +3372,14 @@
         }
       },
     }, t('common.save'));
-    return el('div', { class: 'card-panel ci-card' }, [
-      el('div', { class: 'ci-card-header' }, [
-        el('h3', null, t('workflow.continuousImprovement')),
-        el('span', { class: `ci-status-pill ${statusView.className}` }, statusView.label),
-      ]),
+    return el('div', { class: 'card-panel settings-card settings-card--featured ci-card' }, [
+      settingsCardHeader(
+        t('workflow.continuousImprovement'),
+        t('settings.continuousImprovementDescription'),
+        el('span', { class: `ci-status-pill ${statusView.className}` }, statusView.label)
+      ),
       fieldRow([
-        field(t('common.enabled'), el('label', { class: 'switch' }, [enabledInput, el('span', { class: 'switch-slider' })])),
+        field(t('common.enabled'), el('span', { class: 'switch' }, [enabledInput, el('span', { class: 'switch-slider' })])),
         field(t('workflow.intervalMs'), intervalInput),
       ]),
       fieldRow([
@@ -3289,18 +3435,18 @@
         }
       },
     }, t('common.apply'));
-    return el('div', { class: 'card-panel' }, [
-      el('h3', null, t('settings.lanePreset')),
+    return el('div', { class: 'card-panel settings-card' }, [
+      settingsCardHeader(t('settings.lanePreset'), t('settings.lanePresetDescription')),
       fieldRow([field(t('settings.lanePresetChoose'), select)]),
       el('div', { class: 'form-hint' }, t('settings.lanePresetHint')),
       buildStageContractsRow(wf),
-      applyButton,
+      el('div', { class: 'settings-card-actions' }, [applyButton]),
     ]);
   }
 
   function buildBoardInfoCard(wf) {
-    return el('div', { class: 'card-panel' }, [
-      el('h3', null, t('settings.boardInfo')),
+    return el('div', { class: 'card-panel settings-card settings-card--utility' }, [
+      settingsCardHeader(t('settings.boardInfo'), t('settings.boardInfoDescription')),
       el('div', { class: 'kv-grid' }, [
         kv(t('settings.workflowPath'), wf.workflow_path),
         kv(t('settings.defaultAgent'), (wf.agent && wf.agent.kind) || '—'),
@@ -3319,8 +3465,8 @@
         el('option', { value: lang.code, selected: lang.code === window.i18n.lang }, lang.label)
       )
     );
-    return el('div', { class: 'card-panel' }, [
-      el('h3', null, t('settings.interface')),
+    return el('div', { class: 'card-panel settings-card settings-card--utility' }, [
+      settingsCardHeader(t('settings.interface'), t('settings.interfaceDescription')),
       field(t('settings.language'), select),
       el('div', { class: 'form-hint' }, t('settings.languageHint')),
     ]);
@@ -3341,12 +3487,21 @@
         }
       },
     }, t('board.refreshOrchestrator'));
-    return el('div', { class: 'card-panel' }, [el('h3', null, t('settings.manualControls')), btn]);
+    return el('div', { class: 'card-panel settings-card settings-card--utility settings-card--control' }, [
+      settingsCardHeader(t('settings.manualControls'), t('settings.manualControlsDescription')),
+      el('div', { class: 'settings-card-actions' }, [btn]),
+    ]);
   }
 
   async function renderSettingsPage(container) {
     const page = el('div', { class: 'page page-settings' });
-    page.appendChild(el('div', { class: 'topbar' }, [el('h1', { class: 'page-title' }, t('nav.settings'))]));
+    page.appendChild(el('div', { class: 'topbar settings-topbar' }, [
+      el('div', { class: 'settings-title-group' }, [
+        el('h1', { class: 'page-title' }, t('nav.settings')),
+        el('p', null, t('settings.pageDescription')),
+      ]),
+      el('span', { class: 'settings-config-badge' }, 'WORKFLOW.md'),
+    ]));
     const body = el('div', { class: 'settings-body' }, [buildSkeletonBlock()]);
     page.appendChild(body);
     container.appendChild(page);
@@ -3362,17 +3517,21 @@
       state.branches = branchesResp.branches;
       if (!state.board) state.board = board;
       clearNode(body);
-      body.appendChild(buildContinuousImprovementCard(wf, ciStatus));
-      body.appendChild(buildLanePresetCard(lanePresets, wf));
-      body.appendChild(buildBranchPolicyCard(wf));
+      body.appendChild(settingsSectionHeading(t('settings.workspace'), t('settings.workspaceDescription')));
       body.appendChild(buildBoardInfoCard(wf));
       body.appendChild(buildInterfaceCard());
       body.appendChild(buildRefreshCard());
+      body.appendChild(settingsSectionHeading(t('settings.workflowSetup'), t('settings.workflowSetupDescription')));
+      body.appendChild(buildLanePresetCard(lanePresets, wf));
+      body.appendChild(buildBranchPolicyCard(wf));
+      body.appendChild(settingsSectionHeading(t('settings.automation'), t('settings.automationDescription')));
+      body.appendChild(buildContinuousImprovementCard(wf, ciStatus));
     } catch (err) {
       clearNode(body);
       body.appendChild(el('div', { class: 'empty-state' }, t('settings.loadFailed', { error: err.message })));
       // The language picker is client-side only, so keep it reachable even
       // when the orchestrator is down.
+      body.appendChild(settingsSectionHeading(t('settings.workspace'), t('settings.workspaceDescription')));
       body.appendChild(buildInterfaceCard());
     }
   }
@@ -3465,7 +3624,12 @@
       updateConnectionIndicator();
     });
     wireGlobalShortcuts();
+    const selector = document.getElementById('project-selector');
+    if (selector) selector.addEventListener('change', () => switchProject(selector.value));
+    const manageButton = document.getElementById('manage-projects');
+    if (manageButton) manageButton.addEventListener('click', openManageProjectsDialog);
     handleRouteChange();
+    loadProjects();
     pollBoard();
   }
 

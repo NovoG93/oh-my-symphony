@@ -17,8 +17,21 @@ symphony hub
 ```
 
 The hub is a control plane: each card opens that project's independent service.
-Each service loads its own `WORKFLOW.md`, board, Git repository, workspaces, and
-Product Preview. It does not multiplex projects through the source checkout.
+The Hub exposes an add/adopt form and project cards; every project board
+exposes **Manage projects** and a project selector. Both surfaces show the
+canonical repository, workflow, and board paths. A missing path is created and
+initialized as Git; an existing non-Git directory is initialized in place; an
+existing Git repository is reused. Only missing Symphony files are added, and
+unrelated changes are never staged.
+
+Switching starts the destination service when needed and navigates to it. It
+never retargets or stops existing workers. Each service continues to own its
+`WORKFLOW.md`, board, Git repository, project-scoped workspaces, and Product
+Preview; the Hub does not multiplex projects through the source checkout.
+
+For an existing non-Git directory, Symphony commits only its own newly added
+operator files. Review and commit the directory's pre-existing product files
+before dispatch; untracked files are not present in Git worktrees.
 
 ## Tickets (file-based tracker)
 

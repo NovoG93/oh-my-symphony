@@ -104,6 +104,17 @@ class _StubOrchestrator:
     def request_refresh(self) -> bool:
         return False
 
+    def continuous_improvement_status(self) -> dict[str, Any]:
+        return {
+            "turns_used": 0,
+            "in_flight": False,
+            "current_phase": None,
+            "last_result": None,
+            "skipped_reason": None,
+            "tickets_created": 0,
+            "next_due_at": None,
+        }
+
     def find_running_issue_id(self, _identifier: str) -> str | None:
         return None
 
@@ -260,6 +271,29 @@ async def _exercise_issue_crud(page: Any) -> None:
     await page.locator(".card", has_text=f"{title} updated").wait_for(
         state="detached"
     )
+
+
+async def _exercise_settings_layout(page: Any, web_base_url: str) -> None:
+    for width in (1440, 1201, 1100, 769, 390):
+        await page.set_viewport_size({"width": width, "height": 900})
+        await page.goto(f"{web_base_url}/#/settings", wait_until="networkidle")
+        await page.locator(".settings-card").first.wait_for()
+        assert await page.locator(".settings-body").get_by_role("heading", level=2).all_text_contents() == [
+            "Workspace & interface",
+            "Workflow setup",
+            "Automation",
+        ]
+        await _assert_no_document_overflow(page, f"settings at {width}px")
+        cards = page.locator(".settings-card")
+        for index in range(await cards.count()):
+            dims = await cards.nth(index).evaluate(
+                "node => ({scrollWidth: node.scrollWidth, clientWidth: node.clientWidth})"
+            )
+            assert dims["scrollWidth"] <= dims["clientWidth"] + 2, (width, index, dims)
+        control_widths = await page.locator(
+            ".settings-card select, .settings-card input[type=number]"
+        ).evaluate_all("nodes => nodes.map(node => node.clientWidth)")
+        assert min(control_widths) >= 150, (width, control_widths)
 
 
 async def _exercise_mobile_layout(page: Any, web_base_url: str) -> None:
@@ -649,6 +683,7 @@ async def test_web_board_browser_e2e(web_base_url: str) -> None:
         try:
             await _exercise_column_scope(page, web_base_url)
             await _exercise_issue_crud(page)
+            await _exercise_settings_layout(page, web_base_url)
             await _exercise_mobile_layout(page, web_base_url)
             assert errors == []
         finally:

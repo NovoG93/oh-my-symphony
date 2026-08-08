@@ -10,6 +10,34 @@ Versioning: [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.18.2] - 2026-08-08 - Responsive settings and safer blocked recovery
+
+### Added
+
+- Manage local projects from both the Hub and each project board: show the
+  canonical repository, workflow, and issue-board paths; create or adopt a path;
+  and switch to another independently running project without retargeting active
+  workers. Missing paths and existing non-Git directories are initialized as Git
+  repositories, while existing Git metadata and files are preserved.
+- Reorganize the web Settings page into workspace, workflow, and automation
+  sections with clearer descriptions, responsive card sizing, visible save
+  semantics, and English/Korean copy that remains readable down to phone widths.
+
+### Fixed
+
+- Replace newly generated blocked-recovery `RCA-*` cards with source-linked
+  `FIX-*` tickets. Fix workers now clarify vague requests into concrete,
+  testable acceptance criteria before retrying the source; the source depends
+  on the fix, legacy RCA cards remain compatible, and an unproven fix is moved
+  out of `Done` instead of leaving the parent silently Blocked.
+- Keep the useful rightmost portion of long project paths visible and reveal the
+  complete value on hover or keyboard focus without widening the sidebar.
+- Adopt repositories whose ignore rules hide Symphony operator files by
+  force-adding only files created by Symphony; unrelated ignored or modified
+  project files remain untouched.
+- Skip ports already occupied by unregistered local services when allocating a
+  new project endpoint, so start-and-switch does not fail after registration.
+
 ## [0.18.1] - 2026-08-08 - Project workflow containment
 
 ### Fixed
@@ -1333,7 +1361,11 @@ First public release of the multi-agent fork.
 - Per-state concurrency caps, `$VAR`/`~` expansion, dynamic WORKFLOW
   reload, structured stderr logging, `symphony doctor`.
 
-[Unreleased]: https://github.com/cskwork/oh-my-symphony/compare/v0.16.0...HEAD
+[Unreleased]: https://github.com/cskwork/oh-my-symphony/compare/v0.18.2...HEAD
+[0.18.2]: https://github.com/cskwork/oh-my-symphony/compare/v0.18.1...v0.18.2
+[0.18.1]: https://github.com/cskwork/oh-my-symphony/compare/v0.18.0...v0.18.1
+[0.18.0]: https://github.com/cskwork/oh-my-symphony/compare/v0.17.0...v0.18.0
+[0.17.0]: https://github.com/cskwork/oh-my-symphony/compare/v0.16.0...v0.17.0
 [0.16.0]: https://github.com/cskwork/oh-my-symphony/releases/tag/v0.16.0
 [0.15.0]: https://github.com/cskwork/oh-my-symphony/releases/tag/v0.15.0
 [0.14.0]: https://github.com/cskwork/oh-my-symphony/releases/tag/v0.14.0

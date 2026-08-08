@@ -3,10 +3,7 @@
 from __future__ import annotations
 
 import argparse
-import os
 import re
-import shutil
-import subprocess
 import sys
 from pathlib import Path
 
@@ -15,155 +12,12 @@ from ..projects import (
     Project,
     ProjectError,
     ProjectRegistry,
-    validate_id as _validate_id,
-    validate_port as _validate_port,
+    create_or_adopt_project,
+    source_checkout,
 )
 
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 9999
-
-
-def _run_git(cwd: Path, *args: str) -> str:
-    try:
-        result = subprocess.run(
-            ["git", "-C", str(cwd), *args],
-            capture_output=True,
-            text=True,
-            check=False,
-        )
-    except OSError as exc:
-        raise ProjectError(f"cannot run git: {exc}") from exc
-    if result.returncode != 0:
-        detail = (result.stderr or result.stdout).strip()
-        raise ProjectError(detail or f"git {' '.join(args)} failed in {cwd}")
-    return result.stdout.strip()
-
-
-def git_toplevel(candidate: Path) -> Path:
-    path = candidate.expanduser().resolve()
-    cwd = path if path.is_dir() else path.parent
-    return Path(_run_git(cwd, "rev-parse", "--show-toplevel")).resolve()
-
-
-def git_common_dir(repo: Path) -> Path:
-    raw = Path(_run_git(repo, "rev-parse", "--git-common-dir"))
-    return (raw if raw.is_absolute() else repo / raw).resolve()
-
-
-def source_checkout() -> Path:
-    """Return the git checkout containing this installed CLI's source."""
-    try:
-        return git_toplevel(Path(__file__))
-    except ProjectError as exc:
-        raise ProjectError(
-            "cannot locate the oh-my-symphony source checkout; run this command "
-            "from an editable/source installation"
-        ) from exc
-
-
-def _slug(value: str) -> str:
-    slug = re.sub(r"[^a-z0-9]+", "-", value.strip().lower()).strip("-")
-    if not slug:
-        raise ProjectError("name must contain at least one letter or digit")
-    return slug[:64].rstrip("-")
-
-
-def _next_port(projects: list[Project], host: str) -> int:
-    used = {project.port for project in projects}
-    for port in range(DEFAULT_PORT, 65536):
-        if port not in used:
-            return port
-    raise ProjectError(f"no available registry port for host {host}")
-
-
-def _workflow_path(repo: Path, raw: str) -> Path:
-    value = Path(raw).expanduser()
-    if value.is_absolute():
-        raise ProjectError("workflow path must be relative to the project repository")
-    root = repo.resolve()
-    workflow = (root / value).resolve()
-    try:
-        workflow.relative_to(root)
-    except ValueError as exc:
-        raise ProjectError("workflow path escapes the project repository") from exc
-    return workflow
-
-
-def _resolve_workflow(repo: Path, raw: str) -> Path:
-    workflow = _workflow_path(repo, raw)
-    if not workflow.is_file():
-        raise ProjectError(f"workflow file not found: {workflow}")
-    if git_common_dir(workflow.parent) != git_common_dir(repo):
-        raise ProjectError("workflow must belong to the registered project Git repository")
-    return workflow
-
-
-def _new_project(
-    *,
-    registry: ProjectRegistry,
-    repo: Path,
-    name: str,
-    project_id: str | None,
-    workflow: str,
-    host: str,
-    port: int | None,
-) -> Project:
-    projects = registry.load()
-    resolved_id = project_id or _slug(name)
-    _validate_id(resolved_id)
-    resolved_port = _next_port(projects, host) if port is None else port
-    _validate_port(resolved_port)
-    source = source_checkout()
-    if git_common_dir(repo) == git_common_dir(source):
-        raise ProjectError(
-            f"refusing to register protected Symphony source checkout: {source}"
-        )
-    project = Project(
-        id=resolved_id,
-        name=name,
-        git_repo=str(repo.resolve()),
-        workflow=str(_resolve_workflow(repo, workflow)),
-        host=host,
-        port=resolved_port,
-    )
-    registry.add(project)
-    return project
-
-
-def bootstrap_project(source: Path, target: Path, workflow: str = "WORKFLOW.md") -> None:
-    """Copy the required file-tracker operator bundle into a new repository."""
-    workflow_target = _workflow_path(target, workflow)
-    required_files = {
-        "tui-open.sh": "tui-open.sh",
-        "tui-open.bat": "tui-open.bat",
-        "WORKFLOW.file.example.md": str(workflow_target.relative_to(target.resolve())),
-        "scripts/symphony-setup-worktree.sh": "scripts/symphony-setup-worktree.sh",
-        "AGENTS.md": "AGENTS.md",
-        "GEMINI.md": "GEMINI.md",
-    }
-    required_dirs = {
-        "docs/symphony-prompts": "docs/symphony-prompts",
-        "skills": "skills",
-    }
-    missing = [name for name in [*required_files, *required_dirs] if not (source / name).exists()]
-    if missing:
-        raise ProjectError(f"source checkout is missing bootstrap files: {', '.join(missing)}")
-    for source_name, target_name in required_files.items():
-        destination = target / target_name
-        destination.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(source / source_name, destination)
-    for source_name, target_name in required_dirs.items():
-        shutil.copytree(source / source_name, target / target_name)
-    (target / "kanban").mkdir()
-    (target / "kanban" / ".gitkeep").touch()
-    (target / ".claude" / "skills").mkdir(parents=True)
-    (target / ".claude" / "skills" / "symphony-skill").symlink_to(
-        Path("../../skills/symphony-skill"), target_is_directory=True
-    )
-    if os.name != "nt":
-        for relative in ("tui-open.sh", "scripts/symphony-setup-worktree.sh"):
-            path = target / relative
-            path.chmod(path.stat().st_mode | 0o111)
 
 
 def cmd_list(args: argparse.Namespace) -> int:
@@ -180,75 +34,52 @@ def cmd_list(args: argparse.Namespace) -> int:
     return 0
 
 
-def cmd_add(args: argparse.Namespace) -> int:
-    repo = git_toplevel(Path(args.repo))
-    name = args.name or repo.name
-    project = _new_project(
-        registry=ProjectRegistry(),
-        repo=repo,
+def _setup_from_args(args: argparse.Namespace, target: Path, *, name: str) -> Project:
+    """Keep CLI argument adaptation separate from the shared domain service."""
+    return create_or_adopt_project(
+        target,
+        source=source_checkout(),
         name=name,
         project_id=args.id,
         workflow=args.workflow,
         host=args.host,
         port=args.port,
+        registry=ProjectRegistry(),
     )
+
+
+def cmd_add(args: argparse.Namespace) -> int:
+    target = Path(args.repo).expanduser().resolve()
+    project = _setup_from_args(args, target, name=args.name or target.name)
     print(f"added project {project.id} ({project.git_repo}) at {project.host}:{project.port}")
     return 0
 
 
-def _init_git_repo(target: Path) -> None:
-    try:
-        result = subprocess.run(
-            ["git", "init", "-b", "main", str(target)],
-            capture_output=True,
-            text=True,
-            check=False,
-        )
-    except OSError as exc:
-        raise ProjectError(f"cannot run git: {exc}") from exc
-    if result.returncode != 0:
-        detail = (result.stderr or result.stdout).strip()
-        raise ProjectError(detail or f"git init failed for {target}")
-
-
 def cmd_create(args: argparse.Namespace) -> int:
     source = source_checkout()
-    project_id = args.id or _slug(args.name)
-    _validate_id(project_id)
+    project_id = args.id
+    default_id = project_id or re.sub(
+        r"[^a-z0-9]+", "-", args.name.strip().lower()
+    ).strip("-")
+    if not default_id:
+        raise ProjectError("name must contain at least one letter or digit")
     target = (
         Path(args.path).expanduser().resolve()
         if args.path
-        else (source.parent / project_id).resolve()
+        else (source.parent / default_id[:64].rstrip("-")).resolve()
     )
-    if target.exists():
-        raise ProjectError(f"new project path already exists: {target}")
-    target.parent.mkdir(parents=True, exist_ok=True)
-    try:
-        _init_git_repo(target)
-        bootstrap_project(source, target, workflow=args.workflow)
-        _run_git(target, "add", "-A")
-        _run_git(
-            target,
-            "-c",
-            "user.name=Symphony",
-            "-c",
-            "user.email=symphony@local",
-            "commit",
-            "-m",
-            "chore: initialize Symphony project",
-        )
-        project = _new_project(
-            registry=ProjectRegistry(),
-            repo=git_toplevel(target),
-            name=args.name,
-            project_id=project_id,
-            workflow=args.workflow,
-            host=args.host,
-            port=args.port,
-        )
-    except Exception:
-        shutil.rmtree(target, ignore_errors=True)
-        raise
+    # Avoid locating the source checkout twice while retaining the small common
+    # CLI adapter used by add.
+    project = create_or_adopt_project(
+        target,
+        source=source,
+        name=args.name,
+        project_id=project_id,
+        workflow=args.workflow,
+        host=args.host,
+        port=args.port,
+        registry=ProjectRegistry(),
+    )
     print(f"created project {project.id} at {project.git_repo} ({project.host}:{project.port})")
     return 0
 

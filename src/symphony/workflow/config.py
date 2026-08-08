@@ -125,7 +125,7 @@ class AgentConfig:
     # In Progress without spending a model turn on one-line triage.
     auto_triage_actionable_todo: bool = True
     # Self-healing path for failed terminal blockers. When a ticket lands in
-    # Blocked, the orchestrator opens one RCA ticket that can fix/prove the
+    # Blocked, the orchestrator opens one FIX ticket that can clarify/fix/prove the
     # root cause before the source returns to the active workflow.
     auto_recover_blocked: bool = DEFAULT_AUTO_RECOVER_BLOCKED
     # Render first-turn prompts with state-relevant ticket context instead
