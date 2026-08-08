@@ -5046,6 +5046,57 @@ class Orchestrator:
             value = payload.get(key)
             if isinstance(value, str) and value.strip():
                 return value.strip()
+        def assistant_message_preview(message: Any) -> str:
+            """Extract text only from an assistant message.
+
+            Pi and Prime wrap response text in a message object.  The same
+            stream also contains user messages and tool results, so requiring
+            an assistant role here keeps those echoes from looking like model
+            output to the empty-turn guard.
+            """
+            if not isinstance(message, dict):
+                return ""
+            kind = str(message.get("role") or message.get("type") or "").lower()
+            if kind != "assistant":
+                return ""
+            content = message.get("content")
+            if isinstance(content, str) and content.strip():
+                return content.strip()
+            if isinstance(content, list):
+                for block in reversed(content):
+                    if isinstance(block, dict):
+                        text = block.get("text")
+                    else:
+                        text = block
+                    if isinstance(text, str) and text.strip():
+                        return text.strip()
+            elif isinstance(content, dict):
+                text = content.get("text")
+                if isinstance(text, str) and text.strip():
+                    return text.strip()
+            text = message.get("text")
+            if isinstance(text, str) and text.strip():
+                return text.strip()
+            return ""
+
+        # Pi/Prime `message_end` and `turn_end` payloads nest the assistant
+        # message under `message`.
+        message = payload.get("message")
+        preview = assistant_message_preview(message)
+        if preview:
+            return preview
+
+        # Their terminal `agent_end` payload carries all messages.  Walk
+        # backwards so the preview reflects the final assistant response,
+        # while skipping user messages and tool-result entries.
+        if str(payload.get("type") or "").lower() == "agent_end":
+            messages = payload.get("messages")
+            if isinstance(messages, list):
+                for message in reversed(messages):
+                    preview = assistant_message_preview(message)
+                    if preview:
+                        return preview
+
         item = payload.get("item")
         if isinstance(item, dict):
             item_type = str(item.get("type") or "").lower()

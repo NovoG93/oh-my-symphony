@@ -92,7 +92,7 @@ DEFAULT_CI_MODE_INTERVAL_HOURS: dict[str, float] = {
 # from `max_tickets_per_run` so a chatty research turn cannot flood the board.
 DEFAULT_CI_MAX_IMPROVEMENT_TICKETS_PER_RUN = 3
 
-SUPPORTED_AGENT_KINDS = {"agy", "codex", "claude", "gemini", "kiro", "opencode", "pi"}
+SUPPORTED_AGENT_KINDS = {"agy", "codex", "claude", "gemini", "kiro", "opencode", "pi", "prime-agent"}
 DEFAULT_AGENT_KIND = "codex"
 DEFAULT_CLAUDE_COMMAND = (
     "claude -p --output-format stream-json --include-partial-messages --verbose"
@@ -116,6 +116,9 @@ DEFAULT_KIRO_COMMAND = (
 # `--mode json` switches stdout to JSONL events so we can parse session id,
 # turn boundaries, and per-message token usage.
 DEFAULT_PI_COMMAND = 'pi --mode json -p ""'
+# Prime Agent CLI (https://github.com/cskwork/prime-agent) — same JSON
+# protocol as Pi; uses `--resume <id>` instead of `--session <id>`.
+DEFAULT_PRIME_AGENT_COMMAND = 'prime-agent -p --mode json'
 # OpenCode documents `opencode run [message..]` for scripting, with
 # `--format json` exposing raw JSON events and `--auto` allowing
 # non-interactive tool permission flow under the user's configured policy.

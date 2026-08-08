@@ -304,6 +304,13 @@ claude:
   read_timeout_ms: 20000
   stall_timeout_ms: 300000
 
+prime_agent:
+  command: 'prime-agent -p --mode json'
+  resume_across_turns: true
+  turn_timeout_ms: 3600000
+  read_timeout_ms: 20000
+  stall_timeout_ms: 300000
+
 codex:
   # `-c model=...` forces a valid model at thread/start time. The user
   # ~/.codex/config.toml here pins `gpt-5.5` which is not a valid model

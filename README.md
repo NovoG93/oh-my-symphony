@@ -7,9 +7,9 @@
 [![Tests](https://github.com/cskwork/oh-my-symphony/actions/workflows/tests.yml/badge.svg)](https://github.com/cskwork/oh-my-symphony/actions/workflows/tests.yml)
 [![GitHub stars](https://img.shields.io/github/stars/cskwork/oh-my-symphony?style=social)](https://github.com/cskwork/oh-my-symphony/stargazers)
 
-> One admin UI. One terminal. One Kanban board. Seven AI coding agents
+> One admin UI. One terminal. One Kanban board. Eight AI coding agents
 > (**Codex**, **Claude Code**, **Gemini**, **AGY/Antigravity**, **Kiro**,
-> **OpenCode**, **Pi**) — pick per ticket, run in parallel, watch live.
+> **OpenCode**, **Pi**, **Prime Agent**) — pick per ticket, run in parallel, watch live.
 
 ![Symphony 9999 admin UI screenshot](docs/admin-ui-screenshot.png)
 
@@ -46,7 +46,7 @@ terminal for.
 
 ## Why Symphony?
 
-- **No vendor lock-in.** Swap Codex ↔ Claude Code ↔ Gemini ↔ AGY ↔ Kiro ↔ OpenCode ↔ Pi with one
+- **No vendor lock-in.** Swap Codex ↔ Claude Code ↔ Gemini ↔ AGY ↔ Kiro ↔ OpenCode ↔ Pi ↔ Prime Agent with one
   YAML line, or mix backends per ticket. New agents (Ollama, local models,
   anything with a CLI) drop in behind a thin `AgentBackend` Protocol without
   changing the orchestrator.
@@ -64,7 +64,7 @@ terminal for.
   external trackers; you don't need either one to try Symphony.
 - **Battle-tested base, hardened for local operations.** Forked from
   [OpenAI's official Symphony reference implementation](https://github.com/openai/symphony).
-  This fork keeps the file-first orchestration model, then adds seven agent
+  This fork keeps the file-first orchestration model, then adds eight agent
   backends, the TUI/web operator surfaces, SQLite run leases, restart-safe
   issue flags, and locked Markdown ticket writes.
 - **A real web app, not just a viewer.** The orchestrator port serves a
@@ -86,7 +86,7 @@ terminal for.
 - **Teams** parallelizing bug fixes, doc updates, or migration tickets across
   multiple coding agents simultaneously.
 - **Researchers and reviewers** comparing how Codex, Claude Code, Gemini,
-  AGY/Antigravity, Kiro, OpenCode, and Pi tackle the same task side by side,
+  AGY/Antigravity, Kiro, OpenCode, Pi, and Prime Agent tackle the same task side by side,
   with identical prompts and workspaces.
 - **Anyone** who hit the "one chat window per agent" ceiling and wants a
   real orchestrator with a Kanban they can read at a glance.
@@ -124,7 +124,7 @@ Upstream polls a tracker (Linear or a local Markdown Kanban) and runs a Codex
 session inside a per-issue workspace. This fork keeps that orchestrator and
 adds:
 
-1. A pluggable **AgentBackend** layer with seven concrete adapters:
+1. A pluggable **AgentBackend** layer with eight concrete adapters:
    - **Codex** — `codex app-server` (JSON-RPC stdio, multi-turn) — original
    - **Claude Code** — `claude -p --output-format stream-json --verbose`
      (NDJSON events, per-turn subprocess with `--resume`)
@@ -140,6 +140,9 @@ adds:
    - **Pi** — `pi --mode json -p ""` (JSONL events, per-turn subprocess with
      `--session` resume; supports Anthropic / OpenAI / Gemini / Bedrock backends
      under one CLI — see [pi.dev](https://pi.dev))
+   - **Prime Agent** — `prime-agent -p --mode json` (same JSONL protocol as Pi,
+     per-turn subprocess with `--resume` continuity; supports subscriptions and
+     provider API keys — see [Prime Agent](https://github.com/cskwork/prime-agent))
 2. A **Jira-style CLI Kanban TUI** built on [Textual](https://textual.textualize.io).
    Columns are tracker states; cards show the active agent, turn count, last
    event, and accumulated tokens. Cards are focusable, the mouse wheel
@@ -163,7 +166,7 @@ Set `agent.kind` in your `WORKFLOW.md`:
 
 ```yaml
 agent:
-  kind: claude          # codex | claude | gemini | agy | kiro | opencode | pi
+  kind: claude          # codex | claude | gemini | agy | kiro | opencode | pi | prime-agent
 
 claude:
   command: claude -p --output-format stream-json --verbose
@@ -174,10 +177,15 @@ pi:
   command: pi --mode json -p ""
   resume_across_turns: true
   turn_timeout_ms: 3600000
+
+prime_agent:
+  command: prime-agent -p --mode json
+  resume_across_turns: true
+  turn_timeout_ms: 3600000
 ```
 
 Each backend reads its own block (`codex`, `claude`, `gemini`, `agy`, `kiro`,
-`opencode`, `pi`); only the one matching `agent.kind` is used at runtime. The
+`opencode`, `pi`, `prime_agent`); only the one matching `agent.kind` is used at runtime. The
 Codex `linear_graphql`
 client tool is only advertised when `agent.kind=codex`.
 
@@ -191,7 +199,8 @@ agent:
 
 The flat alias `agent_kind: codex` is also accepted for hand-edited cards.
 All backend command and timeout settings still come from the matching global
-`codex:`, `claude:`, `gemini:`, `agy:`, `kiro:`, `opencode:`, or `pi:` block
+`codex:`, `claude:`, `gemini:`, `agy:`, `kiro:`, `opencode:`, `pi:`, or
+`prime_agent:` block
 in `WORKFLOW.md`.
 When creating file-board tickets from the CLI, use
 `symphony board new TASK-2 "title" --agent-kind codex`.
@@ -248,6 +257,7 @@ Make the relevant CLI available on `$PATH`:
 | `kiro`       | `kiro-cli` (Kiro CLI — install from `https://cli.kiro.dev/install`; run `kiro-cli login` or set `KIRO_API_KEY` for headless runs) |
 | `opencode`   | `opencode` (OpenCode CLI — install with `npm install -g opencode-ai`; authenticate providers with `opencode auth login`) |
 | `pi`         | `pi` (Pi coding-agent — `npm i -g @earendil-works/pi-coding-agent` or `curl -fsSL https://pi.dev/install.sh \| sh`; sign in once via `pi` → `/login` (OAuth, credentials cached at `~/.pi/agent/auth.json`) — no env var needed) |
+| `prime-agent` | `prime-agent` (Prime Agent — install with `curl -fsSL https://app.primeintellect.ai/prime-agent/install.sh \| sh`; sign in once via `prime-agent` → `/login`, or provide a provider API key; credentials cached at `~/.prime/agent/auth.json`) |
 
 ## Try it in 60 seconds (no agent CLI required)
 
@@ -939,7 +949,7 @@ If you don't have Linear, use the local Markdown-file tracker
 src/symphony/
   backends/          AgentBackend Protocol + factory + normalized events;
                      codex.py, claude_code.py, gemini.py, agy.py, kiro.py,
-                     opencode.py, pi.py adapters
+                     opencode.py, pi.py, prime_agent.py adapters
   trackers/          TrackerClient Protocol + factory; file.py (locked
                      Markdown ticket mutations), jira.py, linear.py, _retry.py
   workflow/
@@ -993,7 +1003,7 @@ real CLIs are intentionally not in CI — run them locally.
 
 ## Design notes
 
-### Why seven different lifecycles behind one Protocol?
+### Why eight different lifecycles behind one Protocol?
 
 - **Codex** opens one `app-server` subprocess per issue and speaks the
   current `codex app-server` JSON-RPC protocol; multi-turn within one
@@ -1014,6 +1024,13 @@ real CLIs are intentionally not in CI — run them locally.
 - **Pi** spawns a fresh `pi --mode json` per turn with `--session <id>`
   from turn 2 onward; usage is accumulated off `message_end` events. Auth
   is delegated to Pi's own `~/.pi/agent/auth.json` store.
+- **Prime Agent** spawns a fresh `prime-agent -p --mode json` per turn with
+  `--resume <id>` from turn 2 onward; it uses the same JSONL event protocol as
+  Pi and resolves subscriptions/API keys through Prime Agent's auth handling
+  (`~/.prime/agent/auth.json` or provider environment variables).
+  For file-backed boards, a clean exit after the ticket reaches a terminal state
+  is accepted even if Prime Agent closes stdout before flushing `agent_end`; non-zero
+  exits still fail.
 
 The `AgentBackend` Protocol hides these differences. The orchestrator only
 sees normalized events (`session_started`, `turn_completed`, `turn_failed`,

@@ -29,7 +29,7 @@ src/symphony/
 ├── webapi.py            # web board REST routes + static SPA serving
 ├── workspace.py         # git-worktree lifecycle + commit_workspace_on_done
 │
-├── backends/            # agent CLI adapters (codex, claude, gemini, opencode, pi)
+├── backends/            # agent CLI adapters (codex, claude, gemini, opencode, pi, prime_agent)
 ├── cli/                 # `symphony` argparse surface (board, doctor, main)
 ├── notifications/       # opt-in Slack dispatcher
 ├── orchestrator/        # state machine + run registry — see below

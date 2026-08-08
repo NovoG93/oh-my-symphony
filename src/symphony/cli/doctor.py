@@ -133,6 +133,8 @@ def check_agent_cli(cfg: ServiceConfig) -> CheckResult:
         command = cfg.opencode.command
     elif kind == "pi":
         command = cfg.pi.command
+    elif kind == "prime-agent":
+        command = cfg.prime_agent.command
     else:
         return CheckResult(f"agent.kind={kind}", "fail", f"unsupported agent kind {kind!r}")
 
@@ -235,6 +237,41 @@ def check_pi_auth(cfg: ServiceConfig) -> CheckResult:
         " provider env var is set, otherwise every dispatch will fail at the"
         " first turn.",
     )
+
+
+def check_prime_agent_auth(cfg: ServiceConfig) -> CheckResult:
+    """Advisory check for Prime Agent's cached provider credentials.
+
+    Prime Agent can also resolve credentials from provider-specific environment
+    variables, so a missing auth file is only a warning.  Do not parse the
+    file here: this check must not expose or reject provider-specific token
+    formats before the CLI gets a chance to resolve them.
+    """
+    name = "agent.kind=prime-agent.auth"
+    if cfg.agent.kind != "prime-agent":
+        return CheckResult(name, "pass", "not prime-agent (skipped)")
+
+    configured_dir = os.environ.get("PRIME_AGENT_CODING_AGENT_DIR")
+    auth_dir = (
+        Path(configured_dir).expanduser()
+        if configured_dir
+        else Path.home() / ".prime" / "agent"
+    )
+    auth = auth_dir / "auth.json"
+    if auth.exists():
+        return CheckResult(name, "pass", f"{auth} present")
+    return CheckResult(
+        name,
+        "warn",
+        f"{auth} not found — run `prime-agent` and `/login` once, or ensure a"
+        " provider API key is available in the environment; this check is"
+        " advisory because Prime Agent supports multiple auth mechanisms.",
+    )
+
+
+# Keep the shorter name available for callers that refer to the backend as
+# ``prime`` rather than by its configured ``prime-agent`` kind.
+check_prime_auth = check_prime_agent_auth
 
 
 def check_gemini_auth(cfg: ServiceConfig) -> CheckResult:
@@ -709,6 +746,7 @@ def _agent_commands(cfg: ServiceConfig) -> dict[str, str]:
         "kiro": cfg.kiro.command,
         "opencode": cfg.opencode.command,
         "pi": cfg.pi.command,
+        "prime-agent": cfg.prime_agent.command,
     }
 
 # CLIs Symphony can widen on the command line. Every other kind gets the grant
@@ -879,6 +917,7 @@ def run_checks(cfg: ServiceConfig, host: str = "127.0.0.1") -> list[CheckResult]
         check_stage_turn_budget(cfg),
         check_agent_cli(cfg),
         check_pi_auth(cfg),
+        check_prime_agent_auth(cfg),
         check_gemini_auth(cfg),
         check_agy_state_dir(cfg),
         check_kiro_auth(cfg),

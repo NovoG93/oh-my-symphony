@@ -171,7 +171,7 @@ hooks:
     git -C "$HOST_REPO" worktree remove --force "$WORKTREE_PATH" 2>/dev/null || true
 
 agent:
-  kind: codex          # codex | claude | gemini | agy | kiro | opencode | pi
+  kind: codex          # codex | claude | gemini | agy | kiro | opencode | pi | prime-agent
   # Optional per-state backend routing: cheap/fast agents on light lanes,
   # the default `kind` everywhere else. Precedence per dispatch:
   # per-ticket `agent_kind` frontmatter pin > stage_kinds > kind.
@@ -340,6 +340,19 @@ pi:
   # at `~/.pi/agent/auth.json` and inherited by every subprocess Symphony
   # spawns — no env var or `--api-key` flag is needed.
   command: 'pi --mode json -p ""'
+  resume_across_turns: true
+  turn_timeout_ms: 3600000
+  read_timeout_ms: 20000
+  stall_timeout_ms: 300000
+
+prime_agent:
+  # Prime Agent emits the same JSONL protocol as Pi. Symphony appends
+  # `--resume <id>` on continuation turns. Install with the Prime Agent
+  # installer, then authenticate once with `prime-agent` → `/login`.
+  # Credentials are cached at `~/.prime/agent/auth.json`; provider API keys
+  # in the environment are also supported. `symphony doctor` reports a
+  # missing auth file as an advisory warning, not a hard failure.
+  command: 'prime-agent -p --mode json'
   resume_across_turns: true
   turn_timeout_ms: 3600000
   read_timeout_ms: 20000

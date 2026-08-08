@@ -19,6 +19,7 @@ from symphony.cli.doctor import (
     check_gemini_auth,
     check_kiro_auth,
     check_pi_auth,
+    check_prime_agent_auth,
     check_port,
     check_prompts,
     check_stage_turn_budget,
@@ -519,11 +520,12 @@ def test_run_checks_returns_one_result_per_check(tmp_path: Path) -> None:
         """,
     )
     results = run_checks(cfg)
-    # port + shell + max_turns + agent + pi_auth + gemini_auth + agy_state + kiro_auth
-    # + prompts + after_create + workspace + git_history + agent_git_grant
-    # + tracker + board.reachable + deep_merge_contract + stage_contracts
-    # + board.cli + board.dependencies + state.db = 20
-    assert len(results) == 20
+    # port + shell + max_turns + agent + pi_auth + prime_agent_auth
+    # + gemini_auth + agy_state + kiro_auth + prompts + after_create
+    # + workspace + git_history + agent_git_grant + tracker + board.reachable
+    # + deep_merge_contract + stage_contracts + board.cli + board.dependencies
+    # + state.db = 21
+    assert len(results) == 21
     assert {r.name.split("=")[0].split(".")[0] for r in results} >= {
         "agent",
         "hooks",
@@ -542,6 +544,20 @@ def test_pi_auth_skipped_for_non_pi(tmp_path: Path) -> None:
         """,
     )
     result = check_pi_auth(cfg)
+    assert result.status == "pass"
+    assert "skipped" in result.message
+
+
+def test_prime_agent_auth_skipped_for_non_prime_agent(tmp_path: Path) -> None:
+    cfg = _build_cfg(
+        tmp_path,
+        """
+        tracker: { kind: file, board_root: ./kanban }
+        agent: { kind: codex }
+        codex: { command: codex app-server }
+        """,
+    )
+    result = check_prime_agent_auth(cfg)
     assert result.status == "pass"
     assert "skipped" in result.message
 
@@ -631,6 +647,64 @@ def test_pi_auth_passes_when_present(tmp_path: Path, monkeypatch) -> None:
     result = check_pi_auth(cfg)
     assert result.status == "pass"
     assert "auth.json" in result.message
+
+
+def test_prime_agent_auth_warns_when_missing(tmp_path: Path, monkeypatch) -> None:
+    _isolate_home(monkeypatch, tmp_path)
+    monkeypatch.delenv("PRIME_AGENT_CODING_AGENT_DIR", raising=False)
+    cfg = _build_cfg(
+        tmp_path,
+        """
+        tracker: { kind: file, board_root: ./kanban }
+        agent: { kind: prime-agent }
+        prime_agent: { command: 'prime-agent -p --mode json' }
+        """,
+    )
+    result = check_prime_agent_auth(cfg)
+    assert result.status == "warn"
+    assert ".prime" in result.message
+    assert "auth.json" in result.message
+
+
+def test_prime_agent_auth_passes_when_present(tmp_path: Path, monkeypatch) -> None:
+    _isolate_home(monkeypatch, tmp_path)
+    monkeypatch.delenv("PRIME_AGENT_CODING_AGENT_DIR", raising=False)
+    auth = tmp_path / ".prime" / "agent" / "auth.json"
+    auth.parent.mkdir(parents=True)
+    auth.write_text("{}")
+    cfg = _build_cfg(
+        tmp_path,
+        """
+        tracker: { kind: file, board_root: ./kanban }
+        agent: { kind: prime-agent }
+        prime_agent: { command: 'prime-agent -p --mode json' }
+        """,
+    )
+    result = check_prime_agent_auth(cfg)
+    assert result.status == "pass"
+    assert "auth.json" in result.message
+
+
+def test_prime_agent_auth_uses_config_dir_override(
+    tmp_path: Path, monkeypatch
+) -> None:
+    _isolate_home(monkeypatch, tmp_path)
+    auth_dir = tmp_path / "prime-config"
+    monkeypatch.setenv("PRIME_AGENT_CODING_AGENT_DIR", str(auth_dir))
+    auth = auth_dir / "auth.json"
+    auth.parent.mkdir(parents=True)
+    auth.write_text("{}")
+    cfg = _build_cfg(
+        tmp_path,
+        """
+        tracker: { kind: file, board_root: ./kanban }
+        agent: { kind: prime-agent }
+        prime_agent: { command: 'prime-agent -p --mode json' }
+        """,
+    )
+    result = check_prime_agent_auth(cfg)
+    assert result.status == "pass"
+    assert str(auth) in result.message
 
 
 def test_gemini_auth_fails_without_root_auth_or_env(
