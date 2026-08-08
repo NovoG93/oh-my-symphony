@@ -364,6 +364,8 @@ async def test_chat_sessions_plural_crud_and_singular_alias(
     listing = await resp.json()
     assert listing["sessions"] == [] and listing["resumable"] == []
     assert listing["max_sessions"] >= 1
+    assert listing["default_agent_kind"] == "claude"
+    assert "prime-agent" in listing["supported_agent_kinds"]
 
     resp = await client.post("/api/v1/chat/sessions", json={"mode": "qa"})
     assert resp.status == 201

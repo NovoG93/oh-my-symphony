@@ -706,7 +706,8 @@ class ChatManager:
         }
 
     def list_sessions(self) -> dict[str, Any]:
-        """Live sessions plus the ones on disk that could be reattached."""
+        """Live sessions plus creation choices and resumable sessions on disk."""
+        cfg = self._config_provider()
         live = [_session_meta(s) for s in self._sessions.values()]
         resumable = [
             entry
@@ -716,6 +717,8 @@ class ChatManager:
         return {
             "active_id": self._active_id,
             "max_sessions": MAX_SESSIONS,
+            "default_agent_kind": cfg.agent.kind,
+            "supported_agent_kinds": sorted(SUPPORTED_AGENT_KINDS),
             "sessions": live,
             "resumable": resumable,
         }

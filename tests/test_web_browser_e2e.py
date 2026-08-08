@@ -636,13 +636,12 @@ async def _exercise_chat_session(
 async def _exercise_chat_prime_snapshots(
     page: Any, base_url: str, backends: list[_FakeChatBackend]
 ) -> str:
-    response = await page.request.post(
-        f"{base_url}/api/v1/chat/sessions",
-        data={"mode": "qa", "agent_kind": "prime-agent"},
-    )
-    assert response.status == 201
-    session_id = (await response.json())["session_id"]
-    await page.goto(f"{base_url}/#/chat", wait_until="networkidle")
+    await page.get_by_role("button", name="+ New").click()
+    modal = page.locator(".modal-form").last
+    await modal.get_by_label("Agent").select_option("prime-agent")
+    await modal.get_by_role("button", name="Start session").click()
+    listing = await (await page.request.get(f"{base_url}/api/v1/chat/sessions")).json()
+    session_id = listing["active_id"]
     await page.wait_for_function(
         "() => document.querySelectorAll('.chat-tab').length === 3"
     )

@@ -617,8 +617,10 @@ symphony board mv TASK-1 Blocked         # forces a state transition
 
 ## Chat intake — 채팅에 요청하면, 보드가 배달한다
 
-어드민 UI에는 같은 에이전트 CLI가 뒷받침하는 **Chat** 페이지가 있다. 채팅은
-단순 Q&A가 아니다: edit 모드에서 채팅 에이전트는 보드 인테이크 프로토콜을
+어드민 UI에는 같은 에이전트 CLI가 뒷받침하는 **Chat** 페이지가 있다. 새
+세션마다 Claude Code, Codex, Gemini CLI, AGY, Kiro, OpenCode, Pi, Prime Agent 중
+하나를 선택할 수 있으며, 기본값은 워크플로에 설정된 에이전트다. 채팅은 단순
+Q&A가 아니다: edit 모드에서 채팅 에이전트는 보드 인테이크 프로토콜을
 따른다. 요청을 입력하면 에이전트가 (요청이 모호할 때만, 최대 두 턴으로)
 범위를 확인한 뒤, 검증된 보드 도구를 통해 티켓을 등록한다 — 자유 형식
 티켓 markdown은 쓰지 않는다:
