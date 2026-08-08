@@ -1724,6 +1724,9 @@ def test_retryable_persisted_pause_restarts_as_retry(tmp_path, monkeypatch):
         monkeypatch.setattr(restarted._workflow_state, "current", lambda: cfg)
         monkeypatch.setattr(restarted, "_fetch_candidates", _fetch)
         monkeypatch.setattr(restarted, "_archive_sweep", _archive)
+        monkeypatch.setattr(
+            restarted, "_auto_reopen_sources_from_resolved_rcas", _archive
+        )
         monkeypatch.setattr(restarted, "_dispatch", _dispatch)
 
         restarted._ensure_run_registry(cfg)
@@ -1813,6 +1816,9 @@ def test_persisted_retry_attempt_drives_next_dispatch_and_cap(tmp_path, monkeypa
         monkeypatch.setattr(restarted._workflow_state, "current", lambda: cfg)
         monkeypatch.setattr(restarted, "_fetch_candidates", _fetch)
         monkeypatch.setattr(restarted, "_archive_sweep", _archive)
+        monkeypatch.setattr(
+            restarted, "_auto_reopen_sources_from_resolved_rcas", _archive
+        )
         monkeypatch.setattr(restarted, "_dispatch", _dispatch)
         monkeypatch.setattr(restarted, "_escalate_max_retries", _escalate)
 
@@ -5883,6 +5889,130 @@ def test_tick_holds_proven_fix_when_source_reopen_write_fails(monkeypatch):
 
     assert ("FIX-MT-BLOCKED-1", "Human Review") in moved
     assert ("FIX-MT-BLOCKED-1", "Fix Completion Blocked") in notes
+
+
+def test_tick_fails_closed_when_fix_safety_inspection_fails(monkeypatch):
+    cfg = _make_config(
+        tracker_kind="file",
+        active_states=("Todo", "In Progress"),
+        terminal_states=("Human Review", "Done", "Blocked"),
+    )
+    orch = _orch()
+    monkeypatch.setattr(orch._workflow_state, "reload", lambda: (cfg, None))
+    fetched = False
+
+    async def _fetch_candidates(_cfg):
+        nonlocal fetched
+        fetched = True
+        return []
+
+    def _terminal_issues(_cfg):
+        raise OSError("simulated terminal inspection failure")
+
+    monkeypatch.setattr(orch, "_fetch_candidates", _fetch_candidates)
+    monkeypatch.setattr(orch, "_tracker_call_terminal_issues", _terminal_issues)
+
+    asyncio.run(orch._on_tick())
+
+    assert fetched is False
+
+
+def test_tick_demotes_unproven_fix_even_when_explanatory_note_fails(monkeypatch):
+    cfg = _make_config(
+        tracker_kind="file",
+        active_states=("Todo", "In Progress"),
+        terminal_states=("Human Review", "Done", "Blocked"),
+    )
+    source = _issue(
+        "MT-BLOCKED",
+        state="Blocked",
+        description="## Blocked Fix\n\nFix ticket `FIX-MT-BLOCKED-1` opened.",
+    )
+    fix = replace(
+        _issue(
+            "FIX-MT-BLOCKED-1",
+            state="Done",
+            description=core_module._blocked_rca_description(
+                source, reopen_state="Todo"
+            ),
+            labels=("blocked-fix", "source-mt-blocked"),
+        ),
+        title="Fix and unblock MT-BLOCKED: MT-BLOCKED title",
+    )
+    orch = _orch()
+    monkeypatch.setattr(orch._workflow_state, "reload", lambda: (cfg, None))
+    moved: list[tuple[str, str]] = []
+
+    async def _fetch_candidates(_cfg):
+        assert moved == [("FIX-MT-BLOCKED-1", "Human Review")]
+        return []
+
+    async def _archive(_cfg):
+        return None
+
+    def _append(*_args):
+        raise OSError("simulated note write failure")
+
+    monkeypatch.setattr(orch, "_fetch_candidates", _fetch_candidates)
+    monkeypatch.setattr(orch, "_archive_sweep", _archive)
+    monkeypatch.setattr(
+        orch, "_tracker_call_terminal_issues", lambda _cfg: [fix, source]
+    )
+    monkeypatch.setattr(orch, "_tracker_call_append_note", _append)
+    monkeypatch.setattr(
+        orch,
+        "_tracker_call_update_state",
+        lambda _cfg, issue, target: moved.append((issue.identifier, target)),
+    )
+
+    asyncio.run(orch._on_tick())
+
+    assert moved == [("FIX-MT-BLOCKED-1", "Human Review")]
+
+
+def test_tick_fails_closed_when_fix_demotion_fails(monkeypatch):
+    cfg = _make_config(
+        tracker_kind="file",
+        active_states=("Todo", "In Progress"),
+        terminal_states=("Human Review", "Done", "Blocked"),
+    )
+    source = _issue(
+        "MT-BLOCKED",
+        state="Blocked",
+        description="## Blocked Fix\n\nFix ticket `FIX-MT-BLOCKED-1` opened.",
+    )
+    fix = replace(
+        _issue(
+            "FIX-MT-BLOCKED-1",
+            state="Done",
+            description=core_module._blocked_rca_description(
+                source, reopen_state="Todo"
+            ),
+            labels=("blocked-fix", "source-mt-blocked"),
+        ),
+        title="Fix and unblock MT-BLOCKED: MT-BLOCKED title",
+    )
+    orch = _orch()
+    monkeypatch.setattr(orch._workflow_state, "reload", lambda: (cfg, None))
+    fetched = False
+
+    async def _fetch_candidates(_cfg):
+        nonlocal fetched
+        fetched = True
+        return []
+
+    def _move(*_args):
+        raise OSError("simulated demotion write failure")
+
+    monkeypatch.setattr(orch, "_fetch_candidates", _fetch_candidates)
+    monkeypatch.setattr(
+        orch, "_tracker_call_terminal_issues", lambda _cfg: [fix, source]
+    )
+    monkeypatch.setattr(orch, "_tracker_call_update_state", _move)
+
+    asyncio.run(orch._on_tick())
+
+    assert fetched is False
 
 
 @pytest.mark.parametrize("auto_recover", (True, False))
