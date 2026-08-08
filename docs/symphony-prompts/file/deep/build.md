@@ -18,4 +18,4 @@ Write: source + tests in this workspace; append one claim to the vault `claims.m
 
 5. Append `## Implementation` to the ticket: what changed, why, residual risk.
 
-Hard gate: the run-to-prove command passes locally and the claim is recorded. Then set state to `Done`.
+Hard gate: the run-to-prove command passes locally and the claim is recorded. Then set state to `Done` — the orchestrator merges this slice's branch at `Done` so QA/Verify/Document worktrees can see it. This ticket only ran because Review already passed the plan; a merged slice is a *reviewed* slice, not yet a verified one, and Verify's `verdict: RED` reopens it.

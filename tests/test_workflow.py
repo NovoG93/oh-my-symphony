@@ -1529,3 +1529,247 @@ def test_continuous_improvement_ticket_prefix_rejects_invalid(tmp_path, raw_valu
         ConfigValidationError, match="continuous_improvement.ticket_prefix"
     ):
         build_service_config(load_workflow(path))
+
+
+# ---------------------------------------------------------------------------
+# F-02 / review §4.2(2) — agent.stall_timeout_ms_by_state
+# ---------------------------------------------------------------------------
+
+
+def test_build_service_config_reads_stall_timeout_ms_by_state(tmp_path):
+    path = _write(
+        tmp_path,
+        textwrap.dedent(
+            """\
+            ---
+            tracker:
+              kind: file
+              board_root: ./kanban
+              active_states: [Todo, In Progress, Verify]
+              terminal_states: [Done]
+            agent:
+              kind: claude
+              stall_timeout_ms_by_state:
+                Verify: 900000
+                " In Progress ": 600000
+            ---
+            body
+            """
+        ),
+    )
+
+    cfg = build_service_config(load_workflow(path))
+
+    assert cfg.agent.stall_timeout_ms_by_state == {
+        "verify": 900_000,
+        "in progress": 600_000,
+    }
+    assert cfg.agent.stall_timeout_ms_for_state("Verify", 300_000) == 900_000
+    assert cfg.agent.stall_timeout_ms_for_state("Todo", 300_000) == 300_000
+    assert cfg.agent.stall_timeout_ms_for_state(None, 300_000) == 300_000
+
+
+def test_stall_timeout_ms_by_state_defaults_empty(tmp_path):
+    path = _write(
+        tmp_path,
+        textwrap.dedent(
+            """\
+            ---
+            tracker:
+              kind: file
+              board_root: ./kanban
+            ---
+            body
+            """
+        ),
+    )
+
+    cfg = build_service_config(load_workflow(path))
+
+    assert cfg.agent.stall_timeout_ms_by_state == {}
+
+
+def test_stall_timeout_ms_by_state_drops_invalid_values(tmp_path):
+    path = _write(
+        tmp_path,
+        textwrap.dedent(
+            """\
+            ---
+            tracker:
+              kind: file
+              board_root: ./kanban
+              active_states: [Todo, Verify]
+              terminal_states: [Done]
+            agent:
+              stall_timeout_ms_by_state:
+                Verify: 900000
+                Todo: 0
+                Bogus: not-a-number
+            ---
+            body
+            """
+        ),
+    )
+
+    cfg = build_service_config(load_workflow(path))
+
+    assert cfg.agent.stall_timeout_ms_by_state == {"verify": 900_000}
+
+
+def test_stall_timeout_ms_by_state_rejects_non_map(tmp_path):
+    path = _write(
+        tmp_path,
+        textwrap.dedent(
+            """\
+            ---
+            tracker:
+              kind: file
+              board_root: ./kanban
+            agent:
+              stall_timeout_ms_by_state: 900000
+            ---
+            body
+            """
+        ),
+    )
+
+    with pytest.raises(ConfigValidationError, match="stall_timeout_ms_by_state"):
+        build_service_config(load_workflow(path))
+
+
+def test_stall_timeout_ms_by_state_unknown_state_warns_but_loads(tmp_path):
+    import io
+
+    from symphony.logging import get_logger
+
+    path = _write(
+        tmp_path,
+        textwrap.dedent(
+            """\
+            ---
+            tracker:
+              kind: file
+              board_root: ./kanban
+              active_states: [Todo]
+              terminal_states: [Done]
+            agent:
+              stall_timeout_ms_by_state:
+                Nonexistent: 900000
+            ---
+            body
+            """
+        ),
+    )
+    buf = io.StringIO()
+    logger = get_logger()
+    logger.add_stream(buf)
+    try:
+        cfg = build_service_config(load_workflow(path))
+    finally:
+        logger._streams.remove(buf)
+
+    assert cfg.agent.stall_timeout_ms_by_state == {"nonexistent": 900_000}
+    assert "agent_stall_timeout_unknown_state" in buf.getvalue()
+
+
+# ---------------------------------------------------------------------------
+# F-06 — agent.stage_contracts: auto | on | off (explicit + observable)
+# ---------------------------------------------------------------------------
+
+
+def _contracts_cfg(tmp_path, *, lanes: str, mode: str | None = None):
+    setting = f"  stage_contracts: {mode}\n" if mode is not None else ""
+    tmp_path.mkdir(parents=True, exist_ok=True)
+    return _write(
+        tmp_path,
+        "---\n"
+        "tracker:\n"
+        "  kind: file\n"
+        "  board_root: ./kanban\n"
+        f"  active_states: [{lanes}]\n"
+        "  terminal_states: [Done]\n"
+        "agent:\n"
+        "  kind: codex\n"
+        "  max_turns: 20\n"
+        f"{setting}"
+        "---\n"
+        "body\n",
+    )
+
+
+def test_stage_contracts_defaults_to_auto_and_follows_the_lane_heuristic(tmp_path):
+    default_board = build_service_config(
+        load_workflow(_contracts_cfg(tmp_path / "a", lanes="Todo, In Progress, Verify, Document"))
+    )
+    assert default_board.agent.stage_contracts == "auto"
+    assert default_board.agent.stage_contracts_enabled(
+        default_board.tracker.active_states
+    )
+
+    renamed = build_service_config(
+        load_workflow(_contracts_cfg(tmp_path / "b", lanes="Todo, In Progress, Verify, Docs"))
+    )
+    assert not renamed.agent.stage_contracts_enabled(renamed.tracker.active_states)
+
+
+def test_stage_contracts_on_enforces_a_renamed_lane_board(tmp_path):
+    cfg = build_service_config(
+        load_workflow(
+            _contracts_cfg(tmp_path, lanes="Todo, In Progress, Verify, Docs", mode="on")
+        )
+    )
+    assert cfg.agent.stage_contracts_enabled(cfg.tracker.active_states)
+
+
+def test_stage_contracts_off_disables_a_default_lane_board(tmp_path):
+    cfg = build_service_config(
+        load_workflow(
+            _contracts_cfg(
+                tmp_path, lanes="Todo, In Progress, Verify, Document", mode="off"
+            )
+        )
+    )
+    assert not cfg.agent.stage_contracts_enabled(cfg.tracker.active_states)
+
+
+def test_stage_contracts_rejects_unknown_mode(tmp_path):
+    path = _contracts_cfg(tmp_path, lanes="Todo, In Progress", mode="sometimes")
+    with pytest.raises(ConfigValidationError, match="stage_contracts"):
+        build_service_config(load_workflow(path))
+
+
+def test_stage_contracts_auto_disable_is_logged_once_per_load(tmp_path):
+    """Renaming a lane silently removed the evidence floor — now it is loud."""
+    import io
+
+    from symphony.logging import get_logger
+
+    path = _contracts_cfg(tmp_path, lanes="Todo, In Progress, Verify, Docs")
+    buf = io.StringIO()
+    logger = get_logger()
+    logger.add_stream(buf)
+    try:
+        build_service_config(load_workflow(path))
+    finally:
+        logger._streams.remove(buf)
+
+    output = buf.getvalue()
+    assert "stage_contracts_disabled" in output
+    assert "Docs" in output
+
+
+def test_stage_contracts_enabled_board_logs_nothing(tmp_path):
+    import io
+
+    from symphony.logging import get_logger
+
+    path = _contracts_cfg(tmp_path, lanes="Todo, In Progress, Verify, Document")
+    buf = io.StringIO()
+    logger = get_logger()
+    logger.add_stream(buf)
+    try:
+        build_service_config(load_workflow(path))
+    finally:
+        logger._streams.remove(buf)
+
+    assert "stage_contracts_disabled" not in buf.getvalue()

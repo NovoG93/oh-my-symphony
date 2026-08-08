@@ -623,7 +623,10 @@ def test_stage_kinds_route_backend_kind_into_backend_factory(
         max_turns=2,
     )
     cfg = replace(
-        cfg, agent=replace(cfg.agent, stage_kinds={"in progress": "claude"})
+        cfg,
+        agent=replace(
+            cfg.agent, stage_kinds={"in progress": "claude", "verify": "gemini"}
+        ),
     )
 
     instances = _install_file_tracker_backend(
@@ -644,3 +647,16 @@ def test_stage_kinds_route_backend_kind_into_backend_factory(
 
     assert instances, "backend factory was never called"
     assert instances[0].calls[0] == ("factory", {"agent_kind": "claude"})
+    # F-01: a ticket that walks In Progress -> Verify inside ONE dispatch must
+    # get Verify's backend on the rebuild, not the lane it started in.
+    assert len(instances) > 1, (
+        "phase transition did not rebuild a backend; the routing assertion "
+        "below would be vacuous"
+    )
+    assert instances[1].calls[0] == ("factory", {"agent_kind": "gemini"}), (
+        "stage_kinds was not re-resolved at the in-run phase transition — "
+        f"got {instances[1].calls[0]!r}"
+    )
+    entry = o._running.get("MT-1")
+    if entry is not None:
+        assert entry.agent_kind == "gemini"

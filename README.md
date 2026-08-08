@@ -200,8 +200,28 @@ Between the ticket pin and the global default sits optional per-state routing:
 `agent.stage_kinds` maps board states to agent kinds so cheap/fast agents can
 own light lanes (e.g. `Todo: gemini`, `Document: gemini`) while a strong default
 handles Plan/Build/Review. Resolution per dispatch: ticket `agent_kind` pin >
-`agent.stage_kinds[state]` > `agent.kind`. A ticket that changes state gets the
-new stage's backend on its next dispatch.
+`agent.stage_kinds[state]` > `agent.kind`. The backend is re-resolved at every
+stage change, including the in-run lane transitions a single dispatch walks, so
+a ticket that goes In Progress → Verify → Document inside one dispatch gets each
+lane's configured backend.
+
+### Heavy stages
+
+A lane that runs a full test suite or a long build goes quiet for minutes at a
+time. The stall detector cancels a worker that produced no progress event
+within its backend's `stall_timeout_ms`; widening that value widens it for
+every lane. `agent.stall_timeout_ms_by_state` widens just the heavy lanes:
+
+```yaml
+agent:
+  stall_timeout_ms_by_state:
+    Verify: 900000     # 15 min of silence is normal while the suite runs
+```
+
+The budget is resolved against the backend the ticket actually runs on (its
+`agent_kind` pin or its `stage_kinds` route), not the workflow default, so
+raising `claude.stall_timeout_ms` now takes effect for claude-pinned tickets on
+a codex-default board.
 
 For file-board workflows, `agent.auto_triage_actionable_todo` defaults to
 `true`: a Todo ticket with a body and an `Acceptance Criteria` section moves to
@@ -610,6 +630,53 @@ Boards start from a preset and stay fully customizable:
   Build/QA/Verify/Document ticket DAG via `symphony board new
   --blocked-by --request`.
 
+### Deep preset merge contract
+
+Every deep lane is a separate ticket, so every lane gets its own worktree on
+its own `symphony/<ID>` branch. A downstream lane can only see a Build slice
+that has already landed on the branch its worktree was cut from, which makes
+the branch policy part of the preset's contract:
+
+```yaml
+agent:
+  auto_merge_on_done: true        # the orchestrator merges each ticket at Done
+  feature_base_branch: ""         # both empty = the host's current branch
+  auto_merge_target_branch: ""    # must resolve to the SAME branch
+```
+
+- The **orchestrator** merges a ticket's branch when the ticket reaches
+  `Done`. No lane merges by hand — Verify proves, Document documents.
+- Build merges are gated by the **Review** lane's `verdict: PASS` (spawned
+  Build tickets stay `blocked_by` the request ticket, which only reaches
+  `Done` after Review passes), *not* by Verify. A merged slice is a reviewed
+  slice, not yet a verified one.
+- A Verify `verdict: RED` reopens the offending Build tickets and holds
+  delivery: `DOCUMENT-*` has its own `verdict: GREEN` gate, so it cannot run
+  until the reopened slice is re-built, re-merged and re-verified.
+
+`symphony doctor` reports this as `board.deep_merge_contract` and fails when
+a deep board disables `auto_merge_on_done` or points the feature base and the
+merge target at different branches.
+
+### Stage contracts on a customized board
+
+The mechanical evidence floor (`orchestrator/contracts.py`) is gated by
+`agent.stage_contracts`:
+
+| value            | behaviour                                                        |
+|------------------|------------------------------------------------------------------|
+| `auto` (default) | enforce when every active lane is a default-preset lane          |
+| `on`             | always enforce, whatever the lanes are called                    |
+| `off`            | never enforce; the stage prompts are the only gate               |
+
+Under `auto`, renaming a lane (`Document` → `Docs`) turns the validator off —
+your prompts become the gate. That is a legitimate choice, but it is never
+silent: the decision is logged as `stage_contracts_disabled` at every config
+load, reported by `symphony doctor` as `agent.stage_contracts`, exposed on
+`GET /api/v1/workflow` (`agent.stage_contracts_enabled`), and shown as a hint
+on the Settings page. Set `stage_contracts: on` to keep the shipped contracts
+on a renamed board.
+
 Switch presets from the web app's **Settings** page, or via
 `GET /api/v1/workflow/presets` + `POST /api/v1/workflow/presets/apply`.
 Applying a preset round-trips through the same comment-preserving
@@ -830,7 +897,7 @@ buttons and the header refresh button triggers an orchestrator
 `poll + reconcile`. The header also
 shows real local git branch dropdowns for `agent.feature_base_branch` and
 `agent.auto_merge_target_branch`, so operators can choose where new feature
-branches start and where Document merges land without editing YAML by hand.
+branches start and where the Done merge lands without editing YAML by hand.
 
 #### One-shot launchers
 

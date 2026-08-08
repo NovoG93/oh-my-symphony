@@ -38,7 +38,9 @@ IN_PROGRESS_RULES = (
 )
 
 VERIFY_RULES = (
-    "Verify has three jobs: review, QA, and merge preflight/merge",
+    "Verify has three jobs: review, QA, and merge preflight",
+    # F-10: exactly one merge per ticket, created by the orchestrator at Done.
+    "Verify proves, Document documents, the orchestrator merges",
     "what worked",
     "what failed",
     "what is not covered",
@@ -217,6 +219,11 @@ def test_verify_stage_demands_review_qa_and_merge_evidence(workflow: str) -> Non
         assert phrase in rendered
     assert "Do not use `git status -uno --porcelain` as merge proof" in rendered
     assert "set state to `In Progress`" in rendered
+    # F-10: the Verify lane must not hand-merge — that produced two merge
+    # commits per ticket and landed code before Document wrote the wiki.
+    assert "orchestrator will merge at Done" in rendered
+    assert "Do NOT create the merge commit yourself" in rendered
+    assert "create the explicit `--no-ff` merge commit" not in rendered
 
 
 @pytest.mark.parametrize("workflow", WORKFLOW_FILES)

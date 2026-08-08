@@ -107,7 +107,7 @@ from .constants import (
     WAIT_AGE_BUMP_MIN,
     _TOKEN_EMA_ALPHA,
 )
-from .contracts import board_uses_default_contracts, evaluate_contract
+from .contracts import evaluate_contract
 from .dispatch_state import DispatchState
 from .entries import RetryEntry, RunningEntry, _CodexTotals, _IssueDebug
 from .executors import LegacyStageExecutor, TicketExecutor, TicketRunContext
@@ -166,6 +166,11 @@ _RETRYABLE_WORKER_ERROR_MARKERS = (
     "connection reset",
     "connection timed out",
     "try again later",
+    # Transient backend stream faults (acceptance finding 3). The strings
+    # below are emitted verbatim by the backends; `test_backend_contract.py`
+    # pins them so the two lists cannot drift apart.
+    "stream unreadable",  # claude_code.py / codex.py / pi.py
+    "no result event",  # claude_code.py — rc!=0 with no result frame
 )
 
 
@@ -3901,7 +3906,12 @@ class Orchestrator:
         outcome: str = "normal"
         error: str | None = None
         try:
-            cfg = _config_for_issue_agent(cfg, issue)
+            # Keep the *unrouted* workflow config: `agent.stage_kinds` must be
+            # re-resolved at every in-run phase transition, and re-resolving
+            # against an already-routed cfg would pin the first lane's backend
+            # for the whole dispatch (the normal Todo→…→Document path).
+            base_cfg = cfg
+            cfg = _config_for_issue_agent(base_cfg, issue)
             running = self._running.get(running_issue_id)
             if running is not None:
                 running.agent_kind = cfg.agent.kind
@@ -4080,7 +4090,7 @@ class Orchestrator:
                             # Failure note, and treat the situation as
                             # a forced rewind so the rebuild + budget
                             # bookkeeping below still apply.
-                            if not is_rewind and board_uses_default_contracts(
+                            if not is_rewind and cfg.agent.stage_contracts_enabled(
                                 cfg.tracker.active_states
                             ):
                                 if prev_phase_state in {
@@ -4223,6 +4233,24 @@ class Orchestrator:
                             if running_entry is not None:
                                 running_entry.consecutive_empty_turns = 0
                                 running_entry.hit_empty_response_loop = False
+                            # F-01: route the *new* lane's backend. The ticket
+                            # walks several states inside one dispatch, so the
+                            # kind must be re-resolved from the unrouted config
+                            # here — not reused from the lane we started in.
+                            phase_cfg = _config_for_issue_agent(base_cfg, issue)
+                            if phase_cfg.agent.kind != cfg.agent.kind:
+                                log.info(
+                                    "stage_backend_rerouted",
+                                    issue_id=issue.id,
+                                    identifier=issue.identifier,
+                                    from_state=prev_phase_state,
+                                    to_state=current_state,
+                                    from_kind=cfg.agent.kind,
+                                    to_kind=phase_cfg.agent.kind,
+                                )
+                            cfg = phase_cfg
+                            if running_entry is not None:
+                                running_entry.agent_kind = cfg.agent.kind
                             client, first_prompt = await self._rebuild_backend_for_phase(
                                 issue=issue,
                                 running_issue_id=running_issue_id,
@@ -6144,13 +6172,33 @@ class Orchestrator:
             entry.worker_task.cancel()
         entry.cancelled_at = now
 
+    def _stall_timeout_ms_for_entry(
+        self, cfg: ServiceConfig, entry: RunningEntry
+    ) -> int:
+        """Stall budget for one running worker.
+
+        F-02: `cfg.backend_timeouts()` keys off the *workflow default*
+        backend, so a ticket pinned (or stage-routed) to another backend was
+        cancelled on the wrong backend's clock — a claude worker configured
+        for 900 s died at codex's 300 s. Resolve per entry, then let
+        `agent.stall_timeout_ms_by_state` widen it for heavy lanes.
+        """
+        entry_cfg = _config_for_issue_agent(cfg, entry.issue)
+        kind = entry.agent_kind or entry_cfg.agent.kind
+        if kind != entry_cfg.agent.kind:
+            entry_cfg = replace(entry_cfg, agent=replace(entry_cfg.agent, kind=kind))
+        _, _, stall_timeout_ms = entry_cfg.backend_timeouts()
+        return cfg.agent.stall_timeout_ms_for_state(
+            entry.issue.state, stall_timeout_ms
+        )
+
     async def _reconcile_running(self, cfg: ServiceConfig) -> None:
         # Part A: isolate each heartbeat/stall/eject lifecycle.
-        _, _, stall_timeout_ms = cfg.backend_timeouts()
         now = datetime.now(timezone.utc)
         for issue_id, entry in list(self._running.items()):
             try:
                 self._heartbeat_run_lease(issue_id, entry)
+                stall_timeout_ms = self._stall_timeout_ms_for_entry(cfg, entry)
                 if stall_timeout_ms > 0:
                     self._reconcile_stall_state(
                         issue_id,

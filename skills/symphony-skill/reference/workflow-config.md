@@ -104,8 +104,8 @@ agent:
 ```
 
 Resolution per dispatch: ticket `agent_kind` pin > `agent.stage_kinds[state]`
-> `agent.kind`. A ticket that changes state gets the new stage's backend on
-its next dispatch.
+> `agent.kind`. The backend is re-resolved at every stage change, including the
+in-run lane transitions one dispatch walks.
 
 ### Codex workspace sandbox and package registries
 

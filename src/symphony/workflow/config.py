@@ -206,6 +206,42 @@ class AgentConfig:
     # Review). Resolution order at dispatch: explicit dispatch arg >
     # per-ticket `agent_kind` frontmatter pin > this map > `kind`.
     stage_kinds: dict[str, str] = field(default_factory=dict)
+    # Whether the shipped stage-contract validator (the mechanical evidence
+    # floor in `orchestrator/contracts.py`) runs on this board.
+    #   "auto" (default) — on when every active lane is a default-preset lane
+    #                      (Todo / In Progress / Verify / Document, plus the
+    #                      legacy `Learn`), off otherwise. Renaming a lane
+    #                      therefore disables it — which is why the decision
+    #                      is logged, reported by doctor and exposed on the
+    #                      workflow API instead of being silent.
+    #   "on"            — always enforce, whatever the lanes are called.
+    #   "off"           — never enforce; the prompts are the only gate.
+    stage_contracts: str = "auto"
+    # Optional per-state stall budget, in milliseconds. Keys are tracker
+    # state names lowercased by the parser (e.g. "verify"). Heavy lanes
+    # (a Verify that runs a full suite, a Build that compiles) can legally
+    # go quiet far longer than a light lane; without this the operator has
+    # to raise the *backend's* stall_timeout_ms for every lane at once.
+    # Falls back to the resolved backend's `stall_timeout_ms`.
+    stall_timeout_ms_by_state: dict[str, int] = field(default_factory=dict)
+
+    def stage_contracts_enabled(self, active_states: "tuple[str, ...]") -> bool:
+        """Resolve `agent.stage_contracts` against the board's lanes."""
+        from ..orchestrator.contracts import board_uses_default_contracts
+
+        mode = (self.stage_contracts or "auto").strip().lower()
+        if mode == "on":
+            return True
+        if mode == "off":
+            return False
+        return board_uses_default_contracts(active_states)
+
+    def stall_timeout_ms_for_state(self, state: str | None, fallback: int) -> int:
+        """Per-state stall budget with fallback to the backend's value."""
+        value = self.stall_timeout_ms_by_state.get(_normalize_state_key(state or ""))
+        if value is None or value <= 0:
+            return fallback
+        return value
 
     def kind_for_state(self, state: str | None, ticket_pin: str | None = None) -> str:
         """Resolve the backend for a dispatch of a ticket in `state`.

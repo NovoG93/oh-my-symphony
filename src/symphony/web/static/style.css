@@ -731,6 +731,7 @@ a { color: inherit; }
 .form-group { display: flex; flex-direction: column; gap: 0.3704rem; }
 .form-label { font-size: 0.8889rem; font-weight: 600; color: var(--text-secondary); }
 .form-hint { font-size: 0.8889rem; color: var(--text-muted); }
+.form-hint-warn { color: var(--warning); }
 
 .confirm-message { margin: 0; line-height: 1.5; }
 

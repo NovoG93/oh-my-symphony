@@ -427,3 +427,92 @@ def test_graph_exits_nonzero_and_prints_cycle(
     err = capsys.readouterr().err
     assert "dependency cycle" in err
     assert "CYC-1" in err and "CYC-2" in err
+
+
+# ---------------------------------------------------------------------------
+# F-03 — identifier validation (path escape, shell metacharacters, length)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "bad_id",
+    [
+        "../../evil",
+        "../escape",
+        "sub/dir",
+        "back\\slash",
+        "A 5; echo pwned",
+        "",
+        "   ",
+        "1-leading-digit",
+        "TKT.1",
+        "A" * 65,
+    ],
+)
+def test_new_rejects_malformed_identifier(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], bad_id: str
+) -> None:
+    workflow = _make_workflow(tmp_path)
+    rc = board_cli.main(["new", "--workflow", str(workflow), bad_id, "escape"])
+    assert rc == 1
+    assert "must match" in capsys.readouterr().err
+
+
+def test_new_path_escape_writes_nothing_outside_board_root(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The exact probe from the review: `board new ../../evil` must not write."""
+    board = tmp_path / "nested" / "board"
+    board.mkdir(parents=True)
+    rc = board_cli.main(["new", "--root", str(board), "../../evil", "escape"])
+    assert rc == 1
+    assert not (tmp_path / "evil.md").exists()
+    assert not (tmp_path / "nested" / "evil.md").exists()
+    assert list(board.glob("*.md")) == []
+    assert "must match" in capsys.readouterr().err
+
+
+def test_new_rejects_malformed_blocked_by_target(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    workflow = _make_workflow(tmp_path)
+    board_cli.main(["new", "--workflow", str(workflow), "TKT-1", "root"])
+    capsys.readouterr()
+    rc = board_cli.main(
+        [
+            "new",
+            "--workflow",
+            str(workflow),
+            "TKT-2",
+            "child",
+            "--blocked-by",
+            "../../evil",
+        ]
+    )
+    assert rc == 1
+    assert "must match" in capsys.readouterr().err
+
+
+def test_tracker_create_rejects_malformed_identifier_directly(tmp_path: Path) -> None:
+    """Defence in depth: the tracker refuses even when the CLI is bypassed."""
+    from symphony.errors import BoardDependencyError
+    from symphony.trackers.file import FileBoardTracker
+
+    board = tmp_path / "board"
+    board.mkdir()
+    tracker = FileBoardTracker(board_cli._tracker_from_root(board))
+    with pytest.raises(BoardDependencyError):
+        tracker.create(identifier="../../evil", title="escape")
+    assert not (tmp_path / "evil.md").exists()
+
+
+def test_tracker_update_fields_rejects_malformed_identifier(tmp_path: Path) -> None:
+    from symphony.errors import BoardDependencyError
+    from symphony.trackers.file import FileBoardTracker
+
+    board = tmp_path / "board"
+    board.mkdir()
+    tracker = FileBoardTracker(board_cli._tracker_from_root(board))
+    tracker.create(identifier="TKT-1", title="ok")
+    with pytest.raises(BoardDependencyError):
+        tracker.update_fields("../TKT-1", title="hijacked")

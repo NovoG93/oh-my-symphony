@@ -62,7 +62,7 @@ hooks:
     # NEVER `git reset --hard` inside a worktree — discards mid-run work.
     set -uo pipefail
     HOST_REPO="${SYMPHONY_WORKFLOW_DIR:?SYMPHONY_WORKFLOW_DIR not set}"
-    for dir in kanban; do
+    for dir in ${SYMPHONY_BOARD_ROOT_NAME:-kanban}; do
       source="$HOST_REPO/$dir"
       target="$PWD/$dir"
       [ -e "$source" ] || continue
@@ -243,6 +243,15 @@ agent:
   # on the (max_attempts+1)th rewind, it moves the ticket to Blocked
   # instead of starting another In Progress pass. Set to 0 to disable.
   max_attempts: 3
+  # Mechanical evidence floor (orchestrator/contracts.py):
+  #   auto (default) — enforce only when every active lane is a default-preset
+  #                    lane (Todo / In Progress / Verify / Document). Renaming
+  #                    a lane therefore turns it OFF — logged as
+  #                    `stage_contracts_disabled` and reported by
+  #                    `symphony doctor`, never silent.
+  #   on             — enforce whatever the lanes are called.
+  #   off            — never enforce; the stage prompts are the only gate.
+  stage_contracts: auto
   # File-board optimization: obvious Todo tickets with Acceptance Criteria
   # are routed to In Progress by Symphony itself, saving a model turn. Bug
   # tickets, blocked tickets, and underspecified tickets still run Todo.
@@ -256,6 +265,12 @@ agent:
   max_total_tokens_by_state:
     "In Progress": 500000000
     Verify: 500000000
+  # Per-lane stall budget (ms). A heavy lane can legally go quiet far longer
+  # than a light one — a Verify that runs a full suite emits nothing for
+  # minutes. Falls back to the resolved backend's `stall_timeout_ms`, so this
+  # is the knob to reach for instead of widening every lane at once.
+  # stall_timeout_ms_by_state:
+  #   Verify: 900000
   # Merge policy for the Verify -> Document gate. Verify must merge the
   # `symphony/<ID>` feature branch into the target branch before setting
   # Document. A human later confirms the card to Done from the TUI (`c`) or

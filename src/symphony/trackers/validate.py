@@ -7,10 +7,31 @@ ticket is created or updated with `blocked_by` edges.
 
 from __future__ import annotations
 
+import re
 from typing import Mapping, Sequence
 
 from ..errors import BoardDependencyError
 from ..issue import Issue
+
+IDENTIFIER_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_-]{0,63}$")
+IDENTIFIER_RULE = "^[A-Za-z][A-Za-z0-9_-]{0,63}$"
+
+
+def validate_identifier(raw: str, *, field: str = "identifier") -> str:
+    """Whitelist a ticket identifier before it ever touches the filesystem.
+
+    Every board write builds `board_root / f"{identifier}.md"`, so an
+    identifier carrying `/`, `\\` or `..` escapes the board root. The CLI,
+    the web API and `FileBoardTracker` all funnel through this one gate so
+    they cannot drift apart (defence in depth).
+    """
+    identifier = (raw or "").strip()
+    if not IDENTIFIER_RE.match(identifier):
+        raise BoardDependencyError(
+            f"{field} must match {IDENTIFIER_RULE}",
+            identifier=identifier or "<empty>",
+        )
+    return identifier
 
 
 def blocker_ids(issue: Issue) -> list[str]:
@@ -140,6 +161,10 @@ def validate_ticket_dependencies(
     ``identifier=None`` means "id will be freshly generated": nothing can
     reference it yet, so only blocker existence is checked.
     """
+    if identifier is not None:
+        identifier = validate_identifier(identifier)
+    for target in blocked_by:
+        validate_identifier(target, field="blocked_by target")
     known = {issue.identifier for issue in issues}
     if new_ticket and identifier is not None and identifier in known:
         raise BoardDependencyError(

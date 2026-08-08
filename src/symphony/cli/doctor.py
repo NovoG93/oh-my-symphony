@@ -46,6 +46,7 @@ from ..workflow import (
     resolve_workflow_path,
 )
 from ..workflow.preflight import stage_turn_budget_error
+from ..workflow.presets import guess_lane_preset
 
 
 Status = Literal["pass", "warn", "fail"]
@@ -399,6 +400,143 @@ def check_after_create_hook(cfg: ServiceConfig) -> CheckResult:
     return CheckResult("hooks.after_create", "pass", "looks customized")
 
 
+_HOOK_SCRIPT_RE = re.compile(r"[\w./$@{}-]*\.sh\b")
+
+
+def _hook_script_text(cfg: ServiceConfig, hook: str) -> str:
+    """Hook text plus the bodies of any `*.sh` scripts it invokes.
+
+    The shipped `after_create` is one line (`bash "$SYMPHONY_WORKFLOW_DIR/
+    scripts/symphony-setup-worktree.sh"`), so grepping the hook alone tells
+    us nothing about which directories it links.
+    """
+    parts = [hook]
+    workflow_dir = cfg.workflow_path.parent
+    for raw in _HOOK_SCRIPT_RE.findall(hook):
+        relative = raw.replace("$SYMPHONY_WORKFLOW_DIR", "").replace(
+            "${SYMPHONY_WORKFLOW_DIR}", ""
+        )
+        candidate = (workflow_dir / relative.lstrip("/")).resolve()
+        try:
+            if candidate.is_file():
+                parts.append(candidate.read_text(encoding="utf-8"))
+        except OSError:  # pragma: no cover - unreadable script
+            continue
+    return "\n".join(parts)
+
+
+def check_board_reachable_from_workspace(cfg: ServiceConfig) -> CheckResult:
+    """Can a dispatched worker write to the *host* board from its workspace?
+
+    Acceptance finding 1: the shipped setup hook used to link a directory
+    literally named `kanban`. On any other `tracker.board_root` the worker
+    silently got a private board copy, its state transitions never reached
+    the orchestrator, and the ticket was re-dispatched forever. Static check
+    only — it greps the hook and the scripts the hook runs.
+    """
+    name = "board.reachable"
+    if cfg.tracker.kind != "file":
+        return CheckResult(name, "pass", f"tracker.kind={cfg.tracker.kind} (skipped)")
+    root = cfg.tracker.board_root
+    if root is None:
+        return CheckResult(name, "fail", "file tracker has no board_root")
+    if not root.exists():
+        return CheckResult(
+            name, "fail", f"{root} does not exist — run `symphony board init {root}`"
+        )
+    workflow_dir = cfg.workflow_path.parent.resolve()
+    try:
+        board_name = root.resolve().relative_to(workflow_dir).as_posix()
+    except ValueError:
+        return CheckResult(
+            name, "pass", f"{root} is outside {workflow_dir}; workers use the host path"
+        )
+    hook = cfg.hooks.after_create or ""
+    if not hook.strip():
+        return CheckResult(
+            name, "pass", "no after_create hook; workspace is not a worktree"
+        )
+    text = _hook_script_text(cfg, hook)
+    if "SYMPHONY_BOARD_ROOT_NAME" in text or re.search(
+        rf"(?<![\w/-]){re.escape(board_name)}(?![\w-])", text
+    ):
+        return CheckResult(name, "pass", f"after_create links {board_name}/")
+    return CheckResult(
+        name,
+        "warn",
+        f"after_create never mentions the board root {board_name!r} — workers "
+        "may get a private board copy and the ticket will be re-dispatched "
+        "forever. Use ${SYMPHONY_BOARD_ROOT_NAME:-kanban} in the link loop.",
+    )
+
+def check_deep_preset_merge_contract(cfg: ServiceConfig) -> CheckResult:
+    """Deep-preset boards need a coherent single-merge branch policy.
+
+    Every deep lane is its own ticket, hence its own worktree on its own
+    `symphony/<ID>` branch. QA/Verify/Document can only see a Build slice
+    that already merged, so the preset requires `auto_merge_on_done` plus a
+    feature base that resolves to the merge target. Without it, either
+    unverified work never reaches the downstream lanes, or they re-prove a
+    tree that does not contain the code.
+    """
+    name = "board.deep_merge_contract"
+    if guess_lane_preset(cfg.tracker.active_states) != "deep":
+        return CheckResult(name, "pass", "not a deep-preset board (skipped)")
+    if not cfg.agent.auto_merge_on_done:
+        return CheckResult(
+            name,
+            "fail",
+            "deep preset requires agent.auto_merge_on_done: true — Build "
+            "slices never reach the QA/Verify/Document worktrees otherwise",
+        )
+    base = (cfg.agent.feature_base_branch or "").strip()
+    target = (cfg.agent.auto_merge_target_branch or "").strip()
+    if base != target:
+        return CheckResult(
+            name,
+            "fail",
+            f"deep preset requires feature_base_branch ({base or '<current>'}) "
+            f"== auto_merge_target_branch ({target or '<current>'}) — new "
+            "worktrees must start from the branch the merges land on",
+        )
+    return CheckResult(
+        name,
+        "pass",
+        f"auto_merge_on_done on, base == target ({base or '<current branch>'})",
+    )
+
+def check_stage_contracts(cfg: ServiceConfig) -> CheckResult:
+    """Report whether the mechanical evidence floor runs on this board.
+
+    F-06: with `agent.stage_contracts: auto` (the default), renaming any
+    default lane turns the whole stage-contract validator off. That is a
+    legal outcome of a customized board, but it silently removes the
+    product's evidence floor — so it gets a row here.
+    """
+    from ..orchestrator.contracts import board_uses_default_contracts
+
+    name = "agent.stage_contracts"
+    mode = (cfg.agent.stage_contracts or "auto").strip().lower()
+    enabled = cfg.agent.stage_contracts_enabled(cfg.tracker.active_states)
+    if enabled:
+        return CheckResult(name, "pass", f"{mode}: contracts enforced")
+    if mode == "off":
+        return CheckResult(
+            name, "warn", "off: no mechanical evidence gate; prompts are the only gate"
+        )
+    offending = [
+        state
+        for state in cfg.tracker.active_states
+        if not board_uses_default_contracts((state,))
+    ]
+    return CheckResult(
+        name,
+        "warn",
+        "auto: contracts disabled because these lanes are not default-preset "
+        f"lanes ({', '.join(offending) or 'n/a'}) — set agent.stage_contracts: "
+        "on to enforce them anyway",
+    )
+
 def check_prompts(cfg: ServiceConfig) -> CheckResult:
     paths = []
     if cfg.prompts.base_path is not None:
@@ -665,6 +803,9 @@ def run_checks(cfg: ServiceConfig, host: str = "127.0.0.1") -> list[CheckResult]
         check_git_history_writable(cfg),
         check_agent_git_grant(cfg),
         check_tracker(cfg),
+        check_board_reachable_from_workspace(cfg),
+        check_deep_preset_merge_contract(cfg),
+        check_stage_contracts(cfg),
         check_workflow_registry(cfg),
     ]
 

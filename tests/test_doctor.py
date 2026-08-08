@@ -521,8 +521,9 @@ def test_run_checks_returns_one_result_per_check(tmp_path: Path) -> None:
     results = run_checks(cfg)
     # port + shell + max_turns + agent + pi_auth + gemini_auth + agy_state + kiro_auth
     # + prompts + after_create + workspace + git_history + agent_git_grant
-    # + tracker + state.db = 15
-    assert len(results) == 15
+    # + tracker + board.reachable + deep_merge_contract + stage_contracts
+    # + state.db = 18
+    assert len(results) == 18
     assert {r.name.split("=")[0].split(".")[0] for r in results} >= {
         "agent",
         "hooks",
@@ -841,3 +842,253 @@ def test_format_results_includes_all_statuses() -> None:
         color=False,
     )
     assert "PASS" in text and "WARN" in text and "FAIL" in text
+
+
+# ---------------------------------------------------------------------------
+# F-04 — board reachability from the worker workspace
+# ---------------------------------------------------------------------------
+
+
+def test_board_reachable_warns_when_hook_ignores_board_root(tmp_path: Path) -> None:
+    from symphony.cli.doctor import check_board_reachable_from_workspace
+
+    (tmp_path / "my-board").mkdir()
+    cfg = _build_cfg(
+        tmp_path,
+        """
+        tracker: { kind: file, board_root: ./my-board }
+        hooks:
+          after_create: |
+            for dir in kanban; do ln -s "$SYMPHONY_WORKFLOW_DIR/$dir" "$dir"; done
+        agent: { kind: codex }
+        codex: { command: codex app-server }
+        """,
+    )
+    result = check_board_reachable_from_workspace(cfg)
+    assert result.status == "warn"
+    assert "my-board" in result.message
+
+
+def test_board_reachable_passes_when_hook_uses_board_root_env(tmp_path: Path) -> None:
+    from symphony.cli.doctor import check_board_reachable_from_workspace
+
+    (tmp_path / "my-board").mkdir()
+    cfg = _build_cfg(
+        tmp_path,
+        """
+        tracker: { kind: file, board_root: ./my-board }
+        hooks:
+          after_create: |
+            for dir in ${SYMPHONY_BOARD_ROOT_NAME:-kanban}; do ln -s x "$dir"; done
+        agent: { kind: codex }
+        codex: { command: codex app-server }
+        """,
+    )
+    assert check_board_reachable_from_workspace(cfg).status == "pass"
+
+
+def test_board_reachable_reads_the_script_the_hook_invokes(tmp_path: Path) -> None:
+    from symphony.cli.doctor import check_board_reachable_from_workspace
+
+    (tmp_path / "kanban").mkdir()
+    (tmp_path / "scripts").mkdir()
+    (tmp_path / "scripts" / "setup.sh").write_text(
+        "for dir in ${SYMPHONY_BOARD_ROOT_NAME:-kanban}; do :; done\n",
+        encoding="utf-8",
+    )
+    cfg = _build_cfg(
+        tmp_path,
+        """
+        tracker: { kind: file, board_root: ./kanban }
+        hooks:
+          after_create: |
+            bash "$SYMPHONY_WORKFLOW_DIR/scripts/setup.sh"
+        agent: { kind: codex }
+        codex: { command: codex app-server }
+        """,
+    )
+    assert check_board_reachable_from_workspace(cfg).status == "pass"
+
+
+def test_board_reachable_fails_when_board_root_missing(tmp_path: Path) -> None:
+    from symphony.cli.doctor import check_board_reachable_from_workspace
+
+    cfg = _build_cfg(
+        tmp_path,
+        """
+        tracker: { kind: file, board_root: ./nope }
+        agent: { kind: codex }
+        codex: { command: codex app-server }
+        """,
+    )
+    result = check_board_reachable_from_workspace(cfg)
+    assert result.status == "fail"
+    assert "does not exist" in result.message
+
+
+def test_run_checks_includes_board_reachable_row(tmp_path: Path) -> None:
+    (tmp_path / "kanban").mkdir()
+    cfg = _build_cfg(
+        tmp_path,
+        """
+        tracker: { kind: file, board_root: ./kanban }
+        agent: { kind: codex }
+        codex: { command: codex app-server }
+        """,
+    )
+    names = [r.name for r in run_checks(cfg)]
+    assert "board.reachable" in names
+
+
+# ---------------------------------------------------------------------------
+# F-05 — deep preset merge contract
+# ---------------------------------------------------------------------------
+
+
+_DEEP_STATES = (
+    "active_states: [Intake, Research, Plan, Review, Build, QA, Verify, Document]"
+)
+
+
+def test_deep_merge_contract_skipped_on_default_board(tmp_path: Path) -> None:
+    from symphony.cli.doctor import check_deep_preset_merge_contract
+
+    cfg = _build_cfg(
+        tmp_path,
+        """
+        tracker: { kind: file, board_root: ./kanban }
+        agent: { kind: codex }
+        codex: { command: codex app-server }
+        """,
+    )
+    result = check_deep_preset_merge_contract(cfg)
+    assert result.status == "pass"
+    assert "not a deep-preset board" in result.message
+
+
+def test_deep_merge_contract_passes_on_default_branch_policy(tmp_path: Path) -> None:
+    from symphony.cli.doctor import check_deep_preset_merge_contract
+
+    cfg = _build_cfg(
+        tmp_path,
+        f"""
+        tracker:
+          kind: file
+          board_root: ./kanban
+          {_DEEP_STATES}
+          terminal_states: [Done, Human Review, Blocked, Cancelled]
+        agent:
+          kind: codex
+          max_turns: 100
+        codex: {{ command: codex app-server }}
+        """,
+    )
+    assert check_deep_preset_merge_contract(cfg).status == "pass"
+
+
+def test_deep_merge_contract_fails_without_auto_merge(tmp_path: Path) -> None:
+    from symphony.cli.doctor import check_deep_preset_merge_contract
+
+    cfg = _build_cfg(
+        tmp_path,
+        f"""
+        tracker:
+          kind: file
+          board_root: ./kanban
+          {_DEEP_STATES}
+          terminal_states: [Done, Human Review, Blocked, Cancelled]
+        agent:
+          kind: codex
+          max_turns: 100
+          auto_merge_on_done: false
+        codex: {{ command: codex app-server }}
+        """,
+    )
+    result = check_deep_preset_merge_contract(cfg)
+    assert result.status == "fail"
+    assert "auto_merge_on_done" in result.message
+
+
+def test_deep_merge_contract_fails_when_base_and_target_diverge(
+    tmp_path: Path,
+) -> None:
+    from symphony.cli.doctor import check_deep_preset_merge_contract
+
+    cfg = _build_cfg(
+        tmp_path,
+        f"""
+        tracker:
+          kind: file
+          board_root: ./kanban
+          {_DEEP_STATES}
+          terminal_states: [Done, Human Review, Blocked, Cancelled]
+        agent:
+          kind: codex
+          max_turns: 100
+          feature_base_branch: main
+          auto_merge_target_branch: release
+        codex: {{ command: codex app-server }}
+        """,
+    )
+    result = check_deep_preset_merge_contract(cfg)
+    assert result.status == "fail"
+    assert "feature_base_branch" in result.message
+
+
+def test_stage_contracts_doctor_row_warns_on_renamed_lane_board(tmp_path: Path) -> None:
+    from symphony.cli.doctor import check_stage_contracts
+
+    cfg = _build_cfg(
+        tmp_path,
+        """
+        tracker:
+          kind: file
+          board_root: ./kanban
+          active_states: [Todo, In Progress, Verify, Docs]
+          terminal_states: [Done]
+        agent: { kind: codex }
+        codex: { command: codex app-server }
+        """,
+    )
+    result = check_stage_contracts(cfg)
+    assert result.status == "warn"
+    assert "Docs" in result.message
+    assert "stage_contracts: on" in result.message
+
+
+def test_stage_contracts_doctor_row_passes_on_default_board(tmp_path: Path) -> None:
+    from symphony.cli.doctor import check_stage_contracts
+
+    cfg = _build_cfg(
+        tmp_path,
+        """
+        tracker:
+          kind: file
+          board_root: ./kanban
+          active_states: [Todo, In Progress, Verify, Document]
+          terminal_states: [Done]
+        agent: { kind: codex }
+        codex: { command: codex app-server }
+        """,
+    )
+    assert check_stage_contracts(cfg).status == "pass"
+
+
+def test_stage_contracts_doctor_row_warns_when_explicitly_off(tmp_path: Path) -> None:
+    from symphony.cli.doctor import check_stage_contracts
+
+    cfg = _build_cfg(
+        tmp_path,
+        """
+        tracker:
+          kind: file
+          board_root: ./kanban
+          active_states: [Todo, In Progress, Verify, Document]
+          terminal_states: [Done]
+        agent: { kind: codex, stage_contracts: off }
+        codex: { command: codex app-server }
+        """,
+    )
+    result = check_stage_contracts(cfg)
+    assert result.status == "warn"
+    assert "prompts are the only gate" in result.message

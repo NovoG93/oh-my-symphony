@@ -224,7 +224,20 @@ def test_web_settings_lane_preset_contract() -> None:
 
     assert "getLanePresets: () => apiRequest('/workflow/presets')" in js
     assert "applyLanePreset: (name)" in js
-    assert "function buildLanePresetCard(presets)" in js
-    assert "body.appendChild(buildLanePresetCard(lanePresets));" in js
+    assert "function buildLanePresetCard(presets, wf)" in js
+    assert "body.appendChild(buildLanePresetCard(lanePresets, wf));" in js
     assert "'settings.lanePreset': 'Lane preset'" in js
     assert "'common.apply': 'Apply'" in js
+
+
+def test_web_settings_stage_contracts_hint_contract() -> None:
+    """F-06: a board whose lanes disable the evidence floor must say so."""
+    js = _script_bundle()
+    css = (STATIC_ROOT / "style.css").read_text(encoding="utf-8")
+
+    assert "function buildStageContractsRow(wf)" in js
+    assert "agent.stage_contracts_enabled !== false" in js
+    assert "buildStageContractsRow(wf)," in js
+    assert "'settings.stageContracts': 'Stage contracts'" in js
+    assert "'settings.stageContractsOff'" in js
+    assert ".form-hint-warn" in css
