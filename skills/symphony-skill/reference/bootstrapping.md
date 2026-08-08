@@ -10,10 +10,12 @@ From inside the `oh-my-symphony` checkout:
 ```bash
 TARGET=/path/to/target-project
 cp tui-open.sh tui-open.bat "$TARGET/"
-cp WORKFLOW.example.md "$TARGET/WORKFLOW.md"              # then edit
-mkdir -p "$TARGET/docs" "$TARGET/tools" "$TARGET/scripts"
+# Pick the example that matches the tracker you will use:
+#   file board (Markdown tickets in the repo, the default) -> WORKFLOW.file.example.md
+#   Linear                                                 -> WORKFLOW.example.md
+cp WORKFLOW.file.example.md "$TARGET/WORKFLOW.md"         # then edit
+mkdir -p "$TARGET/docs" "$TARGET/scripts"
 cp -R docs/symphony-prompts "$TARGET/docs/"
-cp -R tools/board-viewer "$TARGET/tools/"                 # required for `--viewer-port`
 cp scripts/symphony-setup-worktree.sh "$TARGET/scripts/"  # required by default after_create hook
 chmod +x "$TARGET/scripts/symphony-setup-worktree.sh"
 cp -R skills "$TARGET/"
@@ -23,12 +25,16 @@ ln -s ../../skills/symphony-skill "$TARGET/.claude/skills/symphony-skill"
 chmod +x "$TARGET/tui-open.sh"
 ```
 
-> Warning: The board viewer (HTML/web UI at `--viewer-port`) auto-detects
-> `<workflow-dir>/tools/board-viewer/server.py`. If that script is missing,
-> `symphony service start` silently skips spawning the viewer — no error,
-> no warning, just an absent `started board viewer pid=...` line and a
-> `viewer_pid: null` in `.symphony/run/*.json`. Always copy `tools/board-viewer/`
-> when bootstrapping, even if you don't think you need the web UI yet.
+> Note: The browser board is the built-in admin web app served on the
+> orchestrator `--port` — nothing extra to copy for it.
+
+> Claude workers need `--permission-mode acceptEdits` (unattended file writes)
+> and `--add-dir "$SYMPHONY_WORKFLOW_DIR/<board-root>"` (writes through the
+> host-board link). Both shipped examples now carry them; if you hand-write a
+> `claude.command`, keep them or the worker silently fails to move tickets and
+> the orchestrator re-dispatches forever. The CLI-driven lanes
+> (`symphony board new/update`) additionally need a permission mode that
+> allows Bash — `symphony doctor` reports this as `board.cli`.
 
 Copy `tui-open.sh` and `tui-open.bat` even for headless-first setups. The
 launcher carries safety behavior that plain `symphony tui` does not: port
@@ -55,8 +61,7 @@ python3.12 -m venv .venv
 | `AGENTS.md` | Codex entrypoint pointing to repo skills |
 | `GEMINI.md` | Gemini entrypoint pointing to repo skills |
 | `tui-open.sh`, `tui-open.bat` | One-shot board launchers |
-| `tools/board-viewer/` | Web HTML board viewer for `--viewer-port` (silently no-ops if absent) |
-| `scripts/symphony-setup-worktree.sh` | Worktree-setup body invoked by the default `after_create` hook in `WORKFLOW.example.md`. Without it, every fresh ticket dispatch fails at the hook stage with `No such file or directory`. |
+| `scripts/symphony-setup-worktree.sh` | Worktree-setup body invoked by the default `after_create` hook in both WORKFLOW examples. Without it, every fresh ticket dispatch fails at the hook stage with `No such file or directory`. |
 
 `skills/symphony-skill/SKILL.md` is the only operator activation route. Edit
 only the canonical files under `skills/`; platform entrypoints should point at
@@ -64,15 +69,15 @@ them.
 
 ## Preserve the default pipeline
 
-`WORKFLOW.example.md` ships with the supported production flow:
+Both WORKFLOW examples ship with the supported production flow:
 
 ```text
-Todo -> In Progress -> Verify -> Learn -> Done
+Todo -> In Progress -> Verify -> Document -> Done
 ```
 
 Do not trim it to a smaller lane set unless the user explicitly asks. The base
 prompt names these stages, Verify is the compulsory review/QA/merge gate, and
-Learn writes back to `docs/llm-wiki/` for future tickets. `Human Review` is an
+Document writes back to `docs/llm-wiki/` for future tickets. `Human Review` is an
 intervention-only terminal state for explicit operator review or critical
 manual decisions; agents should not use it as the normal completion path.
 
@@ -88,9 +93,10 @@ Use `reference/customization.md` for lane and prompt changes.
 ## Pick the prompt flavor
 
 - `tracker.kind: file` uses `docs/symphony-prompts/file/...`; the agent writes
-  stage notes into the ticket file body.
+  stage notes into the ticket file body. Bootstrap from
+  `WORKFLOW.file.example.md`.
 - `tracker.kind: linear` uses `docs/symphony-prompts/linear/...`; the agent
-  writes stage notes as Linear comments.
+  writes stage notes as Linear comments. Bootstrap from `WORKFLOW.example.md`.
 
 Copy only the flavor you need if you want a smaller target repo. Copying both
 is fine when simplicity matters more than disk hygiene.
@@ -105,5 +111,5 @@ Foreground board view:
 tui-open.bat
 ```
 
-For managed headless operation and viewer commands, use
+For managed headless operation and the admin web app, use
 `reference/operations.md`.

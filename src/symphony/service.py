@@ -43,7 +43,6 @@ ServiceState = Literal["running", "stopped"]
 # A separately-bound bool keeps every branch analyzable on every host.
 _IS_WIN32: bool = sys.platform == "win32"
 DEFAULT_SERVICE_PORT = 9999
-DEFAULT_VIEWER_PORT = 8765
 
 
 class ServiceLockError(RuntimeError):
@@ -56,14 +55,10 @@ class ServiceRecord:
     workflow_dir: Path
     host: str
     port: int
-    viewer_port: int | None
     orchestrator_pid: int | None
-    viewer_pid: int | None
     log_path: Path
-    viewer_log_path: Path | None
     started_at: str
     orchestrator_command: list[str] = field(default_factory=list)
-    viewer_command: list[str] = field(default_factory=list)
 
 
 @dataclass(frozen=True)
@@ -111,26 +106,16 @@ def acquire_service_lock(workflow_path: str | Path):
             pass
 
 
-def _path_or_none(value: Any) -> Path | None:
-    if value is None:
-        return None
-    return Path(str(value))
-
-
 def _record_to_json(record: ServiceRecord) -> dict[str, Any]:
     return {
         "workflow_path": str(record.workflow_path),
         "workflow_dir": str(record.workflow_dir),
         "host": record.host,
         "port": record.port,
-        "viewer_port": record.viewer_port,
         "orchestrator_pid": record.orchestrator_pid,
-        "viewer_pid": record.viewer_pid,
         "log_path": str(record.log_path),
-        "viewer_log_path": str(record.viewer_log_path) if record.viewer_log_path else None,
         "started_at": record.started_at,
         "orchestrator_command": list(record.orchestrator_command),
-        "viewer_command": list(record.viewer_command),
     }
 
 
@@ -140,18 +125,14 @@ def _record_from_json(data: dict[str, Any]) -> ServiceRecord:
         workflow_dir=Path(str(data["workflow_dir"])),
         host=str(data["host"]),
         port=int(data["port"]),
-        viewer_port=int(data["viewer_port"]) if data.get("viewer_port") is not None else None,
         orchestrator_pid=(
             int(data["orchestrator_pid"])
             if data.get("orchestrator_pid") is not None
             else None
         ),
-        viewer_pid=int(data["viewer_pid"]) if data.get("viewer_pid") is not None else None,
         log_path=Path(str(data["log_path"])),
-        viewer_log_path=_path_or_none(data.get("viewer_log_path")),
         started_at=str(data["started_at"]),
         orchestrator_command=[str(part) for part in data.get("orchestrator_command", [])],
-        viewer_command=[str(part) for part in data.get("viewer_command", [])],
     )
 
 
@@ -362,38 +343,6 @@ def build_orchestrator_command(
         "--port",
         str(port),
     ]
-
-
-def board_viewer_script_for(workflow_path: str | Path) -> Path | None:
-    script = _resolved(workflow_path).parent / "tools" / "board-viewer" / "server.py"
-    return script if script.exists() else None
-
-
-def build_viewer_command(
-    workflow_path: str | Path,
-    *,
-    host: str,
-    port: int,
-    viewer_port: int,
-    kanban_dir: Path | None = None,
-) -> list[str] | None:
-    """Build the shell-free board-viewer command when a viewer is available."""
-    script = board_viewer_script_for(workflow_path)
-    if script is None:
-        return None
-    command = [
-        sys.executable,
-        str(script),
-        "--port",
-        str(viewer_port),
-        "--symphony",
-        f"http://{host}:{port}",
-        "--workflow",
-        str(_resolved(workflow_path)),
-    ]
-    if kanban_dir is not None:
-        command.extend(["--kanban", str(kanban_dir)])
-    return command
 
 
 def _popen_detached(command: list[str], *, cwd: Path, log_path: Path) -> int:
@@ -707,14 +656,12 @@ def _start_locked(args: argparse.Namespace, *, workflow: Path, cfg: Any) -> int:
 
     workflow_dir = workflow.parent
     log_path = workflow_dir / "log" / "symphony.log"
-    viewer_log_path = workflow_dir / "log" / "board-viewer.log"
     orchestrator_command = build_orchestrator_command(
         workflow,
         host=args.host,
         port=port,
     )
     orchestrator_pid: int | None = None
-    viewer_pid: int | None = None
     try:
         orchestrator_pid = _popen_detached(
             orchestrator_command,
@@ -727,41 +674,7 @@ def _start_locked(args: argparse.Namespace, *, workflow: Path, cfg: Any) -> int:
                 file=sys.stderr,
             )
             return 1
-
-        viewer_port = None if args.no_viewer else int(args.viewer_port)
-        viewer_command: list[str] = []
-        if viewer_port is not None:
-            built_viewer = build_viewer_command(
-                workflow,
-                host=args.host,
-                port=port,
-                viewer_port=viewer_port,
-                kanban_dir=cfg.tracker.board_root,
-            )
-            if built_viewer is not None:
-                viewer_command = built_viewer
-                viewer_pid = _popen_detached(
-                    viewer_command,
-                    cwd=workflow_dir,
-                    log_path=viewer_log_path,
-                )
-                if not _wait_until(lambda: is_process_running(viewer_pid), timeout_s=1.0):
-                    print(
-                        f"warning: board viewer exited early; see {viewer_log_path}",
-                        file=sys.stderr,
-                    )
-                    viewer_pid = None
-            else:
-                expected = workflow_dir / "tools" / "board-viewer" / "server.py"
-                print(
-                    f"warning: --viewer-port {viewer_port} requested but {expected} not found; "
-                    "viewer skipped (orchestrator OK). "
-                    "Copy `tools/board-viewer/` from the symphony checkout to enable the web UI.",
-                    file=sys.stderr,
-                )
     except OSError as exc:
-        if viewer_pid is not None:
-            terminate_process(viewer_pid, force=True)
         if orchestrator_pid is not None:
             terminate_process(orchestrator_pid, force=True)
         print(f"service start failed: {exc}", file=sys.stderr)
@@ -772,20 +685,14 @@ def _start_locked(args: argparse.Namespace, *, workflow: Path, cfg: Any) -> int:
         workflow_dir=workflow_dir.resolve(),
         host=args.host,
         port=port,
-        viewer_port=viewer_port if viewer_pid is not None else None,
         orchestrator_pid=orchestrator_pid,
-        viewer_pid=viewer_pid,
         log_path=log_path.resolve(),
-        viewer_log_path=viewer_log_path.resolve() if viewer_pid is not None else None,
         started_at=_utc_now(),
         orchestrator_command=orchestrator_command,
-        viewer_command=viewer_command,
     )
     try:
         save_record(record)
     except Exception as exc:
-        if viewer_pid is not None:
-            terminate_process(viewer_pid, force=True)
         if orchestrator_pid is not None:
             terminate_process(orchestrator_pid, force=True)
         print(f"failed to save service record: {exc}", file=sys.stderr)
@@ -795,11 +702,6 @@ def _start_locked(args: argparse.Namespace, *, workflow: Path, cfg: Any) -> int:
         f"started symphony service pid={orchestrator_pid} "
         f"url=http://{args.host}:{port}/"
     )
-    if viewer_pid is not None and viewer_port is not None:
-        print(
-            f"started board viewer pid={viewer_pid} "
-            f"url=http://{args.host}:{viewer_port}/"
-        )
     return 0
 
 
@@ -812,7 +714,6 @@ def _stop(args: argparse.Namespace) -> int:
 
     all_stopped = True
     for label, pid in (
-        ("viewer", record.viewer_pid),
         ("orchestrator", record.orchestrator_pid),
     ):
         if not is_process_running(pid):
@@ -875,11 +776,6 @@ def _status(args: argparse.Namespace) -> int:
             f"stale pid={record.orchestrator_pid} port={record.port} "
             f"url=http://{record.host}:{record.port}/ (api alive)"
         )
-    if record.viewer_pid is not None and record.viewer_port is not None:
-        print(
-            f"viewer pid={record.viewer_pid} port={record.viewer_port} "
-            f"url=http://{record.host}:{record.viewer_port}/"
-        )
     if port is not None and record.port != port:
         print(
             f"requested port {port}; existing service for this workflow uses "
@@ -901,8 +797,6 @@ def _restart(args: argparse.Namespace) -> int:
         workflow=args.workflow,
         host=args.host,
         port=args.port,
-        viewer_port=args.viewer_port,
-        no_viewer=args.no_viewer,
         replace=False,
         skip_doctor=args.skip_doctor,
     )
@@ -915,7 +809,7 @@ def _logs(args: argparse.Namespace) -> int:
     if record is None:
         print(f"no service record for {workflow}", file=sys.stderr)
         return 1
-    path = record.viewer_log_path if args.viewer else record.log_path
+    path = record.log_path
     if path is None or not path.exists():
         print(f"log file not found: {path}", file=sys.stderr)
         return 1
@@ -940,12 +834,12 @@ def build_parser() -> argparse.ArgumentParser:
             help="path to WORKFLOW.md (default: ./WORKFLOW.md)",
         )
 
-    p_start = sub.add_parser("start", help="start orchestrator and board viewer")
+    p_start = sub.add_parser(
+        "start", help="start the orchestrator (admin UI serves on --port)"
+    )
     add_workflow(p_start)
     p_start.add_argument("--host", default="127.0.0.1")
     p_start.add_argument("--port", type=int, default=None)
-    p_start.add_argument("--viewer-port", type=int, default=DEFAULT_VIEWER_PORT)
-    p_start.add_argument("--no-viewer", action="store_true")
     p_start.add_argument("--replace", action="store_true")
     p_start.add_argument("--skip-doctor", action="store_true")
     p_start.set_defaults(func=_start)
@@ -960,8 +854,6 @@ def build_parser() -> argparse.ArgumentParser:
     add_workflow(p_restart)
     p_restart.add_argument("--host", default="127.0.0.1")
     p_restart.add_argument("--port", type=int, default=None)
-    p_restart.add_argument("--viewer-port", type=int, default=DEFAULT_VIEWER_PORT)
-    p_restart.add_argument("--no-viewer", action="store_true")
     p_restart.add_argument("--skip-doctor", action="store_true")
     p_restart.add_argument("--timeout", type=float, default=10.0)
     p_restart.add_argument("--force", action="store_true")
@@ -974,7 +866,6 @@ def build_parser() -> argparse.ArgumentParser:
 
     p_logs = sub.add_parser("logs", help="print recent service logs")
     add_workflow(p_logs)
-    p_logs.add_argument("--viewer", action="store_true")
     p_logs.add_argument("--lines", type=int, default=80)
     p_logs.set_defaults(func=_logs)
 

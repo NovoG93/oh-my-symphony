@@ -145,7 +145,7 @@ def test_multi_stage_workflow_rejects_too_low_max_turns(tmp_path: Path) -> None:
         tracker:
           kind: file
           board_root: ./tickets
-          active_states: [Todo, In Progress, Verify, Learn]
+          active_states: [Todo, In Progress, Verify, Document]
           terminal_states: [Done, Blocked]
         agent:
           max_turns: 1
@@ -407,3 +407,41 @@ def test_workflow_with_no_tracker_block_at_all_fails_preflight(tmp_path: Path) -
         with pytest.raises(UnsupportedTrackerKind):
             validate_for_dispatch(cfg)
     # else: the builder defaulted to a usable kind — that's fine too.
+
+
+# ---------------------------------------------------------------------------
+# F-18 — bootstrap-recommended examples must give claude a usable command
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "workflow",
+    [
+        "WORKFLOW.md",
+        "WORKFLOW.example.md",
+        "WORKFLOW.file.example.md",
+        "skills/symphony-skill/oneshot/templates/WORKFLOW.oneshot.md",
+    ],
+)
+def test_shipped_claude_commands_accept_edits_and_extend_write_scope(
+    workflow: str,
+) -> None:
+    """A bare `claude -p` worker cannot accept edits or write the host board.
+
+    That is the configuration that produced acceptance finding 1, and until
+    this test it was what a fresh bootstrap copied.
+    """
+    text = Path(workflow).read_text(encoding="utf-8")
+    command_lines = [
+        line
+        for line in text.splitlines()
+        if line.strip().startswith("command:") and "claude" in line
+    ]
+    assert command_lines, f"{workflow} declares no claude command"
+    for line in command_lines:
+        assert "--permission-mode acceptEdits" in line, (
+            f"{workflow}: claude worker cannot accept edits unattended: {line}"
+        )
+        assert "--add-dir" in line, (
+            f"{workflow}: claude worker has no write scope beyond its cwd: {line}"
+        )

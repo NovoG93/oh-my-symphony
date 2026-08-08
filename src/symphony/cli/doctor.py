@@ -32,7 +32,7 @@ import sys
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Iterable, Literal
+from typing import Iterable, Literal
 
 from .._shell import _is_wsl_launcher, resolve_bash
 from ..backends.codex import _sandbox_uses_workspace_write
@@ -46,6 +46,7 @@ from ..workflow import (
     resolve_workflow_path,
 )
 from ..workflow.preflight import stage_turn_budget_error
+from ..workflow.presets import guess_lane_preset
 
 
 Status = Literal["pass", "warn", "fail"]
@@ -399,6 +400,228 @@ def check_after_create_hook(cfg: ServiceConfig) -> CheckResult:
     return CheckResult("hooks.after_create", "pass", "looks customized")
 
 
+_HOOK_SCRIPT_RE = re.compile(r"[\w./$@{}-]*\.sh\b")
+
+
+def _hook_script_text(cfg: ServiceConfig, hook: str) -> str:
+    """Hook text plus the bodies of any `*.sh` scripts it invokes.
+
+    The shipped `after_create` is one line (`bash "$SYMPHONY_WORKFLOW_DIR/
+    scripts/symphony-setup-worktree.sh"`), so grepping the hook alone tells
+    us nothing about which directories it links.
+    """
+    parts = [hook]
+    workflow_dir = cfg.workflow_path.parent
+    for raw in _HOOK_SCRIPT_RE.findall(hook):
+        relative = raw.replace("$SYMPHONY_WORKFLOW_DIR", "").replace(
+            "${SYMPHONY_WORKFLOW_DIR}", ""
+        )
+        candidate = (workflow_dir / relative.lstrip("/")).resolve()
+        try:
+            if candidate.is_file():
+                parts.append(candidate.read_text(encoding="utf-8"))
+        except OSError:  # pragma: no cover - unreadable script
+            continue
+    return "\n".join(parts)
+
+
+def check_board_reachable_from_workspace(cfg: ServiceConfig) -> CheckResult:
+    """Can a dispatched worker write to the *host* board from its workspace?
+
+    Acceptance finding 1: the shipped setup hook used to link a directory
+    literally named `kanban`. On any other `tracker.board_root` the worker
+    silently got a private board copy, its state transitions never reached
+    the orchestrator, and the ticket was re-dispatched forever. Static check
+    only — it greps the hook and the scripts the hook runs.
+    """
+    name = "board.reachable"
+    if cfg.tracker.kind != "file":
+        return CheckResult(name, "pass", f"tracker.kind={cfg.tracker.kind} (skipped)")
+    root = cfg.tracker.board_root
+    if root is None:
+        return CheckResult(name, "fail", "file tracker has no board_root")
+    if not root.exists():
+        return CheckResult(
+            name, "fail", f"{root} does not exist — run `symphony board init {root}`"
+        )
+    workflow_dir = cfg.workflow_path.parent.resolve()
+    try:
+        board_name = root.resolve().relative_to(workflow_dir).as_posix()
+    except ValueError:
+        return CheckResult(
+            name, "pass", f"{root} is outside {workflow_dir}; workers use the host path"
+        )
+    hook = cfg.hooks.after_create or ""
+    if not hook.strip():
+        return CheckResult(
+            name, "pass", "no after_create hook; workspace is not a worktree"
+        )
+    text = _hook_script_text(cfg, hook)
+    if "SYMPHONY_BOARD_ROOT_NAME" in text or re.search(
+        rf"(?<![\w/-]){re.escape(board_name)}(?![\w-])", text
+    ):
+        return CheckResult(name, "pass", f"after_create links {board_name}/")
+    return CheckResult(
+        name,
+        "warn",
+        f"after_create never mentions the board root {board_name!r} — workers "
+        "may get a private board copy and the ticket will be re-dispatched "
+        "forever. Use ${SYMPHONY_BOARD_ROOT_NAME:-kanban} in the link loop.",
+    )
+
+def check_deep_preset_merge_contract(cfg: ServiceConfig) -> CheckResult:
+    """Deep-preset boards need a coherent single-merge branch policy.
+
+    Every deep lane is its own ticket, hence its own worktree on its own
+    `symphony/<ID>` branch. QA/Verify/Document can only see a Build slice
+    that already merged, so the preset requires `auto_merge_on_done` plus a
+    feature base that resolves to the merge target. Without it, either
+    unverified work never reaches the downstream lanes, or they re-prove a
+    tree that does not contain the code.
+    """
+    name = "board.deep_merge_contract"
+    if guess_lane_preset(cfg.tracker.active_states) != "deep":
+        return CheckResult(name, "pass", "not a deep-preset board (skipped)")
+    if not cfg.agent.auto_merge_on_done:
+        return CheckResult(
+            name,
+            "fail",
+            "deep preset requires agent.auto_merge_on_done: true — Build "
+            "slices never reach the QA/Verify/Document worktrees otherwise",
+        )
+    base = (cfg.agent.feature_base_branch or "").strip()
+    target = (cfg.agent.auto_merge_target_branch or "").strip()
+    if base != target:
+        return CheckResult(
+            name,
+            "fail",
+            f"deep preset requires feature_base_branch ({base or '<current>'}) "
+            f"== auto_merge_target_branch ({target or '<current>'}) — new "
+            "worktrees must start from the branch the merges land on",
+        )
+    return CheckResult(
+        name,
+        "pass",
+        f"auto_merge_on_done on, base == target ({base or '<current branch>'})",
+    )
+
+def check_stage_contracts(cfg: ServiceConfig) -> CheckResult:
+    """Report whether the mechanical evidence floor runs on this board.
+
+    F-06: with `agent.stage_contracts: auto` (the default), renaming any
+    default lane turns the whole stage-contract validator off. That is a
+    legal outcome of a customized board, but it silently removes the
+    product's evidence floor — so it gets a row here.
+    """
+    from ..orchestrator.contracts import board_uses_default_contracts
+
+    name = "agent.stage_contracts"
+    mode = (cfg.agent.stage_contracts or "auto").strip().lower()
+    enabled = cfg.agent.stage_contracts_enabled(cfg.tracker.active_states)
+    if enabled:
+        return CheckResult(name, "pass", f"{mode}: contracts enforced")
+    if mode == "off":
+        return CheckResult(
+            name, "warn", "off: no mechanical evidence gate; prompts are the only gate"
+        )
+    offending = [
+        state
+        for state in cfg.tracker.active_states
+        if not board_uses_default_contracts((state,))
+    ]
+    return CheckResult(
+        name,
+        "warn",
+        "auto: contracts disabled because these lanes are not default-preset "
+        f"lanes ({', '.join(offending) or 'n/a'}) — set agent.stage_contracts: "
+        "on to enforce them anyway",
+    )
+
+def check_symphony_cli_reachable(cfg: ServiceConfig) -> CheckResult:
+    """Can a dispatched worker actually run `symphony board ...`?
+
+    F-19: the stage prompts and the chat preamble now *require* the board
+    CLI, but Symphony is usually installed in a venv and launched by
+    absolute path, so `symphony` need not be on the worker's PATH. The
+    orchestrator exports `SYMPHONY_CLI`, and the prompts use
+    `${SYMPHONY_CLI:-symphony}`; this check reports both halves.
+    """
+    from ..orchestrator.helpers import resolve_symphony_cli
+
+    name = "board.cli"
+    if cfg.tracker.kind != "file":
+        return CheckResult(name, "pass", f"tracker.kind={cfg.tracker.kind} (skipped)")
+    resolved = resolve_symphony_cli()
+    bash = resolve_bash()
+    on_path = False
+    try:
+        probe = subprocess.run(
+            [bash, "-lc", "command -v symphony"],
+            capture_output=True,
+            text=True,
+            timeout=15,
+            check=False,
+        )
+        on_path = probe.returncode == 0 and bool(probe.stdout.strip())
+    except (OSError, subprocess.TimeoutExpired):
+        on_path = False
+    if on_path:
+        return CheckResult(name, "pass", f"`symphony` on the worker PATH; {resolved}")
+    if " -m " in resolved:
+        return CheckResult(
+            name,
+            "fail",
+            "`symphony` is not on a login-shell PATH and no console script was "
+            "found — prompts that call the board CLI will fail. Install the "
+            "package (`pip install -e .`) or add its venv bin to PATH.",
+        )
+    return CheckResult(
+        name,
+        "warn",
+        f"`symphony` is not on a login-shell PATH; workers get SYMPHONY_CLI="
+        f"{resolved}. Prompts must use ${{SYMPHONY_CLI:-symphony}} (the shipped "
+        "ones do); custom prompts calling bare `symphony` will fail.",
+    )
+
+def check_board_dependencies(cfg: ServiceConfig) -> CheckResult:
+    """Report dangling `blocked_by` ids and dependency cycles on the board.
+
+    F-13: a blocker id that does not exist (agent typo, deleted ticket)
+    never resolves, so the ticket is silently never dispatched again. The
+    only previous signal was one WARN line in the orchestrator log.
+    """
+    from ..trackers.file import FileBoardTracker
+    from ..trackers.validate import board_edges, dangling_blockers, find_cycle
+
+    name = "board.dependencies"
+    if cfg.tracker.kind != "file" or cfg.tracker.board_root is None:
+        return CheckResult(name, "pass", f"tracker.kind={cfg.tracker.kind} (skipped)")
+    if not cfg.tracker.board_root.exists():
+        return CheckResult(name, "pass", "no board directory yet")
+    try:
+        issues = FileBoardTracker(cfg.tracker).scan_all()
+    except SymphonyError as exc:
+        return CheckResult(name, "warn", f"could not scan the board: {exc}")
+    dangling = dangling_blockers(issues)
+    cycle = find_cycle(board_edges(issues))
+    problems: list[str] = []
+    for identifier, missing in sorted(dangling.items()):
+        problems.append(f"{identifier} blocked_by {', '.join(missing)} (not on board)")
+    if cycle:
+        problems.append(f"cycle: {' -> '.join(cycle)}")
+    if not problems:
+        return CheckResult(
+            name, "pass", f"{len(issues)} ticket(s), no dangling blockers or cycles"
+        )
+    sample = "; ".join(problems[:3])
+    suffix = "" if len(problems) <= 3 else f"; +{len(problems) - 3} more"
+    return CheckResult(
+        name,
+        "fail",
+        f"{sample}{suffix} — these tickets will never be dispatched; fix with "
+        "`symphony board update <ID> --blocked-by <ID>`",
+    )
+
 def check_prompts(cfg: ServiceConfig) -> CheckResult:
     paths = []
     if cfg.prompts.base_path is not None:
@@ -570,31 +793,6 @@ def check_tracker(cfg: ServiceConfig) -> CheckResult:
     return CheckResult(f"tracker.kind={tracker.kind}", "warn", "unknown tracker kind")
 
 
-def check_board_viewer(cfg: ServiceConfig) -> CheckResult:
-    """Warn when the web HTML viewer script is absent.
-
-    `symphony service start --viewer-port N` silently skips the viewer if
-    `<workflow-dir>/tools/board-viewer/server.py` is missing (see
-    `service.board_viewer_script_for`). Operators routinely don't notice the
-    omitted "started board viewer" line and end up with `viewer_pid: null`
-    in the run record. This is a WARN (not FAIL) because the orchestrator
-    runs fine without the viewer.
-    """
-    script = cfg.workflow_path.parent / "tools" / "board-viewer" / "server.py"
-    if script.exists():
-        return CheckResult("viewer.board-viewer", "pass", f"{script}")
-    return CheckResult(
-        "viewer.board-viewer",
-        "warn",
-        (
-            f"{script} not found — `--viewer-port` will be a no-op. "
-            "The built-in web app on the orchestrator port (`--port`, default "
-            "9999) replaces it; the legacy `tools/board-viewer/` copy is only "
-            "needed for the separate read-only viewer."
-        ),
-    )
-
-
 def check_shell() -> CheckResult:
     """Hooks and backend subprocesses spawn via ``bash -lc``. On Windows we
     must avoid the WSL launcher (``C:\\Windows\\System32\\bash.exe``) — see
@@ -640,94 +838,6 @@ def check_stage_turn_budget(cfg: ServiceConfig) -> CheckResult:
         "pass",
         f"{cfg.agent.max_turns} turn budget covers {active_count} active states",
     )
-
-
-def check_workflow_engine(cfg: ServiceConfig) -> CheckResult:
-    """Validate governed workflow mode, if the repository opted into it.
-
-    Compiles every discovered workflow rather than only the default: a
-    ticket can name any of them, and finding out at dispatch that one does
-    not compile means the ticket is blocked instead of running.
-    """
-    engine = cfg.workflow_engine
-    if not engine.enabled:
-        return CheckResult(
-            "workflow_engine", "pass", "disabled — legacy stage loop in use"
-        )
-    if engine.directory is None or not engine.directory.is_dir():
-        return CheckResult(
-            "workflow_engine",
-            "fail",
-            f"workflow directory not found: {engine.directory}",
-        )
-
-    from ..flow.loader import WorkflowLoader
-
-    loader = WorkflowLoader(
-        engine.directory,
-        workflow_dir=cfg.workflow_path.parent,
-        max_parallel_nodes=engine.max_parallel_nodes,
-    )
-    entries = loader.list_workflows()
-    if not entries:
-        return CheckResult(
-            "workflow_engine",
-            "fail",
-            f"no workflow files under {engine.directory}",
-        )
-    broken = [entry for entry in entries if not entry.valid]
-    if broken:
-        detail = "; ".join(f"{entry.name}: {entry.error}" for entry in broken[:3])
-        return CheckResult("workflow_engine", "fail", detail)
-    if not any(entry.name == engine.default for entry in entries):
-        return CheckResult(
-            "workflow_engine",
-            "fail",
-            f"default workflow {engine.default!r} is not among "
-            + ", ".join(entry.name for entry in entries),
-        )
-
-    known_states = {
-        state.strip().lower()
-        for state in (*cfg.tracker.active_states, *cfg.tracker.terminal_states)
-        if state
-    }
-    unmapped = [
-        f"{condition}->{target}"
-        for condition, target in engine.ticket_state_mapping.items()
-        if target.strip().lower() not in known_states
-    ]
-    if unmapped:
-        return CheckResult(
-            "workflow_engine",
-            "fail",
-            "ticket_state_mapping targets unknown states: " + ", ".join(unmapped),
-        )
-
-    risky = [
-        entry.name
-        for entry in entries
-        if _workflow_has_ungated_side_effects(loader, entry.name)
-    ]
-    summary = f"{len(entries)} workflow(s) valid; default={engine.default}"
-    if risky:
-        # Not a failure — a repository may legitimately want this — but an
-        # external side effect with no approval ancestor is exactly the
-        # thing an operator should have decided on deliberately.
-        return CheckResult(
-            "workflow_engine",
-            "warn",
-            f"{summary}; external side effects with no approval gate in: "
-            + ", ".join(risky),
-        )
-    return CheckResult("workflow_engine", "pass", summary)
-
-
-def _workflow_has_ungated_side_effects(loader: Any, name: str) -> bool:
-    try:
-        return bool(loader.load(name).risk.ungated_external_node_ids)
-    except Exception:
-        return False
 
 
 def check_workflow_registry(cfg: ServiceConfig) -> CheckResult:
@@ -778,8 +888,11 @@ def run_checks(cfg: ServiceConfig, host: str = "127.0.0.1") -> list[CheckResult]
         check_git_history_writable(cfg),
         check_agent_git_grant(cfg),
         check_tracker(cfg),
-        check_board_viewer(cfg),
-        check_workflow_engine(cfg),
+        check_board_reachable_from_workspace(cfg),
+        check_deep_preset_merge_contract(cfg),
+        check_stage_contracts(cfg),
+        check_symphony_cli_reachable(cfg),
+        check_board_dependencies(cfg),
         check_workflow_registry(cfg),
     ]
 

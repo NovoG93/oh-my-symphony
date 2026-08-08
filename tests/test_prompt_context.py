@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import pytest
+
 from symphony.issue import BlockerRef, Issue
 from symphony.prompt_context import build_issue_prompt_context
 
@@ -140,8 +142,9 @@ def test_in_progress_fresh_dispatch_keeps_latest_failure_after_restart() -> None
     assert "old failure v1 should be stale" not in context
 
 
-def test_learn_context_keeps_latest_delivery_notes() -> None:
-    context = build_issue_prompt_context(_issue("Learn"), state="Learn")
+@pytest.mark.parametrize("state", ["Document", "Learn"])  # "Learn" = legacy lane
+def test_document_context_keeps_latest_delivery_notes(state: str) -> None:
+    context = build_issue_prompt_context(_issue(state), state=state)
 
     assert "User goal: reduce repeated prompt input" in context
     assert "new implementation v2" in context

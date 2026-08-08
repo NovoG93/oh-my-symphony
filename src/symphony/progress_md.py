@@ -25,6 +25,7 @@ from typing import Any, Iterable
 from . import trackers as tracker_module
 from .issue import Issue, normalize_state
 from .logging import get_logger
+from .service import DEFAULT_SERVICE_PORT
 from .workflow import ServiceConfig, WorkflowState
 
 log = get_logger()
@@ -118,18 +119,21 @@ def _ordered_states(cfg: ServiceConfig) -> list[str]:
     return out
 
 
-def _resolve_board_url() -> str | None:
-    """Return the board-viewer URL to advertise in the progress header.
+def _resolve_board_url(cfg: ServiceConfig) -> str | None:
+    """Return the admin-UI board URL to advertise in the progress header.
 
     Resolution:
-    - `SYMPHONY_BOARD_URL` env var unset → default ``http://127.0.0.1:8765/``
-      (the port used by ``tools/board-viewer/board-viewer-open.sh``).
+    - `SYMPHONY_BOARD_URL` env var unset → the built-in admin UI served on
+      the orchestrator port: ``http://127.0.0.1:<server.port>/`` (falls back
+      to the `symphony service` default port 9999 when `server.port` is not
+      set in WORKFLOW.md).
     - `SYMPHONY_BOARD_URL=""` (explicit empty) → disabled, no header line.
     - Any other value → that exact URL.
     """
     raw = os.environ.get("SYMPHONY_BOARD_URL")
     if raw is None:
-        return "http://127.0.0.1:8765/"
+        port = cfg.server.port if cfg.server.port is not None else DEFAULT_SERVICE_PORT
+        return f"http://127.0.0.1:{port}/"
     stripped = raw.strip()
     if not stripped:
         return None
@@ -149,8 +153,8 @@ def render_progress_md(
     """Render the progress markdown body. Pure function — easy to test.
 
     ``board_url`` is rendered as a clickable header line so headless operators
-    can jump straight to the browser board-viewer that ships in
-    ``tools/board-viewer/``. Defaults via :func:`_resolve_board_url` when None.
+    can jump straight to the built-in admin UI served on the orchestrator
+    port. Defaults via :func:`_resolve_board_url` when None.
     """
     state_order = _ordered_states(cfg)
     by_state: dict[str, list[Issue]] = {s: [] for s in state_order}
@@ -164,7 +168,7 @@ def render_progress_md(
             by_state[bucket].append(issue)
 
     if board_url is None:
-        board_url = _resolve_board_url()
+        board_url = _resolve_board_url(cfg)
 
     lines: list[str] = []
     lines.append("# Symphony Progress")
@@ -176,7 +180,7 @@ def render_progress_md(
     if board_url:
         # Clickable in any markdown viewer (GitHub, VS Code, Obsidian, etc.)
         lines.append("")
-        lines.append(f"_Board viewer:_ [{board_url}]({board_url})")
+        lines.append(f"_Board:_ [{board_url}]({board_url})")
     lines.append("")
     lines.append("## Kanban")
     lines.append("")

@@ -72,6 +72,8 @@
     getPrompt: (stateName) => apiRequest(`/workflow/prompts/${encodeURIComponent(stateName)}`),
     putPrompt: (stateName, content) => apiRequest(`/workflow/prompts/${encodeURIComponent(stateName)}`, { method: 'PUT', body: JSON.stringify({ content }) }),
     putBranchPolicy: (payload) => apiRequest('/workflow/branch-policy', { method: 'PUT', body: JSON.stringify(payload) }),
+    getLanePresets: () => apiRequest('/workflow/presets'),
+    applyLanePreset: (name) => apiRequest('/workflow/presets/apply', { method: 'POST', body: JSON.stringify({ name }) }),
     putContinuousImprovement: (payload) => apiRequest('/workflow/continuous-improvement', { method: 'PUT', body: JSON.stringify(payload) }),
     getContinuousImprovementStatus: () => apiRequest('/continuous-improvement/status'),
     resetContinuousImprovementTurns: () => apiRequest('/workflow/continuous-improvement/reset-turns', { method: 'POST' }),
@@ -118,17 +120,9 @@
     getStats: (days) => apiRequest(`/stats?days=${encodeURIComponent(days)}`),
     pause: (id) => apiRequest(`/${encodeURIComponent(id)}/pause`, { method: 'POST' }),
     resume: (id) => apiRequest(`/${encodeURIComponent(id)}/resume`, { method: 'POST' }),
-    skipLearn: (id) => apiRequest(`/${encodeURIComponent(id)}/skip-learn`, { method: 'POST' }),
+    skipDocument: (id) => apiRequest(`/${encodeURIComponent(id)}/skip-document`, { method: 'POST' }),
     recoverBlocked: (id) => apiRequest(`/issues/${encodeURIComponent(id)}/recover-blocked`, { method: 'POST' }),
     refresh: () => apiRequest('/refresh', { method: 'POST' }),
-    // Governed workflow runs. The run detail carries its own `actions` list,
-    // so the UI never derives which mutations are legal from the status.
-    getGovernedRun: (runId) => apiRequest(`/runs/${encodeURIComponent(runId)}`),
-    resumeGovernedRun: (runId) => apiRequest(`/runs/${encodeURIComponent(runId)}/resume`, { method: 'POST' }),
-    abandonGovernedRun: (runId) => apiRequest(`/runs/${encodeURIComponent(runId)}/abandon`, { method: 'POST' }),
-    startFreshGovernedRun: (runId) => apiRequest(`/runs/${encodeURIComponent(runId)}/start-fresh`, { method: 'POST' }),
-    cancelGovernedRun: (runId) => apiRequest(`/runs/${encodeURIComponent(runId)}/cancel`, { method: 'POST' }),
-    resolveApproval: (approvalId, payload) => apiRequest(`/approvals/${encodeURIComponent(approvalId)}/resolve`, { method: 'POST', body: JSON.stringify(payload) }),
   };
 
   // ------------------------------------------------------------------
@@ -162,15 +156,6 @@
     openModalBackdrop: null,
     openMenu: null,
     wfRerender: null,
-    // Governed run execution panel. `runPanelBody` is rebuilt on every poll,
-    // `runPanelError` survives it so a conflict message is not wiped by the
-    // refresh it triggers, and `runPanelHold` freezes the poll while the
-    // operator is mid-decision.
-    runPanelId: null,
-    runPanelBody: null,
-    runPanelError: null,
-    runPanelHold: false,
-    runPanelExpanded: new Set(),
   };
 
   // ------------------------------------------------------------------
@@ -394,8 +379,10 @@
     return found ? found.name : lowerName;
   }
 
-  function isLearnState(name) {
-    return String(name || '').trim().toLowerCase() === 'learn';
+  function isDocumentState(name) {
+    const state = String(name || '').trim().toLowerCase();
+    // 'learn' is the legacy name of the Document lane (pre-rename boards).
+    return state === 'document' || state === 'learn';
   }
 
   function isBlockedState(name) {
@@ -1054,6 +1041,20 @@
     }, attention.label || t('board.attention'));
   }
 
+  function blockedByIds(issue) {
+    if (!issue || !Array.isArray(issue.blocked_by)) return [];
+    return issue.blocked_by
+      .map((b) => (typeof b === 'string' ? b : (b && b.identifier) || ''))
+      .filter(Boolean);
+  }
+
+  function parseIdList(value) {
+    return String(value || '')
+      .split(',')
+      .map((s) => s.trim())
+      .filter(Boolean);
+  }
+
   function buildCardEl(issue, liveEntry, readOnly) {
     const card = el('div', {
       class: `card${liveEntry && liveEntry.paused ? ' paused' : ''}`,
@@ -1076,18 +1077,35 @@
     }
     for (const label of issue.labels) badges.appendChild(el('span', { class: 'chip-label' }, label));
     if (issue.agent_kind) badges.appendChild(el('span', { class: 'chip-agent' }, issue.agent_kind));
+    else if (issue.last_agent_kind) {
+      // Stage-routed board: no pin is written, so show who actually ran it.
+      badges.appendChild(el('span', {
+        class: 'chip-agent chip-agent-last',
+        title: t('board.lastAgentTitle'),
+      }, issue.last_agent_kind));
+    }
+    // The API has always returned `blocked_by` and `request`; without these
+    // chips the DAG the chat intake files is invisible on the board it points
+    // the operator at.
+    const blockerIds = blockedByIds(issue);
+    if (blockerIds.length) {
+      badges.appendChild(el('span', {
+        class: 'chip-blocked',
+        title: t('board.blockedByTitle', { ids: blockerIds.join(', ') }),
+      }, `⛓ ${blockerIds.join(', ')}`));
+    }
+    if (issue.request) badges.appendChild(el('span', { class: 'chip-request' }, issue.request));
     const attentionBadge = buildAttentionBadge(issue.attention);
     if (attentionBadge) badges.appendChild(attentionBadge);
-    for (const badge of buildGovernedBadges(liveEntry)) badges.appendChild(badge);
     if (badges.childNodes.length) card.appendChild(badges);
-    if (!readOnly && isLearnState(issue.state) && !liveEntry) {
+    if (!readOnly && isDocumentState(issue.state) && !liveEntry) {
       card.appendChild(el('button', {
         class: 'btn btn-ghost btn-sm card-action',
         onClick: async (e) => {
           e.stopPropagation();
-          await runControlAction(api.skipLearn, issue.identifier, t('issue.skippedLearn'));
+          await runControlAction(api.skipDocument, issue.identifier, t('issue.skippedDocument'));
         },
-      }, t('issue.skipLearn')));
+      }, t('issue.skipDocument')));
     }
     if (!readOnly && isBlockedState(issue.state) && !liveEntry) {
       card.appendChild(el('button', {
@@ -1127,12 +1145,15 @@
     const labelsInput = el('input', { class: 'input', type: 'text', placeholder: t('board.labelsPlaceholder') });
     const agentSelect = buildAgentSelect('');
     const prefixInput = el('input', { class: 'input', type: 'text', placeholder: 'TASK', maxlength: 16 });
+    const blockedByInput = el('input', { class: 'input', type: 'text', placeholder: t('board.blockedByPlaceholder') });
+    const requestInput = el('input', { class: 'input', type: 'text', placeholder: t('board.requestPlaceholder') });
 
     const body = el('div', { class: 'form-stack' }, [
       field(t('common.title'), titleInput),
       field(t('common.description'), descInput),
       fieldRow([field(t('common.state'), stateSelect), field(t('common.priority'), prioritySelect)]),
       field(t('common.labels'), labelsInput),
+      fieldRow([field(t('common.blockedBy'), blockedByInput), field(t('common.request'), requestInput)]),
       fieldRow([field(t('common.agent'), agentSelect), field(t('settings.idPrefix'), prefixInput)]),
     ]);
 
@@ -1150,6 +1171,8 @@
           priority: prioritySelect.value === '' ? null : Number(prioritySelect.value),
           labels: parseLabels(labelsInput.value),
           agent_kind: agentSelect.value,
+          blocked_by: parseIdList(blockedByInput.value),
+          request: requestInput.value.trim(),
           prefix: prefixInput.value.trim() || 'TASK',
         });
         showToast(t('board.issueCreated', { id: created.identifier }), 'success');
@@ -1243,11 +1266,50 @@
     labelsInput.addEventListener('blur', commitLabels);
     labelsInput.addEventListener('keydown', (e) => { if (e.key === 'Enter') labelsInput.blur(); });
 
+    const blockedByInput = el('input', {
+      class: 'input',
+      type: 'text',
+      value: blockedByIds(detail).join(', '),
+      placeholder: t('board.blockedByPlaceholder'),
+    });
+    const commitBlockedBy = () => {
+      const ids = parseIdList(blockedByInput.value);
+      const current = blockedByIds(detail);
+      if (JSON.stringify(ids) === JSON.stringify(current)) return;
+      commitField(
+        detail.identifier, 'blocked_by', ids,
+        () => { blockedByInput.value = current.join(', '); },
+        () => { detail.blocked_by = ids.map((identifier) => ({ identifier, state: null })); },
+      );
+    };
+    blockedByInput.addEventListener('blur', commitBlockedBy);
+    blockedByInput.addEventListener('keydown', (e) => { if (e.key === 'Enter') blockedByInput.blur(); });
+
+    const requestInput = el('input', {
+      class: 'input',
+      type: 'text',
+      value: detail.request || '',
+      placeholder: t('board.requestPlaceholder'),
+    });
+    const commitRequest = () => {
+      const value = requestInput.value.trim();
+      if (value === (detail.request || '')) return;
+      commitField(
+        detail.identifier, 'request', value,
+        () => { requestInput.value = detail.request || ''; },
+        () => { detail.request = value; },
+      );
+    };
+    requestInput.addEventListener('blur', commitRequest);
+    requestInput.addEventListener('keydown', (e) => { if (e.key === 'Enter') requestInput.blur(); });
+
     const fieldsGrid = el('div', { class: 'drawer-fields' }, [
       field(t('common.state'), stateSelect),
       field(t('common.priority'), prioritySelect),
       field(t('common.agent'), agentSelect),
       field(t('common.labels'), labelsInput),
+      field(t('common.blockedBy'), blockedByInput),
+      field(t('common.request'), requestInput),
     ]);
 
     const deleteBtn = el('button', {
@@ -1275,13 +1337,13 @@
         el('span', null, detail.attention.message || ''),
       ]));
     }
-    if (!detail.live && isLearnState(detail.state)) {
+    if (!detail.live && isDocumentState(detail.state)) {
       container.appendChild(el('button', {
         class: 'btn btn-ghost',
         onClick: async () => {
-          await runControlAction(api.skipLearn, detail.identifier, t('issue.skippedLearn'));
+          await runControlAction(api.skipDocument, detail.identifier, t('issue.skippedDocument'));
         },
-      }, t('issue.skipLearn')));
+      }, t('issue.skipDocument')));
     }
     if (!detail.live && isBlockedState(detail.state)) {
       container.appendChild(el('button', {
@@ -1292,13 +1354,6 @@
       }, t('issue.openRca')));
     }
     if (detail.live) container.appendChild(buildLiveSection(detail));
-    const governedLive = governedLiveInfo(detail.live);
-    if (governedLive) {
-      container.appendChild(el('button', {
-        class: 'btn btn-ghost',
-        onClick: () => openRunPanel(governedLive.run_id),
-      }, t('governed.openRunPanel')));
-    }
     container.appendChild(buildRunHistorySection(detail));
     container.appendChild(buildDescriptionSection(detail));
     container.appendChild(el('div', { class: 'drawer-meta' }, [
@@ -1456,523 +1511,6 @@
     }
   }
 
-  // ------------------------------------------------------------------
-  // Governed workflow runs: card badges, execution panel, gates
-  //
-  // The server owns every decision here. `detail.actions` says which buttons
-  // exist, `approval.version` is echoed back as `expected_version` so a stale
-  // decision loses the compare-and-set, and node order is the topological
-  // order the executor used — the UI never re-sorts or re-derives it.
-  // ------------------------------------------------------------------
-
-  // Governed info rides along on the live board entry only while a governed
-  // run holds the ticket. The board payload may nest it under `governed` or
-  // spread it onto the row, so accept either and treat `run_id` as the marker.
-  function governedLiveInfo(liveEntry) {
-    if (!liveEntry) return null;
-    const info = liveEntry.governed || liveEntry;
-    return info && info.run_id ? info : null;
-  }
-
-  function buildGovernedBadges(liveEntry) {
-    const info = governedLiveInfo(liveEntry);
-    if (!info) return [];
-    const badges = [];
-    if (info.workflow_name) {
-      badges.push(el('button', {
-        class: 'chip-workflow',
-        type: 'button',
-        title: t('governed.openRunPanel'),
-        onClick: (e) => { e.stopPropagation(); openRunPanel(info.run_id); },
-      }, `⚙ ${info.workflow_name}`));
-    }
-    const activeNode = info.active_node || info.node_id || '';
-    if (activeNode) badges.push(el('span', { class: 'chip-node' }, t('governed.badgeNode', { node: activeNode })));
-    const progress = info.progress;
-    if (progress && progress.total != null) {
-      badges.push(el('span', { class: 'chip-progress' }, t('governed.badgeProgress', { completed: progress.completed ?? 0, total: progress.total })));
-    }
-    // Gate and attention differ by word and symbol, never by colour alone —
-    // the same rule the TUI follows, and what a colour-blind operator needs.
-    if (info.pending_approval || info.execution_status === 'waiting_approval') {
-      badges.push(el('span', { class: 'chip-gate' }, t('governed.badgeGate')));
-    }
-    if (info.needs_attention || info.execution_status === 'needs_attention') {
-      badges.push(el('span', { class: 'chip-run-attention' }, t('governed.badgeAttention')));
-    }
-    return badges;
-  }
-
-  const RUN_ACTION_LABELS = {
-    resume: 'governed.actionResume',
-    abandon: 'governed.actionAbandon',
-    cancel: 'governed.actionCancel',
-    start_fresh: 'governed.actionStartFresh',
-  };
-
-  const RUN_ACTION_HANDLERS = {
-    resume: { call: (runId) => api.resumeGovernedRun(runId), doneKey: 'governed.resumed' },
-    abandon: { call: (runId) => api.abandonGovernedRun(runId), doneKey: 'governed.abandoned', confirm: true },
-    cancel: { call: (runId) => api.cancelGovernedRun(runId), doneKey: 'governed.cancelled' },
-    // Abandons this run and lets the ordinary dispatch path create a new one
-    // from the current definition, so it is as irreversible as abandon.
-    start_fresh: { call: (runId) => api.startFreshGovernedRun(runId), doneKey: 'governed.startedFresh', confirm: true },
-  };
-
-  function openRunPanel(runId) {
-    const body = el('div', { class: 'run-panel-body' }, el('div', { class: 'history-muted' }, t('governed.loadingRun')));
-    // The error box lives outside `body` so the refresh that a failure triggers
-    // cannot erase the message explaining why the action failed.
-    const errorBox = el('div', { class: 'modal-error', style: 'display:none;' });
-    const content = el('div', { class: 'modal-form run-panel' }, [
-      el('div', { class: 'modal-header' }, [
-        el('h2', null, t('governed.runPanelTitle')),
-        el('button', { class: 'btn-icon modal-close', type: 'button', 'aria-label': t('common.close'), onClick: closeRunPanel }, '✕'),
-      ]),
-      el('div', { class: 'modal-body' }, [body, errorBox]),
-    ]);
-    openModal(content, 'lg');
-    state.runPanelId = runId;
-    state.runPanelBody = body;
-    state.runPanelError = errorBox;
-    state.runPanelHold = false;
-    state.runPanelExpanded = new Set();
-    loadRunPanel(runId, body);
-    pollRunPanel(body);
-  }
-
-  function closeRunPanel() {
-    state.runPanelId = null;
-    state.runPanelBody = null;
-    state.runPanelError = null;
-    state.runPanelHold = false;
-    closeModal();
-  }
-
-  async function loadRunPanel(runId, body) {
-    try {
-      const detail = await api.getGovernedRun(runId);
-      if (state.runPanelId !== runId) return;
-      clearNode(body);
-      body.appendChild(buildRunPanelContent(detail));
-    } catch (err) {
-      if (state.runPanelId !== runId) return;
-      clearNode(body);
-      body.appendChild(el('div', { class: 'modal-error' }, t('governed.runLoadFailed', { id: runId, error: apiErrorText(err) })));
-    }
-  }
-
-  function refreshRunPanel() {
-    if (!state.runPanelId || !state.runPanelBody) return Promise.resolve();
-    return loadRunPanel(state.runPanelId, state.runPanelBody);
-  }
-
-  async function pollRunPanel(body) {
-    // One loop per panel: a newer panel owns state.runPanelBody, so this loop
-    // retires instead of polling on the new panel's behalf as well.
-    if (body !== state.runPanelBody) return;
-    // Any close path — backdrop, Escape, the ✕ — detaches the body, which is
-    // the signal to stop; there is no other place that owns this loop.
-    if (!body.isConnected) {
-      state.runPanelId = null;
-      state.runPanelBody = null;
-      state.runPanelError = null;
-      return;
-    }
-    // Same hold as pollBoard, plus the mid-decision hold: a refresh must never
-    // pull a focused comment box or a pending confirm step out from under the
-    // operator.
-    if (!shouldHoldRender() && !state.runPanelHold) await refreshRunPanel();
-    setTimeout(() => pollRunPanel(body), 5000);
-  }
-
-  function apiErrorText(err) {
-    // PRD §24.6: the operator sees the server's code and message, never a
-    // swallowed failure.
-    if (err instanceof ApiError) return t('governed.errorWithCode', { code: err.code, message: err.message });
-    return (err && err.message) || t('common.somethingWentWrong');
-  }
-
-  function showRunPanelError(message) {
-    const box = state.runPanelError;
-    if (!box) {
-      showToast(message, 'error');
-      return;
-    }
-    box.textContent = message;
-    box.style.display = 'block';
-  }
-
-  function clearRunPanelError() {
-    if (state.runPanelError) state.runPanelError.style.display = 'none';
-  }
-
-  function buildRunPanelContent(detail) {
-    const wrap = el('div', { class: 'run-panel-content' });
-    wrap.appendChild(buildRunPanelSummary(detail));
-    if (detail.attention_reason) wrap.appendChild(buildRunAttentionSection(detail));
-    if (detail.terminal_reason) {
-      wrap.appendChild(el('div', { class: 'run-terminal-reason' }, t('governed.terminalReason', { reason: detail.terminal_reason })));
-    }
-    const actionsRow = buildRunActionsRow(detail);
-    if (actionsRow.childNodes.length) wrap.appendChild(actionsRow);
-    const approvals = buildRunApprovalsSection(detail);
-    if (approvals) wrap.appendChild(approvals);
-    wrap.appendChild(buildRunNodesSection(detail));
-    wrap.appendChild(buildRunArtifactsSection(detail));
-    return wrap;
-  }
-
-  function buildRunPanelSummary(detail) {
-    const usage = detail.usage || {};
-    const progress = detail.progress || {};
-    return el('div', { class: 'run-panel-summary' }, [
-      liveStat(t('governed.workflow'), detail.workflow_name || '—'),
-      liveStat(t('common.status'), detail.execution_status || t('common.unknown')),
-      liveStat(t('governed.progress'), t('governed.badgeProgress', { completed: progress.completed ?? 0, total: progress.total ?? 0 })),
-      liveStat(t('governed.usage'), t('governed.usageTokens', {
-        input: formatCompactNumber(usage.input_tokens ?? 0),
-        output: formatCompactNumber(usage.output_tokens ?? 0),
-      })),
-      liveStat(t('governed.cost'), formatCostUsd(usage.cost_usd)),
-      liveStat(t('governed.runId'), detail.run_id || '—'),
-    ]);
-  }
-
-  function buildRunAttentionSection(detail) {
-    return el('div', { class: 'run-attention' }, [
-      el('strong', null, t('governed.attentionHeading')),
-      el('span', null, t('governed.attentionReason', { reason: detail.attention_reason })),
-    ]);
-  }
-
-  function buildRunActionsRow(detail) {
-    const row = el('div', { class: 'run-panel-actions' });
-    for (const action of detail.actions || []) {
-      // approve/reject belong to the gate that owns the version, not here.
-      if (action === 'approve' || action === 'reject') continue;
-      const labelKey = RUN_ACTION_LABELS[action];
-      const label = labelKey ? t(labelKey) : action;
-      const handler = RUN_ACTION_HANDLERS[action];
-      if (!handler) {
-        // Offered by the server but with no endpoint in this build: show it
-        // disabled rather than pretending the server never offered it.
-        row.appendChild(el('button', {
-          class: 'btn btn-ghost btn-sm',
-          type: 'button',
-          disabled: true,
-          title: t('governed.actionUnavailable'),
-        }, label));
-        continue;
-      }
-      if (handler.confirm) {
-        row.appendChild(buildConfirmedActionControl(detail, action, handler, label));
-        continue;
-      }
-      row.appendChild(el('button', {
-        class: 'btn btn-ghost btn-sm',
-        type: 'button',
-        onClick: () => runGovernedAction(detail, handler),
-      }, label));
-    }
-    return row;
-  }
-
-  // Abandon is irreversible, so it takes two clicks. It confirms inline rather
-  // than through confirmDialog() because that would close this modal.
-  function buildConfirmedActionControl(detail, action, handler, label) {
-    const wrap = el('span', { class: 'run-confirm-control' });
-    const render = (confirming) => {
-      clearNode(wrap);
-      state.runPanelHold = confirming;
-      if (!confirming) {
-        wrap.appendChild(el('button', {
-          class: 'btn btn-ghost btn-sm',
-          type: 'button',
-          onClick: () => render(true),
-        }, label));
-        return;
-      }
-      wrap.appendChild(el('span', { class: 'run-confirm-text' }, t('governed.abandonConfirm', { id: detail.run_id })));
-      wrap.appendChild(el('button', {
-        class: 'btn btn-danger btn-sm',
-        type: 'button',
-        onClick: () => {
-          state.runPanelHold = false;
-          runGovernedAction(detail, handler);
-        },
-      }, t('governed.confirmAction')));
-      wrap.appendChild(el('button', {
-        class: 'btn btn-ghost btn-sm',
-        type: 'button',
-        onClick: () => render(false),
-      }, t('common.cancel')));
-    };
-    render(false);
-    return wrap;
-  }
-
-  async function runGovernedAction(detail, handler) {
-    clearRunPanelError();
-    state.runPanelHold = true;
-    try {
-      await handler.call(detail.run_id);
-      showToast(t(handler.doneKey), 'success');
-    } catch (err) {
-      showRunPanelError(apiErrorText(err));
-    } finally {
-      state.runPanelHold = false;
-      await refreshRunPanel();
-      await refreshBoard();
-    }
-  }
-
-  function buildRunApprovalsSection(detail) {
-    const approvals = detail.approvals || [];
-    if (!approvals.length) return null;
-    const list = el('div', { class: 'run-approval-list' });
-    for (const approval of approvals) list.appendChild(buildApprovalPanel(detail, approval));
-    return el('div', { class: 'run-panel-section' }, [
-      el('div', { class: 'section-heading' }, t('governed.approvals')),
-      list,
-    ]);
-  }
-
-  function buildApprovalPanel(detail, approval) {
-    const panel = el('div', { class: `run-approval run-approval-${approval.status || 'unknown'}` }, [
-      el('div', { class: 'run-approval-title' }, approval.title || approval.node_id || t('governed.approvals')),
-      el('div', { class: 'run-approval-status' }, t('governed.gateStatus', { status: approval.status || t('common.unknown') })),
-    ]);
-    if (approval.instructions) {
-      panel.appendChild(el('div', { class: 'run-approval-instructions' }, renderMarkdown(approval.instructions)));
-    }
-    panel.appendChild(buildApprovalEvidence(detail, approval));
-    if (approval.status !== 'pending') {
-      panel.appendChild(el('div', { class: 'history-muted' }, t('governed.gateResolved', {
-        decision: approval.decision || '—',
-        actor: approval.actor || '—',
-      })));
-      if (approval.comment) panel.appendChild(el('div', { class: 'run-approval-comment' }, approval.comment));
-      return panel;
-    }
-    const commentInput = el('textarea', { class: 'textarea', rows: 2, placeholder: t('governed.commentPlaceholder') });
-    panel.appendChild(commentInput);
-    const allowed = detail.actions || [];
-    const actions = el('div', { class: 'run-approval-actions' });
-    if (allowed.includes('approve')) {
-      actions.appendChild(el('button', {
-        class: 'btn btn-primary btn-sm',
-        type: 'button',
-        onClick: () => resolveGate(approval, 'approved', commentInput),
-      }, t('governed.approve')));
-    }
-    if (allowed.includes('reject')) {
-      actions.appendChild(el('button', {
-        class: 'btn btn-danger btn-sm',
-        type: 'button',
-        onClick: () => resolveGate(approval, 'rejected', commentInput),
-      }, t('governed.reject')));
-    }
-    panel.appendChild(actions);
-    return panel;
-  }
-
-  // Evidence is whatever the gate names — its declared evidence nodes, or the
-  // gate node itself. Showing an unrelated preview would be worse than none.
-  function buildApprovalEvidence(detail, approval) {
-    const block = el('div', { class: 'run-approval-evidence' }, [
-      el('div', { class: 'run-panel-subheading' }, t('governed.evidence')),
-    ]);
-    const ids = (approval.evidence && approval.evidence.length ? approval.evidence : [approval.node_id]).filter(Boolean);
-    const previews = [];
-    for (const nodeId of ids) {
-      const node = latestNodeAttempt(detail, nodeId);
-      if (!node || !node.output_preview) continue;
-      previews.push(el('div', { class: 'run-evidence-item' }, [
-        el('div', { class: 'run-evidence-node' }, nodeId),
-        el('pre', { class: 'run-node-output' }, node.output_preview),
-      ]));
-    }
-    if (!previews.length) {
-      block.appendChild(el('div', { class: 'history-muted' }, t('governed.noEvidence')));
-      return block;
-    }
-    for (const item of previews) block.appendChild(item);
-    return block;
-  }
-
-  function latestNodeAttempt(detail, nodeId) {
-    let best = null;
-    for (const node of detail.nodes || []) {
-      if (node.node_id !== nodeId) continue;
-      if (!best || (node.attempt ?? 0) >= (best.attempt ?? 0)) best = node;
-    }
-    return best;
-  }
-
-  async function resolveGate(approval, decision, commentInput) {
-    const comment = commentInput.value.trim();
-    if (decision === 'rejected' && !comment) {
-      showRunPanelError(t('governed.commentRequired'));
-      return;
-    }
-    clearRunPanelError();
-    state.runPanelHold = true;
-    try {
-      // expected_version is the version of the record actually rendered, so a
-      // gate that moved since then is rejected by the server, not overwritten.
-      await api.resolveApproval(approval.approval_id, {
-        decision,
-        expected_version: approval.version,
-        comment,
-      });
-      showToast(decision === 'approved' ? t('governed.approved') : t('governed.rejected'), 'success');
-    } catch (err) {
-      if (err instanceof ApiError && err.status === 409) {
-        // Never mark it resolved optimistically — reload and let the operator
-        // decide again against the version the server now holds.
-        showRunPanelError(t('governed.gateConflict', { message: err.message }));
-      } else {
-        showRunPanelError(apiErrorText(err));
-      }
-    } finally {
-      state.runPanelHold = false;
-      await refreshRunPanel();
-      await refreshBoard();
-    }
-  }
-
-  function buildRunNodesSection(detail) {
-    const rows = el('div', { class: 'run-node-rows' });
-    const nodes = detail.nodes || [];
-    if (!nodes.length) rows.appendChild(el('div', { class: 'history-muted' }, t('governed.noNodes')));
-    // Server order is the topological order the run executed in; re-sorting
-    // would show a graph that never ran.
-    for (const node of nodes) rows.appendChild(buildRunNodeRow(node));
-    return el('div', { class: 'run-panel-section' }, [
-      el('div', { class: 'section-heading' }, t('governed.nodes')),
-      rows,
-    ]);
-  }
-
-  function buildRunNodeRow(node) {
-    const key = `${node.node_id}#${node.attempt}`;
-    const summary = el('summary', { class: 'run-node-summary' }, [
-      el('span', { class: 'run-node-id' }, node.node_id),
-      el('span', { class: 'run-node-attempt' }, t('governed.attempt', { n: node.attempt ?? 1 })),
-      el('span', { class: `run-node-status node-${node.status || 'unknown'}` }, node.status || t('common.unknown')),
-      el('span', { class: 'run-node-type' }, node.node_type || '—'),
-    ]);
-    const row = el('details', { class: 'run-node-row', open: state.runPanelExpanded.has(key) }, [
-      summary,
-      buildRunNodeDetail(node),
-    ]);
-    // Expansion is remembered across the 5s refresh, otherwise reading a long
-    // output preview would be impossible.
-    row.addEventListener('toggle', () => {
-      if (row.open) state.runPanelExpanded.add(key);
-      else state.runPanelExpanded.delete(key);
-    });
-    return row;
-  }
-
-  function buildRunNodeDetail(node) {
-    const usage = node.usage || {};
-    const wrap = el('div', { class: 'run-node-detail' }, [
-      el('div', { class: 'run-node-facts' }, [
-        liveStat(t('governed.backend'), node.backend_kind || '—'),
-        liveStat(t('governed.started'), node.started_at ? formatShortDateTime(node.started_at) : '—'),
-        liveStat(t('governed.completed'), node.completed_at ? formatShortDateTime(node.completed_at) : t('common.openEnded')),
-        liveStat(t('governed.usage'), t('governed.usageTokens', {
-          input: formatCompactNumber(usage.input_tokens ?? 0),
-          output: formatCompactNumber(usage.output_tokens ?? 0),
-        })),
-        liveStat(t('governed.cost'), formatCostUsd(usage.cost_usd)),
-      ]),
-    ]);
-    if (node.error_class || node.error_code || node.error_message) {
-      wrap.appendChild(el('div', { class: 'run-node-error' }, t('governed.errorDetail', {
-        cls: node.error_class || '—',
-        code: node.error_code || '—',
-        message: node.error_message || '',
-      })));
-    }
-    if (node.output_preview) {
-      wrap.appendChild(el('div', { class: 'run-panel-subheading' }, t('governed.outputPreview')));
-      wrap.appendChild(el('pre', { class: 'run-node-output' }, node.output_preview));
-    }
-    wrap.appendChild(buildNodeGitSummary(node.git));
-    return wrap;
-  }
-
-  function buildNodeGitSummary(git) {
-    const block = el('div', { class: 'run-node-git' }, [
-      el('div', { class: 'run-panel-subheading' }, t('governed.gitSummary')),
-    ]);
-    if (!git || (!git.head_before && !git.head_after)) {
-      block.appendChild(el('div', { class: 'history-muted' }, t('governed.noGitProvenance')));
-      return block;
-    }
-    block.appendChild(el('div', { class: 'run-node-heads' }, t('governed.gitHeads', {
-      before: shortSha(git.head_before),
-      after: shortSha(git.head_after),
-    })));
-    const total = git.diffstat && git.diffstat.total;
-    if (total) {
-      block.appendChild(el('div', { class: 'run-node-diffstat' }, t('governed.diffstatSummary', {
-        files: total.files ?? 0,
-        insertions: total.insertions ?? 0,
-        deletions: total.deletions ?? 0,
-      })));
-    }
-    return block;
-  }
-
-  function buildRunArtifactsSection(detail) {
-    const rows = el('div', { class: 'run-artifact-rows' });
-    const artifacts = detail.artifacts || [];
-    if (!artifacts.length) rows.appendChild(el('div', { class: 'history-muted' }, t('governed.noArtifacts')));
-    for (const artifact of artifacts) rows.appendChild(buildRunArtifactRow(artifact));
-    return el('div', { class: 'run-panel-section' }, [
-      el('div', { class: 'section-heading' }, t('governed.artifacts')),
-      rows,
-    ]);
-  }
-
-  function buildRunArtifactRow(artifact) {
-    return el('div', { class: 'run-artifact-row' }, [
-      el('a', {
-        class: 'run-artifact-link',
-        href: `${API_BASE}/artifacts/${encodeURIComponent(artifact.artifact_id)}`,
-        target: '_blank',
-        rel: 'noopener',
-      }, artifact.relative_path || artifact.artifact_id),
-      el('span', { class: 'run-artifact-meta' }, t('governed.artifactMeta', {
-        type: artifact.artifact_type || '—',
-        size: formatBytes(artifact.size_bytes),
-      })),
-    ]);
-  }
-
-  function shortSha(sha) {
-    return sha ? String(sha).slice(0, 8) : '—';
-  }
-
-  function formatCostUsd(value) {
-    return value == null ? '—' : `$${Number(value).toFixed(4)}`;
-  }
-
-  function formatBytes(bytes) {
-    if (bytes == null) return '—';
-    const units = ['B', 'KB', 'MB', 'GB'];
-    let value = Number(bytes);
-    let unit = 0;
-    while (value >= 1024 && unit < units.length - 1) {
-      value /= 1024;
-      unit++;
-    }
-    return `${unit === 0 ? value : value.toFixed(1)} ${units[unit]}`;
-  }
 
   // ------------------------------------------------------------------
   // Page: Stats
@@ -3226,10 +2764,25 @@
     return options;
   }
 
+  // Improvement modes: one opt-in checkbox each. An empty selection keeps the
+  // original readiness-only heartbeat, which is what `enabled` alone meant
+  // before modes existed.
+  function ciModeCheckboxes(ci) {
+    const supported = ci.supported_modes || ['readiness'];
+    const selected = new Set(ci.modes || []);
+    return supported.map((mode) =>
+      el('label', { class: 'form-check', 'data-ci-mode': mode }, [
+        el('input', { type: 'checkbox', 'data-ci-mode-input': mode, checked: selected.has(mode) }),
+        el('span', null, t(`workflow.ciMode.${mode}`)),
+      ])
+    );
+  }
+
   function buildContinuousImprovementCard(wf, ciStatus) {
     const ci = wf.continuous_improvement || {};
     const status = ciStatus || {};
     const statusView = ciStatusView(ci, status);
+    const modeChecks = ciModeCheckboxes(ci);
     const enabledInput = el('input', { id: 'ci-enabled-toggle', type: 'checkbox', checked: Boolean(ci.enabled) });
     const intervalInput = el('input', { id: 'ci-interval-input', class: 'input', type: 'number', min: '60000', step: '60000', value: ci.interval_ms || 1800000 });
     const maxTurnsInput = el('input', { id: 'ci-max-turns-input', class: 'input', type: 'number', min: '0', step: '1', value: ci.max_turns == null ? 48 : ci.max_turns });
@@ -3262,6 +2815,9 @@
             interval_ms: Number(intervalInput.value),
             max_turns: Number(maxTurnsInput.value),
             agent_kind: agentSelect.value,
+            modes: modeChecks
+              .filter((node) => node.querySelector('input').checked)
+              .map((node) => node.getAttribute('data-ci-mode')),
           };
           const result = await api.putContinuousImprovement(payload);
           state.workflow = { ...wf, continuous_improvement: result.continuous_improvement };
@@ -3287,6 +2843,8 @@
         field(t('chat.maxTurns'), maxTurnsInput),
         field(t('issue.ticketAgent'), agentSelect),
       ]),
+      field(t('workflow.ciModes'), el('div', { class: 'ci-modes' }, modeChecks)),
+      el('div', { class: 'form-hint' }, t('workflow.ciModesHint')),
       el('div', { class: 'ci-status-grid' }, [
         kv(t('workflow.turnsUsed'), `${status.turns_used == null ? 0 : status.turns_used} / ${ci.max_turns === 0 ? t('workflow.unlimited') : ci.max_turns}`),
         kv(t('common.phase'), status.current_phase || '—'),
@@ -3296,6 +2854,50 @@
         kv(t('workflow.nextDue'), status.next_due_at || '—'),
       ]),
       el('div', { class: 'ci-actions' }, [saveButton, resetButton]),
+    ]);
+  }
+
+  function buildStageContractsRow(wf) {
+    // F-06: `agent.stage_contracts: auto` silently switches the mechanical
+    // evidence floor off as soon as a default lane is renamed. Say so here.
+    const agent = (wf && wf.agent) || {};
+    const enabled = agent.stage_contracts_enabled !== false;
+    const lanes = 'Todo, In Progress, Verify, Document';
+    return el('div', { class: enabled ? 'form-hint' : 'form-hint form-hint-warn' }, [
+      el('strong', null, t('settings.stageContracts') + ': '),
+      enabled ? t('settings.stageContractsOn') : t('settings.stageContractsOff', { lanes }),
+    ]);
+  }
+
+  function buildLanePresetCard(presets, wf) {
+    const select = el(
+      'select',
+      { class: 'select' },
+      presets.presets.map((p) =>
+        el('option', { value: p.name, selected: p.name === presets.current }, p.label)
+      )
+    );
+    const applyButton = el('button', {
+      class: 'btn btn-primary',
+      onClick: async (e) => {
+        e.target.disabled = true;
+        try {
+          const result = await api.applyLanePreset(select.value);
+          showToast(t('settings.lanePresetApplied', { name: result.applied }), 'success');
+          renderRoute();
+        } catch (err) {
+          showToast(err.message, 'error');
+        } finally {
+          e.target.disabled = false;
+        }
+      },
+    }, t('common.apply'));
+    return el('div', { class: 'card-panel' }, [
+      el('h3', null, t('settings.lanePreset')),
+      fieldRow([field(t('settings.lanePresetChoose'), select)]),
+      el('div', { class: 'form-hint' }, t('settings.lanePresetHint')),
+      buildStageContractsRow(wf),
+      applyButton,
     ]);
   }
 
@@ -3358,11 +2960,13 @@
         state.board ? Promise.resolve(state.board) : api.getBoard(),
       ]);
       const ciStatus = await api.getContinuousImprovementStatus();
+      const lanePresets = await api.getLanePresets();
       state.workflow = wf;
       state.branches = branchesResp.branches;
       if (!state.board) state.board = board;
       clearNode(body);
       body.appendChild(buildContinuousImprovementCard(wf, ciStatus));
+      body.appendChild(buildLanePresetCard(lanePresets, wf));
       body.appendChild(buildBranchPolicyCard(wf));
       body.appendChild(buildBoardInfoCard(wf));
       body.appendChild(buildInterfaceCard());

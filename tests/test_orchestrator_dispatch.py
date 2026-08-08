@@ -5295,7 +5295,7 @@ def test_running_snapshot_includes_effective_agent_kind():
     assert row["agent_kind"] == "pi"
 
 
-def test_snapshot_includes_branch_policy_for_board_viewer():
+def test_snapshot_includes_branch_policy_for_admin_ui():
     orch = _orch()
     cfg = replace(
         _make_config(),
@@ -5314,7 +5314,7 @@ def test_snapshot_includes_branch_policy_for_board_viewer():
         "feature_branch_pattern": "symphony/<ID>",
         "base_branch": "dev",
         "merge_target_branch": "release",
-        "merge_timing": "after Learn, before Done",
+        "merge_timing": "after Document, before Done",
         "auto_merge_enabled": True,
     }
 
@@ -5457,7 +5457,7 @@ def test_issue_attention_reports_tracker_error():
 
 def test_issue_attention_reports_unresolved_dependency():
     orch = _orch()
-    blocker = BlockerRef(id="TASK-999", identifier="TASK-999", state=None)
+    blocker = BlockerRef(id="TASK-999", identifier="TASK-999", state="Todo")
     issue = _issue("MT-BLOCKED", state="In Progress", blocked_by=(blocker,))
 
     attention = orch.issue_attention(issue)
@@ -5467,6 +5467,22 @@ def test_issue_attention_reports_unresolved_dependency():
     assert attention["label"] == "Blocked dependency"
     assert attention["severity"] == "warning"
     assert attention["message"] == "waiting on unresolved dependency: TASK-999"
+
+
+def test_issue_attention_names_a_blocker_that_is_not_on_the_board():
+    """F-13: a dangling id deadlocks the ticket; the card must say so."""
+    orch = _orch()
+    blocker = BlockerRef(id="TYPO-999", identifier="TYPO-999", state=None)
+    issue = _issue("MT-BLOCKED", state="In Progress", blocked_by=(blocker,))
+
+    attention = orch.issue_attention(issue)
+
+    assert attention is not None
+    assert attention["kind"] == "dangling_dependency"
+    assert attention["label"] == "Unknown blocker"
+    assert attention["severity"] == "error"
+    assert "TYPO-999 is not on the board" in attention["message"]
+    assert "symphony board update MT-BLOCKED" in attention["message"]
 
 
 def test_issue_attention_reports_failed_terminal_dependency(monkeypatch: pytest.MonkeyPatch):
@@ -6034,7 +6050,7 @@ def test_blocked_rca_prompt_reopens_source_to_todo_then_full_workflow():
 
     assert "move that source ticket to `Todo`" in description
     assert "Do not skip the source ticket's normal workflow" in description
-    assert "it must pass through the configured Todo/In Progress/Verify/Learn" in description
+    assert "it must pass through the configured Todo/In Progress/Verify/Document" in description
 
 
 def test_recover_blocked_issue_rejects_non_blocked_ticket(monkeypatch):
@@ -8563,3 +8579,124 @@ def test_tick_declines_recovery_when_no_delivery_branch_exists(monkeypatch, tmp_
 
     assert created == ["MT-BLOCKED"]
     assert states == []
+
+
+# ---------------------------------------------------------------------------
+# agent.stage_kinds — per-state backend routing (ticket pin > stage map > default)
+# ---------------------------------------------------------------------------
+
+
+def test_config_for_issue_agent_stage_kind_precedence():
+    """Ticket pin beats the stage map; the stage map beats the workflow default."""
+    from symphony.orchestrator import _config_for_issue_agent
+
+    cfg = _make_config()
+    routed = replace(cfg, agent=replace(cfg.agent, stage_kinds={"todo": "gemini"}))
+
+    mapped = _issue("MT-1", state="Todo")
+    assert _config_for_issue_agent(routed, mapped).agent.kind == "gemini"
+
+    pinned = replace(_issue("MT-2", state="Todo"), agent_kind="claude")
+    assert _config_for_issue_agent(routed, pinned).agent.kind == "claude"
+
+    unmapped = _issue("MT-3", state="In Progress")
+    assert _config_for_issue_agent(routed, unmapped).agent.kind == "codex"
+
+
+def test_dispatch_stage_kinds_route_by_state_and_skip_pin_stamp(tmp_path, monkeypatch):
+    """A dispatch resolves the stage-mapped backend for the ticket's current
+    state, and the resolved kind is NOT stamped back onto the ticket as an
+    `agent_kind` pin — the stamp would win over the stage map on the next
+    dispatch and freeze the first stage's backend across state changes."""
+    base = _make_config(
+        workflow_path=tmp_path / "WORKFLOW.md", workspace_root=tmp_path / "ws"
+    )
+    cfg = replace(base, agent=replace(base.agent, stage_kinds={"todo": "gemini"}))
+    stamped: list[tuple[str, str]] = []
+    monkeypatch.setattr(
+        Orchestrator,
+        "_tracker_call_record_agent_kind",
+        staticmethod(
+            lambda _cfg, identifier, agent_kind: stamped.append(
+                (identifier, agent_kind)
+            )
+        ),
+    )
+
+    async def _parked_worker(_issue, _attempt, _cfg) -> None:
+        await asyncio.sleep(3600)
+
+    async def _run() -> None:
+        orch = _orch()
+        orch._loop = asyncio.get_running_loop()
+        orch._run_registry = RunRegistry(
+            tmp_path / ".symphony" / "state.db", lease_ttl=timedelta(minutes=5)
+        )
+        monkeypatch.setattr(orch, "_run_agent_attempt", _parked_worker)
+
+        mapped = _issue("MT-1", state="Todo")
+        pinned = replace(_issue("MT-2", state="Todo"), agent_kind="claude")
+        unmapped = _issue("MT-3", state="In Progress")
+        orch._dispatch(mapped, cfg, attempt=None)
+        orch._dispatch(pinned, cfg, attempt=None)
+        orch._dispatch(unmapped, cfg, attempt=None)
+
+        assert orch._running[mapped.id].agent_kind == "gemini"
+        assert orch._running[pinned.id].agent_kind == "claude"
+        assert orch._running[unmapped.id].agent_kind == "codex"
+
+        for entry in list(orch._running.values()):
+            task = entry.worker_task
+            assert task is not None
+            task.cancel()
+            try:
+                await task
+            except (asyncio.CancelledError, Exception):
+                pass
+
+    asyncio.run(_run())
+    assert stamped == []
+
+
+def test_dispatch_without_stage_kinds_still_stamps_agent_kind(tmp_path, monkeypatch):
+    """Legacy behaviour is preserved: with no stage routing configured, the
+    resolved backend is still recorded onto the ticket for board visibility."""
+    cfg = _make_config(
+        workflow_path=tmp_path / "WORKFLOW.md", workspace_root=tmp_path / "ws"
+    )
+    stamped: list[tuple[str, str]] = []
+    monkeypatch.setattr(
+        Orchestrator,
+        "_tracker_call_record_agent_kind",
+        staticmethod(
+            lambda _cfg, identifier, agent_kind: stamped.append(
+                (identifier, agent_kind)
+            )
+        ),
+    )
+
+    async def _parked_worker(_issue, _attempt, _cfg) -> None:
+        await asyncio.sleep(3600)
+
+    async def _run() -> None:
+        orch = _orch()
+        orch._loop = asyncio.get_running_loop()
+        orch._run_registry = RunRegistry(
+            tmp_path / ".symphony" / "state.db", lease_ttl=timedelta(minutes=5)
+        )
+        monkeypatch.setattr(orch, "_run_agent_attempt", _parked_worker)
+
+        issue = _issue("MT-1", state="Todo")
+        orch._dispatch(issue, cfg, attempt=None)
+        assert orch._running[issue.id].agent_kind == "codex"
+
+        task = orch._running[issue.id].worker_task
+        assert task is not None
+        task.cancel()
+        try:
+            await task
+        except (asyncio.CancelledError, Exception):
+            pass
+
+    asyncio.run(_run())
+    assert stamped == [("MT-1", "codex")]

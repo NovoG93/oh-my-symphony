@@ -17,6 +17,10 @@ ENTRY_RE = re.compile(r"^\s*'([^']+)':\s*'((?:[^'\\]|\\.)*)',\s*$", re.M)
 # Keys are not always the first argument — `t(cond ? 'a.b' : 'a.c')` is valid —
 # so collect every literal shaped like a dictionary key instead of parsing calls.
 CALL_RE = re.compile(r"'([a-z][a-zA-Z0-9]*\.[a-zA-Z0-9]+)'")
+# Keys can also be built dynamically: t(`workflow.ciMode.${mode}`) consumes the
+# whole `workflow.ciMode.*` family. Treat the literal prefix as used so a
+# checker run on a clean tree does not fail on keys the UI really does render.
+TEMPLATE_PREFIX_RE = re.compile(r"`([a-z][a-zA-Z0-9]*(?:\.[a-zA-Z0-9_]+)*)\.\$\{")
 
 # localStorage keys share the dotted shape but are not translations.
 NON_KEY_PREFIXES = ("symphony.",)
@@ -40,11 +44,15 @@ def main() -> int:
         return 1
     en = dicts["en"]
 
+    app_js = (static_dir / "app.js").read_text(encoding="utf-8")
     used: set[str] = {
         key
-        for key in CALL_RE.findall((static_dir / "app.js").read_text(encoding="utf-8"))
+        for key in CALL_RE.findall(app_js)
         if not key.startswith(NON_KEY_PREFIXES)
     }
+    dynamic_prefixes = tuple(
+        f"{prefix}." for prefix in TEMPLATE_PREFIX_RE.findall(app_js)
+    )
     for attr in STATIC_RE.findall((static_dir / "index.html").read_text(encoding="utf-8")):
         for pair in attr.split(","):
             used.add(pair.split(":")[-1].strip())
@@ -58,7 +66,11 @@ def main() -> int:
         for key in missing:
             print(f"  {key}")
 
-    unused = sorted(set(en) - used)
+    unused = sorted(
+        key
+        for key in set(en) - used
+        if not key.startswith(dynamic_prefixes)
+    )
     if unused:
         problems += len(unused)
         print(f"FAIL: {len(unused)} English key(s) defined but never used:")

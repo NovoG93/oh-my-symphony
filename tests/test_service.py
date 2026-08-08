@@ -16,7 +16,6 @@ from symphony.service import (
     ServiceLockError,
     acquire_service_lock,
     build_orchestrator_command,
-    build_viewer_command,
     clear_record,
     is_process_running,
     load_record,
@@ -53,14 +52,10 @@ def _record(workflow_path: Path, *, pid: int | None = 1234, port: int = 9999) ->
         workflow_dir=workflow_dir.resolve(),
         host="127.0.0.1",
         port=port,
-        viewer_port=port + 1,
         orchestrator_pid=pid,
-        viewer_pid=pid + 1 if pid is not None else None,
         log_path=workflow_dir / "log" / "symphony.log",
-        viewer_log_path=workflow_dir / "log" / "symphony-viewer.log",
         started_at="2026-05-16T00:00:00Z",
         orchestrator_command=["symphony", str(workflow_path), "--port", str(port)],
-        viewer_command=["symphony", "tui", str(workflow_path)],
     )
 
 
@@ -169,25 +164,6 @@ def test_build_orchestrator_command_uses_python_module(tmp_path: Path) -> None:
     assert "--host" in command
 
 
-def test_build_viewer_command_passes_workflow_path(tmp_path: Path) -> None:
-    workflow = _workflow(tmp_path)
-    viewer_dir = tmp_path / "tools" / "board-viewer"
-    viewer_dir.mkdir(parents=True)
-    (viewer_dir / "server.py").write_text("# viewer\n", encoding="utf-8")
-
-    command = build_viewer_command(
-        workflow,
-        host="127.0.0.1",
-        port=9999,
-        viewer_port=8765,
-        kanban_dir=tmp_path / "kanban",
-    )
-
-    assert command is not None
-    assert "--workflow" in command
-    assert str(workflow.resolve()) in command
-
-
 def test_service_status_cli_reports_stopped(tmp_path: Path, capsys) -> None:
     workflow = _workflow(tmp_path)
 
@@ -273,7 +249,7 @@ def test_force_stop_terminates_active_backend_processes_from_registry(
         backend_agent_pid=5678,
     )
     registry.close()
-    live_pids = {1234, 1235, 5678}
+    live_pids = {1234, 5678}
     stopped: list[tuple[int | None, bool]] = []
     monkeypatch.setattr(
         service_module,
@@ -296,7 +272,7 @@ def test_force_stop_terminates_active_backend_processes_from_registry(
     rc = service_main(["stop", "--force", "--timeout", "0", str(workflow)])
 
     assert rc == 0
-    assert stopped == [(1235, False), (1234, False), (5678, True)]
+    assert stopped == [(1234, False), (5678, True)]
     assert 5678 not in live_pids
     assert load_record(workflow) is None
 
@@ -335,7 +311,7 @@ def test_force_stop_terminates_owned_backend_process_after_run_completed(
         now=now + timedelta(seconds=2),
     )
     registry.close()
-    live_pids = {1234, 1235, 5678}
+    live_pids = {1234, 5678}
     stopped: list[tuple[int | None, bool]] = []
     monkeypatch.setattr(
         service_module,
@@ -353,7 +329,7 @@ def test_force_stop_terminates_owned_backend_process_after_run_completed(
     rc = service_main(["stop", "--force", "--timeout", "0", str(workflow)])
 
     assert rc == 0
-    assert stopped == [(1235, False), (1234, False), (5678, True)]
+    assert stopped == [(1234, False), (5678, True)]
     assert 5678 not in live_pids
     assert load_record(workflow) is None
 
@@ -387,7 +363,7 @@ def test_force_stop_terminates_processes_referencing_owned_workspace(
         now=now + timedelta(seconds=1),
     )
     registry.close()
-    live_pids = {1234, 1235, 9010}
+    live_pids = {1234, 9010}
     stopped: list[tuple[int | None, bool]] = []
     monkeypatch.setattr(
         service_module,
@@ -416,7 +392,7 @@ def test_force_stop_terminates_processes_referencing_owned_workspace(
     rc = service_main(["stop", "--force", "--timeout", "0", str(workflow)])
 
     assert rc == 0
-    assert stopped == [(1235, False), (1234, False), (9010, True)]
+    assert stopped == [(1234, False), (9010, True)]
     assert 9010 not in live_pids
     assert load_record(workflow) is None
 
@@ -430,37 +406,27 @@ def test_service_lock_blocks_second_start_for_same_workflow(tmp_path: Path) -> N
                 pass
 
 
-def test_start_cleans_live_viewer_from_stale_record_before_doctor(
+def test_start_clears_stale_record_before_doctor(
     tmp_path: Path, monkeypatch, capsys
 ) -> None:
     workflow = _workflow(tmp_path)
     save_record(_record(workflow, pid=1234))
-    live_pids = {1235}
-    stopped: list[int | None] = []
     monkeypatch.setattr(
         service_module,
         "is_process_running",
-        lambda pid: pid in live_pids,
+        lambda pid: False,
     )
     monkeypatch.setattr(
         service_module,
         "is_symphony_api_reachable",
         lambda host, port: False,
     )
-
-    def _stop_pid(pid, *args, **kwargs):  # noqa: ANN001
-        stopped.append(pid)
-        live_pids.discard(pid)
-        return True
-
-    monkeypatch.setattr(service_module, "terminate_process", _stop_pid)
     monkeypatch.setattr(service_module, "_run_doctor_or_print", lambda *args, **kwargs: False)
 
     rc = service_main(["start", str(workflow)])
 
     captured = capsys.readouterr()
     assert rc == 1
-    assert stopped == [1235]
     assert load_record(workflow) is None
     assert "doctor reported FAIL" in captured.err
 
@@ -484,7 +450,7 @@ def test_start_cleans_spawned_process_if_record_save_fails(
         lambda pid, *args, **kwargs: stopped.append(pid) or True,
     )
 
-    rc = service_main(["start", "--skip-doctor", "--no-viewer", str(workflow)])
+    rc = service_main(["start", "--skip-doctor", str(workflow)])
 
     captured = capsys.readouterr()
     assert rc == 1

@@ -47,6 +47,8 @@ _AGENT_OWNED_SECTIONS = {
     "wiki updates",
     "learn defect",
     "learn skipped",
+    "document defect",
+    "document skipped",
     "human review",
     "as is to be report",
     "as-is to-be report",
@@ -59,6 +61,8 @@ _AGENT_OWNED_SECTIONS = {
 _FAILURE_SECTIONS = {
     "review findings",
     "qa failure",
+    "document defect",
+    # legacy section name (pre-rename Learn lane)
     "learn defect",
     "contract failure",
 }
@@ -71,7 +75,7 @@ _VERIFY_LATEST_SECTIONS = {
     "stage contract checklist",
     "contract checklist",
 }
-_LEARN_LATEST_SECTIONS = {
+_DOCUMENT_LATEST_SECTIONS = {
     "implementation",
     "qa evidence",
     "ac scorecard",
@@ -127,8 +131,9 @@ def build_issue_prompt_context(
             selected[latest_failure.index] = latest_failure
     elif normalized_state == "verify":
         _select_latest_matching(selected, sections, _VERIFY_LATEST_SECTIONS)
-    elif normalized_state in {"learn", "learning"}:
-        _select_latest_matching(selected, sections, _LEARN_LATEST_SECTIONS)
+    elif normalized_state in {"document", "learn", "learning"}:
+        # "learn"/"learning" are legacy names of the Document lane.
+        _select_latest_matching(selected, sections, _DOCUMENT_LATEST_SECTIONS)
     elif normalized_state == "in progress":
         _select_latest_matching(selected, sections, _IN_PROGRESS_LATEST_SECTIONS)
         latest_failure = _latest_section(sections, _FAILURE_SECTIONS)

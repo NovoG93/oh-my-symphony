@@ -1,7 +1,8 @@
 # GEMINI.md — Gemini CLI entry point
 
 This repo is **Symphony**, a polling orchestrator that dispatches coding
-agents (Codex / Claude Code / Gemini / Pi) at a Kanban board. This file is
+agents (Codex / Claude Code / Gemini / AGY / Kiro / OpenCode / Pi) at a
+Kanban board. This file is
 the discovery point Gemini CLI reads on startup so the **operator** — the
 human or agent running `symphony` — has the same skill guidance Claude Code
 gets from `.claude/skills/`.
@@ -24,7 +25,8 @@ router, not separate activation routes.
 ### `symphony-skill`
 
 > Use when the user wants to dispatch coding agents (Codex / Claude Code /
-> Gemini / Pi) against a Kanban board via this `oh-my-symphony` repo
+> Gemini / AGY / Kiro / OpenCode / Pi) against a Kanban board via this
+> `oh-my-symphony` repo
 > — adding/listing/transitioning tickets, launching the TUI, inspecting
 > orchestrator state, customizing the workflow (lanes, per-state prompts),
 > delegating sub-tasks to free up context, one-shotting a prompt into an

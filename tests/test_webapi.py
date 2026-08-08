@@ -7,8 +7,10 @@ stub orchestrator for the live-run surface.
 from __future__ import annotations
 
 import asyncio
+import shutil
 import subprocess
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any, AsyncIterator, cast
 
 import pytest
@@ -65,6 +67,7 @@ class _StubOrchestrator:
         self.run_history_error: str | None = None
         self.reset_ci_calls = 0
         self.recover_calls: list[dict[str, str | None]] = []
+        self.skip_calls: list[str] = []
         self.ci_status: dict[str, Any] = {
             "enabled": True,
             "interval_ms": 60_000,
@@ -106,6 +109,10 @@ class _StubOrchestrator:
 
     def issue_snapshot(self, _identifier: str) -> dict[str, Any] | None:
         return None
+
+    async def skip_document(self, identifier: str) -> tuple[bool, str]:
+        self.skip_calls.append(identifier)
+        return True, f"moved {identifier} to Human Review"
 
     def request_refresh(self) -> bool:
         self.refresh_calls += 1
@@ -220,6 +227,12 @@ def board_dir(tmp_path: Path) -> Path:
     (skill / "SKILL.md").write_text(
         "---\nname: tdd\ndescription: test first\n---\nWrite tests first.\n",
         encoding="utf-8",
+    )
+    # F-11: preset applies refuse a board without the shipped prompt bodies,
+    # so the fixture mirrors the documented `cp -R docs/symphony-prompts` step.
+    shutil.copytree(
+        Path(__file__).resolve().parents[1] / "docs" / "symphony-prompts",
+        tmp_path / "docs" / "symphony-prompts",
     )
     return tmp_path
 
@@ -361,6 +374,104 @@ async def test_create_issue_validation_errors(client: TestClient) -> None:
     ).status == 400
 
 
+async def test_create_issue_with_blocked_by_and_request(
+    client: TestClient,
+) -> None:
+    resp = await client.post(
+        "/api/v1/issues",
+        json={
+            "title": "child work",
+            "identifier": "CHILD-1",
+            "blocked_by": ["SEED-1"],
+            "request": "REQ-1",
+        },
+    )
+    assert resp.status == 201
+    detail = await (await client.get("/api/v1/issues/CHILD-1")).json()
+    assert detail["request"] == "REQ-1"
+    assert [b["identifier"] for b in detail["blocked_by"]] == ["SEED-1"]
+    assert detail["frontmatter"]["request"] == "REQ-1"
+
+
+async def test_create_issue_rejects_unknown_blocker(client: TestClient) -> None:
+    resp = await client.post(
+        "/api/v1/issues",
+        json={"title": "x", "blocked_by": ["GHOST-1"]},
+    )
+    assert resp.status == 400
+    payload = await resp.json()
+    assert payload["error"]["code"] == "board_dependency_error"
+    assert "GHOST-1" in payload["error"]["message"]
+
+
+async def test_create_issue_rejects_cycle_with_path_in_message(
+    client: TestClient, board_dir: Path
+) -> None:
+    # SEED-1 already (danglingly) depends on LOOP-1; creating LOOP-1 <- SEED-1
+    # would close the loop.
+    (board_dir / "kanban" / "SEED-1.md").write_text(
+        TICKET.replace("---\n\nSeed body.", "blocked_by: [LOOP-1]\n---\n\nSeed body."),
+        encoding="utf-8",
+    )
+    resp = await client.post(
+        "/api/v1/issues",
+        json={"title": "loop", "identifier": "LOOP-1", "blocked_by": ["SEED-1"]},
+    )
+    assert resp.status == 400
+    payload = await resp.json()
+    assert payload["error"]["code"] == "board_dependency_error"
+    assert "LOOP-1 -> SEED-1 -> LOOP-1" in payload["error"]["message"]
+    assert not (board_dir / "kanban" / "LOOP-1.md").exists()
+
+
+async def test_create_issue_rejects_malformed_blocked_by_and_request(
+    client: TestClient,
+) -> None:
+    assert (
+        await client.post(
+            "/api/v1/issues", json={"title": "x", "blocked_by": "SEED-1"}
+        )
+    ).status == 400
+    assert (
+        await client.post(
+            "/api/v1/issues", json={"title": "x", "request": "bad request!"}
+        )
+    ).status == 400
+
+
+async def test_patch_updates_blocked_by_and_request(client: TestClient) -> None:
+    created = await client.post(
+        "/api/v1/issues", json={"title": "dep", "identifier": "DEP-1"}
+    )
+    assert created.status == 201
+    resp = await client.patch(
+        "/api/v1/issues/DEP-1",
+        json={"blocked_by": ["SEED-1"], "request": "REQ-2"},
+    )
+    assert resp.status == 200
+    detail = await (await client.get("/api/v1/issues/DEP-1")).json()
+    assert detail["request"] == "REQ-2"
+    assert [b["identifier"] for b in detail["blocked_by"]] == ["SEED-1"]
+
+    cleared = await client.patch(
+        "/api/v1/issues/DEP-1", json={"blocked_by": [], "request": ""}
+    )
+    assert cleared.status == 200
+    detail = await (await client.get("/api/v1/issues/DEP-1")).json()
+    assert detail["request"] == ""
+    assert detail["blocked_by"] == []
+
+
+async def test_patch_rejects_self_blocking_cycle(client: TestClient) -> None:
+    resp = await client.patch(
+        "/api/v1/issues/SEED-1", json={"blocked_by": ["SEED-1"]}
+    )
+    assert resp.status == 400
+    payload = await resp.json()
+    assert payload["error"]["code"] == "board_dependency_error"
+    assert "cycle" in payload["error"]["message"]
+
+
 async def test_patch_moves_state_and_updates_fields(client: TestClient) -> None:
     resp = await client.patch(
         "/api/v1/issues/SEED-1",
@@ -440,6 +551,29 @@ async def test_recover_blocked_route_calls_orchestrator(client: TestClient) -> N
             "agent_kind": "codex",
         }
     ]
+
+
+async def test_skip_document_route_and_legacy_skip_learn_alias(
+    client: TestClient,
+) -> None:
+    """`/skip-document` is the route; `/skip-learn` stays a deprecated alias."""
+    stub = client.stub  # type: ignore[attr-defined]
+
+    resp = await client.post("/api/v1/issues/SEED-1/skip-document")
+    assert resp.status == 200
+    payload = await resp.json()
+    assert payload == {
+        "identifier": "SEED-1",
+        "skipped": True,
+        "message": "moved SEED-1 to Human Review",
+    }
+
+    legacy = await client.post("/api/v1/issues/SEED-1/skip-learn")
+    assert legacy.status == 200
+    legacy_payload = await legacy.json()
+    assert legacy_payload["skipped"] is True
+
+    assert stub.skip_calls == ["SEED-1", "SEED-1"]
 
 
 async def test_delete_issue_and_running_guard(client: TestClient) -> None:
@@ -568,6 +702,24 @@ async def test_workflow_get_includes_continuous_improvement(
         "ticket_prefix": "CI",
         "max_tickets_per_run": 5,
         "require_idle_board": True,
+        "modes": [],
+        # Disabled: nothing resolves, so nothing runs.
+        "resolved_modes": [],
+        "supported_modes": [
+            "readiness",
+            "blocked_fixes",
+            "security",
+            "market_research",
+            "feature_improvements",
+        ],
+        "mode_interval_hours": {
+            "readiness": 0.0,
+            "blocked_fixes": 0.0,
+            "security": 24.0,
+            "market_research": 168.0,
+            "feature_improvements": 72.0,
+        },
+        "max_improvement_tickets_per_run": 3,
     }
     assert "codex" in payload["agent_kinds"]
     assert "claude" in payload["agent_kinds"]
@@ -618,6 +770,39 @@ async def test_continuous_improvement_put_validates_and_persists(
     assert "interval_ms: 120000" in text
     assert "max_turns: 3" in text
     assert "agent_kind: opencode" in text
+
+
+async def test_continuous_improvement_put_modes_roundtrip(
+    client: TestClient, board_dir: Path
+) -> None:
+    resp = await client.put(
+        "/api/v1/workflow/continuous-improvement",
+        json={"modes": ["nonsense"]},
+    )
+    assert resp.status == 400
+
+    resp = await client.put(
+        "/api/v1/workflow/continuous-improvement",
+        json={"enabled": True, "modes": ["market_research", "Blocked_Fixes"]},
+    )
+
+    assert resp.status == 200
+    payload = await resp.json()
+    ci = payload["continuous_improvement"]
+    assert payload["updated"] == ["enabled", "modes"]
+    assert ci["modes"] == ["blocked_fixes", "market_research"]
+    assert ci["resolved_modes"] == ["blocked_fixes", "market_research"]
+    text = (board_dir / "WORKFLOW.md").read_text(encoding="utf-8")
+    assert "modes:" in text
+
+    # Clearing the list falls back to the readiness-only default.
+    resp = await client.put(
+        "/api/v1/workflow/continuous-improvement", json={"modes": []}
+    )
+    assert resp.status == 200
+    ci = (await resp.json())["continuous_improvement"]
+    assert ci["modes"] == []
+    assert ci["resolved_modes"] == ["readiness"]
 
 
 async def test_continuous_improvement_put_guards_json_contract(
@@ -1220,3 +1405,104 @@ async def test_git_diff_returns_patch_for_branch_and_commit(
     assert resp.status == 400
     resp = await client.get("/api/v1/git/diff?branch=symphony/SEED-1&path=--evil")
     assert resp.status == 400
+
+
+# ---------------------------------------------------------------------------
+# workflow: lane presets
+# ---------------------------------------------------------------------------
+
+
+async def test_lane_presets_get_lists_shipped_presets(client: TestClient) -> None:
+    resp = await client.get("/api/v1/workflow/presets")
+    assert resp.status == 200
+    payload = await resp.json()
+    assert [p["name"] for p in payload["presets"]] == ["default", "deep"]
+    deep = payload["presets"][1]
+    assert deep["active_states"][0] == "Intake"
+    assert deep["active_states"][-1] == "Document"
+    # The fixture board (Todo/Doing) matches no shipped preset.
+    assert payload["current"] is None
+
+
+async def test_lane_preset_apply_rewrites_workflow_and_migrates_tickets(
+    client: TestClient, board_dir: Path
+) -> None:
+    await client.patch("/api/v1/issues/SEED-1", json={"state": "Doing"})
+
+    resp = await client.post(
+        "/api/v1/workflow/presets/apply", json={"name": "deep"}
+    )
+    assert resp.status == 200
+    payload = await resp.json()
+    assert payload["applied"] == "deep"
+    assert payload["removed"] == ["Todo", "Doing"]
+    assert payload["fallback_state"] == "Intake"
+    assert payload["migrated"] == {"SEED-1": "Intake"}
+    text = (board_dir / "WORKFLOW.md").read_text(encoding="utf-8")
+    assert (
+        "active_states: [Intake, Research, Plan, Review, Build, QA, Verify, Document]"
+        in text
+    )
+    assert "base: ./docs/symphony-prompts/file/deep/base.md" in text
+    detail = await (await client.get("/api/v1/issues/SEED-1")).json()
+    assert detail["state"] == "Intake"
+
+    # The board now guesses as the deep preset.
+    presets = await (await client.get("/api/v1/workflow/presets")).json()
+    assert presets["current"] == "deep"
+
+
+async def test_lane_preset_apply_rejects_bad_payloads(client: TestClient) -> None:
+    resp = await client.post("/api/v1/workflow/presets/apply", json={})
+    assert resp.status == 400
+    resp = await client.post(
+        "/api/v1/workflow/presets/apply", json={"name": "mystery"}
+    )
+    assert resp.status == 400
+    assert "unknown lane preset" in (await resp.json())["error"]["message"]
+
+
+async def test_lane_preset_apply_blocks_running_worker_in_removed_lane(
+    client: TestClient, board_dir: Path
+) -> None:
+    stub = client.stub  # type: ignore[attr-defined]
+    seed = await (await client.get("/api/v1/issues/SEED-1")).json()
+    running = SimpleNamespace(identifier="SEED-1", state=seed["state"])
+    stub.iter_running_issues = lambda: (running,)
+    before = (board_dir / "WORKFLOW.md").read_bytes()
+
+    resp = await client.post(
+        "/api/v1/workflow/presets/apply", json={"name": "deep"}
+    )
+
+    assert resp.status == 409
+    assert (await resp.json())["error"]["code"] == "state_in_use"
+    assert (board_dir / "WORKFLOW.md").read_bytes() == before
+
+
+async def test_lane_preset_apply_warns_when_max_turns_cannot_cover_the_lanes(
+    client: TestClient, board_dir: Path
+) -> None:
+    """F-23: nothing validated the board after a preset switch."""
+    workflow = board_dir / "WORKFLOW.md"
+    text = workflow.read_text(encoding="utf-8")
+    assert "agent:" in text
+    workflow.write_text(text.replace("agent:", "agent:\n  max_turns: 3", 1), encoding="utf-8")
+    client.stub.workflow_state.reload()  # type: ignore[attr-defined]
+
+    resp = await client.post("/api/v1/workflow/presets/apply", json={"name": "deep"})
+
+    assert resp.status == 200
+    payload = await resp.json()
+    assert payload["applied"] == "deep"
+    assert payload["warning"] is not None
+    assert "agent.max_turns=3" in payload["warning"]
+
+
+async def test_lane_preset_apply_reports_no_warning_for_a_sane_budget(
+    client: TestClient,
+) -> None:
+    resp = await client.post("/api/v1/workflow/presets/apply", json={"name": "default"})
+
+    assert resp.status == 200
+    assert (await resp.json())["warning"] is None

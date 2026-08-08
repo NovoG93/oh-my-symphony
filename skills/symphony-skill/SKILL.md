@@ -47,7 +47,7 @@ references for this router.
   sorts by stable numeric suffix before mutable fields like priority.
 - The default Verify prompt expects the `symphony/<ID>` branch to be merged or
   proven ready against the configured target branch before the ticket moves to
-  `Learn`.
+  `Document`.
 
 ## Board Ticket Quality Gate
 
@@ -104,8 +104,12 @@ unwritable workspaces, and missing board directories.
   leave the operator with only a bare `WORKFLOW.md`; read
   `reference/bootstrapping.md` for the exact bundle.
 - Preserve the shipped four active lanes (`Todo`, `In Progress`, `Verify`,
-  `Learn`) unless the user explicitly requests a custom workflow. If you change
-  lanes, update both `tracker.active_states` and `prompts.stages`.
+  `Document`) unless the user explicitly requests a custom workflow or the deep
+  pipeline. For the 8-lane deep preset (`Intake → Research → Plan → Review →
+  Build → QA → Verify → Document`), apply it via the settings page or
+  `POST /api/v1/workflow/presets/apply` instead of hand-editing lanes. If you
+  change lanes by hand, update both `tracker.active_states` and
+  `prompts.stages`.
 - Pick the prompt flavor that matches the tracker:
   `tracker.kind: file` uses `docs/symphony-prompts/file/...`;
   `tracker.kind: linear` uses `docs/symphony-prompts/linear/...`.
@@ -124,19 +128,24 @@ symphony board new TASK-001 "<title>" --description "<spec>"
 ./tui-open.sh ./WORKFLOW.md
 ```
 
-Run headless with service state and browser viewer:
+For dependent multi-ticket work, use the validated flags — `--blocked-by`
+(repeatable), `--request REQ-<n>` grouping, `--description-file PATH|-` —
+and inspect the DAG with `symphony board graph [--request REQ-n]`. Creation
+rejects unknown states, missing blockers, and dependency cycles.
+
+Run headless with service state:
 
 ```bash
-symphony service start ./WORKFLOW.md --port 9999 --viewer-port 8765
+symphony service start ./WORKFLOW.md --port 9999
 symphony service status ./WORKFLOW.md
 curl -s http://127.0.0.1:9999/api/v1/state | jq
 ```
 
-The `--port` (9999) root serves a browsable web app (`oh-my-symphony`), not
-just the JSON API. **"Open the orchestrator" defaults to opening
-`http://127.0.0.1:9999/`** (`open`/`xdg-open`/`start`); the `--viewer-port`
-board (8765) is the secondary card board — open it only when asked for the
-board view.
+The `--port` (9999) root serves the built-in browsable admin web app
+(board, workflow editor, chat, stats, settings), not just the JSON API.
+**"Open the orchestrator" defaults to opening `http://127.0.0.1:9999/`**
+(`open`/`xdg-open`/`start`). There is no separate board viewer — the admin
+UI on the orchestrator port is the only board.
 
 Use `symphony service ...` for normal headless operation. It writes
 per-workflow run state under `.symphony/run/` and refuses duplicate starts for

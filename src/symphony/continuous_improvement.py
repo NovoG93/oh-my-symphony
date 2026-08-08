@@ -1,7 +1,7 @@
 """Continuous-improvement heartbeat: runner, registrar, and durable lease.
 
-This module owns the read-only product-readiness inspection that the
-orchestrator scheduler delegates to:
+This module owns the read-only inspection work the orchestrator scheduler
+delegates to:
 
 * prove the current baseline without changing the host worktree;
 * run fixed argv checks with timeouts, caps, and redaction;
@@ -9,12 +9,29 @@ orchestrator scheduler delegates to:
 * register failed findings as normal Kanban tickets through the tracker API;
 * coordinate concurrent orchestrators through a fakeable advisory lease.
 
-Keep this module dependency-light: it must not import the orchestrator.
+On top of that baseline inspection sits an opt-in set of *improvement modes*
+(`continuous_improvement.modes`, all default off) that turn the heartbeat into
+an autonomous application-improvement engine:
+
+* ``readiness`` — the original product-readiness checks (implicit default);
+* ``blocked_fixes`` — triage Blocked / Human Review tickets into linked fix
+  tickets carrying a root-cause note;
+* ``security`` — optional dependency/vulnerability scans into patch tickets;
+* ``market_research`` / ``feature_improvements`` — an agent turn (supplied by
+  the orchestrator as an :data:`AgentRunner`) that proposes improvements.
+
+Every mode's only board write path is a *normal* Kanban ticket created through
+the tracker API, so proposals flow through the same pipeline as any other
+work. Nothing here dispatches, plans, or executes those tickets.
+
+Keep this module dependency-light: it must not import the orchestrator. The
+agent capability the agent-driven modes need is injected as a callable.
 """
 
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 import hashlib
 import json
 import os
@@ -31,7 +48,20 @@ if TYPE_CHECKING:
     from symphony.workflow import ServiceConfig
 
 from ._shell import safe_proc_wait
+from .issue import Issue, normalize_state
+from .logging import get_logger
 from .trackers.file import FileBoardTracker
+from .workflow.constants import (
+    CI_AGENT_MODES,
+    CI_MODE_BLOCKED_FIXES,
+    CI_MODE_FEATURE_IMPROVEMENTS,
+    CI_MODE_MARKET_RESEARCH,
+    CI_MODE_READINESS,
+    CI_MODE_SECURITY,
+    SUPPORTED_CI_MODES,
+)
+
+log = get_logger()
 
 # Lockfile name under `<workflow_dir>/.symphony/`.
 LEASE_FILENAME = "continuous_improvement.lock"
@@ -41,6 +71,24 @@ DEFAULT_LEASE_TTL_SECONDS = 1800.0
 DEFAULT_CHECK_TIMEOUT_S = 600.0
 DEFAULT_OUTPUT_LIMIT = 12_000
 DEFAULT_REPORT_PATH = Path("docs/continuous-improvement/latest.md")
+# Durable per-mode cadence bookkeeping. Wall-clock (not monotonic) because a
+# weekly market-research cadence has to survive orchestrator restarts.
+MODE_STATE_PATH = Path(".symphony/continuous-improvement/mode-state.json")
+# Where an operator may override a built-in agent-mode prompt, relative to the
+# workflow dir. Mirrors `docs/symphony-prompts/<flavor>/` for stage prompts.
+AGENT_PROMPT_DIR = Path("docs/symphony-prompts/ci")
+# The agent's single write path in the host worktree: a JSON proposal file
+# this module then validates, caps, dedupes, and files as normal tickets.
+AGENT_OUTPUT_DIR = Path(".symphony/continuous-improvement/proposals")
+# States a proposal is allowed to duplicate into. Anything closed is fair game
+# to propose again — the world moved on since it was done.
+CLOSED_STATE_KEYS = frozenset(
+    {"done", "archive", "archived", "cancelled", "canceled", "closed", "duplicate"}
+)
+# Label stamped on every ticket the heartbeat files, in addition to the
+# long-form `continuous-improvement` label the readiness registrar already
+# used. Cheap board filter + the dedupe marker's carrier.
+CI_LABEL = "ci"
 
 SECRET_RE = re.compile(
     r"(?i)(sk-[a-z0-9_-]{8,}|"
@@ -99,6 +147,8 @@ class IssueFinding:
     verification_commands: tuple[str, ...]
     baseline_branch: str | None
     baseline_sha: str | None
+    # Extra labels beyond the registrar's defaults (e.g. `security`).
+    labels: tuple[str, ...] = ()
 
     @property
     def fingerprint(self) -> str:
@@ -140,6 +190,65 @@ class ImprovementRunResult:
     finished_at: str | None = None
     turns_used: int = 0
     max_turns: int = 0
+    # Improvement modes considered/run this heartbeat, in canonical order.
+    modes: tuple["ModeOutcome", ...] = ()
+    # Request group the proposal tickets of this run were filed under.
+    request_id: str | None = None
+
+
+@dataclass(frozen=True)
+class ModeOutcome:
+    """One improvement mode's result within a heartbeat run."""
+
+    mode: str
+    status: str
+    summary: str
+    ticket_ids: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
+class ImprovementProposal:
+    """A board-ready improvement the heartbeat wants a normal worker to do.
+
+    Proposals are *not* executed here. They become ordinary Kanban tickets in
+    the board's first active state and flow through the configured pipeline
+    (single ticket or stage DAG) like any other request.
+    """
+
+    mode: str
+    title: str
+    goal: str
+    scope: str = ""
+    acceptance: str = ""
+    evidence: str = ""
+    priority: int = 2
+    # Identifier of a ticket this proposal should unblock (blocked_fixes).
+    blocks: str = ""
+    labels: tuple[str, ...] = ()
+
+    @property
+    def dedupe_key(self) -> str:
+        return f"{self.mode}/{_slug(self.title)}"
+
+    @property
+    def marker(self) -> str:
+        return f"CI Proposal: {self.dedupe_key}"
+
+
+@dataclass(frozen=True)
+class AgentTask:
+    """One read-mostly agent turn requested by an agent-driven mode."""
+
+    mode: str
+    prompt: str
+    cwd: Path
+    output_path: Path
+
+
+# Supplied by the orchestrator (which owns backend construction) so this
+# module never imports it. Returns the agent's last message; the real payload
+# is the JSON proposal file the prompt tells the agent to write.
+AgentRunner = Callable[[AgentTask], Awaitable[str]]
 
 
 # The scheduler passes the live config, the resolved workflow dir, and a
@@ -155,8 +264,15 @@ async def default_improvement_runner(
     cfg: "ServiceConfig",
     workflow_dir: Path,
     report_phase: Callable[[str], None],
+    *,
+    agent_runner: AgentRunner | None = None,
 ) -> ImprovementRunResult:
-    return await run_continuous_improvement(cfg, workflow_dir, report_phase)
+    """Default runner. The orchestrator binds `agent_runner` with a partial so
+    the 3-positional `ImprovementRunner` signature (and every test fake that
+    implements it) stays unchanged."""
+    return await run_continuous_improvement(
+        cfg, workflow_dir, report_phase, agent_runner=agent_runner
+    )
 
 
 def _utc_iso_z() -> str:
@@ -564,6 +680,8 @@ def register_findings(
     cfg: "ServiceConfig",
     workflow_dir: Path,
     findings: tuple[IssueFinding, ...],
+    *,
+    request: str | None = None,
 ) -> TicketRegistrationResult:
     ci = cfg.continuous_improvement
     if not findings:
@@ -595,9 +713,12 @@ def register_findings(
             title=title,
             state=cfg.tracker.active_states[0] if cfg.tracker.active_states else "Todo",
             priority=1,
-            labels=["continuous-improvement", "bug"],
+            labels=_merge_labels(
+                ("continuous-improvement", CI_LABEL, "bug"), finding.labels
+            ),
             description=_ticket_body(finding),
             agent_kind=ci.agent_kind or None,
+            request=request,
         )
         created.append(identifier)
         existing.add(finding.fingerprint)
@@ -608,6 +729,653 @@ def register_findings(
         duplicates=duplicates,
         skipped_due_to_cap=skipped_due_to_cap,
     )
+
+
+# ---------------------------------------------------------------------------
+# improvement modes (opt-in; see docs/continuous-improvement/rubric.md)
+# ---------------------------------------------------------------------------
+
+
+def _slug(text: str) -> str:
+    return re.sub(r"[^a-z0-9]+", "-", text.strip().lower()).strip("-")[:60]
+
+
+def _title_key(text: str) -> tuple[str, int]:
+    """Dedupe key: the truncated slug *and* the normalized title length.
+
+    F-30: two genuinely different proposals sharing a 60-char prefix used to
+    collapse into one, silently counted as a duplicate. Pairing the slug with
+    the length keeps the cheap prefix comparison while making a collision
+    require the same length as well.
+    """
+    normalized = re.sub(r"\s+", " ", text.strip().lower())
+    return _slug(text), len(normalized)
+
+
+def _merge_labels(base: tuple[str, ...], extra: tuple[str, ...]) -> list[str]:
+    out = list(base)
+    for label in extra:
+        cleaned = label.strip().lower()
+        if cleaned and cleaned not in out:
+            out.append(cleaned)
+    return out
+
+
+def mode_state_path(workflow_dir: Path) -> Path:
+    return workflow_dir / MODE_STATE_PATH
+
+
+def load_mode_state(workflow_dir: Path) -> dict[str, float]:
+    """`{mode: last-run epoch seconds}`; unreadable state means "never ran"."""
+    try:
+        raw = json.loads(mode_state_path(workflow_dir).read_text(encoding="utf-8"))
+    except (OSError, ValueError, TypeError):
+        return {}
+    if not isinstance(raw, dict):
+        return {}
+    out: dict[str, float] = {}
+    for mode, value in raw.items():
+        if mode in SUPPORTED_CI_MODES and isinstance(value, (int, float)):
+            out[mode] = float(value)
+    return out
+
+
+def save_mode_state(workflow_dir: Path, state: dict[str, float]) -> None:
+    path = mode_state_path(workflow_dir)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(f".{os.getpid()}.tmp")
+    tmp.write_text(json.dumps(state, sort_keys=True), encoding="utf-8")
+    os.replace(tmp, path)
+
+
+def due_modes(
+    cfg: "ServiceConfig", state: dict[str, float], now: float
+) -> tuple[str, ...]:
+    """Modes whose per-mode cadence floor has elapsed.
+
+    The orchestrator keeps one heartbeat timer (`interval_ms`); each mode then
+    gates itself on `interval_hours` so an expensive weekly market-research
+    turn can share a 30-minute readiness heartbeat.
+    """
+    ci = cfg.continuous_improvement
+    out: list[str] = []
+    for mode in ci.resolved_modes():
+        interval_s = max(ci.interval_hours_for(mode), 0.0) * 3600.0
+        last = state.get(mode)
+        if interval_s <= 0 or last is None or (now - last) >= interval_s:
+            out.append(mode)
+    return tuple(out)
+
+
+def any_mode_due(
+    cfg: "ServiceConfig", workflow_dir: Path, *, clock: Callable[[], float] = time.time
+) -> bool:
+    """Cheap scheduler-side pre-check: is any enabled mode past its floor?
+
+    Lets the orchestrator postpone a heartbeat whose every mode is still
+    cooling down (a weekly market-research-only board) without burning a turn.
+    """
+    return bool(due_modes(cfg, load_mode_state(workflow_dir), clock()))
+
+
+def _tracker_or_none(cfg: "ServiceConfig") -> FileBoardTracker | None:
+    if cfg.tracker.kind != "file" or cfg.tracker.board_root is None:
+        return None
+    return FileBoardTracker(cfg.tracker)
+
+
+def open_issues(tracker: FileBoardTracker) -> list[Issue]:
+    """Every ticket that is not in a closed state (Blocked counts as open)."""
+    return [
+        issue
+        for issue in tracker.scan_all()
+        if normalize_state(issue.state) not in CLOSED_STATE_KEYS
+    ]
+
+
+def next_request_id(issues: list[Issue], *, today: str) -> str:
+    """`REQ-CI-<YYYYMMDD>-<n>`, first free n for today across the board.
+
+    F-29: callers must pass *every* ticket, not just the open ones. Scanning
+    open issues only meant a later run on the same day reused a request id
+    whose tickets had since closed, so request groups stopped being keys.
+    """
+    base = f"REQ-CI-{today}"
+    used = {issue.request for issue in issues if issue.request}
+    index = 1
+    while f"{base}-{index}" in used:
+        index += 1
+    return f"{base}-{index}"
+
+
+def _proposal_body(proposal: ImprovementProposal, *, request: str) -> str:
+    """Chat-intake description format: Goal / Scope / Acceptance / Evidence.
+
+    Composed line by line rather than from a dedent()ed literal: the
+    interpolated values are themselves multi-line, and a single unindented
+    continuation line would defeat `textwrap.dedent`'s common-prefix scan and
+    leak the template's indentation into the ticket body.
+    """
+    scope = (
+        proposal.scope.strip()
+        or "Only what the goal requires; no drive-by refactors."
+    )
+    acceptance = proposal.acceptance.strip() or (
+        "The goal is met and verified with the project's own test/lint commands."
+    )
+    evidence_links = [
+        f"- Source: continuous improvement, `{proposal.mode}` mode",
+        f"- Report: `{DEFAULT_REPORT_PATH.as_posix()}` (section: modes)",
+        f"- Request group: `{request}`",
+    ]
+    if proposal.blocks:
+        evidence_links.append(f"- Unblocks: `{proposal.blocks}`")
+    sections = [
+        "## Goal",
+        proposal.goal.strip(),
+        "## Scope",
+        scope,
+        "## Acceptance criteria",
+        acceptance,
+        "## Evidence",
+        "\n".join(evidence_links),
+        proposal.evidence.strip() or "(no further evidence supplied)",
+        proposal.marker,
+    ]
+    return "\n\n".join(sections) + "\n"
+
+
+def register_proposals(
+    cfg: "ServiceConfig",
+    proposals: tuple[ImprovementProposal, ...],
+    *,
+    request: str,
+    tracker: FileBoardTracker | None = None,
+    existing: list[Issue] | None = None,
+) -> TicketRegistrationResult:
+    """File proposals as normal tickets: capped, deduped, request-grouped.
+
+    De-duplication is two-layered: the `CI Proposal:` marker in the body (an
+    exact re-proposal) and the normalized title of any open ticket (a human
+    already filed the same thing).
+    """
+    if not proposals:
+        return TicketRegistrationResult()
+    board = tracker or _tracker_or_none(cfg)
+    if board is None:
+        return TicketRegistrationResult(
+            unsupported_tracker=True, skipped_reason="unsupported_tracker"
+        )
+    ci = cfg.continuous_improvement
+    issues = open_issues(board) if existing is None else existing
+    seen_markers = {
+        match.group(1)
+        for issue in issues
+        for match in re.finditer(
+            r"CI Proposal:\s*(\S+)", issue.description or ""
+        )
+    }
+    seen_titles = {_title_key(issue.title) for issue in issues}
+    state = cfg.tracker.active_states[0] if cfg.tracker.active_states else "Todo"
+    created: list[str] = []
+    duplicates = 0
+    cap = max(1, ci.max_improvement_tickets_per_run)
+    for proposal in proposals:
+        title_key = _title_key(proposal.title)
+        if proposal.dedupe_key in seen_markers:
+            log.info(
+                "ci_proposal_deduped",
+                mode=proposal.mode,
+                reason="marker",
+                marker=proposal.dedupe_key,
+                title=proposal.title[:120],
+            )
+            duplicates += 1
+            continue
+        if title_key in seen_titles:
+            log.info(
+                "ci_proposal_deduped",
+                mode=proposal.mode,
+                reason="title",
+                title=proposal.title[:120],
+            )
+            duplicates += 1
+            continue
+        if len(created) >= cap:
+            continue
+        identifier, _ = board.create_with_next_identifier(
+            ci.ticket_prefix,
+            title=proposal.title[:120],
+            state=state,
+            priority=proposal.priority,
+            labels=_merge_labels(
+                ("continuous-improvement", CI_LABEL, proposal.mode), proposal.labels
+            ),
+            description=_proposal_body(proposal, request=request),
+            agent_kind=ci.agent_kind or None,
+            request=request,
+        )
+        created.append(identifier)
+        seen_markers.add(proposal.dedupe_key)
+        seen_titles.add(title_key)
+        if proposal.blocks:
+            _link_blocker(board, source=proposal.blocks, fix=identifier)
+    skipped_due_to_cap = max(0, len(proposals) - duplicates - len(created))
+    return TicketRegistrationResult(
+        tickets_created=len(created),
+        ticket_ids=tuple(created),
+        duplicates=duplicates,
+        skipped_due_to_cap=skipped_due_to_cap,
+    )
+
+
+def _link_blocker(tracker: FileBoardTracker, *, source: str, fix: str) -> None:
+    """Make `source` blocked by the freshly filed `fix` ticket.
+
+    Additive and self-cancelling: a missing source, an existing edge, or the
+    degenerate self-edge leaves the board untouched. The reverse edge can
+    never close a cycle because `fix` was created moments ago with no
+    blockers of its own.
+    """
+    if source == fix:
+        return
+    issue = tracker.fetch_issue_full_by_id(source)
+    if issue is None:
+        return
+    current = [b.identifier or b.id for b in issue.blocked_by]
+    current = [item for item in current if item]
+    if fix in current:
+        return
+    tracker.update_fields(source, blocked_by=[*current, fix])
+
+
+# --- blocked_fixes ---------------------------------------------------------
+
+_BLOCKER_SECTION_RE = re.compile(
+    r"^##\s+(Blocker|Blocked RCA|QA Failure|Review Findings|Budget Exceeded)\s*$",
+    re.IGNORECASE | re.MULTILINE,
+)
+_TRIAGE_STATE_KEYS = ("blocked", "human review")
+
+
+def _root_cause_note(issue: Issue) -> str:
+    """Last blocker-ish section of the ticket body, capped for a ticket quote."""
+    body = issue.description or ""
+    matches = list(_BLOCKER_SECTION_RE.finditer(body))
+    if not matches:
+        return "(no blocker section on the source ticket)"
+    last = matches[-1]
+    tail = body[last.end():]
+    next_heading = re.search(r"^##\s+", tail, re.MULTILINE)
+    section = tail[: next_heading.start()] if next_heading else tail
+    return redact_output(section.strip()[:1500]) or "(empty blocker section)"
+
+
+
+_CI_RESOLVED_BLOCKER_STATES = frozenset({"done", "archive", "archived", "closed"})
+
+
+def _blocked_source_reopen_state(cfg: "ServiceConfig") -> str:
+    """First `Todo`-ish active lane, else the first active lane."""
+    for state in cfg.tracker.active_states:
+        if normalize_state(state) == "todo":
+            return state
+    return cfg.tracker.active_states[0] if cfg.tracker.active_states else "Todo"
+
+
+def reopen_resolved_blocked_sources(
+    cfg: "ServiceConfig",
+    *,
+    tracker: FileBoardTracker | None = None,
+) -> tuple[tuple[str, ...], str]:
+    """Hand a source ticket back to the pipeline once its CI fix is done.
+
+    F-17: `blocked_fixes` filed `fix -> blocks source` and stopped, so the
+    source stayed in `Blocked` forever even though the mode's own acceptance
+    criterion is "`X` can leave its stuck state". This closes that loop, and
+    only that loop: a source is reopened only when *every* blocker has reached
+    a successful terminal state and at least one of them is a CI-filed fix
+    ticket (carrying the `ci` label). Arbitrary operator-managed boards are
+    left alone.
+    """
+    board = tracker or _tracker_or_none(cfg)
+    if board is None:
+        return (), "unsupported tracker"
+    everything = {issue.identifier: issue for issue in board.scan_all()}
+    target_state = _blocked_source_reopen_state(cfg)
+    reopened: list[str] = []
+    for issue in everything.values():
+        if normalize_state(issue.state) != "blocked":
+            continue
+        blocker_ids = [b.identifier or b.id for b in issue.blocked_by]
+        blockers = [everything.get(bid or "") for bid in blocker_ids]
+        if not blockers or any(blocker is None for blocker in blockers):
+            continue
+        if any(
+            normalize_state(blocker.state) not in _CI_RESOLVED_BLOCKER_STATES
+            for blocker in blockers
+            if blocker is not None
+        ):
+            continue
+        if not any(
+            CI_LABEL in {label.strip().lower() for label in blocker.labels}
+            for blocker in blockers
+            if blocker is not None
+        ):
+            continue
+        board.append_note(
+            issue,
+            "Unblocked",
+            f"Every blocker is resolved ({', '.join(str(b) for b in blocker_ids)}); "
+            f"continuous improvement returned this ticket to `{target_state}`.",
+        )
+        board.transition(issue.identifier, target_state)
+        reopened.append(issue.identifier)
+    summary = (
+        f"{len(reopened)} source ticket(s) returned to {target_state}"
+        if reopened
+        else "no fully-unblocked source tickets"
+    )
+    return tuple(reopened), summary
+
+
+def collect_blocked_fix_proposals(
+    cfg: "ServiceConfig",
+    *,
+    tracker: FileBoardTracker | None = None,
+) -> tuple[tuple[ImprovementProposal, ...], str]:
+    """Turn stuck tickets into fix proposals. Returns `(proposals, summary)`.
+
+    A source ticket that is already blocked by an open ticket is skipped —
+    something is already tracking its unblock.
+    """
+    board = tracker or _tracker_or_none(cfg)
+    if board is None:
+        return (), "unsupported tracker"
+    issues = open_issues(board)
+    open_ids = {issue.identifier for issue in issues}
+    stuck = [
+        issue
+        for issue in issues
+        if normalize_state(issue.state) in _TRIAGE_STATE_KEYS
+    ]
+    proposals: list[ImprovementProposal] = []
+    for issue in stuck:
+        blockers = [b.identifier or b.id for b in issue.blocked_by]
+        if any(blocker in open_ids for blocker in blockers if blocker):
+            continue
+        note = _root_cause_note(issue)
+        proposals.append(
+            ImprovementProposal(
+                mode=CI_MODE_BLOCKED_FIXES,
+                title=f"CI fix: unblock {issue.identifier} — {issue.title}"[:120],
+                goal=(
+                    f"Resolve the root cause keeping `{issue.identifier}` "
+                    f"({issue.state}) stuck, then hand it back to the pipeline."
+                ),
+                scope=(
+                    f"In: the root cause of `{issue.identifier}`.\n"
+                    "Out: unrelated refactors, and the source ticket's own "
+                    "remaining workflow — it resumes normally once unblocked."
+                ),
+                acceptance=(
+                    f"`{issue.identifier}` can leave its stuck state, with the "
+                    "fix proven by the project's own verification commands."
+                ),
+                evidence=(
+                    f"Root cause note from `{issue.identifier}`:\n\n"
+                    f"```text\n{note}\n```"
+                ),
+                priority=1,
+                blocks=issue.identifier,
+                labels=("bug",),
+            )
+        )
+    summary = (
+        f"{len(stuck)} stuck ticket(s); {len(proposals)} without an open fix"
+        if stuck
+        else "no Blocked or Human Review tickets"
+    )
+    return tuple(proposals), summary
+
+
+# --- security --------------------------------------------------------------
+
+
+def security_check_specs(root: Path) -> tuple[CheckSpec, ...]:
+    """Ecosystem-detected, optional-by-construction vulnerability scans.
+
+    Optional means a missing scanner is `not_available`, never `failed`: an
+    unavailable tool must not manufacture a security ticket.
+    """
+    specs: list[CheckSpec] = []
+    if (root / "pyproject.toml").exists() or (root / "requirements.txt").exists():
+        specs.append(
+            CheckSpec(
+                "pip_audit",
+                (CHECK_PYTHON, "-m", "pip_audit", "--progress-spinner", "off"),
+                optional=True,
+                not_available_detail="pip-audit is not installed",
+            )
+        )
+    if (root / "package.json").exists():
+        specs.append(
+            CheckSpec(
+                "npm_audit",
+                ("npm", "audit", "--audit-level=high"),
+                optional=True,
+                not_available_detail="npm is not installed",
+            )
+        )
+    return tuple(specs)
+
+
+def _security_finding(check: CheckResult, baseline: BaselineProof) -> IssueFinding:
+    return IssueFinding(
+        rubric_item=f"security/{check.name}",
+        check_name=check.name,
+        command=check.command,
+        summary=check.summary,
+        evidence=check.output,
+        expected=f"{' '.join(check.command)} reports no actionable advisories",
+        fix_boundary=(
+            "Patch or pin the affected dependencies. Prefer the smallest "
+            "upgrade that clears the advisory; note any that cannot be "
+            "upgraded and why."
+        ),
+        verification_commands=(" ".join(check.command),),
+        baseline_branch=baseline.branch,
+        baseline_sha=baseline.sha,
+        labels=("security",),
+    )
+
+
+# --- agent-driven modes ----------------------------------------------------
+
+_AGENT_PROMPT_FILES = {
+    CI_MODE_MARKET_RESEARCH: "market-research.md",
+    CI_MODE_FEATURE_IMPROVEMENTS: "feature-improvements.md",
+}
+
+_PROMPT_RULES = """\
+Rules
+- Read only. Do NOT modify any file in this repository except the output file.
+- Do NOT create, edit or move board tickets — the heartbeat files them for you.
+- Skip anything already covered by the open tickets listed above.
+- At most {max_proposals} proposals; zero is a valid, and often correct, answer.
+
+Output
+Write JSON to {output_path} (and nothing else), shaped:
+{"proposals": [{"title": "...", "goal": "...", "scope": "...",
+"acceptance": "...", "evidence": "...", "priority": 1}]}
+- title: imperative, <= 100 chars. evidence: URLs and/or repo paths.
+- priority: 1 high, 2 normal, 3 low.
+Then reply with one line: how many proposals you wrote.
+"""
+
+DEFAULT_AGENT_PROMPTS = {
+    CI_MODE_MARKET_RESEARCH: """\
+Continuous improvement — market research for this application.
+
+{app_context}
+
+Task
+1. Survey what comparable products and the wider ecosystem now do that this
+   app does not — current trends, expected features, deprecated practices.
+2. Keep only gaps that are concrete, valuable to this app's users, and
+   buildable inside this repository.
+
+"""
+    + _PROMPT_RULES,
+    CI_MODE_FEATURE_IMPROVEMENTS: """\
+Continuous improvement — feature and code-health review of this application.
+
+{app_context}
+
+Task
+1. Inspect the product surface (UX, docs, error paths) and code health
+   (duplication, dead code, missing tests, rough edges) of this repository.
+2. Keep only improvements a single normal ticket can deliver end to end.
+
+"""
+    + _PROMPT_RULES,
+}
+
+
+def _render_prompt(template: str, values: dict[str, str]) -> str:
+    """Token replace, not `str.format` — the templates contain JSON braces."""
+    for key, value in values.items():
+        template = template.replace("{" + key + "}", value)
+    return template
+
+
+def agent_prompt_template(workflow_dir: Path, mode: str) -> str:
+    """Operator override from `docs/symphony-prompts/ci/`, else the built-in."""
+    filename = _AGENT_PROMPT_FILES.get(mode)
+    if filename:
+        override = workflow_dir / AGENT_PROMPT_DIR / filename
+        try:
+            text = override.read_text(encoding="utf-8").strip()
+        except OSError:
+            text = ""
+        if text:
+            return text
+    return DEFAULT_AGENT_PROMPTS.get(mode, "")
+
+
+def build_app_context(
+    workflow_dir: Path, issues: list[Issue], *, readme_limit: int = 2000
+) -> str:
+    """Succinct "what is this app" block: README head, wiki index, open board."""
+    parts: list[str] = []
+    for name in ("README.md", "readme.md"):
+        candidate = workflow_dir / name
+        if candidate.exists():
+            try:
+                head = candidate.read_text(encoding="utf-8")[:readme_limit]
+            except OSError:
+                head = ""
+            if head.strip():
+                parts.append(f"README (head)\n{head.strip()}")
+            break
+    wiki_index = workflow_dir / "docs" / "llm-wiki" / "INDEX.md"
+    if wiki_index.exists():
+        try:
+            parts.append(
+                "Wiki index\n"
+                + wiki_index.read_text(encoding="utf-8")[:1500].strip()
+            )
+        except OSError:
+            pass
+    titles = [f"- {issue.identifier}: {issue.title}" for issue in issues[:40]]
+    parts.append("Open board tickets\n" + ("\n".join(titles) or "(none)"))
+    return "\n\n".join(parts)
+
+
+def parse_agent_proposals(
+    mode: str, *, output_path: Path, reply: str
+) -> tuple[ImprovementProposal, ...]:
+    """Read the agent's JSON proposal file (falling back to its reply text)."""
+    payload = _load_json_object(output_path, reply)
+    raw_proposals = payload.get("proposals") if isinstance(payload, dict) else None
+    if not isinstance(raw_proposals, list):
+        return ()
+    out: list[ImprovementProposal] = []
+    for raw in raw_proposals:
+        if not isinstance(raw, dict):
+            continue
+        title = str(raw.get("title") or "").strip()
+        goal = str(raw.get("goal") or "").strip()
+        if not title or not goal:
+            continue
+        priority = raw.get("priority")
+        if isinstance(priority, bool) or not isinstance(priority, int):
+            priority = 2
+        out.append(
+            ImprovementProposal(
+                mode=mode,
+                title=title[:120],
+                goal=redact_output(goal[:2000]),
+                scope=redact_output(str(raw.get("scope") or "").strip()[:2000]),
+                acceptance=redact_output(
+                    str(raw.get("acceptance") or "").strip()[:2000]
+                ),
+                evidence=redact_output(str(raw.get("evidence") or "").strip()[:2000]),
+                priority=min(max(priority, 1), 3),
+            )
+        )
+    return tuple(out)
+
+
+def _load_json_object(output_path: Path, reply: str) -> dict[str, Any]:
+    try:
+        return json.loads(output_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError, TypeError):
+        pass
+    match = re.search(r"\{.*\}", reply or "", re.DOTALL)
+    if match is None:
+        return {}
+    try:
+        parsed = json.loads(match.group(0))
+    except ValueError:
+        return {}
+    return parsed if isinstance(parsed, dict) else {}
+
+
+async def run_agent_mode(
+    cfg: "ServiceConfig",
+    workflow_dir: Path,
+    mode: str,
+    agent_runner: AgentRunner,
+    *,
+    issues: list[Issue] | None = None,
+) -> tuple[tuple[ImprovementProposal, ...], str]:
+    """One agent turn for an agent-driven mode. Returns `(proposals, summary)`."""
+    template = agent_prompt_template(workflow_dir, mode)
+    if not template:
+        return (), f"no prompt template for {mode}"
+    board = _tracker_or_none(cfg)
+    board_issues = issues if issues is not None else (open_issues(board) if board else [])
+    cap = max(1, cfg.continuous_improvement.max_improvement_tickets_per_run)
+    output_path = workflow_dir / AGENT_OUTPUT_DIR / f"{mode}.json"
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        output_path.unlink()
+    except FileNotFoundError:
+        pass
+    prompt = _render_prompt(
+        template,
+        {
+            "app_context": build_app_context(workflow_dir, board_issues),
+            "output_path": str(output_path),
+            "max_proposals": str(cap),
+        },
+    )
+    reply = await agent_runner(
+        AgentTask(mode=mode, prompt=prompt, cwd=workflow_dir, output_path=output_path)
+    )
+    proposals = parse_agent_proposals(mode, output_path=output_path, reply=reply or "")
+    return proposals, f"{len(proposals)} proposal(s) from the agent turn"
 
 
 def _table_cell(value: str) -> str:
@@ -652,6 +1420,16 @@ def _report_sections(result: ImprovementRunResult) -> dict[str, str]:
     else:
         check_rows.append("| (none) | - | - |")
     tickets = "\n".join(f"- {ticket}" for ticket in result.ticket_ids) or "(none)"
+    mode_rows = ["| Mode | Result | Detail | Tickets |", "| --- | --- | --- | --- |"]
+    if result.modes:
+        for outcome in result.modes:
+            mode_rows.append(
+                f"| {_table_cell(outcome.mode)} | {outcome.status} | "
+                f"{_table_cell(outcome.summary)} | "
+                f"{_table_cell(', '.join(outcome.ticket_ids) or '-')} |"
+            )
+    else:
+        mode_rows.append("| (none) | - | - | - |")
     return {
         "summary": (
             f"- Result: {result.status}\n"
@@ -667,6 +1445,12 @@ def _report_sections(result: ImprovementRunResult) -> dict[str, str]:
             f"- Summary: {baseline.summary}"
         ),
         "checks": "\n".join(check_rows),
+        "modes": "\n".join(mode_rows)
+        + (
+            f"\n\nRequest group: `{result.request_id}`"
+            if result.request_id
+            else ""
+        ),
         "evidence": _evidence_blocks(checks),
         "tickets": tickets,
         "meta": (
@@ -736,68 +1520,266 @@ async def run_continuous_improvement(
     report_phase: Callable[[str], None],
     *,
     run_argv_func: Callable[..., Awaitable[CommandExecution]] = run_argv,
+    agent_runner: AgentRunner | None = None,
+    clock: Callable[[], float] = time.time,
 ) -> ImprovementRunResult:
+    """Run every improvement mode that is enabled *and* due, then report.
+
+    Check-based modes (`readiness`, `security`) share one proven baseline and
+    one registrar pass. Triage and agent-driven modes produce proposals that
+    are filed together under a single request group. With no `modes:`
+    configured this is exactly the original readiness heartbeat.
+    """
     started_at = _utc_iso_z()
-    report_phase("baseline")
-    prepared = await _prepare_baseline(
-        workflow_dir,
-        cfg.agent.auto_merge_target_branch,
-        run_argv_func=run_argv_func,
-    )
-    baseline = prepared.proof
+    ci = cfg.continuous_improvement
+    mode_state = load_mode_state(workflow_dir)
+    now_epoch = clock()
+    due = due_modes(cfg, mode_state, now_epoch)
+    outcomes: list[ModeOutcome] = []
     checks: list[CheckResult] = []
     registration = TicketRegistrationResult()
-    try:
-        if baseline.status == "passed":
-            report_phase("checks")
-            for spec in DEFAULT_CHECKS:
-                checks.append(
-                    await run_predefined_check(
-                        spec, prepared.check_dir, run_argv_func=run_argv_func
+    baseline: BaselineProof | None = None
+    proposals: list[ImprovementProposal] = []
+    proposal_modes: list[str] = []
+    request_id: str | None = None
+
+    if CI_MODE_READINESS in due or CI_MODE_SECURITY in due:
+        report_phase("baseline")
+        prepared = await _prepare_baseline(
+            workflow_dir,
+            cfg.agent.auto_merge_target_branch,
+            run_argv_func=run_argv_func,
+        )
+        baseline = prepared.proof
+        try:
+            if baseline.status == "passed":
+                findings: list[IssueFinding] = []
+                if CI_MODE_READINESS in due:
+                    report_phase("checks")
+                    for spec in DEFAULT_CHECKS:
+                        checks.append(
+                            await run_predefined_check(
+                                spec, prepared.check_dir, run_argv_func=run_argv_func
+                            )
+                        )
+                    checks.extend(
+                        [
+                            CheckResult(
+                                "browser_qa", (), "not_available", "not configured"
+                            ),
+                            CheckResult(
+                                "db_probe", (), "not_available", "not configured"
+                            ),
+                        ]
                     )
+                    findings.extend(
+                        _finding_from_check(c, baseline)
+                        for c in checks
+                        if c.status == "failed"
+                    )
+                    outcomes.append(
+                        _check_outcome(CI_MODE_READINESS, tuple(checks))
+                    )
+                if CI_MODE_SECURITY in due:
+                    report_phase("security")
+                    security_checks: list[CheckResult] = []
+                    for spec in security_check_specs(prepared.check_dir):
+                        security_checks.append(
+                            await run_predefined_check(
+                                spec, prepared.check_dir, run_argv_func=run_argv_func
+                            )
+                        )
+                    checks.extend(security_checks)
+                    findings.extend(
+                        _security_finding(c, baseline)
+                        for c in security_checks
+                        if c.status == "failed"
+                    )
+                    outcomes.append(
+                        _check_outcome(CI_MODE_SECURITY, tuple(security_checks))
+                    )
+                report_phase("report")
+                registration = register_findings(cfg, workflow_dir, tuple(findings))
+                report_phase("registrar")
+            else:
+                for mode in (CI_MODE_READINESS, CI_MODE_SECURITY):
+                    if mode in due:
+                        outcomes.append(
+                            ModeOutcome(mode, "not_proven", baseline.summary)
+                        )
+        finally:
+            await asyncio.shield(
+                _cleanup_baseline(
+                    prepared, workflow_dir, run_argv_func=run_argv_func
                 )
-            checks.extend(
-                [
-                    CheckResult("browser_qa", (), "not_available", "not configured"),
-                    CheckResult("db_probe", (), "not_available", "not configured"),
-                ]
             )
-            findings = tuple(
-                _finding_from_check(c, baseline)
-                for c in checks
-                if c.status == "failed"
-            )
-            report_phase("report")
-            registration = register_findings(cfg, workflow_dir, findings)
-            report_phase("registrar")
-    finally:
-        await asyncio.shield(
-            _cleanup_baseline(
-                prepared, workflow_dir, run_argv_func=run_argv_func
+
+    if CI_MODE_BLOCKED_FIXES in due:
+        report_phase(CI_MODE_BLOCKED_FIXES)
+        # Close the loop first: a source whose CI fix is Done goes back to the
+        # pipeline before we look for newly stuck tickets (F-17).
+        reopened, reopen_summary = reopen_resolved_blocked_sources(cfg)
+        triaged, summary = collect_blocked_fix_proposals(cfg)
+        proposals.extend(triaged)
+        proposal_modes.append(CI_MODE_BLOCKED_FIXES)
+        outcomes.append(
+            ModeOutcome(
+                CI_MODE_BLOCKED_FIXES,
+                "passed",
+                f"{summary}; {reopen_summary}"
+                if reopened
+                else summary,
             )
         )
-    status = "passed"
-    if baseline.status == "not_proven":
-        status = "not_proven"
-    elif any(c.status == "failed" for c in checks):
-        status = "failed"
-    elif any(c.status == "not_proven" for c in checks):
-        status = "not_proven"
+
+    for mode in CI_AGENT_MODES:
+        if mode not in due:
+            continue
+        report_phase(mode)
+        if agent_runner is None:
+            outcomes.append(
+                ModeOutcome(mode, "not_available", "no agent runner available")
+            )
+            continue
+        try:
+            agent_proposals, summary = await run_agent_mode(
+                cfg, workflow_dir, mode, agent_runner
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001 — one mode must not kill the run
+            outcomes.append(ModeOutcome(mode, "not_proven", str(exc)[:240]))
+            continue
+        proposals.extend(agent_proposals)
+        proposal_modes.append(mode)
+        outcomes.append(ModeOutcome(mode, "passed", summary))
+
+    proposal_registration = TicketRegistrationResult()
+    if proposals:
+        report_phase("proposals")
+        board = _tracker_or_none(cfg)
+        if board is None:
+            proposal_registration = TicketRegistrationResult(
+                unsupported_tracker=True, skipped_reason="unsupported_tracker"
+            )
+        else:
+            request_id = next_request_id(
+                board.scan_all(), today=time.strftime("%Y%m%d", time.gmtime())
+            )
+            proposal_registration = register_proposals(
+                cfg, tuple(proposals), request=request_id, tracker=board
+            )
+            outcomes = _attribute_tickets(
+                outcomes, tuple(proposals), proposal_registration, proposal_modes
+            )
+
+    # F-16: only stamp the cadence for modes that produced a real result.
+    # A `not_available` (no agent runner) or `not_proven` (dirty baseline,
+    # exception) mode never ran, so a weekly mode would otherwise wait
+    # another week before trying again.
+    stamped_status = {"passed", "failed"}
+    outcome_status = {outcome.mode: outcome.status for outcome in outcomes}
+    stamped = [
+        mode
+        for mode in due
+        if outcome_status.get(mode, "not_proven") in stamped_status
+    ]
+    for mode in stamped:
+        mode_state[mode] = now_epoch
+    if stamped:
+        save_mode_state(workflow_dir, mode_state)
+
+    status = _run_status(baseline, tuple(checks), tuple(outcomes))
+    ticket_ids = registration.ticket_ids + proposal_registration.ticket_ids
     result = ImprovementRunResult(
-        tickets_created=registration.tickets_created,
-        verified_branch=baseline.branch,
-        verified_sha=baseline.sha,
+        tickets_created=(
+            registration.tickets_created + proposal_registration.tickets_created
+        ),
+        verified_branch=baseline.branch if baseline else None,
+        verified_sha=baseline.sha if baseline else None,
         status=status,
-        skipped_reason=registration.skipped_reason,
+        skipped_reason=(
+            registration.skipped_reason
+            or proposal_registration.skipped_reason
+            or (None if due else "no_modes_due")
+        ),
         baseline=baseline,
         checks=tuple(checks),
-        ticket_ids=registration.ticket_ids,
+        ticket_ids=ticket_ids,
         started_at=started_at,
         finished_at=_utc_iso_z(),
-        max_turns=cfg.continuous_improvement.max_turns,
+        max_turns=ci.max_turns,
+        modes=tuple(outcomes),
+        request_id=request_id,
     )
     write_report(workflow_dir / DEFAULT_REPORT_PATH, result)
     return result
+
+
+def _check_outcome(mode: str, checks: tuple[CheckResult, ...]) -> ModeOutcome:
+    if not checks:
+        return ModeOutcome(mode, "not_available", "no checks configured")
+    failed = [c.name for c in checks if c.status == "failed"]
+    not_proven = [c.name for c in checks if c.status == "not_proven"]
+    if failed:
+        return ModeOutcome(mode, "failed", f"failed: {', '.join(failed)}")
+    if not_proven:
+        return ModeOutcome(mode, "not_proven", f"not proven: {', '.join(not_proven)}")
+    return ModeOutcome(mode, "passed", f"{len(checks)} check(s) clean")
+
+
+def _attribute_tickets(
+    outcomes: list[ModeOutcome],
+    proposals: tuple[ImprovementProposal, ...],
+    registration: TicketRegistrationResult,
+    proposal_modes: list[str],
+) -> list[ModeOutcome]:
+    """Map created ticket ids back onto the mode that proposed them.
+
+    `register_proposals` files in proposal order and skips duplicates, so the
+    created ids line up with the proposals that survived de-duplication.
+    """
+    filed = {
+        proposal.mode: []
+        for proposal in proposals
+        if proposal.mode in proposal_modes
+    }
+    remaining = list(registration.ticket_ids)
+    for proposal in proposals:
+        if not remaining:
+            break
+        filed.setdefault(proposal.mode, []).append(remaining.pop(0))
+    return [
+        (
+            dataclasses.replace(
+                outcome,
+                ticket_ids=tuple(filed.get(outcome.mode, ())),
+                summary=(
+                    f"{outcome.summary}; "
+                    f"{len(filed.get(outcome.mode, ()))} ticket(s) filed"
+                ),
+            )
+            if outcome.mode in proposal_modes
+            else outcome
+        )
+        for outcome in outcomes
+    ]
+
+
+def _run_status(
+    baseline: BaselineProof | None,
+    checks: tuple[CheckResult, ...],
+    outcomes: tuple[ModeOutcome, ...],
+) -> str:
+    if baseline is not None and baseline.status == "not_proven":
+        return "not_proven"
+    if any(c.status == "failed" for c in checks):
+        return "failed"
+    if any(c.status == "not_proven" for c in checks):
+        return "not_proven"
+    if any(o.status == "not_proven" for o in outcomes):
+        return "not_proven"
+    return "passed"
 
 
 @runtime_checkable

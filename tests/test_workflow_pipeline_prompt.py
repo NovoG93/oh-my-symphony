@@ -18,7 +18,7 @@ STAGE_HEADINGS_BY_STATE = {
     "Todo": "### TRIAGE",
     "In Progress": "### IMPLEMENT",
     "Verify": "### VERIFY",
-    "Learn": "### LEARN",
+    "Document": "### DOCUMENT",
     "Done": "### DONE",
 }
 
@@ -38,7 +38,9 @@ IN_PROGRESS_RULES = (
 )
 
 VERIFY_RULES = (
-    "Verify has three jobs: review, QA, and merge preflight/merge",
+    "Verify has three jobs: review, QA, and merge preflight",
+    # F-10: exactly one merge per ticket, created by the orchestrator at Done.
+    "Verify proves, Document documents, the orchestrator merges",
     "what worked",
     "what failed",
     "what is not covered",
@@ -52,7 +54,12 @@ VERIFY_RULES = (
     "Full integration gate",
     "committed target branch",
     "register new Kanban/board bug tickets",
-    "blocked_by",
+    # F-09: the lane names the validated write verb instead of telling the
+    # agent to hand-edit `blocked_by` frontmatter.
+    "board update {{ issue.identifier }} --add-blocked-by <ID>".replace(
+        "{{ issue.identifier }}", "DEMO-1"
+    ),
+    "never hand-edit frontmatter",
     "rerun from scratch",
     "## QA Evidence",
     "## AC Scorecard",
@@ -61,10 +68,10 @@ VERIFY_RULES = (
     "git merge-tree --write-tree",
     "Do not merge the target branch into the ticket workspace",
     "## Merge Status",
-    "Set state to `Learn`",
+    "Set state to `Document`",
 )
 
-LEARN_RULES = (
+DOCUMENT_RULES = (
     "llm-wiki",
     "INDEX.md",
     "## Wiki Updates",
@@ -153,9 +160,9 @@ def test_active_states_cover_four_stage_pipeline(workflow: str) -> None:
         "Todo",
         "In Progress",
         "Verify",
-        "Learn",
+        "Document",
     )
-    for required in ("Todo", "In Progress", "Verify", "Learn"):
+    for required in ("Todo", "In Progress", "Verify", "Document"):
         assert required.lower() in cfg.prompts.stage_templates
     assert "done" in cfg.prompts.stage_templates
     assert "Human Review" in cfg.tracker.terminal_states
@@ -217,6 +224,11 @@ def test_verify_stage_demands_review_qa_and_merge_evidence(workflow: str) -> Non
         assert phrase in rendered
     assert "Do not use `git status -uno --porcelain` as merge proof" in rendered
     assert "set state to `In Progress`" in rendered
+    # F-10: the Verify lane must not hand-merge — that produced two merge
+    # commits per ticket and landed code before Document wrote the wiki.
+    assert "orchestrator will merge at Done" in rendered
+    assert "Do NOT create the merge commit yourself" in rendered
+    assert "create the explicit `--no-ff` merge commit" not in rendered
 
 
 @pytest.mark.parametrize("workflow", WORKFLOW_FILES)
@@ -233,26 +245,38 @@ def test_verify_stage_respects_disabled_auto_merge(workflow: str) -> None:
 
     assert "Merge Gate is disabled" in rendered
     assert "leaves branch integration to the operator" in rendered
-    assert "Set state to `Learn`" in rendered
+    assert "Set state to `Document`" in rendered
 
 
 @pytest.mark.parametrize("workflow", WORKFLOW_FILES)
-def test_learn_stage_writes_wiki_and_done_or_intervention_handoff(workflow: str) -> None:
+def test_document_stage_writes_wiki_and_done_or_intervention_handoff(workflow: str) -> None:
     cfg = _load(workflow)
     rendered = render(
-        cfg.prompt_template_for_state("Learn"),
-        build_prompt_env(_issue("Learn"), attempt=None),
+        cfg.prompt_template_for_state("Document"),
+        build_prompt_env(_issue("Document"), attempt=None),
     )
 
-    for phrase in LEARN_RULES:
+    for phrase in DOCUMENT_RULES:
         assert phrase in rendered
     for heading in HUMAN_REVIEW_HANDOFF_SHAPE:
         assert heading in rendered
-    assert "Do NOT edit source, do NOT run git history commands" in rendered
+    # F-07: read-only history inspection is the lane's job, not a cage.
+    assert "Read-only inspection of history is expected" in rendered
+    assert "do NOT run git history commands" not in rendered
+    # F-08: the lane's write scope matches its charter (docs, not just wiki).
+    assert "the user-facing docs this change touched" in rendered
+    assert "Update every user-facing doc the change touched" in rendered
+    assert "no source or test edits" in rendered
+    # The ownership boundaries that ARE legitimate stay.
+    assert "Do not create commits, tags, branches, or pushes" in rendered
+    # F-27: `## Document Defect` was consumed as a rewind section that no
+    # prompt ever told an agent to write.
+    assert "## Document Defect" in rendered
+    assert "set state to `In Progress`" in rendered
 
 
 @pytest.mark.parametrize("flavor", ("file", "linear"))
-def test_base_prompt_declares_four_stage_pipeline_and_skip_learn(flavor: str) -> None:
+def test_base_prompt_declares_four_stage_pipeline_and_skip_document(flavor: str) -> None:
     text = (REPO_ROOT / "docs" / "symphony-prompts" / flavor / "base.md").read_text(
         encoding="utf-8"
     )
@@ -260,7 +284,7 @@ def test_base_prompt_declares_four_stage_pipeline_and_skip_learn(flavor: str) ->
     assert "Production pipeline (4 active stages)" in text
     assert "Board card mental model" in text
     assert "Each lane answers one human question" in text
-    assert "Todo  ->  In Progress  ->  Verify  ->  Learn" in text
+    assert "Todo  ->  In Progress  ->  Verify  ->  Document" in text
     assert "critical/manual intervention -> Human Review" in text
     assert "Use `Human Review` only for real critical/manual intervention" in text
     assert "Use `Not proven` when evidence is missing" in text

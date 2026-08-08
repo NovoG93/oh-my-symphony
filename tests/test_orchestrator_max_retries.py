@@ -261,3 +261,111 @@ def test_escalation_picks_human_terminal_when_named(monkeypatch) -> None:
     # "Needs Human" comes BEFORE "Blocked" in terminal_states and
     # matches the "human" preference rule, so it should win.
     assert captured == ["Needs Human"], captured
+
+
+# ---------------------------------------------------------------------------
+# Review §4.3 — transient stream errors retry (bounded), then escalate
+# ---------------------------------------------------------------------------
+
+
+_STREAM_ERROR = "claude stream unreadable: 20 consecutive malformed lines"
+
+
+def _entry_for_exit(issue_id: str):
+    from datetime import datetime, timezone
+
+    from symphony.issue import Issue
+    from symphony.orchestrator import RunningEntry
+
+    issue = Issue(
+        id=issue_id,
+        identifier="MT-1",
+        title="stream fault",
+        description="",
+        priority=2,
+        state="In Progress",
+        created_at=datetime(2026, 1, 1, tzinfo=timezone.utc),
+    )
+    return RunningEntry(
+        issue=issue,
+        started_at=datetime.now(timezone.utc),
+        retry_attempt=None,
+        worker_task=None,  # type: ignore[arg-type]
+        workspace_path=Path("/tmp/ws/MT-1"),
+        agent_kind="claude",
+    )
+
+
+def _drive_worker_exit(o: Orchestrator, issue_id: str, error: str) -> None:
+    async def _run() -> None:
+        await o._on_worker_exit_impl(issue_id, "error", error)
+        await asyncio.sleep(0)
+
+    o._loop.run_until_complete(_run())
+
+
+def test_stream_unreadable_exit_schedules_a_retry_instead_of_pausing(
+    monkeypatch,
+) -> None:
+    cfg = _make_config(max_retries=3)
+    o = _orch(cfg)
+    issue_id = "iss-stream"
+    o._running[issue_id] = _entry_for_exit(issue_id)
+
+    _drive_worker_exit(o, issue_id, _STREAM_ERROR)
+
+    assert issue_id not in o._paused_issue_ids, (
+        "a transient stream fault paused the ticket for operator inspection"
+    )
+    assert issue_id in o._retry
+    o._retry[issue_id].timer_handle.cancel()
+    o._loop.close()
+
+
+def test_unmatched_worker_error_still_auto_pauses(monkeypatch) -> None:
+    cfg = _make_config(max_retries=3)
+    o = _orch(cfg)
+    issue_id = "iss-crash"
+    o._running[issue_id] = _entry_for_exit(issue_id)
+
+    _drive_worker_exit(o, issue_id, "TypeError: NoneType is not subscriptable")
+
+    assert issue_id in o._paused_issue_ids
+    if issue_id in o._retry:
+        o._retry[issue_id].timer_handle.cancel()
+    o._loop.close()
+
+
+def test_stream_unreadable_retries_stay_bounded_by_max_retries(monkeypatch) -> None:
+    """(b) the cap still escalates with the ## Escalation note."""
+    cfg = _make_config(max_retries=3)
+    o = _orch(cfg)
+    issue_id = "iss-stream-cap"
+    entry = _entry_for_exit(issue_id)
+    entry.retry_attempt = 3  # next attempt would be 4 > max_retries
+    o._running[issue_id] = entry
+
+    captured: list[tuple] = []
+
+    monkeypatch.setattr(
+        Orchestrator,
+        "_tracker_call_append_note",
+        staticmethod(
+            lambda cfg, issue, heading, body: captured.append(("note", heading))
+        ),
+    )
+    monkeypatch.setattr(
+        Orchestrator,
+        "_tracker_call_update_state",
+        staticmethod(lambda cfg, issue, state: captured.append(("state", state))),
+    )
+
+    _drive_worker_exit(o, issue_id, _STREAM_ERROR)
+    pending = asyncio.all_tasks(o._loop)
+    if pending:
+        o._loop.run_until_complete(asyncio.gather(*pending, return_exceptions=True))
+
+    assert issue_id not in o._retry, "retries were not bounded by max_retries"
+    assert any(c[0] == "note" and "Escalation" in c[1] for c in captured), captured
+    assert any(c[0] == "state" and "Block" in c[1] for c in captured), captured
+    o._loop.close()

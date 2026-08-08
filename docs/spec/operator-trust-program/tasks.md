@@ -1,5 +1,11 @@
 # Tasks: Operator Trust Program
 
+> **Superseded — archived design record.** This document describes the repo as
+> it was when the spec was written. `tools/board-viewer/` and the `Learn` lane
+> no longer exist (the built-in admin web app on `server.port` is the only
+> board; `Learn` was renamed `Document`). Kept for the decision history, not
+> as a description of current behaviour.
+
 Statuses audited 2026-07-03 against `dev` (`7be48e2`); evidence in
 `audit.md`. Detailed execution steps for the open tasks live in
 `docs/plans/2026-07-03-operator-trust-implementation.md`.

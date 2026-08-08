@@ -23,7 +23,7 @@ backend-specific protocol details.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field, replace
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Awaitable, Callable, Protocol, cast, runtime_checkable
 
@@ -167,117 +167,6 @@ class BaseAgentBackend:
         """
         del event
         return True
-
-
-@dataclass(frozen=True)
-class BackendCapabilities:
-    """What a backend can actually do, declared rather than inferred.
-
-    Before this existed, behavioural differences between drivers lived as
-    `if kind == "claude"` checks scattered across call sites. Governed
-    workflows make that untenable: a node declaring `context: continue`
-    must be rejected at preflight with a precise reason, not discovered to
-    misbehave at turn three.
-
-    Every field answers a question the workflow engine asks:
-
-    - `session_resume` — may a node use `context: continue`?
-    - `process_cancel` — can a cancel actually stop the child process tree?
-    - `streaming_usage` — does token usage arrive during a turn, or only at
-      the end?
-    - `structured_output` — can the backend be asked for parseable output?
-      (Reserved for Phase 3 conditions; no backend reports this yet.)
-    - `node_skills` — can per-node skill/tool sets be injected?
-    - `tool_policy` — can tool access be restricted per node?
-    - `enforce_read_only_workspace` — can the *process* be prevented from
-      writing to the workspace? Not "does the node promise not to write".
-    """
-
-    session_resume: bool = False
-    process_cancel: bool = False
-    streaming_usage: bool = False
-    structured_output: bool = False
-    node_skills: bool = False
-    tool_policy: bool = False
-    enforce_read_only_workspace: bool = False
-
-
-# Static half of the capability matrix — the facts that do not depend on
-# configuration. `resume_across_turns` is per-backend config, so
-# `capabilities_for` layers it on top.
-#
-# On `enforce_read_only_workspace`: every entry is False in this release,
-# and that is deliberate rather than pending. Codex and Claude *can* be
-# launched with sandbox/permission modes that would enforce it, but the
-# workflow executor does not yet pass those flags. PRD §9.3 is explicit
-# that a declaration alone is never sufficient isolation, so until the
-# executor actually hands the backend a read-only mode, read nodes degrade
-# to the exclusive workspace lock. Flipping a flag here without wiring the
-# flag through would silently permit concurrent writers.
-_STATIC_CAPABILITIES: dict[str, BackendCapabilities] = {
-    "codex": BackendCapabilities(
-        process_cancel=True,
-        streaming_usage=True,
-        tool_policy=True,
-    ),
-    "claude": BackendCapabilities(
-        process_cancel=True,
-        streaming_usage=True,
-        tool_policy=True,
-    ),
-    # Current Gemini CLI releases expose no resume flag at all, so session
-    # resume is False regardless of what config asks for.
-    "gemini": BackendCapabilities(process_cancel=True),
-    "agy": BackendCapabilities(process_cancel=True),
-    "kiro": BackendCapabilities(process_cancel=True),
-    "opencode": BackendCapabilities(process_cancel=True),
-    "pi": BackendCapabilities(process_cancel=True),
-}
-
-# Backends whose session id survives across turns only when the workflow
-# config enables it. Gemini is absent: it has no resume mechanism to enable.
-_RESUME_CONFIG_ATTR: dict[str, str] = {
-    "claude": "claude",
-    "agy": "agy",
-    "kiro": "kiro",
-    "opencode": "opencode",
-    "pi": "pi",
-}
-
-
-def capabilities_for(cfg: ServiceConfig, kind: str | None = None) -> BackendCapabilities:
-    """Capabilities of one backend kind under the current configuration.
-
-    `kind` defaults to the service's configured backend. Unknown kinds get
-    the all-False default rather than raising: preflight reports unknown
-    kinds with a better message than this function could.
-    """
-    resolved = (kind or cfg.agent.kind or "").strip().lower()
-    static = _STATIC_CAPABILITIES.get(resolved)
-    if static is None:
-        return BackendCapabilities()
-    if resolved == "codex":
-        # The codex app server is one long-lived process that owns the
-        # thread, so turns 2+ always rejoin it — there is no config toggle.
-        return replace(static, session_resume=True)
-    attr = _RESUME_CONFIG_ATTR.get(resolved)
-    if attr is None:
-        return static
-    backend_cfg = getattr(cfg, attr, None)
-    return replace(
-        static, session_resume=bool(getattr(backend_cfg, "resume_across_turns", False))
-    )
-
-
-def missing_capabilities(
-    required: frozenset[str], capabilities: BackendCapabilities
-) -> tuple[str, ...]:
-    """Required capability names this backend does not provide."""
-    return tuple(
-        name
-        for name in sorted(required)
-        if not bool(getattr(capabilities, name, False))
-    )
 
 
 def build_backend(init: BackendInit) -> AgentBackend:

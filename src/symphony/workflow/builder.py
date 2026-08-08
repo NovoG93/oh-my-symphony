@@ -19,6 +19,7 @@ from pathlib import Path
 from typing import Any
 
 from ..errors import ConfigValidationError
+from ..logging import get_logger
 from ..notifications import build_notifications_config
 from .coercion import (
     _as_int,
@@ -50,7 +51,6 @@ from .config import (
     TrackerConfig,
     TuiConfig,
     WikiConfig,
-    WorkflowEngineConfig,
 )
 from .constants import (
     _AFTER_DONE_FAILURE_POLICIES,
@@ -64,6 +64,7 @@ from .constants import (
     DEFAULT_BACKEND_TURN_TIMEOUT_MS,
     DEFAULT_BOARD_ROOT_NAME,
     DEFAULT_CI_INTERVAL_MS,
+    DEFAULT_CI_MAX_IMPROVEMENT_TICKETS_PER_RUN,
     DEFAULT_CI_MAX_TICKETS_PER_RUN,
     DEFAULT_CI_MAX_TURNS,
     DEFAULT_CI_MIN_INTERVAL_MS,
@@ -90,18 +91,13 @@ from .constants import (
     DEFAULT_POLL_INTERVAL_MS,
     DEFAULT_PROMPT,
     DEFAULT_TERMINAL_STATES,
-    DEFAULT_WORKFLOW_ARTIFACT_DIRECTORY,
-    DEFAULT_WORKFLOW_ARTIFACT_RETENTION_DAYS,
-    DEFAULT_WORKFLOW_DIRECTORY,
-    DEFAULT_WORKFLOW_MAX_PARALLEL_NODES,
-    DEFAULT_WORKFLOW_NAME,
     DEFAULT_WORKSPACE_REUSE_POLICY,
-    MAX_WORKFLOW_PARALLEL_NODES,
     JIRA_API_TOKEN_ENV,
     JIRA_EMAIL_ENV,
     LINEAR_API_KEY_ENV,
     LINEAR_DEFAULT_ENDPOINT,
     SUPPORTED_AGENT_KINDS,
+    SUPPORTED_CI_MODES,
     SUPPORTED_WORKSPACE_REUSE_POLICIES,
 )
 from .parser import WorkflowDefinition
@@ -403,6 +399,19 @@ def build_service_config(workflow: WorkflowDefinition) -> ServiceConfig:
         budget_exhausted_state=_as_str(
             agent_raw.get("budget_exhausted_state"), ""
         ) or "",
+        stage_kinds=_validated_stage_kinds(
+            agent_raw.get("stage_kinds"),
+            active_states=tracker.active_states,
+            terminal_states=tracker.terminal_states,
+        ),
+        stage_contracts=_validated_stage_contracts(
+            agent_raw.get("stage_contracts")
+        ),
+        stall_timeout_ms_by_state=_validated_stall_timeout_by_state(
+            agent_raw.get("stall_timeout_ms_by_state"),
+            active_states=tracker.active_states,
+            terminal_states=tracker.terminal_states,
+        ),
     )
 
     codex_raw = cfg.get("codex") or {}
@@ -660,9 +669,7 @@ def build_service_config(workflow: WorkflowDefinition) -> ServiceConfig:
         cfg.get("continuous_improvement")
     )
 
-    workflow_engine = _build_workflow_engine_config(
-        cfg.get("workflow_engine"), base_dir
-    )
+    _log_stage_contracts_decision(agent, tracker)
 
     return ServiceConfig(
         workflow_path=workflow.source_path,
@@ -686,7 +693,6 @@ def build_service_config(workflow: WorkflowDefinition) -> ServiceConfig:
         wiki=wiki,
         notifications=notifications,
         continuous_improvement=continuous_improvement,
-        workflow_engine=workflow_engine,
         raw=dict(cfg),
         prompt_template=prompt_template,
         workspace_reuse_policy=workspace_reuse_policy,
@@ -743,6 +749,133 @@ def _validated_nonnegative_or_default(value: Any, default: int, *, name: str) ->
     if ivalue < 0:
         raise ConfigValidationError(f"{name} must be a non-negative integer", value=value)
     return ivalue
+
+
+def _validated_stage_kinds(
+    value: Any,
+    *,
+    active_states: tuple[str, ...],
+    terminal_states: tuple[str, ...],
+) -> dict[str, str]:
+    """agent.stage_kinds — per-state backend routing, keys lowercased.
+
+    Values must be supported agent kinds (a typo would dispatch nothing, so
+    it is a hard config error). Unknown state keys only warn: states are
+    user-editable through the web UI, and a stale mapping entry should not
+    brick the whole workflow load.
+    """
+    if value is None:
+        return {}
+    if not isinstance(value, dict):
+        raise ConfigValidationError(
+            "agent.stage_kinds must be a map of state name to agent kind",
+            value=value,
+        )
+    known = {state.strip().lower() for state in (*active_states, *terminal_states)}
+    out: dict[str, str] = {}
+    for key, raw in value.items():
+        if not isinstance(key, str):
+            continue
+        normalized_key = key.strip().lower()
+        if not normalized_key:
+            continue
+        kind = _canonical_agent_kind(_as_str(raw).strip().lower())
+        if kind not in SUPPORTED_AGENT_KINDS:
+            raise ConfigValidationError(
+                f"agent.stage_kinds[{key!r}] must be one of "
+                f"{sorted(SUPPORTED_AGENT_KINDS)}",
+                value=raw,
+            )
+        if normalized_key not in known:
+            get_logger().warning(
+                "agent_stage_kinds_unknown_state",
+                state=key,
+                known_states=sorted(known),
+            )
+        out[normalized_key] = kind
+    return out
+
+
+def _log_stage_contracts_decision(agent: AgentConfig, tracker: TrackerConfig) -> None:
+    """Say out loud when the mechanical evidence floor is NOT running.
+
+    F-06: renaming one default lane (`Document` → `Docs`) silently switched
+    the whole stage-contract validator off. It is a legitimate outcome of a
+    customized board, but it must never be invisible — this is the product's
+    evidence floor.
+    """
+    from ..orchestrator.contracts import board_uses_default_contracts
+
+    mode = (agent.stage_contracts or "auto").strip().lower()
+    if agent.stage_contracts_enabled(tracker.active_states):
+        return
+    if mode == "off":
+        get_logger().info(
+            "stage_contracts_disabled",
+            reason="agent.stage_contracts: off",
+            lanes=list(tracker.active_states),
+        )
+        return
+    offending = [
+        state
+        for state in tracker.active_states
+        if not board_uses_default_contracts((state,))
+    ]
+    get_logger().warning(
+        "stage_contracts_disabled",
+        reason="board lanes are not the default preset",
+        offending_lanes=offending,
+        lanes=list(tracker.active_states),
+        hint="set agent.stage_contracts: on to enforce them anyway",
+    )
+
+
+_STAGE_CONTRACT_MODES = ("auto", "on", "off")
+
+
+def _validated_stage_contracts(value: Any) -> str:
+    """agent.stage_contracts — auto (default) | on | off."""
+    if value is None:
+        return "auto"
+    if isinstance(value, bool):
+        return "on" if value else "off"
+    mode = _as_str(value).strip().lower()
+    if mode not in _STAGE_CONTRACT_MODES:
+        raise ConfigValidationError(
+            f"agent.stage_contracts must be one of {list(_STAGE_CONTRACT_MODES)}",
+            value=value,
+        )
+    return mode
+
+
+def _validated_stall_timeout_by_state(
+    value: Any,
+    *,
+    active_states: tuple[str, ...],
+    terminal_states: tuple[str, ...],
+) -> dict[str, int]:
+    """agent.stall_timeout_ms_by_state — per-lane stall budget, keys lowercased.
+
+    Same shape as `max_total_tokens_by_state`: non-positive / non-numeric
+    entries are dropped rather than fatal, because a stall budget is an
+    ergonomics knob and a stale entry must not brick the workflow load.
+    Unknown state keys warn (states are UI-editable).
+    """
+    if value is not None and not isinstance(value, dict):
+        raise ConfigValidationError(
+            "agent.stall_timeout_ms_by_state must be a map of state name to ms",
+            value=value,
+        )
+    out = _normalize_state_map(value)
+    known = {state.strip().lower() for state in (*active_states, *terminal_states)}
+    for key in out:
+        if key not in known:
+            get_logger().warning(
+                "agent_stall_timeout_unknown_state",
+                state=key,
+                known_states=sorted(known),
+            )
+    return out
 
 
 def _validated_after_done_failure_policy(value: Any) -> str:
@@ -846,141 +979,72 @@ def _validated_ci_ticket_prefix(value: Any) -> str:
     return value
 
 
-def _build_workflow_engine_config(raw: Any, base_dir: Path) -> WorkflowEngineConfig:
-    """§governed workflow mode — default-off, every field validated strictly.
 
-    A missing or non-mapping `workflow_engine:` yields the disabled default,
-    which is byte-for-byte today's behavior. Path fields resolve against the
-    WORKFLOW.md directory and are rejected if they escape it: workflow files
-    are executable code, so the set of directories they can be loaded from
-    must stay inside the reviewed repository.
+def validated_ci_modes(value: Any) -> tuple[str, ...]:
+    """Normalize `continuous_improvement.modes` to canonical mode order.
+
+    `None`/absent means "no explicit modes" — the config's `resolved_modes()`
+    then falls back to readiness-only, which is what an `enabled: true` block
+    meant before improvement modes existed. Shared with the mutation API so
+    WORKFLOW.md and the settings card reject the same strings.
     """
-    engine_raw = raw or {}
-    if not isinstance(engine_raw, dict):
-        engine_raw = {}
-
-    enabled = _validated_bool(
-        engine_raw.get("enabled"), False, name="workflow_engine.enabled"
-    )
-    directory = _validated_repo_relative_dir(
-        engine_raw.get("directory"),
-        DEFAULT_WORKFLOW_DIRECTORY,
-        base_dir=base_dir,
-        name="workflow_engine.directory",
-    )
-    artifact_directory = _validated_repo_relative_dir(
-        engine_raw.get("artifact_directory"),
-        DEFAULT_WORKFLOW_ARTIFACT_DIRECTORY,
-        base_dir=base_dir,
-        name="workflow_engine.artifact_directory",
-    )
-    default_name = _as_str(engine_raw.get("default")) or DEFAULT_WORKFLOW_NAME
-    default_name = default_name.strip()
-    if not _WORKFLOW_NAME_RE.match(default_name):
+    if value is None:
+        return ()
+    if isinstance(value, str) or not isinstance(value, (list, tuple)):
         raise ConfigValidationError(
-            "workflow_engine.default must be lowercase letters, digits, and "
-            "hyphens, starting with a letter",
-            value=default_name,
+            "continuous_improvement.modes must be a list of mode names",
+            value=value,
         )
-    max_parallel_nodes = _validated_strict_int(
-        engine_raw.get("max_parallel_nodes"),
-        DEFAULT_WORKFLOW_MAX_PARALLEL_NODES,
-        name="workflow_engine.max_parallel_nodes",
-        minimum=1,
-    )
-    if max_parallel_nodes > MAX_WORKFLOW_PARALLEL_NODES:
-        raise ConfigValidationError(
-            f"workflow_engine.max_parallel_nodes must be <= "
-            f"{MAX_WORKFLOW_PARALLEL_NODES}",
-            value=max_parallel_nodes,
-        )
-    require_explicit_resume = _validated_bool(
-        engine_raw.get("require_explicit_resume"),
-        True,
-        name="workflow_engine.require_explicit_resume",
-    )
-    if not require_explicit_resume:
-        raise ConfigValidationError(
-            "workflow_engine.require_explicit_resume cannot be disabled in this "
-            "release; automatic resume of an interrupted governed run is unsafe "
-            "until node-level side effects are provably idempotent",
-            value=require_explicit_resume,
-        )
-    artifact_retention_days = _validated_strict_int(
-        engine_raw.get("artifact_retention_days"),
-        DEFAULT_WORKFLOW_ARTIFACT_RETENTION_DAYS,
-        name="workflow_engine.artifact_retention_days",
-        minimum=0,
-    )
-    ticket_state_mapping = _validated_ticket_state_mapping(
-        engine_raw.get("ticket_state_mapping")
-    )
-
-    return WorkflowEngineConfig(
-        enabled=enabled,
-        directory=directory,
-        artifact_directory=artifact_directory,
-        default=default_name,
-        max_parallel_nodes=max_parallel_nodes,
-        require_explicit_resume=require_explicit_resume,
-        artifact_retention_days=artifact_retention_days,
-        ticket_state_mapping=ticket_state_mapping,
-    )
+    seen: list[str] = []
+    for item in value:
+        if not isinstance(item, str):
+            raise ConfigValidationError(
+                "continuous_improvement.modes must be a list of mode names",
+                value=item,
+            )
+        mode = item.strip().lower()
+        if mode not in SUPPORTED_CI_MODES:
+            raise ConfigValidationError(
+                "unknown continuous_improvement mode "
+                f"{mode!r}; supported: {list(SUPPORTED_CI_MODES)}",
+                value=item,
+            )
+        if mode not in seen:
+            seen.append(mode)
+    return tuple(mode for mode in SUPPORTED_CI_MODES if mode in seen)
 
 
-_WORKFLOW_NAME_RE = re.compile(r"^[a-z][a-z0-9-]{0,62}$")
-
-# Runtime conditions a repository may map to a tracker state (PRD §13.2).
-_TICKET_STATE_CONDITIONS = frozenset(
-    {"running", "waiting_approval", "succeeded", "rejected", "abandoned"}
-)
-
-
-def _validated_repo_relative_dir(
-    value: Any, default: str, *, base_dir: Path, name: str
-) -> Path:
-    raw = _as_str(value) or default
-    candidate = Path(expand_path_value(raw.strip()))
-    resolved = (
-        candidate.resolve()
-        if candidate.is_absolute()
-        else (base_dir / candidate).resolve()
-    )
-    root = base_dir.resolve()
-    try:
-        resolved.relative_to(root)
-    except ValueError as exc:
-        raise ConfigValidationError(
-            f"{name} must stay inside the workflow directory", value=raw
-        ) from exc
-    return resolved
-
-
-def _validated_ticket_state_mapping(value: Any) -> dict[str, str]:
+def _validated_ci_mode_interval_hours(value: Any) -> dict[str, float]:
+    """`{mode: hours}` cadence overrides; hours must be a non-negative number."""
     if value is None:
         return {}
     if not isinstance(value, dict):
         raise ConfigValidationError(
-            "workflow_engine.ticket_state_mapping must be a mapping", value=value
+            "continuous_improvement.mode_interval_hours must be a mapping "
+            "of mode name to hours",
+            value=value,
         )
-    mapping: dict[str, str] = {}
-    for key, target in value.items():
-        condition = str(key).strip().lower()
-        if condition not in _TICKET_STATE_CONDITIONS:
+    out: dict[str, float] = {}
+    for raw_mode, raw_hours in value.items():
+        mode = raw_mode.strip().lower() if isinstance(raw_mode, str) else raw_mode
+        if mode not in SUPPORTED_CI_MODES:
             raise ConfigValidationError(
-                "workflow_engine.ticket_state_mapping key must be one of "
-                + ", ".join(sorted(_TICKET_STATE_CONDITIONS)),
-                value=key,
+                "unknown continuous_improvement mode "
+                f"{raw_mode!r}; supported: {list(SUPPORTED_CI_MODES)}",
+                value=raw_mode,
             )
-        target_state = _as_str(target)
-        if not target_state or not target_state.strip():
+        if isinstance(raw_hours, bool) or not isinstance(raw_hours, (int, float)):
             raise ConfigValidationError(
-                f"workflow_engine.ticket_state_mapping.{condition} must name a "
-                "tracker state",
-                value=target,
+                f"continuous_improvement.mode_interval_hours.{mode} must be a number",
+                value=raw_hours,
             )
-        mapping[condition] = target_state.strip()
-    return mapping
+        if raw_hours < 0:
+            raise ConfigValidationError(
+                f"continuous_improvement.mode_interval_hours.{mode} must be >= 0",
+                value=raw_hours,
+            )
+        out[mode] = float(raw_hours)
+    return out
 
 
 def _build_continuous_improvement_config(raw: Any) -> ContinuousImprovementConfig:
@@ -1021,6 +1085,16 @@ def _build_continuous_improvement_config(raw: Any) -> ContinuousImprovementConfi
         name="continuous_improvement.require_idle_board",
     )
     agent_kind = _validated_ci_agent_kind(ci_raw.get("agent_kind"))
+    modes = validated_ci_modes(ci_raw.get("modes"))
+    mode_interval_hours = _validated_ci_mode_interval_hours(
+        ci_raw.get("mode_interval_hours")
+    )
+    max_improvement_tickets_per_run = _validated_strict_int(
+        ci_raw.get("max_improvement_tickets_per_run"),
+        DEFAULT_CI_MAX_IMPROVEMENT_TICKETS_PER_RUN,
+        name="continuous_improvement.max_improvement_tickets_per_run",
+        minimum=1,
+    )
 
     return ContinuousImprovementConfig(
         enabled=enabled,
@@ -1030,4 +1104,7 @@ def _build_continuous_improvement_config(raw: Any) -> ContinuousImprovementConfi
         max_tickets_per_run=max_tickets_per_run,
         require_idle_board=require_idle_board,
         agent_kind=agent_kind,
+        modes=modes,
+        mode_interval_hours=mode_interval_hours,
+        max_improvement_tickets_per_run=max_improvement_tickets_per_run,
     )

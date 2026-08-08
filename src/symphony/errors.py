@@ -105,6 +105,17 @@ class InvalidWorkspaceCwd(SymphonyError):
     code = "invalid_workspace_cwd"
 
 
+class WorkspaceBoardUnreachable(SymphonyError):
+    """The workspace's board directory is not the host board.
+
+    Raised before the first turn is spent: a workspace whose board link
+    points at a private copy makes every ticket write invisible to the
+    orchestrator, which then re-dispatches the ticket forever.
+    """
+
+    code = "workspace_board_unreachable"
+
+
 class ResponseTimeout(SymphonyError):
     code = "response_timeout"
 
@@ -138,73 +149,9 @@ class ConfigValidationError(SymphonyError):
     code = "config_validation_error"
 
 
-# governed workflow engine (symphony.flow)
-class WorkflowDefinitionInvalid(SymphonyError):
-    """A workflow YAML file failed schema decoding or DAG compilation."""
-
-    code = "workflow_invalid"
-
-
-class WorkflowDefinitionNotFound(SymphonyError):
-    code = "workflow_not_found"
-
-
-class RunNotFound(SymphonyError):
-    code = "run_not_found"
-
-
-class IllegalRunTransition(SymphonyError):
-    """A run status move the state machine does not allow (PRD §9.1)."""
-
-    code = "illegal_run_transition"
-
-
-class RunNotResumable(SymphonyError):
-    """Resume was requested for a run that is terminal, active, or unverified."""
-
-    code = "run_not_resumable"
-
-
-class RunFenced(SymphonyError):
-    """The issue already has a nonterminal governed run holding its fence."""
-
-    code = "run_fenced"
-
-
-class ApprovalNotFound(SymphonyError):
-    code = "approval_not_found"
-
-
-class ApprovalAlreadyResolved(SymphonyError):
-    """A second, conflicting decision arrived for a gate already resolved."""
-
-    code = "approval_already_resolved"
-
-
-class ApprovalVersionConflict(SymphonyError):
-    """The caller's `expected_version` no longer matches the stored record."""
-
-    code = "approval_version_conflict"
-
-
-class BackendCapabilityMissing(SymphonyError):
-    code = "backend_capability_missing"
-
-
-class ArtifactNotFound(SymphonyError):
-    code = "artifact_not_found"
-
-
-class WorkspaceIntegrityFailed(SymphonyError):
-    """A required artifact is missing or its content no longer hashes equal."""
-
-    code = "workspace_integrity_failed"
-
-
-class UnsafePath(SymphonyError):
-    """A path escaped its approved root via `..`, an absolute path, or a symlink."""
-
-    code = "unsafe_path"
+# board dependency DAG (symphony.trackers.validate)
+class BoardDependencyError(SymphonyError):
+    code = "board_dependency_error"
 
 
 # operator chat (symphony.chat)
