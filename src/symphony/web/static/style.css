@@ -1242,19 +1242,139 @@ a { color: inherit; }
 .git-left > .card-panel,
 .settings-body > .card-panel { margin-top: 0; }
 
-/* Settings is a set of independent cards: on a wide window let them flow into
-   columns instead of stacking in a narrow strip against the sidebar. */
+/* Settings uses a 12-column editorial grid: dense automation gets the full
+   width, related cards pair up, and manual controls get their own action row.
+   Section labels keep unrelated controls from competing. */
+.page-settings { background: var(--bg); }
+
+.settings-topbar { align-items: flex-start; }
+.settings-title-group { display: grid; gap: 0.2963rem; }
+.settings-title-group p {
+  margin: 0;
+  color: var(--text-muted);
+  font-size: 0.8889rem;
+  line-height: 1.5;
+}
+.settings-config-badge {
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  background: var(--surface-2);
+  color: var(--text-muted);
+  font-family: var(--font-mono);
+  font-size: 0.7407rem;
+  letter-spacing: .02em;
+  padding: 0.3704rem 0.6667rem;
+}
+
 .settings-body {
   display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(26rem, 1fr));
+  grid-template-columns: repeat(12, minmax(0, 1fr));
   gap: 1.1852rem;
   align-content: start;
-  align-items: start;
+  align-items: stretch;
+  width: 100%;
+  max-width: 92rem;
+  margin: 0 auto;
+  background:
+    radial-gradient(circle at 92% 2%, rgba(99, 102, 241, .045), transparent 22rem),
+    transparent;
 }
 
 .settings-body > .card-panel { max-width: none; }
 .settings-body > .empty-state,
 .settings-body > .skeleton { grid-column: 1 / -1; }
+
+.settings-section-heading {
+  grid-column: 1 / -1;
+  display: flex;
+  align-items: baseline;
+  gap: 0.7407rem;
+  margin-top: 0.4444rem;
+  padding-top: 0.7407rem;
+  border-top: 1px solid var(--border);
+}
+.settings-section-heading:first-child { margin-top: 0; padding-top: 0; border-top: 0; }
+.settings-section-kicker {
+  margin: 0;
+  color: var(--text);
+  font-size: 0.8148rem;
+  font-weight: 700;
+  letter-spacing: .075em;
+  text-transform: uppercase;
+  white-space: nowrap;
+}
+.settings-section-heading p {
+  margin: 0;
+  color: var(--text-muted);
+  font-size: 0.8148rem;
+  line-height: 1.5;
+}
+
+.settings-card {
+  grid-column: span 6;
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  height: 100%;
+  margin: 0;
+  border-color: var(--border-strong);
+  box-shadow: var(--shadow-sm);
+  transition: border-color 150ms ease, box-shadow 150ms ease, transform 150ms ease;
+}
+.settings-card:hover {
+  border-color: #c7c7ce;
+  box-shadow: 0 8px 24px rgba(24, 24, 27, .06), var(--shadow-sm);
+  transform: translateY(-1px);
+}
+.settings-card--featured {
+  grid-column: 1 / -1;
+  position: relative;
+}
+.settings-card--featured::before {
+  content: "";
+  position: absolute;
+  inset: 0 auto 0 0;
+  width: 3px;
+  background: linear-gradient(180deg, var(--focus-ring), #22c55e);
+}
+.settings-card--utility { grid-column: span 6; }
+.settings-card--control {
+  grid-column: 1 / -1;
+  background: linear-gradient(145deg, var(--surface), #fafafa);
+}
+.settings-card--control .settings-card-header { margin-bottom: 0; }
+.settings-card--control .settings-card-actions { margin-top: 0; padding-top: 1.037rem; }
+
+.settings-card-header {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 1.037rem;
+  margin-bottom: 1.1852rem;
+}
+.settings-card-header-copy { min-width: 0; }
+.settings-card-header h3,
+.card-panel .settings-card-header h3 { margin: 0; }
+.settings-card-header p {
+  max-width: 48rem;
+  margin: 0.3704rem 0 0;
+  color: var(--text-muted);
+  font-size: 0.8519rem;
+  line-height: 1.5;
+}
+.settings-card-actions {
+  display: flex;
+  align-items: center;
+  gap: 0.5926rem;
+  margin-top: auto;
+  padding-top: 1.1852rem;
+}
+.settings-auto-save::before {
+  content: "✓";
+  margin-right: 0.3704rem;
+  color: var(--success);
+  font-weight: 700;
+}
 
 /* The workflow editor caps its width for readability; centre it so the spare
    room is shared instead of all landing on the right. Cards nested inside it
@@ -1266,16 +1386,6 @@ a { color: inherit; }
 .kv-row { display: flex; justify-content: space-between; gap: 0.8889rem; font-size: 0.9259rem; }
 .kv-label { color: var(--text-muted); }
 .kv-value { font-family: var(--font-mono); font-size: 0.8889rem; text-align: right; word-break: break-all; }
-
-.ci-card-header {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 0.8889rem;
-  margin-bottom: 1.037rem;
-}
-
-.ci-card-header h3 { margin: 0; }
 
 .ci-status-pill {
   border-radius: 999px;
@@ -1327,6 +1437,14 @@ a { color: inherit; }
   .sidebar-header { padding: 1.037rem 0.5926rem; text-align: center; }
   .nav-item { justify-content: center; }
   .sidebar-footer span:last-child { display: none; }
+  .settings-card--utility { grid-column: span 6; }
+}
+
+/* Compact windows need one settings card per row before the rest of the app
+   enters its phone layout; branch and agent selects otherwise become cramped. */
+@media (max-width: 1200px) {
+  .settings-card,
+  .settings-card--utility { grid-column: 1 / -1; }
 }
 
 /* Mobile: one board lane at a time, full-bleed overlays, single-column grids.
@@ -1373,6 +1491,11 @@ a { color: inherit; }
   .form-row { flex-direction: column; }
   .topbar { padding: 0.8889rem 1.037rem; }
   .stats-content, .workflow-body, .settings-body, .git-body { padding: 1.037rem; }
+  .settings-card,
+  .settings-card--utility { grid-column: 1 / -1; }
+  .settings-section-heading { display: grid; gap: 0.2963rem; }
+  .settings-card-header { gap: 0.7407rem; }
+  .settings-config-badge { display: none; }
   /* Actions wrap instead of overflowing once labels grow. */
   .topbar-left, .topbar-right { flex-wrap: wrap; }
 }
