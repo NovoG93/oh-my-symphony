@@ -257,7 +257,7 @@ agent:
   # tickets, blocked tickets, and underspecified tickets still run Todo.
   auto_triage_actionable_todo: true
   # Blocked integration/merge/review episodes are software work: Symphony
-  # opens one deduplicated RCA ticket, dispatches it, verifies the repair,
+  # opens one deduplicated FIX ticket, dispatches it, verifies the repair,
   # and reopens the source ticket without waiting for an operator.
   auto_recover_blocked: true
   max_concurrent_agents_by_state:
