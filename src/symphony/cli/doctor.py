@@ -37,6 +37,10 @@ from typing import Iterable, Literal
 from .._shell import _is_wsl_launcher, resolve_bash
 from ..backends.codex import _sandbox_uses_workspace_write
 from ..errors import SymphonyError
+from ..runtime_safety import (
+    PROTECTED_REPOSITORY_MESSAGE,
+    workflow_uses_protected_source_repo,
+)
 from ..utils.git_sandbox import resolve_git_common_dir, writable_git_roots
 from ..service import ProcessRunningPredicate, port_owner_hint
 from ..workflow import (
@@ -46,6 +50,7 @@ from ..workflow import (
     resolve_workflow_path,
 )
 from ..workflow.preflight import stage_turn_budget_error
+from ..workflow.presets import guess_lane_preset
 
 
 Status = Literal["pass", "warn", "fail"]
@@ -132,6 +137,8 @@ def check_agent_cli(cfg: ServiceConfig) -> CheckResult:
         command = cfg.opencode.command
     elif kind == "pi":
         command = cfg.pi.command
+    elif kind == "prime-agent":
+        command = cfg.prime_agent.command
     else:
         return CheckResult(f"agent.kind={kind}", "fail", f"unsupported agent kind {kind!r}")
 
@@ -234,6 +241,41 @@ def check_pi_auth(cfg: ServiceConfig) -> CheckResult:
         " provider env var is set, otherwise every dispatch will fail at the"
         " first turn.",
     )
+
+
+def check_prime_agent_auth(cfg: ServiceConfig) -> CheckResult:
+    """Advisory check for Prime Agent's cached provider credentials.
+
+    Prime Agent can also resolve credentials from provider-specific environment
+    variables, so a missing auth file is only a warning.  Do not parse the
+    file here: this check must not expose or reject provider-specific token
+    formats before the CLI gets a chance to resolve them.
+    """
+    name = "agent.kind=prime-agent.auth"
+    if cfg.agent.kind != "prime-agent":
+        return CheckResult(name, "pass", "not prime-agent (skipped)")
+
+    configured_dir = os.environ.get("PRIME_AGENT_CODING_AGENT_DIR")
+    auth_dir = (
+        Path(configured_dir).expanduser()
+        if configured_dir
+        else Path.home() / ".prime" / "agent"
+    )
+    auth = auth_dir / "auth.json"
+    if auth.exists():
+        return CheckResult(name, "pass", f"{auth} present")
+    return CheckResult(
+        name,
+        "warn",
+        f"{auth} not found — run `prime-agent` and `/login` once, or ensure a"
+        " provider API key is available in the environment; this check is"
+        " advisory because Prime Agent supports multiple auth mechanisms.",
+    )
+
+
+# Keep the shorter name available for callers that refer to the backend as
+# ``prime`` rather than by its configured ``prime-agent`` kind.
+check_prime_auth = check_prime_agent_auth
 
 
 def check_gemini_auth(cfg: ServiceConfig) -> CheckResult:
@@ -399,6 +441,228 @@ def check_after_create_hook(cfg: ServiceConfig) -> CheckResult:
     return CheckResult("hooks.after_create", "pass", "looks customized")
 
 
+_HOOK_SCRIPT_RE = re.compile(r"[\w./$@{}-]*\.sh\b")
+
+
+def _hook_script_text(cfg: ServiceConfig, hook: str) -> str:
+    """Hook text plus the bodies of any `*.sh` scripts it invokes.
+
+    The shipped `after_create` is one line (`bash "$SYMPHONY_WORKFLOW_DIR/
+    scripts/symphony-setup-worktree.sh"`), so grepping the hook alone tells
+    us nothing about which directories it links.
+    """
+    parts = [hook]
+    workflow_dir = cfg.workflow_path.parent
+    for raw in _HOOK_SCRIPT_RE.findall(hook):
+        relative = raw.replace("$SYMPHONY_WORKFLOW_DIR", "").replace(
+            "${SYMPHONY_WORKFLOW_DIR}", ""
+        )
+        candidate = (workflow_dir / relative.lstrip("/")).resolve()
+        try:
+            if candidate.is_file():
+                parts.append(candidate.read_text(encoding="utf-8"))
+        except OSError:  # pragma: no cover - unreadable script
+            continue
+    return "\n".join(parts)
+
+
+def check_board_reachable_from_workspace(cfg: ServiceConfig) -> CheckResult:
+    """Can a dispatched worker write to the *host* board from its workspace?
+
+    Acceptance finding 1: the shipped setup hook used to link a directory
+    literally named `kanban`. On any other `tracker.board_root` the worker
+    silently got a private board copy, its state transitions never reached
+    the orchestrator, and the ticket was re-dispatched forever. Static check
+    only — it greps the hook and the scripts the hook runs.
+    """
+    name = "board.reachable"
+    if cfg.tracker.kind != "file":
+        return CheckResult(name, "pass", f"tracker.kind={cfg.tracker.kind} (skipped)")
+    root = cfg.tracker.board_root
+    if root is None:
+        return CheckResult(name, "fail", "file tracker has no board_root")
+    if not root.exists():
+        return CheckResult(
+            name, "fail", f"{root} does not exist — run `symphony board init {root}`"
+        )
+    workflow_dir = cfg.workflow_path.parent.resolve()
+    try:
+        board_name = root.resolve().relative_to(workflow_dir).as_posix()
+    except ValueError:
+        return CheckResult(
+            name, "pass", f"{root} is outside {workflow_dir}; workers use the host path"
+        )
+    hook = cfg.hooks.after_create or ""
+    if not hook.strip():
+        return CheckResult(
+            name, "pass", "no after_create hook; workspace is not a worktree"
+        )
+    text = _hook_script_text(cfg, hook)
+    if "SYMPHONY_BOARD_ROOT_NAME" in text or re.search(
+        rf"(?<![\w/-]){re.escape(board_name)}(?![\w-])", text
+    ):
+        return CheckResult(name, "pass", f"after_create links {board_name}/")
+    return CheckResult(
+        name,
+        "warn",
+        f"after_create never mentions the board root {board_name!r} — workers "
+        "may get a private board copy and the ticket will be re-dispatched "
+        "forever. Use ${SYMPHONY_BOARD_ROOT_NAME:-kanban} in the link loop.",
+    )
+
+def check_deep_preset_merge_contract(cfg: ServiceConfig) -> CheckResult:
+    """Deep-preset boards need a coherent single-merge branch policy.
+
+    Every deep lane is its own ticket, hence its own worktree on its own
+    `symphony/<ID>` branch. QA/Verify/Document can only see a Build slice
+    that already merged, so the preset requires `auto_merge_on_done` plus a
+    feature base that resolves to the merge target. Without it, either
+    unverified work never reaches the downstream lanes, or they re-prove a
+    tree that does not contain the code.
+    """
+    name = "board.deep_merge_contract"
+    if guess_lane_preset(cfg.tracker.active_states) != "deep":
+        return CheckResult(name, "pass", "not a deep-preset board (skipped)")
+    if not cfg.agent.auto_merge_on_done:
+        return CheckResult(
+            name,
+            "fail",
+            "deep preset requires agent.auto_merge_on_done: true — Build "
+            "slices never reach the QA/Verify/Document worktrees otherwise",
+        )
+    base = (cfg.agent.feature_base_branch or "").strip()
+    target = (cfg.agent.auto_merge_target_branch or "").strip()
+    if base != target:
+        return CheckResult(
+            name,
+            "fail",
+            f"deep preset requires feature_base_branch ({base or '<current>'}) "
+            f"== auto_merge_target_branch ({target or '<current>'}) — new "
+            "worktrees must start from the branch the merges land on",
+        )
+    return CheckResult(
+        name,
+        "pass",
+        f"auto_merge_on_done on, base == target ({base or '<current branch>'})",
+    )
+
+def check_stage_contracts(cfg: ServiceConfig) -> CheckResult:
+    """Report whether the mechanical evidence floor runs on this board.
+
+    F-06: with `agent.stage_contracts: auto` (the default), renaming any
+    default lane turns the whole stage-contract validator off. That is a
+    legal outcome of a customized board, but it silently removes the
+    product's evidence floor — so it gets a row here.
+    """
+    from ..orchestrator.contracts import board_uses_default_contracts
+
+    name = "agent.stage_contracts"
+    mode = (cfg.agent.stage_contracts or "auto").strip().lower()
+    enabled = cfg.agent.stage_contracts_enabled(cfg.tracker.active_states)
+    if enabled:
+        return CheckResult(name, "pass", f"{mode}: contracts enforced")
+    if mode == "off":
+        return CheckResult(
+            name, "warn", "off: no mechanical evidence gate; prompts are the only gate"
+        )
+    offending = [
+        state
+        for state in cfg.tracker.active_states
+        if not board_uses_default_contracts((state,))
+    ]
+    return CheckResult(
+        name,
+        "warn",
+        "auto: contracts disabled because these lanes are not default-preset "
+        f"lanes ({', '.join(offending) or 'n/a'}) — set agent.stage_contracts: "
+        "on to enforce them anyway",
+    )
+
+def check_symphony_cli_reachable(cfg: ServiceConfig) -> CheckResult:
+    """Can a dispatched worker actually run `symphony board ...`?
+
+    F-19: the stage prompts and the chat preamble now *require* the board
+    CLI, but Symphony is usually installed in a venv and launched by
+    absolute path, so `symphony` need not be on the worker's PATH. The
+    orchestrator exports `SYMPHONY_CLI`, and the prompts use
+    `${SYMPHONY_CLI:-symphony}`; this check reports both halves.
+    """
+    from ..orchestrator.helpers import resolve_symphony_cli
+
+    name = "board.cli"
+    if cfg.tracker.kind != "file":
+        return CheckResult(name, "pass", f"tracker.kind={cfg.tracker.kind} (skipped)")
+    resolved = resolve_symphony_cli()
+    bash = resolve_bash()
+    on_path = False
+    try:
+        probe = subprocess.run(
+            [bash, "-lc", "command -v symphony"],
+            capture_output=True,
+            text=True,
+            timeout=15,
+            check=False,
+        )
+        on_path = probe.returncode == 0 and bool(probe.stdout.strip())
+    except (OSError, subprocess.TimeoutExpired):
+        on_path = False
+    if on_path:
+        return CheckResult(name, "pass", f"`symphony` on the worker PATH; {resolved}")
+    if " -m " in resolved:
+        return CheckResult(
+            name,
+            "fail",
+            "`symphony` is not on a login-shell PATH and no console script was "
+            "found — prompts that call the board CLI will fail. Install the "
+            "package (`pip install -e .`) or add its venv bin to PATH.",
+        )
+    return CheckResult(
+        name,
+        "warn",
+        f"`symphony` is not on a login-shell PATH; workers get SYMPHONY_CLI="
+        f"{resolved}. Prompts must use ${{SYMPHONY_CLI:-symphony}} (the shipped "
+        "ones do); custom prompts calling bare `symphony` will fail.",
+    )
+
+def check_board_dependencies(cfg: ServiceConfig) -> CheckResult:
+    """Report dangling `blocked_by` ids and dependency cycles on the board.
+
+    F-13: a blocker id that does not exist (agent typo, deleted ticket)
+    never resolves, so the ticket is silently never dispatched again. The
+    only previous signal was one WARN line in the orchestrator log.
+    """
+    from ..trackers.file import FileBoardTracker
+    from ..trackers.validate import board_edges, dangling_blockers, find_cycle
+
+    name = "board.dependencies"
+    if cfg.tracker.kind != "file" or cfg.tracker.board_root is None:
+        return CheckResult(name, "pass", f"tracker.kind={cfg.tracker.kind} (skipped)")
+    if not cfg.tracker.board_root.exists():
+        return CheckResult(name, "pass", "no board directory yet")
+    try:
+        issues = FileBoardTracker(cfg.tracker).scan_all()
+    except SymphonyError as exc:
+        return CheckResult(name, "warn", f"could not scan the board: {exc}")
+    dangling = dangling_blockers(issues)
+    cycle = find_cycle(board_edges(issues))
+    problems: list[str] = []
+    for identifier, missing in sorted(dangling.items()):
+        problems.append(f"{identifier} blocked_by {', '.join(missing)} (not on board)")
+    if cycle:
+        problems.append(f"cycle: {' -> '.join(cycle)}")
+    if not problems:
+        return CheckResult(
+            name, "pass", f"{len(issues)} ticket(s), no dangling blockers or cycles"
+        )
+    sample = "; ".join(problems[:3])
+    suffix = "" if len(problems) <= 3 else f"; +{len(problems) - 3} more"
+    return CheckResult(
+        name,
+        "fail",
+        f"{sample}{suffix} — these tickets will never be dispatched; fix with "
+        "`symphony board update <ID> --blocked-by <ID>`",
+    )
+
 def check_prompts(cfg: ServiceConfig) -> CheckResult:
     paths = []
     if cfg.prompts.base_path is not None:
@@ -486,6 +750,7 @@ def _agent_commands(cfg: ServiceConfig) -> dict[str, str]:
         "kiro": cfg.kiro.command,
         "opencode": cfg.opencode.command,
         "pi": cfg.pi.command,
+        "prime-agent": cfg.prime_agent.command,
     }
 
 # CLIs Symphony can widen on the command line. Every other kind gets the grant
@@ -570,31 +835,6 @@ def check_tracker(cfg: ServiceConfig) -> CheckResult:
     return CheckResult(f"tracker.kind={tracker.kind}", "warn", "unknown tracker kind")
 
 
-def check_board_viewer(cfg: ServiceConfig) -> CheckResult:
-    """Warn when the web HTML viewer script is absent.
-
-    `symphony service start --viewer-port N` silently skips the viewer if
-    `<workflow-dir>/tools/board-viewer/server.py` is missing (see
-    `service.board_viewer_script_for`). Operators routinely don't notice the
-    omitted "started board viewer" line and end up with `viewer_pid: null`
-    in the run record. This is a WARN (not FAIL) because the orchestrator
-    runs fine without the viewer.
-    """
-    script = cfg.workflow_path.parent / "tools" / "board-viewer" / "server.py"
-    if script.exists():
-        return CheckResult("viewer.board-viewer", "pass", f"{script}")
-    return CheckResult(
-        "viewer.board-viewer",
-        "warn",
-        (
-            f"{script} not found — `--viewer-port` will be a no-op. "
-            "The built-in web app on the orchestrator port (`--port`, default "
-            "9999) replaces it; the legacy `tools/board-viewer/` copy is only "
-            "needed for the separate read-only viewer."
-        ),
-    )
-
-
 def check_shell() -> CheckResult:
     """Hooks and backend subprocesses spawn via ``bash -lc``. On Windows we
     must avoid the WSL launcher (``C:\\Windows\\System32\\bash.exe``) — see
@@ -642,13 +882,58 @@ def check_stage_turn_budget(cfg: ServiceConfig) -> CheckResult:
     )
 
 
+def check_workflow_registry(cfg: ServiceConfig) -> CheckResult:
+    """Confirm `.symphony/state.db` is migrated to the current schema."""
+    from ..orchestrator.migrations import LATEST_SCHEMA_VERSION
+    from ..orchestrator.run_registry import RunRegistry, registry_path_for_workflow
+
+    path = registry_path_for_workflow(cfg.workflow_path)
+    if not path.exists():
+        return CheckResult(
+            "state.db", "pass", "no run history yet; will be created on first run"
+        )
+    try:
+        registry = RunRegistry(path)
+    except Exception as exc:
+        return CheckResult("state.db", "fail", f"cannot open {path}: {exc}")
+    try:
+        version = registry.schema_version()
+        applied = registry.applied_migrations
+    finally:
+        registry.close()
+    if version < LATEST_SCHEMA_VERSION:
+        return CheckResult(
+            "state.db",
+            "fail",
+            f"schema version {version} < {LATEST_SCHEMA_VERSION}; migration "
+            "did not complete",
+        )
+    detail = f"schema v{version}"
+    if applied:
+        detail += f" (applied {', '.join(str(v) for v in applied)} just now)"
+    return CheckResult("state.db", "pass", detail)
+
+
+def check_source_repository(cfg: ServiceConfig) -> CheckResult:
+    """Refuse workflows in the checkout that supplies Symphony's runtime."""
+    if workflow_uses_protected_source_repo(cfg.workflow_path):
+        return CheckResult(
+            "workflow.repository", "fail", PROTECTED_REPOSITORY_MESSAGE
+        )
+    return CheckResult(
+        "workflow.repository", "pass", "project repository is separate from Symphony source"
+    )
+
+
 def run_checks(cfg: ServiceConfig, host: str = "127.0.0.1") -> list[CheckResult]:
     return [
+        check_source_repository(cfg),
         check_port(cfg, host=host),
         check_shell(),
         check_stage_turn_budget(cfg),
         check_agent_cli(cfg),
         check_pi_auth(cfg),
+        check_prime_agent_auth(cfg),
         check_gemini_auth(cfg),
         check_agy_state_dir(cfg),
         check_kiro_auth(cfg),
@@ -658,7 +943,12 @@ def run_checks(cfg: ServiceConfig, host: str = "127.0.0.1") -> list[CheckResult]
         check_git_history_writable(cfg),
         check_agent_git_grant(cfg),
         check_tracker(cfg),
-        check_board_viewer(cfg),
+        check_board_reachable_from_workspace(cfg),
+        check_deep_preset_merge_contract(cfg),
+        check_stage_contracts(cfg),
+        check_symphony_cli_reachable(cfg),
+        check_board_dependencies(cfg),
+        check_workflow_registry(cfg),
     ]
 
 

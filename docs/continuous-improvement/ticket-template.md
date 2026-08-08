@@ -67,6 +67,46 @@ Re-run before closing:
 CI Fingerprint: <hash>
 ```
 
+
+## Proposal ticket template (improvement modes)
+
+Triage and agent-driven modes (`blocked_fixes`, `market_research`,
+`feature_improvements`) do not produce check failures, so they use the
+chat-intake description format instead of the finding template above:
+
+```markdown
+## Goal
+
+<one paragraph: what should be true afterwards>
+
+## Scope
+
+In: <what this ticket covers>
+Out: <what it explicitly does not>
+
+## Acceptance criteria
+
+<verifiable outcome, in the project's own terms>
+
+## Evidence
+
+- Source: continuous improvement, `<mode>` mode
+- Report: `docs/continuous-improvement/latest.md` (section: modes)
+- Request group: `REQ-CI-<YYYYMMDD>-<n>`
+- Unblocks: `<source ticket>`        <!-- blocked_fixes only -->
+
+<evidence links / quoted scan output / root-cause note>
+
+CI Proposal: <mode>/<title-slug>
+```
+
+The `CI Proposal:` marker plays the same role for proposals that
+`CI Fingerprint:` plays for findings: the registrar refuses to file a
+proposal whose marker — or whose normalized title — already exists on an
+open ticket. Proposal tickets also carry the `continuous-improvement`, `ci`
+and per-mode labels, a priority of 1-3, and the run's request group.
+
+
 ## Fingerprint rule
 
 The fingerprint is a stable hash (e.g. SHA-256, truncated for readability)

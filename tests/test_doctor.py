@@ -16,10 +16,10 @@ from symphony.cli.doctor import (
     check_after_create_hook,
     check_agy_state_dir,
     check_agent_cli,
-    check_board_viewer,
     check_gemini_auth,
     check_kiro_auth,
     check_pi_auth,
+    check_prime_agent_auth,
     check_port,
     check_prompts,
     check_stage_turn_budget,
@@ -333,14 +333,10 @@ def test_port_fail_names_this_workflow_service_when_record_matches(
                 workflow_dir=cfg.workflow_path.parent,
                 host="127.0.0.1",
                 port=bound_port,
-                viewer_port=None,
                 orchestrator_pid=4242,
-                viewer_pid=None,
                 log_path=tmp_path / "log" / "symphony.log",
-                viewer_log_path=None,
                 started_at="2026-07-03T01:00:00Z",
                 orchestrator_command=["symphony", str(cfg.workflow_path)],
-                viewer_command=[],
             )
         )
         result = check_port(cfg, is_running=lambda pid: pid == 4242)
@@ -375,14 +371,10 @@ def test_port_fail_names_stale_record_when_api_still_responds(
                 workflow_dir=cfg.workflow_path.parent,
                 host="127.0.0.1",
                 port=bound_port,
-                viewer_port=None,
                 orchestrator_pid=4242,
-                viewer_pid=None,
                 log_path=tmp_path / "log" / "symphony.log",
-                viewer_log_path=None,
                 started_at="2026-07-03T01:00:00Z",
                 orchestrator_command=["symphony", str(cfg.workflow_path)],
-                viewer_command=[],
             )
         )
         monkeypatch.setattr(
@@ -528,16 +520,17 @@ def test_run_checks_returns_one_result_per_check(tmp_path: Path) -> None:
         """,
     )
     results = run_checks(cfg)
-    # port + shell + max_turns + agent + pi_auth + gemini_auth + agy_state + kiro_auth
-    # + prompts + after_create + workspace + git_history + agent_git_grant
-    # + tracker + viewer = 15
-    assert len(results) == 15
+    # protected repository + port + shell + max_turns + agent + pi_auth
+    # + prime_agent_auth + gemini_auth + agy_state + kiro_auth + prompts
+    # + after_create + workspace + git_history + agent_git_grant + tracker
+    # + board.reachable + deep_merge_contract + stage_contracts + board.cli
+    # + board.dependencies + state.db = 22
+    assert len(results) == 22
     assert {r.name.split("=")[0].split(".")[0] for r in results} >= {
         "agent",
         "hooks",
         "workspace",
         "tracker",
-        "viewer",
     }
 
 
@@ -551,6 +544,20 @@ def test_pi_auth_skipped_for_non_pi(tmp_path: Path) -> None:
         """,
     )
     result = check_pi_auth(cfg)
+    assert result.status == "pass"
+    assert "skipped" in result.message
+
+
+def test_prime_agent_auth_skipped_for_non_prime_agent(tmp_path: Path) -> None:
+    cfg = _build_cfg(
+        tmp_path,
+        """
+        tracker: { kind: file, board_root: ./kanban }
+        agent: { kind: codex }
+        codex: { command: codex app-server }
+        """,
+    )
+    result = check_prime_agent_auth(cfg)
     assert result.status == "pass"
     assert "skipped" in result.message
 
@@ -640,6 +647,64 @@ def test_pi_auth_passes_when_present(tmp_path: Path, monkeypatch) -> None:
     result = check_pi_auth(cfg)
     assert result.status == "pass"
     assert "auth.json" in result.message
+
+
+def test_prime_agent_auth_warns_when_missing(tmp_path: Path, monkeypatch) -> None:
+    _isolate_home(monkeypatch, tmp_path)
+    monkeypatch.delenv("PRIME_AGENT_CODING_AGENT_DIR", raising=False)
+    cfg = _build_cfg(
+        tmp_path,
+        """
+        tracker: { kind: file, board_root: ./kanban }
+        agent: { kind: prime-agent }
+        prime_agent: { command: 'prime-agent -p --mode json' }
+        """,
+    )
+    result = check_prime_agent_auth(cfg)
+    assert result.status == "warn"
+    assert ".prime" in result.message
+    assert "auth.json" in result.message
+
+
+def test_prime_agent_auth_passes_when_present(tmp_path: Path, monkeypatch) -> None:
+    _isolate_home(monkeypatch, tmp_path)
+    monkeypatch.delenv("PRIME_AGENT_CODING_AGENT_DIR", raising=False)
+    auth = tmp_path / ".prime" / "agent" / "auth.json"
+    auth.parent.mkdir(parents=True)
+    auth.write_text("{}")
+    cfg = _build_cfg(
+        tmp_path,
+        """
+        tracker: { kind: file, board_root: ./kanban }
+        agent: { kind: prime-agent }
+        prime_agent: { command: 'prime-agent -p --mode json' }
+        """,
+    )
+    result = check_prime_agent_auth(cfg)
+    assert result.status == "pass"
+    assert "auth.json" in result.message
+
+
+def test_prime_agent_auth_uses_config_dir_override(
+    tmp_path: Path, monkeypatch
+) -> None:
+    _isolate_home(monkeypatch, tmp_path)
+    auth_dir = tmp_path / "prime-config"
+    monkeypatch.setenv("PRIME_AGENT_CODING_AGENT_DIR", str(auth_dir))
+    auth = auth_dir / "auth.json"
+    auth.parent.mkdir(parents=True)
+    auth.write_text("{}")
+    cfg = _build_cfg(
+        tmp_path,
+        """
+        tracker: { kind: file, board_root: ./kanban }
+        agent: { kind: prime-agent }
+        prime_agent: { command: 'prime-agent -p --mode json' }
+        """,
+    )
+    result = check_prime_agent_auth(cfg)
+    assert result.status == "pass"
+    assert str(auth) in result.message
 
 
 def test_gemini_auth_fails_without_root_auth_or_env(
@@ -823,7 +888,7 @@ def test_stage_turn_budget_fails_for_multi_stage_one_turn_workflow(tmp_path: Pat
         tracker:
           kind: file
           board_root: ./kanban
-          active_states: [Todo, In Progress, Verify, Learn]
+          active_states: [Todo, In Progress, Verify, Document]
           terminal_states: [Done, Blocked]
         agent:
           kind: codex
@@ -853,38 +918,381 @@ def test_format_results_includes_all_statuses() -> None:
     assert "PASS" in text and "WARN" in text and "FAIL" in text
 
 
-def test_board_viewer_pass_when_script_present(tmp_path: Path) -> None:
-    """WARN downgrades to PASS once `tools/board-viewer/server.py` exists."""
+# ---------------------------------------------------------------------------
+# F-04 — board reachability from the worker workspace
+# ---------------------------------------------------------------------------
+
+
+def test_board_reachable_warns_when_hook_ignores_board_root(tmp_path: Path) -> None:
+    from symphony.cli.doctor import check_board_reachable_from_workspace
+
+    (tmp_path / "my-board").mkdir()
     cfg = _build_cfg(
         tmp_path,
         """
-        tracker: { kind: file, board_root: ./kanban }
+        tracker: { kind: file, board_root: ./my-board }
+        hooks:
+          after_create: |
+            for dir in kanban; do ln -s "$SYMPHONY_WORKFLOW_DIR/$dir" "$dir"; done
         agent: { kind: codex }
         codex: { command: codex app-server }
         """,
     )
-    viewer = tmp_path / "tools" / "board-viewer" / "server.py"
-    viewer.parent.mkdir(parents=True)
-    viewer.write_text("# stub viewer\n")
-
-    result = check_board_viewer(cfg)
-    assert result.status == "pass"
-    assert "server.py" in result.message
-
-
-def test_board_viewer_warns_when_script_missing(tmp_path: Path) -> None:
-    """WARN (not FAIL) so the orchestrator can still launch headless."""
-    cfg = _build_cfg(
-        tmp_path,
-        """
-        tracker: { kind: file, board_root: ./kanban }
-        agent: { kind: codex }
-        codex: { command: codex app-server }
-        """,
-    )
-    result = check_board_viewer(cfg)
+    result = check_board_reachable_from_workspace(cfg)
     assert result.status == "warn"
-    # Windows renders the script path with backslashes — compare separator-
-    # agnostically so the assertion holds on every platform.
-    assert "tools/board-viewer/server.py" in result.message.replace("\\", "/")
-    assert "no-op" in result.message
+    assert "my-board" in result.message
+
+
+def test_board_reachable_passes_when_hook_uses_board_root_env(tmp_path: Path) -> None:
+    from symphony.cli.doctor import check_board_reachable_from_workspace
+
+    (tmp_path / "my-board").mkdir()
+    cfg = _build_cfg(
+        tmp_path,
+        """
+        tracker: { kind: file, board_root: ./my-board }
+        hooks:
+          after_create: |
+            for dir in ${SYMPHONY_BOARD_ROOT_NAME:-kanban}; do ln -s x "$dir"; done
+        agent: { kind: codex }
+        codex: { command: codex app-server }
+        """,
+    )
+    assert check_board_reachable_from_workspace(cfg).status == "pass"
+
+
+def test_board_reachable_reads_the_script_the_hook_invokes(tmp_path: Path) -> None:
+    from symphony.cli.doctor import check_board_reachable_from_workspace
+
+    (tmp_path / "kanban").mkdir()
+    (tmp_path / "scripts").mkdir()
+    (tmp_path / "scripts" / "setup.sh").write_text(
+        "for dir in ${SYMPHONY_BOARD_ROOT_NAME:-kanban}; do :; done\n",
+        encoding="utf-8",
+    )
+    cfg = _build_cfg(
+        tmp_path,
+        """
+        tracker: { kind: file, board_root: ./kanban }
+        hooks:
+          after_create: |
+            bash "$SYMPHONY_WORKFLOW_DIR/scripts/setup.sh"
+        agent: { kind: codex }
+        codex: { command: codex app-server }
+        """,
+    )
+    assert check_board_reachable_from_workspace(cfg).status == "pass"
+
+
+def test_board_reachable_fails_when_board_root_missing(tmp_path: Path) -> None:
+    from symphony.cli.doctor import check_board_reachable_from_workspace
+
+    cfg = _build_cfg(
+        tmp_path,
+        """
+        tracker: { kind: file, board_root: ./nope }
+        agent: { kind: codex }
+        codex: { command: codex app-server }
+        """,
+    )
+    result = check_board_reachable_from_workspace(cfg)
+    assert result.status == "fail"
+    assert "does not exist" in result.message
+
+
+def test_run_checks_includes_board_reachable_row(tmp_path: Path) -> None:
+    (tmp_path / "kanban").mkdir()
+    cfg = _build_cfg(
+        tmp_path,
+        """
+        tracker: { kind: file, board_root: ./kanban }
+        agent: { kind: codex }
+        codex: { command: codex app-server }
+        """,
+    )
+    names = [r.name for r in run_checks(cfg)]
+    assert "board.reachable" in names
+
+
+# ---------------------------------------------------------------------------
+# F-05 — deep preset merge contract
+# ---------------------------------------------------------------------------
+
+
+_DEEP_STATES = (
+    "active_states: [Intake, Research, Plan, Review, Build, QA, Verify, Document]"
+)
+
+
+def test_deep_merge_contract_skipped_on_default_board(tmp_path: Path) -> None:
+    from symphony.cli.doctor import check_deep_preset_merge_contract
+
+    cfg = _build_cfg(
+        tmp_path,
+        """
+        tracker: { kind: file, board_root: ./kanban }
+        agent: { kind: codex }
+        codex: { command: codex app-server }
+        """,
+    )
+    result = check_deep_preset_merge_contract(cfg)
+    assert result.status == "pass"
+    assert "not a deep-preset board" in result.message
+
+
+def test_deep_merge_contract_passes_on_default_branch_policy(tmp_path: Path) -> None:
+    from symphony.cli.doctor import check_deep_preset_merge_contract
+
+    cfg = _build_cfg(
+        tmp_path,
+        f"""
+        tracker:
+          kind: file
+          board_root: ./kanban
+          {_DEEP_STATES}
+          terminal_states: [Done, Human Review, Blocked, Cancelled]
+        agent:
+          kind: codex
+          max_turns: 100
+        codex: {{ command: codex app-server }}
+        """,
+    )
+    assert check_deep_preset_merge_contract(cfg).status == "pass"
+
+
+def test_deep_merge_contract_fails_without_auto_merge(tmp_path: Path) -> None:
+    from symphony.cli.doctor import check_deep_preset_merge_contract
+
+    cfg = _build_cfg(
+        tmp_path,
+        f"""
+        tracker:
+          kind: file
+          board_root: ./kanban
+          {_DEEP_STATES}
+          terminal_states: [Done, Human Review, Blocked, Cancelled]
+        agent:
+          kind: codex
+          max_turns: 100
+          auto_merge_on_done: false
+        codex: {{ command: codex app-server }}
+        """,
+    )
+    result = check_deep_preset_merge_contract(cfg)
+    assert result.status == "fail"
+    assert "auto_merge_on_done" in result.message
+
+
+def test_deep_merge_contract_fails_when_base_and_target_diverge(
+    tmp_path: Path,
+) -> None:
+    from symphony.cli.doctor import check_deep_preset_merge_contract
+
+    cfg = _build_cfg(
+        tmp_path,
+        f"""
+        tracker:
+          kind: file
+          board_root: ./kanban
+          {_DEEP_STATES}
+          terminal_states: [Done, Human Review, Blocked, Cancelled]
+        agent:
+          kind: codex
+          max_turns: 100
+          feature_base_branch: main
+          auto_merge_target_branch: release
+        codex: {{ command: codex app-server }}
+        """,
+    )
+    result = check_deep_preset_merge_contract(cfg)
+    assert result.status == "fail"
+    assert "feature_base_branch" in result.message
+
+
+def test_stage_contracts_doctor_row_warns_on_renamed_lane_board(tmp_path: Path) -> None:
+    from symphony.cli.doctor import check_stage_contracts
+
+    cfg = _build_cfg(
+        tmp_path,
+        """
+        tracker:
+          kind: file
+          board_root: ./kanban
+          active_states: [Todo, In Progress, Verify, Docs]
+          terminal_states: [Done]
+        agent: { kind: codex }
+        codex: { command: codex app-server }
+        """,
+    )
+    result = check_stage_contracts(cfg)
+    assert result.status == "warn"
+    assert "Docs" in result.message
+    assert "stage_contracts: on" in result.message
+
+
+def test_stage_contracts_doctor_row_passes_on_default_board(tmp_path: Path) -> None:
+    from symphony.cli.doctor import check_stage_contracts
+
+    cfg = _build_cfg(
+        tmp_path,
+        """
+        tracker:
+          kind: file
+          board_root: ./kanban
+          active_states: [Todo, In Progress, Verify, Document]
+          terminal_states: [Done]
+        agent: { kind: codex }
+        codex: { command: codex app-server }
+        """,
+    )
+    assert check_stage_contracts(cfg).status == "pass"
+
+
+def test_stage_contracts_doctor_row_warns_when_explicitly_off(tmp_path: Path) -> None:
+    from symphony.cli.doctor import check_stage_contracts
+
+    cfg = _build_cfg(
+        tmp_path,
+        """
+        tracker:
+          kind: file
+          board_root: ./kanban
+          active_states: [Todo, In Progress, Verify, Document]
+          terminal_states: [Done]
+        agent: { kind: codex, stage_contracts: off }
+        codex: { command: codex app-server }
+        """,
+    )
+    result = check_stage_contracts(cfg)
+    assert result.status == "warn"
+    assert "prompts are the only gate" in result.message
+
+
+# ---------------------------------------------------------------------------
+# F-19 — the board CLI must be reachable from a worker
+# ---------------------------------------------------------------------------
+
+
+def test_symphony_cli_check_skipped_for_non_file_trackers(tmp_path: Path) -> None:
+    from symphony.cli.doctor import check_symphony_cli_reachable
+
+    cfg = _build_cfg(
+        tmp_path,
+        """
+        tracker: { kind: linear, api_key: tok, project_slug: p }
+        agent: { kind: codex }
+        codex: { command: codex app-server }
+        """,
+    )
+    assert check_symphony_cli_reachable(cfg).status == "pass"
+
+
+def test_symphony_cli_check_warns_when_not_on_login_path(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import symphony.cli.doctor as doctor_module
+
+    cfg = _build_cfg(
+        tmp_path,
+        """
+        tracker: { kind: file, board_root: ./kanban }
+        agent: { kind: codex }
+        codex: { command: codex app-server }
+        """,
+    )
+
+    class _Missing:
+        returncode = 1
+        stdout = ""
+
+    monkeypatch.setattr(
+        doctor_module.subprocess, "run", lambda *a, **k: _Missing()
+    )
+    monkeypatch.setattr(
+        "symphony.orchestrator.helpers.resolve_symphony_cli",
+        lambda: "/opt/venv/bin/symphony",
+    )
+    result = doctor_module.check_symphony_cli_reachable(cfg)
+    assert result.status == "warn"
+    assert "SYMPHONY_CLI=/opt/venv/bin/symphony" in result.message
+
+
+def test_symphony_cli_check_passes_when_on_path(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import symphony.cli.doctor as doctor_module
+
+    cfg = _build_cfg(
+        tmp_path,
+        """
+        tracker: { kind: file, board_root: ./kanban }
+        agent: { kind: codex }
+        codex: { command: codex app-server }
+        """,
+    )
+
+    class _Found:
+        returncode = 0
+        stdout = "/usr/local/bin/symphony\n"
+
+    monkeypatch.setattr(doctor_module.subprocess, "run", lambda *a, **k: _Found())
+    assert doctor_module.check_symphony_cli_reachable(cfg).status == "pass"
+
+
+# ---------------------------------------------------------------------------
+# F-13 — dangling blockers / cycles are reported, not silently deadlocking
+# ---------------------------------------------------------------------------
+
+
+def _board_with(tmp_path: Path, tickets: dict[str, list[str]]) -> "ServiceConfig":
+    from symphony.trackers.file import write_ticket_atomic
+
+    board = tmp_path / "kanban"
+    board.mkdir(exist_ok=True)
+    for identifier, blockers in tickets.items():
+        front = {
+            "id": identifier,
+            "identifier": identifier,
+            "title": identifier,
+            "state": "Todo",
+            "created_at": "2026-01-01T00:00:00Z",
+        }
+        if blockers:
+            front["blocked_by"] = list(blockers)
+        write_ticket_atomic(board / f"{identifier}.md", front, "body")
+    return _build_cfg(
+        tmp_path,
+        """
+        tracker: { kind: file, board_root: ./kanban }
+        agent: { kind: codex }
+        codex: { command: codex app-server }
+        """,
+    )
+
+
+def test_board_dependencies_passes_on_a_clean_board(tmp_path: Path) -> None:
+    from symphony.cli.doctor import check_board_dependencies
+
+    cfg = _board_with(tmp_path, {"A-1": [], "A-2": ["A-1"]})
+    result = check_board_dependencies(cfg)
+    assert result.status == "pass"
+    assert "no dangling blockers" in result.message
+
+
+def test_board_dependencies_fails_on_a_dangling_blocker(tmp_path: Path) -> None:
+    from symphony.cli.doctor import check_board_dependencies
+
+    cfg = _board_with(tmp_path, {"A-1": ["TYPO-9"]})
+    result = check_board_dependencies(cfg)
+    assert result.status == "fail"
+    assert "TYPO-9" in result.message
+    assert "never be dispatched" in result.message
+
+
+def test_board_dependencies_fails_on_a_cycle(tmp_path: Path) -> None:
+    from symphony.cli.doctor import check_board_dependencies
+
+    cfg = _board_with(tmp_path, {"A-1": ["A-2"], "A-2": ["A-1"]})
+    result = check_board_dependencies(cfg)
+    assert result.status == "fail"
+    assert "cycle" in result.message

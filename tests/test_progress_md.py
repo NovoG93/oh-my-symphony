@@ -22,6 +22,7 @@ from symphony.workflow import (
     GeminiConfig,
     HooksConfig,
     PiConfig,
+    PrimeAgentConfig,
     ProgressConfig,
     ServerConfig,
     ServiceConfig,
@@ -83,6 +84,13 @@ def _cfg(tmp_path: Path, board_root: Path | None = None) -> ServiceConfig:
             stall_timeout_ms=300_000,
             resume_across_turns=True,
         ),
+prime_agent=PrimeAgentConfig(
+    command='prime-agent -p --mode json',
+    turn_timeout_ms=3_600_000,
+    read_timeout_ms=5_000,
+    stall_timeout_ms=300_000,
+    resume_across_turns=True,
+),
         server=ServerConfig(port=None),
         progress=ProgressConfig(enabled=True, path=tmp_path / "WORKFLOW-PROGRESS.md"),
         prompt_template="hi",
@@ -197,7 +205,7 @@ def test_render_unknown_state_lands_in_other(tmp_path):
 
 
 def test_render_includes_default_board_url(tmp_path, monkeypatch):
-    """SYMPHONY_BOARD_URL unset → default board-viewer URL is advertised."""
+    """SYMPHONY_BOARD_URL unset → admin UI URL on the service port is advertised."""
     monkeypatch.delenv("SYMPHONY_BOARD_URL", raising=False)
     cfg = _cfg(tmp_path)
     text = render_progress_md(
@@ -208,8 +216,26 @@ def test_render_includes_default_board_url(tmp_path, monkeypatch):
         transitions=(),
         generated_at=datetime(2026, 5, 16, 14, 22, 31, tzinfo=timezone.utc),
     )
-    assert "_Board viewer:_" in text
-    assert "[http://127.0.0.1:8765/](http://127.0.0.1:8765/)" in text
+    assert "_Board:_" in text
+    # server.port unset in _cfg → falls back to the service default port 9999.
+    assert "[http://127.0.0.1:9999/](http://127.0.0.1:9999/)" in text
+
+
+def test_render_default_board_url_uses_server_port(tmp_path, monkeypatch):
+    """SYMPHONY_BOARD_URL unset + server.port set → that port is advertised."""
+    monkeypatch.delenv("SYMPHONY_BOARD_URL", raising=False)
+    from dataclasses import replace
+
+    cfg = replace(_cfg(tmp_path), server=ServerConfig(port=8123))
+    text = render_progress_md(
+        cfg,
+        [],
+        running_by_id={},
+        retry_by_id={},
+        transitions=(),
+        generated_at=datetime(2026, 5, 16, 14, 22, 31, tzinfo=timezone.utc),
+    )
+    assert "[http://127.0.0.1:8123/](http://127.0.0.1:8123/)" in text
 
 
 def test_render_board_url_can_be_disabled(tmp_path, monkeypatch):
@@ -224,7 +250,7 @@ def test_render_board_url_can_be_disabled(tmp_path, monkeypatch):
         transitions=(),
         generated_at=datetime(2026, 5, 16, 14, 22, 31, tzinfo=timezone.utc),
     )
-    assert "_Board viewer:_" not in text
+    assert "_Board:_" not in text
 
 
 def test_render_explicit_board_url_overrides_env(tmp_path, monkeypatch):

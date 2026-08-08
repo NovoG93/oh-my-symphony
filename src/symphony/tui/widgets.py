@@ -169,7 +169,7 @@ class IssueCard(Static):
             silent_s = _silent_seconds(status.last_event_at)
             if silent_s is not None and silent_s >= SILENT_THRESHOLD_S:
                 line.append(f"  silent {int(silent_s)}s", style="bold yellow")
-        elif normalize_state(issue.state) == "learn":
+        elif normalize_state(issue.state) in {"document", "learn"}:
             line.append("  S skip", style="dim magenta")
         if status.tokens:
             line.append(f"  {status.tokens:,}t", style="dim cyan")
@@ -241,8 +241,8 @@ class IssueCard(Static):
                     f"{t('card.blocked_by', language)} {', '.join(blocker_names)}",
                     style="dim red",
                 )
-        elif normalize_state(issue.state) == "learn":
-            meta.append("S to skip Learn", style="dim magenta")
+        elif normalize_state(issue.state) in {"document", "learn"}:
+            meta.append("S to skip Document", style="dim magenta")
         elif issue.labels:
             meta.append("  ".join(f"#{label}" for label in issue.labels[:3]), style="dim")
         if status.attention:

@@ -1,8 +1,7 @@
 """HTTP route shape for `symphony.server.build_app`.
 
-`build_app(orchestrator)` exposes the JSON API the TUI / board-viewer /
-operators consume. The existing test_board_viewer covers the viewer's
-own server. This file pins the orchestrator-side route contract:
+`build_app(orchestrator)` exposes the JSON API the TUI / admin UI /
+operators consume. This file pins the orchestrator-side route contract:
 
   * GET  /                         -> text hint
   * GET  /api/v1/state             -> orchestrator.snapshot()

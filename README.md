@@ -7,9 +7,9 @@
 [![Tests](https://github.com/cskwork/oh-my-symphony/actions/workflows/tests.yml/badge.svg)](https://github.com/cskwork/oh-my-symphony/actions/workflows/tests.yml)
 [![GitHub stars](https://img.shields.io/github/stars/cskwork/oh-my-symphony?style=social)](https://github.com/cskwork/oh-my-symphony/stargazers)
 
-> One admin UI. One terminal. One Kanban board. Seven AI coding agents
+> One admin UI. One terminal. One Kanban board. Eight AI coding agents
 > (**Codex**, **Claude Code**, **Gemini**, **AGY/Antigravity**, **Kiro**,
-> **OpenCode**, **Pi**) — pick per ticket, run in parallel, watch live.
+> **OpenCode**, **Pi**, **Prime Agent**) — pick per ticket, run in parallel, watch live.
 
 ![Symphony 9999 admin UI screenshot](docs/admin-ui-screenshot.png)
 
@@ -35,6 +35,9 @@ terminal for.
 - [Install](#install)
 - [Try it in 60 seconds](#try-it-in-60-seconds-no-agent-cli-required)
 - [Quickstart](#quickstart--your-first-task-end-to-end)
+- [Lane presets](#lane-presets)
+- [Chat intake](#chat-intake--type-a-request-the-board-delivers)
+- [Continuous improvement](#continuous-improvement--experimental-autonomous-upkeep)
 - [Run](#run)
 - [Layout](#layout)
 - [Tests](#tests)
@@ -43,7 +46,7 @@ terminal for.
 
 ## Why Symphony?
 
-- **No vendor lock-in.** Swap Codex ↔ Claude Code ↔ Gemini ↔ AGY ↔ Kiro ↔ OpenCode ↔ Pi with one
+- **No vendor lock-in.** Swap Codex ↔ Claude Code ↔ Gemini ↔ AGY ↔ Kiro ↔ OpenCode ↔ Pi ↔ Prime Agent with one
   YAML line, or mix backends per ticket. New agents (Ollama, local models,
   anything with a CLI) drop in behind a thin `AgentBackend` Protocol without
   changing the orchestrator.
@@ -61,15 +64,13 @@ terminal for.
   external trackers; you don't need either one to try Symphony.
 - **Battle-tested base, hardened for local operations.** Forked from
   [OpenAI's official Symphony reference implementation](https://github.com/openai/symphony).
-  This fork keeps the file-first orchestration model, then adds seven agent
+  This fork keeps the file-first orchestration model, then adds eight agent
   backends, the TUI/web operator surfaces, SQLite run leases, restart-safe
   issue flags, and locked Markdown ticket writes.
 - **A real web app, not just a viewer.** The orchestrator port serves a
-  Linear-style board: register issues, drag cards
-  between columns, add / delete / rename columns, edit each column's stage
-  prompt, pick feature / merge branches, pause / resume workers, skip Learn
-  when no wiki write-back is needed, and read a dedicated stats page (tokens
-  per day, cycle time per column, per-agent totals). All edits round-trip into
+  Linear-style board: issue CRUD, drag-and-drop columns, per-column stage
+  prompts, branch policy, pause / resume, lane presets, an operator chat that
+  files validated ticket DAGs, and a stats page. All edits round-trip into
   `WORKFLOW.md` with your comments intact.
 - **Operator-grade tooling out of the box.** `symphony doctor` catches the
   five most common first-run failures (port collisions, missing CLIs,
@@ -85,7 +86,7 @@ terminal for.
 - **Teams** parallelizing bug fixes, doc updates, or migration tickets across
   multiple coding agents simultaneously.
 - **Researchers and reviewers** comparing how Codex, Claude Code, Gemini,
-  AGY/Antigravity, Kiro, OpenCode, and Pi tackle the same task side by side,
+  AGY/Antigravity, Kiro, OpenCode, Pi, and Prime Agent tackle the same task side by side,
   with identical prompts and workspaces.
 - **Anyone** who hit the "one chat window per agent" ceiling and wants a
   real orchestrator with a Kanban they can read at a glance.
@@ -99,7 +100,7 @@ terminal for.
   agent=codex  tracker=linear  workflow=WORKFLOW.md  lang=en   running=2  retrying=1   │  tokens in=84,200 out=27,640 total=111,840
                                                                                        │  rate-limits=requests_remaining=4823, tokens_remaining=1.2M
 
-╭── Todo [1/4] (3) ╮ ╭── In Progress [2/4] ╮ ╭── Verify [3/4] ╮ ╭── Learn [4/4] ╮ ╭── Done (2) ──╮ ╭── detail ───────────────────────╮
+╭── Todo [1/4] (3) ╮ ╭── In Progress [2/4] ╮ ╭── Verify [3/4] ╮ ╭── Document [4/4] ╮ ╭── Done (2) ──╮ ╭── detail ───────────────────────╮
 │  DEMO-120 [1/4]  │ │  DEMO-104 [2/4] ●   │ │  DEMO-122 [3/4]│ │  DEMO-123     │ │  DEMO-088    │ │  DEMO-104 [2/4]                 │
 │  Migrate auth …  │ │  Fix race condi…    │ │  Review + QA   │ │  S skip       │ │  Drop dead-… │ │  Fix race condition in pagina…  │
 │  #backend …      │ │  turn 4  20,180t    │ │  #docs         │ │  Wiki notes   │ │  DEMO-091    │ │                                 │
@@ -113,7 +114,7 @@ terminal for.
 │  blocked by D…   │                                                                                 ╰─────────────────────────────────╯
 ╰──────────────────╯
 
-q quit · r refresh · enter details · n new · e edit · s stats · S skip Learn · P pause/resume · / filter · ?
+q quit · r refresh · enter details · n new · e edit · s stats · S skip Document · P pause/resume · / filter · ?
 ```
 
 </details>
@@ -123,7 +124,7 @@ Upstream polls a tracker (Linear or a local Markdown Kanban) and runs a Codex
 session inside a per-issue workspace. This fork keeps that orchestrator and
 adds:
 
-1. A pluggable **AgentBackend** layer with seven concrete adapters:
+1. A pluggable **AgentBackend** layer with eight concrete adapters:
    - **Codex** — `codex app-server` (JSON-RPC stdio, multi-turn) — original
    - **Claude Code** — `claude -p --output-format stream-json --verbose`
      (NDJSON events, per-turn subprocess with `--resume`)
@@ -139,14 +140,17 @@ adds:
    - **Pi** — `pi --mode json -p ""` (JSONL events, per-turn subprocess with
      `--session` resume; supports Anthropic / OpenAI / Gemini / Bedrock backends
      under one CLI — see [pi.dev](https://pi.dev))
+   - **Prime Agent** — `prime-agent -p --mode json` (same JSONL protocol as Pi,
+     per-turn subprocess with `--resume` continuity; supports subscriptions and
+     provider API keys — see [Prime Agent](https://github.com/cskwork/prime-agent))
 2. A **Jira-style CLI Kanban TUI** built on [Textual](https://textual.textualize.io).
    Columns are tracker states; cards show the active agent, turn count, last
    event, and accumulated tokens. Cards are focusable, the mouse wheel
    scrolls each lane, `enter` opens a full-detail modal, `n` registers a new
-   ticket with a multiline body, `e` edits the focused ticket, `S` skips Learn,
+   ticket with a multiline body, `e` edits the focused ticket, `S` skips Document,
    and `s` opens the stats screen.
 3. A **built-in web Kanban app** on the orchestrator port — issue CRUD with
-   drag-and-drop state moves, Learn skip, column add/delete/rename, per-column
+   drag-and-drop state moves, Document skip, column add/delete/rename, per-column
    prompt editing, branch policy, and a dedicated stats page.
 4. A **single-node reliability ledger** in `.symphony/state.db` — active run
    leases block duplicate dispatch across restarts, dead-owner leases are
@@ -162,7 +166,7 @@ Set `agent.kind` in your `WORKFLOW.md`:
 
 ```yaml
 agent:
-  kind: claude          # codex | claude | gemini | agy | kiro | opencode | pi
+  kind: claude          # codex | claude | gemini | agy | kiro | opencode | pi | prime-agent
 
 claude:
   command: claude -p --output-format stream-json --verbose
@@ -173,10 +177,15 @@ pi:
   command: pi --mode json -p ""
   resume_across_turns: true
   turn_timeout_ms: 3600000
+
+prime_agent:
+  command: prime-agent -p --mode json
+  resume_across_turns: true
+  turn_timeout_ms: 3600000
 ```
 
 Each backend reads its own block (`codex`, `claude`, `gemini`, `agy`, `kiro`,
-`opencode`, `pi`); only the one matching `agent.kind` is used at runtime. The
+`opencode`, `pi`, `prime_agent`); only the one matching `agent.kind` is used at runtime. The
 Codex `linear_graphql`
 client tool is only advertised when `agent.kind=codex`.
 
@@ -190,10 +199,38 @@ agent:
 
 The flat alias `agent_kind: codex` is also accepted for hand-edited cards.
 All backend command and timeout settings still come from the matching global
-`codex:`, `claude:`, `gemini:`, `agy:`, `kiro:`, `opencode:`, or `pi:` block
+`codex:`, `claude:`, `gemini:`, `agy:`, `kiro:`, `opencode:`, `pi:`, or
+`prime_agent:` block
 in `WORKFLOW.md`.
 When creating file-board tickets from the CLI, use
 `symphony board new TASK-2 "title" --agent-kind codex`.
+
+Between the ticket pin and the global default sits optional per-state routing:
+`agent.stage_kinds` maps board states to agent kinds so cheap/fast agents can
+own light lanes (e.g. `Todo: gemini`, `Document: gemini`) while a strong default
+handles Plan/Build/Review. Resolution per dispatch: ticket `agent_kind` pin >
+`agent.stage_kinds[state]` > `agent.kind`. The backend is re-resolved at every
+stage change, including the in-run lane transitions a single dispatch walks, so
+a ticket that goes In Progress → Verify → Document inside one dispatch gets each
+lane's configured backend.
+
+### Heavy stages
+
+A lane that runs a full test suite or a long build goes quiet for minutes at a
+time. The stall detector cancels a worker that produced no progress event
+within its backend's `stall_timeout_ms`; widening that value widens it for
+every lane. `agent.stall_timeout_ms_by_state` widens just the heavy lanes:
+
+```yaml
+agent:
+  stall_timeout_ms_by_state:
+    Verify: 900000     # 15 min of silence is normal while the suite runs
+```
+
+The budget is resolved against the backend the ticket actually runs on (its
+`agent_kind` pin or its `stage_kinds` route), not the workflow default, so
+raising `claude.stall_timeout_ms` now takes effect for claude-pinned tickets on
+a codex-default board.
 
 For file-board workflows, `agent.auto_triage_actionable_todo` defaults to
 `true`: a Todo ticket with a body and an `Acceptance Criteria` section moves to
@@ -220,13 +257,33 @@ Make the relevant CLI available on `$PATH`:
 | `kiro`       | `kiro-cli` (Kiro CLI — install from `https://cli.kiro.dev/install`; run `kiro-cli login` or set `KIRO_API_KEY` for headless runs) |
 | `opencode`   | `opencode` (OpenCode CLI — install with `npm install -g opencode-ai`; authenticate providers with `opencode auth login`) |
 | `pi`         | `pi` (Pi coding-agent — `npm i -g @earendil-works/pi-coding-agent` or `curl -fsSL https://pi.dev/install.sh \| sh`; sign in once via `pi` → `/login` (OAuth, credentials cached at `~/.pi/agent/auth.json`) — no env var needed) |
+| `prime-agent` | `prime-agent` (Prime Agent — install with `curl -fsSL https://app.primeintellect.ai/prime-agent/install.sh \| sh`; sign in once via `prime-agent` → `/login`, or provide a provider API key; credentials cached at `~/.prime/agent/auth.json`) |
+
+## Create or register a project
+
+Keep this `oh-my-symphony` checkout as the control plane. Doctor and normal
+startup refuse a `WORKFLOW.md` in Symphony's own canonical Git repository
+(including linked worktrees), preventing agents from editing the orchestrator
+that launched them.
+
+```bash
+symphony project create "My App" --path ../my-app
+# or register an existing repository that already has WORKFLOW.md
+symphony project add /path/to/existing-repo --name "My App"
+symphony project start my-app
+symphony hub
+```
+
+The hub links to independent per-project services. Each service loads that
+project's workflow and repository, so its board, workspaces, and Product
+Preview stay naturally scoped to that project.
 
 ## Try it in 60 seconds (no agent CLI required)
 
-Want to see the TUI move cards around before installing `codex`, `claude`,
-or `gemini`? Use the bundled **mock backend** — it speaks the same JSON-RPC
-protocol as Codex but does no real work, just simulates turns and emits
-token-usage ticks.
+Want to see the TUI move cards around before installing an agent CLI? Use
+the bundled **mock backend** — it speaks the same JSON-RPC protocol as
+Codex but does no real work, just simulates turns and emits token-usage
+ticks.
 
 ```bash
 git clone https://github.com/cskwork/oh-my-symphony.git
@@ -234,11 +291,15 @@ cd oh-my-symphony
 python3 -m venv .venv && source .venv/bin/activate
 pip install -e ".[dev]"
 
+# Keep the source checkout protected; create the demo as a separate project.
+symphony project create "Symphony Demo" --path ../symphony-demo
+cd ../symphony-demo
+
 # WORKFLOW.md pointed at the mock backend
 cat > WORKFLOW.md <<'YAML'
 ---
 tracker: { kind: file, board_root: ./kanban,
-           active_states: [Todo, "In Progress", Verify, Learn],
+           active_states: [Todo, "In Progress", Verify, Document],
            terminal_states: ["Human Review", Done, Blocked, Archive] }
 polling: { interval_ms: 5000 }
 workspace: { root: ~/symphony_workspaces }
@@ -314,8 +375,10 @@ board, static assets, issue CRUD, refresh, workflow, and stats.
 
 ## Quickstart — your first task end-to-end
 
-This walks from a clean clone to a running ticket, using the file-based
-tracker and Claude Code as the agent.
+This walks from a registered project repository to a running ticket, using
+the file-based tracker and Claude Code as the agent. Do not perform these steps
+in the protected `oh-my-symphony` source checkout; use `symphony project create`
+or `symphony project add` first.
 
 ### 1. Initialize the board
 
@@ -343,7 +406,7 @@ Four blocks matter for first-run sanity:
 tracker:
   kind: file
   board_root: ./kanban
-  active_states: [Todo, "In Progress", Verify, Learn]
+  active_states: [Todo, "In Progress", Verify, Document]
   terminal_states: ["Human Review", Done, Blocked, Archive]
 
 workspace:
@@ -368,7 +431,7 @@ prompts:
     Todo: ./docs/symphony-prompts/file/stages/todo.md
     "In Progress": ./docs/symphony-prompts/file/stages/in-progress.md
     Verify: ./docs/symphony-prompts/file/stages/verify.md
-    Learn: ./docs/symphony-prompts/file/stages/learn.md
+    Document: ./docs/symphony-prompts/file/stages/document.md
     Done: ./docs/symphony-prompts/file/stages/done.md
 ```
 
@@ -391,6 +454,30 @@ symphony board new TASK-1 "Fix flaky pagination test" \
   --labels backend,test \
   --description "tests/test_pagination.py::test_cursor_advance is flaky on CI."
 # → created kanban/TASK-1.md
+
+# Structured creation: dependencies, request grouping, body from file/stdin.
+symphony board new TASK-2 "Add regression test" \
+  --blocked-by TASK-1 \
+  --request REQ-1 \
+  --label test --label ci \
+  --description-file ./spec.md      # or `-` to read stdin
+```
+
+`new` validates before writing: the identifier must match
+`^[A-Za-z][A-Za-z0-9_-]{0,63}$` (so a model-generated id can never escape the
+board root), a state from `tracker.active_states`/`terminal_states`, every
+`--blocked-by` target must exist on the board, and the added edges must keep
+the dependency graph acyclic (violations print the cycle path and exit
+non-zero). The web API's issue create/update endpoints apply the same rules.
+
+Edit an existing ticket through the same validation instead of hand-writing
+frontmatter:
+
+```bash
+symphony board update TASK-2 --add-blocked-by BUG-7   # keeps existing blockers
+symphony board update TASK-2 --blocked-by TASK-1      # replaces the list
+symphony board update BUILD-1 --state Build           # reopen a slice
+symphony board update TASK-2 --request REQ-2
 ```
 
 Inspect:
@@ -399,6 +486,8 @@ Inspect:
 symphony board ls                    # all tickets
 symphony board ls --state Todo       # filter by state
 symphony board show TASK-1           # full body
+symphony board graph                 # dependency DAG (topological, indented)
+symphony board graph --request REQ-1 # only one request group
 ```
 
 ### 4. Launch the TUI
@@ -531,6 +620,7 @@ Then `tail -F log/symphony.log` works.
 
 ```bash
 symphony board mv TASK-1 Blocked         # forces a state transition
+symphony board update TASK-1 --state Blocked --add-blocked-by BUG-7
 ```
 
 The orchestrator re-evaluates on the next poll tick. Manual transitions are
@@ -564,24 +654,83 @@ Every artefact a ticket produces lives under `docs/<TICKET-ID>/<stage>/`. See [`
 
 ## Custom prompts
 
-`WORKFLOW.md` can point at editable prompt files under `docs/`:
+`WORKFLOW.md` points at editable prompt files under `docs/` via the
+`prompts.base` + `prompts.stages` map shown in the Quickstart. Symphony
+sends `base` plus only the prompt file for the ticket's current state,
+keeping each turn small. If the `prompts` block is absent, the inline body
+of `WORKFLOW.md` still works as the legacy fallback. Prompts are also
+editable in place from the web app's **Workflow** page — same files, no
+restart needed.
+
+## Lane presets
+
+Boards start from a preset and stay fully customizable:
+
+- **default** — the succinct 4-lane board `Todo → In Progress → Verify →
+  Document`. Short stage prompts; the stage contracts in
+  `orchestrator/contracts.py` are the mechanical gate. Complex work is
+  expressed as a ticket DAG (`--blocked-by` / `--request`), not extra lanes.
+- **deep** — an optional 8-lane pipeline `Intake → Research → Plan → Review
+  → Build → QA → Verify → Document` for complex deliveries. Each lane
+  carries its own lean gate (Verify/Document run a literal
+  `grep 'verdict: GREEN'` check); the Plan lane spawns the
+  Build/QA/Verify/Document ticket DAG via `symphony board new
+  --blocked-by --request`.
+
+### Deep preset merge contract
+
+Every deep lane is a separate ticket, so every lane gets its own worktree on
+its own `symphony/<ID>` branch. A downstream lane can only see a Build slice
+that has already landed on the branch its worktree was cut from, which makes
+the branch policy part of the preset's contract:
 
 ```yaml
-prompts:
-  base: ./docs/symphony-prompts/file/base.md
-  stages:
-    Todo: ./docs/symphony-prompts/file/stages/todo.md
-    "In Progress": ./docs/symphony-prompts/file/stages/in-progress.md
-    Verify: ./docs/symphony-prompts/file/stages/verify.md
-    Learn: ./docs/symphony-prompts/file/stages/learn.md
-    Done: ./docs/symphony-prompts/file/stages/done.md
+agent:
+  auto_merge_on_done: true        # the orchestrator merges each ticket at Done
+  feature_base_branch: ""         # both empty = the host's current branch
+  auto_merge_target_branch: ""    # must resolve to the SAME branch
 ```
 
-Symphony sends `base` plus only the prompt file for the ticket's current
-state, keeping each turn smaller than the old all-stage prompt. If the
-`prompts` block is absent, the inline body of `WORKFLOW.md` still works as
-the legacy fallback. Prompts are also editable in place from the web app's
-**Workflow** page — same files, no restart needed.
+- The **orchestrator** merges a ticket's branch when the ticket reaches
+  `Done`. No lane merges by hand — Verify proves, Document documents.
+- Build merges are gated by the **Review** lane's `verdict: PASS` (spawned
+  Build tickets stay `blocked_by` the request ticket, which only reaches
+  `Done` after Review passes), *not* by Verify. A merged slice is a reviewed
+  slice, not yet a verified one.
+- A Verify `verdict: RED` reopens the offending Build tickets and holds
+  delivery: `DOCUMENT-*` has its own `verdict: GREEN` gate, so it cannot run
+  until the reopened slice is re-built, re-merged and re-verified.
+
+`symphony doctor` reports this as `board.deep_merge_contract` and fails when
+a deep board disables `auto_merge_on_done` or points the feature base and the
+merge target at different branches.
+
+### Stage contracts on a customized board
+
+The mechanical evidence floor (`orchestrator/contracts.py`) is gated by
+`agent.stage_contracts`:
+
+| value            | behaviour                                                        |
+|------------------|------------------------------------------------------------------|
+| `auto` (default) | enforce when every active lane is a default-preset lane          |
+| `on`             | always enforce, whatever the lanes are called                    |
+| `off`            | never enforce; the stage prompts are the only gate               |
+
+Under `auto`, renaming a lane (`Document` → `Docs`) turns the validator off —
+your prompts become the gate. That is a legitimate choice, but it is never
+silent: the decision is logged as `stage_contracts_disabled` at every config
+load, reported by `symphony doctor` as `agent.stage_contracts`, exposed on
+`GET /api/v1/workflow` (`agent.stage_contracts_enabled`), and shown as a hint
+on the Settings page. Set `stage_contracts: on` to keep the shipped contracts
+on a renamed board.
+
+Switch presets from the web app's **Settings** page, or via
+`GET /api/v1/workflow/presets` + `POST /api/v1/workflow/presets/apply`.
+Applying a preset round-trips through the same comment-preserving
+`WORKFLOW.md` machinery as lane CRUD, so your comments and customizations
+survive; tickets in removed lanes migrate to a fallback state. Presets are
+starting points, not cages — lane add/delete/rename and per-column prompt
+editing keep working afterwards.
 
 ## Skills — frontmatter-only power user instructions
 
@@ -604,6 +753,65 @@ the web/TUI issue forms; add them by hand in frontmatter when you need this
 advanced behavior. Unknown skill names are surfaced to the agent as "not
 found" instead of silently dropped.
 
+## Chat intake — type a request, the board delivers
+
+The admin UI ships a **Chat** page backed by the same agent CLIs. Chat is
+not just Q&A: in edit mode the chat agent follows a board-intake protocol.
+Type a request; the agent confirms scope (at most two turns, and only when
+the request is ambiguous), then files tickets through the validated board
+tool — never freehand ticket markdown:
+
+- **simple request** → one ticket in the first active state;
+- **complex request** → a research → plan → plan-review → build → qa →
+  document stage-ticket DAG, chained via `--blocked-by` under one
+  `--request REQ-<n>` group;
+- **deep-preset board** (an `Intake` lane exists) → one Intake ticket; the
+  pipeline itself decomposes the work.
+
+Every ticket passes `symphony board new` validation (unique id, legal
+state, existing blockers, acyclic DAG). In Q&A mode the agent describes
+the tickets it would file and defers filing until you switch the session
+to edit mode. Chat converses; the board delivers.
+
+---
+
+## Continuous improvement — experimental autonomous upkeep
+
+**Experimental and fully opt-in.** With no `continuous_improvement:` block in
+`WORKFLOW.md`, nothing here runs.
+
+The heartbeat is a scheduler that periodically inspects the repo *without
+touching product code* and files what it finds as **normal board tickets**,
+which then flow through the ordinary pipeline like any other request. Each
+capability is a separate mode:
+
+```yaml
+continuous_improvement:
+  enabled: true
+  interval_ms: 1800000            # heartbeat cadence
+  modes: [readiness, blocked_fixes, security, market_research,
+          feature_improvements]
+  mode_interval_hours:            # per-mode cadence floor (optional)
+    market_research: 168          # weekly
+  max_improvement_tickets_per_run: 3
+```
+
+| Mode | What it does |
+| --- | --- |
+| `readiness` | Runs tests / lint / type-check on a proven baseline; failures become bug tickets. This is the original behaviour. |
+| `blocked_fixes` | Triages `Blocked` / `Human Review` tickets into a linked fix ticket carrying a root-cause note (`blocked_by` edge back to the source). |
+| `security` | Optional dependency/vulnerability scans (`pip-audit`, `npm audit`) into patch tickets. A missing scanner is *not available*, never a finding. |
+| `market_research` | One agent turn surveys current trends and competitor features for **this** app (from README/docs/wiki) and proposes improvements with evidence links. |
+| `feature_improvements` | One agent turn reviews UX and code health and proposes improvements. |
+
+`enabled: true` with no `modes:` means readiness only — exactly what the
+heartbeat did before modes existed. Proposal tickets are capped per run,
+de-duplicated against open tickets, labelled `ci`, and grouped under one
+`REQ-CI-<date>-<n>` request. The agent-driven modes get a succinct prompt
+(overridable in `docs/symphony-prompts/ci/`) and may write nothing but their
+JSON proposal file — the heartbeat files the tickets. Modes and cadence are
+also editable from the web **Settings** page.
+
 ---
 
 ## Run
@@ -620,7 +828,7 @@ only). From the browser you can:
 
 - **Board** — create / edit / delete issues, drag cards between columns,
   watch live run badges (turn count, tokens), pause / resume workers, and
-  skip Learn for tickets that do not need wiki write-back. The board defaults
+  skip Document for tickets that do not need wiki write-back. The board defaults
   to the four active agent lanes; `Human Review`, `Done`, `Blocked`, and
   `Archive` stay visible in the compact **Review and parked** group until
   you switch to `All`.
@@ -628,10 +836,12 @@ only). From the browser you can:
   each column's stage prompt. Changes write back into `WORKFLOW.md`
   frontmatter with your comments preserved; tickets in renamed or removed
   columns migrate automatically.
+- **Chat** — operator chat sessions with the board-intake protocol
+  (see [Chat intake](#chat-intake--type-a-request-the-board-delivers)).
 - **Stats** — tokens per day, throughput, per-column dwell time, per-agent
   totals, average cycle time (from `.symphony/stats.jsonl`).
 - **Settings** — branch policy (feature base / merge target) from a real
-  local-branch dropdown.
+  local-branch dropdown, plus the lane-preset switch (default ↔ deep).
 
 JSON API endpoints:
 
@@ -645,11 +855,13 @@ JSON API endpoints:
 | PUT    | `/api/v1/workflow/states`         | Column add / delete / rename / reorder       |
 | GET/PUT| `/api/v1/workflow/prompts/<state>`| Read / edit a column's stage prompt          |
 | PUT    | `/api/v1/workflow/branch-policy`  | Update feature base / merge target branches  |
+| GET/POST | `/api/v1/workflow/presets[...]` | List lane presets / apply one (`/apply`)     |
+| *      | `/api/v1/chat/...`                | Operator chat sessions + WebSocket stream    |
 | GET    | `/api/v1/git/branches`            | Local branch list for branch policy UI       |
 | GET    | `/api/v1/stats?days=N`            | Aggregated run statistics                    |
 | POST   | `/api/v1/refresh`                 | Coalesced trigger of poll + reconcile        |
 | POST   | `/api/v1/{id}/pause` `/resume`    | Hold / release a running worker              |
-| POST   | `/api/v1/issues/{id}/skip-learn`  | Move idle Learn ticket to Human Review       |
+| POST   | `/api/v1/issues/{id}/skip-document` | Move idle Document ticket to Human Review (deprecated alias: `/skip-learn`) |
 
 ### CLI Kanban TUI (primary UI)
 
@@ -663,9 +875,8 @@ symphony ./WORKFLOW.md --tui
 
 The TUI is the primary operator view and the JSON API is the
 programmatic / curl-friendly view. Run both in one process by pinning
-`server.port` in `WORKFLOW.md` and launching with `--tui`
-(`tools/board-viewer/` remains available as an optional in-browser
-kanban, see below):
+`server.port` in `WORKFLOW.md` and launching with `--tui` (the built-in
+web admin UI is served on the same port):
 
 ```yaml
 # WORKFLOW.md
@@ -689,33 +900,22 @@ runtime indicator:
 - **↻ yellow** — in retry queue, shows `retry #N` and the last error
 - **✓ green** — completed in this session
 
-Key bindings (also auto-listed in the footer):
+Key bindings (`?` shows the full list; also auto-listed in the footer):
 
 | Key                | Action                                       |
 |--------------------|----------------------------------------------|
 | `q`                | Quit (drains active workers cleanly)         |
 | `r`                | Force a refresh + re-poll the tracker        |
-| `?`                | Show all key bindings as a notification      |
 | `tab` / `shift+tab`| Move focus to next / previous card or lane   |
-| `j` / `↓`          | Scroll focused lane down one row             |
-| `k` / `↑`          | Scroll focused lane up one row               |
-| `space` / `pgdn`   | Page down                                    |
-| `b` / `pgup`       | Page up                                      |
-| `g` / `home`       | Jump to top                                  |
-| `G` / `end`        | Jump to bottom                               |
+| `j`/`k`, page keys | Scroll the focused lane                      |
 | `1`–`9` / `0`      | Zoom that lane (others shrink) / reset zoom  |
-| `t` / `T`          | Page lanes forward / back                    |
-| `+` / `-`          | Grow / shrink the visible-lane window        |
-| `d`                | Toggle card density (compact / full)         |
-| `p`                | Toggle the detail pane                        |
-| `]` / `[`          | Park focus in the detail pane / back to board|
-| `L`                | Cycle TUI + doc language                      |
-| `a`                | Archive the focused card                     |
-| `c`                | Confirm a Done-gated card (clears manual gate)|
+| `n` / `e`          | Register a new ticket / edit the focused one |
+| `a` / `c`          | Archive / confirm a Done-gated card          |
+| `S`                | Skip Document for the focused ticket         |
 | `P`                | Pause / resume the focused running worker    |
+| `L`                | Cycle TUI + doc language                     |
 | `/`                | Open the filter prompt                       |
-| `enter`            | Open the focused card's full-detail modal    |
-| `esc` / `q`        | Close the modal (when one is open)           |
+| `enter` / `esc`    | Open / close the full-detail modal           |
 
 Mouse: clicking a card focuses it, the wheel scrolls its lane.
 
@@ -727,24 +927,24 @@ shell jobs. It records the workflow it started under
 started again on a second port by accident:
 
 ```bash
-symphony service start ./WORKFLOW.md --port 9999 --viewer-port 8765
+symphony service start ./WORKFLOW.md --port 9999
 symphony service status ./WORKFLOW.md
 symphony service restart ./WORKFLOW.md
 symphony service stop ./WORKFLOW.md
 symphony service logs ./WORKFLOW.md
 ```
 
-`service start` runs `symphony doctor` before spawning, starts the
-orchestrator with Python's module runner, and starts `tools/board-viewer/`
-when that folder exists. Commands are launched without a shell, so the same
-path works on macOS, Linux, and Windows.
+`service start` runs `symphony doctor` before spawning and starts the
+orchestrator with Python's module runner; the built-in web admin UI is
+served on the orchestrator port. Commands are launched without a shell, so
+the same path works on macOS, Linux, and Windows.
 
-Since v0.4.7, the board viewer (default `--viewer-port 8765`) is no longer
-read-only: running cards surface **Pause / Resume** buttons and the header
-refresh button triggers an orchestrator `poll + reconcile`. The header also
+The admin UI is not read-only: running cards surface **Pause / Resume**
+buttons and the header refresh button triggers an orchestrator
+`poll + reconcile`. The header also
 shows real local git branch dropdowns for `agent.feature_base_branch` and
 `agent.auto_merge_target_branch`, so operators can choose where new feature
-branches start and where Learn merges land without editing YAML by hand.
+branches start and where the Done merge lands without editing YAML by hand.
 
 #### One-shot launchers
 
@@ -764,71 +964,52 @@ the alt-screen on top of unreadable preflight output.
 
 ### File-based Kanban tracker
 
-If you don't have Linear, use the local Markdown-file tracker (unchanged from
-upstream):
-
-```yaml
-tracker:
-  kind: file
-  board_root: ./kanban
-```
-
-```bash
-symphony board init ./kanban
-symphony board new DEV-1 "Title" --priority 2
-symphony tui ./WORKFLOW.md
-```
+If you don't have Linear, use the local Markdown-file tracker
+(`tracker: { kind: file, board_root: ./kanban }`) — see the
+[Quickstart](#quickstart--your-first-task-end-to-end).
 
 ## Layout
 
 ```
 src/symphony/
-  backends/
-    __init__.py        AgentBackend Protocol + factory + normalized events
-    codex.py           Codex JSON-RPC stdio backend (was upstream agent.py)
-    claude_code.py     Claude Code stream-json backend
-    gemini.py          Gemini one-shot backend
-    agy.py             AGY / Antigravity one-shot backend
-    kiro.py            Kiro headless chat backend
-    opencode.py        OpenCode run/json backend (per-turn subprocess, --session resume)
-    pi.py              Pi --mode json backend (per-turn subprocess, --session resume)
-  trackers/
-    __init__.py        TrackerClient Protocol + factory
-    _retry.py          retry/backoff wrapper for network trackers
-    file.py            FileBoardTracker (locked Markdown ticket mutations)
-    jira.py            Jira REST tracker
-    linear.py          LinearClient (Linear GraphQL)
+  backends/          AgentBackend Protocol + factory + normalized events;
+                     codex.py, claude_code.py, gemini.py, agy.py, kiro.py,
+                     opencode.py, pi.py, prime_agent.py adapters
+  trackers/          TrackerClient Protocol + factory; file.py (locked
+                     Markdown ticket mutations), jira.py, linear.py, _retry.py
   workflow/
-    parser.py          WORKFLOW.md frontmatter/body parser
-    config.py          frozen config dataclasses
-    builder.py         ServiceConfig construction + validation
-    mutate.py          comment-preserving workflow edits for the web UI
-    preflight.py       dispatch-time validation
+    parser.py        WORKFLOW.md frontmatter/body parser
+    config.py        frozen config dataclasses (incl. agent.stage_kinds)
+    builder.py       ServiceConfig construction + validation
+    mutate.py        comment-preserving workflow edits for the web UI
+    presets.py       lane presets (4-lane default, 8-lane deep)
+    preflight.py     dispatch-time validation
   orchestrator/
-    core.py            scheduler/state machine
-    run_registry.py    SQLite WAL run leases + issue flags
-    contracts.py       stage-contract validation helpers
+    core.py          scheduler/state machine (blocked_by-aware dispatch)
+    run_registry.py  SQLite WAL run leases + issue flags
+    contracts.py     stage-contract validation helpers
   cli/
-    __init__.py        re-exports `main` for the `symphony` console_script
-    __main__.py        keeps `python -m symphony.cli ...` working for service.py
-    main.py            root dispatch + `symphony [WORKFLOW]`
-    board.py           `symphony board ...` file-tracker helper
-    doctor.py          `symphony doctor` WORKFLOW.md preflight checks
-  utils/
-    archive.py         auto-archive selector
-    auto_merge.py      symphony/<ID> branch → host repo merge
-    keep_awake.py      macOS caffeinate wrapper (no-op on other platforms)
-    wiki_sweep.py      Learn-prompt wiki integrity sweep
-  agent.py             back-compat shim re-exporting backends.* symbols
-  server.py            aiohttp server, health/state/refresh routes
-  webapi.py            web app REST routes + static SPA serving
-  stats.py             .symphony/stats.jsonl aggregation
-  skills.py            SKILL.md discovery + prompt injection
-  tui/                 Textual Kanban TUI package
-  service.py           `symphony service` background lifecycle
-  mock_codex.py        runnable via `python -m symphony.mock_codex` for demos/tests
-  web/static/          built-in browser app assets
-tui-open.sh            cross-platform launcher (macOS / Linux): doctor preflight + open TUI in a new terminal window
+    main.py          root dispatch + `symphony [WORKFLOW]`
+    board.py         `symphony board ...` validated ticket tool + `graph`
+    doctor.py        `symphony doctor` WORKFLOW.md preflight checks
+  utils/             auto_merge.py, git_inspect.py, git_ops.py, git_sandbox.py,
+                     archive.py, keep_awake.py, wiki_sweep.py
+  notifications/     Slack state-transition notifications
+  tui/               Textual Kanban TUI package
+  web/static/        built-in browser app assets (board / workflow / chat /
+                     stats / settings)
+  webapi.py          web app REST routes + static SPA serving
+  server.py          aiohttp server, health/state/refresh routes
+  chat.py            operator chat sessions + board-intake protocol
+  continuous_improvement.py  idle-time improvement-proposal loop
+  i18n.py            TUI/doc language switching
+  stats.py           .symphony/stats.jsonl aggregation
+  skills.py          SKILL.md discovery + prompt injection
+  service.py         `symphony service` background lifecycle
+  progress_md.py     WORKFLOW-PROGRESS.md live mirror
+  mock_codex.py      demo backend via `python -m symphony.mock_codex`
+  agent.py           back-compat shim re-exporting backends.* symbols
+tui-open.sh            launcher (macOS / Linux): doctor preflight + open TUI in a new terminal window
 tui-open.bat           Windows equivalent
 ```
 
@@ -838,51 +1019,43 @@ tui-open.bat           Windows equivalent
 pytest -q
 ```
 
-The test suite covers the upstream conformance suite, backend unit tests for
-the factory, event normalization, Claude / Pi usage accumulation, Gemini
-session synthesis, AGY/Kiro command construction, OpenCode command/session
-parsing, Pi failure-reason detection, run-registry persistence, file-tracker
-locking, web API contracts, and Textual `Pilot`-driven smoke tests for the TUI app. Subprocess-driven
-integration tests against real CLIs are intentionally not in CI — run them
-locally.
+The suite (1614 passed, 7 skipped) covers the upstream conformance suite,
+backend unit tests (factory, event normalization, per-CLI command/session
+handling), board-tool DAG validation, run-registry persistence, file-tracker
+locking, web API contracts, chat intake, lane presets, and Textual
+`Pilot`-driven TUI smoke tests. Subprocess-driven integration tests against
+real CLIs are intentionally not in CI — run them locally.
 
 ## Design notes
 
-### Why five different lifecycles behind one Protocol?
+### Why eight different lifecycles behind one Protocol?
 
 - **Codex** opens one `app-server` subprocess per issue and speaks the
-  current `codex app-server` JSON-RPC protocol (`initialize` + `thread/start`
-  + `turn/start` + streamed `turn/completed` and `item/completed`
-  notifications). Multi-turn within one process. Older `v2/initialize`-style
-  releases are not supported — pin to `codex-cli ≥ 0.39` (current upstream).
-- **Claude Code** has no persistent server; sessions are tracked by ID. Each
-  `run_turn` spawns a fresh `claude -p` and uses `--resume <session-id>` from
-  turn 2 onward.
-- **Gemini CLI** is one-shot per invocation with no native session model.
-  Each turn is independent; we synthesize a `gemini-<uuid>` session id so the
-  orchestrator's bookkeeping stays consistent.
-- **AGY / Antigravity CLI** is one-shot per invocation. Symphony sends the
-  rendered prompt on stdin with `agy --print -`, appends
-  `--dangerously-skip-permissions`, and adds
-  `--continue` on continuation turns when `resume_across_turns` is true.
-- **Kiro CLI** runs through headless chat mode. Because Kiro does not treat
-  piped stdin as the first message, Symphony bridges stdin into the positional
-  chat input with `"$(cat)"` and inserts `--resume` before that input on
-  continuation turns. `symphony doctor` accepts either `KIRO_API_KEY` or a
-  successful `kiro-cli whoami` login check.
-- **OpenCode** runs through its documented automation path:
-  `opencode run --format json --auto [message..]`. Symphony passes the prompt
-  as the `message` argument, reads raw JSON events when present, and starts
-  adding `--session <id>` on continuation turns after OpenCode reports a real
-  session id.
-- **Pi** has no persistent server but auto-saves sessions to
-  `~/.pi/agent/sessions/`. Each `run_turn` spawns a fresh `pi --mode json` and
-  passes `--session <id>` from turn 2 onward. The session id is read from the
-  first `{"type":"session"}` JSONL line; per-message `usage` is accumulated
-  off `message_end` events, and `agent_end` is treated as the terminal event.
-  Auth is delegated to Pi: the OAuth/API-key store at `~/.pi/agent/auth.json`
-  populated by `/login` is inherited by the subprocess, so Symphony itself
-  never handles credentials.
+  current `codex app-server` JSON-RPC protocol; multi-turn within one
+  process. Pin to `codex-cli ≥ 0.39` (current upstream).
+- **Claude Code** has no persistent server; each `run_turn` spawns a fresh
+  `claude -p` and uses `--resume <session-id>` from turn 2 onward.
+- **Gemini CLI** is one-shot per invocation with no native session model;
+  we synthesize a `gemini-<uuid>` session id for bookkeeping.
+- **AGY / Antigravity CLI** is one-shot per invocation: prompt on stdin via
+  `agy --print -` (plus `--dangerously-skip-permissions`), `--continue` on
+  continuation turns when `resume_across_turns` is true.
+- **Kiro CLI** runs through headless chat mode. Kiro does not treat piped
+  stdin as the first message, so Symphony bridges stdin into the positional
+  chat input with `"$(cat)"` and inserts `--resume` on continuation turns.
+- **OpenCode** runs `opencode run --format json --auto` with the prompt as
+  the `message` argument, adding `--session <id>` once OpenCode reports a
+  real session id.
+- **Pi** spawns a fresh `pi --mode json` per turn with `--session <id>`
+  from turn 2 onward; usage is accumulated off `message_end` events. Auth
+  is delegated to Pi's own `~/.pi/agent/auth.json` store.
+- **Prime Agent** spawns a fresh `prime-agent -p --mode json` per turn with
+  `--resume <id>` from turn 2 onward; it uses the same JSONL event protocol as
+  Pi and resolves subscriptions/API keys through Prime Agent's auth handling
+  (`~/.prime/agent/auth.json` or provider environment variables).
+  For file-backed boards, a clean exit after the ticket reaches a terminal state
+  is accepted even if Prime Agent closes stdout before flushing `agent_end`; non-zero
+  exits still fail.
 
 The `AgentBackend` Protocol hides these differences. The orchestrator only
 sees normalized events (`session_started`, `turn_completed`, `turn_failed`,
@@ -894,15 +1067,8 @@ The web app is the full browser editor for file boards: it can create, patch,
 delete, drag cards between configured states, edit workflow columns/prompts,
 and update branch policy through the same tracker/workflow modules the CLI
 uses. The TUI is optimized for keyboard operation: it can create/edit tickets,
-archive, confirm Done-gated cards, pause/resume running workers, skip Learn,
+archive, confirm Done-gated cards, pause/resume running workers, skip Document,
 filter, and inspect details without leaving the terminal.
-
-What you *can* do interactively:
-
-- Focus any card with `tab` / `shift+tab` or by clicking it.
-- Scroll a lane with the mouse wheel, `j` / `k`, or page keys.
-- Open a focused card's full description in a modal with `enter`.
-- Use `n`, `e`, `a`, `c`, `P`, `S`, and `/` for the core TUI write actions.
 
 What is intentionally out of scope:
 

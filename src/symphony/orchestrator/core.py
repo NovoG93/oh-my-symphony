@@ -22,11 +22,13 @@ import asyncio
 import json
 import os
 import re
+import subprocess
 import time
 import traceback
 from dataclasses import dataclass, replace
 from datetime import datetime, timedelta, timezone
 from enum import Enum
+from functools import partial
 from pathlib import Path
 from typing import Any, Awaitable, Callable, Coroutine
 
@@ -44,6 +46,7 @@ from ..backends import (
     BackendInit,
 )
 from ..backends import build_backend
+from ..chat import cfg_for_mode
 from ..utils.archive import select_archivable
 from ..backends.codex import linear_graphql_tool
 from ..errors import (
@@ -54,7 +57,9 @@ from ..errors import (
     TurnCancelled,
 )
 from ..continuous_improvement import (
+    AgentTask,
     FileLease,
+    any_mode_due,
     ImprovementRunner,
     Lease,
     default_improvement_runner,
@@ -63,6 +68,7 @@ from ..continuous_improvement import (
 from ..issue import BlockerRef, Issue, normalize_state
 from ..logging import get_logger
 from ..prompt import build_continuation_prompt, build_first_turn_prompt
+from ..runtime_safety import ensure_workflow_repo_is_safe
 from ..skills import render_skill_block
 from ..stats import StatsStore, stats_store_for
 from ..trackers import build_tracker_client
@@ -106,14 +112,18 @@ from .constants import (
 from .contracts import evaluate_contract
 from .dispatch_state import DispatchState
 from .entries import RetryEntry, RunningEntry, _CodexTotals, _IssueDebug
+from .executors import LegacyStageExecutor, TicketExecutor, TicketRunContext
 from .helpers import (
     _branch_hook_env,
     _branch_already_merged_into_target,
     _config_for_issue_agent,
+    resolve_symphony_cli,
     _from_monotonic_to_iso,
     _is_auto_triage_todo_candidate,
     _is_rewind_transition,
+    _human_review_target_state,
     _max_turns_exhausted_target_state,
+    _rewind_budget_target_state,
     _notify_state_transition,
     _requested_agent_kind,
     _sort_for_dispatch_fifo,
@@ -161,6 +171,11 @@ _RETRYABLE_WORKER_ERROR_MARKERS = (
     "connection reset",
     "connection timed out",
     "try again later",
+    # Transient backend stream faults (acceptance finding 3). The strings
+    # below are emitted verbatim by the backends; `test_backend_contract.py`
+    # pins them so the two lists cannot drift apart.
+    "stream unreadable",  # claude_code.py / codex.py / pi.py
+    "no result event",  # claude_code.py — rc!=0 with no result frame
 )
 
 
@@ -175,6 +190,40 @@ class _EligibilityDisposition(str, Enum):
 class _EligibilityDecision:
     disposition: _EligibilityDisposition
     reason: str
+
+
+# The one path a continuous-improvement agent turn may write in the host
+# worktree. Mirrors `continuous_improvement.AGENT_OUTPUT_DIR`.
+CI_AGENT_OUTPUT_PREFIX = ".symphony/continuous-improvement/proposals/"
+
+
+def _worktree_status_snapshot(cwd: Path) -> dict[str, str] | None:
+    """`path -> porcelain status code` for a worktree, or None when not git.
+
+    Untracked files are listed individually (`-uall`) so a new file in a
+    previously-clean directory is visible as its own path.
+    """
+    try:
+        result = subprocess.run(
+            ["git", "status", "--porcelain=v1", "-uall", "-z"],
+            cwd=str(cwd),
+            capture_output=True,
+            text=True,
+            timeout=60,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if result.returncode != 0:
+        return None
+    snapshot: dict[str, str] = {}
+    for record in result.stdout.split("\0"):
+        if len(record) < 4:
+            continue
+        code, path = record[:2], record[3:]
+        if path:
+            snapshot[path] = code
+    return snapshot
 
 
 def _clean_board_error_message(message: str) -> str:
@@ -253,6 +302,7 @@ def _initial_improvement_status() -> dict[str, Any]:
         "interval_ms": 0,
         "max_turns": 0,
         "agent_kind": "",
+        "modes": [],
         "in_flight": False,
         "current_phase": None,
         "last_started_at": None,
@@ -263,6 +313,8 @@ def _initial_improvement_status() -> dict[str, Any]:
         "skipped_reason": None,
         "last_verified_branch": None,
         "last_verified_sha": None,
+        "last_mode_results": [],
+        "last_request_id": None,
     }
 
 
@@ -357,7 +409,7 @@ _BLOCKED_RCA_HEADING_RE = re.compile(
     re.IGNORECASE | re.MULTILINE,
 )
 _BLOCKED_RCA_RESOLVED_HEADING_RE = re.compile(
-    r"^##\s+Blocked\s+RCA\s+Resolved\s*$",
+    r"^##\s+(?:Blocked\s+RCA\s+Resolved|RCA\s+Resolution)\s*$",
     re.IGNORECASE | re.MULTILINE,
 )
 _BLOCKED_RCA_SOURCE_IDENTIFIER_RE = re.compile(
@@ -423,7 +475,18 @@ def _markdown_section(description: str, heading_re: re.Pattern[str]) -> str:
 
 
 def _blocked_rca_already_requested(issue: Issue) -> bool:
-    return bool(_BLOCKED_RCA_HEADING_RE.search(issue.description or ""))
+    """Whether the current Blocked episode already requested an RCA.
+
+    Resolution notes close the preceding request.  A source that later blocks
+    again is a new episode and may open a new RCA, provided no RCA for that
+    source is currently active on the board.
+    """
+    description = issue.description or ""
+    requested = list(_BLOCKED_RCA_HEADING_RE.finditer(description))
+    if not requested:
+        return False
+    resolved = list(_BLOCKED_RCA_RESOLVED_HEADING_RE.finditer(description))
+    return not resolved or requested[-1].start() > resolved[-1].start()
 
 
 def _is_blocked_rca_ticket(issue: Issue) -> bool:
@@ -520,7 +583,7 @@ def _blocked_rca_description(
         f"to `{issue.identifier}` and move that source ticket to `{reopen_state}`.\n"
         "5. Do not skip the source ticket's normal workflow. Once it is back "
         "in Todo, it must pass through the configured Todo/In Progress/Verify/"
-        "Learn review path like any other ticket.\n"
+        "Document review path like any other ticket.\n"
         "6. If the root cause requires credentials, host worktree cleanup, "
         "destructive operations, or external approval, leave the source ticket "
         "Blocked and append `## RCA Blocker` with exact operator action.\n\n"
@@ -562,6 +625,10 @@ class Orchestrator:
         self._last_archive_sweep_monotonic: float | None = None
         self._lease_blocked: dict[str, str] = {}
         self._blocked_rca_source_ids: set[str] = set()
+        # Serialize the board check + create sequence.  The in-memory source
+        # set is only a cache; concurrent manual/automatic recovery requests
+        # must re-check the persisted board before either creates an RCA.
+        self._blocked_rca_creation_lock = asyncio.Lock()
         # Tickets the host already re-checked for a sandbox-denied history
         # write. Bounds the extra description fetch to one per ticket per
         # process instead of one per sweep.
@@ -641,7 +708,17 @@ class Orchestrator:
         # — never a worker slot. Due-math uses the monotonic clock so a
         # wall-clock jump can't wedge it. Runner + lease are injectable so
         # tests never spawn real subprocesses or touch a shared lockfile.
-        self._improvement_runner = improvement_runner or default_improvement_runner
+        # Agent-driven improvement modes need a real backend turn. The CI
+        # module must stay orchestrator-free, so the capability is injected:
+        # binding it as a keyword partial keeps the 3-positional
+        # `ImprovementRunner` signature every injected test fake implements.
+        self._improvement_runner: ImprovementRunner = (
+            improvement_runner
+            or partial(
+                default_improvement_runner,
+                agent_runner=self._run_improvement_agent,
+            )
+        )
         self._improvement_lease = improvement_lease
         self._improvement_task: asyncio.Task[None] | None = None
         self._improvement_run_timeout_s: float = DEFAULT_IMPROVEMENT_RUN_TIMEOUT_S
@@ -1160,6 +1237,7 @@ class Orchestrator:
             cfg, err = self._workflow_state.reload()
             if err is not None or cfg is None:
                 raise err or SymphonyError("workflow not loaded")
+        ensure_workflow_repo_is_safe(cfg.workflow_path)
         validate_for_dispatch(cfg)
         # Surface the workflow dir to every subprocess spawned afterwards
         # (hooks and agent backends inherit via os.environ). WORKFLOW.md
@@ -1168,6 +1246,10 @@ class Orchestrator:
         # writes through the host-board junction installed by after_create.
         import os as _os
         _os.environ["SYMPHONY_WORKFLOW_DIR"] = str(cfg.workflow_path.parent)
+        # The board-tool protocol in the stage prompts and the chat preamble
+        # requires the `symphony` CLI; a venv install is not necessarily on
+        # the worker's PATH. Prompts reference `${SYMPHONY_CLI:-symphony}`.
+        _os.environ["SYMPHONY_CLI"] = resolve_symphony_cli()
         self._workspace_manager = WorkspaceManager(
             cfg.workspace_root,
             cfg.hooks,
@@ -1389,7 +1471,7 @@ class Orchestrator:
                 "feature_branch_pattern": "symphony/<ID>",
                 "base_branch": "current branch",
                 "merge_target_branch": "current branch",
-                "merge_timing": "after Learn, before Done",
+                "merge_timing": "after Document, before Done",
                 "auto_merge_enabled": False,
             }
         base = cfg.agent.feature_base_branch or "current branch"
@@ -1398,7 +1480,7 @@ class Orchestrator:
             "feature_branch_pattern": "symphony/<ID>",
             "base_branch": base,
             "merge_target_branch": target,
-            "merge_timing": "after Learn, before Done",
+            "merge_timing": "after Document, before Done",
             "auto_merge_enabled": bool(cfg.agent.auto_merge_on_done),
         }
 
@@ -1520,6 +1602,19 @@ class Orchestrator:
                 if _blocker_dependency_is_resolved(blocker.state, cfg):
                     continue
                 identifier = blocker.identifier or blocker.id or "unknown"
+                # F-13: a blocker id that is not on the board hydrates to
+                # `state=None` and deadlocks the ticket forever. "waiting on
+                # unresolved dependency" reads like normal queueing, so say
+                # what actually happened.
+                if not normalize_state(blocker.state).strip():
+                    return _attention_signal(
+                        "dangling_dependency",
+                        "Unknown blocker",
+                        f"blocker {identifier} is not on the board — fix the id "
+                        f"with `symphony board update {issue.identifier} "
+                        "--blocked-by <ID>` or clear it",
+                        "error",
+                    )
                 return _attention_signal(
                     "blocked_dependency",
                     "Blocked dependency",
@@ -1603,10 +1698,10 @@ class Orchestrator:
         if entry.agent_kind:
             return entry.agent_kind
         requested = _requested_agent_kind(entry.issue)
-        if requested is not None:
-            return requested
         cfg = self._workflow_state.current()
-        return cfg.agent.kind if cfg is not None else ""
+        if cfg is None:
+            return requested or ""
+        return cfg.agent.kind_for_state(entry.issue.state, requested)
 
     # ------------------------------------------------------------------
     # operator-driven pause / resume
@@ -1723,8 +1818,12 @@ class Orchestrator:
             return identifier
         return None
 
-    async def skip_learn(self, identifier: str) -> tuple[bool, str]:
-        """Move an idle Learn ticket to Human Review with an audit note."""
+    async def skip_document(self, identifier: str) -> tuple[bool, str]:
+        """Move an idle Document ticket to Human Review with an audit note.
+
+        Accepts the legacy `Learn` lane name so pre-rename boards keep the
+        skip control without migration.
+        """
         cfg = self._workflow_state.current()
         if cfg is None:
             cfg, err = self._workflow_state.reload()
@@ -1739,26 +1838,38 @@ class Orchestrator:
         )
         if issue is None:
             return False, f"unknown issue {identifier}"
-        if normalize_state(issue.state) != "learn":
-            return False, f"only Learn tickets can be skipped (state={issue.state})"
+        if normalize_state(issue.state) not in {"document", "learn"}:
+            return False, (
+                f"only Document tickets can be skipped (state={issue.state})"
+            )
         if self.find_running_issue_id(identifier) is not None:
             return False, f"{identifier} started running; retry after it stops"
 
+        target_state = _human_review_target_state(cfg)
+        if not target_state:
+            return False, (
+                "this board declares no terminal lane to skip into; add a "
+                "`Human Review`-style terminal state to tracker.terminal_states"
+            )
         await asyncio.to_thread(
             self._tracker_call_append_note,
             cfg,
             issue,
-            "Learn Skipped",
-            "Operator skipped wiki write-back from the Learn lane.",
+            "Document Skipped",
+            f"Operator skipped documentation write-back from the {issue.state} lane.",
         )
         await asyncio.to_thread(
             self._tracker_call_update_state,
             cfg,
             issue,
-            "Human Review",
+            target_state,
         )
         self.request_refresh()
         return True, f"moved {identifier} to Human Review"
+
+    # Deprecated alias — the lane was renamed Learn -> Document; external
+    # callers using the old method name keep working.
+    skip_learn = skip_document
 
     def _retry_row(self, entry: RetryEntry) -> dict[str, Any]:
         return {
@@ -2345,6 +2456,39 @@ class Orchestrator:
             client.close()
 
     @staticmethod
+    def _tracker_call_active_rca_for_source(
+        cfg: ServiceConfig, source_identifier: str
+    ) -> str | None:
+        """Return the persisted active RCA for a source, if one exists."""
+        client = build_tracker_client(cfg)
+        try:
+            # Blocked/Human Review RCA cards are still unresolved work even
+            # when the workflow models those parking lanes as terminal. Only
+            # completed/discarded RCA states stop suppressing duplicates.
+            resolved_states = {"done", "archive", "cancelled"}
+            scan_states = tuple(
+                dict.fromkeys(
+                    (*cfg.tracker.active_states, *cfg.tracker.terminal_states)
+                )
+            )
+            unresolved_states = tuple(
+                state
+                for state in scan_states
+                if normalize_state(state) not in resolved_states
+            )
+            issues = client.fetch_issues_by_states(unresolved_states)
+        finally:
+            client.close()
+        source_key = source_identifier.casefold()
+        for candidate in issues:
+            if not _looks_like_blocked_rca_ticket(candidate):
+                continue
+            candidate_source = _blocked_rca_source_identifier(candidate)
+            if candidate_source and candidate_source.casefold() == source_key:
+                return candidate.identifier
+        return None
+
+    @staticmethod
     def _tracker_call_create_blocked_rca_issue(
         cfg: ServiceConfig,
         issue: Issue,
@@ -2605,24 +2749,52 @@ class Orchestrator:
                 )
             rca_state = requested_rca_state
 
-        requested_agent = (agent_kind or issue.agent_kind or cfg.agent.kind).strip().lower()
+        requested_agent = (agent_kind or "").strip().lower() or cfg.agent.kind_for_state(
+            rca_state, issue.agent_kind
+        )
         if requested_agent not in SUPPORTED_AGENT_KINDS:
             requested_agent = cfg.agent.kind
 
-        rca_identifier = await asyncio.to_thread(
-            self._tracker_call_create_blocked_rca_issue,
-            cfg,
-            issue,
-            rca_state,
-            reopen_state,
-            requested_agent,
-        )
-        if rca_identifier is None:
-            return (
-                False,
-                "blocked RCA creation requires a tracker that can create tickets",
-                {},
+        async with self._blocked_rca_creation_lock:
+            # The source note and in-memory set can both be stale or absent
+            # after a restart.  The board is authoritative: inspect every
+            # configured active lane before creating another RCA.
+            if (
+                _blocked_rca_already_requested(issue)
+                or issue.id in self._blocked_rca_source_ids
+            ):
+                return (
+                    False,
+                    f"blocked RCA already opened for {issue.identifier}",
+                    {},
+                )
+            active_rca = await asyncio.to_thread(
+                self._tracker_call_active_rca_for_source,
+                cfg,
+                issue.identifier,
             )
+            if active_rca is not None:
+                self._blocked_rca_source_ids.add(issue.id)
+                return (
+                    False,
+                    f"blocked RCA already opened for {issue.identifier}",
+                    {},
+                )
+            rca_identifier = await asyncio.to_thread(
+                self._tracker_call_create_blocked_rca_issue,
+                cfg,
+                issue,
+                rca_state,
+                reopen_state,
+                requested_agent,
+            )
+            if rca_identifier is None:
+                return (
+                    False,
+                    "blocked RCA creation requires a tracker that can create tickets",
+                    {},
+                )
+            self._blocked_rca_source_ids.add(issue.id)
 
         body = (
             f"RCA ticket `{rca_identifier}` opened in `{rca_state}` for "
@@ -2643,7 +2815,6 @@ class Orchestrator:
             "Blocked RCA",
             body,
         )
-        self._blocked_rca_source_ids.add(issue.id)
         self._record_stats_transition(rca_identifier, "", rca_state)
         self.request_refresh()
         return (
@@ -3082,6 +3253,7 @@ class Orchestrator:
             interval_ms=ci.interval_ms,
             max_turns=ci.max_turns,
             agent_kind=ci.agent_kind,
+            modes=list(ci.resolved_modes()),
         )
         if not ci.enabled:
             return
@@ -3116,6 +3288,12 @@ class Orchestrator:
             self._running or self._retry or self._terminal_persist_pending
         ):
             self._improvement_status["skipped_reason"] = "board_busy"
+            return
+        # Per-mode cadence (`mode_interval_hours`): when every enabled mode is
+        # still cooling down, re-arm the heartbeat without spending a turn.
+        if not any_mode_due(cfg, cfg.workflow_path.parent):
+            self._improvement_status["skipped_reason"] = "no_modes_due"
+            self._next_improvement_due_monotonic = now + interval_s
             return
 
         self._improvement_status["skipped_reason"] = None
@@ -3166,6 +3344,16 @@ class Orchestrator:
                 tickets_created=result.tickets_created,
                 last_verified_branch=result.verified_branch,
                 last_verified_sha=result.verified_sha,
+                last_mode_results=[
+                    {
+                        "mode": outcome.mode,
+                        "status": outcome.status,
+                        "summary": outcome.summary,
+                        "ticket_ids": list(outcome.ticket_ids),
+                    }
+                    for outcome in result.modes
+                ],
+                last_request_id=result.request_id,
             )
             consumed = True
         except asyncio.CancelledError:
@@ -3203,6 +3391,87 @@ class Orchestrator:
                 self._improvement_status["last_finished_at"] = _utc_iso_z()
             self._improvement_status.update(in_flight=False, current_phase=None)
 
+    async def _run_improvement_agent(self, task: AgentTask) -> str:
+        """Give an agent-driven improvement mode one backend turn.
+
+        This is the orchestrator-side capability the continuous-improvement
+        module is handed (it must not import the orchestrator). The turn runs
+        against the host repo with `cwd == workspace_root == workflow_dir`,
+        exactly like a chat turn, and outside the dispatch slot accounting —
+        the heartbeat already holds the idle board. The backend stays in its
+        normal editing mode so the agent can write its one proposal file.
+
+        F-12: "read only except the proposal file" used to be prompt text
+        only, in the *host* tree. It is now also mechanical — the working
+        tree is snapshotted before and after the turn, and a write outside
+        `.symphony/continuous-improvement/proposals/` discards the mode's
+        proposals (the caller records `not_proven`) and logs the paths.
+        """
+        cfg = self._workflow_state.current()
+        if cfg is None:
+            raise SymphonyError("no workflow configuration loaded")
+        ci = cfg.continuous_improvement
+        agent_cfg, _ = cfg_for_mode(cfg, "edit", ci.agent_kind or cfg.agent.kind)
+
+        async def _ignore_event(_event: dict[str, Any]) -> None:
+            return None
+
+        backend = self._build_agent_backend(
+            BackendInit(
+                cfg=agent_cfg,
+                cwd=task.cwd,
+                workspace_root=task.cwd,
+                on_event=_ignore_event,
+            )
+        )
+        before = await asyncio.to_thread(_worktree_status_snapshot, task.cwd)
+        await backend.start()
+        try:
+            await backend.initialize()
+            await backend.start_session(initial_prompt="", issue_title=None)
+            result = await backend.run_turn(prompt=task.prompt, is_continuation=False)
+        finally:
+            await backend.stop()
+        after = await asyncio.to_thread(_worktree_status_snapshot, task.cwd)
+        self._enforce_improvement_write_contract(task, before, after)
+        return result.last_message or ""
+
+    def _enforce_improvement_write_contract(
+        self,
+        task: AgentTask,
+        before: dict[str, str] | None,
+        after: dict[str, str] | None,
+    ) -> None:
+        """Discard a CI agent turn that wrote outside its contract."""
+        if before is None or after is None:
+            # Not a git worktree (or git unavailable): nothing to compare
+            # against. The prompt remains the only gate, as before.
+            return
+        allowed = CI_AGENT_OUTPUT_PREFIX
+        offending = sorted(
+            path
+            for path, code in after.items()
+            if before.get(path) != code and not path.startswith(allowed)
+        )
+        if not offending:
+            return
+        try:
+            task.output_path.unlink()
+        except OSError:
+            pass
+        log.error(
+            "ci_agent_wrote_outside_contract",
+            mode=task.mode,
+            cwd=str(task.cwd),
+            paths=offending[:20],
+            path_count=len(offending),
+        )
+        raise SymphonyError(
+            "continuous-improvement agent wrote outside its contract; "
+            f"proposals discarded: {', '.join(offending[:5])}",
+            mode=task.mode,
+        )
+
     def _report_improvement_phase(self, phase: str) -> None:
         self._improvement_status["current_phase"] = phase
 
@@ -3232,6 +3501,7 @@ class Orchestrator:
                 interval_ms=ci.interval_ms,
                 max_turns=ci.max_turns,
                 agent_kind=ci.agent_kind,
+                modes=list(ci.resolved_modes()),
             )
         status["turns_used"] = self._improvement_turns_used
         status["in_flight"] = (
@@ -3608,6 +3878,10 @@ class Orchestrator:
     # dispatch (§16.4)
     # ------------------------------------------------------------------
 
+    def _executor_for(self, cfg: ServiceConfig) -> TicketExecutor:
+        """Pick the execution strategy for one dispatch."""
+        return LegacyStageExecutor(self)
+
     def _dispatch(
         self,
         issue: Issue,
@@ -3626,7 +3900,7 @@ class Orchestrator:
         resolved_attempt_kind = attempt_kind or (
             "retry" if attempt is not None else "initial"
         )
-        agent_kind = _requested_agent_kind(issue) or cfg.agent.kind
+        agent_kind = cfg.agent.kind_for_state(issue.state, _requested_agent_kind(issue))
         run_id = self._try_acquire_run_lease(
             issue=issue,
             workspace_path=workspace_path,
@@ -3647,9 +3921,22 @@ class Orchestrator:
             run_id=run_id,
         )
         self._dispatch_state.begin_run(issue.id, entry)
+        # Execution mode is chosen once, here, and fixed for the run's
+        # lifetime. Deciding later would let a mid-run config reload switch
+        # a ticket between the stage loop and a DAG.
+        executor = self._executor_for(cfg)
+        run_context = TicketRunContext(
+            issue=issue,
+            attempt=attempt,
+            cfg=cfg,
+            run_id=run_id,
+            workspace_path=workspace_path,
+            agent_kind=agent_kind,
+            attempt_kind=resolved_attempt_kind,
+        )
         try:
             worker_task = asyncio.create_task(
-                self._run_agent_attempt(issue, attempt, cfg),
+                executor.execute(run_context),
                 name=f"symphony-worker-{issue.identifier}",
             )
         except Exception:
@@ -3674,9 +3961,21 @@ class Orchestrator:
         # Persist the resolved backend onto the ticket so downstream
         # consumers (board UIs, audits, Done-state history) can see who
         # ran which ticket without inferring from logs. Idempotent —
-        # adapter preserves any existing override.
+        # adapter preserves any existing override. Skipped when
+        # `agent.stage_kinds` routing is active: the stamp is read back as
+        # a per-ticket pin on later dispatches, which would freeze the
+        # first stage's backend and defeat per-state routing.
         try:
-            self._tracker_call_record_agent_kind(cfg, issue.identifier, entry.agent_kind)
+            if cfg.agent.stage_kinds:
+                # Routed board: the pin must stay empty, but the audit value
+                # still belongs on the ticket (F-20).
+                self._tracker_call_record_last_agent_kind(
+                    cfg, issue.identifier, entry.agent_kind
+                )
+            else:
+                self._tracker_call_record_agent_kind(
+                    cfg, issue.identifier, entry.agent_kind
+                )
         except Exception as exc:
             log.warning(
                 "record_agent_kind_failed",
@@ -3776,6 +4075,16 @@ class Orchestrator:
     # worker (§16.5)
     # ------------------------------------------------------------------
 
+    async def run_legacy_stage_loop(
+        self, issue: Issue, attempt: int | None, cfg: ServiceConfig
+    ) -> None:
+        """Public entry point for `LegacyStageExecutor`.
+
+        A one-line forward so the execution-mode seam does not have to
+        reach into a private method across modules.
+        """
+        await self._run_agent_attempt(issue, attempt, cfg)
+
     async def _run_agent_attempt(
         self, issue: Issue, attempt: int | None, cfg: ServiceConfig
     ) -> None:
@@ -3783,7 +4092,12 @@ class Orchestrator:
         outcome: str = "normal"
         error: str | None = None
         try:
-            cfg = _config_for_issue_agent(cfg, issue)
+            # Keep the *unrouted* workflow config: `agent.stage_kinds` must be
+            # re-resolved at every in-run phase transition, and re-resolving
+            # against an already-routed cfg would pin the first lane's backend
+            # for the whole dispatch (the normal Todo→…→Document path).
+            base_cfg = cfg
+            cfg = _config_for_issue_agent(base_cfg, issue)
             running = self._running.get(running_issue_id)
             if running is not None:
                 running.agent_kind = cfg.agent.kind
@@ -3962,10 +4276,14 @@ class Orchestrator:
                             # Failure note, and treat the situation as
                             # a forced rewind so the rebuild + budget
                             # bookkeeping below still apply.
-                            if not is_rewind:
+                            if not is_rewind and cfg.agent.stage_contracts_enabled(
+                                cfg.tracker.active_states
+                            ):
                                 if prev_phase_state in {
                                     "in progress",
                                     "verify",
+                                    "document",
+                                    # legacy lane name (pre-rename boards)
                                     "learn",
                                     "done",
                                 }:
@@ -4075,13 +4393,15 @@ class Orchestrator:
                                     cfg.agent.max_attempts > 0
                                     and debug.rewind_count > cfg.agent.max_attempts
                                 ):
-                                    await asyncio.to_thread(
-                                        self._tracker_call_update_state,
-                                        cfg,
-                                        issue,
-                                        "Blocked",
-                                    )
-                                    issue = replace(issue, state="Blocked")
+                                    rewind_target = _rewind_budget_target_state(cfg)
+                                    if rewind_target:
+                                        await asyncio.to_thread(
+                                            self._tracker_call_update_state,
+                                            cfg,
+                                            issue,
+                                            rewind_target,
+                                        )
+                                        issue = replace(issue, state=rewind_target)
                                     running_entry = self._running.get(
                                         running_issue_id
                                     )
@@ -4095,12 +4415,34 @@ class Orchestrator:
                                         to_state=current_state,
                                         rewind_count=debug.rewind_count,
                                         max_attempts=cfg.agent.max_attempts,
+                                        # F-32: a board with no block/human
+                                        # terminal lane keeps its state; the
+                                        # worker still stops.
+                                        target_state=rewind_target or "(none)",
                                     )
                                     break
                             running_entry = self._running.get(running_issue_id)
                             if running_entry is not None:
                                 running_entry.consecutive_empty_turns = 0
                                 running_entry.hit_empty_response_loop = False
+                            # F-01: route the *new* lane's backend. The ticket
+                            # walks several states inside one dispatch, so the
+                            # kind must be re-resolved from the unrouted config
+                            # here — not reused from the lane we started in.
+                            phase_cfg = _config_for_issue_agent(base_cfg, issue)
+                            if phase_cfg.agent.kind != cfg.agent.kind:
+                                log.info(
+                                    "stage_backend_rerouted",
+                                    issue_id=issue.id,
+                                    identifier=issue.identifier,
+                                    from_state=prev_phase_state,
+                                    to_state=current_state,
+                                    from_kind=cfg.agent.kind,
+                                    to_kind=phase_cfg.agent.kind,
+                                )
+                            cfg = phase_cfg
+                            if running_entry is not None:
+                                running_entry.agent_kind = cfg.agent.kind
                             client, first_prompt = await self._rebuild_backend_for_phase(
                                 issue=issue,
                                 running_issue_id=running_issue_id,
@@ -4779,6 +5121,58 @@ class Orchestrator:
             value = payload.get(key)
             if isinstance(value, str) and value.strip():
                 return value.strip()
+
+        def assistant_message_preview(message: Any) -> str:
+            """Extract text only from an assistant message.
+
+            Pi and Prime wrap response text in a message object.  The same
+            stream also contains user messages and tool results, so requiring
+            an assistant role here keeps those echoes from looking like model
+            output to the empty-turn guard.
+            """
+            if not isinstance(message, dict):
+                return ""
+            kind = str(message.get("role") or message.get("type") or "").lower()
+            if kind != "assistant":
+                return ""
+            content = message.get("content")
+            if isinstance(content, str) and content.strip():
+                return content.strip()
+            if isinstance(content, list):
+                for block in reversed(content):
+                    if isinstance(block, dict):
+                        text = block.get("text")
+                    else:
+                        text = block
+                    if isinstance(text, str) and text.strip():
+                        return text.strip()
+            elif isinstance(content, dict):
+                text = content.get("text")
+                if isinstance(text, str) and text.strip():
+                    return text.strip()
+            text = message.get("text")
+            if isinstance(text, str) and text.strip():
+                return text.strip()
+            return ""
+
+        # Pi/Prime `message_end` and `turn_end` payloads nest the assistant
+        # message under `message`.
+        message = payload.get("message")
+        preview = assistant_message_preview(message)
+        if preview:
+            return preview
+
+        # Their terminal `agent_end` payload carries all messages.  Walk
+        # backwards so the preview reflects the final assistant response,
+        # while skipping user messages and tool-result entries.
+        if str(payload.get("type") or "").lower() == "agent_end":
+            messages = payload.get("messages")
+            if isinstance(messages, list):
+                for message in reversed(messages):
+                    preview = assistant_message_preview(message)
+                    if preview:
+                        return preview
+
         item = payload.get("item")
         if isinstance(item, dict):
             item_type = str(item.get("type") or "").lower()
@@ -6022,13 +6416,33 @@ class Orchestrator:
             entry.worker_task.cancel()
         entry.cancelled_at = now
 
+    def _stall_timeout_ms_for_entry(
+        self, cfg: ServiceConfig, entry: RunningEntry
+    ) -> int:
+        """Stall budget for one running worker.
+
+        F-02: `cfg.backend_timeouts()` keys off the *workflow default*
+        backend, so a ticket pinned (or stage-routed) to another backend was
+        cancelled on the wrong backend's clock — a claude worker configured
+        for 900 s died at codex's 300 s. Resolve per entry, then let
+        `agent.stall_timeout_ms_by_state` widen it for heavy lanes.
+        """
+        entry_cfg = _config_for_issue_agent(cfg, entry.issue)
+        kind = entry.agent_kind or entry_cfg.agent.kind
+        if kind != entry_cfg.agent.kind:
+            entry_cfg = replace(entry_cfg, agent=replace(entry_cfg.agent, kind=kind))
+        _, _, stall_timeout_ms = entry_cfg.backend_timeouts()
+        return cfg.agent.stall_timeout_ms_for_state(
+            entry.issue.state, stall_timeout_ms
+        )
+
     async def _reconcile_running(self, cfg: ServiceConfig) -> None:
         # Part A: isolate each heartbeat/stall/eject lifecycle.
-        _, _, stall_timeout_ms = cfg.backend_timeouts()
         now = datetime.now(timezone.utc)
         for issue_id, entry in list(self._running.items()):
             try:
                 self._heartbeat_run_lease(issue_id, entry)
+                stall_timeout_ms = self._stall_timeout_ms_for_entry(cfg, entry)
                 if stall_timeout_ms > 0:
                     self._reconcile_stall_state(
                         issue_id,
@@ -6362,6 +6776,24 @@ class Orchestrator:
         client = build_tracker_client(cfg)
         try:
             record = getattr(client, "record_agent_kind", None)
+            if record is None:
+                return
+            record(identifier, agent_kind)
+        finally:
+            client.close()
+
+    @staticmethod
+    def _tracker_call_record_last_agent_kind(
+        cfg: ServiceConfig, identifier: str, agent_kind: str
+    ) -> None:
+        """Best-effort: persist the audit-only `last_agent_kind` stamp.
+
+        Used instead of the pin on `stage_kinds`-routed boards, where writing
+        the pin would freeze the first lane's backend for the whole ticket.
+        """
+        client = build_tracker_client(cfg)
+        try:
+            record = getattr(client, "record_last_agent_kind", None)
             if record is None:
                 return
             record(identifier, agent_kind)

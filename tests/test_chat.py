@@ -19,6 +19,7 @@ from symphony.backends import (
 )
 from symphony.chat import (
     ChatManager,
+    _board_preamble,
     _claude_command_for_mode,
     _summarize_claude_frame,
     cfg_for_mode,
@@ -229,6 +230,13 @@ async def test_send_message_preamble_and_continuation(
     assert "do not create, modify or delete" in prompt
     assert "Symphony kanban board at" in prompt
     assert "kanban" in prompt
+    # Q&A mode describes tickets and defers filing to edit mode.
+    assert "switch the chat to edit mode" in prompt
+    # Board protocol: validated CLI with the board's actual states, never
+    # hand-written ticket markdown.
+    assert "${SYMPHONY_CLI:-symphony} board new" in prompt
+    assert "Todo, Doing" in prompt
+    assert "<IDENTIFIER>.md" not in prompt
     assert is_continuation is False
 
     await manager.send_message("second question")
@@ -417,7 +425,7 @@ async def test_request_refresh_called_after_each_turn(
     assert calls == [1]
     prompt, _ = fake_backends[0].turns[0]
     assert "Symphony kanban board at" in prompt
-    assert "state: Todo" in prompt
+    assert "${SYMPHONY_CLI:-symphony} board new" in prompt
     await manager.stop_session()
 
 
@@ -736,3 +744,47 @@ async def test_mode_switch_prepends_notice_on_next_message(
     prompt, _ = fake_backends[1].turns[1]
     assert prompt == "another message"
     await manager.stop_session()
+
+
+# ---------------------------------------------------------------------------
+# board preamble — build-request protocol
+# ---------------------------------------------------------------------------
+
+
+def _cfg_with_states(tmp_path: Path, active_states: str) -> ServiceConfig:
+    (tmp_path / "WORKFLOW.md").write_text(
+        WORKFLOW_TEXT.replace("[Todo, Doing]", active_states), encoding="utf-8"
+    )
+    (tmp_path / "kanban").mkdir(exist_ok=True)
+    state = WorkflowState(tmp_path / "WORKFLOW.md")
+    cfg, err = state.reload()
+    assert err is None and cfg is not None
+    return cfg
+
+
+def test_board_preamble_default_board_routes_by_complexity(tmp_path: Path) -> None:
+    preamble = _board_preamble(_cfg(tmp_path))
+    # Validated CLI protocol, rendered with the board's actual states.
+    assert "${SYMPHONY_CLI:-symphony} board new" in preamble
+    # F-19: the CLI may live in a venv the worker's PATH does not carry.
+    assert "SYMPHONY_CLI is exported by the orchestrator" in preamble
+    assert "board update <ID>" in preamble
+    assert "--description-file -" in preamble
+    assert "Todo, Doing" in preamble
+    assert "SIMPLE task: one ticket in Todo" in preamble
+    assert "research -> plan -> adversarial plan-review" in preamble
+    # No freehand ticket-markdown instruction survives.
+    assert "<IDENTIFIER>.md" not in preamble
+    assert "front matter" not in preamble
+
+
+def test_board_preamble_deep_board_files_one_intake_ticket(tmp_path: Path) -> None:
+    cfg = _cfg_with_states(
+        tmp_path,
+        "[Intake, Research, Plan, Review, Build, QA, Verify, Document]",
+    )
+    preamble = _board_preamble(cfg)
+    assert "ONE Intake ticket" in preamble
+    assert "Intake, Research, Plan" in preamble
+    # On a deep board the pipeline decomposes; chat does not build the DAG.
+    assert "adversarial plan-review" not in preamble

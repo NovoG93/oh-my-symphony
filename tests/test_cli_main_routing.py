@@ -75,6 +75,21 @@ def test_doctor_token_dispatches_to_doctor_main(
     assert captured["argv"] == ["--workflow", "WORKFLOW.md"]
 
 
+def test_hub_token_dispatches_to_hub_main(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: dict = {"argv": None}
+
+    def fake_hub_main(argv: list[str] | None = None) -> int:
+        captured["argv"] = argv
+        return 6
+
+    monkeypatch.setattr("symphony.hub.main", fake_hub_main)
+    rc = cli_main_mod.main(["hub", "--host", "localhost", "--port", "8123"])
+    assert rc == 6
+    assert captured["argv"] == ["--host", "localhost", "--port", "8123"]
+
+
 def test_service_token_dispatches_to_service_main(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -230,3 +245,15 @@ def test_version_flag_prints_version_and_exits_zero(
         cli_main_mod.main(["--version"])
     assert exc.value.code == 0
     assert capsys.readouterr().out.strip() == f"symphony {__version__}"
+
+
+def test_project_token_dispatches_to_project_main(monkeypatch: pytest.MonkeyPatch) -> None:
+    captured: dict = {}
+
+    def fake_project_main(argv: list[str]) -> int:
+        captured["argv"] = argv
+        return 6
+
+    monkeypatch.setattr("symphony.cli.project.main", fake_project_main)
+    assert cli_main_mod.main(["project", "list"]) == 6
+    assert captured["argv"] == ["list"]

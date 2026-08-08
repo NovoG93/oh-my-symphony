@@ -31,10 +31,18 @@ from .constants import (
     DEFAULT_CODEX_REASONING_EFFORT,
     DEFAULT_CODEX_STALL_TIMEOUT_MS,
     DEFAULT_CODEX_TURN_TIMEOUT_MS,
+    CI_AGENT_MODES,
+    CI_MODE_BLOCKED_FIXES,
+    CI_MODE_FEATURE_IMPROVEMENTS,
+    CI_MODE_MARKET_RESEARCH,
+    CI_MODE_READINESS,
+    CI_MODE_SECURITY,
     DEFAULT_CI_INTERVAL_MS,
+    DEFAULT_CI_MAX_IMPROVEMENT_TICKETS_PER_RUN,
     DEFAULT_CI_MAX_TICKETS_PER_RUN,
     DEFAULT_CI_MAX_TURNS,
     DEFAULT_CI_MIN_INTERVAL_MS,
+    DEFAULT_CI_MODE_INTERVAL_HOURS,
     DEFAULT_CI_TICKET_PREFIX,
     DEFAULT_GEMINI_COMMAND,
     DEFAULT_HOOK_TIMEOUT_MS,
@@ -47,6 +55,7 @@ from .constants import (
     DEFAULT_MAX_TURNS,
     DEFAULT_OPENCODE_COMMAND,
     DEFAULT_PI_COMMAND,
+    DEFAULT_PRIME_AGENT_COMMAND,
     DEFAULT_POLL_INTERVAL_MS,
     DEFAULT_PROMPT,
     DEFAULT_TERMINAL_STATES,
@@ -56,6 +65,7 @@ from .constants import (
     LINEAR_API_KEY_ENV,
     LINEAR_DEFAULT_ENDPOINT,
     SUPPORTED_AGENT_KINDS,
+    SUPPORTED_CI_MODES,
     SUPPORTED_TRACKER_KINDS,
     SUPPORTED_WORKSPACE_REUSE_POLICIES,
     SYMPHONY_BRANCH_PREFIX,
@@ -85,6 +95,8 @@ from .config import (
     KiroConfig,
     OpenCodeConfig,
     PiConfig,
+    PrimeAgentConfig,
+    PreviewConfig,
     ProgressConfig,
     PromptConfig,
     ServerConfig,
@@ -94,7 +106,7 @@ from .config import (
     TuiConfig,
     WikiConfig,
 )
-from .builder import build_service_config
+from .builder import build_service_config, validated_ci_modes
 from .preflight import validate_for_dispatch
 from .state import WorkflowState
 
@@ -118,6 +130,8 @@ __all__ = [
     "KiroConfig",
     "OpenCodeConfig",
     "PiConfig",
+    "PrimeAgentConfig",
+    "PreviewConfig",
     "ServerConfig",
     "TuiConfig",
     "ProgressConfig",
@@ -128,12 +142,22 @@ __all__ = [
     "ContinuousImprovementConfig",
     # builder
     "build_service_config",
+    "validated_ci_modes",
     # preflight
     "validate_for_dispatch",
     # state
     "WorkflowState",
     # constants used by callers / tests
     "SUPPORTED_AGENT_KINDS",
+    "SUPPORTED_CI_MODES",
+    "CI_AGENT_MODES",
+    "CI_MODE_READINESS",
+    "CI_MODE_BLOCKED_FIXES",
+    "CI_MODE_SECURITY",
+    "CI_MODE_MARKET_RESEARCH",
+    "CI_MODE_FEATURE_IMPROVEMENTS",
+    "DEFAULT_CI_MODE_INTERVAL_HOURS",
+    "DEFAULT_CI_MAX_IMPROVEMENT_TICKETS_PER_RUN",
     "SUPPORTED_TRACKER_KINDS",
     "SUPPORTED_WORKSPACE_REUSE_POLICIES",
     "DEFAULT_AGENT_KIND",
@@ -147,6 +171,7 @@ __all__ = [
     "DEFAULT_AGY_COMMAND",
     "DEFAULT_KIRO_COMMAND",
     "DEFAULT_OPENCODE_COMMAND",
+    "DEFAULT_PRIME_AGENT_COMMAND",
     "LINEAR_API_KEY_ENV",
     "LINEAR_DEFAULT_ENDPOINT",
     "JIRA_API_TOKEN_ENV",

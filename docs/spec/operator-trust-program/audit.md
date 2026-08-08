@@ -1,5 +1,11 @@
 # Audit: Operator Trust Program vs `dev` (2026-07-03)
 
+> **Superseded — archived design record.** This document describes the repo as
+> it was when the spec was written. `tools/board-viewer/` and the `Learn` lane
+> no longer exist (the built-in admin web app on `server.port` is the only
+> board; `Learn` was renamed `Document`). Kept for the decision history, not
+> as a description of current behaviour.
+
 This document completes task 1.1 of `tasks.md`: map the spec against the code
 that is actually on `dev` (HEAD `7be48e2`). The spec was written alongside
 commit `1818d60` ("feat: harden reliability lifecycle and trackers"), which

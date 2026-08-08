@@ -22,8 +22,10 @@ from ruamel.yaml import YAML
 from ruamel.yaml.comments import CommentedMap, CommentedSeq
 from ruamel.yaml.error import YAMLError
 
-from ..errors import SymphonyError
+from ..errors import ConfigValidationError, SymphonyError
+from .builder import validated_ci_modes
 from .constants import DEFAULT_CI_MIN_INTERVAL_MS, SUPPORTED_AGENT_KINDS
+from .presets import LanePreset, get_lane_preset
 
 _STATE_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9 _/-]{0,39}$")
 _MAX_COLUMNS = 100
@@ -178,7 +180,9 @@ def apply_states_update(workflow_path: Path, specs: list[StateSpec]) -> StatesUp
 
     Handles add / remove / rename / reorder / description edits and keeps
     the per-state maps (`prompts.stages`, `agent.max_concurrent_agents_by_state`,
-    `agent.max_total_tokens_by_state`) consistent. New active columns get a
+    `agent.max_total_tokens_by_state`, `agent.stall_timeout_ms_by_state`,
+    `agent.stage_kinds`) consistent. New
+    active columns get a
     starter prompt file next to the existing stage prompts.
 
     Returns the change plan; the caller migrates board tickets accordingly.
@@ -242,6 +246,8 @@ def apply_states_update(workflow_path: Path, specs: list[StateSpec]) -> StatesUp
         _rename_state_keyed_map(agent, "max_concurrent_agents_by_state", renamed, removed)
         _rename_state_keyed_map(agent, "max_state_turns_by_state", renamed, removed)
         _rename_state_keyed_map(agent, "max_total_tokens_by_state", renamed, removed)
+        _rename_state_keyed_map(agent, "stall_timeout_ms_by_state", renamed, removed)
+        _rename_state_keyed_map(agent, "stage_kinds", renamed, removed)
 
     _add_stage_prompts(data, workflow_path, [s for s in specs if not s.terminal and s.name in added])
 
@@ -393,7 +399,7 @@ def write_prompt(workflow_path: Path, state: str, content: str) -> Path:
 
 
 # ---------------------------------------------------------------------------
-# branch policy (ported from tools/board-viewer text surgery, now round-trip)
+# branch policy (ported from legacy board-viewer text surgery, now round-trip)
 # ---------------------------------------------------------------------------
 
 
@@ -424,14 +430,17 @@ def set_continuous_improvement_settings(
     interval_ms: int | None = None,
     max_turns: int | None = None,
     agent_kind: str | None = None,
+    modes: list[str] | None = None,
 ) -> None:
     """Update the settable subset of `continuous_improvement:` in WORKFLOW.md.
 
-    Only `enabled`, `interval_ms`, `max_turns`, and `agent_kind` are writable
-    here — the remaining fields (`ticket_prefix`, `max_tickets_per_run`,
-    `require_idle_board`) are parse-only and must be hand-edited. Omitted
-    keyword arguments leave the existing value untouched; `agent_kind=""`
-    explicitly clears back to inheriting the workflow's default agent.
+    Only `enabled`, `interval_ms`, `max_turns`, `agent_kind`, and `modes` are
+    writable here — the remaining fields (`ticket_prefix`,
+    `max_tickets_per_run`, `mode_interval_hours`,
+    `max_improvement_tickets_per_run`, `require_idle_board`) are parse-only
+    and must be hand-edited. Omitted keyword arguments leave the existing
+    value untouched; `agent_kind=""` explicitly clears back to inheriting the
+    workflow's default agent, and `modes=[]` clears back to readiness-only.
     """
     if enabled is not None and not isinstance(enabled, bool):
         raise WorkflowMutationError("continuous_improvement.enabled must be a boolean")
@@ -466,6 +475,13 @@ def set_continuous_improvement_settings(
                 f"supported: {sorted(SUPPORTED_AGENT_KINDS)}"
             )
 
+    normalized_modes: list[str] | None = None
+    if modes is not None:
+        try:
+            normalized_modes = list(validated_ci_modes(modes))
+        except ConfigValidationError as exc:
+            raise WorkflowMutationError(exc.message) from exc
+
     data, body = _load_frontmatter(workflow_path)
     ci = _ensure_map(data, "continuous_improvement")
     if enabled is not None:
@@ -476,4 +492,159 @@ def set_continuous_improvement_settings(
         ci["max_turns"] = max_turns
     if normalized_agent_kind is not None:
         ci["agent_kind"] = normalized_agent_kind
+    if normalized_modes is not None:
+        if normalized_modes:
+            ci["modes"] = normalized_modes
+        else:
+            ci.pop("modes", None)
     _write_workflow_atomic(workflow_path, data, body)
+
+
+# ---------------------------------------------------------------------------
+# lane presets
+# ---------------------------------------------------------------------------
+
+
+def apply_lane_preset(workflow_path: Path, preset_name: str) -> StatesUpdatePlan:
+    """Apply a shipped lane preset as the board's new starting point.
+
+    Sets `tracker.active_states` to the preset lanes exactly, merges
+    `tracker.terminal_states` (preset lanes first, user extras kept),
+    rewrites `state_descriptions` (preset text for preset lanes, carried
+    text for surviving user lanes), and points `prompts.base` +
+    `prompts.stages` at the preset's prompt files. Everything else in the
+    frontmatter — comments, agent policy, hooks, per-state maps for
+    surviving lanes — is untouched, so a preset is a starting point and
+    the board stays fully customizable afterwards.
+
+    Old active lanes that are not part of the preset are removed (their
+    per-state map entries drop, matching `apply_states_update`); the
+    caller migrates their tickets to `plan.fallback_state`. Preset prompt
+    files ship under `docs/symphony-prompts/file/`; when a mapped file is
+    missing on this board a starter prompt is created so the workflow
+    stays loadable.
+
+    Returns the change plan; the caller migrates board tickets accordingly.
+    """
+    try:
+        preset = get_lane_preset(preset_name)
+    except ValueError as exc:
+        raise WorkflowMutationError(str(exc)) from exc
+
+    # Fail before touching WORKFLOW.md: a board without the preset's prompt
+    # bodies would otherwise switch lanes and lose every gate (F-11).
+    _require_preset_prompt_files(workflow_path, preset)
+
+    data, body = _load_frontmatter(workflow_path)
+    tracker = _ensure_map(data, "tracker")
+    old_active = [str(s) for s in tracker.get("active_states") or []]
+    old_terminal = [str(s) for s in tracker.get("terminal_states") or []]
+    old_names = {n.lower(): n for n in old_active + old_terminal}
+
+    preset_lanes_lower = {
+        s.lower() for s in preset.active_states + preset.terminal_states
+    }
+    extra_terminal = [t for t in old_terminal if t.lower() not in preset_lanes_lower]
+    new_active = list(preset.active_states)
+    new_terminal = list(preset.terminal_states) + extra_terminal
+
+    new_names_lower = {s.lower() for s in new_active + new_terminal}
+    removed = [
+        original
+        for low, original in old_names.items()
+        if low not in new_names_lower
+    ]
+    added = [
+        name
+        for name in new_active + new_terminal
+        if name.lower() not in old_names
+    ]
+
+    tracker["active_states"] = _flow_seq(new_active)
+    tracker["terminal_states"] = _flow_seq(new_terminal)
+
+    old_descriptions = {
+        str(k).lower(): str(v)
+        for k, v in (tracker.get("state_descriptions") or {}).items()
+    }
+    descriptions = CommentedMap()
+    for name in new_active + new_terminal:
+        text = preset.state_descriptions.get(name) or old_descriptions.get(
+            name.lower()
+        )
+        if text:
+            descriptions[name] = text
+    if descriptions or "state_descriptions" in tracker:
+        tracker["state_descriptions"] = descriptions
+
+    prompts = _ensure_map(data, "prompts")
+    prompts["base"] = preset.base_prompt
+    stages = _ensure_map(prompts, "stages")
+    _apply_key_changes(stages, {}, removed)
+    # Keep stage entries only for the preset's lanes and the user's own
+    # extra lanes — a leftover entry from the previous preset (e.g. the
+    # 4-lane Done report prompt on the deep board) would carry the wrong
+    # stage semantics.
+    allowed = {s.lower() for s in preset.stage_prompts} | {
+        t.lower() for t in extra_terminal
+    }
+    for existing in list(stages.keys()):
+        if str(existing).lower() not in allowed:
+            stages.pop(existing)
+    for state, rel in preset.stage_prompts.items():
+        for existing in list(stages.keys()):
+            if str(existing).lower() == state.lower() and str(existing) != state:
+                stages.pop(existing)
+        stages[state] = rel
+
+    agent = data.get("agent")
+    if isinstance(agent, dict):
+        _rename_state_keyed_map(agent, "max_concurrent_agents_by_state", {}, removed)
+        _rename_state_keyed_map(agent, "max_state_turns_by_state", {}, removed)
+        _rename_state_keyed_map(agent, "max_total_tokens_by_state", {}, removed)
+        _rename_state_keyed_map(agent, "stall_timeout_ms_by_state", {}, removed)
+        _rename_state_keyed_map(agent, "stage_kinds", {}, removed)
+
+    _write_workflow_atomic(workflow_path, data, body)
+    return StatesUpdatePlan(
+        renamed={},
+        removed=removed,
+        added=added,
+        fallback_state=new_active[0],
+    )
+
+
+def _require_preset_prompt_files(workflow_path: Path, preset: LanePreset) -> None:
+    """Refuse a preset apply when the board lacks the preset's prompt bodies.
+
+    F-11: this used to write placeholder stubs ("Do the work this column
+    stands for…") and report success. That is the normal state of any repo
+    bootstrapped before a preset shipped, so the board silently degraded from
+    a gated pipeline to "do something" — with the mutation already written.
+    The prompt bodies are documentation files (`docs/symphony-prompts/**`),
+    not package data, so the honest answer is to name the missing files and
+    the one command that fixes them.
+    """
+    workflow_dir = workflow_path.parent.resolve()
+
+    def _resolved(rel: str) -> Path:
+        path = (workflow_dir / rel).resolve()
+        if not path.is_relative_to(workflow_dir):
+            raise WorkflowMutationError(
+                f"prompt path escapes the workflow directory: {rel}"
+            )
+        return path
+
+    missing = [
+        rel
+        for rel in (preset.base_prompt, *preset.stage_prompts.values())
+        if not _resolved(rel).is_file()
+    ]
+    if not missing:
+        return
+    raise WorkflowMutationError(
+        f"lane preset {preset.name!r} needs prompt files this board does not "
+        f"have: {', '.join(sorted(missing))}. Copy them from the Symphony "
+        "checkout first: `cp -R <symphony>/docs/symphony-prompts "
+        f"{workflow_dir}/docs/`. Nothing was changed."
+    )

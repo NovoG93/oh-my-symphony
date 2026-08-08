@@ -21,6 +21,7 @@ from __future__ import annotations
 import asyncio
 import json
 import re
+from functools import partial
 from datetime import date, datetime
 from pathlib import Path
 from typing import Any, Awaitable, Callable
@@ -33,34 +34,50 @@ from .errors import (
     ChatBusyError,
     ChatNoSessionError,
     ChatSessionExistsError,
+    ConfigValidationError,
     SymphonyError,
 )
 from .issue import Issue, registration_order_key
 from .logging import get_logger
 from .skills import normalize_skill_names
 from .stats import StatsStore, stats_store_for
+from .trackers import context_manager as tracker_context_manager
 from .trackers.file import FileBoardTracker, parse_ticket_file
+from .trackers.validate import (
+    IDENTIFIER_RE as _IDENTIFIER_RE,
+    IDENTIFIER_RULE as _IDENTIFIER_RULE,
+    validate_ticket_dependencies,
+)
 from .utils import git_inspect, git_ops
 from .utils.auto_merge import auto_merge_on_done_best_effort
 from .utils.git_ops import GitOpResult
 from .orchestrator import Orchestrator
+from .product_preview import ProductPreviewError, ProductPreviewManager
 from .orchestrator.run_registry import clamp_run_history_limit
-from .workflow import SUPPORTED_AGENT_KINDS, SYMPHONY_BRANCH_PREFIX, ServiceConfig
+from .workflow import (
+    SUPPORTED_AGENT_KINDS,
+    SUPPORTED_CI_MODES,
+    SYMPHONY_BRANCH_PREFIX,
+    ServiceConfig,
+    validated_ci_modes,
+)
 from .workflow.mutate import (
     StateSpec,
     WorkflowMutationError,
+    apply_lane_preset,
     apply_states_update,
     read_prompt,
     set_branch_policy,
     set_continuous_improvement_settings,
     write_prompt,
 )
+from .workflow.preflight import stage_turn_budget_error
+from .workflow.presets import LANE_PRESETS, get_lane_preset, guess_lane_preset
 
 log = get_logger()
 
 STATIC_DIR = Path(__file__).parent / "web" / "static"
 
-_IDENTIFIER_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_-]{0,63}$")
 _BRANCH_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/-]{0,199}$")
 _COMMIT_RE = re.compile(r"^[0-9a-fA-F]{4,64}$")
 # `ChatManager` mints these as <UTC date>-<UTC time>-<6 hex>.
@@ -70,7 +87,7 @@ _MAX_BODY = 128_000
 _MAX_LABELS = 20
 _ALLOWED_HOSTS = {"localhost", "127.0.0.1", "[::1]"}
 _LOOPBACK_BINDS = {"", "localhost", "127.0.0.1", "::1", "[::1]"}
-_CI_EDITABLE_KEYS = {"enabled", "interval_ms", "max_turns", "agent_kind"}
+_CI_EDITABLE_KEYS = {"enabled", "interval_ms", "max_turns", "agent_kind", "modes"}
 BIND_HOST_KEY: web.AppKey[str] = web.AppKey("symphony.bind_host", str)
 CHAT_MANAGER_KEY: web.AppKey[ChatManager] = web.AppKey("symphony.chat", ChatManager)
 _MAX_CHAT_MESSAGE = 32_000
@@ -201,6 +218,10 @@ def _issue_card(
         "labels": list(issue.labels),
         "skills": list(issue.skills),
         "agent_kind": issue.agent_kind or "",
+        # Audit stamp on `stage_kinds`-routed boards, where the pin stays
+        # empty on purpose (F-20).
+        "last_agent_kind": issue.last_agent_kind or "",
+        "request": issue.request or "",
         "blocked_by": [
             {"identifier": b.identifier, "state": b.state} for b in issue.blocked_by
         ],
@@ -257,6 +278,13 @@ def _continuous_improvement_payload(cfg: ServiceConfig) -> dict[str, Any]:
         "ticket_prefix": ci.ticket_prefix,
         "max_tickets_per_run": ci.max_tickets_per_run,
         "require_idle_board": ci.require_idle_board,
+        "modes": list(ci.modes),
+        "resolved_modes": list(ci.resolved_modes()),
+        "supported_modes": list(SUPPORTED_CI_MODES),
+        "mode_interval_hours": {
+            mode: ci.interval_hours_for(mode) for mode in SUPPORTED_CI_MODES
+        },
+        "max_improvement_tickets_per_run": ci.max_improvement_tickets_per_run,
     }
 
 
@@ -272,9 +300,23 @@ def _workflow_payload(cfg: ServiceConfig) -> dict[str, Any]:
             "feature_base_branch": cfg.agent.feature_base_branch,
             "auto_merge_target_branch": cfg.agent.auto_merge_target_branch,
             "auto_merge_on_done": cfg.agent.auto_merge_on_done,
+            # F-06: the mechanical evidence floor is lane-name gated by
+            # default, so the UI must be able to say when it is off.
+            "stage_contracts": cfg.agent.stage_contracts,
+            "stage_contracts_enabled": cfg.agent.stage_contracts_enabled(
+                cfg.tracker.active_states
+            ),
         },
         "agent_kinds": sorted(SUPPORTED_AGENT_KINDS),
         "continuous_improvement": _continuous_improvement_payload(cfg),
+        "preview": {
+            "enabled": cfg.preview.enabled,
+            "cwd": cfg.preview.cwd,
+            "health_path": cfg.preview.health_path,
+            "url_path": cfg.preview.url_path,
+            "release_ticket": cfg.preview.release_ticket,
+            "acceptance": list(cfg.preview.acceptance),
+        },
         "polling_interval_ms": cfg.poll_interval_ms,
     }
 
@@ -312,9 +354,7 @@ def _check_identifier(raw: str) -> str:
     """
     identifier = (raw or "").strip()
     if not _IDENTIFIER_RE.match(identifier):
-        raise WorkflowMutationError(
-            "identifier must match ^[A-Za-z][A-Za-z0-9_-]{0,63}$"
-        )
+        raise WorkflowMutationError(f"identifier must match {_IDENTIFIER_RULE}")
     return identifier
 
 
@@ -373,6 +413,35 @@ def _check_labels(raw: Any) -> list[str]:
     return labels
 
 
+def _check_request(raw: Any) -> str:
+    """Optional request grouping id (e.g. REQ-1); empty string clears."""
+    if raw is None:
+        return ""
+    if not isinstance(raw, str):
+        raise WorkflowMutationError("request must be a string")
+    request = raw.strip()
+    if request and not _IDENTIFIER_RE.match(request):
+        raise WorkflowMutationError(f"request must match {_IDENTIFIER_RULE}")
+    return request
+
+
+def _check_blocked_by(raw: Any) -> list[str]:
+    if raw is None:
+        return []
+    if not isinstance(raw, list):
+        raise WorkflowMutationError("blocked_by must be a list of ticket identifiers")
+    out: list[str] = []
+    for item in raw:
+        if not isinstance(item, str):
+            raise WorkflowMutationError(
+                "blocked_by must be a list of ticket identifiers"
+            )
+        identifier = _check_identifier(item)
+        if identifier not in out:
+            out.append(identifier)
+    return out
+
+
 def _check_agent_kind(raw: Any) -> str:
     if raw is None:
         return ""
@@ -429,11 +498,24 @@ def _parse_ci_settings(body: dict[str, Any]) -> dict[str, Any]:
         updates["max_turns"] = value
     if "agent_kind" in body:
         updates["agent_kind"] = _check_agent_kind(body["agent_kind"])
+    if "modes" in body:
+        updates["modes"] = _check_ci_modes(body["modes"])
     if not updates:
         raise WorkflowMutationError(
-            "body must set enabled, interval_ms, max_turns, and/or agent_kind"
+            "body must set enabled, interval_ms, max_turns, modes, "
+            "and/or agent_kind"
         )
     return updates
+
+
+def _check_ci_modes(raw: Any) -> list[str]:
+    """Improvement modes; `[]` clears back to readiness-only."""
+    if raw is None:
+        return []
+    try:
+        return list(validated_ci_modes(raw))
+    except ConfigValidationError as exc:
+        raise WorkflowMutationError(exc.message) from exc
 
 
 def _check_state(cfg: ServiceConfig, raw: Any) -> str:
@@ -531,6 +613,7 @@ def _register_issue_routes(
             if body.get("state")
             else (cfg.tracker.active_states[0] if cfg.tracker.active_states else "Todo")
         )
+        blocked_by = _check_blocked_by(body.get("blocked_by"))
         fields = {
             "title": title,
             "state": state,
@@ -539,13 +622,26 @@ def _register_issue_routes(
             "description": _check_description(body.get("description")),
             "agent_kind": _check_agent_kind(body.get("agent_kind")) or None,
             "skills": list(normalize_skill_names(body.get("skills") or [])),
+            "blocked_by": blocked_by or None,
+            "request": _check_request(body.get("request")) or None,
         }
+        # F-15: validate and write under the same board lock so concurrent
+        # creates cannot jointly introduce a cycle or race the allocator.
+        def _validate(issues: list[Issue], resolved: str) -> None:
+            validate_ticket_dependencies(
+                issues,
+                identifier=resolved,
+                blocked_by=blocked_by,
+                new_ticket=True,
+            )
+
         raw_identifier = body.get("identifier")
+        prefix = "TASK"
+        identifier_arg: str | None = None
         if raw_identifier:
             if not isinstance(raw_identifier, str):
                 raise WorkflowMutationError("identifier must be a string")
-            identifier = _check_identifier(raw_identifier)
-            await asyncio.to_thread(tracker.create, identifier=identifier, **fields)
+            identifier_arg = _check_identifier(raw_identifier)
         else:
             prefix_raw = body.get("prefix")
             prefix = (
@@ -555,10 +651,15 @@ def _register_issue_routes(
             )
             if not re.match(r"^[A-Za-z][A-Za-z0-9]{0,15}$", prefix):
                 raise WorkflowMutationError("prefix must be 1-16 alphanumeric chars")
-
-            identifier, _ = await asyncio.to_thread(
-                tracker.create_with_next_identifier, prefix, **fields
+        identifier, _ = await asyncio.to_thread(
+            partial(
+                tracker.create_validated,
+                identifier=identifier_arg,
+                prefix=prefix,
+                validate=_validate,
+                **fields,
             )
+        )
         await asyncio.to_thread(
             ctx.stats().record_transition,
             issue=identifier,
@@ -622,6 +723,19 @@ def _register_issue_routes(
             ]
         if "agent_kind" in body:
             fields["agent_kind"] = _check_agent_kind(body.get("agent_kind"))
+        if "request" in body:
+            fields["request"] = _check_request(body.get("request"))
+        if "blocked_by" in body:
+            blocked_by = _check_blocked_by(body.get("blocked_by"))
+            await asyncio.to_thread(
+                lambda: validate_ticket_dependencies(
+                    tracker.scan_all(),
+                    identifier=identifier,
+                    blocked_by=blocked_by,
+                    new_ticket=False,
+                )
+            )
+            fields["blocked_by"] = blocked_by
         new_state: str | None = None
         if "state" in body:
             new_state = _check_state(cfg, body.get("state"))
@@ -690,12 +804,12 @@ def _register_issue_routes(
         orchestrator.request_refresh()
         return web.json_response({"identifier": identifier, "deleted": True})
 
-    async def handle_issue_skip_learn(request: web.Request) -> web.Response:
+    async def handle_issue_skip_document(request: web.Request) -> web.Response:
         identifier = _check_identifier(request.match_info["identifier"])
-        changed, message = await orchestrator.skip_learn(identifier)
+        changed, message = await orchestrator.skip_document(identifier)
         if not changed:
             status = 404 if message.startswith("unknown issue") else 409
-            return _json_error(status, "learn_skip_rejected", message)
+            return _json_error(status, "document_skip_rejected", message)
         return web.json_response(
             {"identifier": identifier, "skipped": True, "message": message}
         )
@@ -711,7 +825,11 @@ def _register_issue_routes(
     )
     app.router.add_delete("/api/v1/issues/{identifier}", _wrap(handle_issue_delete))
     app.router.add_post(
-        "/api/v1/issues/{identifier}/skip-learn", _wrap(handle_issue_skip_learn)
+        "/api/v1/issues/{identifier}/skip-document", _wrap(handle_issue_skip_document)
+    )
+    # Deprecated alias — lane renamed Learn -> Document; old scripts keep working.
+    app.router.add_post(
+        "/api/v1/issues/{identifier}/skip-learn", _wrap(handle_issue_skip_document)
     )
 
 
@@ -828,6 +946,85 @@ def _register_workflow_routes(
         orchestrator.workflow_state.reload()
         return web.json_response({"updated": sorted(updates)})
 
+    async def handle_lane_presets_get(_request: web.Request) -> web.Response:
+        cfg = ctx.config()
+        return web.json_response(
+            {
+                "presets": [
+                    {
+                        "name": preset.name,
+                        "label": preset.label,
+                        "active_states": list(preset.active_states),
+                        "terminal_states": list(preset.terminal_states),
+                    }
+                    for preset in LANE_PRESETS.values()
+                ],
+                "current": guess_lane_preset(cfg.tracker.active_states),
+            }
+        )
+
+    async def handle_lane_preset_apply(request: web.Request) -> web.Response:
+        body = await _read_json(request)
+        name = body.get("name")
+        if not isinstance(name, str) or not name.strip():
+            raise WorkflowMutationError("body must contain string `name`")
+        try:
+            preset = get_lane_preset(name)
+        except ValueError as exc:
+            raise WorkflowMutationError(str(exc)) from exc
+        cfg = ctx.config()
+        tracker = ctx.file_tracker()
+        # Same guard as handle_states_put: a running worker owns its
+        # ticket's state string — refuse to pull a lane out from under it.
+        preset_active = {s.lower() for s in preset.active_states}
+        for issue in orchestrator.iter_running_issues():
+            if issue.state.lower() not in preset_active:
+                return _json_error(
+                    409,
+                    "state_in_use",
+                    f"column {issue.state!r} has a running worker; "
+                    "wait or pause first",
+                )
+
+        plan = await asyncio.to_thread(apply_lane_preset, cfg.workflow_path, name)
+        migrated: dict[str, str] = {}
+        skipped: list[str] = []
+        for old in plan.removed:
+            for issue in await asyncio.to_thread(
+                tracker.fetch_issues_by_states, [old]
+            ):
+                if orchestrator.find_running_issue_id(issue.identifier) is not None:
+                    skipped.append(issue.identifier)
+                    continue
+                await asyncio.to_thread(
+                    tracker.transition, issue.identifier, plan.fallback_state
+                )
+                migrated[issue.identifier] = plan.fallback_state
+        orchestrator.workflow_state.reload()
+        orchestrator.request_refresh()
+        # F-23: an 8-lane preset needs `agent.max_turns >= len(active_states)`
+        # or the very next dispatch fails preflight. Report it in the response
+        # instead of letting the operator discover it at run time.
+        reloaded = orchestrator.workflow_state.current()
+        warning = (
+            stage_turn_budget_error(reloaded) if reloaded is not None else None
+        )
+        if warning:
+            log.warning(
+                "lane_preset_turn_budget_warning", preset=preset.name, detail=warning
+            )
+        return web.json_response(
+            {
+                "applied": preset.name,
+                "added": plan.added,
+                "removed": plan.removed,
+                "migrated": migrated,
+                "skipped_running": skipped,
+                "fallback_state": plan.fallback_state,
+                "warning": warning,
+            }
+        )
+
     async def handle_continuous_improvement_put(
         request: web.Request,
     ) -> web.Response:
@@ -841,6 +1038,7 @@ def _register_workflow_routes(
             interval_ms=updates.get("interval_ms"),
             max_turns=updates.get("max_turns"),
             agent_kind=updates.get("agent_kind"),
+            modes=updates.get("modes"),
         )
         new_cfg, err = orchestrator.workflow_state.reload()
         if new_cfg is None:
@@ -873,6 +1071,10 @@ def _register_workflow_routes(
     app.router.add_get("/api/v1/workflow/prompts/{state}", _wrap(handle_prompt_get))
     app.router.add_put("/api/v1/workflow/prompts/{state}", _wrap(handle_prompt_put))
     app.router.add_put("/api/v1/workflow/branch-policy", _wrap(handle_branch_policy_put))
+    app.router.add_get("/api/v1/workflow/presets", _wrap(handle_lane_presets_get))
+    app.router.add_post(
+        "/api/v1/workflow/presets/apply", _wrap(handle_lane_preset_apply)
+    )
     app.router.add_put(
         "/api/v1/workflow/continuous-improvement",
         _wrap(handle_continuous_improvement_put),
@@ -1622,6 +1824,126 @@ def _register_chat_routes(
 # ---------------------------------------------------------------------------
 
 
+def _register_preview_routes(
+    app: web.Application, ctx: _Ctx, orchestrator: Orchestrator
+) -> None:
+    manager = ProductPreviewManager()
+
+    def release_gate(
+        cfg: ServiceConfig, *, authoritative: bool = False
+    ) -> dict[str, Any]:
+        ticket = cfg.preview.release_ticket
+        if not ticket:
+            return {
+                "ticket": "",
+                "state": None,
+                "ready": True,
+                "reason": "No release ticket configured",
+            }
+        state: str | None = None
+        title: str | None = None
+        if cfg.tracker.kind == "file":
+            issue = ctx.file_tracker().fetch_issue_full_by_id(ticket)
+            if issue is not None:
+                state, title = issue.state, issue.title
+        elif authoritative:
+            # Launch/restart must use tracker truth, not a possibly stale live
+            # orchestrator snapshot. Status polling keeps the cheap snapshot.
+            with tracker_context_manager(cfg) as tracker:
+                issue = tracker.fetch_issue_full_by_id(ticket)
+            if issue is not None:
+                state, title = issue.state, issue.title
+        else:
+            snapshot = orchestrator.issue_snapshot(ticket)
+            if snapshot:
+                state = snapshot.get("state")
+                title = snapshot.get("title")
+        ready = isinstance(state, str) and state.strip().lower() == "done"
+        reason = (
+            "Release verification passed"
+            if ready
+            else f"{ticket} must be Done before launch"
+        )
+        return {
+            "ticket": ticket,
+            "title": title,
+            "state": state,
+            "ready": ready,
+            "reason": reason,
+        }
+
+    async def payload() -> dict[str, Any]:
+        cfg = ctx.config()
+        status = await manager.status(cfg)
+        if not cfg.preview.enabled and status["phase"] == "stopped":
+            status["phase"] = "disabled"
+        return {
+            "configured": bool(cfg.preview.command),
+            "enabled": cfg.preview.enabled,
+            **status,
+            "release_gate": release_gate(cfg),
+            "acceptance": list(cfg.preview.acceptance),
+        }
+
+    async def get_preview(_request: web.Request) -> web.Response:
+        return web.json_response(await payload())
+
+    async def mutate(request: web.Request, action: str) -> web.Response:
+        # Unlike ordinary JSON mutations, these bodyless process controls
+        # would otherwise be submit-able by a cross-origin HTML form without
+        # a CORS preflight. Require JSON even when the body is empty.
+        if request.content_type != "application/json":
+            return _json_error(
+                415,
+                "unsupported_media_type",
+                "Product Preview actions require application/json",
+            )
+        bind = str(request.app.get(BIND_HOST_KEY) or "127.0.0.1").lower()
+        if bind not in _LOOPBACK_BINDS:
+            return _json_error(
+                403,
+                "preview_loopback_required",
+                "Product Preview process control is available only on loopback",
+            )
+        body = await _read_json(request)
+        if body:
+            return _json_error(
+                400,
+                "invalid_body",
+                "Product Preview actions do not accept command or path input",
+            )
+        cfg = ctx.config()
+        gate = release_gate(cfg, authoritative=action in {"start", "restart"})
+        if action in {"start", "restart"} and not gate["ready"]:
+            return _json_error(409, "release_not_ready", str(gate["reason"]))
+        try:
+            if action == "start":
+                await manager.start(cfg)
+            elif action == "restart":
+                await manager.restart(cfg)
+            else:
+                await manager.stop(cfg)
+        except ProductPreviewError as exc:
+            return _json_error(409, "preview_error", str(exc))
+        return web.json_response(await payload())
+
+    app.router.add_get("/api/v1/preview", _wrap(get_preview))
+    app.router.add_post(
+        "/api/v1/preview/start", _wrap(partial(mutate, action="start"))
+    )
+    app.router.add_post(
+        "/api/v1/preview/restart", _wrap(partial(mutate, action="restart"))
+    )
+    app.router.add_post(
+        "/api/v1/preview/stop", _wrap(partial(mutate, action="stop"))
+    )
+
+    async def cleanup(_app: web.Application) -> None:
+        await manager.close()
+
+    app.on_cleanup.append(cleanup)
+
+
 def _register_meta_routes(
     app: web.Application, ctx: _Ctx, orchestrator: Orchestrator
 ) -> None:
@@ -1668,4 +1990,5 @@ def register_web_routes(app: web.Application, orchestrator: Orchestrator) -> Non
     _register_workflow_routes(app, ctx, orchestrator)
     _register_git_routes(app, ctx, orchestrator)
     _register_chat_routes(app, ctx, orchestrator)
+    _register_preview_routes(app, ctx, orchestrator)
     _register_meta_routes(app, ctx, orchestrator)

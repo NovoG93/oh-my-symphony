@@ -1,5 +1,11 @@
 # Requirements: Human Review Confirmation Gate
 
+> **Superseded — archived design record.** This document describes the repo as
+> it was when the spec was written. `tools/board-viewer/` and the `Learn` lane
+> no longer exist (the built-in admin web app on `server.port` is the only
+> board; `Learn` was renamed `Document`). Kept for the decision history, not
+> as a description of current behaviour.
+
 ## Introduction
 
 Symphony's production pipeline normally closes successful work in `Done` from

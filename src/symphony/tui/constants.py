@@ -13,6 +13,8 @@ STATE_COLOR = {
     "todo": "bright_black",
     "in progress": "cyan",
     "verify": "yellow",
+    "document": "bright_magenta",
+    # legacy lane name (pre-rename boards)
     "learn": "bright_magenta",
     "human review": "magenta",
     "blocked": "red",
@@ -29,6 +31,7 @@ AGENT_COLOR = {
     "codex": "bright_blue",
     "claude": "bright_magenta",
     "gemini": "bright_yellow",
+    "prime-agent": "bright_cyan",
 }
 
 

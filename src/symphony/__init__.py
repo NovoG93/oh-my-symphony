@@ -18,7 +18,7 @@ Layout (see ``AGENTS.md`` for full SPEC references):
     - ``trackers``      — tracker protocol + ``file`` / ``jira`` / ``linear`` adapters (SPEC §11)
 
 * Agents
-    - ``backends``      — codex / claude_code / gemini / agy / kiro / opencode / pi (SPEC §10)
+    - ``backends``      — codex / claude_code / gemini / agy / kiro / opencode / pi / prime_agent (SPEC §10)
     - ``agent``         — backwards-compat shim for ``symphony.backends.*``
 
 * Orchestration
@@ -47,4 +47,4 @@ Layout (see ``AGENTS.md`` for full SPEC references):
     - ``mock_codex``    — mock Codex app-server, runnable as ``python -m symphony.mock_codex``
 """
 
-__version__ = "0.16.1"
+__version__ = "0.18.0"

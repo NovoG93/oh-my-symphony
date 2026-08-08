@@ -143,7 +143,7 @@ def test_web_chat_page_contract() -> None:
     html = (STATIC_ROOT / "index.html").read_text(encoding="utf-8")
 
     assert 'data-route="chat"' in html
-    assert "const ROUTES = ['board', 'stats', 'workflow', 'git', 'chat', 'settings']" in js
+    assert "const ROUTES = ['board', 'stats', 'workflow', 'git', 'chat', 'preview', 'settings']" in js
     assert "function renderChatPage(container)" in js
     assert "getChatSession: () => apiRequest('/chat/session')" in js
     assert "createChatSession: (payload)" in js
@@ -217,3 +217,92 @@ def test_web_chat_font_controls_contract() -> None:
     assert "function buildFontControls(view)" in js
     assert ".chat-font-controls" in css
     assert "font-size: inherit" in css
+
+
+def test_web_settings_lane_preset_contract() -> None:
+    js = _script_bundle()
+
+    assert "getLanePresets: () => apiRequest('/workflow/presets')" in js
+    assert "applyLanePreset: (name)" in js
+    assert "function buildLanePresetCard(presets, wf)" in js
+    assert "body.appendChild(buildLanePresetCard(lanePresets, wf));" in js
+    assert "'settings.lanePreset': 'Lane preset'" in js
+    assert "'common.apply': 'Apply'" in js
+
+
+def test_web_settings_stage_contracts_hint_contract() -> None:
+    """F-06: a board whose lanes disable the evidence floor must say so."""
+    js = _script_bundle()
+    css = (STATIC_ROOT / "style.css").read_text(encoding="utf-8")
+
+    assert "function buildStageContractsRow(wf)" in js
+    assert "agent.stage_contracts_enabled !== false" in js
+    assert "buildStageContractsRow(wf)," in js
+    assert "'settings.stageContracts': 'Stage contracts'" in js
+    assert "'settings.stageContractsOff'" in js
+    assert ".form-hint-warn" in css
+
+
+def test_web_board_renders_dependency_and_request_chips() -> None:
+    """F-14: the API returned blocked_by/request; the board ignored both."""
+    js = _script_bundle()
+    css = (STATIC_ROOT / "style.css").read_text(encoding="utf-8")
+
+    assert "function blockedByIds(issue)" in js
+    assert "function parseIdList(value)" in js
+    assert "class: 'chip-blocked'" in js
+    assert "class: 'chip-request'" in js
+    assert ".chip-blocked" in css
+    assert ".chip-request" in css
+    # Create modal + drawer can both set them, through the validating API.
+    assert "blocked_by: parseIdList(blockedByInput.value)" in js
+    assert "request: requestInput.value.trim()" in js
+    assert "commitField(\n        detail.identifier, 'blocked_by', ids," in js
+    assert "field(t('common.blockedBy'), blockedByInput)" in js
+    assert "'common.blockedBy': 'Blocked by'" in js
+    assert "'board.blockedByPlaceholder'" in js
+
+
+def test_web_markdown_renders_human_readable_tables() -> None:
+    """LLM-authored ticket Markdown must render as safe, readable HTML nodes."""
+    js = _script_bundle()
+    css = (STATIC_ROOT / "style.css").read_text(encoding="utf-8")
+
+    assert "function renderMarkdown(source)" in js
+    assert "function parseTableAt(lines, index)" in js
+    assert "function parseTableAlignments(line)" in js
+    assert "el('table', { class: 'md-table' }" in js
+    assert "class: `md-table-cell md-align-${alignments[index] || 'left'}`" in js
+    assert ".md-table-wrap" in css
+    assert ".md-table-cell" in css
+
+
+def test_web_product_preview_page_contract() -> None:
+    js = _script_bundle()
+    css = (STATIC_ROOT / "style.css").read_text(encoding="utf-8")
+    html = (STATIC_ROOT / "index.html").read_text(encoding="utf-8")
+
+    assert 'data-route="preview"' in html
+    assert 'data-i18n="nav.preview"' in html
+    assert "getPreview: () => apiRequest('/preview')" in js
+    assert "startPreview: () => apiRequest('/preview/start', { method: 'POST', body: '{}' })" in js
+    assert "stopPreview: () => apiRequest('/preview/stop', { method: 'POST', body: '{}' })" in js
+    assert "restartPreview: () => apiRequest('/preview/restart', { method: 'POST', body: '{}' })" in js
+    assert "function renderPreviewPage(container)" in js
+    assert "function paintPreviewPage(body, data)" in js
+    assert "function safePreviewUrl(value)" in js
+    assert "previewPollTimer = setTimeout(() => refreshPreviewPage(body, false), 3000)" in js
+    assert "role: 'log'" in js
+    assert "'aria-live': 'polite'" in js
+    assert "el('iframe'" in js
+    assert "title: t('preview.iframeTitle')" in js
+    assert "rel: 'noopener noreferrer'" in js
+    assert "data.release_gate || {}" in js
+    assert "Array.isArray(data.acceptance)" in js
+    assert "'preview.title': 'Product Preview'" in js
+    assert "'preview.title': '제품 프리뷰'" in js
+    assert ".preview-command-deck" in css
+    assert ".preview-status.running" in css
+    assert ".preview-frame" in css
+    assert ".preview-log-output" in css
+    assert "@media (max-width: 560px)" in css

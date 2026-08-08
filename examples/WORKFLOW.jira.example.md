@@ -18,7 +18,7 @@ tracker:
   # these to match your project's actual workflow statuses — the names
   # are inserted verbatim into the JQL `status in (...)` clause and
   # matched case-insensitively when resolving transitions.
-  active_states: ["To Do", "In Progress", "Verify", "Learn"]
+  active_states: ["To Do", "In Progress", "Verify", "Document"]
   terminal_states: ["Human Review", "Done", "Cancelled", "Blocked"]
   # Auto-archive sweep — terminal-state issues older than archive_after_days
   # transition to archive_state. Set to 0 to disable. The target state must

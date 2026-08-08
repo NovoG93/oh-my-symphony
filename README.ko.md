@@ -7,9 +7,9 @@
 [![Tests](https://github.com/cskwork/oh-my-symphony/actions/workflows/tests.yml/badge.svg)](https://github.com/cskwork/oh-my-symphony/actions/workflows/tests.yml)
 [![GitHub stars](https://img.shields.io/github/stars/cskwork/oh-my-symphony?style=social)](https://github.com/cskwork/oh-my-symphony/stargazers)
 
-> 하나의 관리자 UI, 하나의 터미널, 하나의 칸반 보드, 일곱 개의 AI 코딩 에이전트
+> 하나의 관리자 UI, 하나의 터미널, 하나의 칸반 보드, 여덟 개의 AI 코딩 에이전트
 > (**Codex**, **Claude Code**, **Gemini**, **AGY/Antigravity**, **Kiro**,
-> **OpenCode**, **Pi**) — 티켓마다 골라 쓰고, 병렬로 실행하며, 실시간으로 지켜본다.
+> **OpenCode**, **Pi**, **Prime Agent**) — 티켓마다 골라 쓰고, 병렬로 실행하며, 실시간으로 지켜본다.
 
 ![Symphony 9999 admin UI screenshot](docs/admin-ui-screenshot.png)
 
@@ -34,6 +34,9 @@
 - [설치](#install)
 - [60초 체험](#try-it-in-60-seconds-no-agent-cli-required)
 - [첫 작업 Quickstart](#quickstart--your-first-task-end-to-end)
+- [레인 프리셋](#lane-presets)
+- [채팅 인테이크](#chat-intake--채팅에-요청하면-보드가-배달한다)
+- [지속적 개선](#continuous-improvement--실험적-자율-유지보수)
 - [실행](#run)
 - [구조](#layout)
 - [테스트](#tests)
@@ -42,7 +45,7 @@
 
 ## Why Symphony?
 
-- **벤더 종속 없음.** Codex ↔ Claude Code ↔ Gemini ↔ AGY ↔ Kiro ↔ OpenCode ↔ Pi를 YAML 한 줄로
+- **벤더 종속 없음.** Codex ↔ Claude Code ↔ Gemini ↔ AGY ↔ Kiro ↔ OpenCode ↔ Pi ↔ Prime Agent를 YAML 한 줄로
   바꾸거나, 티켓마다 백엔드를 섞어 쓴다. 새 에이전트(Ollama, 로컬 모델,
   CLI가 있는 무엇이든)는 오케스트레이터를 바꾸지 않고 얇은
   `AgentBackend` Protocol 뒤에 끼워 넣으면 된다.
@@ -60,15 +63,14 @@
   Symphony를 체험하는 데는 둘 다 필요하지 않다.
 - **검증된 기반 위에 로컬 운영 안정성을 더했다.**
   [OpenAI의 공식 Symphony 레퍼런스 구현](https://github.com/openai/symphony)에서
-  포크했다. 이 포크는 파일 우선 오케스트레이션 모델을 유지하면서 일곱 개의
+  포크했다. 이 포크는 파일 우선 오케스트레이션 모델을 유지하면서 여덟 개의
   백엔드, TUI / 웹 운영 화면, SQLite 실행 lease, 재시작에도 보존되는 이슈
   플래그, 잠금 기반 Markdown 티켓 쓰기를 더한다.
 - **뷰어가 아니라 진짜 웹 앱.** 오케스트레이터 포트가 Linear 스타일 보드를
-  직접 서빙한다: 이슈 등록, 드래그로 컬럼 이동, 컬럼 추가/삭제/이름변경,
-  컬럼별 스테이지 프롬프트 편집, 브랜치 정책 선택, 워커 Pause / Resume,
-  Learn 스킵, 그리고 전용 통계 페이지(일별 토큰, 컬럼별 체류 시간,
-  에이전트별 합계)까지. 모든 편집은 주석을 보존한 채 `WORKFLOW.md`로
-  왕복 저장된다.
+  직접 서빙한다: 이슈 CRUD, 드래그 앤 드롭 컬럼, 컬럼별 스테이지 프롬프트,
+  브랜치 정책, Pause / Resume, 레인 프리셋, 검증된 티켓 DAG를 등록하는
+  운영자 채팅, 그리고 통계 페이지까지. 모든 편집은 주석을 보존한 채
+  `WORKFLOW.md`로 왕복 저장된다.
 - **운영자급 도구가 기본 제공.** `symphony doctor`는 첫 실행에서 가장 흔한
   다섯 가지 실패(포트 충돌, CLI 누락, 자리표시자 URL, 쓰기 불가 워크스페이스)를
   한 번에 잡아낸다. `symphony service start/stop/restart/logs`는 오케스트레이터를
@@ -80,7 +82,7 @@
 - 버그 수정, 문서 갱신, 마이그레이션 티켓을 여러 코딩 에이전트에 걸쳐 동시에
   병렬화하는 **팀**.
 - 동일한 프롬프트와 워크스페이스로 Codex, Claude Code, Gemini,
-  AGY/Antigravity, Kiro, OpenCode, Pi가 같은 작업을 어떻게 처리하는지 나란히
+  AGY/Antigravity, Kiro, OpenCode, Pi, Prime Agent가 같은 작업을 어떻게 처리하는지 나란히
   비교하는 **연구자와 리뷰어**.
 - "에이전트당 채팅 창 하나"의 한계에 부딪혀, 한눈에 읽히는 칸반을 갖춘 진짜
   오케스트레이터를 원하는 **누구든**.
@@ -94,7 +96,7 @@
   agent=codex  tracker=linear  workflow=WORKFLOW.md  lang=en   running=2  retrying=1   │  tokens in=84,200 out=27,640 total=111,840
                                                                                        │  rate-limits=requests_remaining=4823, tokens_remaining=1.2M
 
-╭── Todo [1/4] (3) ╮ ╭── In Progress [2/4] ╮ ╭── Verify [3/4] ╮ ╭── Learn [4/4] ╮ ╭── Done (2) ──╮ ╭── detail ───────────────────────╮
+╭── Todo [1/4] (3) ╮ ╭── In Progress [2/4] ╮ ╭── Verify [3/4] ╮ ╭── Document [4/4] ╮ ╭── Done (2) ──╮ ╭── detail ───────────────────────╮
 │  DEMO-120 [1/4]  │ │  DEMO-104 [2/4] ●   │ │  DEMO-122 [3/4]│ │  DEMO-123     │ │  DEMO-088    │ │  DEMO-104 [2/4]                 │
 │  Migrate auth …  │ │  Fix race condi…    │ │  Review + QA   │ │  S skip       │ │  Drop dead-… │ │  Fix race condition in pagina…  │
 │  #backend …      │ │  turn 4  20,180t    │ │  #docs         │ │  Wiki notes   │ │  DEMO-091    │ │                                 │
@@ -108,7 +110,7 @@
 │  blocked by D…   │                                                                                 ╰─────────────────────────────────╯
 ╰──────────────────╯
 
-q quit · r refresh · enter details · n new · e edit · s stats · S skip Learn · P pause/resume · / filter · ?
+q quit · r refresh · enter details · n new · e edit · s stats · S skip Document · P pause/resume · / filter · ?
 ```
 
 </details>
@@ -118,7 +120,7 @@ q quit · r refresh · enter details · n new · e edit · s stats · S skip Lea
 안에서 Codex 세션을 실행한다. 이 포크는 그 오케스트레이터를 유지하면서 다음을
 더한다:
 
-1. 일곱 개의 구체 어댑터를 가진 플러그형 **AgentBackend** 레이어:
+1. 여덟 개의 구체 어댑터를 가진 플러그형 **AgentBackend** 레이어:
    - **Codex** — `codex app-server` (JSON-RPC stdio, 멀티턴) — 원본
    - **Claude Code** — `claude -p --output-format stream-json --verbose`
      (NDJSON 이벤트, `--resume`를 쓰는 턴별 서브프로세스)
@@ -133,12 +135,15 @@ q quit · r refresh · enter details · n new · e edit · s stats · S skip Lea
    - **Pi** — `pi --mode json -p ""` (JSONL 이벤트, `--session` 재개를 쓰는
      턴별 서브프로세스; 하나의 CLI 아래에서 Anthropic / OpenAI / Gemini / Bedrock
      백엔드를 지원 — [pi.dev](https://pi.dev) 참고)
+   - **Prime Agent** — `prime-agent -p --mode json` (Pi와 같은 JSONL 이벤트,
+     `--resume` 재개를 쓰는 턴별 서브프로세스; `/login` 또는 provider API 키 사용,
+     자격 증명은 `~/.prime/agent/auth.json`에 저장)
 2. [Textual](https://textual.textualize.io) 기반 **Jira 스타일 CLI 칸반 TUI**.
    컬럼은 트래커 상태이고, 카드는 현재 에이전트, 턴 수, 마지막 이벤트, 누적
    토큰을 보여준다. 카드는 포커스할 수 있고, 마우스 휠로 각 레인을 스크롤하며,
    카드에서 `enter`를 누르면 전체 상세 모달이, `n`으로 멀티라인 새 티켓 등록,
-   `e`로 포커스 티켓 편집, `S`로 Learn 스킵, `s`로 통계 화면이 열린다.
-3. 오케스트레이터 포트에 내장된 **웹 칸반 앱** — 이슈 CRUD, Learn 스킵,
+   `e`로 포커스 티켓 편집, `S`로 Document 스킵, `s`로 통계 화면이 열린다.
+3. 오케스트레이터 포트에 내장된 **웹 칸반 앱** — 이슈 CRUD, Document 스킵,
    드래그 앤 드롭 상태 이동, 컬럼 추가/삭제/이름변경, 컬럼별 프롬프트
    편집, 브랜치 정책, 전용 통계 페이지.
 4. `.symphony/state.db`의 **단일 노드 신뢰성 ledger** — 활성 실행 lease가
@@ -154,7 +159,7 @@ q quit · r refresh · enter details · n new · e edit · s stats · S skip Lea
 
 ```yaml
 agent:
-  kind: claude          # codex | claude | gemini | agy | kiro | opencode | pi
+  kind: claude          # codex | claude | gemini | agy | kiro | opencode | pi | prime-agent
 
 claude:
   command: claude -p --output-format stream-json --verbose
@@ -165,10 +170,15 @@ pi:
   command: pi --mode json -p ""
   resume_across_turns: true
   turn_timeout_ms: 3600000
+
+prime_agent:
+  command: prime-agent -p --mode json
+  resume_across_turns: true
+  turn_timeout_ms: 3600000
 ```
 
 각 백엔드는 자기 블록(`codex`, `claude`, `gemini`, `agy`, `kiro`,
-`opencode`, `pi`)을 읽으며, 런타임에는
+`opencode`, `pi`, `prime_agent`)을 읽으며, 런타임에는
 `agent.kind`에 맞는 것만 사용된다. Codex `linear_graphql` 클라이언트 도구는
 `agent.kind=codex`일 때만 노출된다.
 
@@ -182,9 +192,18 @@ agent:
 
 손으로 편집한 카드에는 플랫 별칭 `agent_kind: codex`도 허용된다.
 모든 백엔드 명령과 타임아웃 설정은 여전히 `WORKFLOW.md`의 해당 전역
-`codex:`, `claude:`, `gemini:`, `agy:`, `kiro:`, `opencode:`, `pi:` 블록에서 가져온다.
+`codex:`, `claude:`, `gemini:`, `agy:`, `kiro:`, `opencode:`, `pi:`,
+`prime_agent:` 블록에서 가져온다.
 CLI에서 파일 보드 티켓을 만들 때는
 `symphony board new TASK-2 "title" --agent-kind codex`를 쓴다.
+
+티켓 고정값과 전역 기본값 사이에는 선택적 상태별 라우팅이 있다:
+`agent.stage_kinds`는 보드 상태를 에이전트 kind에 매핑해서, 가벼운 레인은
+저렴하고 빠른 에이전트가(예: `Todo: gemini`, `Document: gemini`), Plan/Build/Review는
+강한 기본 에이전트가 맡게 한다. 디스패치별 우선순위: 티켓 `agent_kind` 고정 >
+`agent.stage_kinds[state]` > `agent.kind`. 백엔드는 상태가 바뀔 때마다 다시
+결정된다 — 한 번의 디스패치 안에서 일어나는 레인 전환도 포함이라, In Progress →
+Verify → Document를 한 디스패치로 걷는 티켓도 레인마다 설정된 백엔드를 받는다.
 
 파일 보드 워크플로에서 `agent.auto_triage_actionable_todo`는 기본값이
 `true`다: 본문과 `Acceptance Criteria` 섹션이 있는 Todo 티켓은 모델 턴을 쓰지 않고
@@ -210,6 +229,7 @@ pip install -e ".[dev]"
 | `kiro`       | `kiro-cli` (Kiro CLI — `https://cli.kiro.dev/install`에서 설치; headless 실행에는 `kiro-cli login` 또는 `KIRO_API_KEY` 필요) |
 | `opencode`   | `opencode` (OpenCode CLI — `npm install -g opencode-ai`로 설치, `opencode auth login`으로 provider 인증) |
 | `pi`         | `pi` (Pi coding-agent — `npm i -g @earendil-works/pi-coding-agent` or `curl -fsSL https://pi.dev/install.sh \| sh`; sign in once via `pi` → `/login` (OAuth, credentials cached at `~/.pi/agent/auth.json`) — no env var needed) |
+| `prime-agent` | `prime-agent` (Prime Agent — install from the Prime Agent installer; sign in via `prime-agent` → `/login`, or provide a provider API key; credentials cached at `~/.prime/agent/auth.json`) |
 
 ## Try it in 60 seconds (no agent CLI required)
 
@@ -228,7 +248,7 @@ pip install -e ".[dev]"
 cat > WORKFLOW.md <<'YAML'
 ---
 tracker: { kind: file, board_root: ./kanban,
-           active_states: [Todo, "In Progress", Verify, Learn],
+           active_states: [Todo, "In Progress", Verify, Document],
            terminal_states: ["Human Review", Done, Blocked, Archive] }
 polling: { interval_ms: 5000 }
 workspace: { root: ~/symphony_workspaces }
@@ -333,7 +353,7 @@ cp WORKFLOW.file.example.md WORKFLOW.md
 tracker:
   kind: file
   board_root: ./kanban
-  active_states: [Todo, "In Progress", Verify, Learn]
+  active_states: [Todo, "In Progress", Verify, Document]
   terminal_states: ["Human Review", Done, Blocked, Archive]
 
 workspace:
@@ -377,7 +397,20 @@ symphony board new TASK-1 "Fix flaky pagination test" \
   --labels backend,test \
   --description "tests/test_pagination.py::test_cursor_advance is flaky on CI."
 # → created kanban/TASK-1.md
+
+# 구조화 생성: 의존성, request 그룹, 본문을 파일/표준입력으로.
+symphony board new TASK-2 "Add regression test" \
+  --blocked-by TASK-1 \
+  --request REQ-1 \
+  --label test --label ci \
+  --description-file ./spec.md      # 또는 `-`로 stdin에서 읽기
 ```
+
+`new`는 쓰기 전에 검증한다: 고유 id, `tracker.active_states`/`terminal_states`에
+있는 상태, 모든 `--blocked-by` 대상이 보드에 존재할 것, 그리고 추가된 간선이
+의존성 그래프를 비순환(acyclic)으로 유지할 것(위반 시 사이클 경로를 출력하고
+0이 아닌 코드로 종료). 웹 API의 이슈 생성/수정 엔드포인트도 같은 규칙을
+적용한다.
 
 확인:
 
@@ -385,6 +418,8 @@ symphony board new TASK-1 "Fix flaky pagination test" \
 symphony board ls                    # all tickets
 symphony board ls --state Todo       # filter by state
 symphony board show TASK-1           # full body
+symphony board graph                 # 의존성 DAG (토폴로지 순, 들여쓰기)
+symphony board graph --request REQ-1 # 한 request 그룹만
 ```
 
 ### 4. Launch the TUI
@@ -551,25 +586,91 @@ symphony board mv TASK-1 Blocked         # forces a state transition
 
 ## Custom prompts
 
-`WORKFLOW.md`는 `docs/` 아래의 편집 가능한 프롬프트 파일을 가리킬 수 있다:
+`WORKFLOW.md`는 Quickstart에 나온 `prompts.base` + `prompts.stages` 맵으로
+`docs/` 아래의 편집 가능한 프롬프트 파일을 가리킨다. Symphony는 `base`와
+티켓의 현재 상태에 해당하는 프롬프트 파일만 보내, 각 턴을 작게 유지한다.
+`prompts` 블록이 없으면 `WORKFLOW.md`의 인라인 본문이 여전히 레거시 폴백으로
+동작한다. 프롬프트는 웹 앱의 **Workflow** 페이지에서도 그 자리에서 편집할 수
+있다 — 같은 파일이며, 재시작이 필요 없다.
 
-```yaml
-prompts:
-  base: ./docs/symphony-prompts/file/base.md
-  stages:
-    Todo: ./docs/symphony-prompts/file/stages/todo.md
-    "In Progress": ./docs/symphony-prompts/file/stages/in-progress.md
-    Verify: ./docs/symphony-prompts/file/stages/verify.md
-    Learn: ./docs/symphony-prompts/file/stages/learn.md
-    Done: ./docs/symphony-prompts/file/stages/done.md
-```
+## Lane presets
 
-Symphony는 `base`와 티켓의 현재 상태에 해당하는 프롬프트 파일만 보내, 각 턴을
-예전의 전 단계 프롬프트보다 작게 유지한다. `prompts` 블록이 없으면 `WORKFLOW.md`의
-인라인 본문이 여전히 레거시 폴백으로 동작한다.
+보드는 프리셋에서 시작하고, 이후에도 완전히 커스터마이즈할 수 있다:
+
+- **default** — 간결한 4레인 보드 `Todo → In Progress → Verify → Document`.
+  짧은 스테이지 프롬프트를 쓰고, `orchestrator/contracts.py`의 스테이지
+  계약이 기계적 게이트다. 복잡한 작업은 레인을 늘리는 대신 티켓 DAG
+  (`--blocked-by` / `--request`)로 표현한다.
+- **deep** — 복잡한 딜리버리를 위한 선택적 8레인 파이프라인
+  `Intake → Research → Plan → Review → Build → QA → Verify → Document`.
+  레인마다 자체 경량 게이트를 갖고(Verify/Document는 리터럴
+  `grep 'verdict: GREEN'` 검사를 실행), Plan 레인이 `symphony board new
+  --blocked-by --request`로 Build/QA/Verify/Document 티켓 DAG를 만든다.
+
+프리셋 전환은 웹 앱의 **Settings** 페이지에서 하거나
+`GET /api/v1/workflow/presets` + `POST /api/v1/workflow/presets/apply`로
+한다. 프리셋 적용은 레인 CRUD와 같은 주석 보존 `WORKFLOW.md` 왕복 저장을
+거치므로 사용자의 주석과 커스터마이징이 살아남고, 제거된 레인의 티켓은
+폴백 상태로 마이그레이션된다. 프리셋은 시작점이지 감옥이 아니다 — 이후에도
+레인 추가/삭제/이름변경과 컬럼별 프롬프트 편집은 그대로 동작한다.
+
+## Chat intake — 채팅에 요청하면, 보드가 배달한다
+
+어드민 UI에는 같은 에이전트 CLI가 뒷받침하는 **Chat** 페이지가 있다. 채팅은
+단순 Q&A가 아니다: edit 모드에서 채팅 에이전트는 보드 인테이크 프로토콜을
+따른다. 요청을 입력하면 에이전트가 (요청이 모호할 때만, 최대 두 턴으로)
+범위를 확인한 뒤, 검증된 보드 도구를 통해 티켓을 등록한다 — 자유 형식
+티켓 markdown은 쓰지 않는다:
+
+- **단순 요청** → 첫 active 상태에 티켓 한 장;
+- **복잡한 요청** → research → plan → plan-review → build → qa → document
+  스테이지 티켓 DAG를 `--blocked-by`로 연결해 하나의 `--request REQ-<n>`
+  그룹 아래 등록;
+- **deep 프리셋 보드** (`Intake` 레인이 있으면) → Intake 티켓 한 장;
+  분해는 파이프라인이 알아서 한다.
+
+모든 티켓은 `symphony board new` 검증(고유 id, 유효한 상태, 존재하는
+blocker, 비순환 DAG)을 통과한다. Q&A 모드에서는 에이전트가 등록할 티켓을
+설명만 하고, 세션을 edit 모드로 바꿀 때까지 등록을 미룬다. 채팅은 대화하고,
+보드가 배달한다.
 
 ---
+## Continuous improvement — 실험적 자율 유지보수
 
+**실험 기능이며 전부 opt-in이다.** `WORKFLOW.md`에 `continuous_improvement:`
+블록이 없으면 아무것도 실행되지 않는다.
+
+하트비트는 제품 코드를 건드리지 않고 주기적으로 저장소를 점검한 뒤, 발견한
+것을 **일반 보드 티켓**으로 등록하는 스케줄러다. 등록된 티켓은 다른 요청과
+똑같이 평소 파이프라인을 탄다. 각 기능은 독립된 모드다:
+
+```yaml
+continuous_improvement:
+  enabled: true
+  interval_ms: 1800000            # 하트비트 주기
+  modes: [readiness, blocked_fixes, security, market_research,
+          feature_improvements]
+  mode_interval_hours:            # 모드별 최소 간격 (선택)
+    market_research: 168          # 주 1회
+  max_improvement_tickets_per_run: 3
+```
+
+| 모드 | 하는 일 |
+| --- | --- |
+| `readiness` | 검증된 baseline에서 테스트/린트/타입체크를 돌리고 실패를 버그 티켓으로 만든다. 기존 동작. |
+| `blocked_fixes` | `Blocked` / `Human Review` 티켓을 분류해 근본 원인 메모가 담긴 수정 티켓을 만들고, 원본 티켓에 `blocked_by`로 연결한다. |
+| `security` | 선택적 의존성/취약점 스캔(`pip-audit`, `npm audit`)을 패치 티켓으로 만든다. 스캐너가 없으면 실패가 아니라 not available이다. |
+| `market_research` | 에이전트 턴 한 번으로 **이 앱**에 맞는 최신 트렌드·경쟁 제품 기능을 조사해(README/docs/wiki 기반) 근거 링크와 함께 개선안을 제안한다. |
+| `feature_improvements` | 에이전트 턴 한 번으로 UX와 코드 건강도를 검토해 개선안을 제안한다. |
+
+`modes:` 없이 `enabled: true`만 두면 readiness만 실행된다 — 모드 도입 전과
+동일하다. 제안 티켓은 실행당 개수 상한이 있고, 열린 티켓과 중복 제거되며,
+`ci` 라벨이 붙고, 하나의 `REQ-CI-<날짜>-<n>` 요청 그룹으로 묶인다. 에이전트
+모드는 간결한 프롬프트(`docs/symphony-prompts/ci/`에서 교체 가능)를 받고,
+JSON 제안 파일 외에는 아무것도 쓰지 않는다 — 티켓 등록은 하트비트가 한다.
+모드와 주기는 웹 **Settings** 페이지에서도 편집할 수 있다.
+
+---
 ## Run
 
 ### Web app + JSON API
@@ -582,15 +683,18 @@ symphony ./WORKFLOW.md --port 9999
 `/`는 내장 웹 칸반 앱을 서빙한다(빌드 단계 없음, 가입 없음, 루프백 전용):
 
 - **Board** — 이슈 생성/수정/삭제, 드래그로 컬럼 이동, 실행 중 배지(턴 수,
-  토큰), 워커 Pause / Resume, Learn 스킵. 기본 화면은 네 개의 active agent
+  토큰), 워커 Pause / Resume, Document 스킵. 기본 화면은 네 개의 active agent
   lane만 보여주며, `Human Review`, `Done`, `Blocked`, `Archive`는 `All`로
   펼치기 전까지 **Review and parked** 그룹에 작게 표시된다.
 - **Workflow** — 칸반 컬럼 추가/삭제/이름변경/순서변경, 컬럼별 스테이지
   프롬프트 편집. 변경은 주석을 보존한 채 `WORKFLOW.md` frontmatter로
   저장되고, 이름이 바뀌거나 삭제된 컬럼의 티켓은 자동 마이그레이션된다.
+- **Chat** — 보드 인테이크 프로토콜을 따르는 운영자 채팅 세션
+  ([Chat intake](#chat-intake--채팅에-요청하면-보드가-배달한다) 참고).
 - **Stats** — 일별 토큰, 처리량, 컬럼별 체류 시간, 에이전트별 합계, 평균
   사이클 타임 (`.symphony/stats.jsonl` 기반).
-- **Settings** — 실제 로컬 브랜치 드롭다운으로 브랜치 정책 설정.
+- **Settings** — 실제 로컬 브랜치 드롭다운으로 브랜치 정책 설정, 그리고
+  레인 프리셋 전환(default ↔ deep).
 
 JSON API 엔드포인트:
 
@@ -604,11 +708,13 @@ JSON API 엔드포인트:
 | PUT    | `/api/v1/workflow/states`         | 컬럼 추가 / 삭제 / 이름변경 / 순서변경        |
 | GET/PUT| `/api/v1/workflow/prompts/<state>`| 컬럼 스테이지 프롬프트 조회 / 편집            |
 | PUT    | `/api/v1/workflow/branch-policy`  | feature base / merge target 브랜치 갱신       |
+| GET/POST | `/api/v1/workflow/presets[...]` | 레인 프리셋 목록 / 적용 (`/apply`)            |
+| *      | `/api/v1/chat/...`                | 운영자 채팅 세션 + WebSocket 스트림           |
 | GET    | `/api/v1/git/branches`            | 브랜치 정책 UI용 로컬 브랜치 목록             |
 | GET    | `/api/v1/stats?days=N`            | 집계된 실행 통계                              |
 | POST   | `/api/v1/refresh`                 | poll + reconcile 즉시 트리거                  |
 | POST   | `/api/v1/{id}/pause` `/resume`    | 실행 중 워커 보류 / 재개                      |
-| POST   | `/api/v1/issues/{id}/skip-learn`  | idle Learn 티켓을 Human Review로 이동         |
+| POST   | `/api/v1/issues/{id}/skip-document` | idle Document 티켓을 Human Review로 이동 (구 별칭: `/skip-learn`) |
 
 ### CLI Kanban TUI (primary UI)
 
@@ -621,9 +727,8 @@ symphony ./WORKFLOW.md --tui
 #### Recommended default: TUI + JSON API together
 
 TUI는 기본 운영자 뷰이고 JSON API는 프로그래밍 / curl 친화적 뷰다. `WORKFLOW.md`에
-`server.port`를 고정하고 `--tui`로 실행하면 둘을 한 프로세스에서 함께 돌릴 수 있다
-(`tools/board-viewer/`는 아래에서 설명하는 선택적 브라우저 칸반으로 계속 사용
-가능):
+`server.port`를 고정하고 `--tui`로 실행하면 둘을 한 프로세스에서 함께 돌릴 수
+있다(내장 웹 어드민 UI도 같은 포트에서 서빙된다):
 
 ```yaml
 # WORKFLOW.md
@@ -673,7 +778,7 @@ CLI에서 `--port N`으로 워크플로 값을 재정의하거나, `server` 블�
 포트에서 다시 시작할 수 없다:
 
 ```bash
-symphony service start ./WORKFLOW.md --port 9999 --viewer-port 8765
+symphony service start ./WORKFLOW.md --port 9999
 symphony service status ./WORKFLOW.md
 symphony service restart ./WORKFLOW.md
 symphony service stop ./WORKFLOW.md
@@ -681,16 +786,16 @@ symphony service logs ./WORKFLOW.md
 ```
 
 `service start`는 스폰 전에 `symphony doctor`를 실행하고, Python 모듈 러너로
-오케스트레이터를 시작하며, 해당 폴더가 있으면 `tools/board-viewer/`도 시작한다.
-명령은 셸 없이 실행되므로, 같은 경로가 macOS, Linux, Windows에서 동일하게
-동작한다.
+오케스트레이터를 시작한다. 내장 웹 어드민 UI는 오케스트레이터 포트에서
+서빙된다. 명령은 셸 없이 실행되므로, 같은 경로가 macOS, Linux, Windows에서
+동일하게 동작한다.
 
-v0.4.7부터 보드 뷰어(기본 `--viewer-port 8765`)는 더 이상 읽기 전용이 아니다:
-실행 중인 카드에 **Pause / Resume** 버튼이 나타나고 헤더의 refresh 버튼이
-오케스트레이터 `poll + reconcile`을 트리거한다. 헤더는 또한
-`agent.feature_base_branch`와 `agent.auto_merge_target_branch`를 위한 실제 로컬 git
-브랜치 드롭다운을 보여주므로, 운영자가 YAML을 손으로 편집하지 않고도 새 기능
-브랜치가 어디서 시작하고 Learn 머지가 어디로 떨어질지 고를 수 있다.
+어드민 UI는 읽기 전용이 아니다: 실행 중인 카드에 **Pause / Resume** 버튼이
+나타나고 헤더의 refresh 버튼이 오케스트레이터 `poll + reconcile`을 트리거한다.
+헤더는 또한 `agent.feature_base_branch`와 `agent.auto_merge_target_branch`를
+위한 실제 로컬 git 브랜치 드롭다운을 보여주므로, 운영자가 YAML을 손으로
+편집하지 않고도 새 기능 브랜치가 어디서 시작하고 Document 머지가 어디로 떨어질지
+고를 수 있다.
 
 #### One-shot launchers
 
@@ -727,52 +832,44 @@ symphony tui ./WORKFLOW.md
 
 ```
 src/symphony/
-  backends/
-    __init__.py        AgentBackend Protocol + factory + normalized events
-    codex.py           Codex JSON-RPC stdio backend (was upstream agent.py)
-    claude_code.py     Claude Code stream-json backend
-    gemini.py          Gemini one-shot backend
-    agy.py             AGY / Antigravity one-shot backend
-    kiro.py            Kiro headless chat backend
-    opencode.py        OpenCode run/json backend (per-turn subprocess, --session resume)
-    pi.py              Pi --mode json backend (per-turn subprocess, --session resume)
-  trackers/
-    __init__.py        TrackerClient Protocol + factory
-    _retry.py          retry/backoff wrapper for network trackers
-    file.py            FileBoardTracker (locked Markdown ticket mutations)
-    jira.py            Jira REST tracker
-    linear.py          LinearClient (Linear GraphQL)
+  backends/          AgentBackend Protocol + factory + normalized events;
+                     codex.py, claude_code.py, gemini.py, agy.py, kiro.py,
+                     opencode.py, pi.py, prime_agent.py adapters
+  trackers/          TrackerClient Protocol + factory; file.py (locked
+                     Markdown ticket mutations), jira.py, linear.py, _retry.py
   workflow/
-    parser.py          WORKFLOW.md frontmatter/body parser
-    config.py          frozen config dataclasses
-    builder.py         ServiceConfig construction + validation
-    mutate.py          comment-preserving workflow edits for the web UI
-    preflight.py       dispatch-time validation
+    parser.py        WORKFLOW.md frontmatter/body parser
+    config.py        frozen config dataclasses (incl. agent.stage_kinds)
+    builder.py       ServiceConfig construction + validation
+    mutate.py        comment-preserving workflow edits for the web UI
+    presets.py       lane presets (4-lane default, 8-lane deep)
+    preflight.py     dispatch-time validation
   orchestrator/
-    core.py            scheduler/state machine
-    run_registry.py    SQLite WAL run leases + issue flags
-    contracts.py       stage-contract validation helpers
+    core.py          scheduler/state machine (blocked_by-aware dispatch)
+    run_registry.py  SQLite WAL run leases + issue flags
+    contracts.py     stage-contract validation helpers
   cli/
-    __init__.py        re-exports `main` for the `symphony` console_script
-    __main__.py        keeps `python -m symphony.cli ...` working for service.py
-    main.py            root dispatch + `symphony [WORKFLOW]`
-    board.py           `symphony board ...` file-tracker helper
-    doctor.py          `symphony doctor` WORKFLOW.md preflight checks
-  utils/
-    archive.py         auto-archive selector
-    auto_merge.py      symphony/<ID> branch → host repo merge
-    keep_awake.py      macOS caffeinate wrapper (no-op on other platforms)
-    wiki_sweep.py      Learn-prompt wiki integrity sweep
-  agent.py             back-compat shim re-exporting backends.* symbols
-  server.py            aiohttp server, health/state/refresh routes
-  webapi.py            web app REST routes + static SPA serving
-  stats.py             .symphony/stats.jsonl aggregation
-  skills.py            SKILL.md discovery + prompt injection
-  tui/                 Textual Kanban TUI package
-  service.py           `symphony service` background lifecycle
-  mock_codex.py        runnable via `python -m symphony.mock_codex` for demos/tests
-  web/static/          built-in browser app assets
-tui-open.sh            cross-platform launcher (macOS / Linux): doctor preflight + open TUI in a new terminal window
+    main.py          root dispatch + `symphony [WORKFLOW]`
+    board.py         `symphony board ...` validated ticket tool + `graph`
+    doctor.py        `symphony doctor` WORKFLOW.md preflight checks
+  utils/             auto_merge.py, git_inspect.py, git_ops.py, git_sandbox.py,
+                     archive.py, keep_awake.py, wiki_sweep.py
+  notifications/     Slack state-transition notifications
+  tui/               Textual Kanban TUI package
+  web/static/        built-in browser app assets (board / workflow / chat /
+                     stats / settings)
+  webapi.py          web app REST routes + static SPA serving
+  server.py          aiohttp server, health/state/refresh routes
+  chat.py            operator chat sessions + board-intake protocol
+  continuous_improvement.py  idle-time improvement-proposal loop
+  i18n.py            TUI/doc language switching
+  stats.py           .symphony/stats.jsonl aggregation
+  skills.py          SKILL.md discovery + prompt injection
+  service.py         `symphony service` background lifecycle
+  progress_md.py     WORKFLOW-PROGRESS.md live mirror
+  mock_codex.py      demo backend via `python -m symphony.mock_codex`
+  agent.py           back-compat shim re-exporting backends.* symbols
+tui-open.sh            launcher (macOS / Linux): doctor preflight + open TUI in a new terminal window
 tui-open.bat           Windows equivalent
 ```
 
@@ -782,16 +879,16 @@ tui-open.bat           Windows equivalent
 pytest -q
 ```
 
-테스트 스위트는 업스트림 적합성 스위트, 팩토리에 대한 백엔드 단위 테스트, 이벤트
-정규화, Claude / Pi 사용량 누적, Gemini 세션 합성, AGY/Kiro 명령 구성,
-OpenCode 명령/세션 파싱, Pi 실패 사유 탐지, run registry 영속성, file tracker locking, 웹 API contract,
-그리고 TUI 앱에 대한 Textual `Pilot` 구동 스모크 테스트를 포함한다. 실제 CLI를
-상대로 한 서브프로세스 구동 통합 테스트는 의도적으로 CI에 포함하지 않았다 —
-로컬에서 실행한다.
+테스트 스위트(1614 passed, 7 skipped)는 업스트림 적합성 스위트, 백엔드 단위
+테스트(팩토리, 이벤트 정규화, CLI별 명령/세션 처리), 보드 도구 DAG 검증,
+run registry 영속성, file tracker locking, 웹 API contract, 채팅 인테이크,
+레인 프리셋, 그리고 TUI 앱에 대한 Textual `Pilot` 구동 스모크 테스트를
+포함한다. 실제 CLI를 상대로 한 서브프로세스 구동 통합 테스트는 의도적으로
+CI에 포함하지 않았다 — 로컬에서 실행한다.
 
 ## Design notes
 
-### Why five different lifecycles behind one Protocol?
+### Why eight different lifecycles behind one Protocol?
 
 - **Codex**는 이슈당 하나의 `app-server` 서브프로세스를 열고 현재의
   `codex app-server` JSON-RPC 프로토콜(`initialize` + `thread/start`
@@ -824,6 +921,11 @@ OpenCode 명령/세션 파싱, Pi 실패 사유 탐지, run registry 영속성, 
   인증은 Pi에 위임된다: `/login`으로 채워진 `~/.pi/agent/auth.json`의
   OAuth/API 키 저장소를 서브프로세스가 상속하므로, Symphony 자체는 자격 증명을
   절대 다루지 않는다.
+- **Prime Agent**는 Pi에서 파생된 독립 CLI지만 `--resume <id>`를 사용하는
+  턴별 JSONL 서브프로세스다. `/login` OAuth 또는 provider API 키를 CLI에 맡기고,
+  Symphony는 `~/.prime/agent/auth.json`을 검사만 하며 자격 증명을 읽지 않는다.
+  파일 보드에서는 티켓이 terminal 상태에 도달한 뒤 Prime Agent가 `agent_end`를
+  flush하지 않고 정상 종료해도 완료로 인정하며, non-zero 종료는 계속 실패로 처리한다.
 
 `AgentBackend` Protocol이 이런 차이를 감춘다. 오케스트레이터는 정규화된
 이벤트(`session_started`, `turn_completed`, `turn_failed` 등)와 최신 사용량 /
@@ -834,7 +936,7 @@ OpenCode 명령/세션 파싱, Pi 실패 사유 탐지, run registry 영속성, 
 웹 앱은 파일 보드를 위한 전체 브라우저 편집기다. 같은 tracker / workflow 모듈을
 통해 이슈 생성/수정/삭제, 드래그 상태 이동, 컬럼/프롬프트 편집, 브랜치 정책
 갱신을 수행한다. TUI는 키보드 운영에 최적화되어 있으며 터미널을 벗어나지 않고
-티켓 생성/수정, archive, Done gate confirm, Pause / Resume, Learn skip, filter,
+티켓 생성/수정, archive, Done gate confirm, Pause / Resume, Document skip, filter,
 detail 확인을 할 수 있다.
 
 대화형으로 *할 수 있는* 것:

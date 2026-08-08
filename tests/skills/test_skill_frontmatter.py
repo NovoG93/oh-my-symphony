@@ -41,6 +41,23 @@ def test_symphony_skill_is_the_single_operator_router() -> None:
     assert [path.parent.name for path in SKILL_MD_FILES] == ["symphony-skill"]
 
 
+def test_claude_skill_symlinks_resolve() -> None:
+    """Every symlink under .claude/skills/ must point to an existing skill dir.
+
+    When a canonical skill is renamed or consolidated, a stale ``.claude``
+    symlink becomes a dead link that triggers skill-discovery warnings in
+    Claude Code.  Guard against that drift.
+    """
+    claude_skills = REPO_ROOT / ".claude" / "skills"
+    if not claude_skills.is_dir():
+        pytest.skip("no .claude/skills directory")
+    broken: list[str] = []
+    for entry in sorted(claude_skills.iterdir()):
+        if entry.is_symlink() and not entry.resolve().is_dir():
+            broken.append(f"{entry.name} -> {entry.readlink()} (target missing)")
+    assert not broken, "broken .claude/skills symlinks:\n  " + "\n  ".join(broken)
+
+
 @pytest.mark.parametrize("skill_md", SKILL_MD_FILES, ids=lambda p: p.parent.name)
 def test_skill_frontmatter_is_valid(skill_md: Path) -> None:
     raw = _frontmatter(skill_md.read_text(encoding="utf-8"))

@@ -2,7 +2,7 @@
 tracker:
   kind: file
   board_root: ./kanban
-  active_states: [Todo, "In Progress", Verify, Learn]
+  active_states: [Todo, "In Progress", Verify, Document]
   terminal_states: ["Human Review", Done, Blocked, Archive]
   # Auto-archive sweep — terminal-state issues whose `updated_at` is older
   # than `archive_after_days` move to `archive_state` on each poll tick.
@@ -15,7 +15,7 @@ tracker:
     Todo: "Triage; route to In Progress"
     "In Progress": "Plan + TDD implementation + self-critique"
     Verify: "Review + QA + Merge Gate"
-    Learn: "Wiki write-back; Done unless intervention"
+    Document: "Docs + wiki write-back; Done unless intervention"
     "Human Review": "Manual intervention or explicit review before Done"
     Done: "Verified complete"
     Archive: "Auto-archived after 30 days idle"
@@ -41,7 +41,7 @@ hooks:
   # Default: each ticket gets its own git worktree of the host repo on a
   # symphony/<ID> branch. Product changes and docs/ artefacts stay on that
   # branch; Symphony merges it back with an explicit --no-ff merge commit
-  # in Verify before Learn closes as Done or parks for Human Review.
+  # in Verify before Document closes as Done or parks for Human Review.
   #
   # If your code lives in a *different* remote than the WORKFLOW.md repo,
   # replace the worktree commands with `git clone <remote> .` instead.
@@ -59,7 +59,7 @@ hooks:
     # to rebase.
     set -uo pipefail
     HOST_REPO="${SYMPHONY_WORKFLOW_DIR:?SYMPHONY_WORKFLOW_DIR not set}"
-    for dir in kanban; do
+    for dir in ${SYMPHONY_BOARD_ROOT_NAME:-kanban}; do
       source="$HOST_REPO/$dir"
       target="$PWD/$dir"
       [ -e "$source" ] || continue
@@ -187,7 +187,13 @@ hooks:
     git -C "$HOST_REPO" worktree remove --force "$WORKTREE_PATH" 2>/dev/null || true
 
 agent:
-  kind: codex          # codex | claude | gemini | agy | kiro | opencode | pi
+  kind: codex          # codex | claude | gemini | agy | kiro | opencode | pi | prime-agent
+  # Optional per-state backend routing: cheap/fast agents on light lanes,
+  # the default `kind` everywhere else. Precedence per dispatch:
+  # per-ticket `agent_kind` frontmatter pin > stage_kinds > kind.
+  # stage_kinds:
+  #   Todo: gemini
+  #   Document: gemini
   max_concurrent_agents: 1
   # This is the per-attempt execution cap. In prompt templates,
   # {{ turn_number }}/{{ max_turns }} reports the ticket lifetime position/cap.
@@ -199,9 +205,23 @@ agent:
   max_total_tokens_by_state:
     "In Progress": 500000000
     Verify: 500000000
+  # Per-lane stall budget (ms), falling back to the resolved backend's
+  # `stall_timeout_ms`. Heavy lanes (a Verify that runs a full suite) go quiet
+  # far longer than light ones; widen just that lane instead of every backend.
+  # stall_timeout_ms_by_state:
+  #   Verify: 900000
   budget_exhausted_state: Blocked
-  # Soft cap for Verify/Learn rewinds back into In Progress. Set 0 to disable.
+  # Soft cap for Verify/Document rewinds back into In Progress. Set 0 to disable.
   max_attempts: 3
+  # Mechanical evidence floor (orchestrator/contracts.py):
+  #   auto (default) — enforce only when every active lane is a default-preset
+  #                    lane (Todo / In Progress / Verify / Document). Renaming
+  #                    a lane therefore turns it OFF — logged as
+  #                    `stage_contracts_disabled` and reported by
+  #                    `symphony doctor`, never silent.
+  #   on             — enforce whatever the lanes are called.
+  #   off            — never enforce; the stage prompts are the only gate.
+  stage_contracts: auto
   # Route obvious Todo tickets with Acceptance Criteria to In Progress without
   # spending a model turn. Bug/blocked/ambiguous tickets still run Todo.
   auto_triage_actionable_todo: true
@@ -209,14 +229,14 @@ agent:
     Todo: 1
     "In Progress": 1
     Verify: 1
-    Learn: 1
+    Document: 1
   # Snapshot the workspace into one git commit when a ticket reaches Done.
   # Reuses any enclosing git repo; otherwise runs `git init` first. Set to
   # false to opt out (e.g. workspace is a real repo you don't want touched).
   auto_commit_on_done: true
-  # Merge policy for the Verify -> Learn gate. Verify must merge the
+  # Merge policy for the Verify -> Document gate. Verify must merge the
   # `symphony/<ID>` feature branch into the target branch before setting
-  # Learn. A human later confirms Done from the TUI (`c`) or board viewer
+  # Document. A human later confirms Done from the TUI (`c`) or board viewer
   # button. kanban/ is a host-owned board link, so if it appears in the
   # feature-branch diff the merge is blocked as leaked workspace plumbing.
   # docs/ is intentionally branch-local and merges normally. The post-Done
@@ -226,7 +246,7 @@ agent:
   # branches. Empty string = current host branch. The board viewer can
   # update this from its real git branch dropdown.
   feature_base_branch: ""
-  # Branch to merge into after Learn. Empty string = same as feature base
+  # Branch to merge into after Document. Empty string = same as feature base
   # branch/current host branch. The board viewer can update this too.
   auto_merge_target_branch: ""
   auto_merge_exclude_paths:
@@ -255,6 +275,9 @@ claude:
   # junctioned into the worktree. Without these, the agent silently
   # fails to flip ticket state to Done because the resolved path lands
   # outside its cwd, and Symphony's tracker keeps re-dispatching it.
+  # `--permission-mode acceptEdits` is also required for the CLI-driven lanes
+  # (`symphony board new/update`): a mode that gates every Bash call leaves
+  # the agent unable to run the tool its prompt mandates.
   command: 'claude -p --output-format stream-json --verbose --permission-mode acceptEdits --add-dir "$SYMPHONY_WORKFLOW_DIR/kanban"'
 
 gemini:
@@ -291,8 +314,30 @@ pi:
   # `~/.pi/agent/auth.json` are inherited automatically.
   command: 'pi --mode json -p ""'
 
+prime_agent:
+  # Prime Agent emits the same JSONL protocol and uses `--resume <id>` on
+  # continuation turns. Authenticate with `prime-agent` → `/login` or a
+  # provider API key; credentials are cached at `~/.prime/agent/auth.json`.
+  command: 'prime-agent -p --mode json'
+  resume_across_turns: true
+
 server:
   port: 9999            # optional JSON API; the primary UI is `symphony tui`
+
+# Optional one-click Product Preview in the admin web UI. Commands are trusted
+# WORKFLOW config, executed argv-only in a clean checkout of the merge target.
+# The API cannot override command, cwd, branch, or port; preview stays loopback.
+preview:
+  enabled: false
+  cwd: web
+  command: npm run preview -- --host ${HOST} --port ${PORT}
+  health_path: /
+  url_path: /
+  startup_timeout_ms: 30000
+  release_ticket: RELEASE-001
+  acceptance:
+    - Final acceptance suite passes
+    - Release evidence is attached
 
 tui:
   language: en               # `en` (default) or `ko`. SYMPHONY_LANG env overrides.
@@ -308,7 +353,7 @@ prompts:
     Todo: ./docs/symphony-prompts/file/stages/todo.md
     "In Progress": ./docs/symphony-prompts/file/stages/in-progress.md
     Verify: ./docs/symphony-prompts/file/stages/verify.md
-    Learn: ./docs/symphony-prompts/file/stages/learn.md
+    Document: ./docs/symphony-prompts/file/stages/document.md
     Done: ./docs/symphony-prompts/file/stages/done.md
 
 ---
