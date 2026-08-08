@@ -10,24 +10,40 @@ Versioning: [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
-## [0.18.0] - 2026-08-08 - Reproducible installs and clean skill discovery
+## [0.18.0] - 2026-08-08 - Multi-project hub and isolated delivery
 
 ### Added
 
+- **Central multi-project hub** — `symphony project create|add|list|start|stop|status`
+  manages independent Git repositories and `symphony hub` provides one local
+  switchboard while project services continue running in parallel. New projects
+  are bootstrapped as sibling Git repositories with an initial commit; existing
+  projects retain their own Git identity, workflow, board, branches, workspaces,
+  merge target, and Product Preview.
+- **Prime Agent backend** — select `agent.kind: prime-agent` alongside the other
+  supported coding-agent CLIs, with configuration preflight, lifecycle handling,
+  terminal-completion detection, and workflow examples.
+- **Managed Product Preview** — start and stop the selected target branch from
+  the admin UI using a preview-owned detached checkout, isolated per registered
+  project service.
 - Commit `uv.lock` so development and operator installs resolve the same tested
-  dependency set.
-- Add a regression test that detects broken symlinks in Claude Code skill
-  discovery.
+  dependency set, plus a regression test for broken Claude skill symlinks.
 
 ### Fixed
 
-- Remove the stale `.claude/skills/symphony-oneshot` symlink left behind after
-  operator routing was consolidated into `symphony-skill`.
+- Recover blocked integrations autonomously when delivery branches are present,
+  while making the operator-only recovery boundary explicit when they are not.
+- Render Markdown tables correctly in ticket details on the web board.
+- Remove the stale `.claude/skills/symphony-oneshot` symlink left after operator
+  routing was consolidated into `symphony-skill`.
 
-### Documentation
+### Security
 
-- Record the verified recovery procedure and merge-safety evidence for a
-  botched ticket-branch rebase.
+- Refuse ticket dispatch, managed service startup, and doctor approval when a
+  workflow points at the canonical `oh-my-symphony` source Git repository,
+  including linked worktrees. Product work must run in a separately registered
+  repository, preventing generated applications from modifying the orchestrator
+  that launched them.
 
 ## [0.17.0] - 2026-08-08 - Minimal Symphony: chat-to-delivery ticket DAGs
 
