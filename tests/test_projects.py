@@ -510,3 +510,27 @@ def test_registry_start_waits_until_service_accepts_connections(
 
     assert registry.start("ready") == 0
     assert attempts == 2
+
+
+def test_project_port_allocation_skips_unregistered_listener(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source = scoped_source_bundle(tmp_path / "source-port")
+    probed: list[int] = []
+
+    def available(host: str, port: int) -> bool:
+        assert host == "127.0.0.1"
+        probed.append(port)
+        return port == 10002
+
+    monkeypatch.setattr("symphony.projects._port_is_available", available)
+    record = create_or_adopt_project(
+        tmp_path / "port-project",
+        source=source,
+        name="Port Project",
+        project_id="port-project",
+        registry=ProjectRegistry(tmp_path / "projects-port.json"),
+    )
+
+    assert record.port == 10002
+    assert probed == [9999, 10000, 10001, 10002]
