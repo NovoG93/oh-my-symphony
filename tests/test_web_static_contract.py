@@ -351,4 +351,10 @@ def test_web_project_switcher_and_management_contract() -> None:
     assert "'projects.boardPath': '이슈 저장 위치'" in js
     assert ".project-selector" in css
     assert ".project-paths" in css
+    assert "direction: rtl" in css
+    assert "unicode-bidi: plaintext" in css
+    assert "function setProjectPath(element, value)" in js
+    assert "element.dataset.fullPath = value || '';" in js
+    assert ".project-paths dd:focus-visible::after" in css
+    assert "content: attr(data-full-path)" in css
     assert ".project-selector { font-size: 0;" not in css

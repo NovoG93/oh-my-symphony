@@ -157,6 +157,39 @@ a { color: inherit; }
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+  direction: rtl;
+  text-align: left;
+  unicode-bidi: plaintext;
+  position: relative;
+  cursor: help;
+}
+.project-paths dd::after {
+  content: attr(data-full-path);
+  position: absolute;
+  top: calc(100% + 0.25rem);
+  left: 0;
+  z-index: 40;
+  display: block;
+  width: max-content;
+  max-width: min(70vw, 60rem);
+  padding: 0.4444rem 0.5926rem;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--surface-elevated, var(--surface));
+  box-shadow: var(--shadow-md);
+  color: var(--text);
+  direction: ltr;
+  text-align: left;
+  white-space: normal;
+  overflow-wrap: anywhere;
+  opacity: 0;
+  visibility: hidden;
+  pointer-events: none;
+}
+.project-paths dd:hover::after,
+.project-paths dd:focus-visible::after {
+  opacity: 1;
+  visibility: visible;
 }
 .project-manage-button {
   border: 0;

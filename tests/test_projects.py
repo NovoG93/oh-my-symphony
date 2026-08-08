@@ -332,6 +332,39 @@ def test_existing_git_without_workflow_is_bootstrapped_without_replacing_history
     assert not git(target, "status", "--porcelain")
 
 
+def test_existing_git_can_adopt_symphony_files_ignored_by_repository(
+    tmp_path: Path,
+) -> None:
+    source = scoped_source_bundle(tmp_path / "source-ignored")
+    target = tmp_path / "ignored-git"
+    target.mkdir()
+    git(target, "init", "-b", "main")
+    (target / ".gitignore").write_text("*\n.domain-agent/\n", encoding="utf-8")
+    (target / "product.txt").write_text("preserve me\n", encoding="utf-8")
+    git(target, "add", "-f", ".gitignore")
+    git(
+        target,
+        "-c", "user.name=Test",
+        "-c", "user.email=test@example.com",
+        "commit", "-m", "ignore policy",
+    )
+
+    project_record = create_or_adopt_project(
+        target,
+        source=source,
+        name="Ignored",
+        project_id="ignored",
+        registry=ProjectRegistry(tmp_path / "projects-ignored.json"),
+    )
+
+    assert Path(project_record.git_repo) == target.resolve()
+    assert git(target, "ls-files", "WORKFLOW.md") == "WORKFLOW.md"
+    assert git(target, "check-ignore", "product.txt") == "product.txt"
+    assert "product.txt" not in git(target, "show", "--format=", "--name-only", "HEAD")
+    assert (target / "product.txt").read_text(encoding="utf-8") == "preserve me\n"
+    assert not git(target, "status", "--porcelain")
+
+
 def scoped_source_bundle(path: Path) -> Path:
     source = source_bundle(path)
     (source / "WORKFLOW.file.example.md").write_text(

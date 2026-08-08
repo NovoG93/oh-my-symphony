@@ -18,6 +18,14 @@ Versioning: [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   workers. Missing paths and existing non-Git directories are initialized as Git
   repositories, while existing Git metadata and files are preserved.
 
+### Fixed
+
+- Keep the useful rightmost portion of long project paths visible and reveal the
+  complete value on hover or keyboard focus without widening the sidebar.
+- Adopt repositories whose ignore rules hide Symphony operator files by
+  force-adding only files created by Symphony; unrelated ignored or modified
+  project files remain untouched.
+
 ## [0.18.1] - 2026-08-08 - Project workflow containment
 
 ### Fixed

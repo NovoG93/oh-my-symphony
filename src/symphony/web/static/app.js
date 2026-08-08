@@ -843,6 +843,17 @@
   // Project identity and switching
   // ------------------------------------------------------------------
 
+  function setProjectPath(element, value) {
+    if (!element) return;
+    const displayValue = value || t('projects.notFileBoard');
+    element.textContent = displayValue;
+    element.title = value || '';
+    element.dataset.fullPath = value || '';
+    element.tabIndex = value ? 0 : -1;
+    if (value) element.setAttribute('aria-label', value);
+    else element.removeAttribute('aria-label');
+  }
+
   function renderProjectSwitcher() {
     const selector = document.getElementById('project-selector');
     const pathEl = document.getElementById('project-current-path');
@@ -862,17 +873,10 @@
       }, project.name));
     }
     selector.disabled = state.projects.length === 0;
-    if (pathEl && current) {
-      pathEl.textContent = current.repo_path;
-      pathEl.title = current.repo_path;
-    }
-    if (workflowPathEl && current) {
-      workflowPathEl.textContent = current.workflow_path;
-      workflowPathEl.title = current.workflow_path;
-    }
-    if (boardPathEl && current) {
-      boardPathEl.textContent = current.board_path || t('projects.notFileBoard');
-      boardPathEl.title = current.board_path || '';
+    if (current) {
+      setProjectPath(pathEl, current.repo_path);
+      setProjectPath(workflowPathEl, current.workflow_path);
+      setProjectPath(boardPathEl, current.board_path);
     }
   }
 
