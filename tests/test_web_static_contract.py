@@ -241,3 +241,23 @@ def test_web_settings_stage_contracts_hint_contract() -> None:
     assert "'settings.stageContracts': 'Stage contracts'" in js
     assert "'settings.stageContractsOff'" in js
     assert ".form-hint-warn" in css
+
+
+def test_web_board_renders_dependency_and_request_chips() -> None:
+    """F-14: the API returned blocked_by/request; the board ignored both."""
+    js = _script_bundle()
+    css = (STATIC_ROOT / "style.css").read_text(encoding="utf-8")
+
+    assert "function blockedByIds(issue)" in js
+    assert "function parseIdList(value)" in js
+    assert "class: 'chip-blocked'" in js
+    assert "class: 'chip-request'" in js
+    assert ".chip-blocked" in css
+    assert ".chip-request" in css
+    # Create modal + drawer can both set them, through the validating API.
+    assert "blocked_by: parseIdList(blockedByInput.value)" in js
+    assert "request: requestInput.value.trim()" in js
+    assert "commitField(\n        detail.identifier, 'blocked_by', ids," in js
+    assert "field(t('common.blockedBy'), blockedByInput)" in js
+    assert "'common.blockedBy': 'Blocked by'" in js
+    assert "'board.blockedByPlaceholder'" in js

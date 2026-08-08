@@ -642,3 +642,122 @@ def test_update_rejects_missing_ticket_and_malformed_id(
 
     assert board_cli.main(["update", "--workflow", str(workflow), "../../evil"]) == 1
     assert "must match" in capsys.readouterr().err
+
+
+# ---------------------------------------------------------------------------
+# F-15 — validate + create is atomic under the board lock
+# ---------------------------------------------------------------------------
+
+
+def test_concurrent_generated_id_creates_never_collide(tmp_path: Path) -> None:
+    """Validate+allocate+write happen under one board lock.
+
+    Eight threads asking for the next `GEN-<n>` used to be able to observe the
+    same snapshot; each ticket must still get its own id and its own file.
+    """
+    import threading
+
+    from symphony.trackers.file import FileBoardTracker
+    from symphony.trackers.validate import validate_ticket_dependencies
+
+    board = tmp_path / "board"
+    board.mkdir()
+    tracker = FileBoardTracker(board_cli._tracker_from_root(board))
+    created: list[str] = []
+    errors: list[Exception] = []
+    lock = threading.Lock()
+
+    def _worker(n: int) -> None:
+        def _validate(issues, resolved):
+            validate_ticket_dependencies(
+                issues, identifier=resolved, blocked_by=[], new_ticket=True
+            )
+
+        try:
+            identifier, _ = tracker.create_validated(
+                identifier=None,
+                prefix="GEN",
+                validate=_validate,
+                title=f"ticket {n}",
+            )
+        except Exception as exc:  # pragma: no cover - failure path
+            with lock:
+                errors.append(exc)
+            return
+        with lock:
+            created.append(identifier)
+
+    threads = [threading.Thread(target=_worker, args=(n,)) for n in range(8)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(30)
+
+    assert not errors, errors
+    assert sorted(created) == sorted(set(created)), f"id collision: {created}"
+    assert len(list(board.glob("*.md"))) == 8
+
+
+def test_create_validated_runs_the_validator_with_the_in_lock_snapshot(
+    tmp_path: Path,
+) -> None:
+    from symphony.trackers.file import FileBoardTracker
+
+    board = tmp_path / "board"
+    board.mkdir()
+    tracker = FileBoardTracker(board_cli._tracker_from_root(board))
+    tracker.create(identifier="A-1", title="root")
+    seen: list[tuple[int, str]] = []
+
+    def _validate(issues, resolved):
+        seen.append((len(issues), resolved))
+
+    identifier, path = tracker.create_validated(
+        identifier=None,
+        prefix="GEN",
+        validate=_validate,
+        title="generated",
+    )
+
+    assert identifier == "GEN-1"
+    assert path.is_file()
+    assert seen == [(1, "GEN-1")]
+
+
+def test_create_validated_aborts_the_write_when_the_validator_raises(
+    tmp_path: Path,
+) -> None:
+    from symphony.errors import BoardDependencyError
+    from symphony.trackers.file import FileBoardTracker
+
+    board = tmp_path / "board"
+    board.mkdir()
+    tracker = FileBoardTracker(board_cli._tracker_from_root(board))
+
+    def _reject(issues, resolved):
+        raise BoardDependencyError("nope", identifier=resolved)
+
+    with pytest.raises(BoardDependencyError):
+        tracker.create_validated(
+            identifier="X-1", validate=_reject, title="never written"
+        )
+
+    assert list(board.glob("*.md")) == []
+
+
+def test_cli_errors_do_not_leak_the_internal_error_code(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """F-31: `board_dependency_error:` is an API code, not operator text."""
+    workflow = _make_workflow(tmp_path)
+    board_cli.main(["new", "--workflow", str(workflow), "A-1", "first"])
+    capsys.readouterr()
+
+    rc = board_cli.main(["new", "--workflow", str(workflow), "A-1", "duplicate"])
+
+    assert rc == 1
+    err = capsys.readouterr().err
+    assert "ticket already exists" in err
+    assert "identifier='A-1'" in err
+    assert "board_dependency_error" not in err
+    assert "symphony_error" not in err

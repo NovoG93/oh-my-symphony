@@ -576,6 +576,26 @@ a { color: inherit; }
   border-radius: 999px;
 }
 
+.chip-agent-last { opacity: 0.75; font-style: italic; }
+
+.chip-blocked {
+  background: #fef2f2;
+  color: #991b1b;
+  border: 1px solid #fecaca;
+  font-size: 0.7778rem;
+  padding: 0.1481rem 0.5926rem;
+  border-radius: 999px;
+}
+
+.chip-request {
+  background: #f0fdfa;
+  color: #0f766e;
+  border: 1px solid #99f6e4;
+  font-size: 0.7778rem;
+  padding: 0.1481rem 0.5926rem;
+  border-radius: 999px;
+}
+
 .chip-attention {
   background: #fff7ed;
   color: #9a3412;

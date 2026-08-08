@@ -1041,6 +1041,20 @@
     }, attention.label || t('board.attention'));
   }
 
+  function blockedByIds(issue) {
+    if (!issue || !Array.isArray(issue.blocked_by)) return [];
+    return issue.blocked_by
+      .map((b) => (typeof b === 'string' ? b : (b && b.identifier) || ''))
+      .filter(Boolean);
+  }
+
+  function parseIdList(value) {
+    return String(value || '')
+      .split(',')
+      .map((s) => s.trim())
+      .filter(Boolean);
+  }
+
   function buildCardEl(issue, liveEntry, readOnly) {
     const card = el('div', {
       class: `card${liveEntry && liveEntry.paused ? ' paused' : ''}`,
@@ -1063,6 +1077,24 @@
     }
     for (const label of issue.labels) badges.appendChild(el('span', { class: 'chip-label' }, label));
     if (issue.agent_kind) badges.appendChild(el('span', { class: 'chip-agent' }, issue.agent_kind));
+    else if (issue.last_agent_kind) {
+      // Stage-routed board: no pin is written, so show who actually ran it.
+      badges.appendChild(el('span', {
+        class: 'chip-agent chip-agent-last',
+        title: t('board.lastAgentTitle'),
+      }, issue.last_agent_kind));
+    }
+    // The API has always returned `blocked_by` and `request`; without these
+    // chips the DAG the chat intake files is invisible on the board it points
+    // the operator at.
+    const blockerIds = blockedByIds(issue);
+    if (blockerIds.length) {
+      badges.appendChild(el('span', {
+        class: 'chip-blocked',
+        title: t('board.blockedByTitle', { ids: blockerIds.join(', ') }),
+      }, `⛓ ${blockerIds.join(', ')}`));
+    }
+    if (issue.request) badges.appendChild(el('span', { class: 'chip-request' }, issue.request));
     const attentionBadge = buildAttentionBadge(issue.attention);
     if (attentionBadge) badges.appendChild(attentionBadge);
     if (badges.childNodes.length) card.appendChild(badges);
@@ -1113,12 +1145,15 @@
     const labelsInput = el('input', { class: 'input', type: 'text', placeholder: t('board.labelsPlaceholder') });
     const agentSelect = buildAgentSelect('');
     const prefixInput = el('input', { class: 'input', type: 'text', placeholder: 'TASK', maxlength: 16 });
+    const blockedByInput = el('input', { class: 'input', type: 'text', placeholder: t('board.blockedByPlaceholder') });
+    const requestInput = el('input', { class: 'input', type: 'text', placeholder: t('board.requestPlaceholder') });
 
     const body = el('div', { class: 'form-stack' }, [
       field(t('common.title'), titleInput),
       field(t('common.description'), descInput),
       fieldRow([field(t('common.state'), stateSelect), field(t('common.priority'), prioritySelect)]),
       field(t('common.labels'), labelsInput),
+      fieldRow([field(t('common.blockedBy'), blockedByInput), field(t('common.request'), requestInput)]),
       fieldRow([field(t('common.agent'), agentSelect), field(t('settings.idPrefix'), prefixInput)]),
     ]);
 
@@ -1136,6 +1171,8 @@
           priority: prioritySelect.value === '' ? null : Number(prioritySelect.value),
           labels: parseLabels(labelsInput.value),
           agent_kind: agentSelect.value,
+          blocked_by: parseIdList(blockedByInput.value),
+          request: requestInput.value.trim(),
           prefix: prefixInput.value.trim() || 'TASK',
         });
         showToast(t('board.issueCreated', { id: created.identifier }), 'success');
@@ -1229,11 +1266,50 @@
     labelsInput.addEventListener('blur', commitLabels);
     labelsInput.addEventListener('keydown', (e) => { if (e.key === 'Enter') labelsInput.blur(); });
 
+    const blockedByInput = el('input', {
+      class: 'input',
+      type: 'text',
+      value: blockedByIds(detail).join(', '),
+      placeholder: t('board.blockedByPlaceholder'),
+    });
+    const commitBlockedBy = () => {
+      const ids = parseIdList(blockedByInput.value);
+      const current = blockedByIds(detail);
+      if (JSON.stringify(ids) === JSON.stringify(current)) return;
+      commitField(
+        detail.identifier, 'blocked_by', ids,
+        () => { blockedByInput.value = current.join(', '); },
+        () => { detail.blocked_by = ids.map((identifier) => ({ identifier, state: null })); },
+      );
+    };
+    blockedByInput.addEventListener('blur', commitBlockedBy);
+    blockedByInput.addEventListener('keydown', (e) => { if (e.key === 'Enter') blockedByInput.blur(); });
+
+    const requestInput = el('input', {
+      class: 'input',
+      type: 'text',
+      value: detail.request || '',
+      placeholder: t('board.requestPlaceholder'),
+    });
+    const commitRequest = () => {
+      const value = requestInput.value.trim();
+      if (value === (detail.request || '')) return;
+      commitField(
+        detail.identifier, 'request', value,
+        () => { requestInput.value = detail.request || ''; },
+        () => { detail.request = value; },
+      );
+    };
+    requestInput.addEventListener('blur', commitRequest);
+    requestInput.addEventListener('keydown', (e) => { if (e.key === 'Enter') requestInput.blur(); });
+
     const fieldsGrid = el('div', { class: 'drawer-fields' }, [
       field(t('common.state'), stateSelect),
       field(t('common.priority'), prioritySelect),
       field(t('common.agent'), agentSelect),
       field(t('common.labels'), labelsInput),
+      field(t('common.blockedBy'), blockedByInput),
+      field(t('common.request'), requestInput),
     ]);
 
     const deleteBtn = el('button', {

@@ -269,6 +269,10 @@ def test_document_stage_writes_wiki_and_done_or_intervention_handoff(workflow: s
     assert "no source or test edits" in rendered
     # The ownership boundaries that ARE legitimate stay.
     assert "Do not create commits, tags, branches, or pushes" in rendered
+    # F-27: `## Document Defect` was consumed as a rewind section that no
+    # prompt ever told an agent to write.
+    assert "## Document Defect" in rendered
+    assert "set state to `In Progress`" in rendered
 
 
 @pytest.mark.parametrize("flavor", ("file", "linear"))

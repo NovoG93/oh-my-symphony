@@ -32,6 +32,12 @@ on the branch their worktree is cut from. The preset therefore requires:
 
 ``symphony doctor`` reports this contract as ``board.deep_merge_contract``.
 
+The deep preset intentionally ships **no ``Done`` stage prompt**: every lane
+is its own ticket that ends at ``Done``, so a Done-lane report would duplicate
+the lane's own gate. ``apply_lane_preset`` therefore drops the default
+preset's ``Done`` entry when switching to deep, and restores it on the way
+back.
+
 A preset is a *starting point*, never a cage: `apply_lane_preset` in
 `workflow.mutate` writes these values into WORKFLOW.md through the same
 comment-preserving round-trip the lane CRUD uses, and every per-column

@@ -62,7 +62,6 @@ Caps: `## Security Audit` exactly 7 rows; `## As-Is -> To-Be Report` <= 20 lines
 - Use `Human Review` only for real critical/manual intervention, never as the normal completion path.
 - Never silence failing tests, hide errors, or add fake success paths. Fix the root cause or move the ticket to `Blocked`.
 - Touch only what the ticket requires; no drive-by refactors.
-- Record non-trivial decisions in `docs/changelog/changelog-YYYY-MM-DD.md` (append; do not overwrite).
 - Every ticket artefact lives under `docs/{{ issue.identifier }}/`.
 - One merge per ticket: Verify proves (`git merge-tree` preflight), Document documents, and the orchestrator creates the single `--no-ff` merge commit when the ticket reaches `Done`. Never hand-merge a `symphony/<ID>` branch. Write wiki files inside your worktree at `docs/llm-wiki/` — the Done merge delivers them.
 - Backward transitions are pipeline, not failure: rewinds start with fresh context; only the ticket body and `docs/{{ issue.identifier }}/` carry over. Exceeding `agent.max_attempts` ({{ agent.max_attempts }}) moves the ticket to `Blocked` (0 disables the cap).
