@@ -261,3 +261,17 @@ def test_web_board_renders_dependency_and_request_chips() -> None:
     assert "field(t('common.blockedBy'), blockedByInput)" in js
     assert "'common.blockedBy': 'Blocked by'" in js
     assert "'board.blockedByPlaceholder'" in js
+
+
+def test_web_markdown_renders_human_readable_tables() -> None:
+    """LLM-authored ticket Markdown must render as safe, readable HTML nodes."""
+    js = _script_bundle()
+    css = (STATIC_ROOT / "style.css").read_text(encoding="utf-8")
+
+    assert "function renderMarkdown(source)" in js
+    assert "function parseTableAt(lines, index)" in js
+    assert "function parseTableAlignments(line)" in js
+    assert "el('table', { class: 'md-table' }" in js
+    assert "class: `md-table-cell md-align-${alignments[index] || 'left'}`" in js
+    assert ".md-table-wrap" in css
+    assert ".md-table-cell" in css

@@ -229,7 +229,13 @@ async def _exercise_issue_crud(page: Any) -> None:
     await page.get_by_role("button", name="+ New Issue").click()
     modal = page.locator(".modal-form").last
     await modal.get_by_label("Title").fill(title)
-    await modal.get_by_label("Description").fill("Created by browser E2E.")
+    await modal.get_by_label("Description").fill(
+        "## QA evidence\n\n"
+        "| Check | Result |\n"
+        "| :--- | :---: |\n"
+        "| Markdown table | **PASS** |\n"
+        "| Safety | <script>window.__xss=1</script> |"
+    )
     await modal.get_by_label("State").select_option("Human Review")
     await modal.get_by_label("Labels").fill("browser, e2e")
     await modal.get_by_label("ID prefix").fill("UIE2E")
@@ -238,6 +244,13 @@ async def _exercise_issue_crud(page: Any) -> None:
 
     await page.locator(".card", has_text=title).click()
     drawer = page.locator("#drawer-panel")
+    await drawer.locator(".description-body .md-table").wait_for()
+    assert await drawer.locator(".description-body .md-heading").count() == 1
+    assert await drawer.locator(".description-body thead th").all_text_contents() == ["Check", "Result"]
+    cells = await drawer.locator(".description-body tbody td").all_text_contents()
+    assert cells[:2] == ["Markdown table", "PASS"]
+    assert "<script>window.__xss=1</script>" in cells
+    assert await drawer.locator(".description-body script").count() == 0
     await drawer.locator(".drawer-title-input").fill(f"{title} updated")
     await drawer.locator(".drawer-title-input").press("Enter")
     await page.locator(".card", has_text=f"{title} updated").wait_for()

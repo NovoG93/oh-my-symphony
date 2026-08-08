@@ -906,6 +906,32 @@ a { color: inherit; }
   font-family: var(--font-mono);
   font-size: 0.8889rem;
 }
+.md-table-wrap {
+  max-width: 100%;
+  overflow-x: auto;
+  margin: 0 0 0.7407rem;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+}
+.md-table {
+  width: 100%;
+  min-width: 30rem;
+  border-collapse: collapse;
+  font-size: 0.9259rem;
+}
+.md-table-cell {
+  padding: 0.5926rem 0.7407rem;
+  border-bottom: 1px solid var(--border);
+  vertical-align: top;
+  text-align: left;
+}
+.md-table thead { background: var(--surface-2); }
+.md-table thead .md-table-cell { font-weight: 600; color: var(--text-secondary); }
+.md-table tbody tr:last-child .md-table-cell { border-bottom: none; }
+.md-table tbody tr:nth-child(even) { background: var(--surface-2); }
+.md-align-left { text-align: left; }
+.md-align-center { text-align: center; }
+.md-align-right { text-align: right; }
 .description-editor { width: 100%; min-height: 11.8519rem; margin-top: 0.5926rem; }
 .description-actions { margin-top: 0.5926rem; display: flex; justify-content: flex-end; }
 
