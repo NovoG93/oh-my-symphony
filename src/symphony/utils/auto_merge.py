@@ -296,18 +296,30 @@ def _build_merge_safety_block() -> str:
         '  printf "%s\\n" "$MERGE_TREE_OUTPUT"\n'
         "  exit 50\n"
         "fi\n"
-        'DIRTY="$( { git diff --name-only; git diff --cached --name-only; } | sort -u )"\n'
-        'if [ -n "$DIRTY" ]; then\n'
-        '  OVERLAP="$(comm -12 '
-        '<(printf "%s\\n" "$DIRTY" | sort -u) '
-        '<(printf "%s\\n" "$CHANGED" | sort -u) || true)"\n'
-        '  if [ -n "$OVERLAP" ]; then\n'
+        # Keep path names NUL-delimited: valid Git paths may contain newlines.
+        'DIRTY_MANIFEST="$(mktemp)" || { echo "FAIL: dirty manifest"; exit 50; }\n'
+        'git diff --name-only -z > "$DIRTY_MANIFEST" || exit 50\n'
+        'git diff --cached --name-only -z >> "$DIRTY_MANIFEST" || exit 50\n'
+        'HAS_DIRTY=0\n'
+        'while IFS= read -r -d "" dirty; do\n'
+        '  HAS_DIRTY=1\n'
+        '  git --literal-pathspecs diff --quiet "$TARGET".."$BRANCH" -- "$dirty"\n'
+        '  DIRTY_RC=$?\n'
+        '  if [ "$DIRTY_RC" -eq 1 ]; then\n'
         '    echo "SKIP: host tracked changes overlap branch merge:"\n'
-        '    printf "%s\\n" "$OVERLAP"\n'
-        "    exit 41\n"
-        "  fi\n"
+        '    printf "%s\\n" "$dirty"\n'
+        '    rm -f -- "$DIRTY_MANIFEST"\n'
+        '    exit 41\n'
+        '  elif [ "$DIRTY_RC" -ne 0 ]; then\n'
+        '    rm -f -- "$DIRTY_MANIFEST"\n'
+        '    echo "FAIL: could not inspect dirty path"\n'
+        '    exit 50\n'
+        '  fi\n'
+        'done < "$DIRTY_MANIFEST"\n'
+        'rm -f -- "$DIRTY_MANIFEST"\n'
+        'if [ "$HAS_DIRTY" -eq 1 ]; then\n'
         '  echo "WARN: preserving non-overlapping host tracked changes"\n'
-        "fi\n"
+        'fi\n'
     )
 
 
@@ -326,27 +338,107 @@ def _build_merge_phase(*, captures: tuple[str, ...]) -> str:
     capture_block = _build_capture_block(captures)
     return (
         'SHA="$(git rev-parse --short "$BRANCH")"\n'
+        'OLD_HEAD="$(git rev-parse HEAD)"\n'
+        'INDEX_PATH="$(git rev-parse --git-path index)"\n'
+        'INDEX_LOCK="${INDEX_PATH}.lock"\n'
+        'MERGE_INDEX="$(mktemp "${INDEX_PATH}.symphony-merge.XXXXXX")" '
+        '|| { echo "FAIL: temporary index creation failed"; exit 50; }\n'
+        'RECONCILE_INDEX="$(mktemp "${INDEX_PATH}.symphony-reconcile.XXXXXX")" '
+        '|| { rm -f -- "$MERGE_INDEX"; echo "FAIL: temporary index creation failed"; exit 50; }\n'
+        'MERGE_PATHS="$(mktemp "${INDEX_PATH}.symphony-paths.XXXXXX")" '
+        '|| { rm -f -- "$MERGE_INDEX" "$RECONCILE_INDEX"; echo "FAIL: merge path manifest creation failed"; exit 50; }\n'
+        'INDEX_INFO="$(mktemp "${INDEX_PATH}.symphony-index-info.XXXXXX")" '
+        '|| { rm -f -- "$MERGE_INDEX" "$RECONCILE_INDEX" "$MERGE_PATHS"; echo "FAIL: index info creation failed"; exit 50; }\n'
+        'TREE_ENTRY="$(mktemp "${INDEX_PATH}.symphony-tree-entry.XXXXXX")" '
+        '|| { rm -f -- "$MERGE_INDEX" "$RECONCILE_INDEX" "$MERGE_PATHS" "$INDEX_INFO"; echo "FAIL: tree entry creation failed"; exit 50; }\n'
+        'OPERATOR_PATHS="$(mktemp "${INDEX_PATH}.symphony-operator-paths.XXXXXX")" '
+        '|| { rm -f -- "$MERGE_INDEX" "$RECONCILE_INDEX" "$MERGE_PATHS" "$INDEX_INFO" "$TREE_ENTRY"; echo "FAIL: operator path manifest creation failed"; exit 50; }\n'
+        'OPERATOR_INFO="$(mktemp "${INDEX_PATH}.symphony-operator-info.XXXXXX")" '
+        '|| { rm -f -- "$MERGE_INDEX" "$RECONCILE_INDEX" "$MERGE_PATHS" "$INDEX_INFO" "$TREE_ENTRY" "$OPERATOR_PATHS"; echo "FAIL: operator index info creation failed"; exit 50; }\n'
+        'INDEX_LOCK_HELD=0\n'
+        'cleanup_merge_indexes() {\n'
+        '  rm -f -- "$MERGE_INDEX" "$RECONCILE_INDEX" "$MERGE_PATHS" "$INDEX_INFO" "$TREE_ENTRY" "$OPERATOR_PATHS" "$OPERATOR_INFO"\n'
+        '  if [ "$INDEX_LOCK_HELD" -eq 1 ]; then rm -f -- "$INDEX_LOCK"; fi\n'
+        '}\n'
+        'trap cleanup_merge_indexes EXIT HUP INT TERM\n'
+        # Own the conventional index lock for the entire merge/reconciliation
+        # window. Other Git processes fail rather than having their staging lost.
+        'if ! ( set -C; : > "$INDEX_LOCK" ) 2>/dev/null; then\n'
+        '  echo "FAIL: index is locked"; exit 50\n'
+        'fi\n'
+        'INDEX_LOCK_HELD=1\n'
+        # Snapshot operator index entries for every dirty tracked path. Reapply
+        # them after the merge so their blobs and staged/partially-staged shape
+        # survive, while zeroed stat data forces Git to re-check racy files.
+        'git diff --name-only -z > "$OPERATOR_PATHS" || exit 50\n'
+        'git diff --cached --name-only -z >> "$OPERATOR_PATHS" || exit 50\n'
+        ': > "$OPERATOR_INFO"\n'
+        'while IFS= read -r -d "" operator_path; do\n'
+        '  GIT_INDEX_FILE="$INDEX_PATH" git --literal-pathspecs ls-files --stage -z -- "$operator_path" > "$TREE_ENTRY" '
+        '  || { echo "FAIL: operator index snapshot"; exit 50; }\n'
+        '  if [ -s "$TREE_ENTRY" ]; then\n'
+        '    cat "$TREE_ENTRY" >> "$OPERATOR_INFO" || exit 50\n'
+        '  else\n'
+        '    printf "0 %040d\\t%s\\0" 0 "$operator_path" >> "$OPERATOR_INFO" || exit 50\n'
+        '  fi\n'
+        'done < "$OPERATOR_PATHS"\n'
+        # The isolated merge index must start clean at OLD_HEAD. Copying the
+        # operator index would reproduce Git's staged-index merge refusal.
+        'GIT_INDEX_FILE="$MERGE_INDEX" git read-tree "$OLD_HEAD" '
+        '|| { echo "FAIL: temporary index initialization"; exit 50; }\n'
+        'merge_git() { GIT_INDEX_FILE="$MERGE_INDEX" git "$@"; }\n'
         'CAPTURE_MANIFEST=""\n'
         + _build_capture_rollback_helpers()
-        +
-        "git -c user.email=symphony@local -c user.name=symphony merge "
+        + 'merge_git -c user.email=symphony@local -c user.name=symphony merge '
         '--no-ff --no-commit "$BRANCH" '
         '|| fail_after_merge 50 "FAIL: merge failed"\n'
         + capture_block
-        + "if git diff --cached --quiet; then\n"
+        + 'if merge_git diff --cached --quiet; then\n'
         '  echo "SKIP: nothing staged after merge"\n'
-        "  if ! rollback_capture_merge; then exit 50; fi\n"
-        "  sync_upstream\n"
-        "  exit 43\n"
-        "fi\n"
-        "git -c user.email=symphony@local -c user.name=symphony commit "
+        '  if ! rollback_capture_merge; then exit 50; fi\n'
+        '  rm -f -- "$INDEX_LOCK"; INDEX_LOCK_HELD=0\n'
+        '  sync_upstream\n'
+        '  exit 43\n'
+        'fi\n'
+        'merge_git -c user.email=symphony@local -c user.name=symphony commit '
         '-m "merge: ${IDENT} from ${BRANCH} (${SHA})" '
         '-m "${TITLE}" '
         '-m "Source: ${BRANCH} ${SHA}" '
         '|| fail_after_merge 51 "FAIL: commit failed"\n'
-        'if [ -n "$CAPTURE_MANIFEST" ]; then\n'
-        '  rm -f -- "$CAPTURE_MANIFEST"\n'
-        "fi\n"
+        'NEW_HEAD="$(git rev-parse HEAD)"\n'
+        # Copy the operator index exactly, then advance only paths changed by
+        # the autonomous merge. This preserves partially-staged entries byte
+        # for byte on every disjoint operator path.
+        'git diff --name-only -z "$OLD_HEAD" "$NEW_HEAD" > "$MERGE_PATHS" '
+        '|| { echo "FAIL: merge path manifest"; exit 50; }\n'
+        'cp -- "$INDEX_PATH" "$RECONCILE_INDEX" '
+        '|| { echo "FAIL: reconciliation index copy"; exit 50; }\n'
+        ': > "$INDEX_INFO"\n'
+        'while IFS= read -r -d "" merged_path; do\n'
+        '  git --literal-pathspecs ls-tree -z "$NEW_HEAD" -- "$merged_path" > "$TREE_ENTRY" '
+        '  || { echo "FAIL: merged tree entry"; exit 50; }\n'
+        '  if [ -s "$TREE_ENTRY" ]; then\n'
+        '    cat "$TREE_ENTRY" >> "$INDEX_INFO" || exit 50\n'
+        '  else\n'
+        '    printf "0 %040d\\t%s\\0" 0 "$merged_path" >> "$INDEX_INFO" || exit 50\n'
+        '  fi\n'
+        'done < "$MERGE_PATHS"\n'
+        'if [ -s "$INDEX_INFO" ]; then\n'
+        '  GIT_INDEX_FILE="$RECONCILE_INDEX" git update-index -z --index-info < "$INDEX_INFO" '
+        '  || { echo "FAIL: index reconciliation"; exit 50; }\n'
+        'fi\n'
+        'if [ -s "$OPERATOR_INFO" ]; then\n'
+        '  GIT_INDEX_FILE="$RECONCILE_INDEX" git update-index -z --index-info < "$OPERATOR_INFO" '
+        '  || { echo "FAIL: operator index restoration"; exit 50; }\n'
+        'fi\n'
+        # Publish the fully-built index through the lock file, then atomically
+        # rename it into place. Push is deliberately after this point.
+        'mv -f -- "$RECONCILE_INDEX" "$INDEX_LOCK" '
+        '|| { echo "FAIL: reconciliation lock publish"; exit 50; }\n'
+        'mv -f -- "$INDEX_LOCK" "$INDEX_PATH" '
+        '|| { echo "FAIL: reconciliation publish"; exit 50; }\n'
+        'INDEX_LOCK_HELD=0\n'
+        'if [ -n "$CAPTURE_MANIFEST" ]; then rm -f -- "$CAPTURE_MANIFEST"; fi\n'
     )
 
 
@@ -354,14 +446,14 @@ def _build_capture_rollback_helpers() -> str:
     return (
         "rollback_capture_merge() {\n"
         '  if [ -n "$CAPTURE_MANIFEST" ] && [ -s "$CAPTURE_MANIFEST" ]; then\n'
-        "    if ! git --literal-pathspecs reset -q HEAD "
+        '    if ! merge_git --literal-pathspecs reset -q HEAD '
         '--pathspec-from-file="$CAPTURE_MANIFEST" --pathspec-file-nul; then\n'
         '      echo "RECOVERY: capture manifest retained at $CAPTURE_MANIFEST"\n'
         "      return 1\n"
         "    fi\n"
         "  fi\n"
-        "  if git rev-parse -q --verify MERGE_HEAD >/dev/null 2>&1; then\n"
-        "    if ! git merge --abort >/dev/null 2>&1; then\n"
+        '  if git rev-parse -q --verify MERGE_HEAD >/dev/null 2>&1; then\n'
+        '    if ! merge_git merge --abort >/dev/null 2>&1; then\n'
         '      echo "RECOVERY: merge state and manifest retained at $CAPTURE_MANIFEST"\n'
         "      return 1\n"
         "    fi\n"
@@ -373,7 +465,7 @@ def _build_capture_rollback_helpers() -> str:
         '  FAIL_MESSAGE="$2"\n'
         '  if [ -n "$FAIL_MESSAGE" ]; then echo "$FAIL_MESSAGE"; fi\n'
         "  if ! rollback_capture_merge; then exit 50; fi\n"
-        "  exit \"$FAIL_RC\"\n"
+        '  exit "$FAIL_RC"\n'
         "}\n"
     )
 
@@ -387,13 +479,13 @@ def _build_capture_block(captures: tuple[str, ...]) -> str:
         '|| fail_after_merge 50 "FAIL: capture manifest creation failed"\n'
         f"for cap in {quoted}; do\n"
         '  if [ -n "$cap" ] && [ -d "$cap" ] && [ ! -L "$cap" ]; then\n'
-        "    git --literal-pathspecs ls-files -z --others --exclude-standard "
+        "    merge_git --literal-pathspecs ls-files -z --others --exclude-standard "
         '-- "$cap" >> "$CAPTURE_MANIFEST" '
         '|| fail_after_merge 50 "FAIL: capture enumeration failed"\n'
         "  fi\n"
         "done\n"
         'if [ -s "$CAPTURE_MANIFEST" ]; then\n'
-        "  git --literal-pathspecs add "
+        "  merge_git --literal-pathspecs add "
         '--pathspec-from-file="$CAPTURE_MANIFEST" --pathspec-file-nul '
         '|| fail_after_merge 50 "FAIL: capture add failed"\n'
         "fi\n"

@@ -408,7 +408,7 @@ _BLOCKED_RCA_HEADING_RE = re.compile(
     re.IGNORECASE | re.MULTILINE,
 )
 _BLOCKED_RCA_RESOLVED_HEADING_RE = re.compile(
-    r"^##\s+Blocked\s+RCA\s+Resolved\s*$",
+    r"^##\s+(?:Blocked\s+RCA\s+Resolved|RCA\s+Resolution)\s*$",
     re.IGNORECASE | re.MULTILINE,
 )
 _BLOCKED_RCA_SOURCE_IDENTIFIER_RE = re.compile(
@@ -474,7 +474,18 @@ def _markdown_section(description: str, heading_re: re.Pattern[str]) -> str:
 
 
 def _blocked_rca_already_requested(issue: Issue) -> bool:
-    return bool(_BLOCKED_RCA_HEADING_RE.search(issue.description or ""))
+    """Whether the current Blocked episode already requested an RCA.
+
+    Resolution notes close the preceding request.  A source that later blocks
+    again is a new episode and may open a new RCA, provided no RCA for that
+    source is currently active on the board.
+    """
+    description = issue.description or ""
+    requested = list(_BLOCKED_RCA_HEADING_RE.finditer(description))
+    if not requested:
+        return False
+    resolved = list(_BLOCKED_RCA_RESOLVED_HEADING_RE.finditer(description))
+    return not resolved or requested[-1].start() > resolved[-1].start()
 
 
 def _is_blocked_rca_ticket(issue: Issue) -> bool:
@@ -613,6 +624,10 @@ class Orchestrator:
         self._last_archive_sweep_monotonic: float | None = None
         self._lease_blocked: dict[str, str] = {}
         self._blocked_rca_source_ids: set[str] = set()
+        # Serialize the board check + create sequence.  The in-memory source
+        # set is only a cache; concurrent manual/automatic recovery requests
+        # must re-check the persisted board before either creates an RCA.
+        self._blocked_rca_creation_lock = asyncio.Lock()
         # Tickets the host already re-checked for a sandbox-denied history
         # write. Bounds the extra description fetch to one per ticket per
         # process instead of one per sweep.
@@ -2439,6 +2454,39 @@ class Orchestrator:
             client.close()
 
     @staticmethod
+    def _tracker_call_active_rca_for_source(
+        cfg: ServiceConfig, source_identifier: str
+    ) -> str | None:
+        """Return the persisted active RCA for a source, if one exists."""
+        client = build_tracker_client(cfg)
+        try:
+            # Blocked/Human Review RCA cards are still unresolved work even
+            # when the workflow models those parking lanes as terminal. Only
+            # completed/discarded RCA states stop suppressing duplicates.
+            resolved_states = {"done", "archive", "cancelled"}
+            scan_states = tuple(
+                dict.fromkeys(
+                    (*cfg.tracker.active_states, *cfg.tracker.terminal_states)
+                )
+            )
+            unresolved_states = tuple(
+                state
+                for state in scan_states
+                if normalize_state(state) not in resolved_states
+            )
+            issues = client.fetch_issues_by_states(unresolved_states)
+        finally:
+            client.close()
+        source_key = source_identifier.casefold()
+        for candidate in issues:
+            if not _looks_like_blocked_rca_ticket(candidate):
+                continue
+            candidate_source = _blocked_rca_source_identifier(candidate)
+            if candidate_source and candidate_source.casefold() == source_key:
+                return candidate.identifier
+        return None
+
+    @staticmethod
     def _tracker_call_create_blocked_rca_issue(
         cfg: ServiceConfig,
         issue: Issue,
@@ -2705,20 +2753,46 @@ class Orchestrator:
         if requested_agent not in SUPPORTED_AGENT_KINDS:
             requested_agent = cfg.agent.kind
 
-        rca_identifier = await asyncio.to_thread(
-            self._tracker_call_create_blocked_rca_issue,
-            cfg,
-            issue,
-            rca_state,
-            reopen_state,
-            requested_agent,
-        )
-        if rca_identifier is None:
-            return (
-                False,
-                "blocked RCA creation requires a tracker that can create tickets",
-                {},
+        async with self._blocked_rca_creation_lock:
+            # The source note and in-memory set can both be stale or absent
+            # after a restart.  The board is authoritative: inspect every
+            # configured active lane before creating another RCA.
+            if (
+                _blocked_rca_already_requested(issue)
+                or issue.id in self._blocked_rca_source_ids
+            ):
+                return (
+                    False,
+                    f"blocked RCA already opened for {issue.identifier}",
+                    {},
+                )
+            active_rca = await asyncio.to_thread(
+                self._tracker_call_active_rca_for_source,
+                cfg,
+                issue.identifier,
             )
+            if active_rca is not None:
+                self._blocked_rca_source_ids.add(issue.id)
+                return (
+                    False,
+                    f"blocked RCA already opened for {issue.identifier}",
+                    {},
+                )
+            rca_identifier = await asyncio.to_thread(
+                self._tracker_call_create_blocked_rca_issue,
+                cfg,
+                issue,
+                rca_state,
+                reopen_state,
+                requested_agent,
+            )
+            if rca_identifier is None:
+                return (
+                    False,
+                    "blocked RCA creation requires a tracker that can create tickets",
+                    {},
+                )
+            self._blocked_rca_source_ids.add(issue.id)
 
         body = (
             f"RCA ticket `{rca_identifier}` opened in `{rca_state}` for "
@@ -2739,7 +2813,6 @@ class Orchestrator:
             "Blocked RCA",
             body,
         )
-        self._blocked_rca_source_ids.add(issue.id)
         self._record_stats_transition(rca_identifier, "", rca_state)
         self.request_refresh()
         return (
@@ -5046,6 +5119,7 @@ class Orchestrator:
             value = payload.get(key)
             if isinstance(value, str) and value.strip():
                 return value.strip()
+
         def assistant_message_preview(message: Any) -> str:
             """Extract text only from an assistant message.
 
