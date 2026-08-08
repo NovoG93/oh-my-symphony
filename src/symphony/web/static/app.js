@@ -123,13 +123,17 @@
     skipDocument: (id) => apiRequest(`/${encodeURIComponent(id)}/skip-document`, { method: 'POST' }),
     recoverBlocked: (id) => apiRequest(`/issues/${encodeURIComponent(id)}/recover-blocked`, { method: 'POST' }),
     refresh: () => apiRequest('/refresh', { method: 'POST' }),
+    getPreview: () => apiRequest('/preview'),
+    startPreview: () => apiRequest('/preview/start', { method: 'POST', body: '{}' }),
+    stopPreview: () => apiRequest('/preview/stop', { method: 'POST', body: '{}' }),
+    restartPreview: () => apiRequest('/preview/restart', { method: 'POST', body: '{}' }),
   };
 
   // ------------------------------------------------------------------
   // State store
   // ------------------------------------------------------------------
 
-  const ROUTES = ['board', 'stats', 'workflow', 'git', 'chat', 'settings'];
+  const ROUTES = ['board', 'stats', 'workflow', 'git', 'chat', 'preview', 'settings'];
 
   const PRIORITY_META = {
     0: { label: t('priority.urgent'), short: 'P0', className: 'p0' },
@@ -856,6 +860,7 @@
     closeAnyMenu();
     closeDrawer();
     closeChatSocket();
+    cancelPreviewPoll();
     switch (state.route) {
       case 'board':
         renderBoardPage(view);
@@ -871,6 +876,9 @@
         break;
       case 'chat':
         renderChatPage(view);
+        break;
+      case 'preview':
+        renderPreviewPage(view);
         break;
       case 'settings':
         renderSettingsPage(view);
@@ -2818,6 +2826,288 @@
         if (state.route === 'chat' && !chatState.socket) connectChatSocket(view);
       }, delay);
     };
+  }
+
+  // ------------------------------------------------------------------
+  // Page: Product Preview
+  // ------------------------------------------------------------------
+
+  let previewPollTimer = null;
+
+  function cancelPreviewPoll() {
+    if (previewPollTimer != null) {
+      clearTimeout(previewPollTimer);
+      previewPollTimer = null;
+    }
+  }
+
+  function safePreviewUrl(value) {
+    if (!value) return null;
+    try {
+      const url = new URL(String(value), window.location.href);
+      return url.protocol === 'http:' || url.protocol === 'https:' ? url.href : null;
+    } catch (_err) {
+      return null;
+    }
+  }
+
+  function previewPhase(data) {
+    const phase = String((data && data.phase) || '').toLowerCase();
+    if (data && data.running) {
+      if (data.healthy || data.ready) return 'running';
+      return phase === 'failed' ? 'failed' : 'starting';
+    }
+    if (phase === 'failed' || (data && data.last_error)) return 'failed';
+    return phase || 'stopped';
+  }
+
+  function previewPhaseLabel(phase) {
+    const labels = {
+      running: t('preview.phase.running'),
+      starting: t('preview.phase.starting'),
+      stopping: t('preview.phase.stopping'),
+      failed: t('preview.phase.failed'),
+      stopped: t('preview.phase.stopped'),
+      disabled: t('preview.phase.disabled'),
+    };
+    return labels[phase] || phase;
+  }
+
+  function previewValue(value) {
+    return value == null || value === '' ? '—' : String(value);
+  }
+
+  function buildPreviewMetric(label, value, extraClass) {
+    return el('div', { class: `preview-metric${extraClass ? ` ${extraClass}` : ''}` }, [
+      el('dt', null, label),
+      el('dd', null, previewValue(value)),
+    ]);
+  }
+
+  function buildPreviewActions(data, body) {
+    const configured = Boolean(data.configured);
+    const enabled = data.enabled !== false;
+    const running = Boolean(data.running);
+    const gateReady = !data.release_gate || data.release_gate.ready !== false;
+    const url = safePreviewUrl(data.url);
+
+    async function act(action, button) {
+      button.disabled = true;
+      body.setAttribute('aria-busy', 'true');
+      try {
+        const next = await api[action]();
+        showToast(t(`preview.${action === 'startPreview' ? 'launched' : action === 'stopPreview' ? 'stopped' : 'restarted'}`), 'success');
+        paintPreviewPage(body, next);
+      } catch (err) {
+        showToast(err.message, 'error');
+        await refreshPreviewPage(body, false);
+      } finally {
+        body.removeAttribute('aria-busy');
+      }
+    }
+
+    const launch = el('button', {
+      class: 'btn btn-primary preview-launch',
+      type: 'button',
+      disabled: !configured || !enabled || !gateReady || running,
+      onClick: (event) => act('startPreview', event.currentTarget),
+    }, t('preview.launch'));
+    const restart = el('button', {
+      class: 'btn',
+      type: 'button',
+      disabled: !configured || !enabled || !gateReady || !running,
+      onClick: (event) => act('restartPreview', event.currentTarget),
+    }, t('preview.restart'));
+    const stop = el('button', {
+      class: 'btn btn-danger-outline',
+      type: 'button',
+      disabled: !running,
+      onClick: (event) => act('stopPreview', event.currentTarget),
+    }, t('preview.stop'));
+    const open = url && running
+      ? el('a', {
+        class: 'btn preview-open',
+        href: url,
+        target: '_blank',
+        rel: 'noopener noreferrer',
+        'aria-label': t('preview.openAria'),
+      }, t('preview.open'))
+      : el('button', { class: 'btn preview-open', type: 'button', disabled: true }, t('preview.open'));
+
+    return el('div', { class: 'preview-actions', 'aria-label': t('preview.controls') }, [launch, open, restart, stop]);
+  }
+
+  function buildPreviewNotice(data) {
+    let title = '';
+    let detail = '';
+    let tone = 'info';
+    if (!data.configured) {
+      title = t('preview.unconfigured');
+      detail = data.last_error || t('preview.unconfiguredHint');
+      tone = 'warning';
+    } else if (data.enabled === false) {
+      title = t('preview.disabled');
+      detail = t('preview.disabledHint');
+      tone = 'warning';
+    } else if (previewPhase(data) === 'failed') {
+      title = t('preview.failed');
+      detail = data.last_error || t('preview.failedHint');
+      tone = 'danger';
+    } else if (data.running && !data.ready) {
+      title = t('preview.notReady');
+      detail = data.last_error || t('preview.notReadyHint');
+      tone = 'warning';
+    }
+    if (!title) return null;
+    return el('section', { class: `preview-notice ${tone}`, role: tone === 'danger' ? 'alert' : 'status' }, [
+      el('strong', null, title),
+      el('span', null, detail),
+    ]);
+  }
+
+  function buildPreviewStage(data) {
+    const url = safePreviewUrl(data.url);
+    if (data.running && url) {
+      return el('section', { class: 'preview-stage', 'aria-label': t('preview.productFrame') }, [
+        el('div', { class: 'preview-browser-bar' }, [
+          el('span', { class: 'preview-browser-light red', 'aria-hidden': 'true' }),
+          el('span', { class: 'preview-browser-light amber', 'aria-hidden': 'true' }),
+          el('span', { class: 'preview-browser-light green', 'aria-hidden': 'true' }),
+          el('span', { class: 'preview-address' }, url),
+        ]),
+        el('iframe', {
+          class: 'preview-frame',
+          src: url,
+          title: t('preview.iframeTitle'),
+          loading: 'eager',
+          referrerpolicy: 'no-referrer',
+        }),
+      ]);
+    }
+    return el('section', { class: 'preview-stage preview-stage-empty', 'aria-label': t('preview.productFrame') }, [
+      el('div', { class: 'preview-empty-mark', 'aria-hidden': 'true' }, '▱'),
+      el('h2', null, data.configured ? t('preview.awaitingLaunch') : t('preview.noTarget')),
+      el('p', null, data.configured ? t('preview.awaitingLaunchHint') : t('preview.noTargetHint')),
+    ]);
+  }
+
+  function buildPreviewAcceptance(data) {
+    const items = Array.isArray(data.acceptance) ? data.acceptance : [];
+    const gate = data.release_gate || {};
+    const gateReady = gate.ready === true;
+    const gateState = gate.state || (gateReady ? t('preview.gateReady') : t('preview.gatePending'));
+    const list = items.length
+      ? el('ul', { class: 'preview-checklist' }, items.map((item) =>
+        el('li', null, [el('span', { class: 'preview-check', 'aria-hidden': 'true' }, '□'), el('span', null, String(item))])
+      ))
+      : el('p', { class: 'preview-muted' }, t('preview.noAcceptance'));
+    return el('section', { class: 'preview-panel preview-acceptance' }, [
+      el('div', { class: 'preview-panel-heading' }, [
+        el('h2', null, t('preview.acceptance')),
+        el('span', { class: `preview-gate ${gateReady ? 'ready' : 'pending'}` }, gateState),
+      ]),
+      list,
+      el('div', { class: 'preview-release-ticket' }, [
+        el('span', null, t('preview.releaseTicket')),
+        el('strong', null, previewValue(gate.ticket)),
+      ]),
+      gate.reason ? el('p', { class: 'preview-gate-reason' }, gate.reason) : null,
+    ]);
+  }
+
+  function buildPreviewLogs(data, body) {
+    const logs = Array.isArray(data.logs) ? data.logs : [];
+    const refresh = el('button', {
+      class: 'btn btn-sm',
+      type: 'button',
+      onClick: async (event) => {
+        event.currentTarget.disabled = true;
+        await refreshPreviewPage(body, true);
+      },
+    }, t('preview.refreshLogs'));
+    const output = el('div', {
+      class: 'preview-log-output',
+      role: 'log',
+      'aria-live': 'polite',
+      'aria-label': t('preview.liveLogs'),
+      tabindex: '0',
+    }, logs.length
+      ? logs.map((entry) => {
+        const record = typeof entry === 'string' ? { line: entry } : (entry || {});
+        return el('div', { class: `preview-log-line ${record.stream === 'stderr' ? 'stderr' : ''}` }, [
+          el('span', { class: 'preview-log-stream' }, record.stream || 'out'),
+          el('span', null, previewValue(record.line)),
+        ]);
+      })
+      : el('div', { class: 'preview-log-empty' }, t('preview.noLogs')));
+    requestAnimationFrame(() => { output.scrollTop = output.scrollHeight; });
+    return el('section', { class: 'preview-panel preview-logs' }, [
+      el('div', { class: 'preview-panel-heading' }, [el('h2', null, t('preview.liveLogs')), refresh]),
+      output,
+    ]);
+  }
+
+  function paintPreviewPage(body, data) {
+    if (!body.isConnected || state.route !== 'preview') return;
+    cancelPreviewPoll();
+    clearNode(body);
+    const phase = previewPhase(data);
+    const header = el('section', { class: 'preview-command-deck' }, [
+      el('div', { class: 'preview-command-copy' }, [
+        el('span', { class: 'preview-eyebrow' }, t('preview.eyebrow')),
+        el('div', { class: 'preview-title-row' }, [
+          el('h1', null, t('preview.title')),
+          el('span', { class: `preview-status ${phase}`, role: 'status', 'aria-live': 'polite' }, previewPhaseLabel(phase)),
+        ]),
+        el('p', null, t('preview.subtitle')),
+      ]),
+      buildPreviewActions(data, body),
+    ]);
+    const notice = buildPreviewNotice(data);
+    const metrics = el('dl', { class: 'preview-metrics' }, [
+      buildPreviewMetric(t('preview.readiness'), data.ready ? t('preview.ready') : t('preview.notReadyValue'), data.ready ? 'good' : 'waiting'),
+      buildPreviewMetric(t('preview.health'), data.healthy ? t('preview.healthy') : t('preview.unhealthy'), data.healthy ? 'good' : 'waiting'),
+      buildPreviewMetric(t('preview.targetSha'), data.target_sha),
+      buildPreviewMetric(t('preview.targetBranch'), data.target_branch),
+      buildPreviewMetric(t('preview.url'), data.url),
+      buildPreviewMetric(t('preview.process'), data.pid ? `PID ${data.pid}${data.port ? ` · :${data.port}` : ''}` : '—'),
+    ]);
+    const lower = el('div', { class: 'preview-lower-grid' }, [buildPreviewAcceptance(data), buildPreviewLogs(data, body)]);
+    body.appendChild(header);
+    if (notice) body.appendChild(notice);
+    body.appendChild(metrics);
+    body.appendChild(buildPreviewStage(data));
+    body.appendChild(lower);
+    previewPollTimer = setTimeout(() => refreshPreviewPage(body, false), 3000);
+  }
+
+  async function refreshPreviewPage(body, announce) {
+    if (!body.isConnected || state.route !== 'preview') return;
+    try {
+      const data = await api.getPreview();
+      paintPreviewPage(body, data || {});
+      if (announce) showToast(t('preview.refreshed'), 'success');
+    } catch (err) {
+      if (!body.isConnected || state.route !== 'preview') return;
+      cancelPreviewPoll();
+      clearNode(body);
+      body.appendChild(el('div', { class: 'preview-load-error', role: 'alert' }, [
+        el('strong', null, t('preview.unavailable')),
+        el('span', null, err.message),
+        el('button', { class: 'btn', type: 'button', onClick: () => refreshPreviewPage(body, false) }, t('common.refresh')),
+      ]));
+      previewPollTimer = setTimeout(() => refreshPreviewPage(body, false), 5000);
+    }
+  }
+
+  function renderPreviewPage(container) {
+    const page = el('div', { class: 'page page-preview' });
+    const body = el('div', { class: 'preview-body' }, [
+      el('div', { class: 'preview-loading', role: 'status' }, [buildSkeletonBlock(), el('span', null, t('preview.loading'))]),
+    ]);
+    page.appendChild(body);
+    container.appendChild(page);
+    refreshPreviewPage(body, false);
   }
 
   // ------------------------------------------------------------------

@@ -324,6 +324,21 @@ prime_agent:
 server:
   port: 9999            # optional JSON API; the primary UI is `symphony tui`
 
+# Optional one-click Product Preview in the admin web UI. Commands are trusted
+# WORKFLOW config, executed argv-only in a clean checkout of the merge target.
+# The API cannot override command, cwd, branch, or port; preview stays loopback.
+preview:
+  enabled: false
+  cwd: web
+  command: npm run preview -- --host ${HOST} --port ${PORT}
+  health_path: /
+  url_path: /
+  startup_timeout_ms: 30000
+  release_ticket: RELEASE-001
+  acceptance:
+    - Final acceptance suite passes
+    - Release evidence is attached
+
 tui:
   language: en               # `en` (default) or `ko`. SYMPHONY_LANG env overrides.
                              # Also drives artefact language: every prompt is

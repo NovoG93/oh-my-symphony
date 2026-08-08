@@ -1506,3 +1506,56 @@ async def test_lane_preset_apply_reports_no_warning_for_a_sane_budget(
 
     assert resp.status == 200
     assert (await resp.json())["warning"] is None
+
+
+@pytest.mark.asyncio
+async def test_product_preview_status_defaults_disabled(client: TestClient):
+    response = await client.get("/api/v1/preview")
+    assert response.status == 200
+    payload = await response.json()
+    assert payload["enabled"] is False
+    assert payload["phase"] == "disabled"
+
+
+@pytest.mark.asyncio
+async def test_product_preview_start_rejects_disabled(client: TestClient):
+    response = await client.post("/api/v1/preview/start", json={})
+    assert response.status == 409
+    payload = await response.json()
+    assert payload["error"]["code"] == "preview_error"
+
+
+
+@pytest.mark.asyncio
+async def test_product_preview_process_controls_require_json(client: TestClient):
+    response = await client.post("/api/v1/preview/stop")
+    assert response.status == 415
+    payload = await response.json()
+    assert payload["error"]["code"] == "unsupported_media_type"
+
+
+@pytest.mark.asyncio
+async def test_product_preview_start_waits_for_done_release_ticket(
+    board_dir: Path,
+):
+    workflow = board_dir / "WORKFLOW.md"
+    text = workflow.read_text(encoding="utf-8").replace(
+        "agent:\n  kind: claude\n",
+        "agent:\n  kind: claude\n  auto_merge_target_branch: dev\n\n"
+        "preview:\n  enabled: true\n  command: python3 -m http.server ${PORT} --bind ${HOST}\n"
+        "  release_ticket: SEED-1\n",
+    )
+    workflow.write_text(text, encoding="utf-8")
+    state = WorkflowState(workflow)
+    cfg, err = state.reload()
+    assert err is None and cfg is not None
+    app = build_app(cast(Orchestrator, _StubOrchestrator(state)))
+    cli = TestClient(TestServer(app))
+    await cli.start_server()
+    try:
+        response = await cli.post("/api/v1/preview/start", json={})
+        assert response.status == 409
+        payload = await response.json()
+        assert payload["error"]["code"] == "release_not_ready"
+    finally:
+        await cli.close()

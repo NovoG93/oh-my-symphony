@@ -279,10 +279,10 @@ agent:
   # Branch/ref used as the start point for new `symphony/<ID>` feature
   # branches. Empty string = current host branch. The board viewer can
   # update this from its real git branch dropdown.
-  feature_base_branch: ""
-  # Branch to merge into after Document. Empty string = same as feature base
-  # branch/current host branch. The board viewer can update this too.
-  auto_merge_target_branch: ""
+  feature_base_branch: "dev"
+  # Branch to merge into after Document. Pinning this avoids integration drift
+  # when an operator checks out another host branch while Symphony is running.
+  auto_merge_target_branch: "dev"
   auto_merge_exclude_paths:
     - kanban
 
@@ -381,6 +381,30 @@ qa:
 
 server:
   port: 9999
+
+# One-click preview of the integrated product. The command is trusted local
+# configuration; the web API never accepts command/path/ref overrides.
+preview:
+  enabled: true
+  cwd: todo-app
+  command: python3 -m http.server ${PORT} --bind ${HOST}
+  health_path: /
+  url_path: /
+  startup_timeout_ms: 10000
+  release_ticket: SMA-32
+  acceptance:
+    - Add and render todos
+    - Toggle completed state
+    - Delete todos
+    - Filter All, Active, and Completed
+    - Show the items-left counter
+    - Clear completed todos
+    - Edit inline with Enter and Escape
+    - Show the correct empty state
+    - Restore todos from localStorage after reload
+    - Run with a clean browser console
+    - Support the documented keyboard flow
+    - Ship an accurate README and screenshot evidence
 
 tui:
   language: en

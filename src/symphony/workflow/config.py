@@ -415,6 +415,20 @@ class ServerConfig:
 
 
 @dataclass(frozen=True)
+class PreviewConfig:
+    """Trusted, loopback-only product preview configured in WORKFLOW.md."""
+
+    enabled: bool = False
+    command: str = ""
+    cwd: str = "."
+    health_path: str = "/"
+    url_path: str = "/"
+    startup_timeout_ms: int = 30_000
+    release_ticket: str = ""
+    acceptance: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
 class TuiConfig:
     """Display-time TUI tweaks. Affects rendering only; orchestrator ignores."""
 
@@ -581,6 +595,9 @@ class ServiceConfig:
     # Appended after the original fields so positional ServiceConfig callers
     # keep receiving the same values as before Prime Agent was added.
     prime_agent: PrimeAgentConfig = field(default_factory=_default_prime_agent_config)
+    # §13.8 Product Preview — off by default, keyword-only so existing
+    # positional ServiceConfig callers are unaffected.
+    preview: PreviewConfig = field(default_factory=PreviewConfig)
 
     def prompt_template_for_state(self, state: str) -> str:
         """Return the runtime prompt template for one tracker state."""

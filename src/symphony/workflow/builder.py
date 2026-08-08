@@ -44,6 +44,7 @@ from .config import (
     OpenCodeConfig,
     PiConfig,
     PrimeAgentConfig,
+    PreviewConfig,
     ProgressConfig,
     PromptConfig,
     ServerConfig,
@@ -583,6 +584,60 @@ def build_service_config(workflow: WorkflowDefinition) -> ServiceConfig:
         port = None
     server = ServerConfig(port=port)
 
+    preview_raw = cfg.get("preview") or {}
+    if not isinstance(preview_raw, dict):
+        raise ConfigValidationError("preview must be a mapping", value=preview_raw)
+    preview_enabled = _validated_bool(
+        preview_raw.get("enabled"), False, name="preview.enabled"
+    )
+    preview_command = _as_str(preview_raw.get("command"), "").strip()
+    preview_cwd = _as_str(preview_raw.get("cwd"), ".").strip() or "."
+    cwd_path = Path(preview_cwd)
+    if cwd_path.is_absolute() or ".." in cwd_path.parts:
+        raise ConfigValidationError(
+            "preview.cwd must be a relative path inside the preview checkout",
+            value=preview_cwd,
+        )
+    health_path = _as_str(preview_raw.get("health_path"), "/").strip() or "/"
+    url_path = _as_str(preview_raw.get("url_path"), "/").strip() or "/"
+    for name, path_value in (("preview.health_path", health_path), ("preview.url_path", url_path)):
+        if not path_value.startswith("/") or "://" in path_value:
+            raise ConfigValidationError(
+                f"{name} must be an absolute URL path", value=path_value
+            )
+    startup_timeout_ms = _validated_positive_or_default(
+        preview_raw.get("startup_timeout_ms"),
+        30_000,
+        name="preview.startup_timeout_ms",
+    )
+    release_ticket = _as_str(preview_raw.get("release_ticket"), "").strip()
+    acceptance_raw = preview_raw.get("acceptance", [])
+    if not isinstance(acceptance_raw, list) or not all(
+        isinstance(item, str) and item.strip() for item in acceptance_raw
+    ):
+        raise ConfigValidationError(
+            "preview.acceptance must be a list of non-empty strings",
+            value=acceptance_raw,
+        )
+    if preview_enabled and not preview_command:
+        raise ConfigValidationError(
+            "preview.command is required when preview.enabled is true"
+        )
+    if preview_enabled and "${HOST}" not in preview_command:
+        raise ConfigValidationError(
+            "preview.command must include ${HOST} so the product binds to loopback"
+        )
+    preview = PreviewConfig(
+        enabled=preview_enabled,
+        command=preview_command,
+        cwd=preview_cwd,
+        health_path=health_path,
+        url_path=url_path,
+        startup_timeout_ms=startup_timeout_ms,
+        release_ticket=release_ticket,
+        acceptance=tuple(item.strip() for item in acceptance_raw),
+    )
+
     tui_raw = cfg.get("tui") or {}
     if not isinstance(tui_raw, dict):
         tui_raw = {}
@@ -723,6 +778,7 @@ def build_service_config(workflow: WorkflowDefinition) -> ServiceConfig:
         raw=dict(cfg),
         prompt_template=prompt_template,
         workspace_reuse_policy=workspace_reuse_policy,
+        preview=preview,
     )
 
 

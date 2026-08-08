@@ -500,3 +500,37 @@ script:
 
 If the operator declines, omit the block. If they want only "Done"
 events, set `notify_on_states: [Done]` and skip templates.
+
+
+## Product Preview
+
+`preview:` adds a one-click local product launcher to the admin UI. It always
+checks out the exact `agent.auto_merge_target_branch` commit into a
+preview-owned detached worktree; it never runs from the host checkout or a
+ticket workspace.
+
+```yaml
+preview:
+  enabled: true
+  cwd: todo-app
+  command: python3 -m http.server ${PORT} --bind ${HOST}
+  health_path: /
+  url_path: /
+  startup_timeout_ms: 10000
+  release_ticket: SMA-32
+  acceptance:
+    - All acceptance scenarios pass
+    - Browser console is clean
+    - README and screenshot evidence exist
+```
+
+The command is trusted operator configuration, parsed with `shlex`, and
+started without a shell. `${PORT}` and `${HOST}` are the only managed launch
+placeholders; `PORT`, `HOST`, and `SYMPHONY_PREVIEW_SHA` are also exported.
+`cwd` must be relative and remain inside the clean checkout. Health and product
+paths must begin with `/`. Start and restart are rejected until the configured
+release ticket is exactly `Done`. Preview process-control endpoints are
+available only when Symphony itself is bound to loopback. Restart stops the
+current process, removes its checkout, resolves the newest target-branch SHA,
+and relaunches. Stop and Symphony shutdown terminate the process group and
+remove the managed checkout.
