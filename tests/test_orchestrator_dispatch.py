@@ -113,13 +113,13 @@ def _make_config(
             stall_timeout_ms=300_000,
             resume_across_turns=True,
         ),
-        prime_agent=PrimeAgentConfig(
-            command="prime-agent -p --mode json",
-            turn_timeout_ms=3_600_000,
-            read_timeout_ms=5_000,
-            stall_timeout_ms=300_000,
-            resume_across_turns=True,
-        ),
+prime_agent=PrimeAgentConfig(
+    command='prime-agent -p --mode json',
+    turn_timeout_ms=3_600_000,
+    read_timeout_ms=5_000,
+    stall_timeout_ms=300_000,
+    resume_across_turns=True,
+),
         server=ServerConfig(port=None),
         prompt_template="hi",
     )
@@ -6107,6 +6107,113 @@ def test_recover_blocked_issue_rejects_duplicate_rca(monkeypatch):
     assert changed is False
     assert message == "blocked RCA already opened for MT-BLOCKED"
     assert details == {}
+
+
+@pytest.mark.parametrize("rca_state", ["In Progress", "Blocked"])
+def test_recover_blocked_issue_finds_active_rca_after_in_memory_loss(
+    monkeypatch, tmp_path, rca_state
+):
+    board_root = tmp_path / "board"
+    board_root.mkdir()
+    (board_root / "RCA-STALE.md").write_text(
+        "---\n"
+        "id: RCA-STALE\n"
+        "title: 'RCA unblock MT-BLOCKED: stale source snapshot'\n"
+        f"state: {rca_state}\n"
+        "labels: [blocked-rca, source-mt-blocked]\n"
+        "---\n\n"
+        "## Source Ticket\n\n- Identifier: `MT-BLOCKED`\n",
+        encoding="utf-8",
+    )
+    cfg = _make_config(
+        tracker_kind="file",
+        active_states=("Todo", "In Progress"),
+        terminal_states=("Done", "Blocked"),
+    )
+    cfg = replace(cfg, tracker=replace(cfg.tracker, board_root=board_root))
+    # This stale source snapshot has neither the persisted note nor the old
+    # process's in-memory guard.  The active RCA on the board is authoritative.
+    issue = _issue("MT-BLOCKED", state="Blocked", description="## Blocker\n\nStill blocked.")
+    orch = _orch()
+    created: list[str] = []
+    monkeypatch.setattr(orch._workflow_state, "current", lambda: cfg)
+    monkeypatch.setattr(
+        orch,
+        "_tracker_call_fetch_issue_full_by_id",
+        lambda _cfg, _identifier: issue,
+    )
+    monkeypatch.setattr(
+        orch,
+        "_tracker_call_create_blocked_rca_issue",
+        lambda *_args: created.append("duplicate") or "RCA-DUPLICATE",
+    )
+
+    changed, message, details = asyncio.run(orch.recover_blocked_issue("MT-BLOCKED"))
+
+    assert changed is False
+    assert message == "blocked RCA already opened for MT-BLOCKED"
+    assert details == {}
+    assert created == []
+    assert issue.id in orch._blocked_rca_source_ids
+
+
+def test_recover_blocked_issue_allows_new_rca_for_later_block_episode(
+    monkeypatch, tmp_path
+):
+    board_root = tmp_path / "board"
+    board_root.mkdir()
+    (board_root / "RCA-1.md").write_text(
+        "---\n"
+        "id: RCA-1\n"
+        "title: 'RCA unblock MT-BLOCKED: first episode'\n"
+        "state: Done\n"
+        "labels: [blocked-rca, source-mt-blocked]\n"
+        "---\n\n"
+        "## Source Ticket\n\n- Identifier: `MT-BLOCKED`\n",
+        encoding="utf-8",
+    )
+    cfg = _make_config(
+        tracker_kind="file",
+        active_states=("Todo", "In Progress"),
+        terminal_states=("Done", "Blocked"),
+    )
+    cfg = replace(cfg, tracker=replace(cfg.tracker, board_root=board_root))
+    issue = _issue(
+        "MT-BLOCKED",
+        state="Blocked",
+        description=(
+            "## Blocked RCA\n\nRCA ticket `RCA-1` opened.\n\n"
+            "## RCA Resolution\n\nRCA-1 completed.\n\n"
+            "## Blocker\n\nA different failure appeared."
+        ),
+    )
+    orch = _orch()
+    created: list[str] = []
+    notes: list[str] = []
+    monkeypatch.setattr(orch._workflow_state, "current", lambda: cfg)
+    monkeypatch.setattr(
+        orch,
+        "_tracker_call_fetch_issue_full_by_id",
+        lambda _cfg, _identifier: issue,
+    )
+    monkeypatch.setattr(
+        orch,
+        "_tracker_call_create_blocked_rca_issue",
+        lambda *_args: created.append("MT-BLOCKED") or "RCA-2",
+    )
+    monkeypatch.setattr(
+        orch,
+        "_tracker_call_append_note",
+        lambda _cfg, _issue, heading, _body: notes.append(heading),
+    )
+
+    changed, message, details = asyncio.run(orch.recover_blocked_issue("MT-BLOCKED"))
+
+    assert changed is True
+    assert message == "RCA-2 opened to unblock MT-BLOCKED; MT-BLOCKED remains Blocked"
+    assert details["rca_identifier"] == "RCA-2"
+    assert created == ["MT-BLOCKED"]
+    assert notes == ["Blocked RCA"]
 
 
 def test_turn_budget_exhaustion_survives_next_tick_claim_prune(monkeypatch):
