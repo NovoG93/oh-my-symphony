@@ -18,6 +18,7 @@ import subprocess
 import uuid
 from dataclasses import replace
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -45,6 +46,7 @@ from symphony.backends.claude_code import (
 )
 from symphony.backends.codex import (
     CodexAppServerBackend,
+    NOTIF_AGENT_MESSAGE_DELTA,
     NOTIF_ITEM_COMPLETED,
     NOTIF_TURN_COMPLETED,
     NOTIF_THREAD_TOKEN_USAGE,
@@ -2358,6 +2360,50 @@ async def test_codex_handles_v2_token_usage_notification(tmp_path: Path) -> None
 
 
 @pytest.mark.asyncio
+async def test_codex_emits_agent_message_deltas_for_chat(tmp_path: Path) -> None:
+    cfg = _make_cfg("codex", workspace_root=tmp_path)
+    cwd = tmp_path / "ws"
+    cwd.mkdir()
+    events: list[dict[str, object]] = []
+
+    async def capture(event: dict[str, object]) -> None:
+        events.append(event)
+
+    backend = CodexAppServerBackend(
+        BackendInit(cfg=cfg, cwd=cwd, workspace_root=tmp_path, on_event=capture)
+    )
+    await backend._handle_notification(
+        {
+            "method": NOTIF_AGENT_MESSAGE_DELTA,
+            "params": {
+                "threadId": "t1",
+                "turnId": "tn1",
+                "itemId": "i1",
+                "delta": "streamed text",
+            },
+        }
+    )
+
+    assert events == [
+        {
+            "event": EVENT_OTHER_MESSAGE,
+            "timestamp": events[0]["timestamp"],
+            "payload": {
+                "type": "agent_delta",
+                "text": "streamed text",
+                "item_id": "i1",
+            },
+            "usage": {
+                "input_tokens": 0,
+                "output_tokens": 0,
+                "total_tokens": 0,
+            },
+            "rate_limits": None,
+            "agent_pid": None,
+        }
+    ]
+
+
 async def test_codex_captures_agent_message_from_item_completed(tmp_path: Path) -> None:
     cfg = _make_cfg("codex", workspace_root=tmp_path)
     cwd = tmp_path / "ws"
@@ -2668,8 +2714,13 @@ async def test_codex_handle_notification_truncates_long_agent_message(
     cfg = _make_cfg("codex", workspace_root=tmp_path)
     cwd = tmp_path / "ws"
     cwd.mkdir()
+    events: list[dict[str, Any]] = []
+
+    async def _capture(event: dict[str, Any]) -> None:
+        events.append(event)
+
     backend = CodexAppServerBackend(
-        BackendInit(cfg=cfg, cwd=cwd, workspace_root=tmp_path, on_event=_noop_event)
+        BackendInit(cfg=cfg, cwd=cwd, workspace_root=tmp_path, on_event=_capture)
     )
     long_text = "x" * (_ASSISTANT_MESSAGE_PREVIEW_CAP + 200)
     await backend._handle_notification(
@@ -2682,6 +2733,7 @@ async def test_codex_handle_notification_truncates_long_agent_message(
     )
     assert backend._latest_assistant_message.endswith("…")
     assert len(backend._latest_assistant_message) == _ASSISTANT_MESSAGE_PREVIEW_CAP + 1
+    assert events[-1]["payload"]["message"] == long_text
 
 
 # ---- Pi backend ---------------------------------------------------------

@@ -78,6 +78,7 @@ METHOD_APPROVAL_RESPOND = "thread/approveGuardianDeniedAction"
 NOTIF_TURN_COMPLETED = "turn/completed"
 NOTIF_TURN_STARTED = "turn/started"
 NOTIF_ITEM_COMPLETED = "item/completed"
+NOTIF_AGENT_MESSAGE_DELTA = "item/agentMessage/delta"
 NOTIF_THREAD_TOKEN_USAGE = "thread/tokenUsage/updated"
 NOTIF_RATE_LIMITS = "account/rateLimits/updated"
 
@@ -737,6 +738,18 @@ class CodexAppServerBackend(BaseAgentBackend):
                 waiter.set_result(params if isinstance(params, dict) else {})
             return
         # ----- streamed thread items (assistant text, tool calls, etc.) -----
+        if method == NOTIF_AGENT_MESSAGE_DELTA:
+            delta = params.get("delta") if isinstance(params, dict) else None
+            if isinstance(delta, str) and delta:
+                await self._emit(
+                    EVENT_OTHER_MESSAGE,
+                    {
+                        "type": "agent_delta",
+                        "text": delta,
+                        "item_id": params.get("itemId"),
+                    },
+                )
+            return
         if method == NOTIF_ITEM_COMPLETED:
             item = params.get("item") if isinstance(params, dict) else None
             if isinstance(item, dict) and item.get("type") == "agentMessage":
@@ -754,7 +767,9 @@ class CodexAppServerBackend(BaseAgentBackend):
                         EVENT_OTHER_MESSAGE,
                         {
                             "type": "assistant",
-                            "message": self._latest_assistant_message,
+                            # Chat consumers need the complete final answer;
+                            # only the dashboard metadata preview is capped.
+                            "message": text,
                             "item": item,
                         },
                     )

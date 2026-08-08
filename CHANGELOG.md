@@ -10,6 +10,27 @@ Versioning: [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.19.0] - 2026-08-09 - Live multi-agent chat and reliable delivery
+
+### Added
+
+- Stream Codex, Pi, and Prime Agent replies into Chat as they arrive, while
+  preserving complete final answers and filtering private thinking blocks.
+- Open Chat with an immediately usable idle QA session when no live session
+  exists; no agent turn starts and no tokens are consumed until a message is sent.
+- Add the portable `symphony-pyright` command so local, CI, and continuous
+  improvement checks use the active Python interpreter consistently.
+
+### Fixed
+
+- Replace cumulative agent snapshots instead of concatenating them, restore
+  terminal assistant messages from provider transcripts, and keep resumable
+  sessions visible when automatic idle-session initialization fails.
+- Keep active tracked board cards from blocking automated merges through shared
+  workspace links, then restore normal host Git tracking during cleanup.
+- Preserve ruamel.yaml runtime behavior while satisfying full-project type
+  checking without broad suppressions or environment-specific `.venv` paths.
+
 ## [0.18.2] - 2026-08-08 - Responsive settings and safer blocked recovery
 
 ### Added

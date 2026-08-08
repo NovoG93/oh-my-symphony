@@ -22,6 +22,9 @@ from symphony.chat import (
     _board_preamble,
     _claude_command_for_mode,
     _summarize_claude_frame,
+    _summarize_codex_frame,
+    _summarize_pi_frame,
+    _terminal_agent_message,
     cfg_for_mode,
 )
 from symphony.errors import (
@@ -453,6 +456,71 @@ def test_summarize_claude_frame_extracts_text_deltas() -> None:
     assert _summarize_claude_frame(_delta_frame("hm", delta_type="thinking_delta")) == []
     assert _summarize_claude_frame({"type": "stream_event", "event": {}}) == []
     assert _summarize_claude_frame(_delta_frame("")) == []
+
+
+def test_summarize_codex_frame_extracts_normalized_deltas() -> None:
+    assert _summarize_codex_frame(
+        {"type": "agent_delta", "text": "Hel", "item_id": "i1"}
+    ) == [("agent_delta", "Hel", {"item_id": "i1"})]
+
+
+def test_summarize_pi_frame_streams_only_visible_assistant_text() -> None:
+    update = {
+        "type": "message_update",
+        "message": {
+            "role": "assistant",
+            "content": [
+                {"type": "thinking", "thinking": "private chain of thought"},
+                {"type": "text", "text": "Hello"},
+            ],
+        },
+    }
+    assert _summarize_pi_frame(update) == [("agent_snapshot", "Hello", {})]
+    assert _summarize_pi_frame(
+        {
+            "type": "message_update",
+            "message": {
+                "role": "assistant",
+                "content": [{"type": "thinking", "thinking": "private"}],
+            },
+        }
+    ) == []
+    assert _summarize_pi_frame(
+        {"type": "message_start", "message": {"role": "assistant", "content": []}}
+    ) == []
+
+
+def test_summarize_pi_frame_finishes_one_persisted_agent_message() -> None:
+    message = {
+        "role": "assistant",
+        "content": [
+            {"type": "thinking", "thinking": "private"},
+            {"type": "text", "text": "Final answer"},
+        ],
+    }
+    assert _summarize_pi_frame({"type": "message_end", "message": message}) == [
+        ("agent_message", "Final answer", {})
+    ]
+    # `turn_end` repeats message_end and must not duplicate the transcript row.
+    assert _summarize_pi_frame({"type": "turn_end", "message": message}) == []
+
+
+def test_terminal_agent_message_accepts_pi_agent_end_shape() -> None:
+    assert _terminal_agent_message(
+        {
+            "type": "agent_end",
+            "messages": [
+                {"role": "user", "content": [{"type": "text", "text": "question"}]},
+                {
+                    "role": "assistant",
+                    "content": [
+                        {"type": "thinking", "thinking": "private"},
+                        {"type": "text", "text": "answer"},
+                    ],
+                },
+            ],
+        }
+    ) == "answer"
 
 
 async def test_token_deltas_stream_without_touching_transcript(

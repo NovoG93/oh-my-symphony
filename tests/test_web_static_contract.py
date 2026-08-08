@@ -171,6 +171,8 @@ def test_web_chat_token_streaming_contract() -> None:
     assert "function appendChatDelta(view, text)" in js
     assert "function finalizeChatLive(view, finalText)" in js
     assert "if (msg.type === 'agent_delta')" in js
+    assert "if (msg.type === 'agent_snapshot')" in js
+    assert "function replaceChatLive(view, text)" in js
     assert "requestAnimationFrame(" in js
     assert (
         "if (msg.type === 'agent_message' && finalizeChatLive(view, msg.text)) return;"
@@ -189,7 +191,11 @@ def test_web_chat_multi_session_contract() -> None:
     assert "reattachChatSession: (id)" in js
     assert "deleteChatSessionById: (id, { forget } = {})" in js
     assert "postChatMessageTo: (id, payload)" in js
+    assert "async function ensureDefaultChatSession()" in js
+    assert "api.createChatSession2({ mode: 'qa' })" in js
     assert "async function refreshChatSessions(view)" in js
+    assert "Keep the successfully fetched resumable-session listing visible" in js
+    assert "showToast(err.message, 'error')" in js
     assert "async function selectChatSession(view, sessionId)" in js
     assert "function renderChatSessionBar(view)" in js
     assert "function buildChatResumeControl(view, resumable, atLimit)" in js

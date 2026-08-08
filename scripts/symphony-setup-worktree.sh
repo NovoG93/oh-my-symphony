@@ -124,7 +124,9 @@ git config extensions.worktreeConfig true
 git config --worktree symphony.basesha "$(git rev-parse HEAD)"
 git config --worktree symphony.basebranch "${FEATURE_BASE_BRANCH:-${BASE_BRANCH:-}}"
 git config --worktree symphony.mergetargetbranch "${MERGE_TARGET_BRANCH:-}"
-_symphony_release_worktree_lock
+# Keep the Git-admin lock through host-index updates below. Concurrent ticket
+# creation otherwise races on the host index and can leave tracked board files
+# visible as dirty even though they are live orchestration state.
 # Link shared board directories back to host so agent state changes are
 # visible to Symphony's file tracker (which reads host board_root).
 #
@@ -162,12 +164,21 @@ for dir in ${SYMPHONY_BOARD_ROOT_NAME:-kanban}; do
   if [ -s "$tracked_file" ]; then
     xargs -0 git update-index --skip-worktree -- < "$tracked_file" || true
   fi
+  # The symlink writes this ticket card into the host checkout, whose main
+  # worktree has a separate index. Hide only the active card while its workspace
+  # exists; before_remove clears the bit so normal host review is restored.
+  # The shared info/exclude entry below already hides new operational cards.
+  git -C "$HOST_REPO" ls-files -z -- "$dir/$ISSUE_ID.md" > "$tracked_file" || true
+  if [ -s "$tracked_file" ]; then
+    xargs -0 git -C "$HOST_REPO" update-index --skip-worktree -- < "$tracked_file" || true
+  fi
   rm -f "$tracked_file"
   exclude_file="$(git rev-parse --git-path info/exclude)"
   mkdir -p "$(dirname "$exclude_file")"
   grep -qxF "$dir" "$exclude_file" 2>/dev/null || echo "$dir" >> "$exclude_file"
   _symphony_link_dir "$dir" "$HOST_REPO/$dir"
 done
+_symphony_release_worktree_lock
 # Pick the first available Python interpreter that satisfies pyproject first.
 # The package currently requires >=3.12; keep 3.11 only as a last fallback so
 # older clones fail in pip with a clear reason instead of skipping venv setup.

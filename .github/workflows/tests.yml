@@ -43,7 +43,7 @@ jobs:
         run: python scripts/check_i18n.py
 
       - name: Type check (pyright)
-        run: python -m pyright
+        run: symphony-pyright
 
       - name: Run tests with coverage
         run: python -m pytest -q --cov=src/symphony --cov-report=term --cov-fail-under=80

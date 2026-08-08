@@ -135,12 +135,13 @@ web.run_app(
 ## 4. 자동화 테스트
 
 ```bash
-.venv/bin/pytest -q                 # 전체
-.venv/bin/pytest -q tests/test_git_inspect.py tests/test_webapi.py \
+source .venv/bin/activate
+python -m pytest -q                 # 전체
+python -m pytest -q tests/test_git_inspect.py tests/test_webapi.py \
     tests/test_chat.py tests/test_webapi_chat.py tests/test_web_static_contract.py
-.venv/bin/ruff check .
-.venv/bin/pyright                   # 기준선 27 errors (환경 문제, 브랜치 base와 동일)
-.venv/bin/symphony doctor ./WORKFLOW.md
+python -m ruff check .
+symphony-pyright
+symphony doctor ./WORKFLOW.md
 ```
 
 **기대 결과**: `1492 passed, 6 skipped, 1 failed` — 실패는

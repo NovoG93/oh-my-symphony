@@ -1506,11 +1506,12 @@ def _check_interpreter() -> str:
 
 
 CHECK_PYTHON = _check_interpreter()
+CHECK_PYRIGHT = (CHECK_PYTHON, "-m", "symphony.pyright")
 
 DEFAULT_CHECKS = (
     CheckSpec("pytest", (CHECK_PYTHON, "-m", "pytest", "-q")),
     CheckSpec("ruff", (CHECK_PYTHON, "-m", "ruff", "check", "src", "tests")),
-    CheckSpec("pyright", (CHECK_PYTHON, "-m", "pyright")),
+    CheckSpec("pyright", CHECK_PYRIGHT),
 )
 
 
