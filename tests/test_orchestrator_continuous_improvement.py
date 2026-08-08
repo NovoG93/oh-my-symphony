@@ -16,11 +16,14 @@ from pathlib import Path
 import pytest
 
 import symphony.orchestrator.core as core_module
+from symphony.backends import TurnResult
 from symphony.continuous_improvement import (
+    AgentTask,
     FileLease,
     ImprovementRunResult,
     Lease,
     lease_path_for,
+    save_mode_state,
 )
 from symphony.issue import Issue
 from symphony.orchestrator import Orchestrator
@@ -672,3 +675,146 @@ def test_file_lease_stale_steal_allows_one_winner(tmp_path: Path) -> None:
 
 def test_file_lease_is_a_lease() -> None:
     assert isinstance(FileLease(Path("/tmp/x.lock")), Lease)
+
+
+# --------------------------------------------------------------------------
+# improvement modes: per-mode cadence gate + injected agent capability
+# --------------------------------------------------------------------------
+
+
+def _make_config_in(tmp_path: Path, ci: ContinuousImprovementConfig) -> ServiceConfig:
+    return dataclasses.replace(
+        _make_config(ci=ci), workflow_path=tmp_path / "WORKFLOW.md"
+    )
+
+
+@pytest.mark.asyncio
+async def test_due_heartbeat_skips_when_no_mode_is_due(tmp_path: Path) -> None:
+    """A weekly-only board must not burn a heartbeat turn every 30 minutes."""
+    runner = _FakeRunner()
+    orch = _orch(improvement_runner=runner, improvement_lease=_FakeLease())
+    cfg = _make_config_in(
+        tmp_path,
+        _enabled_ci(
+            modes=("market_research",),
+            mode_interval_hours={"market_research": 168.0},
+        ),
+    )
+    save_mode_state(tmp_path, {"market_research": time.time()})
+
+    orch._maybe_schedule_continuous_improvement(cfg)  # arm
+    orch._next_improvement_due_monotonic = time.monotonic() - 1  # force due
+    orch._maybe_schedule_continuous_improvement(cfg)
+
+    assert runner.calls == 0
+    assert orch._improvement_task is None
+    status = orch.continuous_improvement_status()
+    assert status["skipped_reason"] == "no_modes_due"
+    assert status["modes"] == ["market_research"]
+    # ...and the heartbeat re-arms rather than hammering the check each tick.
+    assert orch._next_improvement_due_monotonic is not None
+
+
+@pytest.mark.asyncio
+async def test_due_heartbeat_runs_when_a_mode_is_due(tmp_path: Path) -> None:
+    runner = _FakeRunner()
+    orch = _orch(improvement_runner=runner, improvement_lease=_FakeLease())
+    cfg = _make_config_in(
+        tmp_path,
+        _enabled_ci(
+            modes=("market_research",),
+            mode_interval_hours={"market_research": 168.0},
+        ),
+    )
+    save_mode_state(tmp_path, {"market_research": time.time() - 200 * 3600})
+
+    orch._maybe_schedule_continuous_improvement(cfg)
+    orch._next_improvement_due_monotonic = time.monotonic() - 1
+    orch._maybe_schedule_continuous_improvement(cfg)
+    await _drain_improvement(orch)
+
+    assert runner.calls == 1
+
+
+@pytest.mark.asyncio
+async def test_improvement_agent_runs_one_turn_against_the_host_repo(
+    tmp_path: Path,
+) -> None:
+    """The CI module stays orchestrator-free; the capability is injected."""
+    workflow = tmp_path / "WORKFLOW.md"
+    workflow.write_text(
+        textwrap.dedent(
+            """\
+            ---
+            tracker:
+              kind: file
+              board_root: ./kanban
+            agent:
+              kind: codex
+            continuous_improvement:
+              enabled: true
+              modes: [market_research]
+              agent_kind: claude
+            ---
+
+            Prompt.
+            """
+        ),
+        encoding="utf-8",
+    )
+    (tmp_path / "kanban").mkdir()
+    state = WorkflowState(workflow)
+    cfg, err = state.reload()
+    assert err is None and cfg is not None
+    backend = _RecordingBackend()
+    orch = Orchestrator(state, build_backend=lambda init: _capture(backend, init))
+
+    reply = await orch._run_improvement_agent(
+        AgentTask(
+            mode="market_research",
+            prompt="survey the market",
+            cwd=tmp_path,
+            output_path=tmp_path / "out.json",
+        )
+    )
+
+    assert reply == "wrote 0 proposals"
+    assert backend.prompts == ["survey the market"]
+    assert backend.stopped is True
+    # Per-CI agent override wins over the workflow's default backend.
+    assert backend.init.cfg.agent.kind == "claude"
+    assert backend.init.cwd == tmp_path == backend.init.workspace_root
+
+
+def _capture(backend: "_RecordingBackend", init) -> "_RecordingBackend":
+    backend.init = init
+    return backend
+
+
+class _RecordingBackend:
+    """Minimal AgentBackend stand-in for the one-shot improvement turn."""
+
+    def __init__(self) -> None:
+        self.init = None
+        self.prompts: list[str] = []
+        self.stopped = False
+        self.session_id = "sess"
+        self.pid = None
+
+    async def start(self) -> None:
+        return None
+
+    async def initialize(self) -> dict:
+        return {}
+
+    async def start_session(self, *, initial_prompt: str, issue_title) -> str:
+        return "sess"
+
+    async def run_turn(self, *, prompt: str, is_continuation: bool) -> TurnResult:
+        self.prompts.append(prompt)
+        return TurnResult(
+            status="completed", turn_id="t1", last_message="wrote 0 proposals"
+        )
+
+    async def stop(self) -> None:
+        self.stopped = True

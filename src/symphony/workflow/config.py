@@ -28,9 +28,12 @@ from .constants import (
     DEFAULT_BACKEND_READ_TIMEOUT_MS,
     DEFAULT_BACKEND_STALL_TIMEOUT_MS,
     DEFAULT_BACKEND_TURN_TIMEOUT_MS,
+    CI_MODE_READINESS,
     DEFAULT_CI_INTERVAL_MS,
+    DEFAULT_CI_MAX_IMPROVEMENT_TICKETS_PER_RUN,
     DEFAULT_CI_MAX_TICKETS_PER_RUN,
     DEFAULT_CI_MAX_TURNS,
+    DEFAULT_CI_MODE_INTERVAL_HOURS,
     DEFAULT_CI_TICKET_PREFIX,
     DEFAULT_CODEX_MODEL,
     DEFAULT_CODEX_REASONING_EFFORT,
@@ -41,6 +44,7 @@ from .constants import (
     DEFAULT_MAX_TOTAL_TURNS,
     DEFAULT_OPENCODE_COMMAND,
     DEFAULT_WORKSPACE_REUSE_POLICY,
+    SUPPORTED_CI_MODES,
 )
 
 
@@ -433,7 +437,7 @@ class ContinuousImprovementConfig:
     """Default-off heartbeat that periodically runs product-readiness checks.
 
     Missing `continuous_improvement:` in WORKFLOW.md means disabled with all
-    defaults below. Only `enabled`, `interval_ms`, `max_turns`, and
+    defaults below. Only `enabled`, `interval_ms`, `max_turns`, `modes`, and
     `agent_kind` are settable through the mutation API
     (`set_continuous_improvement_settings`); the remaining fields are
     parse-only from WORKFLOW.md.
@@ -452,6 +456,36 @@ class ContinuousImprovementConfig:
     # "" (default) inherits whatever `agent.kind` the workflow is already
     # configured with.
     agent_kind: str = ""
+    # Experimental improvement modes (SUPPORTED_CI_MODES). Empty means
+    # "readiness only", which is exactly what `enabled: true` did before
+    # modes existed — see `resolved_modes`.
+    modes: tuple[str, ...] = ()
+    # Per-mode cadence floor in hours, overriding
+    # DEFAULT_CI_MODE_INTERVAL_HOURS. 0 = run on every due heartbeat.
+    mode_interval_hours: dict[str, float] = field(default_factory=dict)
+    # Cap on proposal tickets (triage/agent modes) filed by a single run.
+    max_improvement_tickets_per_run: int = (
+        DEFAULT_CI_MAX_IMPROVEMENT_TICKETS_PER_RUN
+    )
+
+    def resolved_modes(self) -> tuple[str, ...]:
+        """Modes this heartbeat should consider, in canonical order.
+
+        Disabled means nothing runs. Enabled with no explicit `modes:`
+        preserves the pre-modes behaviour (readiness only).
+        """
+        if not self.enabled:
+            return ()
+        if not self.modes:
+            return (CI_MODE_READINESS,)
+        return tuple(m for m in SUPPORTED_CI_MODES if m in self.modes)
+
+    def interval_hours_for(self, mode: str) -> float:
+        """Cadence floor for one mode: explicit override, else the default."""
+        override = self.mode_interval_hours.get(mode)
+        if override is None:
+            return DEFAULT_CI_MODE_INTERVAL_HOURS.get(mode, 0.0)
+        return float(override)
 
 
 

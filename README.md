@@ -37,6 +37,7 @@ terminal for.
 - [Quickstart](#quickstart--your-first-task-end-to-end)
 - [Lane presets](#lane-presets)
 - [Chat intake](#chat-intake--type-a-request-the-board-delivers)
+- [Continuous improvement](#continuous-improvement--experimental-autonomous-upkeep)
 - [Run](#run)
 - [Layout](#layout)
 - [Tests](#tests)
@@ -660,6 +661,45 @@ to edit mode. Chat converses; the board delivers.
 
 ---
 
+## Continuous improvement — experimental autonomous upkeep
+
+**Experimental and fully opt-in.** With no `continuous_improvement:` block in
+`WORKFLOW.md`, nothing here runs.
+
+The heartbeat is a scheduler that periodically inspects the repo *without
+touching product code* and files what it finds as **normal board tickets**,
+which then flow through the ordinary pipeline like any other request. Each
+capability is a separate mode:
+
+```yaml
+continuous_improvement:
+  enabled: true
+  interval_ms: 1800000            # heartbeat cadence
+  modes: [readiness, blocked_fixes, security, market_research,
+          feature_improvements]
+  mode_interval_hours:            # per-mode cadence floor (optional)
+    market_research: 168          # weekly
+  max_improvement_tickets_per_run: 3
+```
+
+| Mode | What it does |
+| --- | --- |
+| `readiness` | Runs tests / lint / type-check on a proven baseline; failures become bug tickets. This is the original behaviour. |
+| `blocked_fixes` | Triages `Blocked` / `Human Review` tickets into a linked fix ticket carrying a root-cause note (`blocked_by` edge back to the source). |
+| `security` | Optional dependency/vulnerability scans (`pip-audit`, `npm audit`) into patch tickets. A missing scanner is *not available*, never a finding. |
+| `market_research` | One agent turn surveys current trends and competitor features for **this** app (from README/docs/wiki) and proposes improvements with evidence links. |
+| `feature_improvements` | One agent turn reviews UX and code health and proposes improvements. |
+
+`enabled: true` with no `modes:` means readiness only — exactly what the
+heartbeat did before modes existed. Proposal tickets are capped per run,
+de-duplicated against open tickets, labelled `ci`, and grouped under one
+`REQ-CI-<date>-<n>` request. The agent-driven modes get a succinct prompt
+(overridable in `docs/symphony-prompts/ci/`) and may write nothing but their
+JSON proposal file — the heartbeat files the tickets. Modes and cadence are
+also editable from the web **Settings** page.
+
+---
+
 ## Run
 
 ### Web app + JSON API
@@ -865,7 +905,7 @@ tui-open.bat           Windows equivalent
 pytest -q
 ```
 
-The suite (1575 passed, 7 skipped) covers the upstream conformance suite,
+The suite (1614 passed, 7 skipped) covers the upstream conformance suite,
 backend unit tests (factory, event normalization, per-CLI command/session
 handling), board-tool DAG validation, run-registry persistence, file-tracker
 locking, web API contracts, chat intake, lane presets, and Textual

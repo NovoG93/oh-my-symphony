@@ -302,6 +302,35 @@ def test_set_continuous_improvement_settings_agent_kind_roundtrip(
     assert cfg.continuous_improvement.agent_kind == ""
 
 
+def test_set_continuous_improvement_settings_modes_roundtrip(
+    workflow: Path,
+) -> None:
+    set_continuous_improvement_settings(
+        workflow, enabled=True, modes=["Market_Research", "blocked_fixes"]
+    )
+    cfg = build_service_config(load_workflow(workflow))
+    # Canonical order, normalized case.
+    assert cfg.continuous_improvement.modes == ("blocked_fixes", "market_research")
+    assert cfg.continuous_improvement.resolved_modes() == (
+        "blocked_fixes",
+        "market_research",
+    )
+
+    # Empty list clears the key entirely -> readiness-only back-compat.
+    set_continuous_improvement_settings(workflow, modes=[])
+    assert "modes:" not in workflow.read_text(encoding="utf-8")
+    cfg = build_service_config(load_workflow(workflow))
+    assert cfg.continuous_improvement.modes == ()
+    assert cfg.continuous_improvement.resolved_modes() == ("readiness",)
+
+
+def test_set_continuous_improvement_settings_rejects_unknown_mode(
+    workflow: Path,
+) -> None:
+    with pytest.raises(WorkflowMutationError):
+        set_continuous_improvement_settings(workflow, modes=["world_domination"])
+
+
 def test_set_continuous_improvement_settings_rejects_unknown_agent_kind(
     workflow: Path,
 ) -> None:

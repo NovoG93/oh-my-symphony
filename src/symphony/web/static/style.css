@@ -1177,6 +1177,14 @@ a { color: inherit; }
 
 .ci-actions { display: flex; gap: 0.5926rem; margin-top: 1.037rem; }
 
+.ci-modes { display: flex; flex-wrap: wrap; gap: 0.5926rem 1.037rem; }
+.ci-modes .form-check {
+  display: flex;
+  align-items: center;
+  gap: 0.3704rem;
+  font-size: 0.8889rem;
+}
+
 /* ---------------------------------------------------------------------- */
 /* Responsive                                                               */
 /* ---------------------------------------------------------------------- */

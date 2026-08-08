@@ -64,6 +64,7 @@ from .constants import (
     DEFAULT_BACKEND_TURN_TIMEOUT_MS,
     DEFAULT_BOARD_ROOT_NAME,
     DEFAULT_CI_INTERVAL_MS,
+    DEFAULT_CI_MAX_IMPROVEMENT_TICKETS_PER_RUN,
     DEFAULT_CI_MAX_TICKETS_PER_RUN,
     DEFAULT_CI_MAX_TURNS,
     DEFAULT_CI_MIN_INTERVAL_MS,
@@ -96,6 +97,7 @@ from .constants import (
     LINEAR_API_KEY_ENV,
     LINEAR_DEFAULT_ENDPOINT,
     SUPPORTED_AGENT_KINDS,
+    SUPPORTED_CI_MODES,
     SUPPORTED_WORKSPACE_REUSE_POLICIES,
 )
 from .parser import WorkflowDefinition
@@ -886,6 +888,73 @@ def _validated_ci_ticket_prefix(value: Any) -> str:
 
 
 
+def validated_ci_modes(value: Any) -> tuple[str, ...]:
+    """Normalize `continuous_improvement.modes` to canonical mode order.
+
+    `None`/absent means "no explicit modes" — the config's `resolved_modes()`
+    then falls back to readiness-only, which is what an `enabled: true` block
+    meant before improvement modes existed. Shared with the mutation API so
+    WORKFLOW.md and the settings card reject the same strings.
+    """
+    if value is None:
+        return ()
+    if isinstance(value, str) or not isinstance(value, (list, tuple)):
+        raise ConfigValidationError(
+            "continuous_improvement.modes must be a list of mode names",
+            value=value,
+        )
+    seen: list[str] = []
+    for item in value:
+        if not isinstance(item, str):
+            raise ConfigValidationError(
+                "continuous_improvement.modes must be a list of mode names",
+                value=item,
+            )
+        mode = item.strip().lower()
+        if mode not in SUPPORTED_CI_MODES:
+            raise ConfigValidationError(
+                "unknown continuous_improvement mode "
+                f"{mode!r}; supported: {list(SUPPORTED_CI_MODES)}",
+                value=item,
+            )
+        if mode not in seen:
+            seen.append(mode)
+    return tuple(mode for mode in SUPPORTED_CI_MODES if mode in seen)
+
+
+def _validated_ci_mode_interval_hours(value: Any) -> dict[str, float]:
+    """`{mode: hours}` cadence overrides; hours must be a non-negative number."""
+    if value is None:
+        return {}
+    if not isinstance(value, dict):
+        raise ConfigValidationError(
+            "continuous_improvement.mode_interval_hours must be a mapping "
+            "of mode name to hours",
+            value=value,
+        )
+    out: dict[str, float] = {}
+    for raw_mode, raw_hours in value.items():
+        mode = raw_mode.strip().lower() if isinstance(raw_mode, str) else raw_mode
+        if mode not in SUPPORTED_CI_MODES:
+            raise ConfigValidationError(
+                "unknown continuous_improvement mode "
+                f"{raw_mode!r}; supported: {list(SUPPORTED_CI_MODES)}",
+                value=raw_mode,
+            )
+        if isinstance(raw_hours, bool) or not isinstance(raw_hours, (int, float)):
+            raise ConfigValidationError(
+                f"continuous_improvement.mode_interval_hours.{mode} must be a number",
+                value=raw_hours,
+            )
+        if raw_hours < 0:
+            raise ConfigValidationError(
+                f"continuous_improvement.mode_interval_hours.{mode} must be >= 0",
+                value=raw_hours,
+            )
+        out[mode] = float(raw_hours)
+    return out
+
+
 def _build_continuous_improvement_config(raw: Any) -> ContinuousImprovementConfig:
     """§continuous-improvement heartbeat — default-off, all fields validated strictly.
 
@@ -924,6 +993,16 @@ def _build_continuous_improvement_config(raw: Any) -> ContinuousImprovementConfi
         name="continuous_improvement.require_idle_board",
     )
     agent_kind = _validated_ci_agent_kind(ci_raw.get("agent_kind"))
+    modes = validated_ci_modes(ci_raw.get("modes"))
+    mode_interval_hours = _validated_ci_mode_interval_hours(
+        ci_raw.get("mode_interval_hours")
+    )
+    max_improvement_tickets_per_run = _validated_strict_int(
+        ci_raw.get("max_improvement_tickets_per_run"),
+        DEFAULT_CI_MAX_IMPROVEMENT_TICKETS_PER_RUN,
+        name="continuous_improvement.max_improvement_tickets_per_run",
+        minimum=1,
+    )
 
     return ContinuousImprovementConfig(
         enabled=enabled,
@@ -933,4 +1012,7 @@ def _build_continuous_improvement_config(raw: Any) -> ContinuousImprovementConfi
         max_tickets_per_run=max_tickets_per_run,
         require_idle_board=require_idle_board,
         agent_kind=agent_kind,
+        modes=modes,
+        mode_interval_hours=mode_interval_hours,
+        max_improvement_tickets_per_run=max_improvement_tickets_per_run,
     )

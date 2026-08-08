@@ -2688,10 +2688,25 @@
     return options;
   }
 
+  // Improvement modes: one opt-in checkbox each. An empty selection keeps the
+  // original readiness-only heartbeat, which is what `enabled` alone meant
+  // before modes existed.
+  function ciModeCheckboxes(ci) {
+    const supported = ci.supported_modes || ['readiness'];
+    const selected = new Set(ci.modes || []);
+    return supported.map((mode) =>
+      el('label', { class: 'form-check', 'data-ci-mode': mode }, [
+        el('input', { type: 'checkbox', 'data-ci-mode-input': mode, checked: selected.has(mode) }),
+        el('span', null, t(`workflow.ciMode.${mode}`)),
+      ])
+    );
+  }
+
   function buildContinuousImprovementCard(wf, ciStatus) {
     const ci = wf.continuous_improvement || {};
     const status = ciStatus || {};
     const statusView = ciStatusView(ci, status);
+    const modeChecks = ciModeCheckboxes(ci);
     const enabledInput = el('input', { id: 'ci-enabled-toggle', type: 'checkbox', checked: Boolean(ci.enabled) });
     const intervalInput = el('input', { id: 'ci-interval-input', class: 'input', type: 'number', min: '60000', step: '60000', value: ci.interval_ms || 1800000 });
     const maxTurnsInput = el('input', { id: 'ci-max-turns-input', class: 'input', type: 'number', min: '0', step: '1', value: ci.max_turns == null ? 48 : ci.max_turns });
@@ -2724,6 +2739,9 @@
             interval_ms: Number(intervalInput.value),
             max_turns: Number(maxTurnsInput.value),
             agent_kind: agentSelect.value,
+            modes: modeChecks
+              .filter((node) => node.querySelector('input').checked)
+              .map((node) => node.getAttribute('data-ci-mode')),
           };
           const result = await api.putContinuousImprovement(payload);
           state.workflow = { ...wf, continuous_improvement: result.continuous_improvement };
@@ -2749,6 +2767,8 @@
         field(t('chat.maxTurns'), maxTurnsInput),
         field(t('issue.ticketAgent'), agentSelect),
       ]),
+      field(t('workflow.ciModes'), el('div', { class: 'ci-modes' }, modeChecks)),
+      el('div', { class: 'form-hint' }, t('workflow.ciModesHint')),
       el('div', { class: 'ci-status-grid' }, [
         kv(t('workflow.turnsUsed'), `${status.turns_used == null ? 0 : status.turns_used} / ${ci.max_turns === 0 ? t('workflow.unlimited') : ci.max_turns}`),
         kv(t('common.phase'), status.current_phase || '—'),

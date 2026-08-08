@@ -174,9 +174,10 @@ the runtime surfaces.
 - **Config** — `continuous_improvement:` block in `WORKFLOW.md`
   (`ContinuousImprovementConfig` in `symphony.workflow.config`): `enabled`,
   `interval_ms`, `max_turns`, `agent_kind`, `ticket_prefix`,
-  `max_tickets_per_run`, `require_idle_board`. Only `enabled`,
-  `interval_ms`, `max_turns`, and `agent_kind` are browser-editable; the
-  rest is trusted workflow configuration.
+  `max_tickets_per_run`, `require_idle_board`, plus the experimental
+  `modes`, `mode_interval_hours`, and `max_improvement_tickets_per_run`.
+  Only `enabled`, `interval_ms`, `max_turns`, `modes`, and `agent_kind` are
+  browser-editable; the rest is trusted workflow configuration.
 - **Web API** — `GET /api/v1/workflow` gains a `continuous_improvement`
   field; `PUT /api/v1/workflow/continuous-improvement` mutates
   `enabled` / `interval_ms` / `max_turns` / `agent_kind` through
@@ -215,6 +216,18 @@ the runtime surfaces.
   instead of crashing. The heartbeat never writes ticket Markdown
   directly — only through tracker lock/compare-and-swap APIs — and never
   edits files under `src/` or `tests/`.
+- **Improvement modes (experimental, opt-in)** — `modes:` extends the
+  heartbeat past readiness into `blocked_fixes`, `security`,
+  `market_research`, and `feature_improvements`. Per-mode cadence lives in
+  `.symphony/continuous-improvement/mode-state.json`; the scheduler
+  re-arms without spending a turn when nothing is due. Agent-driven modes
+  need a backend turn, so the orchestrator injects an `AgentRunner`
+  callable (bound as a keyword partial onto `default_improvement_runner`)
+  — `continuous_improvement.py` must stay orchestrator-free. Their output
+  is a JSON proposal file the registrar turns into normal tickets: capped,
+  de-duplicated by the `CI Proposal:` marker and open-ticket titles,
+  labelled `ci`, and grouped under one `REQ-CI-<date>-<n>` request. See
+  `docs/continuous-improvement/rubric.md` ("Improvement modes").
 
 ## Adding a new public symbol
 

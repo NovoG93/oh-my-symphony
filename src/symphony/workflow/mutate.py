@@ -22,7 +22,8 @@ from ruamel.yaml import YAML
 from ruamel.yaml.comments import CommentedMap, CommentedSeq
 from ruamel.yaml.error import YAMLError
 
-from ..errors import SymphonyError
+from ..errors import ConfigValidationError, SymphonyError
+from .builder import validated_ci_modes
 from .constants import DEFAULT_CI_MIN_INTERVAL_MS, SUPPORTED_AGENT_KINDS
 from .presets import LanePreset, get_lane_preset
 
@@ -427,14 +428,17 @@ def set_continuous_improvement_settings(
     interval_ms: int | None = None,
     max_turns: int | None = None,
     agent_kind: str | None = None,
+    modes: list[str] | None = None,
 ) -> None:
     """Update the settable subset of `continuous_improvement:` in WORKFLOW.md.
 
-    Only `enabled`, `interval_ms`, `max_turns`, and `agent_kind` are writable
-    here — the remaining fields (`ticket_prefix`, `max_tickets_per_run`,
-    `require_idle_board`) are parse-only and must be hand-edited. Omitted
-    keyword arguments leave the existing value untouched; `agent_kind=""`
-    explicitly clears back to inheriting the workflow's default agent.
+    Only `enabled`, `interval_ms`, `max_turns`, `agent_kind`, and `modes` are
+    writable here — the remaining fields (`ticket_prefix`,
+    `max_tickets_per_run`, `mode_interval_hours`,
+    `max_improvement_tickets_per_run`, `require_idle_board`) are parse-only
+    and must be hand-edited. Omitted keyword arguments leave the existing
+    value untouched; `agent_kind=""` explicitly clears back to inheriting the
+    workflow's default agent, and `modes=[]` clears back to readiness-only.
     """
     if enabled is not None and not isinstance(enabled, bool):
         raise WorkflowMutationError("continuous_improvement.enabled must be a boolean")
@@ -469,6 +473,13 @@ def set_continuous_improvement_settings(
                 f"supported: {sorted(SUPPORTED_AGENT_KINDS)}"
             )
 
+    normalized_modes: list[str] | None = None
+    if modes is not None:
+        try:
+            normalized_modes = list(validated_ci_modes(modes))
+        except ConfigValidationError as exc:
+            raise WorkflowMutationError(exc.message) from exc
+
     data, body = _load_frontmatter(workflow_path)
     ci = _ensure_map(data, "continuous_improvement")
     if enabled is not None:
@@ -479,6 +490,11 @@ def set_continuous_improvement_settings(
         ci["max_turns"] = max_turns
     if normalized_agent_kind is not None:
         ci["agent_kind"] = normalized_agent_kind
+    if normalized_modes is not None:
+        if normalized_modes:
+            ci["modes"] = normalized_modes
+        else:
+            ci.pop("modes", None)
     _write_workflow_atomic(workflow_path, data, body)
 
 

@@ -12,18 +12,29 @@ import pytest
 
 from symphony.continuous_improvement import (
     CHECK_PYTHON,
+    DEFAULT_AGENT_PROMPTS,
+    AgentTask,
     BaselineProof,
     CheckResult,
     CheckSpec,
     CommandExecution,
     ImprovementRunResult,
     IssueFinding,
+    _AGENT_PROMPT_FILES,
+    agent_prompt_template,
+    any_mode_due,
+    due_modes,
+    load_mode_state,
+    mode_state_path,
+    parse_agent_proposals,
     prove_baseline,
     register_findings,
     render_report,
     run_argv,
     run_continuous_improvement,
     run_predefined_check,
+    save_mode_state,
+    security_check_specs,
     write_report,
 )
 from symphony.workflow import build_service_config, load_workflow
@@ -594,3 +605,365 @@ async def test_run_continuous_improvement_real_git_target_worktree_e2e(
     assert "clean temporary worktree for dev" in report
     assert _git(tmp_path, "rev-parse", "--abbrev-ref", "HEAD") == "feature"
     assert remaining_worktrees == []
+
+
+# --------------------------------------------------------------------------
+# improvement modes (opt-in): cadence, triage, agent-driven proposals
+# --------------------------------------------------------------------------
+
+
+def _modes_workflow(
+    tmp_path: Path,
+    modes: str,
+    *,
+    extra_lines: tuple[str, ...] = (),
+) -> Any:
+    # Rendered inside a dedent()ed literal, so extra keys carry its indent.
+    extra = ("\n" + " " * 12).join(extra_lines)
+    (tmp_path / "kanban").mkdir(exist_ok=True)
+    workflow = tmp_path / "WORKFLOW.md"
+    workflow.write_text(
+        textwrap.dedent(
+            f"""\
+            ---
+            tracker:
+              kind: file
+              board_root: ./kanban
+              project_slug: demo
+              active_states: [Todo, In Progress]
+              terminal_states: [Done, Archive, Blocked, Human Review]
+            agent:
+              kind: codex
+            continuous_improvement:
+              enabled: true
+              interval_ms: 60000
+              modes: [{modes}]
+            {extra}
+            ---
+
+            Prompt.
+            """
+        ),
+        encoding="utf-8",
+    )
+    return build_service_config(load_workflow(workflow))
+
+
+def _write_ticket(tmp_path: Path, identifier: str, front: str, body: str = "") -> None:
+    (tmp_path / "kanban" / f"{identifier}.md").write_text(
+        f"---\nid: {identifier}\nidentifier: {identifier}\n{front}---\n\n{body}",
+        encoding="utf-8",
+    )
+
+
+def test_due_modes_honors_per_mode_interval(tmp_path: Path) -> None:
+    cfg = _modes_workflow(
+        tmp_path,
+        "readiness, market_research",
+        extra_lines=("  mode_interval_hours:", "    market_research: 10"),
+    )
+    now = 1_000_000.0
+
+    # Never run: everything is due.
+    assert due_modes(cfg, {}, now) == ("readiness", "market_research")
+    # market_research ran an hour ago; readiness has a zero-hour floor.
+    recent = {"readiness": now - 60, "market_research": now - 3600}
+    assert due_modes(cfg, recent, now) == ("readiness",)
+    # ...and comes back once its 10h floor elapses.
+    stale = {"readiness": now - 60, "market_research": now - 11 * 3600}
+    assert due_modes(cfg, stale, now) == ("readiness", "market_research")
+
+
+def test_mode_state_roundtrips_and_survives_corruption(tmp_path: Path) -> None:
+    save_mode_state(tmp_path, {"readiness": 12.5, "bogus": 1.0})
+    assert load_mode_state(tmp_path) == {"readiness": 12.5}
+
+    mode_state_path(tmp_path).write_text("not json", encoding="utf-8")
+    assert load_mode_state(tmp_path) == {}
+
+
+def test_any_mode_due_gates_the_scheduler(tmp_path: Path) -> None:
+    cfg = _modes_workflow(
+        tmp_path,
+        "market_research",
+        extra_lines=("  mode_interval_hours:", "    market_research: 10"),
+    )
+    assert any_mode_due(cfg, tmp_path, clock=lambda: 1_000.0) is True
+    save_mode_state(tmp_path, {"market_research": 1_000.0})
+    assert any_mode_due(cfg, tmp_path, clock=lambda: 1_000.0) is False
+    assert any_mode_due(cfg, tmp_path, clock=lambda: 1_000.0 + 11 * 3600) is True
+
+
+@pytest.mark.asyncio
+async def test_blocked_fixes_files_linked_fix_ticket(tmp_path: Path) -> None:
+    cfg = _modes_workflow(tmp_path, "blocked_fixes")
+    _write_ticket(
+        tmp_path,
+        "TASK-1",
+        "title: Ship the importer\nstate: Blocked\npriority: 2\nlabels: []\n",
+        "## Blocker\n\nThe importer needs a DB credential nobody has.\n",
+    )
+
+    result = await run_continuous_improvement(
+        cfg, tmp_path, lambda _phase: None, clock=lambda: 100.0
+    )
+
+    assert result.tickets_created == 1
+    (fix_id,) = result.ticket_ids
+    fix_text = (tmp_path / "kanban" / f"{fix_id}.md").read_text(encoding="utf-8")
+    source_text = (tmp_path / "kanban" / "TASK-1.md").read_text(encoding="utf-8")
+    assert "unblock TASK-1" in fix_text
+    assert "DB credential nobody has" in fix_text
+    # Headings must sit at column 0 — interpolated multi-line values used to
+    # defeat dedent() and leak the template's indentation into the body.
+    for heading in ("## Goal", "## Scope", "## Acceptance criteria", "## Evidence"):
+        assert f"\n{heading}\n" in fix_text
+    assert result.request_id is not None
+    assert f"request: {result.request_id}" in fix_text
+    # The source ticket now waits on the fix — a normal DAG edge, not a
+    # parallel execution path.
+    assert f"- {fix_id}" in source_text.split("blocked_by:")[1]
+
+    # Second run: the source is blocked by an open fix, so nothing new.
+    again = await run_continuous_improvement(
+        cfg, tmp_path, lambda _phase: None, clock=lambda: 200.0
+    )
+    assert again.tickets_created == 0
+
+
+@pytest.mark.asyncio
+async def test_market_research_caps_dedupes_and_groups_agent_proposals(
+    tmp_path: Path,
+) -> None:
+    cfg = _modes_workflow(
+        tmp_path,
+        "market_research",
+        extra_lines=("  max_improvement_tickets_per_run: 2",),
+    )
+    (tmp_path / "README.md").write_text("# Demo app\n\nIt demos.\n", encoding="utf-8")
+    _write_ticket(
+        tmp_path,
+        "TASK-9",
+        "title: Add dark mode\nstate: Todo\npriority: 2\nlabels: []\n",
+    )
+    tasks: list[AgentTask] = []
+
+    async def fake_agent(task: AgentTask) -> str:
+        tasks.append(task)
+        task.output_path.write_text(
+            json.dumps(
+                {
+                    "proposals": [
+                        {
+                            "title": "Add dark mode",
+                            "goal": "already on the board",
+                            "priority": 2,
+                        },
+                        {
+                            "title": "Support passkey sign-in",
+                            "goal": "Competitors ship passkeys.",
+                            "scope": "In: auth. Out: SSO.",
+                            "acceptance": "A user can register a passkey.",
+                            "evidence": "https://example.test/passkeys",
+                            "priority": 1,
+                        },
+                        {
+                            "title": "Publish an OpenAPI schema",
+                            "goal": "Integrators expect one.",
+                            "priority": 2,
+                        },
+                        {
+                            "title": "Rewrite everything in Rust",
+                            "goal": "over the cap",
+                            "priority": 3,
+                        },
+                    ]
+                }
+            ),
+            encoding="utf-8",
+        )
+        return "wrote 4 proposals"
+
+    result = await run_continuous_improvement(
+        cfg,
+        tmp_path,
+        lambda _phase: None,
+        agent_runner=fake_agent,
+        clock=lambda: 100.0,
+    )
+
+    assert [task.mode for task in tasks] == ["market_research"]
+    assert "Demo app" in tasks[0].prompt
+    assert "TASK-9: Add dark mode" in tasks[0].prompt
+    assert str(tasks[0].output_path) in tasks[0].prompt
+    # 4 proposals: 1 duplicate title, cap 2, so 1 dropped.
+    assert result.tickets_created == 2
+    assert result.request_id is not None and result.request_id.startswith("REQ-CI-")
+    bodies = [
+        (tmp_path / "kanban" / f"{ticket}.md").read_text(encoding="utf-8")
+        for ticket in result.ticket_ids
+    ]
+    assert any("passkey" in body.lower() for body in bodies)
+    assert all(f"request: {result.request_id}" in body for body in bodies)
+    assert all("- ci" in body for body in bodies)
+    assert all("CI Proposal: market_research/" in body for body in bodies)
+    assert not any("Rust" in body for body in bodies)
+
+    # Re-proposing the same thing is a no-op thanks to the marker.
+    repeat = await run_continuous_improvement(
+        cfg,
+        tmp_path,
+        lambda _phase: None,
+        agent_runner=fake_agent,
+        clock=lambda: 200.0,
+    )
+    assert repeat.tickets_created == 0
+
+
+@pytest.mark.asyncio
+async def test_agent_mode_without_runner_is_not_available(tmp_path: Path) -> None:
+    cfg = _modes_workflow(tmp_path, "feature_improvements")
+
+    result = await run_continuous_improvement(
+        cfg, tmp_path, lambda _phase: None, clock=lambda: 100.0
+    )
+
+    assert result.tickets_created == 0
+    assert [(o.mode, o.status) for o in result.modes] == [
+        ("feature_improvements", "not_available")
+    ]
+
+
+@pytest.mark.asyncio
+async def test_agent_mode_failure_does_not_kill_the_run(tmp_path: Path) -> None:
+    cfg = _modes_workflow(tmp_path, "feature_improvements")
+
+    async def exploding_agent(_task: AgentTask) -> str:
+        raise RuntimeError("backend exploded")
+
+    result = await run_continuous_improvement(
+        cfg,
+        tmp_path,
+        lambda _phase: None,
+        agent_runner=exploding_agent,
+        clock=lambda: 100.0,
+    )
+
+    assert result.status == "not_proven"
+    assert result.modes[0].status == "not_proven"
+    assert "backend exploded" in result.modes[0].summary
+
+
+def test_agent_prompt_override_wins_over_builtin(tmp_path: Path) -> None:
+    override = tmp_path / "docs" / "symphony-prompts" / "ci" / "market-research.md"
+    override.parent.mkdir(parents=True)
+    override.write_text("custom research prompt\n", encoding="utf-8")
+
+    assert agent_prompt_template(tmp_path, "market_research") == (
+        "custom research prompt"
+    )
+    assert "market research" in agent_prompt_template(
+        tmp_path / "elsewhere", "market_research"
+    )
+
+
+def test_shipped_ci_prompts_match_builtin_defaults() -> None:
+    """The docs copies are the operator-visible source of the built-ins."""
+    repo_root = Path(__file__).resolve().parents[1]
+    for mode, filename in _AGENT_PROMPT_FILES.items():
+        shipped = (repo_root / "docs" / "symphony-prompts" / "ci" / filename).read_text(
+            encoding="utf-8"
+        )
+        assert shipped.strip() == DEFAULT_AGENT_PROMPTS[mode].strip()
+
+
+def test_parse_agent_proposals_falls_back_to_reply_and_skips_junk(
+    tmp_path: Path,
+) -> None:
+    missing = tmp_path / "nope.json"
+    proposals = parse_agent_proposals(
+        "market_research",
+        output_path=missing,
+        reply='noise {"proposals": [{"title": "T", "goal": "G", "priority": 9}, '
+        '{"title": "", "goal": "no title"}, "junk"]} trailing',
+    )
+
+    assert len(proposals) == 1
+    assert proposals[0].title == "T"
+    # Priority is clamped into the board's 1-3 range.
+    assert proposals[0].priority == 3
+
+
+@pytest.mark.asyncio
+async def test_security_mode_files_patch_ticket_from_scan(tmp_path: Path) -> None:
+    cfg = _modes_workflow(tmp_path, "security")
+    (tmp_path / "pyproject.toml").write_text("[project]\nname='x'\n", encoding="utf-8")
+    phases: list[str] = []
+
+    async def fake_run(argv, _cwd, **_kwargs):
+        key = tuple(argv)
+        outputs = {
+            ("git", "rev-parse", "--abbrev-ref", "HEAD"): (0, "dev\n"),
+            ("git", "rev-parse", "HEAD"): (0, "abc123\n"),
+            ("git", "status", "--porcelain"): (0, ""),
+            ("git", "rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}"): (
+                128,
+                "no upstream",
+            ),
+            (CHECK_PYTHON, "-m", "pip_audit", "--progress-spinner", "off"): (
+                1,
+                "requests 2.0.0 GHSA-xxxx\n",
+            ),
+        }
+        rc, output = outputs[key]
+        return CommandExecution(key, rc, output, False, False)
+
+    result = await run_continuous_improvement(
+        cfg, tmp_path, phases.append, run_argv_func=fake_run, clock=lambda: 100.0
+    )
+
+    assert phases == ["baseline", "security", "report", "registrar"]
+    assert result.status == "failed"
+    assert result.tickets_created == 1
+    ticket = (tmp_path / "kanban" / "CI-1.md").read_text(encoding="utf-8")
+    assert "GHSA-xxxx" in ticket
+    assert "- security" in ticket
+
+
+def test_security_specs_are_optional_and_ecosystem_detected(tmp_path: Path) -> None:
+    assert security_check_specs(tmp_path) == ()
+    (tmp_path / "package.json").write_text("{}", encoding="utf-8")
+    specs = security_check_specs(tmp_path)
+    assert [spec.name for spec in specs] == ["npm_audit"]
+    assert all(spec.optional for spec in specs)
+
+
+@pytest.mark.asyncio
+async def test_readiness_only_run_records_mode_outcome(tmp_path: Path) -> None:
+    """Default (no `modes:`) still runs readiness — and now reports it."""
+    cfg = _workflow(tmp_path)
+
+    async def fake_run(argv, _cwd, **_kwargs):
+        key = tuple(argv)
+        outputs = {
+            ("git", "rev-parse", "--abbrev-ref", "HEAD"): (0, "dev\n"),
+            ("git", "rev-parse", "HEAD"): (0, "abc123\n"),
+            ("git", "status", "--porcelain"): (0, ""),
+            ("git", "rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}"): (
+                128,
+                "no upstream",
+            ),
+            (CHECK_PYTHON, "-m", "pytest", "-q"): (0, "ok\n"),
+            (CHECK_PYTHON, "-m", "ruff", "check", "src", "tests"): (0, "ok\n"),
+            (CHECK_PYTHON, "-m", "pyright"): (0, "0 errors\n"),
+        }
+        rc, output = outputs[key]
+        return CommandExecution(key, rc, output, False, False)
+
+    result = await run_continuous_improvement(
+        cfg, tmp_path, lambda _phase: None, run_argv_func=fake_run, clock=lambda: 5.0
+    )
+
+    assert [(o.mode, o.status) for o in result.modes] == [("readiness", "passed")]
+    assert load_mode_state(tmp_path) == {"readiness": 5.0}
+    assert "| readiness | passed |" in render_report(result)

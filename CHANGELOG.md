@@ -28,6 +28,27 @@ feature, and turn chat into a gated ticket-DAG pipeline.
 
 ### Added
 
+- **Continuous-improvement modes (experimental, opt-in)** — the heartbeat
+  grows from a product-readiness inspector into an autonomous application
+  improvement engine. `continuous_improvement.modes` selects any of
+  `readiness` (today's checks), `blocked_fixes` (triage Blocked / Human
+  Review tickets into linked fix tickets with a root-cause note),
+  `security` (optional `pip-audit` / `npm audit` scans into patch tickets),
+  `market_research` and `feature_improvements` (an agent turn that proposes
+  improvements with evidence). Everything stays opt-in: a missing or
+  disabled block runs nothing, and `enabled: true` with no `modes:` is the
+  old readiness-only behaviour. Proposals become **normal board tickets**
+  (first active state, `Goal`/`Scope`/`Acceptance` body, `ci` label,
+  `REQ-CI-<date>-<n>` request group, per-run cap, de-duplicated against open
+  tickets) and flow through the ordinary pipeline — never a parallel
+  execution path. Per-mode cadence via `mode_interval_hours` is durable
+  across restarts; a heartbeat with nothing due re-arms without spending a
+  turn. Agent-driven modes get a succinct prompt from
+  `docs/symphony-prompts/ci/` (built-in default otherwise) and may write
+  only their JSON proposal file — the orchestrator supplies the agent
+  capability so `continuous_improvement.py` stays orchestrator-free. Modes
+  are editable from the web settings card and
+  `PUT /api/v1/workflow/continuous-improvement`.
 - **Validated board tool** — `symphony board new` gains `--blocked-by`
   (repeatable), `--request REQ-<n>` grouping, `--label` (repeatable), and
   `--description-file PATH|-`. Creation — and the web API's issue
