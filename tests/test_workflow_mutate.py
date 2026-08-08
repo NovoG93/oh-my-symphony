@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import shutil
 from pathlib import Path
 
 import pytest
@@ -55,6 +56,22 @@ Body text with {{ issue.identifier }} stays untouched.
 """
 
 
+def install_shipped_prompts(root: Path) -> None:
+    """Copy the shipped prompt bodies into a temp board.
+
+    F-11: `apply_lane_preset` refuses a board that does not carry the
+    preset's prompt files rather than writing placeholder stubs, so every
+    preset test must start from a board that has them — exactly like the
+    `cp -R docs/symphony-prompts` step the error message names.
+    """
+    source = Path(__file__).resolve().parents[1] / "docs" / "symphony-prompts"
+    target = root / "docs" / "symphony-prompts"
+    target.parent.mkdir(parents=True, exist_ok=True)
+    if target.exists():
+        shutil.rmtree(target)
+    shutil.copytree(source, target)
+
+
 @pytest.fixture()
 def workflow(tmp_path: Path) -> Path:
     path = tmp_path / "WORKFLOW.md"
@@ -64,6 +81,7 @@ def workflow(tmp_path: Path) -> Path:
     (tmp_path / "prompts" / "base.md").write_text("base", encoding="utf-8")
     (stages / "todo.md").write_text("todo prompt", encoding="utf-8")
     (stages / "doing.md").write_text("doing prompt", encoding="utf-8")
+    install_shipped_prompts(tmp_path)
     return path
 
 
@@ -453,7 +471,10 @@ def test_apply_lane_preset_deep_rewrites_lanes_and_keeps_comments(
     assert "Body text with {{ issue.identifier }} stays untouched." in text
 
 
-def test_apply_lane_preset_creates_missing_prompt_files(workflow: Path) -> None:
+def test_apply_lane_preset_points_at_the_real_shipped_prompt_bodies(
+    workflow: Path,
+) -> None:
+    """F-11: the lanes must land on real gates, never placeholder stubs."""
     apply_lane_preset(workflow, "deep")
 
     deep_dir = workflow.parent / "docs" / "symphony-prompts" / "file" / "deep"
@@ -469,6 +490,33 @@ def test_apply_lane_preset_creates_missing_prompt_files(workflow: Path) -> None:
         "document",
     ):
         assert (deep_dir / f"{slug}.md").is_file(), slug
+    # Distinctive lines from the shipped prompts — a placeholder stub
+    # ("Do the work this column stands for") would not contain them.
+    assert "PLAN -- decompose into a ticket DAG" in (
+        deep_dir / "plan.md"
+    ).read_text(encoding="utf-8")
+    assert "verdict: GREEN" in (deep_dir / "verify.md").read_text(encoding="utf-8")
+    assert "Do the work this column stands for" not in (
+        deep_dir / "build.md"
+    ).read_text(encoding="utf-8")
+
+
+def test_apply_lane_preset_refuses_a_board_without_the_prompt_files(
+    tmp_path: Path,
+) -> None:
+    """The upgrade case: refuse loudly instead of degrading the board."""
+    path = tmp_path / "WORKFLOW.md"
+    path.write_text(WORKFLOW_TEXT, encoding="utf-8")
+    before = path.read_text(encoding="utf-8")
+
+    with pytest.raises(WorkflowMutationError) as exc_info:
+        apply_lane_preset(path, "deep")
+
+    message = str(exc_info.value)
+    assert "docs/symphony-prompts/file/deep/plan.md" in message
+    assert "cp -R" in message
+    assert "Nothing was changed" in message
+    assert path.read_text(encoding="utf-8") == before
 
 
 def test_apply_lane_preset_round_trips_back_to_default(workflow: Path) -> None:

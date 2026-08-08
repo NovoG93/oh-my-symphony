@@ -20,6 +20,7 @@ What is covered here:
 from __future__ import annotations
 
 import asyncio
+import shutil
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from pathlib import Path
@@ -66,6 +67,12 @@ _DEEP_ACTIVE = DEEP_PRESET.active_states
 
 
 def _seed_workflow(tmp_path: Path) -> Path:
+    # F-11: `apply_lane_preset` refuses a board that lacks the preset's
+    # prompt bodies, so start from a board that carries the shipped set.
+    source = Path(__file__).resolve().parents[1] / "docs" / "symphony-prompts"
+    target = tmp_path / "docs" / "symphony-prompts"
+    target.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copytree(source, target)
     path = tmp_path / "WORKFLOW.md"
     path.write_text(
         "\n".join(

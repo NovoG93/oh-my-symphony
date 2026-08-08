@@ -10,7 +10,9 @@ asyncio orchestration itself.
 from __future__ import annotations
 
 import asyncio
+import shutil
 import subprocess
+import sys
 import time
 from dataclasses import replace
 from datetime import datetime, timezone
@@ -69,6 +71,35 @@ def _branch_hook_env(cfg: ServiceConfig) -> dict[str, str]:
     if name is not None:
         env["SYMPHONY_BOARD_ROOT_NAME"] = name
     return env
+
+
+def resolve_symphony_cli() -> str:
+    """Absolute path to the `symphony` CLI a dispatched worker can run.
+
+    F-19: every stage prompt and the chat preamble now *require*
+    `symphony board new`, but Symphony is typically installed in a venv and
+    launched by absolute path (`.venv/bin/symphony`) or by `sys.executable -m`.
+    The spawned agent inherits the orchestrator's PATH, which need not contain
+    that venv's `bin`. Exporting the resolved path as `SYMPHONY_CLI` lets the
+    prompts say `${SYMPHONY_CLI:-symphony} board new ...` and work either way.
+    """
+    argv0 = Path(sys.argv[0]) if sys.argv and sys.argv[0] else None
+    if argv0 is not None and argv0.name in {"symphony", "symphony.exe"}:
+        resolved = argv0.resolve()
+        if resolved.is_file():
+            return str(resolved)
+    sibling = Path(sys.executable).parent / (
+        "symphony.exe" if sys.platform == "win32" else "symphony"
+    )
+    if sibling.is_file():
+        return str(sibling)
+    found = shutil.which("symphony")
+    if found:
+        return str(Path(found).resolve())
+    # Last resort: the module entry point through this interpreter. Callers
+    # interpolate it unquoted (`${SYMPHONY_CLI:-symphony} board ...`), so a
+    # multi-word value still forms a valid command line.
+    return f"{sys.executable} -m symphony.cli.main"
 
 
 def board_root_name_for_hooks(cfg: ServiceConfig) -> str | None:

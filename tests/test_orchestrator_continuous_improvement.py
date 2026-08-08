@@ -9,6 +9,8 @@ from __future__ import annotations
 
 import asyncio
 import dataclasses
+import os
+import subprocess
 import textwrap
 import time
 from pathlib import Path
@@ -25,6 +27,7 @@ from symphony.continuous_improvement import (
     lease_path_for,
     save_mode_state,
 )
+from symphony.errors import SymphonyError
 from symphony.issue import Issue
 from symphony.orchestrator import Orchestrator
 from symphony.workflow import (
@@ -818,3 +821,195 @@ class _RecordingBackend:
 
     async def stop(self) -> None:
         self.stopped = True
+
+
+# ---------------------------------------------------------------------------
+# F-12 — the CI agent's read-only contract is enforced, not just prompted
+# ---------------------------------------------------------------------------
+
+
+def _init_repo(root: Path) -> None:
+    env = {
+        "HOME": str(root),
+        "GIT_AUTHOR_NAME": "T",
+        "GIT_AUTHOR_EMAIL": "t@example.com",
+        "GIT_COMMITTER_NAME": "T",
+        "GIT_COMMITTER_EMAIL": "t@example.com",
+        "PATH": os.environ.get("PATH", ""),
+    }
+    subprocess.run(["git", "init", "-q"], cwd=root, check=True, env=env)
+    (root / "seed.txt").write_text("seed\n", encoding="utf-8")
+    subprocess.run(["git", "add", "-A"], cwd=root, check=True, env=env)
+    subprocess.run(
+        ["git", "commit", "-qm", "seed"], cwd=root, check=True, env=env
+    )
+
+
+class _WritingBackend(_RecordingBackend):
+    """Backend whose turn writes files into the host worktree."""
+
+    def __init__(self, writes: dict[str, str]) -> None:
+        super().__init__()
+        self._writes = writes
+        self.root: Path | None = None
+
+    async def run_turn(self, *, prompt: str, is_continuation: bool):
+        assert self.root is not None
+        for rel, content in self._writes.items():
+            path = self.root / rel
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(content, encoding="utf-8")
+        return await super().run_turn(prompt=prompt, is_continuation=is_continuation)
+
+
+def _ci_orch(tmp_path: Path, backend) -> tuple[Orchestrator, Path]:
+    workflow = tmp_path / "WORKFLOW.md"
+    workflow.write_text(
+        textwrap.dedent(
+            """\
+            ---
+            tracker:
+              kind: file
+              board_root: ./kanban
+            agent:
+              kind: codex
+            continuous_improvement:
+              enabled: true
+              modes: [market_research]
+            ---
+
+            Prompt.
+            """
+        ),
+        encoding="utf-8",
+    )
+    (tmp_path / "kanban").mkdir()
+    state = WorkflowState(workflow)
+    cfg, err = state.reload()
+    assert err is None and cfg is not None
+    return Orchestrator(state, build_backend=lambda init: _capture(backend, init)), workflow
+
+
+@pytest.mark.asyncio
+async def test_improvement_agent_turn_that_writes_only_its_proposal_file_passes(
+    tmp_path: Path,
+) -> None:
+    _init_repo(tmp_path)
+    backend = _WritingBackend(
+        {".symphony/continuous-improvement/proposals/market_research.json": "{}"}
+    )
+    backend.root = tmp_path
+    orch, _ = _ci_orch(tmp_path, backend)
+    output = tmp_path / ".symphony" / "continuous-improvement" / "proposals" / "market_research.json"
+
+    reply = await orch._run_improvement_agent(
+        AgentTask(
+            mode="market_research",
+            prompt="survey",
+            cwd=tmp_path,
+            output_path=output,
+        )
+    )
+
+    assert reply == "wrote 0 proposals"
+    assert output.is_file()
+
+
+@pytest.mark.asyncio
+async def test_improvement_agent_turn_that_edits_source_is_discarded(
+    tmp_path: Path,
+) -> None:
+    """The read-only contract used to be prompt text only, in the HOST tree."""
+    _init_repo(tmp_path)
+    backend = _WritingBackend(
+        {
+            ".symphony/continuous-improvement/proposals/market_research.json": "{}",
+            "seed.txt": "the agent rewrote production code\n",
+        }
+    )
+    backend.root = tmp_path
+    orch, _ = _ci_orch(tmp_path, backend)
+    output = tmp_path / ".symphony" / "continuous-improvement" / "proposals" / "market_research.json"
+
+    with pytest.raises(SymphonyError) as exc_info:
+        await orch._run_improvement_agent(
+            AgentTask(
+                mode="market_research",
+                prompt="survey",
+                cwd=tmp_path,
+                output_path=output,
+            )
+        )
+
+    assert "wrote outside its contract" in str(exc_info.value)
+    assert "seed.txt" in str(exc_info.value)
+    # Proposals from a contract-breaking turn must not be registered.
+    assert not output.exists()
+
+
+@pytest.mark.asyncio
+async def test_improvement_agent_contract_check_is_skipped_outside_a_git_repo(
+    tmp_path: Path,
+) -> None:
+    backend = _WritingBackend({"seed.txt": "no repo here"})
+    backend.root = tmp_path
+    orch, _ = _ci_orch(tmp_path, backend)
+
+    reply = await orch._run_improvement_agent(
+        AgentTask(
+            mode="market_research",
+            prompt="survey",
+            cwd=tmp_path,
+            output_path=tmp_path / "out.json",
+        )
+    )
+
+    assert reply == "wrote 0 proposals"
+
+
+@pytest.mark.asyncio
+async def test_improvement_agent_run_records_not_proven_on_contract_breach(
+    tmp_path: Path,
+) -> None:
+    """End of the chain: the mode is `not_proven`, the run survives."""
+    from symphony.continuous_improvement import default_improvement_runner
+
+    _init_repo(tmp_path)
+    workflow = tmp_path / "WORKFLOW.md"
+    workflow.write_text(
+        textwrap.dedent(
+            """\
+            ---
+            tracker:
+              kind: file
+              board_root: ./kanban
+            agent:
+              kind: codex
+            continuous_improvement:
+              enabled: true
+              modes: [market_research]
+            ---
+
+            Prompt.
+            """
+        ),
+        encoding="utf-8",
+    )
+    (tmp_path / "kanban").mkdir(exist_ok=True)
+    state = WorkflowState(workflow)
+    cfg, err = state.reload()
+    assert err is None and cfg is not None
+
+    async def _rogue_runner(task: AgentTask) -> str:
+        raise SymphonyError(
+            "continuous-improvement agent wrote outside its contract; "
+            "proposals discarded: src/app.py"
+        )
+
+    result = await default_improvement_runner(
+        cfg, tmp_path, lambda _phase: None, agent_runner=_rogue_runner
+    )
+
+    outcomes = {o.mode: o for o in result.modes}
+    assert outcomes["market_research"].status == "not_proven"
+    assert "outside its contract" in outcomes["market_research"].summary

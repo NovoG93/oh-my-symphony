@@ -91,7 +91,8 @@ def test_deep_prompts_are_succinct_and_carry_the_gates() -> None:
         text = (repo_root / rel).read_text(encoding="utf-8")
         assert text.count("\n") <= 45, f"{rel} is not succinct"
     plan = (deep_dir / "plan.md").read_text(encoding="utf-8")
-    assert "symphony board new" in plan
+    # F-19: the CLI may live in a venv the worker's PATH does not carry.
+    assert "${SYMPHONY_CLI:-symphony} board new" in plan
     assert "--blocked-by" in plan
     assert "--request" in plan
     review = (deep_dir / "review.md").read_text(encoding="utf-8")

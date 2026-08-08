@@ -30,16 +30,33 @@ symphony board new TASK-2 "Add regression test" \
   --description-file ./spec.md      # or `-` to read stdin
 ```
 
-Identifiers are free-form strings (`TASK-1`, `BUG-007`, `PROD-2026-05-09`).
-Convention is `<PREFIX>-<NUMBER>` but it is not enforced. The file lands at
+Identifiers must match `^[A-Za-z][A-Za-z0-9_-]{0,63}$` (`TASK-1`, `BUG-007`,
+`PROD-2026-05-09`); anything with a slash, backslash, space or `..` is
+rejected before it can escape the board root. Convention is
+`<PREFIX>-<NUMBER>` but the shape is not enforced. The file lands at
 `kanban/<ID>.md`. Omit `--agent-kind` to use the global `agent.kind` from
 `WORKFLOW.md`; set it only for tickets that need a different backend.
 
-`new` validates before writing: unique id, a state from
+`new` validates before writing: legal id, unique id, a state from
 `tracker.active_states`/`terminal_states`, every `--blocked-by` target must
 exist on the board, and the added edges must keep the dependency graph
 acyclic (violations print the cycle path and exit non-zero). The web API's
 issue create/update endpoints apply the same rules.
+
+### Update a ticket
+
+Never hand-edit ticket frontmatter — it bypasses cycle validation:
+
+```bash
+symphony board update TASK-2 --add-blocked-by BUG-7   # keep existing blockers
+symphony board update TASK-2 --blocked-by TASK-1      # replace the list
+symphony board update BUILD-1 --state Build           # reopen a slice
+symphony board update TASK-2 --request REQ-2
+```
+
+Dispatched workers get the resolved CLI path in `$SYMPHONY_CLI`; prompts call
+`${SYMPHONY_CLI:-symphony} board ...` so a venv install that is not on the
+worker's PATH still works. `symphony doctor` reports this as `board.cli`.
 
 When creating more than one ticket, assign IDs in the same order as the task
 list: `TASK-001`, then `TASK-002`, then `TASK-003`. Symphony uses the stable

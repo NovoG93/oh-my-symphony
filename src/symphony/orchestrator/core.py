@@ -22,6 +22,7 @@ import asyncio
 import json
 import os
 import re
+import subprocess
 import time
 import traceback
 from dataclasses import dataclass, replace
@@ -115,6 +116,7 @@ from .helpers import (
     _branch_hook_env,
     _branch_already_merged_into_target,
     _config_for_issue_agent,
+    resolve_symphony_cli,
     _from_monotonic_to_iso,
     _is_auto_triage_todo_candidate,
     _is_rewind_transition,
@@ -185,6 +187,40 @@ class _EligibilityDisposition(str, Enum):
 class _EligibilityDecision:
     disposition: _EligibilityDisposition
     reason: str
+
+
+# The one path a continuous-improvement agent turn may write in the host
+# worktree. Mirrors `continuous_improvement.AGENT_OUTPUT_DIR`.
+CI_AGENT_OUTPUT_PREFIX = ".symphony/continuous-improvement/proposals/"
+
+
+def _worktree_status_snapshot(cwd: Path) -> dict[str, str] | None:
+    """`path -> porcelain status code` for a worktree, or None when not git.
+
+    Untracked files are listed individually (`-uall`) so a new file in a
+    previously-clean directory is visible as its own path.
+    """
+    try:
+        result = subprocess.run(
+            ["git", "status", "--porcelain=v1", "-uall", "-z"],
+            cwd=str(cwd),
+            capture_output=True,
+            text=True,
+            timeout=60,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if result.returncode != 0:
+        return None
+    snapshot: dict[str, str] = {}
+    for record in result.stdout.split("\0"):
+        if len(record) < 4:
+            continue
+        code, path = record[:2], record[3:]
+        if path:
+            snapshot[path] = code
+    return snapshot
 
 
 def _clean_board_error_message(message: str) -> str:
@@ -1191,6 +1227,10 @@ class Orchestrator:
         # writes through the host-board junction installed by after_create.
         import os as _os
         _os.environ["SYMPHONY_WORKFLOW_DIR"] = str(cfg.workflow_path.parent)
+        # The board-tool protocol in the stage prompts and the chat preamble
+        # requires the `symphony` CLI; a venv install is not necessarily on
+        # the worker's PATH. Prompts reference `${SYMPHONY_CLI:-symphony}`.
+        _os.environ["SYMPHONY_CLI"] = resolve_symphony_cli()
         self._workspace_manager = WorkspaceManager(
             cfg.workspace_root,
             cfg.hooks,
@@ -1543,6 +1583,19 @@ class Orchestrator:
                 if _blocker_dependency_is_resolved(blocker.state, cfg):
                     continue
                 identifier = blocker.identifier or blocker.id or "unknown"
+                # F-13: a blocker id that is not on the board hydrates to
+                # `state=None` and deadlocks the ticket forever. "waiting on
+                # unresolved dependency" reads like normal queueing, so say
+                # what actually happened.
+                if not normalize_state(blocker.state).strip():
+                    return _attention_signal(
+                        "dangling_dependency",
+                        "Unknown blocker",
+                        f"blocker {identifier} is not on the board — fix the id "
+                        f"with `symphony board update {issue.identifier} "
+                        "--blocked-by <ID>` or clear it",
+                        "error",
+                    )
                 return _attention_signal(
                     "blocked_dependency",
                     "Blocked dependency",
@@ -3262,9 +3315,14 @@ class Orchestrator:
         module is handed (it must not import the orchestrator). The turn runs
         against the host repo with `cwd == workspace_root == workflow_dir`,
         exactly like a chat turn, and outside the dispatch slot accounting —
-        the heartbeat already holds the idle board. Enforcement of "read
-        only except the proposal file" is the prompt's job; the backend is
-        left in its normal editing mode so the agent can write that one file.
+        the heartbeat already holds the idle board. The backend stays in its
+        normal editing mode so the agent can write its one proposal file.
+
+        F-12: "read only except the proposal file" used to be prompt text
+        only, in the *host* tree. It is now also mechanical — the working
+        tree is snapshotted before and after the turn, and a write outside
+        `.symphony/continuous-improvement/proposals/` discards the mode's
+        proposals (the caller records `not_proven`) and logs the paths.
         """
         cfg = self._workflow_state.current()
         if cfg is None:
@@ -3283,6 +3341,7 @@ class Orchestrator:
                 on_event=_ignore_event,
             )
         )
+        before = await asyncio.to_thread(_worktree_status_snapshot, task.cwd)
         await backend.start()
         try:
             await backend.initialize()
@@ -3290,7 +3349,45 @@ class Orchestrator:
             result = await backend.run_turn(prompt=task.prompt, is_continuation=False)
         finally:
             await backend.stop()
+        after = await asyncio.to_thread(_worktree_status_snapshot, task.cwd)
+        self._enforce_improvement_write_contract(task, before, after)
         return result.last_message or ""
+
+    def _enforce_improvement_write_contract(
+        self,
+        task: AgentTask,
+        before: dict[str, str] | None,
+        after: dict[str, str] | None,
+    ) -> None:
+        """Discard a CI agent turn that wrote outside its contract."""
+        if before is None or after is None:
+            # Not a git worktree (or git unavailable): nothing to compare
+            # against. The prompt remains the only gate, as before.
+            return
+        allowed = CI_AGENT_OUTPUT_PREFIX
+        offending = sorted(
+            path
+            for path, code in after.items()
+            if before.get(path) != code and not path.startswith(allowed)
+        )
+        if not offending:
+            return
+        try:
+            task.output_path.unlink()
+        except OSError:
+            pass
+        log.error(
+            "ci_agent_wrote_outside_contract",
+            mode=task.mode,
+            cwd=str(task.cwd),
+            paths=offending[:20],
+            path_count=len(offending),
+        )
+        raise SymphonyError(
+            "continuous-improvement agent wrote outside its contract; "
+            f"proposals discarded: {', '.join(offending[:5])}",
+            mode=task.mode,
+        )
 
     def _report_improvement_phase(self, phase: str) -> None:
         self._improvement_status["current_phase"] = phase
