@@ -228,6 +228,27 @@ def test_web_chat_font_controls_contract() -> None:
     assert "font-size: inherit" in css
 
 
+def test_web_settings_visual_hierarchy_contract() -> None:
+    js = _script_bundle()
+    css = (STATIC_ROOT / "style.css").read_text(encoding="utf-8")
+
+    assert "function settingsSectionHeading(title, description)" in js
+    assert "settings-card--featured" in js
+    assert "settings-card--utility" in js
+    assert "settings.pageDescription" in js
+    assert "el('h2', { class: 'settings-section-kicker' }, title)" in js
+    assert "function bindBranchPolicyAutosave(select, key)" in js
+    assert "else select.value = savedValue" in js
+    settings_render = js[js.index("async function renderSettingsPage"):]
+    assert settings_render.index("settings.workspace") < settings_render.index("settings.workflowSetup")
+    assert settings_render.index("settings.workflowSetup") < settings_render.index("settings.automation")
+    assert "field(t('common.enabled'), el('span', { class: 'switch' }" in js
+    assert ".settings-section-heading" in css
+    assert ".settings-card-header" in css
+    assert "@media (max-width: 1200px)" in css
+    assert "@media (max-width: 768px)" in css
+
+
 def test_web_settings_lane_preset_contract() -> None:
     js = _script_bundle()
 

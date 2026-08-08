@@ -17,6 +17,9 @@ Versioning: [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   and switch to another independently running project without retargeting active
   workers. Missing paths and existing non-Git directories are initialized as Git
   repositories, while existing Git metadata and files are preserved.
+- Reorganize the web Settings page into workspace, workflow, and automation
+  sections with clearer descriptions, responsive card sizing, visible save
+  semantics, and English/Korean copy that remains readable down to phone widths.
 
 ### Fixed
 
