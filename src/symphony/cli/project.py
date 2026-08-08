@@ -76,11 +76,25 @@ def _next_port(projects: list[Project], host: str) -> int:
     raise ProjectError(f"no available registry port for host {host}")
 
 
-def _resolve_workflow(repo: Path, raw: str) -> Path:
+def _workflow_path(repo: Path, raw: str) -> Path:
     value = Path(raw).expanduser()
-    workflow = (value if value.is_absolute() else repo / value).resolve()
+    if value.is_absolute():
+        raise ProjectError("workflow path must be relative to the project repository")
+    root = repo.resolve()
+    workflow = (root / value).resolve()
+    try:
+        workflow.relative_to(root)
+    except ValueError as exc:
+        raise ProjectError("workflow path escapes the project repository") from exc
+    return workflow
+
+
+def _resolve_workflow(repo: Path, raw: str) -> Path:
+    workflow = _workflow_path(repo, raw)
     if not workflow.is_file():
         raise ProjectError(f"workflow file not found: {workflow}")
+    if git_common_dir(workflow.parent) != git_common_dir(repo):
+        raise ProjectError("workflow must belong to the registered project Git repository")
     return workflow
 
 
@@ -118,10 +132,11 @@ def _new_project(
 
 def bootstrap_project(source: Path, target: Path, workflow: str = "WORKFLOW.md") -> None:
     """Copy the required file-tracker operator bundle into a new repository."""
+    workflow_target = _workflow_path(target, workflow)
     required_files = {
         "tui-open.sh": "tui-open.sh",
         "tui-open.bat": "tui-open.bat",
-        "WORKFLOW.file.example.md": workflow,
+        "WORKFLOW.file.example.md": str(workflow_target.relative_to(target.resolve())),
         "scripts/symphony-setup-worktree.sh": "scripts/symphony-setup-worktree.sh",
         "AGENTS.md": "AGENTS.md",
         "GEMINI.md": "GEMINI.md",

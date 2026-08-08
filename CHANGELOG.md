@@ -10,6 +10,15 @@ Versioning: [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.18.1] - 2026-08-08 - Project workflow containment
+
+### Fixed
+
+- Require every registered or bootstrapped `WORKFLOW.md` path to be relative
+  to, contained by, and backed by the same Git repository as its project.
+  Absolute paths, `..` escapes, symlink escapes, and cross-repository workflow
+  selection are rejected before any external file can be written.
+
 ## [0.18.0] - 2026-08-08 - Multi-project hub and isolated delivery
 
 ### Added
