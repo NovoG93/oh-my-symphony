@@ -710,7 +710,10 @@ def _create_or_adopt_project_locked(
 
         relative_files = [str(path.relative_to(repo)) for path in created_files]
         if relative_files:
-            _run_git(repo, "add", "--", *relative_files)
+            # Existing repositories may intentionally ignore operator files.
+            # Force-add only paths this operation created; unrelated ignored or
+            # modified files are never included in ``relative_files``.
+            _run_git(repo, "add", "-f", "--", *relative_files)
             staged = subprocess.run(
                 ["git", "-C", str(repo), "diff", "--cached", "--quiet", "--", *relative_files],
                 check=False,
