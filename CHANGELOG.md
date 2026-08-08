@@ -10,51 +10,140 @@ Versioning: [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+The "minimal" line: delete duplicate machinery, keep every operator-facing
+feature, and turn chat into a gated ticket-DAG pipeline.
+
+### Removed
+
+- **Governed per-ticket workflow engine** — the `symphony.flow` package, the
+  `symphony workflow`/`symphony run`/`symphony approval` CLIs, the
+  `workflow_engine:` config block, the flow run store, and the earlier
+  Unreleased notes describing them (the feature never shipped in a release).
+  Board-level `blocked_by` ticket DAGs are the one DAG substrate.
+- **`tools/board-viewer/`** standalone web board and the service
+  `--viewer-port` flag. The built-in admin UI on the orchestrator port is
+  the only board.
+- Repo debris: per-ticket dev archives under `docs/`, one-off screenshot and
+  demo scripts, generated progress files, and empty packages.
+
 ### Added
 
-- **Governed workflow mode** — an opt-in, repository-defined workflow engine
-  that runs inside each ticket run. A committed YAML DAG decides node order,
-  completion, and gating; the model supplies judgement and code but no longer
-  decides whether its own work is finished. Enable with `workflow_engine:` in
-  `WORKFLOW.md`. Absent that block, behaviour is unchanged.
-  - Three node types: `agent` (one backend turn), `shell` (deterministic
-    command), and `approval` (a durable human gate that suspends the run).
-  - Per-node backend selection — plan with one agent, implement with another,
-    review with a third, under one audit trail. A node-level override never
-    mutates the ticket's default backend.
-  - A node-level execution ledger in `.symphony/state.db`: every attempt, its
-    output, error class, token usage, and the git revision before and after it.
-    Each state change and the event describing it commit in one transaction.
-  - Human approval that only an explicit, versioned mutation can resolve.
-    Moving a card, editing a ticket, or an agent writing "approved" does not
-    clear a gate. A conflicting second decision returns a conflict rather than
-    overwriting the first.
-  - Crash recovery that never restarts a ticket behind the operator. An
-    interrupted node is recorded as interrupted, the run parks in
-    `needs_attention` holding a durable fence, and `resume` replays the stored
-    definition snapshot, skipping succeeded nodes after verifying their
-    artifacts still hash correctly.
-- Versioned, transactional SQLite migrations for `.symphony/state.db`, with a
-  timestamped backup taken before the first governed-workflow migration.
-- `BackendCapabilities` — explicit per-backend capability metadata, replacing
-  behaviour inferred from the backend's name. Preflight now rejects a workflow
-  asking for a capability its backend lacks, naming the node and the backend.
-- `symphony workflow list|show|validate`, `symphony run show|events|resume|
-  abandon|cancel`, and `symphony approval list|resolve`, plus the matching REST
-  endpoints and a web execution panel.
-- `symphony doctor` validates the workflow directory, compiles every discovered
-  workflow, checks `ticket_state_mapping` against the tracker's states, warns
-  about external side effects with no approval gate, and confirms the database
-  schema is current.
+- **Continuous-improvement modes (experimental, opt-in)** — the heartbeat
+  grows from a product-readiness inspector into an autonomous application
+  improvement engine. `continuous_improvement.modes` selects any of
+  `readiness` (today's checks), `blocked_fixes` (triage Blocked / Human
+  Review tickets into linked fix tickets with a root-cause note),
+  `security` (optional `pip-audit` / `npm audit` scans into patch tickets),
+  `market_research` and `feature_improvements` (an agent turn that proposes
+  improvements with evidence). Everything stays opt-in: a missing or
+  disabled block runs nothing, and `enabled: true` with no `modes:` is the
+  old readiness-only behaviour. Proposals become **normal board tickets**
+  (first active state, `Goal`/`Scope`/`Acceptance` body, `ci` label,
+  `REQ-CI-<date>-<n>` request group, per-run cap, de-duplicated against open
+  tickets) and flow through the ordinary pipeline — never a parallel
+  execution path. Per-mode cadence via `mode_interval_hours` is durable
+  across restarts; a heartbeat with nothing due re-arms without spending a
+  turn. Agent-driven modes get a succinct prompt from
+  `docs/symphony-prompts/ci/` (built-in default otherwise) and may write
+  only their JSON proposal file — the orchestrator supplies the agent
+  capability so `continuous_improvement.py` stays orchestrator-free. Modes
+  are editable from the web settings card and
+  `PUT /api/v1/workflow/continuous-improvement`.
+- **Validated board tool** — `symphony board new` gains `--blocked-by`
+  (repeatable), `--request REQ-<n>` grouping, `--label` (repeatable), and
+  `--description-file PATH|-`. Creation — and the web API's issue
+  create/update — validates unique id, legal state, existing blockers, and
+  an acyclic dependency graph (violations print the cycle path).
+  `symphony board graph [--request REQ-n]` prints the ticket DAG.
+- **Per-stage backend routing** — `agent.stage_kinds` maps board states to
+  agent kinds. Resolution per dispatch: ticket `agent_kind` pin >
+  `agent.stage_kinds[state]` > `agent.kind`.
+- **Lane presets** — a succinct 4-lane default (`Todo → In Progress →
+  Verify → Document`) and an optional 8-lane deep pipeline (`Intake → Research
+  → Plan → Review → Build → QA → Verify → Document`) ported from the
+  OneShot template. Switchable from the admin UI settings page or
+  `GET /api/v1/workflow/presets` + `POST /api/v1/workflow/presets/apply`,
+  with comments preserved and removed-lane tickets migrated; boards stay
+  fully customizable.
+- **Chat board-intake protocol** — the chat agent files validated ticket
+  DAGs instead of freehand ticket markdown: a simple request becomes one
+  ticket; a complex request becomes a research → plan → plan-review →
+  build → qa → document stage-ticket DAG under one `--request` group; a
+  deep-preset board gets one Intake ticket and the pipeline decomposes.
 
 ### Changed
 
-- `.gitignore` narrowed from `.symphony/` to `.symphony/*` with
-  `!.symphony/workflows/`. Workflow definitions are executable code and must be
-  committed and reviewable; runtime state and artifacts stay ignored.
-- Ticket dispatch now also respects a governed run fence, so an issue whose run
-  is waiting on a human gate is not redispatched even though it holds no
-  process lease.
+- **Default board: `Learn` lane renamed to `Document`** (existing boards with
+  a `Learn` lane keep working — the orchestrator, contracts, rewinds, and the
+  skip control all accept the legacy name, and `POST .../skip-learn` stays as
+  a deprecated alias of `POST .../skip-document`).
+- `symphony doctor` **loses two rows** (`viewer.board-viewer` and
+  `workflow_engine`) with the subsystems they checked, and **gains six**:
+  `board.reachable`, `board.deep_merge_contract`, `agent.stage_contracts`,
+  `board.cli`, `board.dependencies`, plus the existing rows. Anything parsing
+  doctor output should expect the new set.
+- `WORKFLOW-PROGRESS.md`'s board URL now points at the orchestrator's
+  `server.port` instead of the removed viewer's `:8765`.
+- **One merge per ticket.** The Verify prompt runs a
+  `git merge-tree --write-tree` preflight and records
+  `## Merge Status: preflight clean, orchestrator will merge at Done`; the
+  orchestrator's `auto_merge_on_done` creates the single `--no-ff` merge
+  commit *after* the Document lane has written its docs and wiki entries.
+  Previously both merged, producing two merge commits per ticket and landing
+  code on the target branch before Document ran.
+- **Document lane write scope** now matches its charter: `docs/llm-wiki/`,
+  the user-facing docs the change touched (README / CHANGELOG / config and
+  policy references), the ticket vault, and ticket comments. Read-only git
+  history inspection (`git log`/`show`/`diff`) is explicitly expected; the
+  commit/branch/push/merge boundary stays.
+- `agent.stage_kinds` is now re-resolved at **every** stage change, including
+  the in-run lane transitions one dispatch walks.
+- The stall budget is resolved from the backend a ticket actually runs on
+  (pin or stage route), not the workflow default.
+
+### Added (hardening)
+
+- `agent.stall_timeout_ms_by_state` — per-lane stall budget for heavy stages.
+- `agent.stage_contracts: auto|on|off` — explicit control of the mechanical
+  evidence floor, with a load-time `stage_contracts_disabled` log line, a
+  doctor row, `agent.stage_contracts_enabled` on `GET /api/v1/workflow`, and
+  a Settings-page hint when a renamed lane turns it off.
+- `symphony board update <id> [--state] [--blocked-by] [--add-blocked-by]
+  [--request]` — the validated write verb the stage prompts already assumed.
+- `SYMPHONY_BOARD_ROOT` / `SYMPHONY_BOARD_ROOT_NAME` / `SYMPHONY_CLI` in the
+  dispatch and hook environments.
+- Ticket frontmatter `last_agent_kind` — audit-only record of the backend
+  that last ran a ticket on a `stage_kinds`-routed board (never a pin).
+- Web board cards render `⛓ blocked by …` and request chips, and both the
+  create modal and the drawer can set `blocked_by` / `request`.
+
+### Fixed
+
+- Board identifiers are validated everywhere (`^[A-Za-z][A-Za-z0-9_-]{0,63}$`):
+  `symphony board new "../../evil"` no longer writes outside the board root.
+- The worktree setup hook links the **configured** `tracker.board_root`
+  instead of a hardcoded `kanban`, and a workspace whose board is not the host
+  board now fails the dispatch with a named error instead of looping forever.
+- Transient backend stream faults (`stream unreadable`, `no result event`)
+  schedule a bounded retry instead of auto-pausing the ticket. Tickets already
+  paused for those reasons self-heal on restart, because
+  `_is_retryable_auto_pause_reason` releases matching persisted pauses.
+- A `blocked_by` id that is not on the board is reported as
+  "blocker X is not on the board" (card + `board.dependencies` doctor row)
+  instead of deadlocking silently.
+- Applying a lane preset on a board without the preset's prompt files now
+  refuses with the `cp -R docs/symphony-prompts` fix instead of writing
+  placeholder prompts and reporting success.
+- Continuous improvement: cadence is stamped only for modes that produced a
+  real result; a `blocked_fixes` source returns to the pipeline once its fix
+  is Done; request ids are unique across the whole board; proposal dedupe no
+  longer collapses two proposals sharing a 60-char title prefix; an agent turn
+  that writes outside its proposal file is discarded and recorded
+  `not_proven`.
+- `scripts/check_i18n.py` understands template-literal key prefixes (it was
+  failing on a clean tree) and now runs in CI and in the test suite.
+
+Suite: 1718 passed, 7 skipped; ruff clean.
 
 ## [0.16.1] - 2026-08-06 - Delivery commits survive the agent's sandbox
 

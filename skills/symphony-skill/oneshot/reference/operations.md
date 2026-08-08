@@ -1,5 +1,13 @@
 # Operations guide
 
+> **Productized as the deep lane preset.** Symphony now ships this pipeline
+> as the built-in 8-lane **deep** preset (`Intake → Research → Plan → Review
+> → Build → QA → Verify → Document`), switchable from the admin UI settings
+> page or `POST /api/v1/workflow/presets/apply`, with prompts under
+> `docs/symphony-prompts/file/deep/`. Prefer the preset for new boards; use
+> this OneShot bundle when you need the standalone single-file template.
+> Where this folder disagrees with shipped behavior, the preset wins.
+
 This file holds operator-facing details that are useful during a OneShot run
 but too bulky for `SKILL.md`.
 

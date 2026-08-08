@@ -3,7 +3,7 @@ tracker:
   kind: linear
   project_slug: my-team-project
   api_key: $LINEAR_API_KEY
-  active_states: [Todo, "In Progress", Verify, Learn]
+  active_states: [Todo, "In Progress", Verify, Document]
   terminal_states: ["Human Review", Done, Blocked, Archive, Closed, Cancelled, Canceled, Duplicate]
   # Auto-archive sweep — terminal-state issues whose `updated_at` is older
   # than `archive_after_days` move to `archive_state` on each poll tick.
@@ -16,7 +16,7 @@ tracker:
     Todo: "Triage; route to In Progress"
     "In Progress": "Plan + TDD implementation + self-critique"
     Verify: "Review + QA + Merge Gate"
-    Learn: "Wiki write-back; Done unless intervention"
+    Document: "Docs + wiki write-back; Done unless intervention"
     "Human Review": "Manual intervention or explicit review before Done"
     Done: "Verified complete"
     Archive: "Auto-archived after 30 days idle"
@@ -38,7 +38,7 @@ hooks:
   # Default: attach the per-ticket workspace as a git worktree of the
   # host repo on a symphony/<ID> branch. The host working tree is never
   # touched while the ticket is active. The default Verify gate merges the
-  # feature branch into the target branch before the ticket can move to Learn.
+  # feature branch into the target branch before the ticket can move to Document.
   # A human later confirms Done from the TUI (`c`) or board viewer.
   #
   # If your code lives in a *different* remote than where WORKFLOW.md
@@ -172,6 +172,12 @@ hooks:
 
 agent:
   kind: codex          # codex | claude | gemini | agy | kiro | opencode | pi
+  # Optional per-state backend routing: cheap/fast agents on light lanes,
+  # the default `kind` everywhere else. Precedence per dispatch:
+  # per-ticket `agent_kind` frontmatter pin > stage_kinds > kind.
+  # stage_kinds:
+  #   Todo: gemini
+  #   Document: gemini
   max_concurrent_agents: 1
   # This is the per-attempt execution cap. In prompt templates,
   # {{ turn_number }}/{{ max_turns }} reports the ticket lifetime position/cap.
@@ -180,14 +186,28 @@ agent:
   # active-state ticket from restarting forever and wasting tokens.
   max_total_turns: 200
   # Hard token ceiling by workflow state. The global cap is the default for
-  # Learn; In Progress and Verify get larger build/verification budgets.
+  # Document; In Progress and Verify get larger build/verification budgets.
   max_total_tokens: 100000000
   max_total_tokens_by_state:
     "In Progress": 500000000
     Verify: 500000000
+  # Per-lane stall budget (ms), falling back to the resolved backend's
+  # `stall_timeout_ms`. Heavy lanes (a Verify that runs a full suite) go quiet
+  # far longer than light ones; widen just that lane instead of every backend.
+  # stall_timeout_ms_by_state:
+  #   Verify: 900000
   budget_exhausted_state: Blocked
-  # Soft cap for Verify/Learn rewinds back into In Progress. Set 0 to disable.
+  # Soft cap for Verify/Document rewinds back into In Progress. Set 0 to disable.
   max_attempts: 3
+  # Mechanical evidence floor (orchestrator/contracts.py):
+  #   auto (default) — enforce only when every active lane is a default-preset
+  #                    lane (Todo / In Progress / Verify / Document). Renaming
+  #                    a lane therefore turns it OFF — logged as
+  #                    `stage_contracts_disabled` and reported by
+  #                    `symphony doctor`, never silent.
+  #   on             — enforce whatever the lanes are called.
+  #   off            — never enforce; the stage prompts are the only gate.
+  stage_contracts: auto
   # Cap on auto-retries scheduled after a worker exits with a non-normal
   # outcome (timeout, crash, transient backend error). On exhaustion the
   # orchestrator stops scheduling further retries, appends an
@@ -204,15 +224,15 @@ agent:
     Todo: 1
     "In Progress": 1
     Verify: 1
-    Learn: 1
+    Document: 1
   # When a ticket reaches Done cleanly, snapshot the workspace into one
   # git commit (`<identifier>: <title>`). If the workspace is nested
   # inside an existing repo, the commit lands there; otherwise `git init`
   # runs first. Set to false if your workspace is an existing repo with
   # strict commit-style rules you don't want auto-touched.
   auto_commit_on_done: true
-  # Merge policy for the Verify -> Learn gate. Verify must merge the
-  # `symphony/<ID>` feature branch into this target before setting Learn.
+  # Merge policy for the Verify -> Document gate. Verify must merge the
+  # `symphony/<ID>` feature branch into this target before setting Document.
   auto_merge_on_done: true
   # Branch/ref used as the start point for new `symphony/<ID>` feature
   # branches. Empty string = current host branch. The board viewer can
@@ -259,7 +279,13 @@ codex:
   stall_timeout_ms: 300000
 
 claude:
-  command: claude -p --output-format stream-json --verbose
+  # `--permission-mode acceptEdits` is required for an unattended worker:
+  # without it every file write waits for an interactive approval that never
+  # arrives, and the ticket looks stalled. `--add-dir` extends Claude Code's
+  # write scope to host directories the `after_create` hook links into the
+  # worktree (a file board's `kanban/`); a Linear board needs no board dir,
+  # but keeping the flag costs nothing if the path does not exist.
+  command: 'claude -p --output-format stream-json --verbose --permission-mode acceptEdits --add-dir "$SYMPHONY_WORKFLOW_DIR"'
   resume_across_turns: true
   turn_timeout_ms: 3600000
   read_timeout_ms: 20000
@@ -344,51 +370,6 @@ server:
 #     icon_emoji: ":robot_face:"
 #     timeout_ms: 5000
 
-# Governed workflow mode — opt-in. Omit this block (or set `enabled: false`)
-# and Symphony behaves exactly as it always has: stage prompts, and the agent
-# moves the ticket between board states itself.
-#
-# When enabled, each ticket run executes a YAML DAG from `directory` instead
-# of the stage loop. The engine — not the model — decides node order, when a
-# node is done, and when the run is finished. Human approval becomes a durable
-# gate that only an explicit `symphony approval resolve` (or the equivalent
-# API call) can clear; moving the card or writing "approved" in a comment does
-# nothing.
-#
-# Workflow files are executable code: they start agents and run shell commands
-# in the ticket workspace. Commit them and review changes the way you review a
-# CI pipeline. `.symphony/artifacts/` holds runtime output and stays out of git.
-#
-# `ticket_state_mapping` is what hands coarse board control to the
-# orchestrator. Omit it entirely to keep the board manual — run progress is
-# still visible in the TUI and web overlay. Every target must be a state your
-# tracker already declares above, or dispatch preflight fails.
-#
-# workflow_engine:
-#   enabled: true
-#   directory: ./.symphony/workflows
-#   artifact_directory: ./.symphony/artifacts
-#   default: ticket-default        # used when a ticket names no workflow
-#   max_parallel_nodes: 1          # service ceiling; a workflow may ask for less
-#   require_explicit_resume: true  # an interrupted run always waits for a human
-#   artifact_retention_days: 30
-#   ticket_state_mapping:
-#     running: "In Progress"
-#     waiting_approval: "Human Review"
-#     succeeded: Done
-#     rejected: Blocked
-#     abandoned: Blocked
-#
-# A single ticket can override the workflow from its own frontmatter:
-#
-#     ---
-#     id: TASK-123
-#     state: Todo
-#     workflow: quick-fix
-#     ---
-#
-# An override naming a workflow that does not exist blocks that ticket and
-# reports the error. It never quietly falls back to the default.
 
 tui:
   language: en               # `en` (default) or `ko`. SYMPHONY_LANG env overrides.
@@ -404,7 +385,7 @@ prompts:
     Todo: ./docs/symphony-prompts/linear/stages/todo.md
     "In Progress": ./docs/symphony-prompts/linear/stages/in-progress.md
     Verify: ./docs/symphony-prompts/linear/stages/verify.md
-    Learn: ./docs/symphony-prompts/linear/stages/learn.md
+    Document: ./docs/symphony-prompts/linear/stages/document.md
     Done: ./docs/symphony-prompts/linear/stages/done.md
 
 ---

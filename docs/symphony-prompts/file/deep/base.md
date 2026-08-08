@@ -1,0 +1,44 @@
+You are picking up ticket {{ issue.identifier }}: {{ issue.title }}.
+Current lane: {{ issue.state }}.
+{% if attempt %}Retry attempt {{ attempt }}. Read the previous `## Resolution` / `## Blocker` / `## Objections` section first; fix the root cause, not the symptom.{% endif %}
+{% if issue.full_ticket_path %}Full ticket: {{ issue.full_ticket_path }}{% endif %}
+
+{% if issue.description %}
+## Description
+
+{{ issue.description }}
+{% endif %}
+
+{% if issue.labels %}Labels: {{ issue.labels | join: ", " }}{% endif %}
+
+{% if issue.blocked_by %}
+This ticket depends on:
+{% for blocker in issue.blocked_by %}- {{ blocker.identifier }} ({{ blocker.state }})
+{% endfor %}
+{% endif %}
+
+## Deep pipeline (8 lanes)
+
+```
+request ticket:   Intake -> Research -> Plan <-> Review -> Done
+                                                    |
+                                    verdict: PASS releases the spawned DAG
+                                                    v
+spawned tickets:                    Build -> QA -> Verify -> Document -> Done
+```
+
+Every lane above is a separate ticket that ends at `Done`. The request ticket
+reaching `Done` (Review's PASS) is what unblocks the spawned Build tickets;
+each spawned ticket then walks its own lane to `Done`. `Done` is intentionally
+unprompted in this preset — the lane gates live in the lane prompts.
+
+- A request ticket walks `Intake -> Research -> Plan -> Review`. Plan spawns the downstream `Build`/`QA`/`Verify`/`Document` tickets as a DAG (`--blocked-by`); Review red-teams the plan before any Build dispatches. Review's `verdict: PASS` moves the request ticket to `Done`, which is what releases the spawned Build tickets.
+- Merge contract: each ticket owns one `symphony/<ID>` branch in its own worktree. **The orchestrator merges a ticket's branch when that ticket reaches `Done` — no lane merges by hand.** Your worktree is cut from the merge target branch, so an earlier slice's code is present only because its ticket already reached `Done`. If you need a slice that is not yet merged, say so in the ticket and set `Blocked`; never cherry-pick or merge another ticket's branch yourself.
+- Vault: `docs/req/{{ issue.request }}/` when this ticket has a `request` group, else `docs/{{ issue.identifier }}/`. Lane outputs (`brief.md`, `research.md`, `plan.md`, `contracts.md`, `claims.md`, `qa-report.md`, `verification.md`, `delivery.md`) live there. `claims.md` and `verification.md` are append-only.
+- `docs/llm-wiki/` is the reusable knowledge base: read `INDEX.md` before broad repo search; Document writes back.
+- Ticket file: `kanban/{{ issue.identifier }}.md`. Transition = edit the frontmatter `state:` field; narrative = append body sections.
+- Honour the hard gate of your lane before closing. Never silence failing tests or invent evidence; use `Not proven` and cite the artifact path for every claim. Fix root cause or set `Blocked`.
+- Use `Human Review` only for a real critical/manual intervention.
+{% if token_budget %}
+- Token budget: keep this turn under {{ token_budget }} completion tokens (stage EMA: {{ token_ema }}).
+{% endif %}

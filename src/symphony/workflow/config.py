@@ -28,9 +28,12 @@ from .constants import (
     DEFAULT_BACKEND_READ_TIMEOUT_MS,
     DEFAULT_BACKEND_STALL_TIMEOUT_MS,
     DEFAULT_BACKEND_TURN_TIMEOUT_MS,
+    CI_MODE_READINESS,
     DEFAULT_CI_INTERVAL_MS,
+    DEFAULT_CI_MAX_IMPROVEMENT_TICKETS_PER_RUN,
     DEFAULT_CI_MAX_TICKETS_PER_RUN,
     DEFAULT_CI_MAX_TURNS,
+    DEFAULT_CI_MODE_INTERVAL_HOURS,
     DEFAULT_CI_TICKET_PREFIX,
     DEFAULT_CODEX_MODEL,
     DEFAULT_CODEX_REASONING_EFFORT,
@@ -40,10 +43,8 @@ from .constants import (
     DEFAULT_MAX_STATE_TURNS,
     DEFAULT_MAX_TOTAL_TURNS,
     DEFAULT_OPENCODE_COMMAND,
-    DEFAULT_WORKFLOW_ARTIFACT_RETENTION_DAYS,
-    DEFAULT_WORKFLOW_MAX_PARALLEL_NODES,
-    DEFAULT_WORKFLOW_NAME,
     DEFAULT_WORKSPACE_REUSE_POLICY,
+    SUPPORTED_CI_MODES,
 )
 
 
@@ -109,7 +110,7 @@ class AgentConfig:
     max_state_turns: int = DEFAULT_MAX_STATE_TURNS
     max_state_turns_by_state: dict[str, int] = field(default_factory=dict)
     no_stage_change_action: str = "block"
-    # Soft cap for Verify/Learn rewinds back into In Progress. 0 disables.
+    # Soft cap for Verify/Document rewinds back into In Progress. 0 disables.
     max_attempts: int = DEFAULT_MAX_ATTEMPTS
     # Cap on auto-retries scheduled after a worker exits with a non-normal
     # outcome (timeout, crash, transient backend error). On exhaustion the
@@ -198,6 +199,65 @@ class AgentConfig:
     # decision survives restart and reaches operators reviewing the
     # board. Must match a state your tracker.kind backend can write to.
     budget_exhausted_state: str = ""
+    # Optional per-state backend routing. Keys are tracker state names
+    # lowercased by the parser (e.g. "research"), values are supported
+    # agent kinds. Lets cheap/fast agents own light lanes (Research,
+    # Document) while a strong default handles heavy ones (Plan, Build,
+    # Review). Resolution order at dispatch: explicit dispatch arg >
+    # per-ticket `agent_kind` frontmatter pin > this map > `kind`.
+    stage_kinds: dict[str, str] = field(default_factory=dict)
+    # Whether the shipped stage-contract validator (the mechanical evidence
+    # floor in `orchestrator/contracts.py`) runs on this board.
+    #   "auto" (default) — on when every active lane is a default-preset lane
+    #                      (Todo / In Progress / Verify / Document, plus the
+    #                      legacy `Learn`), off otherwise. Renaming a lane
+    #                      therefore disables it — which is why the decision
+    #                      is logged, reported by doctor and exposed on the
+    #                      workflow API instead of being silent.
+    #   "on"            — always enforce, whatever the lanes are called.
+    #   "off"           — never enforce; the prompts are the only gate.
+    stage_contracts: str = "auto"
+    # Optional per-state stall budget, in milliseconds. Keys are tracker
+    # state names lowercased by the parser (e.g. "verify"). Heavy lanes
+    # (a Verify that runs a full suite, a Build that compiles) can legally
+    # go quiet far longer than a light lane; without this the operator has
+    # to raise the *backend's* stall_timeout_ms for every lane at once.
+    # Falls back to the resolved backend's `stall_timeout_ms`.
+    stall_timeout_ms_by_state: dict[str, int] = field(default_factory=dict)
+
+    def stage_contracts_enabled(self, active_states: "tuple[str, ...]") -> bool:
+        """Resolve `agent.stage_contracts` against the board's lanes."""
+        from ..orchestrator.contracts import board_uses_default_contracts
+
+        mode = (self.stage_contracts or "auto").strip().lower()
+        if mode == "on":
+            return True
+        if mode == "off":
+            return False
+        return board_uses_default_contracts(active_states)
+
+    def stall_timeout_ms_for_state(self, state: str | None, fallback: int) -> int:
+        """Per-state stall budget with fallback to the backend's value."""
+        value = self.stall_timeout_ms_by_state.get(_normalize_state_key(state or ""))
+        if value is None or value <= 0:
+            return fallback
+        return value
+
+    def kind_for_state(self, state: str | None, ticket_pin: str | None = None) -> str:
+        """Resolve the backend for a dispatch of a ticket in `state`.
+
+        Precedence: ticket pin (`agent_kind` frontmatter) > `stage_kinds`
+        entry for the ticket's state > workflow-level `kind`. Explicit
+        dispatch arguments outrank all three and are applied by callers
+        before reaching this helper.
+        """
+        pin = (ticket_pin or "").strip().lower()
+        if pin:
+            return pin
+        stage = self.stage_kinds.get(_normalize_state_key(state or ""))
+        if stage:
+            return stage
+        return self.kind
 
 
 @dataclass(frozen=True)
@@ -413,7 +473,7 @@ class ContinuousImprovementConfig:
     """Default-off heartbeat that periodically runs product-readiness checks.
 
     Missing `continuous_improvement:` in WORKFLOW.md means disabled with all
-    defaults below. Only `enabled`, `interval_ms`, `max_turns`, and
+    defaults below. Only `enabled`, `interval_ms`, `max_turns`, `modes`, and
     `agent_kind` are settable through the mutation API
     (`set_continuous_improvement_settings`); the remaining fields are
     parse-only from WORKFLOW.md.
@@ -432,40 +492,37 @@ class ContinuousImprovementConfig:
     # "" (default) inherits whatever `agent.kind` the workflow is already
     # configured with.
     agent_kind: str = ""
+    # Experimental improvement modes (SUPPORTED_CI_MODES). Empty means
+    # "readiness only", which is exactly what `enabled: true` did before
+    # modes existed — see `resolved_modes`.
+    modes: tuple[str, ...] = ()
+    # Per-mode cadence floor in hours, overriding
+    # DEFAULT_CI_MODE_INTERVAL_HOURS. 0 = run on every due heartbeat.
+    mode_interval_hours: dict[str, float] = field(default_factory=dict)
+    # Cap on proposal tickets (triage/agent modes) filed by a single run.
+    max_improvement_tickets_per_run: int = (
+        DEFAULT_CI_MAX_IMPROVEMENT_TICKETS_PER_RUN
+    )
 
+    def resolved_modes(self) -> tuple[str, ...]:
+        """Modes this heartbeat should consider, in canonical order.
 
-@dataclass(frozen=True)
-class WorkflowEngineConfig:
-    """Opt-in governed workflow mode (PRD §7.2).
+        Disabled means nothing runs. Enabled with no explicit `modes:`
+        preserves the pre-modes behaviour (readiness only).
+        """
+        if not self.enabled:
+            return ()
+        if not self.modes:
+            return (CI_MODE_READINESS,)
+        return tuple(m for m in SUPPORTED_CI_MODES if m in self.modes)
 
-    A missing `workflow_engine:` section, or `enabled: false`, means the
-    orchestrator keeps using stage prompts and agent-authored ticket
-    transitions exactly as before. Nothing else in this dataclass has any
-    effect until `enabled` is true.
-    """
+    def interval_hours_for(self, mode: str) -> float:
+        """Cadence floor for one mode: explicit override, else the default."""
+        override = self.mode_interval_hours.get(mode)
+        if override is None:
+            return DEFAULT_CI_MODE_INTERVAL_HOURS.get(mode, 0.0)
+        return float(override)
 
-    enabled: bool = False
-    # Where workflow YAML lives, resolved against the WORKFLOW.md directory.
-    directory: Path | None = None
-    # Runtime artifacts (logs, full node output). Gitignored by default.
-    artifact_directory: Path | None = None
-    # Workflow used when a ticket does not name one.
-    default: str = DEFAULT_WORKFLOW_NAME
-    # Service ceiling on concurrent nodes within one ticket. A workflow may
-    # ask for less, never more.
-    max_parallel_nodes: int = DEFAULT_WORKFLOW_MAX_PARALLEL_NODES
-    # When true (the default), an interrupted run waits for an operator
-    # instead of restarting itself. Turning this off is not supported in v1;
-    # the field exists so the config is explicit about the guarantee.
-    require_explicit_resume: bool = True
-    artifact_retention_days: int = DEFAULT_WORKFLOW_ARTIFACT_RETENTION_DAYS
-    # Runtime condition -> tracker state. Empty means the orchestrator makes
-    # no coarse board transitions and only the live overlay reflects the run.
-    ticket_state_mapping: dict[str, str] = field(default_factory=dict)
-
-    def state_for(self, condition: str) -> str | None:
-        """Target tracker state for a runtime condition, if configured."""
-        return self.ticket_state_mapping.get(condition) or None
 
 
 @dataclass(frozen=True)
@@ -493,7 +550,6 @@ class ServiceConfig:
     continuous_improvement: ContinuousImprovementConfig = field(
         default_factory=ContinuousImprovementConfig
     )
-    workflow_engine: WorkflowEngineConfig = field(default_factory=WorkflowEngineConfig)
     raw: dict[str, Any] = field(default_factory=dict)
     prompt_template: str = ""
     workspace_reuse_policy: str = DEFAULT_WORKSPACE_REUSE_POLICY

@@ -5,12 +5,9 @@ Subcommands:
     symphony tui [WORKFLOW]        run orchestrator + Jira-style CLI Kanban TUI
     symphony board ...             file-tracker board helper
     symphony doctor [WORKFLOW]     preflight checks for WORKFLOW.md
-    symphony service ...           managed background orchestrator + viewer
+    symphony service ...           managed background orchestrator
     symphony wiki-sweep ...        scan docs/llm-wiki/ for dup/orphan/stale rows
     symphony runs [WORKFLOW]       recent run-registry attempts
-    symphony workflow ...          list / show / validate workflow definitions
-    symphony run ...               inspect and steer governed workflow runs
-    symphony approval ...          list and resolve human approval gates
 """
 
 from __future__ import annotations
@@ -264,7 +261,7 @@ async def _run(args: argparse.Namespace) -> int:
         )
     else:
         # Surfaces the silent-no-HTTP case so the operator immediately sees
-        # why board-viewer / API consumers can't reach this instance.
+        # why the admin UI / API consumers can't reach this instance.
         # Common cause: `server.port` lives outside frontmatter (embedded
         # `---` fence in a YAML literal truncated the workflow header) —
         # see workflow.parse_workflow_text greedy end detection.
@@ -422,18 +419,6 @@ def main(argv: list[str] | None = None) -> int:
         return _wiki_sweep_main(raw_argv[1:])
     if raw_argv and raw_argv[0] == "runs":
         return _runs_main(raw_argv[1:])
-    if raw_argv and raw_argv[0] == "workflow":
-        from .flow import workflow_main
-
-        return workflow_main(raw_argv[1:])
-    if raw_argv and raw_argv[0] == "run":
-        from .flow import run_main
-
-        return run_main(raw_argv[1:])
-    if raw_argv and raw_argv[0] == "approval":
-        from .flow import approval_main
-
-        return approval_main(raw_argv[1:])
     if raw_argv and raw_argv[0] == "tui":
         # Rewrite `symphony tui [...args]` as `symphony --tui [...args]`.
         raw_argv = ["--tui", *raw_argv[1:]]

@@ -1,5 +1,11 @@
 # Board viewer theming — CSS variable token surface and the three-theme switcher
 
+> **Historical — the subsystem this describes was removed.** `tools/board-viewer/`
+> no longer exists; the built-in admin web app served on `server.port`
+> (`src/symphony/web/static/`) is the only browser board. The CSS-variable
+> token pattern below still describes how that app themes itself, but the
+> file paths and the theme switcher are from the removed viewer.
+
 ## Getting the Feel (For Beginners)
 
 ### Why board-viewer theming exists

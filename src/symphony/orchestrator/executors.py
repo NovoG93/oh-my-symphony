@@ -6,19 +6,10 @@ workspaces, enforcing global concurrency, publishing snapshots, and
 applying terminal policy. What it delegates through this Protocol is only
 the shape of the work *inside* one ticket run.
 
-Two implementations:
-
-- `LegacyStageExecutor` is the behavior that has always existed — stage
-  prompts, agent-authored board transitions, the multi-turn loop in
-  `core._run_agent_attempt`. It delegates rather than duplicating, so
-  introducing the seam moves no legacy code and cannot regress it. That is
-  deliberate: PRD Phase 0's exit criterion is "all current tests pass
-  unchanged", and a 400-line code move is the least safe way to reach it.
-  The DAG logic the PRD wants kept out of `core.py` lives in
-  `symphony.flow`, which is the property that actually mattered.
-
-- `GovernedWorkflowExecutor` runs a compiled DAG. It is selected only when
-  a repository opts in via `workflow_engine.enabled`.
+`LegacyStageExecutor` is the one implementation — stage prompts,
+agent-authored board transitions, the multi-turn loop in
+`core._run_agent_attempt`. It delegates rather than duplicating, so the
+seam moves no legacy code and cannot regress it.
 
 Selection happens once per dispatch, before the worker task is created, so
 a run's execution mode is fixed for its whole lifetime.

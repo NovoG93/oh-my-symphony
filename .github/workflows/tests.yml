@@ -39,6 +39,9 @@ jobs:
       - name: Lint (ruff)
         run: python -m ruff check src tests
 
+      - name: Check SPA translations
+        run: python scripts/check_i18n.py
+
       - name: Type check (pyright)
         run: python -m pyright
 

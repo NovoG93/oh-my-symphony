@@ -8,13 +8,10 @@ import uuid
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import TYPE_CHECKING, Callable, cast
+from typing import Callable, cast
 
 from ..issue import Issue
 from .migrations import LATEST_SCHEMA_VERSION, apply_migrations, current_schema_version
-
-if TYPE_CHECKING:  # pragma: no cover - typing only, avoids an import cycle
-    from .flow_store import GovernedRunStore
 
 
 DEFAULT_LEASE_TTL = timedelta(minutes=5)
@@ -100,7 +97,6 @@ class RunRegistry:
         self._owner_pid = owner_pid if owner_pid is not None else os.getpid()
         self._boot_id = boot_id or uuid.uuid4().hex
         self._applied_migrations: list[int] = []
-        self._governed: "GovernedRunStore | None" = None
         self._ensure_schema()
 
     @property
@@ -117,19 +113,6 @@ class RunRegistry:
 
     def schema_is_current(self) -> bool:
         return self.schema_version() >= LATEST_SCHEMA_VERSION
-
-    @property
-    def governed(self) -> "GovernedRunStore":
-        """Node-level ledger sharing this registry's connection.
-
-        Imported lazily because `flow_store` imports this module's time
-        helpers; a top-level import here would close the cycle.
-        """
-        if self._governed is None:
-            from .flow_store import GovernedRunStore
-
-            self._governed = GovernedRunStore(self._connect)
-        return self._governed
 
     def close(self) -> None:
         if self._conn is not None:

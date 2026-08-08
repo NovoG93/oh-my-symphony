@@ -104,7 +104,7 @@ class KanbanApp(App):
         Binding("L", "toggle_language", "Language"),
         Binding("a", "archive_focused", "Archive"),
         Binding("c", "confirm_done_focused", "Confirm done"),
-        Binding("S", "skip_learn_focused", "Skip Learn"),
+        Binding("S", "skip_document_focused", "Skip Document"),
         Binding("P", "toggle_pause_focused", "Pause/resume"),
         Binding("n", "new_issue", "New issue"),
         Binding("e", "edit_focused", "Edit issue"),
@@ -338,7 +338,7 @@ class KanbanApp(App):
             "1-9 zoom lane · 0/esc reset · "
             f"t/T page lanes ({page}/{total_pages}) · +/- resize window · "
             "d density · p detail-pane · ]/[ focus detail/board · "
-            "L language · a archive · c confirm done · S skip Learn · "
+            "L language · a archive · c confirm done · S skip Document · "
             "P pause/resume · n new · e edit · / filter · "
             "tab focus · j/k scroll · g/G top/bottom · "
             f"lang={lang}"
@@ -615,32 +615,32 @@ class KanbanApp(App):
         self.notify(f"confirmed {issue.identifier} as Done", timeout=2)
         self._kick_tracker_refresh()
 
-    def action_skip_learn_focused(self) -> None:
-        """Move a Learn card to Human Review without running Learn."""
+    def action_skip_document_focused(self) -> None:
+        """Move a Document card to Human Review without running Document."""
         focused = self.focused
         if not isinstance(focused, IssueCard):
             self.notify("focus a card first", timeout=2)
             return
         issue = focused.issue
-        if normalize_state(issue.state) != "learn":
+        if normalize_state(issue.state) not in {"document", "learn"}:
             self.notify(
-                f"only Learn cards can be skipped (state={issue.state})",
+                f"only Document cards can be skipped (state={issue.state})",
                 timeout=3,
             )
             return
         self.run_worker(
-            self._skip_learn_issue(issue),
+            self._skip_document_issue(issue),
             thread=False,
             exclusive=False,
-            group="skip_learn",
+            group="skip_document",
         )
 
-    async def _skip_learn_issue(self, issue: Issue) -> None:
+    async def _skip_document_issue(self, issue: Issue) -> None:
         try:
-            changed, message = await self._orch.skip_learn(issue.identifier)
+            changed, message = await self._orch.skip_document(issue.identifier)
         except Exception as exc:
             log.warning(
-                "tui_skip_learn_failed", identifier=issue.identifier, error=str(exc)
+                "tui_skip_document_failed", identifier=issue.identifier, error=str(exc)
             )
             self.notify(f"skip failed: {exc}", timeout=4, severity="error")
             return

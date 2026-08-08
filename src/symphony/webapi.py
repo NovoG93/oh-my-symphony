@@ -21,6 +21,7 @@ from __future__ import annotations
 import asyncio
 import json
 import re
+from functools import partial
 from datetime import date, datetime
 from pathlib import Path
 from typing import Any, Awaitable, Callable
@@ -30,45 +31,51 @@ from aiohttp import WSCloseCode, WSMsgType, web
 
 from .chat import ChatManager
 from .errors import (
-    ArtifactNotFound,
     ChatBusyError,
     ChatNoSessionError,
     ChatSessionExistsError,
-    RunNotFound,
+    ConfigValidationError,
     SymphonyError,
-    WorkflowDefinitionInvalid,
 )
 from .issue import Issue, registration_order_key
 from .logging import get_logger
 from .skills import normalize_skill_names
 from .stats import StatsStore, stats_store_for
 from .trackers.file import FileBoardTracker, parse_ticket_file
+from .trackers.validate import (
+    IDENTIFIER_RE as _IDENTIFIER_RE,
+    IDENTIFIER_RULE as _IDENTIFIER_RULE,
+    validate_ticket_dependencies,
+)
 from .utils import git_inspect, git_ops
 from .utils.auto_merge import auto_merge_on_done_best_effort
 from .utils.git_ops import GitOpResult
 from .orchestrator import Orchestrator
-
-# The one serializer for an approval record. Imported rather than
-# reimplemented so the shape returned by `GET /api/v1/approvals` cannot
-# drift from the `approvals[]` embedded in `governed_run_detail`.
-from .orchestrator.core import _approval_payload as _governed_approval_payload
 from .orchestrator.run_registry import clamp_run_history_limit
-from .workflow import SUPPORTED_AGENT_KINDS, SYMPHONY_BRANCH_PREFIX, ServiceConfig
+from .workflow import (
+    SUPPORTED_AGENT_KINDS,
+    SUPPORTED_CI_MODES,
+    SYMPHONY_BRANCH_PREFIX,
+    ServiceConfig,
+    validated_ci_modes,
+)
 from .workflow.mutate import (
     StateSpec,
     WorkflowMutationError,
+    apply_lane_preset,
     apply_states_update,
     read_prompt,
     set_branch_policy,
     set_continuous_improvement_settings,
     write_prompt,
 )
+from .workflow.preflight import stage_turn_budget_error
+from .workflow.presets import LANE_PRESETS, get_lane_preset, guess_lane_preset
 
 log = get_logger()
 
 STATIC_DIR = Path(__file__).parent / "web" / "static"
 
-_IDENTIFIER_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_-]{0,63}$")
 _BRANCH_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/-]{0,199}$")
 _COMMIT_RE = re.compile(r"^[0-9a-fA-F]{4,64}$")
 # `ChatManager` mints these as <UTC date>-<UTC time>-<6 hex>.
@@ -78,7 +85,7 @@ _MAX_BODY = 128_000
 _MAX_LABELS = 20
 _ALLOWED_HOSTS = {"localhost", "127.0.0.1", "[::1]"}
 _LOOPBACK_BINDS = {"", "localhost", "127.0.0.1", "::1", "[::1]"}
-_CI_EDITABLE_KEYS = {"enabled", "interval_ms", "max_turns", "agent_kind"}
+_CI_EDITABLE_KEYS = {"enabled", "interval_ms", "max_turns", "agent_kind", "modes"}
 BIND_HOST_KEY: web.AppKey[str] = web.AppKey("symphony.bind_host", str)
 CHAT_MANAGER_KEY: web.AppKey[ChatManager] = web.AppKey("symphony.chat", ChatManager)
 _MAX_CHAT_MESSAGE = 32_000
@@ -162,69 +169,6 @@ def _wrap(handler: Callable[[web.Request], Awaitable[web.Response]]):
     return wrapped
 
 
-class _RegistryUnavailable(SymphonyError):
-    """The governed run ledger could not be opened for this request.
-
-    `Orchestrator.governed_store` raises a bare `SymphonyError` when the
-    SQLite registry is missing or unopenable. That is an availability
-    failure of a dependency, not a bad request and not a bug in this
-    process, so it gets its own code and a 503.
-    """
-
-    code = "registry_unavailable"
-
-
-# `_wrap` collapses every `SymphonyError` to 400, which is right for the
-# board mutations it guards (they all reject bad operator input) and wrong
-# for the governed surface, where "unknown run" and "someone else already
-# decided this gate" are the common cases. Codes absent from this table
-# keep the 400 default.
-_GOVERNED_ERROR_STATUS: dict[str, int] = {
-    # missing
-    "workflow_not_found": 404,
-    "run_not_found": 404,
-    "approval_not_found": 404,
-    "artifact_not_found": 404,
-    # lost a race / illegal move
-    "approval_already_resolved": 409,
-    "approval_version_conflict": 409,
-    "run_fenced": 409,
-    "illegal_run_transition": 409,
-    # caller-fixable input
-    "workflow_invalid": 400,
-    "backend_capability_missing": 400,
-    "run_not_resumable": 400,
-    "unsafe_path": 400,
-    "workspace_integrity_failed": 400,
-    # dependency down
-    "registry_unavailable": 503,
-}
-
-
-def _wrap_governed(handler: Callable[[web.Request], Awaitable[web.StreamResponse]]):
-    """`_wrap`, but with the governed status table applied to the error code."""
-
-    async def wrapped(request: web.Request) -> web.StreamResponse:
-        try:
-            return await handler(request)
-        except web.HTTPException:
-            raise
-        except SymphonyError as exc:
-            return _json_error(
-                _GOVERNED_ERROR_STATUS.get(exc.code, 400), exc.code, exc.message
-            )
-        except Exception as exc:
-            log.warning(
-                "webapi_unhandled_error",
-                path=request.path,
-                method=request.method,
-                error=str(exc),
-            )
-            return _json_error(500, "internal_error", str(exc))
-
-    return wrapped
-
-
 class _Ctx:
     """Per-request access to config, tracker and stats for one board."""
 
@@ -272,6 +216,10 @@ def _issue_card(
         "labels": list(issue.labels),
         "skills": list(issue.skills),
         "agent_kind": issue.agent_kind or "",
+        # Audit stamp on `stage_kinds`-routed boards, where the pin stays
+        # empty on purpose (F-20).
+        "last_agent_kind": issue.last_agent_kind or "",
+        "request": issue.request or "",
         "blocked_by": [
             {"identifier": b.identifier, "state": b.state} for b in issue.blocked_by
         ],
@@ -328,6 +276,13 @@ def _continuous_improvement_payload(cfg: ServiceConfig) -> dict[str, Any]:
         "ticket_prefix": ci.ticket_prefix,
         "max_tickets_per_run": ci.max_tickets_per_run,
         "require_idle_board": ci.require_idle_board,
+        "modes": list(ci.modes),
+        "resolved_modes": list(ci.resolved_modes()),
+        "supported_modes": list(SUPPORTED_CI_MODES),
+        "mode_interval_hours": {
+            mode: ci.interval_hours_for(mode) for mode in SUPPORTED_CI_MODES
+        },
+        "max_improvement_tickets_per_run": ci.max_improvement_tickets_per_run,
     }
 
 
@@ -343,6 +298,12 @@ def _workflow_payload(cfg: ServiceConfig) -> dict[str, Any]:
             "feature_base_branch": cfg.agent.feature_base_branch,
             "auto_merge_target_branch": cfg.agent.auto_merge_target_branch,
             "auto_merge_on_done": cfg.agent.auto_merge_on_done,
+            # F-06: the mechanical evidence floor is lane-name gated by
+            # default, so the UI must be able to say when it is off.
+            "stage_contracts": cfg.agent.stage_contracts,
+            "stage_contracts_enabled": cfg.agent.stage_contracts_enabled(
+                cfg.tracker.active_states
+            ),
         },
         "agent_kinds": sorted(SUPPORTED_AGENT_KINDS),
         "continuous_improvement": _continuous_improvement_payload(cfg),
@@ -383,9 +344,7 @@ def _check_identifier(raw: str) -> str:
     """
     identifier = (raw or "").strip()
     if not _IDENTIFIER_RE.match(identifier):
-        raise WorkflowMutationError(
-            "identifier must match ^[A-Za-z][A-Za-z0-9_-]{0,63}$"
-        )
+        raise WorkflowMutationError(f"identifier must match {_IDENTIFIER_RULE}")
     return identifier
 
 
@@ -444,6 +403,35 @@ def _check_labels(raw: Any) -> list[str]:
     return labels
 
 
+def _check_request(raw: Any) -> str:
+    """Optional request grouping id (e.g. REQ-1); empty string clears."""
+    if raw is None:
+        return ""
+    if not isinstance(raw, str):
+        raise WorkflowMutationError("request must be a string")
+    request = raw.strip()
+    if request and not _IDENTIFIER_RE.match(request):
+        raise WorkflowMutationError(f"request must match {_IDENTIFIER_RULE}")
+    return request
+
+
+def _check_blocked_by(raw: Any) -> list[str]:
+    if raw is None:
+        return []
+    if not isinstance(raw, list):
+        raise WorkflowMutationError("blocked_by must be a list of ticket identifiers")
+    out: list[str] = []
+    for item in raw:
+        if not isinstance(item, str):
+            raise WorkflowMutationError(
+                "blocked_by must be a list of ticket identifiers"
+            )
+        identifier = _check_identifier(item)
+        if identifier not in out:
+            out.append(identifier)
+    return out
+
+
 def _check_agent_kind(raw: Any) -> str:
     if raw is None:
         return ""
@@ -500,11 +488,24 @@ def _parse_ci_settings(body: dict[str, Any]) -> dict[str, Any]:
         updates["max_turns"] = value
     if "agent_kind" in body:
         updates["agent_kind"] = _check_agent_kind(body["agent_kind"])
+    if "modes" in body:
+        updates["modes"] = _check_ci_modes(body["modes"])
     if not updates:
         raise WorkflowMutationError(
-            "body must set enabled, interval_ms, max_turns, and/or agent_kind"
+            "body must set enabled, interval_ms, max_turns, modes, "
+            "and/or agent_kind"
         )
     return updates
+
+
+def _check_ci_modes(raw: Any) -> list[str]:
+    """Improvement modes; `[]` clears back to readiness-only."""
+    if raw is None:
+        return []
+    try:
+        return list(validated_ci_modes(raw))
+    except ConfigValidationError as exc:
+        raise WorkflowMutationError(exc.message) from exc
 
 
 def _check_state(cfg: ServiceConfig, raw: Any) -> str:
@@ -602,6 +603,7 @@ def _register_issue_routes(
             if body.get("state")
             else (cfg.tracker.active_states[0] if cfg.tracker.active_states else "Todo")
         )
+        blocked_by = _check_blocked_by(body.get("blocked_by"))
         fields = {
             "title": title,
             "state": state,
@@ -610,13 +612,26 @@ def _register_issue_routes(
             "description": _check_description(body.get("description")),
             "agent_kind": _check_agent_kind(body.get("agent_kind")) or None,
             "skills": list(normalize_skill_names(body.get("skills") or [])),
+            "blocked_by": blocked_by or None,
+            "request": _check_request(body.get("request")) or None,
         }
+        # F-15: validate and write under the same board lock so concurrent
+        # creates cannot jointly introduce a cycle or race the allocator.
+        def _validate(issues: list[Issue], resolved: str) -> None:
+            validate_ticket_dependencies(
+                issues,
+                identifier=resolved,
+                blocked_by=blocked_by,
+                new_ticket=True,
+            )
+
         raw_identifier = body.get("identifier")
+        prefix = "TASK"
+        identifier_arg: str | None = None
         if raw_identifier:
             if not isinstance(raw_identifier, str):
                 raise WorkflowMutationError("identifier must be a string")
-            identifier = _check_identifier(raw_identifier)
-            await asyncio.to_thread(tracker.create, identifier=identifier, **fields)
+            identifier_arg = _check_identifier(raw_identifier)
         else:
             prefix_raw = body.get("prefix")
             prefix = (
@@ -626,10 +641,15 @@ def _register_issue_routes(
             )
             if not re.match(r"^[A-Za-z][A-Za-z0-9]{0,15}$", prefix):
                 raise WorkflowMutationError("prefix must be 1-16 alphanumeric chars")
-
-            identifier, _ = await asyncio.to_thread(
-                tracker.create_with_next_identifier, prefix, **fields
+        identifier, _ = await asyncio.to_thread(
+            partial(
+                tracker.create_validated,
+                identifier=identifier_arg,
+                prefix=prefix,
+                validate=_validate,
+                **fields,
             )
+        )
         await asyncio.to_thread(
             ctx.stats().record_transition,
             issue=identifier,
@@ -693,6 +713,19 @@ def _register_issue_routes(
             ]
         if "agent_kind" in body:
             fields["agent_kind"] = _check_agent_kind(body.get("agent_kind"))
+        if "request" in body:
+            fields["request"] = _check_request(body.get("request"))
+        if "blocked_by" in body:
+            blocked_by = _check_blocked_by(body.get("blocked_by"))
+            await asyncio.to_thread(
+                lambda: validate_ticket_dependencies(
+                    tracker.scan_all(),
+                    identifier=identifier,
+                    blocked_by=blocked_by,
+                    new_ticket=False,
+                )
+            )
+            fields["blocked_by"] = blocked_by
         new_state: str | None = None
         if "state" in body:
             new_state = _check_state(cfg, body.get("state"))
@@ -761,12 +794,12 @@ def _register_issue_routes(
         orchestrator.request_refresh()
         return web.json_response({"identifier": identifier, "deleted": True})
 
-    async def handle_issue_skip_learn(request: web.Request) -> web.Response:
+    async def handle_issue_skip_document(request: web.Request) -> web.Response:
         identifier = _check_identifier(request.match_info["identifier"])
-        changed, message = await orchestrator.skip_learn(identifier)
+        changed, message = await orchestrator.skip_document(identifier)
         if not changed:
             status = 404 if message.startswith("unknown issue") else 409
-            return _json_error(status, "learn_skip_rejected", message)
+            return _json_error(status, "document_skip_rejected", message)
         return web.json_response(
             {"identifier": identifier, "skipped": True, "message": message}
         )
@@ -782,7 +815,11 @@ def _register_issue_routes(
     )
     app.router.add_delete("/api/v1/issues/{identifier}", _wrap(handle_issue_delete))
     app.router.add_post(
-        "/api/v1/issues/{identifier}/skip-learn", _wrap(handle_issue_skip_learn)
+        "/api/v1/issues/{identifier}/skip-document", _wrap(handle_issue_skip_document)
+    )
+    # Deprecated alias — lane renamed Learn -> Document; old scripts keep working.
+    app.router.add_post(
+        "/api/v1/issues/{identifier}/skip-learn", _wrap(handle_issue_skip_document)
     )
 
 
@@ -899,6 +936,85 @@ def _register_workflow_routes(
         orchestrator.workflow_state.reload()
         return web.json_response({"updated": sorted(updates)})
 
+    async def handle_lane_presets_get(_request: web.Request) -> web.Response:
+        cfg = ctx.config()
+        return web.json_response(
+            {
+                "presets": [
+                    {
+                        "name": preset.name,
+                        "label": preset.label,
+                        "active_states": list(preset.active_states),
+                        "terminal_states": list(preset.terminal_states),
+                    }
+                    for preset in LANE_PRESETS.values()
+                ],
+                "current": guess_lane_preset(cfg.tracker.active_states),
+            }
+        )
+
+    async def handle_lane_preset_apply(request: web.Request) -> web.Response:
+        body = await _read_json(request)
+        name = body.get("name")
+        if not isinstance(name, str) or not name.strip():
+            raise WorkflowMutationError("body must contain string `name`")
+        try:
+            preset = get_lane_preset(name)
+        except ValueError as exc:
+            raise WorkflowMutationError(str(exc)) from exc
+        cfg = ctx.config()
+        tracker = ctx.file_tracker()
+        # Same guard as handle_states_put: a running worker owns its
+        # ticket's state string — refuse to pull a lane out from under it.
+        preset_active = {s.lower() for s in preset.active_states}
+        for issue in orchestrator.iter_running_issues():
+            if issue.state.lower() not in preset_active:
+                return _json_error(
+                    409,
+                    "state_in_use",
+                    f"column {issue.state!r} has a running worker; "
+                    "wait or pause first",
+                )
+
+        plan = await asyncio.to_thread(apply_lane_preset, cfg.workflow_path, name)
+        migrated: dict[str, str] = {}
+        skipped: list[str] = []
+        for old in plan.removed:
+            for issue in await asyncio.to_thread(
+                tracker.fetch_issues_by_states, [old]
+            ):
+                if orchestrator.find_running_issue_id(issue.identifier) is not None:
+                    skipped.append(issue.identifier)
+                    continue
+                await asyncio.to_thread(
+                    tracker.transition, issue.identifier, plan.fallback_state
+                )
+                migrated[issue.identifier] = plan.fallback_state
+        orchestrator.workflow_state.reload()
+        orchestrator.request_refresh()
+        # F-23: an 8-lane preset needs `agent.max_turns >= len(active_states)`
+        # or the very next dispatch fails preflight. Report it in the response
+        # instead of letting the operator discover it at run time.
+        reloaded = orchestrator.workflow_state.current()
+        warning = (
+            stage_turn_budget_error(reloaded) if reloaded is not None else None
+        )
+        if warning:
+            log.warning(
+                "lane_preset_turn_budget_warning", preset=preset.name, detail=warning
+            )
+        return web.json_response(
+            {
+                "applied": preset.name,
+                "added": plan.added,
+                "removed": plan.removed,
+                "migrated": migrated,
+                "skipped_running": skipped,
+                "fallback_state": plan.fallback_state,
+                "warning": warning,
+            }
+        )
+
     async def handle_continuous_improvement_put(
         request: web.Request,
     ) -> web.Response:
@@ -912,6 +1028,7 @@ def _register_workflow_routes(
             interval_ms=updates.get("interval_ms"),
             max_turns=updates.get("max_turns"),
             agent_kind=updates.get("agent_kind"),
+            modes=updates.get("modes"),
         )
         new_cfg, err = orchestrator.workflow_state.reload()
         if new_cfg is None:
@@ -944,6 +1061,10 @@ def _register_workflow_routes(
     app.router.add_get("/api/v1/workflow/prompts/{state}", _wrap(handle_prompt_get))
     app.router.add_put("/api/v1/workflow/prompts/{state}", _wrap(handle_prompt_put))
     app.router.add_put("/api/v1/workflow/branch-policy", _wrap(handle_branch_policy_put))
+    app.router.add_get("/api/v1/workflow/presets", _wrap(handle_lane_presets_get))
+    app.router.add_post(
+        "/api/v1/workflow/presets/apply", _wrap(handle_lane_preset_apply)
+    )
     app.router.add_put(
         "/api/v1/workflow/continuous-improvement",
         _wrap(handle_continuous_improvement_put),
@@ -1438,398 +1559,6 @@ def _register_git_routes(
 
 
 # ---------------------------------------------------------------------------
-# routes: governed workflow engine (PRD §16)
-# ---------------------------------------------------------------------------
-
-
-_APPROVAL_DECISIONS = ("approved", "rejected")
-_MAX_EVENT_PAGE = 2000
-_MAX_APPROVAL_COMMENT = 4096
-_MAX_ABANDON_REASON = 500
-
-
-def _governed_diagnostics(exc: WorkflowDefinitionInvalid) -> list[dict[str, Any]]:
-    """Diagnostics as JSON, always at least one entry.
-
-    `WorkflowDefinitionInvalid` carries a `diagnostics` tuple for field and
-    DAG failures but an empty one for whole-file failures (over the size
-    limit, unreadable YAML preamble). The editor needs something to render
-    either way, so the summary message becomes a file-level diagnostic.
-    """
-    raw = exc.context.get("diagnostics") or ()
-    source = exc.context.get("source")
-    rendered = [
-        {
-            "path": getattr(diag, "path", ""),
-            "message": getattr(diag, "message", str(diag)),
-            "line": getattr(diag, "line", None),
-            "rendered": diag.render()
-            if hasattr(diag, "render")
-            else str(diag),
-        }
-        for diag in raw  # type: ignore[union-attr]
-    ]
-    if not rendered:
-        rendered = [
-            {
-                "path": "",
-                "message": exc.message,
-                "line": None,
-                "rendered": exc.message,
-            }
-        ]
-    if source:
-        for item in rendered:
-            item.setdefault("source", str(source))
-    return rendered
-
-
-def _bounded_int(raw: str | None, default: int, *, low: int, high: int) -> int:
-    try:
-        value = int(raw) if raw not in (None, "") else default
-    except (TypeError, ValueError):
-        value = default
-    return max(low, min(value, high))
-
-
-def _register_governed_routes(
-    app: web.Application, ctx: _Ctx, orchestrator: Orchestrator
-) -> None:
-    def store(cfg: ServiceConfig):
-        """Governed ledger, with an unopenable registry surfaced as 503."""
-        try:
-            return orchestrator.governed_store(cfg)
-        except _RegistryUnavailable:
-            raise
-        except SymphonyError as exc:
-            raise _RegistryUnavailable(exc.message) from exc
-
-    def loader(cfg: ServiceConfig):
-        try:
-            return orchestrator.governed_loader(cfg)
-        except SymphonyError as exc:
-            raise _RegistryUnavailable(exc.message) from exc
-
-    def artifacts(cfg: ServiceConfig):
-        try:
-            return orchestrator.governed_artifacts(cfg)
-        except SymphonyError as exc:
-            raise _RegistryUnavailable(exc.message) from exc
-
-    def require_run(cfg: ServiceConfig, run_id: str):
-        record = store(cfg).get_governed_run(run_id)
-        if record is None:
-            raise RunNotFound("unknown governed run", run_id=run_id)
-        return record
-
-    # --- workflow definitions ---------------------------------------------
-    #
-    # Readable whether or not `workflow_engine.enabled` is set: enabling the
-    # engine on a board whose YAML has never been validated is exactly the
-    # mistake this endpoint exists to prevent.
-
-    async def handle_workflows_list(_request: web.Request) -> web.Response:
-        cfg = ctx.config()
-        engine = cfg.workflow_engine
-        entries = loader(cfg).list_workflows()
-        return web.json_response(
-            {
-                "enabled": engine.enabled,
-                "directory": str(engine.directory) if engine.directory else None,
-                "default": engine.default,
-                "workflows": [entry.to_json() for entry in entries],
-                "count": len(entries),
-            }
-        )
-
-    async def handle_workflow_detail(request: web.Request) -> web.Response:
-        cfg = ctx.config()
-        # `path_for` owns name validation: a name with a separator or a
-        # leading dot is reported as "no such workflow", never opened.
-        compiled = loader(cfg).load(request.match_info["name"])
-        return web.json_response(compiled.to_json())
-
-    async def handle_workflow_validate(request: web.Request) -> web.Response:
-        cfg = ctx.config()
-        body = await _read_json(request)
-        content = body.get("content")
-        if not isinstance(content, str):
-            return _json_error(400, "invalid_content", "content must be a string")
-        raw_name = body.get("name")
-        if raw_name is not None and not isinstance(raw_name, str):
-            return _json_error(400, "invalid_name", "name must be a string")
-        name = (raw_name or "").strip()
-        if name and ("/" in name or "\\" in name or name.startswith(".")):
-            return _json_error(
-                400, "invalid_name", "name must be a plain file stem"
-            )
-        flow_loader = loader(cfg)
-        stem = name or "unsaved"
-        source_path = flow_loader.directory / f"{stem}.yaml"
-        try:
-            compiled = flow_loader.compile_text(content, source_path=source_path)
-        except WorkflowDefinitionInvalid as exc:
-            # 200: "this text is invalid" is the answer to the question the
-            # editor asked, not a failure of the request.
-            return web.json_response(
-                {
-                    "valid": False,
-                    "name": name or None,
-                    "message": exc.message,
-                    "diagnostics": _governed_diagnostics(exc),
-                }
-            )
-        if name and compiled.name != name:
-            # `WorkflowLoader.load` refuses this file, so accepting it here
-            # would let an operator save YAML the engine then cannot load.
-            return web.json_response(
-                {
-                    "valid": False,
-                    "name": name,
-                    "message": (
-                        f"workflow declares name {compiled.name!r}; the file "
-                        f"stem {name!r} must match"
-                    ),
-                    "diagnostics": [
-                        {
-                            "path": "name",
-                            "message": (
-                                f"must be {name!r} to match the file stem, "
-                                f"got {compiled.name!r}"
-                            ),
-                            "line": None,
-                            "rendered": f"[name] must be {name!r}",
-                        }
-                    ],
-                }
-            )
-        return web.json_response(
-            {
-                "valid": True,
-                "name": compiled.name,
-                "diagnostics": [],
-                "workflow": compiled.to_json(),
-            }
-        )
-
-    # --- runs --------------------------------------------------------------
-
-    async def handle_run_detail(request: web.Request) -> web.Response:
-        cfg = ctx.config()
-        store(cfg)  # 503 rather than 500 when the ledger is unopenable
-        return web.json_response(
-            orchestrator.governed_run_detail(cfg, request.match_info["run_id"])
-        )
-
-    async def handle_run_events(request: web.Request) -> web.Response:
-        cfg = ctx.config()
-        run_id = request.match_info["run_id"]
-        require_run(cfg, run_id)
-        after_seq = _bounded_int(
-            request.query.get("after_seq"), 0, low=0, high=2**53
-        )
-        limit = _bounded_int(
-            request.query.get("limit"), 200, low=1, high=_MAX_EVENT_PAGE
-        )
-        events = store(cfg).events_after(run_id, after_seq=after_seq, limit=limit)
-        return web.json_response(
-            {
-                "run_id": run_id,
-                "after_seq": after_seq,
-                # Where the next poll should start. Echoing the request when
-                # the page is empty keeps a tailing client from rewinding.
-                "next_after_seq": events[-1].seq if events else after_seq,
-                "events": [
-                    {
-                        "seq": event.seq,
-                        "node_id": event.node_id,
-                        "type": event.type,
-                        "created_at": event.created_at.isoformat()
-                        if event.created_at
-                        else None,
-                        "payload": _json_safe(event.payload),
-                    }
-                    for event in events
-                ],
-                "count": len(events),
-            }
-        )
-
-    async def handle_run_artifacts(request: web.Request) -> web.Response:
-        cfg = ctx.config()
-        run_id = request.match_info["run_id"]
-        store(cfg)  # 503 rather than 500 when the ledger is unopenable
-        detail = orchestrator.governed_run_detail(cfg, run_id)
-        return web.json_response(
-            {
-                "run_id": run_id,
-                "artifacts": detail["artifacts"],
-                "count": len(detail["artifacts"]),
-            }
-        )
-
-    async def handle_artifact_download(request: web.Request) -> web.StreamResponse:
-        cfg = ctx.config()
-        artifact_id = request.match_info["artifact_id"]
-        # Only the recorded relative path is ever resolved — the caller
-        # names a row, never a path, so there is nothing to traverse with.
-        record = store(cfg).get_artifact(artifact_id)
-        if record is None:
-            raise ArtifactNotFound("unknown artifact", artifact_id=artifact_id)
-        if record.payload_expired_at is not None:
-            raise ArtifactNotFound(
-                "artifact payload was removed by retention",
-                artifact_id=artifact_id,
-            )
-        path = artifacts(cfg).resolve(record.relative_path)
-        filename = Path(record.relative_path).name.replace('"', "")
-        return web.FileResponse(
-            path,
-            headers={
-                # Artifacts hold verbatim agent output. Forcing a download
-                # and disabling sniffing keeps an HTML transcript from
-                # executing as same-origin script against the operator UI.
-                "Content-Type": record.media_type or "application/octet-stream",
-                "Content-Disposition": f'attachment; filename="{filename}"',
-                "X-Content-Type-Options": "nosniff",
-            },
-        )
-
-    async def handle_run_resume(request: web.Request) -> web.Response:
-        cfg = ctx.config()
-        run_id = request.match_info["run_id"]
-        require_run(cfg, run_id)
-        return web.json_response(await orchestrator.resume_governed_run(cfg, run_id))
-
-    async def handle_run_abandon(request: web.Request) -> web.Response:
-        cfg = ctx.config()
-        run_id = request.match_info["run_id"]
-        body = await _read_json(request)
-        raw_reason = body.get("reason")
-        if raw_reason is not None and not isinstance(raw_reason, str):
-            return _json_error(400, "invalid_reason", "reason must be a string")
-        reason = (raw_reason or "").strip()[:_MAX_ABANDON_REASON] or "operator_abandon"
-        require_run(cfg, run_id)
-        return web.json_response(
-            orchestrator.abandon_governed_run(cfg, run_id, reason=reason)
-        )
-
-    async def handle_run_start_fresh(request: web.Request) -> web.Response:
-        """Abandon this run so the ticket dispatches anew (PRD §10.4).
-
-        The response is the *abandoned* run, not a new one. Releasing the
-        fence is the whole action; the replacement run is created by the
-        ordinary dispatch path on the next poll tick, which is what makes
-        it pick up the current workflow definition.
-        """
-        cfg = ctx.config()
-        run_id = request.match_info["run_id"]
-        require_run(cfg, run_id)
-        return web.json_response(orchestrator.start_fresh_governed_run(cfg, run_id))
-
-    async def handle_run_cancel(request: web.Request) -> web.Response:
-        cfg = ctx.config()
-        run_id = request.match_info["run_id"]
-        store(cfg)
-        return web.json_response(orchestrator.cancel_governed_run(cfg, run_id))
-
-    # --- approvals ---------------------------------------------------------
-
-    async def handle_approvals_list(request: web.Request) -> web.Response:
-        cfg = ctx.config()
-        governed = store(cfg)
-        status = (request.query.get("status") or "").strip() or None
-        records = governed.list_approvals(
-            status=status, run_id=request.query.get("run_id") or None
-        )
-        items: list[dict[str, Any]] = []
-        for record in records:
-            payload = _governed_approval_payload(record)
-            # An approvals inbox is useless without the ticket it belongs
-            # to; the approval row itself only knows its run.
-            run = governed.get_governed_run(record.run_id)
-            payload["identifier"] = run.identifier if run else None
-            payload["workflow_name"] = run.workflow_name if run else None
-            items.append(payload)
-        return web.json_response(
-            {"status": status, "approvals": items, "count": len(items)}
-        )
-
-    async def handle_approval_resolve(request: web.Request) -> web.Response:
-        cfg = ctx.config()
-        approval_id = request.match_info["approval_id"]
-        body = await _read_json(request)
-        decision = body.get("decision")
-        # Exact match only. Nothing else in the body may imply a decision —
-        # an approval must be something the operator typed, not something a
-        # missing or misspelled field defaulted into.
-        if decision not in _APPROVAL_DECISIONS:
-            return _json_error(
-                400,
-                "invalid_decision",
-                "decision must be exactly 'approved' or 'rejected'",
-            )
-        expected_version = body.get("expected_version")
-        if expected_version is not None and (
-            isinstance(expected_version, bool) or not isinstance(expected_version, int)
-        ):
-            return _json_error(
-                400, "invalid_expected_version", "expected_version must be an integer"
-            )
-        actor = body.get("actor")
-        if actor is not None and not isinstance(actor, str):
-            return _json_error(400, "invalid_actor", "actor must be a string")
-        comment = body.get("comment")
-        if comment is not None and not isinstance(comment, str):
-            return _json_error(400, "invalid_comment", "comment must be a string")
-        store(cfg)
-        payload = orchestrator.resolve_governed_approval(
-            cfg,
-            approval_id,
-            decision=decision,
-            expected_version=expected_version,
-            actor=(actor or "").strip() or None,
-            source="web",
-            comment=(comment[:_MAX_APPROVAL_COMMENT] if comment else None),
-        )
-        return web.json_response(payload)
-
-    # Registered here — inside `register_web_routes` — so these named paths
-    # resolve before `server.build_app` adds its `/api/v1/{identifier}`
-    # catch-alls, which would otherwise swallow `GET /api/v1/workflows`.
-    app.router.add_get("/api/v1/workflows", _wrap_governed(handle_workflows_list))
-    app.router.add_post(
-        "/api/v1/workflows/validate", _wrap_governed(handle_workflow_validate)
-    )
-    app.router.add_get(
-        "/api/v1/workflows/{name}", _wrap_governed(handle_workflow_detail)
-    )
-    app.router.add_get("/api/v1/runs/{run_id}", _wrap_governed(handle_run_detail))
-    app.router.add_get(
-        "/api/v1/runs/{run_id}/events", _wrap_governed(handle_run_events)
-    )
-    app.router.add_get(
-        "/api/v1/runs/{run_id}/artifacts", _wrap_governed(handle_run_artifacts)
-    )
-    app.router.add_get(
-        "/api/v1/artifacts/{artifact_id}", _wrap_governed(handle_artifact_download)
-    )
-    app.router.add_post("/api/v1/runs/{run_id}/resume", _wrap_governed(handle_run_resume))
-    app.router.add_post(
-        "/api/v1/runs/{run_id}/abandon", _wrap_governed(handle_run_abandon)
-    )
-    app.router.add_post(
-        "/api/v1/runs/{run_id}/start-fresh", _wrap_governed(handle_run_start_fresh)
-    )
-    app.router.add_post("/api/v1/runs/{run_id}/cancel", _wrap_governed(handle_run_cancel))
-    app.router.add_get("/api/v1/approvals", _wrap_governed(handle_approvals_list))
-    app.router.add_post(
-        "/api/v1/approvals/{approval_id}/resolve",
-        _wrap_governed(handle_approval_resolve),
-    )
-
-
-# ---------------------------------------------------------------------------
 # routes: operator chat (REST mutations + one-way WebSocket stream)
 # ---------------------------------------------------------------------------
 
@@ -2129,7 +1858,6 @@ def register_web_routes(app: web.Application, orchestrator: Orchestrator) -> Non
     app.middlewares.append(_api_guard)
     _register_issue_routes(app, ctx, orchestrator)
     _register_workflow_routes(app, ctx, orchestrator)
-    _register_governed_routes(app, ctx, orchestrator)
     _register_git_routes(app, ctx, orchestrator)
     _register_chat_routes(app, ctx, orchestrator)
     _register_meta_routes(app, ctx, orchestrator)

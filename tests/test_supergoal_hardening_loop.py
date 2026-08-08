@@ -2,7 +2,7 @@
 
 Where the per-gate unit tests in ``test_orchestrator_contracts.py`` probe
 each new gate in isolation, this file walks ONE bug ticket (``BUG-7``)
-through Verify -> In Progress and Learn -> In Progress rewinds.
+through Verify -> In Progress and Document -> In Progress rewinds.
 
 The idiom matches the contract unit tests: drive ``evaluate_contract``
 directly with crafted ticket bodies and a ``docs_root = tmp_path / "docs"``,
@@ -15,7 +15,7 @@ The narrative:
    ``reproduce/`` dir be answered with ``qa/repro-after.log`` — without it
    Verify rewinds naming the missing log. Once the re-run log is saved,
    Verify passes on valid evidence + scorecard.
-2. Learn can rewind only when it records a real defect back to In Progress.
+2. Document can rewind only when it records a real defect back to In Progress.
 """
 
 from __future__ import annotations
@@ -133,5 +133,7 @@ def test_verify_bug_repro_closed_passes(tmp_path: Path) -> None:
 
 def test_loop_rewind_transitions_are_recognised() -> None:
     assert _is_rewind_transition("verify", "in progress") is True
+    assert _is_rewind_transition("document", "in progress") is True
+    # Legacy lane name (pre-rename boards).
     assert _is_rewind_transition("learn", "in progress") is True
     assert _is_rewind_transition("in progress", "verify") is False

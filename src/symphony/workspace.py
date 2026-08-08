@@ -13,7 +13,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from ._shell import resolve_bash
-from .errors import InvalidWorkspaceCwd, SymphonyError
+from .errors import InvalidWorkspaceCwd, SymphonyError, WorkspaceBoardUnreachable
 from .issue import workspace_key
 from .logging import get_logger
 from .utils.git_sandbox import (
@@ -186,8 +186,55 @@ class WorkspaceManager:
                         )
                 raise
 
+        self._enforce_board_reachable(path)
         self._write_workspace_owner_marker(key)
         return Workspace(path=path, workspace_key=key, created_now=created_now)
+
+    def _board_link_name(self) -> str | None:
+        """Board root relative to the workflow dir, or None when outside it."""
+        if self._board_root is None or self._workflow_dir is None:
+            return None
+        try:
+            relative = self._board_root.resolve().relative_to(
+                self._workflow_dir.resolve()
+            )
+        except (ValueError, OSError):
+            return None
+        text = relative.as_posix()
+        return text or None
+
+    def _enforce_board_reachable(self, path: Path) -> None:
+        """Fail the dispatch when the workspace board is not the host board.
+
+        A workspace whose `<board>` entry is a real directory (link fallback
+        on Windows, stale copy, wrong `board_root`) swallows every ticket
+        write the agent makes: the orchestrator keeps reading the host board,
+        never sees the transition, and re-dispatches forever. Catching it here
+        costs one `resolve()` and turns a silent money-burning loop into a
+        named error before the first turn.
+        """
+        name = self._board_link_name()
+        if name is None or self._board_root is None:
+            return
+        linked = path / name
+        if not linked.exists():
+            if self._hooks.after_create:
+                log.warning(
+                    "workspace_board_link_missing",
+                    workspace=str(linked),
+                    host_board=str(self._board_root),
+                )
+            return
+        try:
+            same = linked.resolve() == self._board_root.resolve()
+        except OSError:  # pragma: no cover - resolve on a broken link
+            same = False
+        if not same:
+            raise WorkspaceBoardUnreachable(
+                "workspace board is not the host board",
+                workspace=str(linked),
+                host_board=str(self._board_root),
+            )
 
     async def before_run(self, path: Path) -> None:
         if self._hooks.before_run:

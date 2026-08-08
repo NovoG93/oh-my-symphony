@@ -28,9 +28,13 @@ from pathlib import Path
 from typing import Callable
 
 
-# Schema version that first carries governed-workflow tables. Upgrading a
-# populated database across this line takes a backup first (PRD §14.8).
-FIRST_GOVERNED_WORKFLOW_VERSION = 2
+# Schema version that first carries the (now inert) flow-engine tables.
+# Upgrading a populated database across this line takes a backup first.
+# The flow engine itself was removed; the constant survives because the
+# backup rule is keyed to the version, not to the feature.
+FIRST_LEGACY_FLOW_TABLE_VERSION = 2
+# Back-compat alias for anything still importing the old name.
+FIRST_GOVERNED_WORKFLOW_VERSION = FIRST_LEGACY_FLOW_TABLE_VERSION
 
 
 @dataclass(frozen=True)
@@ -114,12 +118,20 @@ def _migrate_001_baseline(conn: sqlite3.Connection) -> None:
     _add_column_if_missing(conn, "issue_flags", "pause_reason", "TEXT")
 
 
-def _migrate_002_governed_workflow(conn: sqlite3.Connection) -> None:
-    """Node-level execution ledger for governed workflow runs (PRD §14).
+def _migrate_002_legacy_flow_tables(conn: sqlite3.Connection) -> None:
+    """INERT: node-level execution ledger for the removed flow engine.
+
+    The governed flow engine (`symphony/flow/**`) is gone and nothing in
+    `src/` reads `workflow_snapshots`, `node_runs`, `approvals`, `artifacts`
+    or the three extra `runs` columns any more. The migration stays exactly
+    as it was so an existing `.symphony/state.db` keeps reporting schema
+    version 2 and the upgrade chain stays valid; a future migration may drop
+    the tables once every deployed database has crossed this line.
 
     Everything here is additive. `runs.status` keeps its lease/history
-    meaning; governed state lives in the separate `execution_status` column
-    so an older binary reading this database still sees valid lease rows.
+    meaning; the legacy execution state lives in the separate
+    `execution_status` column, so an older binary reading this database
+    still sees valid lease rows.
     """
     _add_column_if_missing(conn, "runs", "execution_mode", "TEXT")
     _add_column_if_missing(conn, "runs", "execution_status", "TEXT")
@@ -279,7 +291,9 @@ def _migrate_002_governed_workflow(conn: sqlite3.Connection) -> None:
 
 MIGRATIONS: tuple[Migration, ...] = (
     Migration(1, "baseline_runs_and_issue_flags", _migrate_001_baseline),
-    Migration(2, "governed_workflow_ledger", _migrate_002_governed_workflow),
+    # The recorded name stays "governed_workflow_ledger" so existing
+    # `schema_migrations` rows keep matching; the tables it creates are inert.
+    Migration(2, "governed_workflow_ledger", _migrate_002_legacy_flow_tables),
 )
 
 LATEST_SCHEMA_VERSION = MIGRATIONS[-1].version
@@ -331,10 +345,10 @@ def apply_migrations(conn: sqlite3.Connection, path: Path) -> list[int]:
 
     # Only worth backing up a database that already holds run history; a
     # database still at version 0 with no rows has nothing to lose.
-    crosses_governed_line = version < FIRST_GOVERNED_WORKFLOW_VERSION <= max(
+    crosses_backup_line = version < FIRST_LEGACY_FLOW_TABLE_VERSION <= max(
         m.version for m in pending
     )
-    if crosses_governed_line and _has_existing_runs(conn):
+    if crosses_backup_line and _has_existing_runs(conn):
         backup_database(conn, path)
 
     for migration in pending:

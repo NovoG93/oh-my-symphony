@@ -9,7 +9,7 @@ endpoints below predate the web app and remain for scripts and the TUI:
     POST /api/v1/refresh         — trigger immediate poll/reconcile
     POST /api/v1/<id>/pause|resume
     POST /api/v1/<id>/recover-blocked
-    POST /api/v1/<id>/skip-learn
+    POST /api/v1/<id>/skip-document  (deprecated alias: /skip-learn)
 """
 
 from __future__ import annotations
@@ -101,12 +101,12 @@ def build_app(orchestrator: Orchestrator) -> web.Application:
             }
         )
 
-    async def handle_skip_learn(request: web.Request) -> web.Response:
+    async def handle_skip_document(request: web.Request) -> web.Response:
         identifier = request.match_info.get("identifier", "")
-        changed, message = await orchestrator.skip_learn(identifier)
+        changed, message = await orchestrator.skip_document(identifier)
         if not changed:
             status = 404 if message.startswith("unknown issue") else 409
-            return _error_response(status, "learn_skip_rejected", message)
+            return _error_response(status, "document_skip_rejected", message)
         return web.json_response(
             {
                 "issue_identifier": identifier,
@@ -192,7 +192,9 @@ def build_app(orchestrator: Orchestrator) -> web.Application:
     app.router.add_post("/api/v1/{identifier}/pause", handle_pause)
     app.router.add_post("/api/v1/{identifier}/resume", handle_resume)
     app.router.add_post("/api/v1/{identifier}/recover-blocked", handle_recover_blocked)
-    app.router.add_post("/api/v1/{identifier}/skip-learn", handle_skip_learn)
+    app.router.add_post("/api/v1/{identifier}/skip-document", handle_skip_document)
+    # Deprecated alias — lane renamed Learn -> Document; old scripts keep working.
+    app.router.add_post("/api/v1/{identifier}/skip-learn", handle_skip_document)
     app.router.add_get("/api/v1/{identifier}", handle_issue)
 
     return app

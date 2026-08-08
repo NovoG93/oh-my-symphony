@@ -22,13 +22,15 @@ import asyncio
 import json
 import os
 import re
+import subprocess
 import time
 import traceback
 from dataclasses import dataclass, replace
 from datetime import datetime, timedelta, timezone
 from enum import Enum
+from functools import partial
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Awaitable, Callable, Coroutine
+from typing import Any, Awaitable, Callable, Coroutine
 
 from .. import __version__
 from .._shell import kill_process_group
@@ -44,11 +46,10 @@ from ..backends import (
     BackendInit,
 )
 from ..backends import build_backend
+from ..chat import cfg_for_mode
 from ..utils.archive import select_archivable
 from ..backends.codex import linear_graphql_tool
 from ..errors import (
-    RunNotFound,
-    RunNotResumable,
     SymphonyError,
     TurnFailed,
     TurnInputRequired,
@@ -56,7 +57,9 @@ from ..errors import (
     TurnCancelled,
 )
 from ..continuous_improvement import (
+    AgentTask,
     FileLease,
+    any_mode_due,
     ImprovementRunner,
     Lease,
     default_improvement_runner,
@@ -109,25 +112,17 @@ from .contracts import evaluate_contract
 from .dispatch_state import DispatchState
 from .entries import RetryEntry, RunningEntry, _CodexTotals, _IssueDebug
 from .executors import LegacyStageExecutor, TicketExecutor, TicketRunContext
-
-if TYPE_CHECKING:  # pragma: no cover - typing only; these import lazily
-    from ..flow.artifacts import ArtifactStore
-    from ..flow.loader import WorkflowLoader
-    from .flow_store import (
-        ApprovalRecord,
-        ArtifactRecord,
-        GovernedRunRecord,
-        GovernedRunStore,
-        NodeRunRecord,
-    )
 from .helpers import (
     _branch_hook_env,
     _branch_already_merged_into_target,
     _config_for_issue_agent,
+    resolve_symphony_cli,
     _from_monotonic_to_iso,
     _is_auto_triage_todo_candidate,
     _is_rewind_transition,
+    _human_review_target_state,
     _max_turns_exhausted_target_state,
+    _rewind_budget_target_state,
     _notify_state_transition,
     _requested_agent_kind,
     _sort_for_dispatch_fifo,
@@ -175,6 +170,11 @@ _RETRYABLE_WORKER_ERROR_MARKERS = (
     "connection reset",
     "connection timed out",
     "try again later",
+    # Transient backend stream faults (acceptance finding 3). The strings
+    # below are emitted verbatim by the backends; `test_backend_contract.py`
+    # pins them so the two lists cannot drift apart.
+    "stream unreadable",  # claude_code.py / codex.py / pi.py
+    "no result event",  # claude_code.py — rc!=0 with no result frame
 )
 
 
@@ -189,6 +189,40 @@ class _EligibilityDisposition(str, Enum):
 class _EligibilityDecision:
     disposition: _EligibilityDisposition
     reason: str
+
+
+# The one path a continuous-improvement agent turn may write in the host
+# worktree. Mirrors `continuous_improvement.AGENT_OUTPUT_DIR`.
+CI_AGENT_OUTPUT_PREFIX = ".symphony/continuous-improvement/proposals/"
+
+
+def _worktree_status_snapshot(cwd: Path) -> dict[str, str] | None:
+    """`path -> porcelain status code` for a worktree, or None when not git.
+
+    Untracked files are listed individually (`-uall`) so a new file in a
+    previously-clean directory is visible as its own path.
+    """
+    try:
+        result = subprocess.run(
+            ["git", "status", "--porcelain=v1", "-uall", "-z"],
+            cwd=str(cwd),
+            capture_output=True,
+            text=True,
+            timeout=60,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if result.returncode != 0:
+        return None
+    snapshot: dict[str, str] = {}
+    for record in result.stdout.split("\0"):
+        if len(record) < 4:
+            continue
+        code, path = record[:2], record[3:]
+        if path:
+            snapshot[path] = code
+    return snapshot
 
 
 def _clean_board_error_message(message: str) -> str:
@@ -267,6 +301,7 @@ def _initial_improvement_status() -> dict[str, Any]:
         "interval_ms": 0,
         "max_turns": 0,
         "agent_kind": "",
+        "modes": [],
         "in_flight": False,
         "current_phase": None,
         "last_started_at": None,
@@ -277,108 +312,9 @@ def _initial_improvement_status() -> dict[str, Any]:
         "skipped_reason": None,
         "last_verified_branch": None,
         "last_verified_sha": None,
+        "last_mode_results": [],
+        "last_request_id": None,
     }
-
-
-def _iso_or_none(value: datetime | None) -> str | None:
-    return value.isoformat() if value is not None else None
-
-
-def _node_run_payload(record: "NodeRunRecord") -> dict[str, Any]:
-    return {
-        "node_run_id": record.node_run_id,
-        "node_id": record.node_id,
-        "attempt": record.attempt,
-        "node_type": record.node_type,
-        "status": record.status,
-        "backend_kind": record.backend_kind,
-        "workspace_access": record.workspace_access,
-        "started_at": _iso_or_none(record.started_at),
-        "completed_at": _iso_or_none(record.completed_at),
-        "error_class": record.error_class,
-        "error_code": record.error_code,
-        "error_message": record.error_message,
-        "output_preview": record.output_preview,
-        "usage": {
-            "input_tokens": record.input_tokens,
-            "output_tokens": record.output_tokens,
-            "cost_usd": record.cost_usd,
-        },
-        "git": {
-            "head_before": record.head_before,
-            "head_after": record.head_after,
-            "diffstat": record.diffstat,
-        },
-    }
-
-
-def _approval_payload(record: "ApprovalRecord") -> dict[str, Any]:
-    return {
-        "approval_id": record.approval_id,
-        "run_id": record.run_id,
-        "node_id": record.node_id,
-        "node_attempt": record.node_attempt,
-        "status": record.status,
-        "version": record.version,
-        "title": record.title,
-        "instructions": record.instructions,
-        "requested_at": _iso_or_none(record.requested_at),
-        "resolved_at": _iso_or_none(record.resolved_at),
-        "decision": record.decision,
-        "actor": record.actor,
-        "source": record.source,
-        "comment": record.comment,
-    }
-
-
-def _artifact_payload(record: "ArtifactRecord") -> dict[str, Any]:
-    return {
-        "artifact_id": record.artifact_id,
-        "node_id": record.node_id,
-        "artifact_type": record.artifact_type,
-        "scope": record.scope,
-        "relative_path": record.relative_path,
-        "media_type": record.media_type,
-        "size_bytes": record.size_bytes,
-        "sha256": record.sha256,
-        "created_at": _iso_or_none(record.created_at),
-        "payload_expired_at": _iso_or_none(record.payload_expired_at),
-    }
-
-
-def _allowed_run_actions(execution_status: str) -> list[str]:
-    """Which operator actions the UI should offer for this run status.
-
-    Returned from the server so CLI, TUI, and web cannot drift into
-    offering an action the state machine would reject.
-    """
-    from ..flow import statuses as flow_st
-
-    if execution_status in flow_st.TERMINAL_RUN_STATUSES:
-        return []
-    if execution_status == flow_st.RUN_WAITING_APPROVAL:
-        return ["approve", "reject", "abandon", "cancel"]
-    if execution_status == flow_st.RUN_NEEDS_ATTENTION:
-        return ["resume", "abandon", "start_fresh"]
-    return ["cancel", "abandon"]
-
-
-def _snapshot_node_ids(normalized_json: str | None) -> tuple[str, ...]:
-    """Node ids declared by a stored definition, for progress denominators."""
-    if not normalized_json:
-        return ()
-    try:
-        payload = json.loads(normalized_json)
-    except (TypeError, ValueError):
-        return ()
-    nodes = payload.get("nodes") if isinstance(payload, dict) else None
-    if not isinstance(nodes, list):
-        return ()
-    return tuple(
-        str(node["id"])
-        for node in nodes
-        if isinstance(node, dict) and isinstance(node.get("id"), str)
-    )
 
 
 def _run_record_payload(record: RunRecord) -> dict[str, Any]:
@@ -635,7 +571,7 @@ def _blocked_rca_description(
         f"to `{issue.identifier}` and move that source ticket to `{reopen_state}`.\n"
         "5. Do not skip the source ticket's normal workflow. Once it is back "
         "in Todo, it must pass through the configured Todo/In Progress/Verify/"
-        "Learn review path like any other ticket.\n"
+        "Document review path like any other ticket.\n"
         "6. If the root cause requires credentials, host worktree cleanup, "
         "destructive operations, or external approval, leave the source ticket "
         "Blocked and append `## RCA Blocker` with exact operator action.\n\n"
@@ -731,11 +667,6 @@ class Orchestrator:
         # tolerant inside StatsStore, so hooks never guard beyond None.
         self._stats: StatsStore | None = None
         self._run_registry: RunRegistry | None = None
-        # Governed workflow mode: loader and artifact store are cached so
-        # their per-file compile cache survives across ticks. Both stay None
-        # until a repository opts in.
-        self._governed_loader: "WorkflowLoader | None" = None
-        self._governed_artifacts: "ArtifactStore | None" = None
         # R1/A1 — supervision + health counters. One bad tick must degrade
         # the tick, never kill the loop; these counters make the difference
         # between "idle and healthy" and "silently dead" observable.
@@ -761,7 +692,17 @@ class Orchestrator:
         # — never a worker slot. Due-math uses the monotonic clock so a
         # wall-clock jump can't wedge it. Runner + lease are injectable so
         # tests never spawn real subprocesses or touch a shared lockfile.
-        self._improvement_runner = improvement_runner or default_improvement_runner
+        # Agent-driven improvement modes need a real backend turn. The CI
+        # module must stay orchestrator-free, so the capability is injected:
+        # binding it as a keyword partial keeps the 3-positional
+        # `ImprovementRunner` signature every injected test fake implements.
+        self._improvement_runner: ImprovementRunner = (
+            improvement_runner
+            or partial(
+                default_improvement_runner,
+                agent_runner=self._run_improvement_agent,
+            )
+        )
         self._improvement_lease = improvement_lease
         self._improvement_task: asyncio.Task[None] | None = None
         self._improvement_run_timeout_s: float = DEFAULT_IMPROVEMENT_RUN_TIMEOUT_S
@@ -931,439 +872,6 @@ class Orchestrator:
             return default
         self._last_registry_error = None
         return result
-
-    # ------------------------------------------------------------------
-    # governed workflow host (PRD §22.1)
-    #
-    # These are the services `flow.executor.GovernedWorkflowExecutor` needs
-    # and cannot provide for itself, because they belong to the
-    # orchestrator: the workspace manager, the dispatch lease, and the
-    # tracker adapter. Everything else the DAG needs lives in `symphony.flow`.
-    # ------------------------------------------------------------------
-
-    def governed_store(self, cfg: ServiceConfig) -> "GovernedRunStore":
-        self._ensure_run_registry(cfg)
-        if self._run_registry is None:
-            raise SymphonyError(
-                "governed workflow mode requires the run registry, which "
-                "could not be opened"
-            )
-        return self._run_registry.governed
-
-    def governed_loader(self, cfg: ServiceConfig) -> "WorkflowLoader":
-        """One loader per workflow directory, kept so its cache survives ticks."""
-        from ..flow.loader import WorkflowLoader
-
-        directory = cfg.workflow_engine.directory
-        if directory is None:
-            raise SymphonyError("workflow_engine.directory is not configured")
-        cached = self._governed_loader
-        if cached is not None and cached.directory == directory:
-            return cached
-        loader = WorkflowLoader(
-            directory,
-            workflow_dir=cfg.workflow_path.parent,
-            max_parallel_nodes=cfg.workflow_engine.max_parallel_nodes,
-        )
-        self._governed_loader = loader
-        return loader
-
-    def governed_artifacts(self, cfg: ServiceConfig) -> "ArtifactStore":
-        from ..flow.artifacts import ArtifactStore
-
-        root = cfg.workflow_engine.artifact_directory
-        if root is None:
-            raise SymphonyError("workflow_engine.artifact_directory is not configured")
-        cached = self._governed_artifacts
-        if cached is not None and cached.root == root.resolve():
-            return cached
-        store = ArtifactStore(root)
-        self._governed_artifacts = store
-        return store
-
-    def _governed_fence_reason(self, issue_id: str) -> str | None:
-        """Why a governed run is holding this issue, or None."""
-        registry = self._run_registry
-        if registry is None:
-            return None
-        try:
-            fence = registry.governed.fence_for_issue(issue_id)
-        except Exception as exc:  # noqa: BLE001 - never block polling on this
-            self._last_registry_error = f"fence_for_issue: {exc}"
-            return None
-        return fence.reason if fence is not None else None
-
-    async def prepare_governed_workspace(self, identifier: str) -> Path:
-        """Reuse the ticket's existing isolated workspace (PRD §6.2).
-
-        One ticket keeps one workspace across every node. Nodes do not get
-        their own worktrees — that would multiply the branch lifecycle the
-        orchestrator already owns.
-        """
-        assert self._workspace_manager is not None
-        workspace = await self._workspace_manager.create_or_reuse(identifier)
-        await self._workspace_manager.before_run(workspace.path)
-        return workspace.path
-
-    async def release_governed_workspace(self, workspace: Path) -> None:
-        """Run the after-run hook without removing the workspace.
-
-        A suspended run will come back to this workspace after a human
-        resolves its gate, so removal stays with the orchestrator's normal
-        terminal handling.
-        """
-        if self._workspace_manager is None:
-            return
-        await self._workspace_manager.after_run_best_effort(workspace)
-
-    def heartbeat_governed_run(self, issue_id: str, run_id: str) -> None:
-        # `run_id` is part of the host contract for symmetry with the store
-        # API, but the lease is already keyed by the running entry, which
-        # carries the authoritative run id.
-        del run_id
-        entry = self._running.get(issue_id)
-        if entry is None:
-            return
-        self._heartbeat_run_lease(
-            issue_id, entry, progress=datetime.now(timezone.utc)
-        )
-
-    def sync_governed_pid(self, issue_id: str, backend_agent_pid: int | None) -> None:
-        self._sync_backend_agent_pid(issue_id, backend_agent_pid)
-
-    def apply_governed_ticket_state(
-        self, cfg: ServiceConfig, issue: Issue, condition: str
-    ) -> None:
-        """Move the board lane for a governed run, if the repo configured one.
-
-        In governed mode the orchestrator owns coarse transitions; the agent
-        is told not to touch `state`. An unmapped condition is a deliberate
-        no-op — a repository that maps nothing keeps its board manual and
-        sees run progress only in the live overlay.
-        """
-        target = cfg.workflow_engine.state_for(condition)
-        if not target:
-            return
-        if normalize_state(issue.state) == normalize_state(target):
-            return
-        try:
-            self._tracker_call_update_state(cfg, issue, target)
-        except Exception as exc:  # noqa: BLE001 - board write must not kill the run
-            log.warning(
-                "governed_state_transition_failed",
-                issue_id=issue.id,
-                identifier=issue.identifier,
-                condition=condition,
-                target=target,
-                error=str(exc),
-            )
-
-    def write_governed_summary(
-        self,
-        cfg: ServiceConfig,
-        issue: Issue,
-        *,
-        run_id: str,
-        workflow_name: str,
-        result: str,
-        artifact_dir: str,
-    ) -> None:
-        """Write the idempotent run summary onto a file ticket.
-
-        Only the file tracker supports the marker-delimited section; Linear
-        and Jira surface governed run state through the live overlay until
-        their adapters expose a verified idempotent write (PRD §13.3).
-        """
-        if cfg.tracker.kind != "file":
-            return
-        client = build_tracker_client(cfg)
-        try:
-            upsert = getattr(client, "upsert_run_summary", None)
-            if upsert is None:
-                return
-            upsert(
-                issue.identifier,
-                run_id=run_id,
-                workflow_name=workflow_name,
-                result=result,
-                artifact_dir=artifact_dir,
-                branch=issue.branch_name,
-            )
-        finally:
-            client.close()
-
-    def _reconcile_governed_runs(self, cfg: ServiceConfig) -> None:
-        """Classify governed runs that a crash left mid-flight (PRD §10.3).
-
-        Runs the process was driving when it died are indistinguishable, at
-        startup, from runs a live peer is driving — except that the lease
-        layer has already reclaimed dead owners by the time this runs. So a
-        node still marked `running` here means its owner is gone.
-
-        Nothing is restarted. Every affected run lands in `needs_attention`
-        with a specific reason and keeps its fence, because a half-finished
-        node may have created a branch, a commit, or a pull request that the
-        engine cannot see. PRD §G4 makes that an operator decision.
-        """
-        if not cfg.workflow_engine.enabled or self._run_registry is None:
-            return
-        store = self._run_registry.governed
-        try:
-            nonterminal = store.list_nonterminal_runs()
-        except Exception as exc:  # noqa: BLE001 - startup must not be fatal
-            log.error("governed_reconcile_failed", error=str(exc))
-            return
-        for record in nonterminal:
-            try:
-                self._reconcile_one_governed_run(cfg, store, record)
-            except Exception as exc:  # noqa: BLE001 - one bad run must not block the rest
-                log.error(
-                    "governed_reconcile_run_failed",
-                    run_id=record.run_id,
-                    error=str(exc),
-                )
-
-    def _reconcile_one_governed_run(
-        self,
-        cfg: ServiceConfig,
-        store: "GovernedRunStore",
-        record: "GovernedRunRecord",
-    ) -> None:
-        from ..flow import statuses as flow_st
-
-        interrupted = store.mark_running_nodes_interrupted(record.run_id)
-        if interrupted:
-            store.set_run_status(
-                run_id=record.run_id,
-                status=flow_st.RUN_NEEDS_ATTENTION,
-                attention_reason=flow_st.ATTENTION_INTERRUPTED,
-            )
-            log.warning(
-                "governed_run_interrupted",
-                run_id=record.run_id,
-                identifier=record.identifier,
-                nodes=interrupted,
-            )
-            return
-
-        if record.execution_status == flow_st.RUN_WAITING_APPROVAL:
-            # A gate needs no repair — it was already parked deliberately.
-            # Re-assert the fence so a rollback-era pause mirror is correct.
-            log.info(
-                "governed_run_awaiting_approval",
-                run_id=record.run_id,
-                identifier=record.identifier,
-            )
-            return
-
-        integrity = self._governed_integrity_failure(cfg, store, record)
-        if integrity is not None:
-            store.set_run_status(
-                run_id=record.run_id,
-                status=flow_st.RUN_NEEDS_ATTENTION,
-                attention_reason=flow_st.ATTENTION_INTEGRITY_FAILED,
-                terminal_reason=integrity,
-            )
-            log.error(
-                "governed_run_integrity_failed",
-                run_id=record.run_id,
-                identifier=record.identifier,
-                reason=integrity,
-            )
-            return
-
-        if record.execution_status in {flow_st.RUN_RUNNING, flow_st.RUN_CREATED}:
-            # No node was running, but the run is not parked either: the
-            # process died between nodes. Same rule — an explicit decision.
-            store.set_run_status(
-                run_id=record.run_id,
-                status=flow_st.RUN_NEEDS_ATTENTION,
-                attention_reason=flow_st.ATTENTION_INTERRUPTED,
-            )
-
-    def _governed_integrity_failure(
-        self,
-        cfg: ServiceConfig,
-        store: "GovernedRunStore",
-        record: "GovernedRunRecord",
-    ) -> str | None:
-        """Reason this run cannot be trusted to resume, or None.
-
-        Checks the two things a resumed run silently depends on: that the
-        workspace it was using still exists, and that the artifacts its
-        succeeded nodes produced still hash the way they did when written.
-        A downstream prompt interpolates those artifacts, so a modified one
-        would change what the run does without anyone deciding to.
-        """
-        from ..flow import statuses as flow_st
-
-        if not record.workspace_path.exists():
-            return f"workspace_missing:{record.workspace_path}"
-        try:
-            artifacts = self.governed_artifacts(cfg)
-        except SymphonyError:
-            return "artifact_store_unavailable"
-        for artifact in store.list_artifacts(record.run_id):
-            if artifact.payload_expired_at is not None:
-                return f"artifact_expired:{artifact.relative_path}"
-            if not artifacts.verify(artifact.relative_path, artifact.sha256):
-                return f"artifact_mismatch:{artifact.relative_path}"
-        del flow_st
-        return None
-
-    # ------------------------------------------------------------------
-    # governed run operator actions (PRD §10.4)
-    # ------------------------------------------------------------------
-
-    def governed_run_detail(self, cfg: ServiceConfig, run_id: str) -> dict[str, Any]:
-        """Full run view: definition, nodes, approvals, artifacts, actions."""
-        from ..flow import statuses as flow_st
-
-        store = self.governed_store(cfg)
-        record = store.get_governed_run(run_id)
-        if record is None:
-            raise RunNotFound("unknown governed run", run_id=run_id)
-        nodes = store.list_node_runs(run_id)
-        approvals = store.list_approvals(run_id=run_id)
-        artifacts = store.list_artifacts(run_id)
-        snapshot = (
-            store.get_workflow_snapshot(record.workflow_hash)
-            if record.workflow_hash
-            else None
-        )
-        latest = store.latest_node_attempts(run_id)
-        total = len(
-            {node.node_id for node in nodes}
-            | set(_snapshot_node_ids(snapshot.normalized_json if snapshot else None))
-        )
-        completed = sum(
-            1 for rec in latest.values() if rec.status == flow_st.NODE_SUCCEEDED
-        )
-        return {
-            "run_id": record.run_id,
-            "issue_id": record.issue_id,
-            "identifier": record.identifier,
-            "execution_mode": record.execution_mode,
-            "execution_status": record.execution_status,
-            "attention_reason": record.attention_reason,
-            "terminal_reason": record.terminal_reason,
-            "workflow_name": record.workflow_name,
-            "workflow_version": record.workflow_version,
-            "workflow_hash": record.workflow_hash,
-            "workspace_path": str(record.workspace_path),
-            "started_at": _iso_or_none(record.started_at),
-            "updated_at": _iso_or_none(record.updated_at),
-            "completed_at": _iso_or_none(record.completed_at),
-            "usage": {
-                "input_tokens": record.input_tokens,
-                "output_tokens": record.output_tokens,
-                "cost_usd": record.cost_usd,
-            },
-            "progress": {"completed": completed, "total": total},
-            "nodes": [_node_run_payload(node) for node in nodes],
-            "approvals": [_approval_payload(item) for item in approvals],
-            "artifacts": [_artifact_payload(item) for item in artifacts],
-            "actions": _allowed_run_actions(record.execution_status),
-        }
-
-    def abandon_governed_run(
-        self, cfg: ServiceConfig, run_id: str, *, reason: str = "operator_abandon"
-    ) -> dict[str, Any]:
-        """Terminalize a run, releasing its fence but keeping its history."""
-        from ..flow import statuses as flow_st
-
-        store = self.governed_store(cfg)
-        store.set_run_status(
-            run_id=run_id, status=flow_st.RUN_ABANDONED, terminal_reason=reason
-        )
-        return self.governed_run_detail(cfg, run_id)
-
-    def start_fresh_governed_run(
-        self, cfg: ServiceConfig, run_id: str
-    ) -> dict[str, Any]:
-        """Abandon a parked run so the ticket can be dispatched anew.
-
-        Deliberately *not* "create the replacement run here". Abandoning
-        releases the fence, and the next poll tick then dispatches the
-        ticket through the ordinary path — which re-reads the current
-        workflow definition, re-acquires a lease, and creates a genuinely
-        new run id. Minting a second run inline would duplicate that
-        machinery and reintroduce the double-dispatch risk the fence exists
-        to remove.
-
-        History and artifacts of the abandoned run are preserved (PRD §10.4).
-        """
-        return self.abandon_governed_run(
-            cfg, run_id, reason="operator_start_fresh"
-        )
-
-    def cancel_governed_run(self, cfg: ServiceConfig, run_id: str) -> dict[str, Any]:
-        """Cancel an active run. The worker task is cancelled separately."""
-        from ..flow import statuses as flow_st
-
-        store = self.governed_store(cfg)
-        record = store.get_governed_run(run_id)
-        if record is None:
-            raise RunNotFound("unknown governed run", run_id=run_id)
-        entry = self._running.get(record.issue_id)
-        if entry is not None and entry.worker_task is not None:
-            entry.cancelled_at = datetime.now(timezone.utc)
-            entry.worker_task.cancel()
-        store.set_run_status(
-            run_id=run_id,
-            status=flow_st.RUN_CANCELLED,
-            terminal_reason="operator_cancel",
-        )
-        return self.governed_run_detail(cfg, run_id)
-
-    async def resume_governed_run(
-        self, cfg: ServiceConfig, run_id: str
-    ) -> dict[str, Any]:
-        """Continue a parked run from its stored snapshot.
-
-        Runs inline rather than through `_dispatch`, because the issue is
-        fenced — that is the whole point of the fence. The executor skips
-        succeeded nodes and picks up where the run stopped.
-        """
-        from ..flow.executor import GovernedWorkflowExecutor
-
-        store = self.governed_store(cfg)
-        record = store.get_governed_run(run_id)
-        if record is None:
-            raise RunNotFound("unknown governed run", run_id=run_id)
-        issue = self._tracker_call_fetch_issue_full_by_id(cfg, record.identifier)
-        if issue is None:
-            raise RunNotResumable(
-                "the ticket this run belongs to no longer exists",
-                run_id=run_id,
-                identifier=record.identifier,
-            )
-        executor = GovernedWorkflowExecutor(self)
-        await executor.resume(cfg=cfg, issue=issue, run_id=run_id)
-        return self.governed_run_detail(cfg, run_id)
-
-    def resolve_governed_approval(
-        self,
-        cfg: ServiceConfig,
-        approval_id: str,
-        *,
-        decision: str,
-        expected_version: int | None = None,
-        actor: str | None = None,
-        source: str = "api",
-        comment: str | None = None,
-    ) -> dict[str, Any]:
-        """Resolve a gate. The only thing that can (PRD §6.4)."""
-        store = self.governed_store(cfg)
-        record = store.resolve_approval(
-            approval_id=approval_id,
-            decision=decision,
-            expected_version=expected_version,
-            actor=actor,
-            source=source,
-            comment=comment,
-        )
-        return _approval_payload(record)
 
     def _ensure_run_registry(self, cfg: ServiceConfig) -> None:
         path = registry_path_for_workflow(cfg.workflow_path)
@@ -1721,6 +1229,10 @@ class Orchestrator:
         # writes through the host-board junction installed by after_create.
         import os as _os
         _os.environ["SYMPHONY_WORKFLOW_DIR"] = str(cfg.workflow_path.parent)
+        # The board-tool protocol in the stage prompts and the chat preamble
+        # requires the `symphony` CLI; a venv install is not necessarily on
+        # the worker's PATH. Prompts reference `${SYMPHONY_CLI:-symphony}`.
+        _os.environ["SYMPHONY_CLI"] = resolve_symphony_cli()
         self._workspace_manager = WorkspaceManager(
             cfg.workspace_root,
             cfg.hooks,
@@ -1736,7 +1248,6 @@ class Orchestrator:
         )
         self._ensure_run_registry(cfg)
         await self._startup_terminal_cleanup(cfg)
-        self._reconcile_governed_runs(cfg)
         self._spawn_tick_loop()
 
     def _spawn_tick_loop(self) -> None:
@@ -1943,7 +1454,7 @@ class Orchestrator:
                 "feature_branch_pattern": "symphony/<ID>",
                 "base_branch": "current branch",
                 "merge_target_branch": "current branch",
-                "merge_timing": "after Learn, before Done",
+                "merge_timing": "after Document, before Done",
                 "auto_merge_enabled": False,
             }
         base = cfg.agent.feature_base_branch or "current branch"
@@ -1952,7 +1463,7 @@ class Orchestrator:
             "feature_branch_pattern": "symphony/<ID>",
             "base_branch": base,
             "merge_target_branch": target,
-            "merge_timing": "after Learn, before Done",
+            "merge_timing": "after Document, before Done",
             "auto_merge_enabled": bool(cfg.agent.auto_merge_on_done),
         }
 
@@ -2074,6 +1585,19 @@ class Orchestrator:
                 if _blocker_dependency_is_resolved(blocker.state, cfg):
                     continue
                 identifier = blocker.identifier or blocker.id or "unknown"
+                # F-13: a blocker id that is not on the board hydrates to
+                # `state=None` and deadlocks the ticket forever. "waiting on
+                # unresolved dependency" reads like normal queueing, so say
+                # what actually happened.
+                if not normalize_state(blocker.state).strip():
+                    return _attention_signal(
+                        "dangling_dependency",
+                        "Unknown blocker",
+                        f"blocker {identifier} is not on the board — fix the id "
+                        f"with `symphony board update {issue.identifier} "
+                        "--blocked-by <ID>` or clear it",
+                        "error",
+                    )
                 return _attention_signal(
                     "blocked_dependency",
                     "Blocked dependency",
@@ -2157,10 +1681,10 @@ class Orchestrator:
         if entry.agent_kind:
             return entry.agent_kind
         requested = _requested_agent_kind(entry.issue)
-        if requested is not None:
-            return requested
         cfg = self._workflow_state.current()
-        return cfg.agent.kind if cfg is not None else ""
+        if cfg is None:
+            return requested or ""
+        return cfg.agent.kind_for_state(entry.issue.state, requested)
 
     # ------------------------------------------------------------------
     # operator-driven pause / resume
@@ -2277,8 +1801,12 @@ class Orchestrator:
             return identifier
         return None
 
-    async def skip_learn(self, identifier: str) -> tuple[bool, str]:
-        """Move an idle Learn ticket to Human Review with an audit note."""
+    async def skip_document(self, identifier: str) -> tuple[bool, str]:
+        """Move an idle Document ticket to Human Review with an audit note.
+
+        Accepts the legacy `Learn` lane name so pre-rename boards keep the
+        skip control without migration.
+        """
         cfg = self._workflow_state.current()
         if cfg is None:
             cfg, err = self._workflow_state.reload()
@@ -2293,26 +1821,38 @@ class Orchestrator:
         )
         if issue is None:
             return False, f"unknown issue {identifier}"
-        if normalize_state(issue.state) != "learn":
-            return False, f"only Learn tickets can be skipped (state={issue.state})"
+        if normalize_state(issue.state) not in {"document", "learn"}:
+            return False, (
+                f"only Document tickets can be skipped (state={issue.state})"
+            )
         if self.find_running_issue_id(identifier) is not None:
             return False, f"{identifier} started running; retry after it stops"
 
+        target_state = _human_review_target_state(cfg)
+        if not target_state:
+            return False, (
+                "this board declares no terminal lane to skip into; add a "
+                "`Human Review`-style terminal state to tracker.terminal_states"
+            )
         await asyncio.to_thread(
             self._tracker_call_append_note,
             cfg,
             issue,
-            "Learn Skipped",
-            "Operator skipped wiki write-back from the Learn lane.",
+            "Document Skipped",
+            f"Operator skipped documentation write-back from the {issue.state} lane.",
         )
         await asyncio.to_thread(
             self._tracker_call_update_state,
             cfg,
             issue,
-            "Human Review",
+            target_state,
         )
         self.request_refresh()
         return True, f"moved {identifier} to Human Review"
+
+    # Deprecated alias — the lane was renamed Learn -> Document; external
+    # callers using the old method name keep working.
+    skip_learn = skip_document
 
     def _retry_row(self, entry: RetryEntry) -> dict[str, Any]:
         return {
@@ -3159,7 +2699,9 @@ class Orchestrator:
                 )
             rca_state = requested_rca_state
 
-        requested_agent = (agent_kind or issue.agent_kind or cfg.agent.kind).strip().lower()
+        requested_agent = (agent_kind or "").strip().lower() or cfg.agent.kind_for_state(
+            rca_state, issue.agent_kind
+        )
         if requested_agent not in SUPPORTED_AGENT_KINDS:
             requested_agent = cfg.agent.kind
 
@@ -3508,16 +3050,6 @@ class Orchestrator:
             self._lease_blocked[issue.id] = reason
             return _EligibilityDecision(_EligibilityDisposition.WAIT_NON_SLOT, reason)
         self._lease_blocked.pop(issue.id, None)
-        # A governed run waiting on a gate, or parked in needs_attention, has
-        # no live process and therefore no lease — but it still owns the
-        # issue. Without this check, ordinary polling would happily start a
-        # second run alongside the one a human has not answered yet.
-        fence_reason = self._governed_fence_reason(issue.id)
-        if fence_reason is not None:
-            return _EligibilityDecision(
-                _EligibilityDisposition.WAIT_NON_SLOT,
-                f"governed run {fence_reason}",
-            )
         if not owning_retry and issue.id in self._claimed:
             return _EligibilityDecision(
                 _EligibilityDisposition.REJECT, "issue already has a claim"
@@ -3646,6 +3178,7 @@ class Orchestrator:
             interval_ms=ci.interval_ms,
             max_turns=ci.max_turns,
             agent_kind=ci.agent_kind,
+            modes=list(ci.resolved_modes()),
         )
         if not ci.enabled:
             return
@@ -3680,6 +3213,12 @@ class Orchestrator:
             self._running or self._retry or self._terminal_persist_pending
         ):
             self._improvement_status["skipped_reason"] = "board_busy"
+            return
+        # Per-mode cadence (`mode_interval_hours`): when every enabled mode is
+        # still cooling down, re-arm the heartbeat without spending a turn.
+        if not any_mode_due(cfg, cfg.workflow_path.parent):
+            self._improvement_status["skipped_reason"] = "no_modes_due"
+            self._next_improvement_due_monotonic = now + interval_s
             return
 
         self._improvement_status["skipped_reason"] = None
@@ -3730,6 +3269,16 @@ class Orchestrator:
                 tickets_created=result.tickets_created,
                 last_verified_branch=result.verified_branch,
                 last_verified_sha=result.verified_sha,
+                last_mode_results=[
+                    {
+                        "mode": outcome.mode,
+                        "status": outcome.status,
+                        "summary": outcome.summary,
+                        "ticket_ids": list(outcome.ticket_ids),
+                    }
+                    for outcome in result.modes
+                ],
+                last_request_id=result.request_id,
             )
             consumed = True
         except asyncio.CancelledError:
@@ -3767,6 +3316,87 @@ class Orchestrator:
                 self._improvement_status["last_finished_at"] = _utc_iso_z()
             self._improvement_status.update(in_flight=False, current_phase=None)
 
+    async def _run_improvement_agent(self, task: AgentTask) -> str:
+        """Give an agent-driven improvement mode one backend turn.
+
+        This is the orchestrator-side capability the continuous-improvement
+        module is handed (it must not import the orchestrator). The turn runs
+        against the host repo with `cwd == workspace_root == workflow_dir`,
+        exactly like a chat turn, and outside the dispatch slot accounting —
+        the heartbeat already holds the idle board. The backend stays in its
+        normal editing mode so the agent can write its one proposal file.
+
+        F-12: "read only except the proposal file" used to be prompt text
+        only, in the *host* tree. It is now also mechanical — the working
+        tree is snapshotted before and after the turn, and a write outside
+        `.symphony/continuous-improvement/proposals/` discards the mode's
+        proposals (the caller records `not_proven`) and logs the paths.
+        """
+        cfg = self._workflow_state.current()
+        if cfg is None:
+            raise SymphonyError("no workflow configuration loaded")
+        ci = cfg.continuous_improvement
+        agent_cfg, _ = cfg_for_mode(cfg, "edit", ci.agent_kind or cfg.agent.kind)
+
+        async def _ignore_event(_event: dict[str, Any]) -> None:
+            return None
+
+        backend = self._build_agent_backend(
+            BackendInit(
+                cfg=agent_cfg,
+                cwd=task.cwd,
+                workspace_root=task.cwd,
+                on_event=_ignore_event,
+            )
+        )
+        before = await asyncio.to_thread(_worktree_status_snapshot, task.cwd)
+        await backend.start()
+        try:
+            await backend.initialize()
+            await backend.start_session(initial_prompt="", issue_title=None)
+            result = await backend.run_turn(prompt=task.prompt, is_continuation=False)
+        finally:
+            await backend.stop()
+        after = await asyncio.to_thread(_worktree_status_snapshot, task.cwd)
+        self._enforce_improvement_write_contract(task, before, after)
+        return result.last_message or ""
+
+    def _enforce_improvement_write_contract(
+        self,
+        task: AgentTask,
+        before: dict[str, str] | None,
+        after: dict[str, str] | None,
+    ) -> None:
+        """Discard a CI agent turn that wrote outside its contract."""
+        if before is None or after is None:
+            # Not a git worktree (or git unavailable): nothing to compare
+            # against. The prompt remains the only gate, as before.
+            return
+        allowed = CI_AGENT_OUTPUT_PREFIX
+        offending = sorted(
+            path
+            for path, code in after.items()
+            if before.get(path) != code and not path.startswith(allowed)
+        )
+        if not offending:
+            return
+        try:
+            task.output_path.unlink()
+        except OSError:
+            pass
+        log.error(
+            "ci_agent_wrote_outside_contract",
+            mode=task.mode,
+            cwd=str(task.cwd),
+            paths=offending[:20],
+            path_count=len(offending),
+        )
+        raise SymphonyError(
+            "continuous-improvement agent wrote outside its contract; "
+            f"proposals discarded: {', '.join(offending[:5])}",
+            mode=task.mode,
+        )
+
     def _report_improvement_phase(self, phase: str) -> None:
         self._improvement_status["current_phase"] = phase
 
@@ -3796,6 +3426,7 @@ class Orchestrator:
                 interval_ms=ci.interval_ms,
                 max_turns=ci.max_turns,
                 agent_kind=ci.agent_kind,
+                modes=list(ci.resolved_modes()),
             )
         status["turns_used"] = self._improvement_turns_used
         status["in_flight"] = (
@@ -4173,17 +3804,7 @@ class Orchestrator:
     # ------------------------------------------------------------------
 
     def _executor_for(self, cfg: ServiceConfig) -> TicketExecutor:
-        """Pick the execution strategy for one dispatch.
-
-        Governed mode is opt-in per repository. With no `workflow_engine`
-        config — the case for every existing installation — this always
-        returns the legacy executor, and the code path below it is the same
-        one that ran before the seam existed.
-        """
-        if cfg.workflow_engine.enabled:
-            from ..flow.executor import GovernedWorkflowExecutor
-
-            return GovernedWorkflowExecutor(self)
+        """Pick the execution strategy for one dispatch."""
         return LegacyStageExecutor(self)
 
     def _dispatch(
@@ -4204,7 +3825,7 @@ class Orchestrator:
         resolved_attempt_kind = attempt_kind or (
             "retry" if attempt is not None else "initial"
         )
-        agent_kind = _requested_agent_kind(issue) or cfg.agent.kind
+        agent_kind = cfg.agent.kind_for_state(issue.state, _requested_agent_kind(issue))
         run_id = self._try_acquire_run_lease(
             issue=issue,
             workspace_path=workspace_path,
@@ -4265,9 +3886,21 @@ class Orchestrator:
         # Persist the resolved backend onto the ticket so downstream
         # consumers (board UIs, audits, Done-state history) can see who
         # ran which ticket without inferring from logs. Idempotent —
-        # adapter preserves any existing override.
+        # adapter preserves any existing override. Skipped when
+        # `agent.stage_kinds` routing is active: the stamp is read back as
+        # a per-ticket pin on later dispatches, which would freeze the
+        # first stage's backend and defeat per-state routing.
         try:
-            self._tracker_call_record_agent_kind(cfg, issue.identifier, entry.agent_kind)
+            if cfg.agent.stage_kinds:
+                # Routed board: the pin must stay empty, but the audit value
+                # still belongs on the ticket (F-20).
+                self._tracker_call_record_last_agent_kind(
+                    cfg, issue.identifier, entry.agent_kind
+                )
+            else:
+                self._tracker_call_record_agent_kind(
+                    cfg, issue.identifier, entry.agent_kind
+                )
         except Exception as exc:
             log.warning(
                 "record_agent_kind_failed",
@@ -4384,7 +4017,12 @@ class Orchestrator:
         outcome: str = "normal"
         error: str | None = None
         try:
-            cfg = _config_for_issue_agent(cfg, issue)
+            # Keep the *unrouted* workflow config: `agent.stage_kinds` must be
+            # re-resolved at every in-run phase transition, and re-resolving
+            # against an already-routed cfg would pin the first lane's backend
+            # for the whole dispatch (the normal Todo→…→Document path).
+            base_cfg = cfg
+            cfg = _config_for_issue_agent(base_cfg, issue)
             running = self._running.get(running_issue_id)
             if running is not None:
                 running.agent_kind = cfg.agent.kind
@@ -4563,10 +4201,14 @@ class Orchestrator:
                             # Failure note, and treat the situation as
                             # a forced rewind so the rebuild + budget
                             # bookkeeping below still apply.
-                            if not is_rewind:
+                            if not is_rewind and cfg.agent.stage_contracts_enabled(
+                                cfg.tracker.active_states
+                            ):
                                 if prev_phase_state in {
                                     "in progress",
                                     "verify",
+                                    "document",
+                                    # legacy lane name (pre-rename boards)
                                     "learn",
                                     "done",
                                 }:
@@ -4676,13 +4318,15 @@ class Orchestrator:
                                     cfg.agent.max_attempts > 0
                                     and debug.rewind_count > cfg.agent.max_attempts
                                 ):
-                                    await asyncio.to_thread(
-                                        self._tracker_call_update_state,
-                                        cfg,
-                                        issue,
-                                        "Blocked",
-                                    )
-                                    issue = replace(issue, state="Blocked")
+                                    rewind_target = _rewind_budget_target_state(cfg)
+                                    if rewind_target:
+                                        await asyncio.to_thread(
+                                            self._tracker_call_update_state,
+                                            cfg,
+                                            issue,
+                                            rewind_target,
+                                        )
+                                        issue = replace(issue, state=rewind_target)
                                     running_entry = self._running.get(
                                         running_issue_id
                                     )
@@ -4696,12 +4340,34 @@ class Orchestrator:
                                         to_state=current_state,
                                         rewind_count=debug.rewind_count,
                                         max_attempts=cfg.agent.max_attempts,
+                                        # F-32: a board with no block/human
+                                        # terminal lane keeps its state; the
+                                        # worker still stops.
+                                        target_state=rewind_target or "(none)",
                                     )
                                     break
                             running_entry = self._running.get(running_issue_id)
                             if running_entry is not None:
                                 running_entry.consecutive_empty_turns = 0
                                 running_entry.hit_empty_response_loop = False
+                            # F-01: route the *new* lane's backend. The ticket
+                            # walks several states inside one dispatch, so the
+                            # kind must be re-resolved from the unrouted config
+                            # here — not reused from the lane we started in.
+                            phase_cfg = _config_for_issue_agent(base_cfg, issue)
+                            if phase_cfg.agent.kind != cfg.agent.kind:
+                                log.info(
+                                    "stage_backend_rerouted",
+                                    issue_id=issue.id,
+                                    identifier=issue.identifier,
+                                    from_state=prev_phase_state,
+                                    to_state=current_state,
+                                    from_kind=cfg.agent.kind,
+                                    to_kind=phase_cfg.agent.kind,
+                                )
+                            cfg = phase_cfg
+                            if running_entry is not None:
+                                running_entry.agent_kind = cfg.agent.kind
                             client, first_prompt = await self._rebuild_backend_for_phase(
                                 issue=issue,
                                 running_issue_id=running_issue_id,
@@ -6623,13 +6289,33 @@ class Orchestrator:
             entry.worker_task.cancel()
         entry.cancelled_at = now
 
+    def _stall_timeout_ms_for_entry(
+        self, cfg: ServiceConfig, entry: RunningEntry
+    ) -> int:
+        """Stall budget for one running worker.
+
+        F-02: `cfg.backend_timeouts()` keys off the *workflow default*
+        backend, so a ticket pinned (or stage-routed) to another backend was
+        cancelled on the wrong backend's clock — a claude worker configured
+        for 900 s died at codex's 300 s. Resolve per entry, then let
+        `agent.stall_timeout_ms_by_state` widen it for heavy lanes.
+        """
+        entry_cfg = _config_for_issue_agent(cfg, entry.issue)
+        kind = entry.agent_kind or entry_cfg.agent.kind
+        if kind != entry_cfg.agent.kind:
+            entry_cfg = replace(entry_cfg, agent=replace(entry_cfg.agent, kind=kind))
+        _, _, stall_timeout_ms = entry_cfg.backend_timeouts()
+        return cfg.agent.stall_timeout_ms_for_state(
+            entry.issue.state, stall_timeout_ms
+        )
+
     async def _reconcile_running(self, cfg: ServiceConfig) -> None:
         # Part A: isolate each heartbeat/stall/eject lifecycle.
-        _, _, stall_timeout_ms = cfg.backend_timeouts()
         now = datetime.now(timezone.utc)
         for issue_id, entry in list(self._running.items()):
             try:
                 self._heartbeat_run_lease(issue_id, entry)
+                stall_timeout_ms = self._stall_timeout_ms_for_entry(cfg, entry)
                 if stall_timeout_ms > 0:
                     self._reconcile_stall_state(
                         issue_id,
@@ -6963,6 +6649,24 @@ class Orchestrator:
         client = build_tracker_client(cfg)
         try:
             record = getattr(client, "record_agent_kind", None)
+            if record is None:
+                return
+            record(identifier, agent_kind)
+        finally:
+            client.close()
+
+    @staticmethod
+    def _tracker_call_record_last_agent_kind(
+        cfg: ServiceConfig, identifier: str, agent_kind: str
+    ) -> None:
+        """Best-effort: persist the audit-only `last_agent_kind` stamp.
+
+        Used instead of the pin on `stage_kinds`-routed boards, where writing
+        the pin would freeze the first lane's backend for the whole ticket.
+        """
+        client = build_tracker_client(cfg)
+        try:
+            record = getattr(client, "record_last_agent_kind", None)
             if record is None:
                 return
             record(identifier, agent_kind)
