@@ -599,6 +599,8 @@ async def test_sessions_run_independently(
     assert [s["session_id"] for s in listing["sessions"]] == [first, second]
     assert listing["active_id"] == second
     assert listing["max_sessions"] == chat_module.MAX_SESSIONS
+    assert listing["default_agent_kind"] == "claude"
+    assert listing["supported_agent_kinds"] == sorted(chat_module.SUPPORTED_AGENT_KINDS)
 
     fake_backends[0].gate.set()
     await _wait_turn(manager, first)

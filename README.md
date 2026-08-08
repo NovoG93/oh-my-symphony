@@ -770,8 +770,10 @@ found" instead of silently dropped.
 
 ## Chat intake — type a request, the board delivers
 
-The admin UI ships a **Chat** page backed by the same agent CLIs. Chat is
-not just Q&A: in edit mode the chat agent follows a board-intake protocol.
+The admin UI ships a **Chat** page backed by the same agent CLIs. Each new
+session lets you choose Claude Code, Codex, Gemini CLI, AGY, Kiro, OpenCode,
+Pi, or Prime Agent; the workflow's configured agent is selected by default.
+Chat is not just Q&A: in edit mode the chat agent follows a board-intake protocol.
 Type a request; the agent confirms scope (at most two turns, and only when
 the request is ambiguous), then files tickets through the validated board
 tool — never freehand ticket markdown:

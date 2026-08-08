@@ -2491,6 +2491,17 @@
     currentId: null, sessions: null, autoCreatePromise: null,
   };
 
+  const CHAT_AGENT_LABELS = {
+    agy: 'AGY',
+    claude: 'Claude Code',
+    codex: 'Codex',
+    gemini: 'Gemini CLI',
+    kiro: 'Kiro',
+    opencode: 'OpenCode',
+    pi: 'Pi',
+    'prime-agent': 'Prime Agent',
+  };
+
   const CHAT_FONT_KEY = 'symphony.chatFontSize';
   const CHAT_FONT_MIN = 12;
   const CHAT_FONT_MAX = 20;
@@ -2693,6 +2704,13 @@
   }
 
   function openNewChatSessionModal(view) {
+    const listing = chatState.sessions || {};
+    const supportedKinds = listing.supported_agent_kinds || Object.keys(CHAT_AGENT_LABELS);
+    const agentSelect = el('select', { class: 'select' }, supportedKinds.map((kind) =>
+      el('option', { value: kind }, CHAT_AGENT_LABELS[kind] || kind)
+    ));
+    const defaultKind = listing.default_agent_kind || 'claude';
+    if (supportedKinds.includes(defaultKind)) agentSelect.value = defaultKind;
     const modeSelect = el('select', { class: 'select' }, [
       el('option', { value: 'qa' }, t('chat.qaReadOnly')),
       el('option', { value: 'edit' }, t('chat.editCoworking')),
@@ -2702,6 +2720,7 @@
     openFormModal({
       title: t('chat.newSession'),
       body: el('div', { class: 'form-stack' }, [
+        field(t('common.agent'), agentSelect),
         field(t('common.mode'), modeSelect),
         fieldRow([
           field(t('chat.warnAfterTurns'), turnsInput),
@@ -2712,6 +2731,7 @@
       submitLabel: t('chat.startSession'),
       onSubmit: async () => {
         const snapshot = await api.createChatSession2({
+          agent_kind: agentSelect.value,
           mode: modeSelect.value,
           max_turns: Math.max(0, Number(turnsInput.value) || 0),
           max_tokens: Math.max(0, Number(tokensInput.value) || 0),

@@ -200,6 +200,10 @@ def test_web_chat_multi_session_contract() -> None:
     assert "function renderChatSessionBar(view)" in js
     assert "function buildChatResumeControl(view, resumable, atLimit)" in js
     assert "function openNewChatSessionModal(view)" in js
+    assert "const CHAT_AGENT_LABELS" in js
+    assert "agent_kind: agentSelect.value" in js
+    assert "listing.supported_agent_kinds" in js
+    assert "listing.default_agent_kind" in js
     assert "function focusChatSocket(sessionId)" in js
     assert "JSON.stringify({ type: 'focus', session_id: sessionId || null })" in js
     assert "?session=${encodeURIComponent(chatState.currentId)}" in js
