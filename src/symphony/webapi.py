@@ -33,6 +33,7 @@ from .errors import (
     ChatBusyError,
     ChatNoSessionError,
     ChatSessionExistsError,
+    ConfigValidationError,
     SymphonyError,
 )
 from .issue import Issue, registration_order_key
@@ -46,7 +47,13 @@ from .utils.auto_merge import auto_merge_on_done_best_effort
 from .utils.git_ops import GitOpResult
 from .orchestrator import Orchestrator
 from .orchestrator.run_registry import clamp_run_history_limit
-from .workflow import SUPPORTED_AGENT_KINDS, SYMPHONY_BRANCH_PREFIX, ServiceConfig
+from .workflow import (
+    SUPPORTED_AGENT_KINDS,
+    SUPPORTED_CI_MODES,
+    SYMPHONY_BRANCH_PREFIX,
+    ServiceConfig,
+    validated_ci_modes,
+)
 from .workflow.mutate import (
     StateSpec,
     WorkflowMutationError,
@@ -73,7 +80,7 @@ _MAX_BODY = 128_000
 _MAX_LABELS = 20
 _ALLOWED_HOSTS = {"localhost", "127.0.0.1", "[::1]"}
 _LOOPBACK_BINDS = {"", "localhost", "127.0.0.1", "::1", "[::1]"}
-_CI_EDITABLE_KEYS = {"enabled", "interval_ms", "max_turns", "agent_kind"}
+_CI_EDITABLE_KEYS = {"enabled", "interval_ms", "max_turns", "agent_kind", "modes"}
 BIND_HOST_KEY: web.AppKey[str] = web.AppKey("symphony.bind_host", str)
 CHAT_MANAGER_KEY: web.AppKey[ChatManager] = web.AppKey("symphony.chat", ChatManager)
 _MAX_CHAT_MESSAGE = 32_000
@@ -261,6 +268,13 @@ def _continuous_improvement_payload(cfg: ServiceConfig) -> dict[str, Any]:
         "ticket_prefix": ci.ticket_prefix,
         "max_tickets_per_run": ci.max_tickets_per_run,
         "require_idle_board": ci.require_idle_board,
+        "modes": list(ci.modes),
+        "resolved_modes": list(ci.resolved_modes()),
+        "supported_modes": list(SUPPORTED_CI_MODES),
+        "mode_interval_hours": {
+            mode: ci.interval_hours_for(mode) for mode in SUPPORTED_CI_MODES
+        },
+        "max_improvement_tickets_per_run": ci.max_improvement_tickets_per_run,
     }
 
 
@@ -464,11 +478,24 @@ def _parse_ci_settings(body: dict[str, Any]) -> dict[str, Any]:
         updates["max_turns"] = value
     if "agent_kind" in body:
         updates["agent_kind"] = _check_agent_kind(body["agent_kind"])
+    if "modes" in body:
+        updates["modes"] = _check_ci_modes(body["modes"])
     if not updates:
         raise WorkflowMutationError(
-            "body must set enabled, interval_ms, max_turns, and/or agent_kind"
+            "body must set enabled, interval_ms, max_turns, modes, "
+            "and/or agent_kind"
         )
     return updates
+
+
+def _check_ci_modes(raw: Any) -> list[str]:
+    """Improvement modes; `[]` clears back to readiness-only."""
+    if raw is None:
+        return []
+    try:
+        return list(validated_ci_modes(raw))
+    except ConfigValidationError as exc:
+        raise WorkflowMutationError(exc.message) from exc
 
 
 def _check_state(cfg: ServiceConfig, raw: Any) -> str:
@@ -973,6 +1000,7 @@ def _register_workflow_routes(
             interval_ms=updates.get("interval_ms"),
             max_turns=updates.get("max_turns"),
             agent_kind=updates.get("agent_kind"),
+            modes=updates.get("modes"),
         )
         new_cfg, err = orchestrator.workflow_state.reload()
         if new_cfg is None:

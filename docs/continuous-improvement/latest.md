@@ -36,6 +36,14 @@ operator opts in from the web settings card or `WORKFLOW.md`.
 | (none yet) | — | — |
 <!-- ci:auto:checks:end -->
 
+## Improvement modes
+
+<!-- ci:auto:modes:start -->
+| Mode | Result | Detail | Tickets |
+| --- | --- | --- | --- |
+| (none yet) | — | — | — |
+<!-- ci:auto:modes:end -->
+
 ## Evidence
 
 <!-- ci:auto:evidence:start -->

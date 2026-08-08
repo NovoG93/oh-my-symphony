@@ -695,6 +695,24 @@ async def test_workflow_get_includes_continuous_improvement(
         "ticket_prefix": "CI",
         "max_tickets_per_run": 5,
         "require_idle_board": True,
+        "modes": [],
+        # Disabled: nothing resolves, so nothing runs.
+        "resolved_modes": [],
+        "supported_modes": [
+            "readiness",
+            "blocked_fixes",
+            "security",
+            "market_research",
+            "feature_improvements",
+        ],
+        "mode_interval_hours": {
+            "readiness": 0.0,
+            "blocked_fixes": 0.0,
+            "security": 24.0,
+            "market_research": 168.0,
+            "feature_improvements": 72.0,
+        },
+        "max_improvement_tickets_per_run": 3,
     }
     assert "codex" in payload["agent_kinds"]
     assert "claude" in payload["agent_kinds"]
@@ -745,6 +763,39 @@ async def test_continuous_improvement_put_validates_and_persists(
     assert "interval_ms: 120000" in text
     assert "max_turns: 3" in text
     assert "agent_kind: opencode" in text
+
+
+async def test_continuous_improvement_put_modes_roundtrip(
+    client: TestClient, board_dir: Path
+) -> None:
+    resp = await client.put(
+        "/api/v1/workflow/continuous-improvement",
+        json={"modes": ["nonsense"]},
+    )
+    assert resp.status == 400
+
+    resp = await client.put(
+        "/api/v1/workflow/continuous-improvement",
+        json={"enabled": True, "modes": ["market_research", "Blocked_Fixes"]},
+    )
+
+    assert resp.status == 200
+    payload = await resp.json()
+    ci = payload["continuous_improvement"]
+    assert payload["updated"] == ["enabled", "modes"]
+    assert ci["modes"] == ["blocked_fixes", "market_research"]
+    assert ci["resolved_modes"] == ["blocked_fixes", "market_research"]
+    text = (board_dir / "WORKFLOW.md").read_text(encoding="utf-8")
+    assert "modes:" in text
+
+    # Clearing the list falls back to the readiness-only default.
+    resp = await client.put(
+        "/api/v1/workflow/continuous-improvement", json={"modes": []}
+    )
+    assert resp.status == 200
+    ci = (await resp.json())["continuous_improvement"]
+    assert ci["modes"] == []
+    assert ci["resolved_modes"] == ["readiness"]
 
 
 async def test_continuous_improvement_put_guards_json_contract(

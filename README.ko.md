@@ -36,6 +36,7 @@
 - [첫 작업 Quickstart](#quickstart--your-first-task-end-to-end)
 - [레인 프리셋](#lane-presets)
 - [채팅 인테이크](#chat-intake--채팅에-요청하면-보드가-배달한다)
+- [지속적 개선](#continuous-improvement--실험적-자율-유지보수)
 - [실행](#run)
 - [구조](#layout)
 - [테스트](#tests)
@@ -623,6 +624,42 @@ blocker, 비순환 DAG)을 통과한다. Q&A 모드에서는 에이전트가 등
 보드가 배달한다.
 
 ---
+## Continuous improvement — 실험적 자율 유지보수
+
+**실험 기능이며 전부 opt-in이다.** `WORKFLOW.md`에 `continuous_improvement:`
+블록이 없으면 아무것도 실행되지 않는다.
+
+하트비트는 제품 코드를 건드리지 않고 주기적으로 저장소를 점검한 뒤, 발견한
+것을 **일반 보드 티켓**으로 등록하는 스케줄러다. 등록된 티켓은 다른 요청과
+똑같이 평소 파이프라인을 탄다. 각 기능은 독립된 모드다:
+
+```yaml
+continuous_improvement:
+  enabled: true
+  interval_ms: 1800000            # 하트비트 주기
+  modes: [readiness, blocked_fixes, security, market_research,
+          feature_improvements]
+  mode_interval_hours:            # 모드별 최소 간격 (선택)
+    market_research: 168          # 주 1회
+  max_improvement_tickets_per_run: 3
+```
+
+| 모드 | 하는 일 |
+| --- | --- |
+| `readiness` | 검증된 baseline에서 테스트/린트/타입체크를 돌리고 실패를 버그 티켓으로 만든다. 기존 동작. |
+| `blocked_fixes` | `Blocked` / `Human Review` 티켓을 분류해 근본 원인 메모가 담긴 수정 티켓을 만들고, 원본 티켓에 `blocked_by`로 연결한다. |
+| `security` | 선택적 의존성/취약점 스캔(`pip-audit`, `npm audit`)을 패치 티켓으로 만든다. 스캐너가 없으면 실패가 아니라 not available이다. |
+| `market_research` | 에이전트 턴 한 번으로 **이 앱**에 맞는 최신 트렌드·경쟁 제품 기능을 조사해(README/docs/wiki 기반) 근거 링크와 함께 개선안을 제안한다. |
+| `feature_improvements` | 에이전트 턴 한 번으로 UX와 코드 건강도를 검토해 개선안을 제안한다. |
+
+`modes:` 없이 `enabled: true`만 두면 readiness만 실행된다 — 모드 도입 전과
+동일하다. 제안 티켓은 실행당 개수 상한이 있고, 열린 티켓과 중복 제거되며,
+`ci` 라벨이 붙고, 하나의 `REQ-CI-<날짜>-<n>` 요청 그룹으로 묶인다. 에이전트
+모드는 간결한 프롬프트(`docs/symphony-prompts/ci/`에서 교체 가능)를 받고,
+JSON 제안 파일 외에는 아무것도 쓰지 않는다 — 티켓 등록은 하트비트가 한다.
+모드와 주기는 웹 **Settings** 페이지에서도 편집할 수 있다.
+
+---
 ## Run
 
 ### Web app + JSON API
@@ -831,7 +868,7 @@ tui-open.bat           Windows equivalent
 pytest -q
 ```
 
-테스트 스위트(1575 passed, 7 skipped)는 업스트림 적합성 스위트, 백엔드 단위
+테스트 스위트(1614 passed, 7 skipped)는 업스트림 적합성 스위트, 백엔드 단위
 테스트(팩토리, 이벤트 정규화, CLI별 명령/세션 처리), 보드 도구 DAG 검증,
 run registry 영속성, file tracker locking, 웹 API contract, 채팅 인테이크,
 레인 프리셋, 그리고 TUI 앱에 대한 Textual `Pilot` 구동 스모크 테스트를

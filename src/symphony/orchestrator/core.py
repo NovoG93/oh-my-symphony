@@ -27,6 +27,7 @@ import traceback
 from dataclasses import dataclass, replace
 from datetime import datetime, timedelta, timezone
 from enum import Enum
+from functools import partial
 from pathlib import Path
 from typing import Any, Awaitable, Callable, Coroutine
 
@@ -44,6 +45,7 @@ from ..backends import (
     BackendInit,
 )
 from ..backends import build_backend
+from ..chat import cfg_for_mode
 from ..utils.archive import select_archivable
 from ..backends.codex import linear_graphql_tool
 from ..errors import (
@@ -54,7 +56,9 @@ from ..errors import (
     TurnCancelled,
 )
 from ..continuous_improvement import (
+    AgentTask,
     FileLease,
+    any_mode_due,
     ImprovementRunner,
     Lease,
     default_improvement_runner,
@@ -254,6 +258,7 @@ def _initial_improvement_status() -> dict[str, Any]:
         "interval_ms": 0,
         "max_turns": 0,
         "agent_kind": "",
+        "modes": [],
         "in_flight": False,
         "current_phase": None,
         "last_started_at": None,
@@ -264,6 +269,8 @@ def _initial_improvement_status() -> dict[str, Any]:
         "skipped_reason": None,
         "last_verified_branch": None,
         "last_verified_sha": None,
+        "last_mode_results": [],
+        "last_request_id": None,
     }
 
 
@@ -642,7 +649,17 @@ class Orchestrator:
         # — never a worker slot. Due-math uses the monotonic clock so a
         # wall-clock jump can't wedge it. Runner + lease are injectable so
         # tests never spawn real subprocesses or touch a shared lockfile.
-        self._improvement_runner = improvement_runner or default_improvement_runner
+        # Agent-driven improvement modes need a real backend turn. The CI
+        # module must stay orchestrator-free, so the capability is injected:
+        # binding it as a keyword partial keeps the 3-positional
+        # `ImprovementRunner` signature every injected test fake implements.
+        self._improvement_runner: ImprovementRunner = (
+            improvement_runner
+            or partial(
+                default_improvement_runner,
+                agent_runner=self._run_improvement_agent,
+            )
+        )
         self._improvement_lease = improvement_lease
         self._improvement_task: asyncio.Task[None] | None = None
         self._improvement_run_timeout_s: float = DEFAULT_IMPROVEMENT_RUN_TIMEOUT_S
@@ -3095,6 +3112,7 @@ class Orchestrator:
             interval_ms=ci.interval_ms,
             max_turns=ci.max_turns,
             agent_kind=ci.agent_kind,
+            modes=list(ci.resolved_modes()),
         )
         if not ci.enabled:
             return
@@ -3129,6 +3147,12 @@ class Orchestrator:
             self._running or self._retry or self._terminal_persist_pending
         ):
             self._improvement_status["skipped_reason"] = "board_busy"
+            return
+        # Per-mode cadence (`mode_interval_hours`): when every enabled mode is
+        # still cooling down, re-arm the heartbeat without spending a turn.
+        if not any_mode_due(cfg, cfg.workflow_path.parent):
+            self._improvement_status["skipped_reason"] = "no_modes_due"
+            self._next_improvement_due_monotonic = now + interval_s
             return
 
         self._improvement_status["skipped_reason"] = None
@@ -3179,6 +3203,16 @@ class Orchestrator:
                 tickets_created=result.tickets_created,
                 last_verified_branch=result.verified_branch,
                 last_verified_sha=result.verified_sha,
+                last_mode_results=[
+                    {
+                        "mode": outcome.mode,
+                        "status": outcome.status,
+                        "summary": outcome.summary,
+                        "ticket_ids": list(outcome.ticket_ids),
+                    }
+                    for outcome in result.modes
+                ],
+                last_request_id=result.request_id,
             )
             consumed = True
         except asyncio.CancelledError:
@@ -3216,6 +3250,43 @@ class Orchestrator:
                 self._improvement_status["last_finished_at"] = _utc_iso_z()
             self._improvement_status.update(in_flight=False, current_phase=None)
 
+    async def _run_improvement_agent(self, task: AgentTask) -> str:
+        """Give an agent-driven improvement mode one backend turn.
+
+        This is the orchestrator-side capability the continuous-improvement
+        module is handed (it must not import the orchestrator). The turn runs
+        against the host repo with `cwd == workspace_root == workflow_dir`,
+        exactly like a chat turn, and outside the dispatch slot accounting —
+        the heartbeat already holds the idle board. Enforcement of "read
+        only except the proposal file" is the prompt's job; the backend is
+        left in its normal editing mode so the agent can write that one file.
+        """
+        cfg = self._workflow_state.current()
+        if cfg is None:
+            raise SymphonyError("no workflow configuration loaded")
+        ci = cfg.continuous_improvement
+        agent_cfg, _ = cfg_for_mode(cfg, "edit", ci.agent_kind or cfg.agent.kind)
+
+        async def _ignore_event(_event: dict[str, Any]) -> None:
+            return None
+
+        backend = self._build_agent_backend(
+            BackendInit(
+                cfg=agent_cfg,
+                cwd=task.cwd,
+                workspace_root=task.cwd,
+                on_event=_ignore_event,
+            )
+        )
+        await backend.start()
+        try:
+            await backend.initialize()
+            await backend.start_session(initial_prompt="", issue_title=None)
+            result = await backend.run_turn(prompt=task.prompt, is_continuation=False)
+        finally:
+            await backend.stop()
+        return result.last_message or ""
+
     def _report_improvement_phase(self, phase: str) -> None:
         self._improvement_status["current_phase"] = phase
 
@@ -3245,6 +3316,7 @@ class Orchestrator:
                 interval_ms=ci.interval_ms,
                 max_turns=ci.max_turns,
                 agent_kind=ci.agent_kind,
+                modes=list(ci.resolved_modes()),
             )
         status["turns_used"] = self._improvement_turns_used
         status["in_flight"] = (

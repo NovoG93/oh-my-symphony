@@ -1251,6 +1251,120 @@ def test_continuous_improvement_reads_configured_values(tmp_path):
     assert ci.require_idle_board is False
 
 
+def test_continuous_improvement_modes_default_to_readiness_only(tmp_path):
+    """Back-compat: `enabled: true` with no `modes:` is the old heartbeat."""
+    path = _write(
+        tmp_path,
+        textwrap.dedent(
+            """\
+            ---
+            tracker: { kind: linear, project_slug: x, api_key: xx }
+            continuous_improvement:
+              enabled: true
+            ---
+            body
+            """
+        ),
+    )
+    ci = build_service_config(load_workflow(path)).continuous_improvement
+    assert ci.modes == ()
+    assert ci.resolved_modes() == ("readiness",)
+    assert ci.max_improvement_tickets_per_run == 3
+
+
+def test_continuous_improvement_disabled_resolves_no_modes(tmp_path):
+    path = _write(
+        tmp_path,
+        textwrap.dedent(
+            """\
+            ---
+            tracker: { kind: linear, project_slug: x, api_key: xx }
+            continuous_improvement:
+              enabled: false
+              modes: [readiness, market_research]
+            ---
+            body
+            """
+        ),
+    )
+    ci = build_service_config(load_workflow(path)).continuous_improvement
+    assert ci.modes == ("readiness", "market_research")
+    assert ci.resolved_modes() == ()
+
+
+def test_continuous_improvement_modes_normalize_and_order(tmp_path):
+    path = _write(
+        tmp_path,
+        textwrap.dedent(
+            """\
+            ---
+            tracker: { kind: linear, project_slug: x, api_key: xx }
+            continuous_improvement:
+              enabled: true
+              modes: [Security, blocked_fixes, security]
+              mode_interval_hours:
+                market_research: 12
+                security: 0
+              max_improvement_tickets_per_run: 2
+            ---
+            body
+            """
+        ),
+    )
+    ci = build_service_config(load_workflow(path)).continuous_improvement
+    assert ci.modes == ("blocked_fixes", "security")
+    assert ci.resolved_modes() == ("blocked_fixes", "security")
+    assert ci.interval_hours_for("market_research") == 12.0
+    assert ci.interval_hours_for("security") == 0.0
+    # Unset modes keep the shipped cadence default.
+    assert ci.interval_hours_for("feature_improvements") == 72.0
+    assert ci.max_improvement_tickets_per_run == 2
+
+
+@pytest.mark.parametrize(
+    "raw_value",
+    ["[bogus]", "readiness", "[1]", "{}"],
+)
+def test_continuous_improvement_modes_reject_bad_values(tmp_path, raw_value):
+    path = _write(
+        tmp_path,
+        textwrap.dedent(
+            f"""\
+            ---
+            tracker: {{ kind: linear, project_slug: x, api_key: xx }}
+            continuous_improvement: {{ modes: {raw_value} }}
+            ---
+            body
+            """
+        ),
+    )
+    with pytest.raises(ConfigValidationError):
+        build_service_config(load_workflow(path))
+
+
+@pytest.mark.parametrize(
+    "raw_value",
+    ["{ bogus: 3 }", "{ security: -1 }", "{ security: \"3\" }", "[security]"],
+)
+def test_continuous_improvement_mode_interval_hours_reject_bad_values(
+    tmp_path, raw_value
+):
+    path = _write(
+        tmp_path,
+        textwrap.dedent(
+            f"""\
+            ---
+            tracker: {{ kind: linear, project_slug: x, api_key: xx }}
+            continuous_improvement: {{ mode_interval_hours: {raw_value} }}
+            ---
+            body
+            """
+        ),
+    )
+    with pytest.raises(ConfigValidationError):
+        build_service_config(load_workflow(path))
+
+
 def test_continuous_improvement_max_turns_zero_means_unlimited(tmp_path):
     path = _write(
         tmp_path,
