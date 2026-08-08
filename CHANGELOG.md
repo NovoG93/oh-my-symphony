@@ -10,6 +10,8 @@ Versioning: [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.17.0] - 2026-08-08 - Minimal Symphony: chat-to-delivery ticket DAGs
+
 The "minimal" line: delete duplicate machinery, keep every operator-facing
 feature, and turn chat into a gated ticket-DAG pipeline.
 
