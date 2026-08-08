@@ -62,7 +62,12 @@ from ..logging import get_logger
 from ..skills import normalize_skill_names
 from ..ticket_markdown import parse_body_dependency_ids
 from ..workflow import TrackerConfig
-from .validate import board_edges, dangling_blockers, find_cycle
+from .validate import (
+    board_edges,
+    dangling_blockers,
+    find_cycle,
+    validate_identifier,
+)
 
 
 _FRONT_MATTER_DELIM = "---"
@@ -909,6 +914,7 @@ class FileBoardTracker:
         blocked_by: list[str] | None = None,
         request: str | None = None,
     ) -> Path:
+        identifier = validate_identifier(identifier)
         path = self._root / f"{identifier}.md"
         with _exclusive_lock(self._ticket_lock_path(identifier)):
             if self.find_path(identifier) is not None:
@@ -984,6 +990,8 @@ class FileBoardTracker:
         `blocked_by=[]` clears the frontmatter blocker list; `request=""`
         clears the request grouping field.
         """
+        identifier = validate_identifier(identifier)
+
         def mutate(front: dict[str, Any], body: str) -> tuple[dict[str, Any], str]:
             if title is not None:
                 front["title"] = title

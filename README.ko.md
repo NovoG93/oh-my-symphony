@@ -192,8 +192,9 @@ CLI에서 파일 보드 티켓을 만들 때는
 `agent.stage_kinds`는 보드 상태를 에이전트 kind에 매핑해서, 가벼운 레인은
 저렴하고 빠른 에이전트가(예: `Todo: gemini`, `Document: gemini`), Plan/Build/Review는
 강한 기본 에이전트가 맡게 한다. 디스패치별 우선순위: 티켓 `agent_kind` 고정 >
-`agent.stage_kinds[state]` > `agent.kind`. 상태가 바뀐 티켓은 다음 디스패치에서
-새 스테이지의 백엔드를 받는다.
+`agent.stage_kinds[state]` > `agent.kind`. 백엔드는 상태가 바뀔 때마다 다시
+결정된다 — 한 번의 디스패치 안에서 일어나는 레인 전환도 포함이라, In Progress →
+Verify → Document를 한 디스패치로 걷는 티켓도 레인마다 설정된 백엔드를 받는다.
 
 파일 보드 워크플로에서 `agent.auto_triage_actionable_todo`는 기본값이
 `true`다: 본문과 `Acceptance Criteria` 섹션이 있는 Todo 티켓은 모델 턴을 쓰지 않고

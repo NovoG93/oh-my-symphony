@@ -11,6 +11,12 @@
 #   SYMPHONY_WORKFLOW_DIR        Path to the host repo containing WORKFLOW.md.
 #   SYMPHONY_FEATURE_BASE_BRANCH Optional override for the new branch's start point.
 #   SYMPHONY_MERGE_TARGET_BRANCH Optional override for the Document-gate merge target.
+#   SYMPHONY_BOARD_ROOT_NAME     Board root relative to SYMPHONY_WORKFLOW_DIR
+#                                (e.g. `kanban`, `board`). Defaults to `kanban`
+#                                for hand-written configs that predate it. A
+#                                board that is not linked here leaves the worker
+#                                writing a private board copy the orchestrator
+#                                never sees.
 set -euo pipefail
 ISSUE_ID="$(basename "$PWD")"
 HOST_REPO="${SYMPHONY_WORKFLOW_DIR:?SYMPHONY_WORKFLOW_DIR not set}"
@@ -149,7 +155,7 @@ _symphony_link_dir() {
     ln -s "$source" "$target"
   fi
 }
-for dir in kanban; do
+for dir in ${SYMPHONY_BOARD_ROOT_NAME:-kanban}; do
   [ -e "$HOST_REPO/$dir" ] || continue
   tracked_file="$(git rev-parse --git-path "symphony-${dir}-tracked")"
   git ls-files -z -- "$dir" > "$tracked_file" || true

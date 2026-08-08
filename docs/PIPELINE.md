@@ -18,7 +18,7 @@ plus the current state's stage prompt for each fresh turn.
 | --- | --- | --- |
 | Todo | triage/router | `## Triage`, then route actionable work to `In Progress` or explain `Blocked` |
 | In Progress | implementer | `## Plan`, `## Acceptance Tests`, `## Done Signals`, `## Implementation`, `## Self-Critique`, plus goal/before/after proof notes under `docs/<ID>/work/` |
-| Verify | reviewer + QA + merge gate | `## Security Audit`, clean `## Review` or `## Review Findings`, `## QA Evidence`, `## AC Scorecard`, `## Merge Status`, plus not-covered and rerun guidance |
+| Verify | reviewer + QA + merge preflight | `## Security Audit`, clean `## Review` or `## Review Findings`, `## QA Evidence`, `## AC Scorecard`, `## Merge Status`, plus not-covered and rerun guidance |
 | Document | distiller | `docs/llm-wiki/` updates, `## Wiki Updates`, `## As-Is -> To-Be Report`; may rewind real defects to `In Progress` |
 | Human Review | operator | manual intervention or explicit review before `Done` |
 | Done | reporter | `## As-Is -> To-Be Report` with goal, evidence, residual risk, and how to re-run |
@@ -32,8 +32,8 @@ turns. The new shape keeps the important gates while reducing context loss:
 - Todo only decides whether a ticket is actionable.
 - In Progress owns planning and implementation together, so the worker does
   not hand its own plan to a different fresh context before writing code.
-- Verify keeps review, execution, acceptance scorecard, and merge proof in one
-  compulsory lane.
+- Verify keeps review, execution, acceptance scorecard, and merge preflight in
+  one compulsory lane; the merge itself happens once, at Done.
 - Document remains a separate write-back lane because durable project knowledge is
   different from verification evidence.
 
@@ -70,7 +70,29 @@ Verify must produce:
   and how to re-run the proof.
 - `## AC Scorecard` - acceptance criteria with signal, source, pass/fail
   status, and evidence path.
-- `## Merge Status` - target branch, merge or PR proof, and final commit/ref.
+- `## Merge Status` - target branch, feature branch, and the
+  `git merge-tree --write-tree` preflight result.
+
+## One merge per ticket
+
+There is exactly one merge, and the orchestrator makes it:
+
+> **Verify proves, Document documents, the orchestrator merges.** Verify runs a
+> `git merge-tree --write-tree` preflight and records the result; when the
+> ticket reaches `Done`, `agent.auto_merge_on_done` creates the single
+> `--no-ff` merge commit on the target branch.
+
+This ordering is also the wiki write-back rule. The wiki is a host-repo,
+tracked path (`<workflow-dir>/docs/llm-wiki/`, configurable via `wiki.root`).
+Workers write it **inside their worktree** at the same relative path; the
+per-turn wip commit carries it and the Done merge delivers it. The wiki is
+never symlinked into the workspace and never written directly to the host
+tree. If you do symlink it (to share it across tickets), add that path to
+`agent.auto_merge_capture_untracked` so the merge commit still carries it.
+
+A Verify lane that hand-merged produced two merge commits per ticket and landed
+code on the target branch *before* Document ran — which is why wiki write-back
+used to arrive inconsistently.
 
 Any CRITICAL/HIGH/MEDIUM review issue, failed command, failed AC, or failed
 security row rewinds to `In Progress`. Verify should not hide failures by

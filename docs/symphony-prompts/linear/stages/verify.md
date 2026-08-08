@@ -1,8 +1,8 @@
-### VERIFY -- prove it and merge safely
+### VERIFY -- prove it, and prove it would merge
 
 Read the full diff, tests, `docs/{{ issue.identifier }}/work/`, and ticket sections. Write evidence under `docs/{{ issue.identifier }}/qa/` and ticket comments; run real commands. Do NOT make unrelated source edits.
 
-Verify has three jobs: review, QA, and merge preflight/merge. The card must say what worked, what failed, what is not covered, how to re-run the proof, and whether the branch merged cleanly.
+Verify has three jobs: review, QA, and merge preflight. **Verify proves, Document documents, the orchestrator merges** -- exactly one merge happens per ticket, created by the orchestrator when the ticket reaches `Done`. The card must say what worked, what failed, what is not covered, how to re-run the proof, and whether the branch would merge cleanly.
 
 1. Review the diff against the ticket, `## Plan`, `## Acceptance Tests`, and `## Done Signals`. No orphan scope.
 2. Append `## Security Audit` with exactly 7 rows: secrets, input-validation, injection, xss, csrf, authz, rate-limit. Result `pass` / `fail` / `n/a`; every `pass`/`fail` row cites a durable `qa/...` or `work/...` artifact; never a source anchor like `todo.py:54`; `n/a` rows may carry a short reason instead.
@@ -16,13 +16,13 @@ Verify has three jobs: review, QA, and merge preflight/merge. The card must say 
 6. Append `## AC Scorecard` -- one row per acceptance criterion: signal, source, result, evidence path. Evidence cells must cite files under `docs/{{ issue.identifier }}/` as `qa/...` or `work/...` (backtick spans; source anchors and prose live inside the cited artifact, not the cell).
 7. Any required command fails or evidence disproves an AC -> append `## QA Failure`, set state to `In Progress`, stop.
 {% if agent.auto_merge_on_done %}
-8. Merge Gate:
+8. Merge preflight (you prove, you do NOT merge -- the orchestrator creates the single `--no-ff` merge commit when the ticket reaches `Done`, after Document has written its docs):
    - Resolve target in order: `agent.auto_merge_target_branch`, `agent.feature_base_branch`, current host branch.
    - From the host repo run `git merge-tree --write-tree <target-branch> symphony/{{ issue.identifier }}`; save output to `docs/{{ issue.identifier }}/qa/merge-tree.log`. Do not merge the target branch into the ticket workspace. Do not use `git status -uno --porcelain` as merge proof.
    - Committed conflicts -> set state to `Blocked`, append `## Merge Failure` (command, target branch, conflicted paths), stop.
    - Clean -> check host dirty tracked files against `git diff --name-only <target-branch>..symphony/{{ issue.identifier }}`; block only on real overlap.
-   - Safe -> create the explicit `--no-ff` merge commit on the target branch; record target branch, feature branch, command, and merge SHA under `## Merge Status`.
+   - Safe -> append `## Merge Status: preflight clean, orchestrator will merge at Done` with target branch, feature branch, and the preflight command. Do NOT create the merge commit yourself: a hand-merge here produces a second merge commit and lands code on the target branch before Document writes the wiki, which is why wiki write-back used to arrive inconsistently.
 {% else %}
-8. Merge Gate is disabled (`agent.auto_merge_on_done` is false). Append `## Merge Status` noting this workflow intentionally leaves branch integration to the operator.
+8. Merge Gate is disabled (`agent.auto_merge_on_done` is false). Run the same `git merge-tree --write-tree` preflight and append `## Merge Status` recording the result plus the fact that this workflow intentionally leaves branch integration to the operator.
 {% endif %}
 9. Set state to `Document`.

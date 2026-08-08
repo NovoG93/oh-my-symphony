@@ -8,6 +8,30 @@ Two shipped presets (v2.1 owner decisions, docs/plans/minimal-symphony-plan.md):
   Review → Build → QA → Verify → Document) ported from the OneShot
   template, carrying its own lean bash gates per lane.
 
+Deep preset merge contract
+--------------------------
+
+Every lane of the deep preset is a *separate ticket*, so each gets its own
+worktree on its own ``symphony/<ID>`` branch. Downstream lanes (QA, Verify,
+Document) can only see a Build slice's code if that slice has already landed
+on the branch their worktree is cut from. The preset therefore requires:
+
+* ``agent.auto_merge_on_done: true`` — the orchestrator merges each slice
+  when its ticket reaches ``Done``; nothing else merges (the Verify lane
+  proves, it does not merge — see the single-merge rule in
+  ``docs/PIPELINE.md``).
+* ``agent.feature_base_branch == agent.auto_merge_target_branch`` — new
+  worktrees must start from the branch the merges land on. Both default to
+  the host repo's current branch, which satisfies this; setting only one of
+  them breaks it.
+* Build merges are gated by the **Review** lane's ``verdict: PASS``, not by
+  Verify: spawned Build tickets stay ``blocked_by`` the request ticket, and
+  the request ticket only reaches ``Done`` when Review passes. A Verify
+  ``verdict: RED`` reopens the offending Build tickets, so the *next* merge
+  is blocked by the reopened slice, not by rewinding an existing one.
+
+``symphony doctor`` reports this contract as ``board.deep_merge_contract``.
+
 A preset is a *starting point*, never a cage: `apply_lane_preset` in
 `workflow.mutate` writes these values into WORKFLOW.md through the same
 comment-preserving round-trip the lane CRUD uses, and every per-column

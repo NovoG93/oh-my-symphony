@@ -51,11 +51,43 @@ def _is_rewind_transition(
 
 
 def _branch_hook_env(cfg: ServiceConfig) -> dict[str, str]:
-    """Env consumed by the default worktree hook when creating a feature branch."""
-    return {
+    """Env consumed by the default worktree hook when creating a feature branch.
+
+    `SYMPHONY_BOARD_ROOT` / `SYMPHONY_BOARD_ROOT_NAME` let the setup hook link
+    the *configured* board root back into the workspace. Hooks that hardcode
+    `kanban` silently give the worker no board on any other `board_root`,
+    which the orchestrator sees only as an endless re-dispatch loop.
+    """
+    env = {
         "SYMPHONY_FEATURE_BASE_BRANCH": cfg.agent.feature_base_branch or "",
         "SYMPHONY_MERGE_TARGET_BRANCH": cfg.agent.auto_merge_target_branch or "",
     }
+    name = board_root_name_for_hooks(cfg)
+    root = cfg.tracker.board_root
+    if root is not None:
+        env["SYMPHONY_BOARD_ROOT"] = str(root.resolve())
+    if name is not None:
+        env["SYMPHONY_BOARD_ROOT_NAME"] = name
+    return env
+
+
+def board_root_name_for_hooks(cfg: ServiceConfig) -> str | None:
+    """Board root path relative to the workflow dir, or None when outside it.
+
+    Only a board that lives *inside* the workflow directory can be linked
+    into a worktree workspace by relative name; an out-of-tree board root is
+    reached by absolute path and needs no link.
+    """
+    root = cfg.tracker.board_root
+    if root is None:
+        return None
+    workflow_dir = cfg.workflow_path.parent.resolve()
+    try:
+        relative = root.resolve().relative_to(workflow_dir)
+    except ValueError:
+        return None
+    text = relative.as_posix()
+    return text or None
 
 
 async def _branch_already_merged_into_target(

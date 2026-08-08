@@ -2781,7 +2781,19 @@
     ]);
   }
 
-  function buildLanePresetCard(presets) {
+  function buildStageContractsRow(wf) {
+    // F-06: `agent.stage_contracts: auto` silently switches the mechanical
+    // evidence floor off as soon as a default lane is renamed. Say so here.
+    const agent = (wf && wf.agent) || {};
+    const enabled = agent.stage_contracts_enabled !== false;
+    const lanes = 'Todo, In Progress, Verify, Document';
+    return el('div', { class: enabled ? 'form-hint' : 'form-hint form-hint-warn' }, [
+      el('strong', null, t('settings.stageContracts') + ': '),
+      enabled ? t('settings.stageContractsOn') : t('settings.stageContractsOff', { lanes }),
+    ]);
+  }
+
+  function buildLanePresetCard(presets, wf) {
     const select = el(
       'select',
       { class: 'select' },
@@ -2808,6 +2820,7 @@
       el('h3', null, t('settings.lanePreset')),
       fieldRow([field(t('settings.lanePresetChoose'), select)]),
       el('div', { class: 'form-hint' }, t('settings.lanePresetHint')),
+      buildStageContractsRow(wf),
       applyButton,
     ]);
   }
@@ -2877,7 +2890,7 @@
       if (!state.board) state.board = board;
       clearNode(body);
       body.appendChild(buildContinuousImprovementCard(wf, ciStatus));
-      body.appendChild(buildLanePresetCard(lanePresets));
+      body.appendChild(buildLanePresetCard(lanePresets, wf));
       body.appendChild(buildBranchPolicyCard(wf));
       body.appendChild(buildBoardInfoCard(wf));
       body.appendChild(buildInterfaceCard());

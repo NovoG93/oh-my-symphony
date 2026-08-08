@@ -41,7 +41,11 @@ from .logging import get_logger
 from .skills import normalize_skill_names
 from .stats import StatsStore, stats_store_for
 from .trackers.file import FileBoardTracker, parse_ticket_file
-from .trackers.validate import validate_ticket_dependencies
+from .trackers.validate import (
+    IDENTIFIER_RE as _IDENTIFIER_RE,
+    IDENTIFIER_RULE as _IDENTIFIER_RULE,
+    validate_ticket_dependencies,
+)
 from .utils import git_inspect, git_ops
 from .utils.auto_merge import auto_merge_on_done_best_effort
 from .utils.git_ops import GitOpResult
@@ -70,7 +74,6 @@ log = get_logger()
 
 STATIC_DIR = Path(__file__).parent / "web" / "static"
 
-_IDENTIFIER_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_-]{0,63}$")
 _BRANCH_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/-]{0,199}$")
 _COMMIT_RE = re.compile(r"^[0-9a-fA-F]{4,64}$")
 # `ChatManager` mints these as <UTC date>-<UTC time>-<6 hex>.
@@ -290,6 +293,12 @@ def _workflow_payload(cfg: ServiceConfig) -> dict[str, Any]:
             "feature_base_branch": cfg.agent.feature_base_branch,
             "auto_merge_target_branch": cfg.agent.auto_merge_target_branch,
             "auto_merge_on_done": cfg.agent.auto_merge_on_done,
+            # F-06: the mechanical evidence floor is lane-name gated by
+            # default, so the UI must be able to say when it is off.
+            "stage_contracts": cfg.agent.stage_contracts,
+            "stage_contracts_enabled": cfg.agent.stage_contracts_enabled(
+                cfg.tracker.active_states
+            ),
         },
         "agent_kinds": sorted(SUPPORTED_AGENT_KINDS),
         "continuous_improvement": _continuous_improvement_payload(cfg),
@@ -330,9 +339,7 @@ def _check_identifier(raw: str) -> str:
     """
     identifier = (raw or "").strip()
     if not _IDENTIFIER_RE.match(identifier):
-        raise WorkflowMutationError(
-            "identifier must match ^[A-Za-z][A-Za-z0-9_-]{0,63}$"
-        )
+        raise WorkflowMutationError(f"identifier must match {_IDENTIFIER_RULE}")
     return identifier
 
 
@@ -399,9 +406,7 @@ def _check_request(raw: Any) -> str:
         raise WorkflowMutationError("request must be a string")
     request = raw.strip()
     if request and not _IDENTIFIER_RE.match(request):
-        raise WorkflowMutationError(
-            "request must match ^[A-Za-z][A-Za-z0-9_-]{0,63}$"
-        )
+        raise WorkflowMutationError(f"request must match {_IDENTIFIER_RULE}")
     return request
 
 

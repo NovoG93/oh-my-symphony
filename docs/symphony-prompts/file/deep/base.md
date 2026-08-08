@@ -23,7 +23,8 @@ This ticket depends on:
 Intake -> Research -> Plan <-> Review -> Build -> QA -> Verify -> Document -> Done
 ```
 
-- A request ticket walks `Intake -> Research -> Plan -> Review`. Plan spawns the downstream `Build`/`QA`/`Verify`/`Document` tickets as a DAG (`--blocked-by`); Review red-teams the plan before any Build dispatches.
+- A request ticket walks `Intake -> Research -> Plan -> Review`. Plan spawns the downstream `Build`/`QA`/`Verify`/`Document` tickets as a DAG (`--blocked-by`); Review red-teams the plan before any Build dispatches. Review's `verdict: PASS` moves the request ticket to `Done`, which is what releases the spawned Build tickets.
+- Merge contract: each ticket owns one `symphony/<ID>` branch in its own worktree. **The orchestrator merges a ticket's branch when that ticket reaches `Done` — no lane merges by hand.** Your worktree is cut from the merge target branch, so an earlier slice's code is present only because its ticket already reached `Done`. If you need a slice that is not yet merged, say so in the ticket and set `Blocked`; never cherry-pick or merge another ticket's branch yourself.
 - Vault: `docs/req/{{ issue.request }}/` when this ticket has a `request` group, else `docs/{{ issue.identifier }}/`. Lane outputs (`brief.md`, `research.md`, `plan.md`, `contracts.md`, `claims.md`, `qa-report.md`, `verification.md`, `delivery.md`) live there. `claims.md` and `verification.md` are append-only.
 - `docs/llm-wiki/` is the reusable knowledge base: read `INDEX.md` before broad repo search; Document writes back.
 - Ticket file: `kanban/{{ issue.identifier }}.md`. Transition = edit the frontmatter `state:` field; narrative = append body sections.

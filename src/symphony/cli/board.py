@@ -30,6 +30,7 @@ from ..trackers.validate import (
     dangling_blockers,
     find_cycle,
     topological_order,
+    validate_identifier,
     validate_ticket_dependencies,
 )
 from ..workflow import (
@@ -156,6 +157,11 @@ def _collect_labels(args: argparse.Namespace) -> list[str] | None:
 def cmd_new(args: argparse.Namespace) -> int:
     tracker = _get_tracker(args)
     fbt = FileBoardTracker(tracker)
+    try:
+        identifier = validate_identifier(args.id)
+    except SymphonyError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
     legal_states = {
         s.lower(): s for s in (*tracker.active_states, *tracker.terminal_states)
     }
@@ -172,12 +178,12 @@ def cmd_new(args: argparse.Namespace) -> int:
         description = _read_description(args)
         validate_ticket_dependencies(
             fbt.scan_all(),
-            identifier=args.id,
+            identifier=identifier,
             blocked_by=blocked_by,
             new_ticket=True,
         )
         path = fbt.create(
-            identifier=args.id,
+            identifier=identifier,
             title=args.title,
             state=state,
             priority=args.priority,

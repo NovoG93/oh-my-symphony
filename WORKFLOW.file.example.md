@@ -59,7 +59,7 @@ hooks:
     # to rebase.
     set -uo pipefail
     HOST_REPO="${SYMPHONY_WORKFLOW_DIR:?SYMPHONY_WORKFLOW_DIR not set}"
-    for dir in kanban; do
+    for dir in ${SYMPHONY_BOARD_ROOT_NAME:-kanban}; do
       source="$HOST_REPO/$dir"
       target="$PWD/$dir"
       [ -e "$source" ] || continue
@@ -205,9 +205,23 @@ agent:
   max_total_tokens_by_state:
     "In Progress": 500000000
     Verify: 500000000
+  # Per-lane stall budget (ms), falling back to the resolved backend's
+  # `stall_timeout_ms`. Heavy lanes (a Verify that runs a full suite) go quiet
+  # far longer than light ones; widen just that lane instead of every backend.
+  # stall_timeout_ms_by_state:
+  #   Verify: 900000
   budget_exhausted_state: Blocked
   # Soft cap for Verify/Document rewinds back into In Progress. Set 0 to disable.
   max_attempts: 3
+  # Mechanical evidence floor (orchestrator/contracts.py):
+  #   auto (default) — enforce only when every active lane is a default-preset
+  #                    lane (Todo / In Progress / Verify / Document). Renaming
+  #                    a lane therefore turns it OFF — logged as
+  #                    `stage_contracts_disabled` and reported by
+  #                    `symphony doctor`, never silent.
+  #   on             — enforce whatever the lanes are called.
+  #   off            — never enforce; the stage prompts are the only gate.
+  stage_contracts: auto
   # Route obvious Todo tickets with Acceptance Criteria to In Progress without
   # spending a model turn. Bug/blocked/ambiguous tickets still run Todo.
   auto_triage_actionable_todo: true

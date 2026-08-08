@@ -404,6 +404,14 @@ def build_service_config(workflow: WorkflowDefinition) -> ServiceConfig:
             active_states=tracker.active_states,
             terminal_states=tracker.terminal_states,
         ),
+        stage_contracts=_validated_stage_contracts(
+            agent_raw.get("stage_contracts")
+        ),
+        stall_timeout_ms_by_state=_validated_stall_timeout_by_state(
+            agent_raw.get("stall_timeout_ms_by_state"),
+            active_states=tracker.active_states,
+            terminal_states=tracker.terminal_states,
+        ),
     )
 
     codex_raw = cfg.get("codex") or {}
@@ -661,6 +669,8 @@ def build_service_config(workflow: WorkflowDefinition) -> ServiceConfig:
         cfg.get("continuous_improvement")
     )
 
+    _log_stage_contracts_decision(agent, tracker)
+
     return ServiceConfig(
         workflow_path=workflow.source_path,
         poll_interval_ms=poll_interval_ms,
@@ -783,6 +793,88 @@ def _validated_stage_kinds(
                 known_states=sorted(known),
             )
         out[normalized_key] = kind
+    return out
+
+
+def _log_stage_contracts_decision(agent: AgentConfig, tracker: TrackerConfig) -> None:
+    """Say out loud when the mechanical evidence floor is NOT running.
+
+    F-06: renaming one default lane (`Document` → `Docs`) silently switched
+    the whole stage-contract validator off. It is a legitimate outcome of a
+    customized board, but it must never be invisible — this is the product's
+    evidence floor.
+    """
+    from ..orchestrator.contracts import board_uses_default_contracts
+
+    mode = (agent.stage_contracts or "auto").strip().lower()
+    if agent.stage_contracts_enabled(tracker.active_states):
+        return
+    if mode == "off":
+        get_logger().info(
+            "stage_contracts_disabled",
+            reason="agent.stage_contracts: off",
+            lanes=list(tracker.active_states),
+        )
+        return
+    offending = [
+        state
+        for state in tracker.active_states
+        if not board_uses_default_contracts((state,))
+    ]
+    get_logger().warning(
+        "stage_contracts_disabled",
+        reason="board lanes are not the default preset",
+        offending_lanes=offending,
+        lanes=list(tracker.active_states),
+        hint="set agent.stage_contracts: on to enforce them anyway",
+    )
+
+
+_STAGE_CONTRACT_MODES = ("auto", "on", "off")
+
+
+def _validated_stage_contracts(value: Any) -> str:
+    """agent.stage_contracts — auto (default) | on | off."""
+    if value is None:
+        return "auto"
+    if isinstance(value, bool):
+        return "on" if value else "off"
+    mode = _as_str(value).strip().lower()
+    if mode not in _STAGE_CONTRACT_MODES:
+        raise ConfigValidationError(
+            f"agent.stage_contracts must be one of {list(_STAGE_CONTRACT_MODES)}",
+            value=value,
+        )
+    return mode
+
+
+def _validated_stall_timeout_by_state(
+    value: Any,
+    *,
+    active_states: tuple[str, ...],
+    terminal_states: tuple[str, ...],
+) -> dict[str, int]:
+    """agent.stall_timeout_ms_by_state — per-lane stall budget, keys lowercased.
+
+    Same shape as `max_total_tokens_by_state`: non-positive / non-numeric
+    entries are dropped rather than fatal, because a stall budget is an
+    ergonomics knob and a stale entry must not brick the workflow load.
+    Unknown state keys warn (states are UI-editable).
+    """
+    if value is not None and not isinstance(value, dict):
+        raise ConfigValidationError(
+            "agent.stall_timeout_ms_by_state must be a map of state name to ms",
+            value=value,
+        )
+    out = _normalize_state_map(value)
+    known = {state.strip().lower() for state in (*active_states, *terminal_states)}
+    for key in out:
+        if key not in known:
+            get_logger().warning(
+                "agent_stall_timeout_unknown_state",
+                state=key,
+                known_states=sorted(known),
+            )
     return out
 
 
