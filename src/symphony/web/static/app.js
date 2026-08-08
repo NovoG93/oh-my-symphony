@@ -235,6 +235,22 @@
         continue;
       }
 
+      const table = parseTableAt(lines, i);
+      if (table) {
+        flushList();
+        i += 2;
+        const rows = [];
+        while (i < lines.length) {
+          if (isMarkdownBlockBoundary(lines[i])) break;
+          const cells = splitTableRow(lines[i]);
+          if (!cells) break;
+          rows.push(normalizeTableRow(cells, table.alignments.length));
+          i++;
+        }
+        root.appendChild(renderTable(table.headers, table.alignments, rows));
+        continue;
+      }
+
       const heading = line.match(/^(#{1,6})\s+(.*)$/);
       if (heading) {
         flushList();
@@ -274,7 +290,12 @@
 
       const paraLines = [line];
       i++;
-      while (i < lines.length && lines[i].trim() && !/^(#{1,6})\s|^```|^\s*[-*]\s|^\s*\d+[.)]\s/.test(lines[i])) {
+      while (
+        i < lines.length &&
+        lines[i].trim() &&
+        !/^(#{1,6})\s|^```|^\s*[-*]\s|^\s*\d+[.)]\s/.test(lines[i]) &&
+        !parseTableAt(lines, i)
+      ) {
         paraLines.push(lines[i]);
         i++;
       }
@@ -282,6 +303,92 @@
     }
     flushList();
     return root;
+  }
+
+  function isMarkdownBlockBoundary(line) {
+    return /^(#{1,6})\s|^```|^\s*[-*]\s|^\s*\d+[.)]\s|^\s*>/.test(line);
+  }
+
+  function parseTableAt(lines, index) {
+    if (index + 1 >= lines.length) return null;
+    const headers = splitTableRow(lines[index]);
+    const alignments = parseTableAlignments(lines[index + 1]);
+    if (!headers || !alignments || headers.length !== alignments.length) return null;
+    return { headers, alignments };
+  }
+
+  function splitTableRow(line) {
+    if (!line || !line.trim() || !hasUnescapedPipe(line)) return null;
+    let content = line.trim();
+    if (content.startsWith('|')) content = content.slice(1);
+    if (content.endsWith('|') && !isEscapedCharacter(content, content.length - 1)) {
+      content = content.slice(0, -1);
+    }
+
+    const cells = [];
+    let cell = '';
+    for (let index = 0; index < content.length; index++) {
+      const char = content[index];
+      if (char === '|' && !isEscapedCharacter(content, index)) {
+        cells.push(cell.trim());
+        cell = '';
+      } else if (char === '\\' && content[index + 1] === '|' && !isEscapedCharacter(content, index)) {
+        cell += '|';
+        index++;
+      } else {
+        cell += char;
+      }
+    }
+    cells.push(cell.trim());
+    return cells;
+  }
+
+  function hasUnescapedPipe(line) {
+    for (let index = 0; index < line.length; index++) {
+      if (line[index] === '|' && !isEscapedCharacter(line, index)) return true;
+    }
+    return false;
+  }
+
+  function isEscapedCharacter(text, index) {
+    let backslashes = 0;
+    for (let cursor = index - 1; cursor >= 0 && text[cursor] === '\\'; cursor--) backslashes++;
+    return backslashes % 2 === 1;
+  }
+
+  function parseTableAlignments(line) {
+    const cells = splitTableRow(line);
+    if (!cells) return null;
+    const alignments = [];
+    for (const rawCell of cells) {
+      const marker = rawCell.replace(/\s/g, '');
+      if (!/^:?-{3,}:?$/.test(marker)) return null;
+      const left = marker.startsWith(':');
+      const right = marker.endsWith(':');
+      alignments.push(left && right ? 'center' : right ? 'right' : 'left');
+    }
+    return alignments;
+  }
+
+  function normalizeTableRow(cells, columnCount) {
+    if (cells.length === columnCount) return cells;
+    if (cells.length < columnCount) return cells.concat(Array(columnCount - cells.length).fill(''));
+    return cells.slice(0, columnCount - 1).concat(cells.slice(columnCount - 1).join(' | '));
+  }
+
+  function renderTable(headers, alignments, rows) {
+    const headerCells = headers.map((text, index) => el('th', {
+      class: `md-table-cell md-align-${alignments[index] || 'left'}`,
+      scope: 'col',
+    }, renderInline(text)));
+    const bodyRows = rows.map((row) => el('tr', null, row.map((text, index) => el('td', {
+      class: `md-table-cell md-align-${alignments[index] || 'left'}`,
+    }, renderInline(text)))));
+    const table = el('table', { class: 'md-table' }, [
+      el('thead', null, el('tr', null, headerCells)),
+      el('tbody', null, bodyRows),
+    ]);
+    return el('div', { class: 'md-table-wrap' }, table);
   }
 
   function renderInline(text) {
