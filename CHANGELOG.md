@@ -10,6 +10,8 @@ Versioning: [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.18.2] - 2026-08-08 - Responsive settings and safer blocked recovery
+
 ### Added
 
 - Manage local projects from both the Hub and each project board: show the
@@ -1359,7 +1361,11 @@ First public release of the multi-agent fork.
 - Per-state concurrency caps, `$VAR`/`~` expansion, dynamic WORKFLOW
   reload, structured stderr logging, `symphony doctor`.
 
-[Unreleased]: https://github.com/cskwork/oh-my-symphony/compare/v0.16.0...HEAD
+[Unreleased]: https://github.com/cskwork/oh-my-symphony/compare/v0.18.2...HEAD
+[0.18.2]: https://github.com/cskwork/oh-my-symphony/compare/v0.18.1...v0.18.2
+[0.18.1]: https://github.com/cskwork/oh-my-symphony/compare/v0.18.0...v0.18.1
+[0.18.0]: https://github.com/cskwork/oh-my-symphony/compare/v0.17.0...v0.18.0
+[0.17.0]: https://github.com/cskwork/oh-my-symphony/compare/v0.16.0...v0.17.0
 [0.16.0]: https://github.com/cskwork/oh-my-symphony/releases/tag/v0.16.0
 [0.15.0]: https://github.com/cskwork/oh-my-symphony/releases/tag/v0.15.0
 [0.14.0]: https://github.com/cskwork/oh-my-symphony/releases/tag/v0.14.0
