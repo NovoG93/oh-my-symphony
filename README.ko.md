@@ -7,13 +7,14 @@
 [![Tests](https://github.com/cskwork/oh-my-symphony/actions/workflows/tests.yml/badge.svg)](https://github.com/cskwork/oh-my-symphony/actions/workflows/tests.yml)
 [![GitHub stars](https://img.shields.io/github/stars/cskwork/oh-my-symphony?style=social)](https://github.com/cskwork/oh-my-symphony/stargazers)
 
-> 하나의 관리자 UI, 하나의 터미널, 하나의 칸반 보드, 여덟 개의 AI 코딩 에이전트
+> 하나의 컨트롤 플레인, 하나의 터미널, 여러 프로젝트 보드, 여덟 개의 AI 코딩 에이전트
 > (**Codex**, **Claude Code**, **Gemini**, **AGY/Antigravity**, **Kiro**,
-> **OpenCode**, **Pi**, **Prime Agent**) — 티켓마다 골라 쓰고, 병렬로 실행하며, 실시간으로 지켜본다.
+> **OpenCode**, **Pi**, **Prime Agent**) — 티켓마다 골라 쓰고, 병렬로 실행하며,
+> Git 변경을 검토하고 빌드를 미리 보면서 실시간으로 지켜본다.
 
 ![Symphony 9999 admin UI screenshot](docs/admin-ui-screenshot.png)
 
-<sub>`symphony service start ./WORKFLOW.md --port 9999` — `http://127.0.0.1:9999/`에서 열리는 내장 관리자 UI. 이슈 생성/수정/삭제, 드래그 컬럼 이동, 실시간 실행 배지, 터미널 상태 묶음, 워크플로 편집, 통계, 설정을 한 화면에서 다룬다. 스크린샷은 데모 데이터다.</sub>
+<sub>`symphony service start ./WORKFLOW.md --port 9999` — `http://127.0.0.1:9999/`에서 열리는 내장 관리자 UI. 프로젝트 전환, 이슈·워크플로 관리, 실시간 실행·통계·Git 변경 확인, 병합·푸시·PR 생성, 운영자 채팅, 상태 확인이 포함된 제품 미리보기를 한곳에서 다룬다. 스크린샷은 정리된 데모 데이터다.</sub>
 
 ![symphony tui screenshot](docs/tui-screenshot.svg)
 
@@ -21,8 +22,8 @@
 
 **AI 코딩 CLI를 더 이상 저글링하지 말자.** Symphony는 각 칸반 티켓을
 원하는 에이전트에 넘기고, 격리된 `git worktree` 워크스페이스에서 동시에 실행하며,
-실시간 진행 상황 — 턴 수, 토큰 사용량, 레이트 리밋 여유 — 을
-9999 브라우저 관리자 UI 또는 터미널을 벗어날 필요 없는 Jira 스타일 TUI로 보여준다.
+실시간 진행 상황 — 턴 수, 토큰 사용량, 선택한 CLI가 제공할 때의 레이트 리밋
+여유 — 을 9999 브라우저 관리자 UI 또는 터미널을 벗어날 필요 없는 Jira 스타일 TUI로 보여준다.
 
 [**AI CLI 없이 60초 만에 체험하기 →**](#try-it-in-60-seconds-no-agent-cli-required)
 
@@ -49,10 +50,10 @@
   바꾸거나, 티켓마다 백엔드를 섞어 쓴다. 새 에이전트(Ollama, 로컬 모델,
   CLI가 있는 무엇이든)는 오케스트레이터를 바꾸지 않고 얇은
   `AgentBackend` Protocol 뒤에 끼워 넣으면 된다.
-- **에이전트가 실제로 무엇을 하는지 본다.** 실시간 칸반은 모든 실행 중 카드의
-  턴 수, 마지막 이벤트, 누적 토큰, 레이트 리밋 여유를 보여준다.
-  "멈춘 건가, 생각 중인 건가?" 더 이상 헷갈릴 일이 없고 — 로그인할 SaaS
-  대시보드도 없다.
+- **에이전트가 실제로 무엇을 하는지 본다.** 실시간 칸반은 실행 중 카드의
+  턴 수, 마지막 이벤트, 누적 토큰, 그리고 제공되는 경우 공급자가 보고한
+  레이트 리밋 여유를 보여준다. "멈춘 건가, 생각 중인 건가?" 더 이상 헷갈릴
+  일이 없고 — 로그인할 SaaS 대시보드도 없다.
 - **수십 개의 티켓을 병렬로, 무인으로 돌린다.** 동시성은 기본 내장 — 모든
   티켓이 자체 `git worktree` 워크스페이스를 가져서 에이전트끼리 충돌하지 않는다.
   Headless 모드는 진행 상황을 어떤 에디터에서든 `tail -F`할 수 있는 Markdown
@@ -66,11 +67,11 @@
   포크했다. 이 포크는 파일 우선 오케스트레이션 모델을 유지하면서 여덟 개의
   백엔드, TUI / 웹 운영 화면, SQLite 실행 lease, 재시작에도 보존되는 이슈
   플래그, 잠금 기반 Markdown 티켓 쓰기를 더한다.
-- **뷰어가 아니라 진짜 웹 앱.** 오케스트레이터 포트가 Linear 스타일 보드를
-  직접 서빙한다: 이슈 CRUD, 드래그 앤 드롭 컬럼, 컬럼별 스테이지 프롬프트,
-  브랜치 정책, Pause / Resume, 레인 프리셋, 검증된 티켓 DAG를 등록하는
-  운영자 채팅, 그리고 통계 페이지까지. 모든 편집은 주석을 보존한 채
-  `WORKFLOW.md`로 왕복 저장된다.
+- **뷰어가 아니라 진짜 웹 앱.** 오케스트레이터 포트가 멀티 프로젝트 컨트롤
+  플레인을 직접 서빙한다: 이슈 CRUD, 드래그 앤 드롭 컬럼, 컬럼별 스테이지
+  프롬프트, 브랜치 정책, Pause / Resume, 레인 프리셋, 운영자 채팅, 통계,
+  Git 검토·배포, 상태 확인이 포함된 제품 미리보기까지 제공한다. 워크플로 편집은
+  주석을 보존한 채 `WORKFLOW.md`로 왕복 저장된다.
 - **운영자급 도구가 기본 제공.** `symphony doctor`는 첫 실행에서 가장 흔한
   다섯 가지 실패(포트 충돌, CLI 누락, 자리표시자 URL, 쓰기 불가 워크스페이스)를
   한 번에 잡아낸다. `symphony service start/stop/restart/logs`는 오케스트레이터를
@@ -682,6 +683,8 @@ symphony ./WORKFLOW.md --port 9999
 
 `/`는 내장 웹 칸반 앱을 서빙한다(빌드 단계 없음, 가입 없음, 루프백 전용):
 
+- **Projects** — 독립된 프로젝트 보드 사이를 전환하고, 각 저장소·워크플로·
+  이슈 저장소 경로를 확인하며, 프로젝트를 만들거나 연다.
 - **Board** — 이슈 생성/수정/삭제, 드래그로 컬럼 이동, 실행 중 배지(턴 수,
   토큰), 워커 Pause / Resume, Document 스킵. 기본 화면은 네 개의 active agent
   lane만 보여주며, `Human Review`, `Done`, `Blocked`, `Archive`는 `All`로
@@ -689,12 +692,16 @@ symphony ./WORKFLOW.md --port 9999
 - **Workflow** — 칸반 컬럼 추가/삭제/이름변경/순서변경, 컬럼별 스테이지
   프롬프트 편집. 변경은 주석을 보존한 채 `WORKFLOW.md` frontmatter로
   저장되고, 이름이 바뀌거나 삭제된 컬럼의 티켓은 자동 마이그레이션된다.
+- **Git** — 히스토리, 작업 브랜치, 비교와 diff를 확인하고, 브랜치를 삭제하며,
+  검증된 작업을 병합·푸시하거나 PR을 연다.
 - **Chat** — 보드 인테이크 프로토콜을 따르는 운영자 채팅 세션
   ([Chat intake](#chat-intake--채팅에-요청하면-보드가-배달한다) 참고).
+- **Preview** — 분리된 대상 브랜치 체크아웃에서 루프백 전용 제품 미리보기를
+  시작·재시작·중지하고, 상태 확인·URL·제한된 로그를 본다.
 - **Stats** — 일별 토큰, 처리량, 컬럼별 체류 시간, 에이전트별 합계, 평균
   사이클 타임 (`.symphony/stats.jsonl` 기반).
-- **Settings** — 실제 로컬 브랜치 드롭다운으로 브랜치 정책 설정, 그리고
-  레인 프리셋 전환(default ↔ deep).
+- **Settings** — 실제 로컬 브랜치 드롭다운으로 브랜치 정책을 설정하고,
+  레인 프리셋과 지속적 개선 설정을 관리한다.
 
 JSON API 엔드포인트:
 
@@ -710,7 +717,9 @@ JSON API 엔드포인트:
 | PUT    | `/api/v1/workflow/branch-policy`  | feature base / merge target 브랜치 갱신       |
 | GET/POST | `/api/v1/workflow/presets[...]` | 레인 프리셋 목록 / 적용 (`/apply`)            |
 | *      | `/api/v1/chat/...`                | 운영자 채팅 세션 + WebSocket 스트림           |
-| GET    | `/api/v1/git/branches`            | 브랜치 정책 UI용 로컬 브랜치 목록             |
+| GET/POST | `/api/v1/projects[...]`         | 프로젝트 목록·생성·조회·열기                  |
+| GET/POST | `/api/v1/git/...`               | 브랜치·히스토리·비교/diff·병합·푸시·PR        |
+| GET/POST | `/api/v1/preview[...]`          | 미리보기 상태와 시작·재시작·중지              |
 | GET    | `/api/v1/stats?days=N`            | 집계된 실행 통계                              |
 | POST   | `/api/v1/refresh`                 | poll + reconcile 즉시 트리거                  |
 | POST   | `/api/v1/{id}/pause` `/resume`    | 실행 중 워커 보류 / 재개                      |
@@ -856,10 +865,12 @@ src/symphony/
                      archive.py, keep_awake.py, wiki_sweep.py
   notifications/     Slack state-transition notifications
   tui/               Textual Kanban TUI package
-  web/static/        built-in browser app assets (board / workflow / chat /
-                     stats / settings)
+  web/static/        built-in browser app assets (projects / board / workflow /
+                     git / chat / preview / stats / settings)
   webapi.py          web app REST routes + static SPA serving
   server.py          aiohttp server, health/state/refresh routes
+  projects.py        multi-project registry + managed service metadata
+  product_preview.py detached target-branch preview lifecycle
   chat.py            operator chat sessions + board-intake protocol
   continuous_improvement.py  idle-time improvement-proposal loop
   i18n.py            TUI/doc language switching
