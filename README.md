@@ -7,13 +7,14 @@
 [![Tests](https://github.com/cskwork/oh-my-symphony/actions/workflows/tests.yml/badge.svg)](https://github.com/cskwork/oh-my-symphony/actions/workflows/tests.yml)
 [![GitHub stars](https://img.shields.io/github/stars/cskwork/oh-my-symphony?style=social)](https://github.com/cskwork/oh-my-symphony/stargazers)
 
-> One admin UI. One terminal. One Kanban board. Eight AI coding agents
+> One control plane. One terminal. Multiple project boards. Eight AI coding agents
 > (**Codex**, **Claude Code**, **Gemini**, **AGY/Antigravity**, **Kiro**,
-> **OpenCode**, **Pi**, **Prime Agent**) — pick per ticket, run in parallel, watch live.
+> **OpenCode**, **Pi**, **Prime Agent**) — pick per ticket, run in parallel,
+> review Git changes, preview builds, and watch live.
 
 ![Symphony 9999 admin UI screenshot](docs/admin-ui-screenshot.png)
 
-<sub>`symphony service start ./WORKFLOW.md --port 9999` — the built-in admin UI served at `http://127.0.0.1:9999/`: issue CRUD, drag/drop columns, live run badges, terminal-state grouping, workflow editing, stats, and settings. Screenshot uses sanitized demo data.</sub>
+<sub>`symphony service start ./WORKFLOW.md --port 9999` — the built-in admin UI served at `http://127.0.0.1:9999/`: switch projects; manage issues and workflows; inspect live runs, stats, and Git changes; merge, push, or open PRs; use operator chat; and launch health-checked product previews. Screenshot uses sanitized demo data.</sub>
 
 ![symphony tui screenshot](docs/tui-screenshot.svg)
 
@@ -21,7 +22,8 @@
 
 **Stop juggling AI coding CLIs.** Symphony hands each Kanban ticket to the
 agent you want, runs them concurrently in isolated `git worktree` workspaces,
-and shows live progress — turn counts, token usage, rate-limit headroom — in
+and shows live progress — turn counts, token usage, and rate-limit headroom
+when reported by the selected CLI — in
 the 9999 browser admin UI or a Jira-style TUI you never have to leave your
 terminal for.
 
@@ -51,9 +53,9 @@ terminal for.
   anything with a CLI) drop in behind a thin `AgentBackend` Protocol without
   changing the orchestrator.
 - **See what your agents are actually doing.** Live Kanban shows turn count,
-  last event, accumulated tokens, and rate-limit headroom for every running
-  card. No more "is it stuck or just thinking?" — and no SaaS dashboard to
-  log into.
+  last event, accumulated tokens, and provider-reported rate-limit headroom
+  when available. No more "is it stuck or just thinking?" — and no SaaS
+  dashboard to log into.
 - **Run dozens of tickets in parallel, unattended.** Concurrency is built in:
   every ticket gets its own `git worktree` workspace, so agents can't step on
   each other. Headless mode mirrors progress to a Markdown file you can
@@ -68,10 +70,10 @@ terminal for.
   backends, the TUI/web operator surfaces, SQLite run leases, restart-safe
   issue flags, and locked Markdown ticket writes.
 - **A real web app, not just a viewer.** The orchestrator port serves a
-  Linear-style board: issue CRUD, drag-and-drop columns, per-column stage
-  prompts, branch policy, pause / resume, lane presets, an operator chat that
-  files validated ticket DAGs, and a stats page. All edits round-trip into
-  `WORKFLOW.md` with your comments intact.
+  multi-project control plane: issue CRUD, drag-and-drop columns, per-column
+  stage prompts, branch policy, pause / resume, lane presets, operator chat,
+  stats, integrated Git review and delivery, and health-checked product
+  previews. Workflow edits round-trip into `WORKFLOW.md` with comments intact.
 - **Operator-grade tooling out of the box.** `symphony doctor` catches the
   five most common first-run failures (port collisions, missing CLIs,
   placeholder URLs, unwritable workspaces, missing board directories) in one
@@ -839,6 +841,8 @@ symphony ./WORKFLOW.md --port 9999
 `/` serves the built-in web Kanban app (no build step, no signup, loopback
 only). From the browser you can:
 
+- **Projects** — switch among independent project boards, inspect each
+  repository / workflow / issue-store path, and create or open projects.
 - **Board** — create / edit / delete issues, drag cards between columns,
   watch live run badges (turn count, tokens), pause / resume workers, and
   skip Document for tickets that do not need wiki write-back. The board defaults
@@ -849,12 +853,16 @@ only). From the browser you can:
   each column's stage prompt. Changes write back into `WORKFLOW.md`
   frontmatter with your comments preserved; tickets in renamed or removed
   columns migrate automatically.
+- **Git** — inspect history, task branches, comparisons, and diffs; delete
+  branches; merge verified work; push branches; or open a pull request.
 - **Chat** — operator chat sessions with the board-intake protocol
   (see [Chat intake](#chat-intake--type-a-request-the-board-delivers)).
+- **Preview** — start, restart, or stop a loopback-only product preview from
+  a detached target-branch checkout, with a health check, URL, and bounded logs.
 - **Stats** — tokens per day, throughput, per-column dwell time, per-agent
   totals, average cycle time (from `.symphony/stats.jsonl`).
 - **Settings** — branch policy (feature base / merge target) from a real
-  local-branch dropdown, plus the lane-preset switch (default ↔ deep).
+  local-branch dropdown, plus lane presets and continuous-improvement controls.
 
 JSON API endpoints:
 
@@ -870,7 +878,9 @@ JSON API endpoints:
 | PUT    | `/api/v1/workflow/branch-policy`  | Update feature base / merge target branches  |
 | GET/POST | `/api/v1/workflow/presets[...]` | List lane presets / apply one (`/apply`)     |
 | *      | `/api/v1/chat/...`                | Operator chat sessions + WebSocket stream    |
-| GET    | `/api/v1/git/branches`            | Local branch list for branch policy UI       |
+| GET/POST | `/api/v1/projects[...]`         | List, create, inspect, and open projects      |
+| GET/POST | `/api/v1/git/...`               | Branches, history, compare/diff, merge, push, PR |
+| GET/POST | `/api/v1/preview[...]`          | Preview status plus start/restart/stop        |
 | GET    | `/api/v1/stats?days=N`            | Aggregated run statistics                    |
 | POST   | `/api/v1/refresh`                 | Coalesced trigger of poll + reconcile        |
 | POST   | `/api/v1/{id}/pause` `/resume`    | Hold / release a running worker              |
@@ -1009,10 +1019,12 @@ src/symphony/
                      archive.py, keep_awake.py, wiki_sweep.py
   notifications/     Slack state-transition notifications
   tui/               Textual Kanban TUI package
-  web/static/        built-in browser app assets (board / workflow / chat /
-                     stats / settings)
+  web/static/        built-in browser app assets (projects / board / workflow /
+                     git / chat / preview / stats / settings)
   webapi.py          web app REST routes + static SPA serving
   server.py          aiohttp server, health/state/refresh routes
+  projects.py        multi-project registry + managed service metadata
+  product_preview.py detached target-branch preview lifecycle
   chat.py            operator chat sessions + board-intake protocol
   continuous_improvement.py  idle-time improvement-proposal loop
   i18n.py            TUI/doc language switching
