@@ -21,7 +21,7 @@ State the route in one line, then open only the reference that route needs.
 
 | Signal | Route | Read |
 | --- | --- | --- |
-| add/list/show/move tickets, start service/TUI/API, inspect state | OPERATE | `reference/operations.md` |
+| create/register projects, open hub, add/list/show/move tickets, start service/TUI/API | OPERATE | `reference/operations.md` |
 | edit `WORKFLOW.md`, agent kind, hooks, prompts, workspace, Slack hooks | CONFIGURE | `reference/workflow-config.md` |
 | rename lanes, add state prompts, change pipeline shape | CUSTOMIZE | `reference/customization.md` |
 | break a large request into Symphony board tickets | DELEGATE | `reference/delegation.md` |
@@ -37,6 +37,10 @@ references for this router.
 
 ## Core Model
 
+- Keep the `oh-my-symphony` source checkout as the control plane, not a worker
+  project. Create or register a separate Git repository with `symphony project
+  create` / `symphony project add`, then operate it from the hub. Runtime and
+  doctor refuse a workflow in Symphony's own canonical Git repository.
 - The orchestrator reads ticket files and dispatches eligible work; the worker
   agent edits the ticket file to move state and append reports.
 - Each ticket runs in its own workspace under `workspace.root` (default
@@ -120,7 +124,15 @@ unwritable workspaces, and missing board directories.
 
 ## Common Starts
 
-Add one file-board ticket and open the managed TUI launcher:
+Create a separate project or register an existing repository, then use the hub:
+
+```bash
+symphony project create "My App" --path ../my-app
+symphony project add /path/to/existing-repo
+symphony hub
+```
+
+Add one file-board ticket and open the managed TUI launcher from that project:
 
 ```bash
 symphony board init ./kanban

@@ -149,6 +149,12 @@ class ConfigValidationError(SymphonyError):
     code = "config_validation_error"
 
 
+class ProtectedSourceRepository(SymphonyError):
+    """A workflow points at the checkout that supplies Symphony's runtime."""
+
+    code = "protected_source_repository"
+
+
 # board dependency DAG (symphony.trackers.validate)
 class BoardDependencyError(SymphonyError):
     code = "board_dependency_error"

@@ -259,6 +259,25 @@ Make the relevant CLI available on `$PATH`:
 | `pi`         | `pi` (Pi coding-agent — `npm i -g @earendil-works/pi-coding-agent` or `curl -fsSL https://pi.dev/install.sh \| sh`; sign in once via `pi` → `/login` (OAuth, credentials cached at `~/.pi/agent/auth.json`) — no env var needed) |
 | `prime-agent` | `prime-agent` (Prime Agent — install with `curl -fsSL https://app.primeintellect.ai/prime-agent/install.sh \| sh`; sign in once via `prime-agent` → `/login`, or provide a provider API key; credentials cached at `~/.prime/agent/auth.json`) |
 
+## Create or register a project
+
+Keep this `oh-my-symphony` checkout as the control plane. Doctor and normal
+startup refuse a `WORKFLOW.md` in Symphony's own canonical Git repository
+(including linked worktrees), preventing agents from editing the orchestrator
+that launched them.
+
+```bash
+symphony project create "My App" --path ../my-app
+# or register an existing repository that already has WORKFLOW.md
+symphony project add /path/to/existing-repo --name "My App"
+symphony project start my-app
+symphony hub
+```
+
+The hub links to independent per-project services. Each service loads that
+project's workflow and repository, so its board, workspaces, and Product
+Preview stay naturally scoped to that project.
+
 ## Try it in 60 seconds (no agent CLI required)
 
 Want to see the TUI move cards around before installing an agent CLI? Use
@@ -271,6 +290,10 @@ git clone https://github.com/cskwork/oh-my-symphony.git
 cd oh-my-symphony
 python3 -m venv .venv && source .venv/bin/activate
 pip install -e ".[dev]"
+
+# Keep the source checkout protected; create the demo as a separate project.
+symphony project create "Symphony Demo" --path ../symphony-demo
+cd ../symphony-demo
 
 # WORKFLOW.md pointed at the mock backend
 cat > WORKFLOW.md <<'YAML'
@@ -352,8 +375,10 @@ board, static assets, issue CRUD, refresh, workflow, and stats.
 
 ## Quickstart — your first task end-to-end
 
-This walks from a clean clone to a running ticket, using the file-based
-tracker and Claude Code as the agent.
+This walks from a registered project repository to a running ticket, using
+the file-based tracker and Claude Code as the agent. Do not perform these steps
+in the protected `oh-my-symphony` source checkout; use `symphony project create`
+or `symphony project add` first.
 
 ### 1. Initialize the board
 

@@ -1,6 +1,24 @@
 # Operations
 
-Day-to-day commands for managing tickets and the orchestrator.
+Day-to-day commands for managing projects, tickets, and orchestrators.
+
+## Projects and hub
+
+Never run a project workflow from the `oh-my-symphony` source checkout. Doctor
+and runtime protect that canonical Git repository, including linked worktrees.
+Create a bootstrapped sibling repository or register an existing project:
+
+```bash
+symphony project create "My App" --path ../my-app
+symphony project add /path/to/existing-repo --name "Existing App"
+symphony project list
+symphony project start my-app
+symphony hub
+```
+
+The hub is a control plane: each card opens that project's independent service.
+Each service loads its own `WORKFLOW.md`, board, Git repository, workspaces, and
+Product Preview. It does not multiplex projects through the source checkout.
 
 ## Tickets (file-based tracker)
 

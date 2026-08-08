@@ -26,6 +26,7 @@ from typing import Any, Callable, Literal
 
 from .errors import SymphonyError
 from .orchestrator.run_registry import RunRegistry, registry_path_for_workflow
+from .runtime_safety import ensure_workflow_repo_is_safe
 from .workflow import (
     ServerConfig,
     build_service_config,
@@ -603,6 +604,11 @@ def _start(args: argparse.Namespace) -> int:
     except SymphonyError as exc:
         print(f"FAIL workflow load failed: {exc}", file=sys.stderr)
         return 2
+    try:
+        ensure_workflow_repo_is_safe(workflow)
+    except SymphonyError as exc:
+        print(f"FAIL unsafe workflow repository: {exc}", file=sys.stderr)
+        return 1
 
     try:
         with acquire_service_lock(workflow):

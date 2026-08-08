@@ -509,6 +509,10 @@ checks out the exact `agent.auto_merge_target_branch` commit into a
 preview-owned detached worktree; it never runs from the host checkout or a
 ticket workspace.
 
+In the hub, Product Preview needs no cross-project routing: every registered
+project runs an independent service from its own `WORKFLOW.md`, so preview
+naturally resolves that workflow's Git repository and target branch.
+
 ```yaml
 preview:
   enabled: true
