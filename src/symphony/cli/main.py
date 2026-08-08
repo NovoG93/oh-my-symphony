@@ -411,6 +411,14 @@ def main(argv: list[str] | None = None) -> int:
         from . import doctor
 
         return doctor.main(raw_argv[1:])
+    if raw_argv and raw_argv[0] == "project":
+        from . import project
+
+        return project.main(raw_argv[1:])
+    if raw_argv and raw_argv[0] == "hub":
+        from .. import hub
+
+        return hub.main(raw_argv[1:])
     if raw_argv and raw_argv[0] == "service":
         from .. import service
 

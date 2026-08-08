@@ -520,12 +520,12 @@ def test_run_checks_returns_one_result_per_check(tmp_path: Path) -> None:
         """,
     )
     results = run_checks(cfg)
-    # port + shell + max_turns + agent + pi_auth + prime_agent_auth
-    # + gemini_auth + agy_state + kiro_auth + prompts + after_create
-    # + workspace + git_history + agent_git_grant + tracker + board.reachable
-    # + deep_merge_contract + stage_contracts + board.cli + board.dependencies
-    # + state.db = 21
-    assert len(results) == 21
+    # protected repository + port + shell + max_turns + agent + pi_auth
+    # + prime_agent_auth + gemini_auth + agy_state + kiro_auth + prompts
+    # + after_create + workspace + git_history + agent_git_grant + tracker
+    # + board.reachable + deep_merge_contract + stage_contracts + board.cli
+    # + board.dependencies + state.db = 22
+    assert len(results) == 22
     assert {r.name.split("=")[0].split(".")[0] for r in results} >= {
         "agent",
         "hooks",

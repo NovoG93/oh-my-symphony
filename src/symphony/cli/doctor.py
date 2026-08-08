@@ -37,6 +37,10 @@ from typing import Iterable, Literal
 from .._shell import _is_wsl_launcher, resolve_bash
 from ..backends.codex import _sandbox_uses_workspace_write
 from ..errors import SymphonyError
+from ..runtime_safety import (
+    PROTECTED_REPOSITORY_MESSAGE,
+    workflow_uses_protected_source_repo,
+)
 from ..utils.git_sandbox import resolve_git_common_dir, writable_git_roots
 from ..service import ProcessRunningPredicate, port_owner_hint
 from ..workflow import (
@@ -910,8 +914,20 @@ def check_workflow_registry(cfg: ServiceConfig) -> CheckResult:
     return CheckResult("state.db", "pass", detail)
 
 
+def check_source_repository(cfg: ServiceConfig) -> CheckResult:
+    """Refuse workflows in the checkout that supplies Symphony's runtime."""
+    if workflow_uses_protected_source_repo(cfg.workflow_path):
+        return CheckResult(
+            "workflow.repository", "fail", PROTECTED_REPOSITORY_MESSAGE
+        )
+    return CheckResult(
+        "workflow.repository", "pass", "project repository is separate from Symphony source"
+    )
+
+
 def run_checks(cfg: ServiceConfig, host: str = "127.0.0.1") -> list[CheckResult]:
     return [
+        check_source_repository(cfg),
         check_port(cfg, host=host),
         check_shell(),
         check_stage_turn_budget(cfg),

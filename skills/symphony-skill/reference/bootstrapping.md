@@ -1,9 +1,23 @@
 # Bootstrapping Symphony into another project
 
 Use this when introducing Symphony to a repo that does not already carry the
-standard operator bundle.
+standard operator bundle. The Symphony source checkout is protected and must
+not be used as the project repository.
 
-## Copy the full operator bundle
+## Preferred: create or register a project
+
+```bash
+symphony project create "My App" --path ../my-app
+# Or bootstrap an existing repository first, then register it:
+symphony project add /path/to/existing-repo --name "My App"
+symphony hub
+```
+
+`project create` copies the required bundle into a new Git repository and
+registers its independent service. Use the manual copy procedure below only
+when adapting an existing repository that needs a customized bundle.
+
+## Manual: copy the full operator bundle
 
 From inside the `oh-my-symphony` checkout:
 

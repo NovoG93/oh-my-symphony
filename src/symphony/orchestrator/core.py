@@ -68,6 +68,7 @@ from ..continuous_improvement import (
 from ..issue import BlockerRef, Issue, normalize_state
 from ..logging import get_logger
 from ..prompt import build_continuation_prompt, build_first_turn_prompt
+from ..runtime_safety import ensure_workflow_repo_is_safe
 from ..skills import render_skill_block
 from ..stats import StatsStore, stats_store_for
 from ..trackers import build_tracker_client
@@ -1236,6 +1237,7 @@ class Orchestrator:
             cfg, err = self._workflow_state.reload()
             if err is not None or cfg is None:
                 raise err or SymphonyError("workflow not loaded")
+        ensure_workflow_repo_is_safe(cfg.workflow_path)
         validate_for_dispatch(cfg)
         # Surface the workflow dir to every subprocess spawned afterwards
         # (hooks and agent backends inherit via os.environ). WORKFLOW.md

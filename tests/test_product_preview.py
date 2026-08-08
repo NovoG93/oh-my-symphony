@@ -18,7 +18,10 @@ def _git(repo: Path, *args: str) -> None:
 
 
 @pytest.mark.asyncio
-async def test_preview_serves_clean_target_and_preserves_dirty_host(tmp_path: Path):
+async def test_preview_uses_service_workflow_repo_and_preserves_dirty_host(
+    tmp_path: Path,
+):
+    """Each registered project service naturally previews its own workflow repo."""
     repo = tmp_path / "repo"
     repo.mkdir()
     _git(repo, "init", "-b", "dev")
