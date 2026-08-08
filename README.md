@@ -131,7 +131,7 @@ adds:
    - **Claude Code** — `claude -p --output-format stream-json --verbose`
      (NDJSON events, per-turn subprocess with `--resume`)
    - **Gemini** — `gemini -p ""` (one-shot per turn, stdin prompt → stdout result)
-   - **AGY / Antigravity** — `agy --print -` (one-shot per turn, stdin prompt
+   - **AGY / Antigravity** — `agy --print "$(cat)"` (one-shot per turn, stdin prompt
      -> stdout result; `agent.kind: antigravity` aliases to `agy`)
    - **Kiro** — `kiro-cli chat --no-interactive --trust-all-tools ...`
      (headless chat mode; prompt bridged into the chat input argument,
@@ -1070,7 +1070,7 @@ real CLIs are intentionally not in CI — run them locally.
 - **Gemini CLI** is one-shot per invocation with no native session model;
   we synthesize a `gemini-<uuid>` session id for bookkeeping.
 - **AGY / Antigravity CLI** is one-shot per invocation: prompt on stdin via
-  `agy --print -` (plus `--dangerously-skip-permissions`), `--continue` on
+  `agy --print "$(cat)"` (plus `--dangerously-skip-permissions`), `--continue` on
   continuation turns when `resume_across_turns` is true.
 - **Kiro CLI** runs through headless chat mode. Kiro does not treat piped
   stdin as the first message, so Symphony bridges stdin into the positional

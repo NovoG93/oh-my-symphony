@@ -126,7 +126,7 @@ q quit · r refresh · enter details · n new · e edit · s stats · S skip Doc
    - **Claude Code** — `claude -p --output-format stream-json --verbose`
      (NDJSON 이벤트, `--resume`를 쓰는 턴별 서브프로세스)
    - **Gemini** — `gemini -p ""` (턴당 1회 호출, stdin 프롬프트 → stdout 결과)
-   - **AGY / Antigravity** — `agy --print -` (턴당 1회 호출, stdin 프롬프트
+   - **AGY / Antigravity** — `agy --print "$(cat)"` (턴당 1회 호출, stdin 프롬프트
      -> stdout 결과; `agent.kind: antigravity`는 `agy`로 처리)
    - **Kiro** — `kiro-cli chat --no-interactive --trust-all-tools ...`
      (headless chat 모드; 프롬프트를 chat 입력 인자로 전달,
@@ -920,7 +920,7 @@ CI에 포함하지 않았다 — 로컬에서 실행한다.
   각 턴은 독립적이며, 오케스트레이터의 기록이 일관되게 유지되도록
   `gemini-<uuid>` 세션 id를 합성한다.
 - **AGY / Antigravity CLI**는 호출당 1회로 실행된다. Symphony는 렌더링된
-  프롬프트를 `agy --print -`의 stdin으로 보내고
+  프롬프트를 `agy --print "$(cat)"`의 stdin으로 보내고
   `--dangerously-skip-permissions`를 붙이며,
   `resume_across_turns`가 true이면 continuation 턴에 `--continue`를 붙인다.
 - **Kiro CLI**는 headless chat 모드로 실행된다. Kiro는 piped stdin을 첫

@@ -292,10 +292,10 @@ gemini:
   resume_across_turns: true
 
 agy:
-  # Antigravity CLI (`agy`) receives the prompt on stdin via `--print -`.
+  # Antigravity CLI (`agy`) receives the stdin prompt through `--print "$(cat)"`.
   # Symphony appends `--dangerously-skip-permissions` and, on continuation turns,
   # `--continue` when resume_across_turns is true.
-  command: agy --print -
+  command: agy --print "$(cat)"
   resume_across_turns: true
 
 kiro:

@@ -10,6 +10,11 @@ Versioning: [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Fixed
+
+- Pass the rendered prompt to AGY as its required `--print` argument instead
+  of the literal `-`, which AGY 1.1.x treats as prompt text rather than stdin.
+
 ## [0.19.0] - 2026-08-09 - Live multi-agent chat and reliable delivery
 
 ### Added

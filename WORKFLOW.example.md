@@ -307,10 +307,10 @@ gemini:
 
 agy:
   # Antigravity CLI (`agy`) is the forward path for Gemini-style Google agent
-  # runs. Symphony sends the full prompt on stdin via `--print -`, appends
+  # runs. Symphony bridges the stdin prompt into `--print "$(cat)"`, appends
   # `--dangerously-skip-permissions`, and adds `--continue` on continuation
   # turns when resume_across_turns is true.
-  command: agy --print -
+  command: agy --print "$(cat)"
   resume_across_turns: true
   turn_timeout_ms: 3600000
   read_timeout_ms: 20000
