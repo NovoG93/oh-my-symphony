@@ -9,8 +9,18 @@
 <body>
   <div class="app">
     <aside class="sidebar">
-      <div class="sidebar-header">
-        <div class="board-name" id="board-name" data-i18n="common.loading">Loading&hellip;</div>
+      <div class="sidebar-header project-header">
+        <label class="sr-only" for="project-selector" data-i18n="projects.selectorLabel">Select project</label>
+        <select class="project-selector" id="project-selector" aria-label="Select project" data-i18n-attr="aria-label:projects.selectorLabel" disabled>
+          <option data-i18n="common.loading">Loading&hellip;</option>
+        </select>
+        <dl class="project-paths" id="project-paths">
+          <div><dt data-i18n="projects.repoPath">Repository</dt><dd id="project-current-path"></dd></div>
+          <div><dt data-i18n="projects.workflowPath">Workflow</dt><dd id="project-workflow-path"></dd></div>
+          <div><dt data-i18n="projects.boardPath">Issues are stored here</dt><dd id="project-board-path"></dd></div>
+        </dl>
+        <button class="project-manage-button" id="manage-projects" type="button" data-i18n="projects.manage">Manage projects</button>
+        <div class="board-name sr-only" id="board-name" data-i18n="common.loading">Loading&hellip;</div>
       </div>
       <nav class="sidebar-nav" id="sidebar-nav">
         <a class="nav-item" data-route="board" href="#/board">

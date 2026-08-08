@@ -10,6 +10,14 @@ Versioning: [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+
+- Manage local projects from both the Hub and each project board: show the
+  canonical repository, workflow, and issue-board paths; create or adopt a path;
+  and switch to another independently running project without retargeting active
+  workers. Missing paths and existing non-Git directories are initialized as Git
+  repositories, while existing Git metadata and files are preserved.
+
 ## [0.18.1] - 2026-08-08 - Project workflow containment
 
 ### Fixed
