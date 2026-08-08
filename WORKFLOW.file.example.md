@@ -184,6 +184,10 @@ hooks:
     set -uo pipefail
     HOST_REPO="${SYMPHONY_WORKFLOW_DIR:?}"
     WORKTREE_PATH="$PWD"
+    ISSUE_ID="${SYMPHONY_ISSUE_ID:-$(basename "$WORKTREE_PATH")}"
+    for dir in ${SYMPHONY_BOARD_ROOT_NAME:-kanban}; do
+      git -C "$HOST_REPO" update-index --no-skip-worktree -- "$dir/$ISSUE_ID.md" 2>/dev/null || true
+    done
     git -C "$HOST_REPO" worktree remove --force "$WORKTREE_PATH" 2>/dev/null || true
 
 agent:

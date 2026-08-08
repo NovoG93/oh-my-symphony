@@ -216,7 +216,7 @@ Verify → Document를 한 디스패치로 걷는 티켓도 레인마다 설정�
 ```bash
 python3 -m venv .venv
 source .venv/bin/activate
-pip install -e ".[dev]"
+python -m pip install -e ".[dev]"
 ```
 
 해당 CLI를 `$PATH`에서 사용할 수 있게 한다:
@@ -243,7 +243,7 @@ pip install -e ".[dev]"
 git clone https://github.com/cskwork/oh-my-symphony.git
 cd oh-my-symphony
 python3 -m venv .venv && source .venv/bin/activate
-pip install -e ".[dev]"
+python -m pip install -e ".[dev]"
 
 # 목 백엔드를 가리키는 WORKFLOW.md
 cat > WORKFLOW.md <<'YAML'
@@ -886,8 +886,13 @@ tui-open.bat           Windows equivalent
 
 ## Tests
 
+개발 의존성을 설치한 뒤 다음 명령을 실행한다. `symphony-pyright`는
+실행 중인 인터프리터를 Pyright에 전달한다.
+
 ```bash
-pytest -q
+python -m pytest -q
+python -m ruff check src tests
+symphony-pyright
 ```
 
 테스트 스위트(1614 passed, 7 skipped)는 업스트림 적합성 스위트, 백엔드 단위
@@ -996,8 +1001,10 @@ PR을 환영한다. 외부 기여는 기본적으로 `dev`를 대상으로 한�
 전에:
 
 ```bash
-pip install -e ".[dev]"
-pytest -q          # must stay green
+python -m pip install -e ".[dev]"
+python -m pytest -q          # must stay green
+python -m ruff check src tests
+symphony-pyright
 ```
 
 백엔드 어댑터는 `src/symphony/backends/` 아래에 산다. 새 에이전트(예: Ollama 구동

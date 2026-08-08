@@ -513,6 +513,18 @@ async def test_file_workflow_after_create_hides_host_symlink_roots_from_git(tmp_
     assert (ws.path / "docs").is_dir()
     assert _git(ws.path, "status", "--short").stdout == ""
 
+    # The symlink writes to the host checkout, which has a separate index from
+    # the ticket worktree. Live state changes must not dirty the merge target.
+    tracked = _git(host, "ls-files", "-v", "--", "kanban/DEMO-1.md").stdout
+    assert tracked.startswith("S ")
+    (host / "kanban" / "DEMO-1.md").write_text("---\nstate: Done\n---\n")
+    assert _git(host, "status", "--short").stdout == ""
+
+    # The shared info/exclude rule also keeps newly-created operational tickets
+    # out of product-code status and merge checks.
+    (host / "kanban" / "NEW-1.md").write_text("---\nstate: Todo\n---\n")
+    assert _git(host, "status", "--short").stdout == ""
+
 
 @pytest.mark.skipif(os.name != "posix", reason="POSIX shell concurrency test")
 @pytest.mark.skipif(not _HAS_GIT, reason="git CLI required")
@@ -1535,3 +1547,11 @@ def test_setup_worktree_script_links_configured_board_root():
     script = Path("scripts/symphony-setup-worktree.sh").read_text(encoding="utf-8")
     assert "for dir in ${SYMPHONY_BOARD_ROOT_NAME:-kanban}; do" in script
     assert "for dir in kanban; do" not in script
+
+
+def test_default_workflows_restore_host_board_tracking_before_remove() -> None:
+    root = Path(__file__).resolve().parents[1]
+    for name in ("WORKFLOW.md", "WORKFLOW.example.md", "WORKFLOW.file.example.md"):
+        workflow = (root / name).read_text(encoding="utf-8")
+        assert "update-index --no-skip-worktree" in workflow
+        assert '"$dir/$ISSUE_ID.md"' in workflow

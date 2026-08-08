@@ -2488,7 +2488,7 @@
     liveBubble: null, liveText: '', liveFrame: 0,
     // Several sessions can run at once; the page shows one at a time and
     // tells the socket which one so only its deltas are streamed.
-    currentId: null, sessions: null,
+    currentId: null, sessions: null, autoCreatePromise: null,
   };
 
   const CHAT_FONT_KEY = 'symphony.chatFontSize';
@@ -2581,15 +2581,41 @@
 
   // ---- session bar: live tabs + resumable sessions -------------------
 
+  async function ensureDefaultChatSession() {
+    if (!chatState.autoCreatePromise) {
+      // Opening Chat should be immediately useful, but must not start an
+      // agent turn. Creating an idle QA session is cheap and read-only.
+      chatState.autoCreatePromise = api.createChatSession2({ mode: 'qa' });
+    }
+    try {
+      return await chatState.autoCreatePromise;
+    } finally {
+      chatState.autoCreatePromise = null;
+    }
+  }
+
   async function refreshChatSessions(view) {
     try {
       chatState.sessions = await api.getChatSessions();
     } catch (_err) {
       chatState.sessions = { sessions: [], resumable: [], active_id: null, max_sessions: 0 };
     }
-    const live = chatState.sessions.sessions || [];
-    if (!live.some((s) => s.session_id === chatState.currentId)) {
-      const fallback = chatState.sessions.active_id || (live[0] && live[0].session_id) || null;
+    let live = chatState.sessions.sessions || [];
+    if (!live.length) {
+      try {
+        const snapshot = await ensureDefaultChatSession();
+        chatState.sessions = await api.getChatSessions();
+        live = chatState.sessions.sessions || [];
+        if (!chatState.sessions.active_id) chatState.sessions.active_id = snapshot.session_id;
+      } catch (err) {
+        // Keep the successfully fetched resumable-session listing visible when
+        // the configured agent cannot initialize an idle default session.
+        showToast(err.message, 'error');
+      }
+    }
+    const liveSessions = chatState.sessions.sessions || [];
+    if (!liveSessions.some((s) => s.session_id === chatState.currentId)) {
+      const fallback = chatState.sessions.active_id || (liveSessions[0] && liveSessions[0].session_id) || null;
       await selectChatSession(view, fallback);
       return;
     }
@@ -2623,6 +2649,7 @@
     const live = listing.sessions || [];
     const tabs = el('div', { class: 'chat-tabs' }, live.map((meta) => el('button', {
       class: `chat-tab${meta.session_id === chatState.currentId ? ' active' : ''}`,
+      'data-session-id': meta.session_id,
       title: t('chat.sessionMeta', { agent: meta.agent_kind, mode: meta.mode, time: formatShortDateTime(meta.created_at) }),
       onClick: () => selectChatSession(view, meta.session_id),
     }, [
@@ -2807,7 +2834,26 @@
     });
   }
 
-  // Deltas are plain text; the finished message is the same content as
+  // Pi and Prime Agent emit the full assistant text on every update rather
+  // than token deltas. Replace the live source so cumulative snapshots do not
+  // render as "HHeHelHello".
+  function replaceChatLive(view, text) {
+    if (!text) return;
+    if (!chatState.liveBubble) {
+      appendChatDelta(view, text);
+      return;
+    }
+    chatState.liveText = text;
+    if (chatState.liveFrame) return;
+    chatState.liveFrame = requestAnimationFrame(() => {
+      chatState.liveFrame = 0;
+      if (!chatState.liveBubble) return;
+      chatState.liveBubble.textContent = chatState.liveText;
+      view.transcript.scrollTop = view.transcript.scrollHeight;
+    });
+  }
+
+  // Streaming text is plain text; the finished message is the same content as
   // markdown, so it replaces the live bubble instead of duplicating it.
   function finalizeChatLive(view, finalText) {
     const bubble = chatState.liveBubble;
@@ -2829,6 +2875,10 @@
   function appendChatMessage(view, msg) {
     if (msg.type === 'agent_delta') {
       appendChatDelta(view, msg.text);
+      return;
+    }
+    if (msg.type === 'agent_snapshot') {
+      replaceChatLive(view, msg.text);
       return;
     }
     if (msg.seq != null) {

@@ -35,6 +35,7 @@ browser = [
 
 [project.scripts]
 symphony = "symphony.cli:main"
+symphony-pyright = "symphony.pyright:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]

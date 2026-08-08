@@ -365,28 +365,57 @@ class _FakeChatBackend:
         del is_continuation
         self.turns.append(prompt)
         await self._emit(EVENT_TURN_STARTED, {})
-        for chunk in _DELTAS:
+        if self.init.cfg.agent.kind == "prime-agent":
+            for text in ("Two files:", _ANSWER):
+                await self._emit(
+                    EVENT_OTHER_MESSAGE,
+                    {
+                        "type": "message_update",
+                        "message": {
+                            "role": "assistant",
+                            "content": [
+                                {"type": "thinking", "thinking": "private"},
+                                {"type": "text", "text": text},
+                            ],
+                        },
+                    },
+                )
+        else:
+            for chunk in _DELTAS:
+                await self._emit(
+                    EVENT_OTHER_MESSAGE,
+                    {
+                        "type": "stream_event",
+                        "event": {
+                            "type": "content_block_delta",
+                            "index": 0,
+                            "delta": {"type": "text_delta", "text": chunk},
+                        },
+                    },
+                )
+        if self.stream_gate is not None:
+            await self.stream_gate.wait()
+        if self.init.cfg.agent.kind == "prime-agent":
+            message = {
+                "role": "assistant",
+                "content": [{"type": "text", "text": _ANSWER}],
+            }
+            await self._emit(
+                EVENT_OTHER_MESSAGE, {"type": "message_end", "message": message}
+            )
+            await self._emit(
+                EVENT_TURN_COMPLETED,
+                {"type": "agent_end", "messages": [message]},
+            )
+        else:
             await self._emit(
                 EVENT_OTHER_MESSAGE,
                 {
-                    "type": "stream_event",
-                    "event": {
-                        "type": "content_block_delta",
-                        "index": 0,
-                        "delta": {"type": "text_delta", "text": chunk},
-                    },
+                    "type": "assistant",
+                    "message": {"content": [{"type": "text", "text": _ANSWER}]},
                 },
             )
-        if self.stream_gate is not None:
-            await self.stream_gate.wait()
-        await self._emit(
-            EVENT_OTHER_MESSAGE,
-            {
-                "type": "assistant",
-                "message": {"content": [{"type": "text", "text": _ANSWER}]},
-            },
-        )
-        await self._emit(EVENT_TURN_COMPLETED, {"message": _ANSWER})
+            await self._emit(EVENT_TURN_COMPLETED, {"message": _ANSWER})
         return TurnResult(
             status=EVENT_TURN_COMPLETED, turn_id="t", last_message=_ANSWER
         )
@@ -548,10 +577,16 @@ async def _exercise_git_actions(page: Any, base_url: str, board: Path) -> None:
 
 async def _exercise_chat_session(
     page: Any, base_url: str, backends: list[_FakeChatBackend]
-) -> None:
+) -> tuple[str, str]:
     await page.goto(f"{base_url}/#/chat", wait_until="networkidle")
     await page.locator(".chat-session-bar").wait_for()
-    assert await page.locator(".chat-tab").count() == 0
+    await page.wait_for_function(
+        "() => document.querySelectorAll('.chat-tab').length === 1"
+    )
+    listing = await (await page.request.get(f"{base_url}/api/v1/chat/sessions")).json()
+    assert listing["sessions"][0]["mode"] == "qa"
+    default_session_id = listing["sessions"][0]["session_id"]
+    assert not await page.locator(".chat-input").is_disabled()
 
     # A budget of one turn so the advisory warning is reachable in one send.
     await page.get_by_role("button", name="+ New").click()
@@ -559,7 +594,9 @@ async def _exercise_chat_session(
     await modal.get_by_label("Mode").select_option("qa")
     await modal.get_by_label("Warn after turns (0 = no limit)").fill("1")
     await modal.get_by_role("button", name="Start session").click()
-    await page.locator(".chat-tab").first.wait_for()
+    await page.wait_for_function(
+        "() => document.querySelectorAll('.chat-tab').length === 2"
+    )
     assert "claude" in await page.locator(".chat-controls").inner_text()
     assert "0/1 turns" in await page.locator(".chat-budget-chip").inner_text()
 
@@ -592,39 +629,89 @@ async def _exercise_chat_session(
     await page.locator(".chat-budget-chip.over").wait_for()
     await page.locator(".chat-status", has_text="chat budget reached").wait_for()
     assert not await page.locator(".chat-input").is_disabled()
+    listing = await (await page.request.get(f"{base_url}/api/v1/chat/sessions")).json()
+    return default_session_id, listing["active_id"]
 
 
-async def _exercise_chat_multi_session(page: Any) -> None:
+async def _exercise_chat_prime_snapshots(
+    page: Any, base_url: str, backends: list[_FakeChatBackend]
+) -> str:
+    response = await page.request.post(
+        f"{base_url}/api/v1/chat/sessions",
+        data={"mode": "qa", "agent_kind": "prime-agent"},
+    )
+    assert response.status == 201
+    session_id = (await response.json())["session_id"]
+    await page.goto(f"{base_url}/#/chat", wait_until="networkidle")
+    await page.wait_for_function(
+        "() => document.querySelectorAll('.chat-tab').length === 3"
+    )
+    await page.locator(".chat-tab").last.click()
+    await page.locator(".chat-controls", has_text="prime-agent").wait_for()
+
+    gate = asyncio.Event()
+    backends[-1].stream_gate = gate
+    await page.locator(".chat-input").fill("stream the answer")
+    await page.get_by_role("button", name="Send", exact=True).click()
+    live = page.locator(".chat-bubble-live")
+    await live.wait_for()
+    await page.wait_for_function(
+        "() => (document.querySelector('.chat-bubble-live')||{}).textContent"
+        f" === {_ANSWER!r}"
+    )
+    # Cumulative snapshots replace the live text; they must not concatenate.
+    assert await live.inner_text() == _ANSWER
+    gate.set()
+    await live.wait_for(state="detached")
+    assert await page.locator(".chat-agent .chat-bubble").last.inner_text() == (
+        "Two files: calc.py and README.md."
+    )
+    return session_id
+
+
+async def _exercise_chat_multi_session(
+    page: Any, default_session_id: str, budget_session_id: str
+) -> None:
     await page.get_by_role("button", name="+ New").click()
     modal = page.locator(".modal-form").last
     await modal.get_by_label("Mode").select_option("edit")
     await modal.get_by_role("button", name="Start session").click()
     await page.wait_for_function(
-        "() => document.querySelectorAll('.chat-tab').length === 2"
+        "() => document.querySelectorAll('.chat-tab').length === 3"
     )
-    # The second session starts empty; the first one's transcript is intact.
+    # The new edit session starts empty; the QA session's transcript is intact.
     assert await page.locator(".chat-agent .chat-bubble").count() == 0
-    await page.locator(".chat-tab").first.click()
+    await page.locator(f'.chat-tab[data-session-id="{budget_session_id}"]').click()
     await page.locator(".chat-agent .chat-bubble").first.wait_for()
     assert await page.locator(".chat-tab.active").count() == 1
 
 
-async def _exercise_chat_reattach(page: Any) -> None:
-    await page.locator(".chat-tab").first.click()
+async def _exercise_chat_reattach(
+    page: Any, session_id: str, default_session_id: str
+) -> None:
+    await page.locator(f'.chat-tab[data-session-id="{session_id}"]').click()
     await page.locator(".chat-agent .chat-bubble").first.wait_for()
     await page.get_by_role("button", name="Stop").click()
     await page.locator(".chat-resume-select").wait_for()
 
-    options = page.locator(".chat-resume-select option")
     await page.wait_for_function(
         "() => document.querySelectorAll('.chat-resume-select option').length >= 2"
     )
-    value = await options.nth(1).get_attribute("value")
+    value = await page.locator(".chat-resume-select option").nth(1).get_attribute("value")
     await page.locator(".chat-resume-select").select_option(value)
     await page.locator(".toast", has_text="Session reattached").wait_for()
     # The conversation comes back from the JSONL, not from memory.
     await page.locator(".chat-agent .chat-bubble").first.wait_for()
     assert "calc.py" in await page.locator(".chat-agent .chat-bubble").first.inner_text()
+
+    # Retire the unused auto-created session only after validating reattach;
+    # the fake backends share a runtime ID, so stopping it earlier would
+    # replace the resumable fixture used above.
+    await page.locator(f'.chat-tab[data-session-id="{default_session_id}"]').click()
+    await page.get_by_role("button", name="Stop").click()
+    await page.wait_for_function(
+        "() => document.querySelectorAll('.chat-tab').length === 2"
+    )
 
 
 async def test_web_git_and_chat_browser_e2e(
@@ -650,9 +737,18 @@ async def test_web_git_and_chat_browser_e2e(
         )
         try:
             await _exercise_git_actions(page, git_web_base_url, git_board_dir)
-            await _exercise_chat_session(page, git_web_base_url, chat_backends)
-            await _exercise_chat_multi_session(page)
-            await _exercise_chat_reattach(page)
+            default_session_id, budget_session_id = await _exercise_chat_session(
+                page, git_web_base_url, chat_backends
+            )
+            await _exercise_chat_multi_session(
+                page, default_session_id, budget_session_id
+            )
+            await _exercise_chat_reattach(
+                page, budget_session_id, default_session_id
+            )
+            await _exercise_chat_prime_snapshots(
+                page, git_web_base_url, chat_backends
+            )
             # Unlike the board flow, this one deliberately drives rejected
             # requests (unmerged delete, mistyped push confirmation, snapshot
             # of a just-stopped session). The browser logs each as a resource

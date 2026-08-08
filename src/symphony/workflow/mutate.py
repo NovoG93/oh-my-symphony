@@ -76,9 +76,12 @@ class StatesUpdatePlan:
 
 def _yaml_rt() -> YAML:
     y = YAML()
-    y.preserve_quotes = True
+    # ruamel.yaml's inferred attributes are typed as None, but these options
+    # accept their documented runtime values. Keep the workaround local rather
+    # than weakening type checking for the module.
+    setattr(y, "preserve_quotes", True)
     # Long hook lines must not be re-wrapped — that corrupts shell blocks.
-    y.width = 100_000
+    setattr(y, "width", 100_000)
     return y
 
 
