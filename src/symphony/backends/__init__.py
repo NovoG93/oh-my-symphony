@@ -9,7 +9,7 @@ Each backend owns its own subprocess lifecycle. The Codex backend keeps the
 single long-running app-server connection that speaks JSON-RPC over stdio.
 The Claude, Gemini, AGY, Kiro, OpenCode, Pi, and Prime Agent backends spawn one
 subprocess per turn — Claude uses `claude -p --output-format stream-json`, Gemini
-uses `gemini -p` one-shot, AGY uses `agy --print -`, Kiro uses
+uses `gemini -p` one-shot, AGY uses `agy --print "$(cat)"`, Kiro uses
 `kiro-cli chat --no-interactive`, OpenCode uses `opencode run --format json`, Pi
 uses `pi --mode json -p ""`, and Prime Agent uses `prime-agent -p --mode json`.
 

@@ -843,7 +843,7 @@ def test_agy_state_dir_passes_when_home_state_is_writable(
         """
         tracker: { kind: file, board_root: ./kanban }
         agent: { kind: agy }
-        agy: { command: agy --print - }
+        agy: { command: agy --print "$(cat)" }
         """,
     )
 
@@ -870,7 +870,7 @@ def test_agy_state_dir_fails_when_state_is_not_writable(
         """
         tracker: { kind: file, board_root: ./kanban }
         agent: { kind: agy }
-        agy: { command: agy --print - }
+        agy: { command: agy --print "$(cat)" }
         """,
     )
 

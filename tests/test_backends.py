@@ -129,7 +129,7 @@ def _make_cfg(kind: str, *, workspace_root: Path) -> ServiceConfig:
             stall_timeout_ms=30_000,
         ),
         agy=AgyConfig(
-            command="agy --print -",
+            command='agy --print "$(cat)"',
             turn_timeout_ms=60_000,
             read_timeout_ms=5_000,
             stall_timeout_ms=30_000,
@@ -1680,7 +1680,7 @@ async def test_agy_plain_text_stdout_is_completed_and_appends_permissions(
     assert backend.session_id == sid
     assert result.turn_id == sid
     assert result.last_message == "agy result"
-    assert commands == ["agy --print - --dangerously-skip-permissions"]
+    assert commands == ['agy --print "$(cat)" --dangerously-skip-permissions']
     assert proc.stdin.data == b"first"
     assert proc.stdin.closed is True
 
@@ -1692,7 +1692,7 @@ async def test_agy_continuation_adds_continue_without_duplicate_permissions(
     cfg = replace(
         _make_cfg("agy", workspace_root=tmp_path),
         agy=AgyConfig(
-            command="agy --print - --dangerously-skip-permissions",
+            command='agy --print "$(cat)" --dangerously-skip-permissions',
             turn_timeout_ms=60_000,
             read_timeout_ms=5_000,
             stall_timeout_ms=30_000,
@@ -1718,8 +1718,8 @@ async def test_agy_continuation_adds_continue_without_duplicate_permissions(
     await backend.run_turn(prompt="second", is_continuation=True)
 
     assert commands == [
-        "agy --print - --dangerously-skip-permissions",
-        "agy --print - --dangerously-skip-permissions --continue",
+        'agy --print "$(cat)" --dangerously-skip-permissions',
+        'agy --print "$(cat)" --dangerously-skip-permissions --continue',
     ]
 
 
@@ -1747,8 +1747,8 @@ async def test_agy_default_continuation_starts_fresh_turn(
     await backend.run_turn(prompt="second", is_continuation=True)
 
     assert commands == [
-        "agy --print - --dangerously-skip-permissions",
-        "agy --print - --dangerously-skip-permissions",
+        'agy --print "$(cat)" --dangerously-skip-permissions',
+        'agy --print "$(cat)" --dangerously-skip-permissions',
     ]
 
 
@@ -2877,14 +2877,14 @@ prompt body
     wf = parse_workflow_text(default_text, tmp_path / "WORKFLOW.md")
     cfg = build_service_config(wf)
     assert cfg.agent.kind == "agy"
-    assert cfg.agy.command == "agy --print -"
+    assert cfg.agy.command == 'agy --print "$(cat)"'
     assert cfg.agy.resume_across_turns is False
 
     alias_text = """---
 tracker: {kind: file, board_root: ./board}
 agent: {kind: antigravity}
 antigravity:
-  command: agy --print - --model gemini-test
+  command: agy --print "$(cat)" --model gemini-test
   resume_across_turns: false
 ---
 prompt body

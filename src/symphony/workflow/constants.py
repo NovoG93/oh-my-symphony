@@ -102,10 +102,9 @@ DEFAULT_CLAUDE_COMMAND = (
 # stdin alone is the prompt (Gemini documents stdin as "Appended to input on
 # stdin (if any).").
 DEFAULT_GEMINI_COMMAND = 'gemini -p ""'
-# Antigravity CLI print mode. `--print` requires an argument; `-` makes AGY
-# read the rendered Symphony prompt from stdin while the backend appends the
-# unattended permission flag at dispatch time.
-DEFAULT_AGY_COMMAND = "agy --print -"
+# Antigravity CLI print mode requires the prompt as an argument and ignores
+# piped stdin when given a literal `-`, so bridge stdin through the shell.
+DEFAULT_AGY_COMMAND = 'agy --print "$(cat)"'
 # Kiro CLI headless mode. Kiro's noninteractive chat command does not consume
 # piped stdin as the first message, so the shell bridges Symphony's stdin into
 # the required positional input argument.
