@@ -59,7 +59,16 @@ from tests.test_backends import (
     _make_cfg,
 )
 
-ALL_KINDS = ("codex", "claude", "gemini", "agy", "kiro", "opencode", "pi")
+ALL_KINDS = (
+    "codex",
+    "claude",
+    "gemini",
+    "agy",
+    "kiro",
+    "opencode",
+    "pi",
+    "prime-agent",
+)
 
 # Keys of the normalized event envelope every backend's `_emit` produces.
 EVENT_ENVELOPE_KEYS = {
@@ -361,6 +370,28 @@ class TestPiBackendContract(PerTurnBackendContract):
         ]
 
 
+class TestPrimeAgentBackendContract(PerTurnBackendContract):
+    kind = "prime-agent"
+    # PrimeAgentBackend inherits PiBackend's subprocess globals.
+    module = pi_module
+
+    def success_processes(self) -> list[_FakeSubprocess]:
+        return [
+            _FakeSubprocess(
+                stdout_lines=[
+                    b'{"type":"session","version":3,"id":"prime-c1"}\n',
+                    b'{"type":"message_end","message":{"role":"user",'
+                    b'"content":[{"type":"text","text":"prompt"}]}}\n',
+                    b'{"type":"message_end","message":{"role":"assistant",'
+                    b'"content":[{"type":"text","text":"done"}]}}\n',
+                    b'{"type":"agent_end","messages":[{"role":"assistant",'
+                    b'"content":[{"type":"text","text":"done"}],'
+                    b'"stopReason":"stop"}]}\n',
+                ]
+            )
+        ]
+
+
 # ---------------------------------------------------------------------------
 # git-root grant — every agent kind, not just the two Symphony can flag-inject
 #
@@ -380,6 +411,7 @@ _SPAWN_MODULES = {
     "kiro": per_turn_module,
     "opencode": per_turn_module,
     "pi": pi_module,
+    "prime-agent": pi_module,
 }
 
 
@@ -510,3 +542,49 @@ async def test_no_backend_grants_extra_roots_for_a_plain_repo_workspace(
         await backend.stop()
 
     assert captured["env"].get(GIT_ROOTS_ENV_VAR, "") == ""
+
+
+# ---------------------------------------------------------------------------
+# Review §4.3 — transient stream errors must retry, not pause
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        "claude stream unreadable: 20 consecutive malformed lines",
+        "codex stream unreadable: 20 consecutive malformed lines",
+        "pi stream unreadable: 20 consecutive malformed lines",
+        "claude exited with no result event (rc=1)",
+    ],
+)
+def test_transient_stream_errors_are_retryable(error: str) -> None:
+    from symphony.orchestrator.core import _is_retryable_worker_error
+
+    assert _is_retryable_worker_error("claude", "worker_exit", error)
+
+
+def test_unmatched_crashes_still_pause_for_inspection() -> None:
+    """A blanket retry-all would mask real crashes — keep the pause path."""
+    from symphony.orchestrator.core import _is_retryable_worker_error
+
+    assert not _is_retryable_worker_error(
+        "claude", "worker_exit", "TypeError: NoneType is not subscriptable"
+    )
+
+
+def test_retry_markers_match_the_strings_backends_actually_emit() -> None:
+    """Drift guard: the marker list and the backend messages are one contract."""
+    import symphony.backends.pi as pi_module
+    from symphony.orchestrator.core import _RETRYABLE_WORKER_ERROR_MARKERS
+
+    sources = "\n".join(
+        Path(mod.__file__).read_text(encoding="utf-8")
+        for mod in (claude_module, codex_module, pi_module)
+    )
+    for marker in ("stream unreadable", "no result event"):
+        assert marker in _RETRYABLE_WORKER_ERROR_MARKERS
+        assert marker in sources, (
+            f"marker {marker!r} no longer appears in any backend — the retry "
+            "list and the backends have drifted apart"
+        )

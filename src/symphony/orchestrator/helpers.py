@@ -10,7 +10,9 @@ asyncio orchestration itself.
 from __future__ import annotations
 
 import asyncio
+import shutil
 import subprocess
+import sys
 import time
 from dataclasses import replace
 from datetime import datetime, timezone
@@ -51,11 +53,72 @@ def _is_rewind_transition(
 
 
 def _branch_hook_env(cfg: ServiceConfig) -> dict[str, str]:
-    """Env consumed by the default worktree hook when creating a feature branch."""
-    return {
+    """Env consumed by the default worktree hook when creating a feature branch.
+
+    `SYMPHONY_BOARD_ROOT` / `SYMPHONY_BOARD_ROOT_NAME` let the setup hook link
+    the *configured* board root back into the workspace. Hooks that hardcode
+    `kanban` silently give the worker no board on any other `board_root`,
+    which the orchestrator sees only as an endless re-dispatch loop.
+    """
+    env = {
         "SYMPHONY_FEATURE_BASE_BRANCH": cfg.agent.feature_base_branch or "",
         "SYMPHONY_MERGE_TARGET_BRANCH": cfg.agent.auto_merge_target_branch or "",
     }
+    name = board_root_name_for_hooks(cfg)
+    root = cfg.tracker.board_root
+    if root is not None:
+        env["SYMPHONY_BOARD_ROOT"] = str(root.resolve())
+    if name is not None:
+        env["SYMPHONY_BOARD_ROOT_NAME"] = name
+    return env
+
+
+def resolve_symphony_cli() -> str:
+    """Absolute path to the `symphony` CLI a dispatched worker can run.
+
+    F-19: every stage prompt and the chat preamble now *require*
+    `symphony board new`, but Symphony is typically installed in a venv and
+    launched by absolute path (`.venv/bin/symphony`) or by `sys.executable -m`.
+    The spawned agent inherits the orchestrator's PATH, which need not contain
+    that venv's `bin`. Exporting the resolved path as `SYMPHONY_CLI` lets the
+    prompts say `${SYMPHONY_CLI:-symphony} board new ...` and work either way.
+    """
+    argv0 = Path(sys.argv[0]) if sys.argv and sys.argv[0] else None
+    if argv0 is not None and argv0.name in {"symphony", "symphony.exe"}:
+        resolved = argv0.resolve()
+        if resolved.is_file():
+            return str(resolved)
+    sibling = Path(sys.executable).parent / (
+        "symphony.exe" if sys.platform == "win32" else "symphony"
+    )
+    if sibling.is_file():
+        return str(sibling)
+    found = shutil.which("symphony")
+    if found:
+        return str(Path(found).resolve())
+    # Last resort: the module entry point through this interpreter. Callers
+    # interpolate it unquoted (`${SYMPHONY_CLI:-symphony} board ...`), so a
+    # multi-word value still forms a valid command line.
+    return f"{sys.executable} -m symphony.cli.main"
+
+
+def board_root_name_for_hooks(cfg: ServiceConfig) -> str | None:
+    """Board root path relative to the workflow dir, or None when outside it.
+
+    Only a board that lives *inside* the workflow directory can be linked
+    into a worktree workspace by relative name; an out-of-tree board root is
+    reached by absolute path and needs no link.
+    """
+    root = cfg.tracker.board_root
+    if root is None:
+        return None
+    workflow_dir = cfg.workflow_path.parent.resolve()
+    try:
+        relative = root.resolve().relative_to(workflow_dir)
+    except ValueError:
+        return None
+    text = relative.as_posix()
+    return text or None
 
 
 async def _branch_already_merged_into_target(
@@ -132,16 +195,21 @@ def _is_auto_triage_todo_candidate(issue: Issue, cfg: ServiceConfig) -> bool:
 
 
 def _config_for_issue_agent(cfg: ServiceConfig, issue: Issue) -> ServiceConfig:
-    """Return a per-worker config with the ticket's backend override applied."""
-    kind = _requested_agent_kind(issue)
-    if kind is None or kind == cfg.agent.kind:
-        return cfg
-    if kind not in SUPPORTED_AGENT_KINDS:
+    """Return a per-worker config with the ticket's backend override applied.
+
+    Precedence: per-ticket `agent_kind` pin > `agent.stage_kinds` entry for
+    the ticket's current state > workflow-level `agent.kind`.
+    """
+    pin = _requested_agent_kind(issue)
+    if pin is not None and pin not in SUPPORTED_AGENT_KINDS:
         raise ConfigValidationError(
             f"ticket agent.kind must be one of {sorted(SUPPORTED_AGENT_KINDS)}",
-            value=kind,
+            value=pin,
             issue=issue.identifier,
         )
+    kind = cfg.agent.kind_for_state(issue.state, pin)
+    if kind == cfg.agent.kind:
+        return cfg
     return replace(cfg, agent=replace(cfg.agent, kind=kind))
 
 
@@ -164,6 +232,39 @@ def _from_monotonic_to_iso(due_at_ms: float) -> str:
     delta_seconds = max((due_at_ms - now_mono) / 1000.0, 0.0)
     target = datetime.now(timezone.utc).timestamp() + delta_seconds
     return datetime.fromtimestamp(target, tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _terminal_state_matching(cfg: ServiceConfig, *keywords: str) -> str:
+    """First terminal lane whose normalized name contains any keyword.
+
+    F-32: `"Human Review"` and `"Blocked"` used to be hardcoded transition
+    targets, so a fully customized board (explicitly allowed) got a state
+    string its tracker does not know. Resolve through the configured lanes
+    and let the caller refuse cleanly when none matches.
+    """
+    normalized = [(state, normalize_state(state)) for state in cfg.tracker.terminal_states]
+    for keyword in keywords:
+        for state, low in normalized:
+            if keyword in low:
+                return state
+    return ""
+
+
+def _human_review_target_state(cfg: ServiceConfig) -> str:
+    """Lane for operator attention: `human`-ish, else `block`-ish, else the
+    first terminal lane. Empty when the board declares no terminal lane."""
+    resolved = _terminal_state_matching(cfg, "human", "review", "block")
+    if resolved:
+        return resolved
+    return cfg.tracker.terminal_states[0] if cfg.tracker.terminal_states else ""
+
+
+def _rewind_budget_target_state(cfg: ServiceConfig) -> str:
+    """Lane for a ticket that exhausted its rewind budget."""
+    resolved = _terminal_state_matching(cfg, "block", "human")
+    if resolved:
+        return resolved
+    return cfg.tracker.terminal_states[0] if cfg.tracker.terminal_states else ""
 
 
 def _max_turns_exhausted_target_state(cfg: ServiceConfig) -> str:

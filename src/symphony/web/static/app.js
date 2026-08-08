@@ -72,6 +72,8 @@
     getPrompt: (stateName) => apiRequest(`/workflow/prompts/${encodeURIComponent(stateName)}`),
     putPrompt: (stateName, content) => apiRequest(`/workflow/prompts/${encodeURIComponent(stateName)}`, { method: 'PUT', body: JSON.stringify({ content }) }),
     putBranchPolicy: (payload) => apiRequest('/workflow/branch-policy', { method: 'PUT', body: JSON.stringify(payload) }),
+    getLanePresets: () => apiRequest('/workflow/presets'),
+    applyLanePreset: (name) => apiRequest('/workflow/presets/apply', { method: 'POST', body: JSON.stringify({ name }) }),
     putContinuousImprovement: (payload) => apiRequest('/workflow/continuous-improvement', { method: 'PUT', body: JSON.stringify(payload) }),
     getContinuousImprovementStatus: () => apiRequest('/continuous-improvement/status'),
     resetContinuousImprovementTurns: () => apiRequest('/workflow/continuous-improvement/reset-turns', { method: 'POST' }),
@@ -118,16 +120,20 @@
     getStats: (days) => apiRequest(`/stats?days=${encodeURIComponent(days)}`),
     pause: (id) => apiRequest(`/${encodeURIComponent(id)}/pause`, { method: 'POST' }),
     resume: (id) => apiRequest(`/${encodeURIComponent(id)}/resume`, { method: 'POST' }),
-    skipLearn: (id) => apiRequest(`/${encodeURIComponent(id)}/skip-learn`, { method: 'POST' }),
+    skipDocument: (id) => apiRequest(`/${encodeURIComponent(id)}/skip-document`, { method: 'POST' }),
     recoverBlocked: (id) => apiRequest(`/issues/${encodeURIComponent(id)}/recover-blocked`, { method: 'POST' }),
     refresh: () => apiRequest('/refresh', { method: 'POST' }),
+    getPreview: () => apiRequest('/preview'),
+    startPreview: () => apiRequest('/preview/start', { method: 'POST', body: '{}' }),
+    stopPreview: () => apiRequest('/preview/stop', { method: 'POST', body: '{}' }),
+    restartPreview: () => apiRequest('/preview/restart', { method: 'POST', body: '{}' }),
   };
 
   // ------------------------------------------------------------------
   // State store
   // ------------------------------------------------------------------
 
-  const ROUTES = ['board', 'stats', 'workflow', 'git', 'chat', 'settings'];
+  const ROUTES = ['board', 'stats', 'workflow', 'git', 'chat', 'preview', 'settings'];
 
   const PRIORITY_META = {
     0: { label: t('priority.urgent'), short: 'P0', className: 'p0' },
@@ -233,6 +239,22 @@
         continue;
       }
 
+      const table = parseTableAt(lines, i);
+      if (table) {
+        flushList();
+        i += 2;
+        const rows = [];
+        while (i < lines.length) {
+          if (isMarkdownBlockBoundary(lines[i])) break;
+          const cells = splitTableRow(lines[i]);
+          if (!cells) break;
+          rows.push(normalizeTableRow(cells, table.alignments.length));
+          i++;
+        }
+        root.appendChild(renderTable(table.headers, table.alignments, rows));
+        continue;
+      }
+
       const heading = line.match(/^(#{1,6})\s+(.*)$/);
       if (heading) {
         flushList();
@@ -272,7 +294,12 @@
 
       const paraLines = [line];
       i++;
-      while (i < lines.length && lines[i].trim() && !/^(#{1,6})\s|^```|^\s*[-*]\s|^\s*\d+[.)]\s/.test(lines[i])) {
+      while (
+        i < lines.length &&
+        lines[i].trim() &&
+        !/^(#{1,6})\s|^```|^\s*[-*]\s|^\s*\d+[.)]\s/.test(lines[i]) &&
+        !parseTableAt(lines, i)
+      ) {
         paraLines.push(lines[i]);
         i++;
       }
@@ -280,6 +307,92 @@
     }
     flushList();
     return root;
+  }
+
+  function isMarkdownBlockBoundary(line) {
+    return /^(#{1,6})\s|^```|^\s*[-*]\s|^\s*\d+[.)]\s|^\s*>/.test(line);
+  }
+
+  function parseTableAt(lines, index) {
+    if (index + 1 >= lines.length) return null;
+    const headers = splitTableRow(lines[index]);
+    const alignments = parseTableAlignments(lines[index + 1]);
+    if (!headers || !alignments || headers.length !== alignments.length) return null;
+    return { headers, alignments };
+  }
+
+  function splitTableRow(line) {
+    if (!line || !line.trim() || !hasUnescapedPipe(line)) return null;
+    let content = line.trim();
+    if (content.startsWith('|')) content = content.slice(1);
+    if (content.endsWith('|') && !isEscapedCharacter(content, content.length - 1)) {
+      content = content.slice(0, -1);
+    }
+
+    const cells = [];
+    let cell = '';
+    for (let index = 0; index < content.length; index++) {
+      const char = content[index];
+      if (char === '|' && !isEscapedCharacter(content, index)) {
+        cells.push(cell.trim());
+        cell = '';
+      } else if (char === '\\' && content[index + 1] === '|' && !isEscapedCharacter(content, index)) {
+        cell += '|';
+        index++;
+      } else {
+        cell += char;
+      }
+    }
+    cells.push(cell.trim());
+    return cells;
+  }
+
+  function hasUnescapedPipe(line) {
+    for (let index = 0; index < line.length; index++) {
+      if (line[index] === '|' && !isEscapedCharacter(line, index)) return true;
+    }
+    return false;
+  }
+
+  function isEscapedCharacter(text, index) {
+    let backslashes = 0;
+    for (let cursor = index - 1; cursor >= 0 && text[cursor] === '\\'; cursor--) backslashes++;
+    return backslashes % 2 === 1;
+  }
+
+  function parseTableAlignments(line) {
+    const cells = splitTableRow(line);
+    if (!cells) return null;
+    const alignments = [];
+    for (const rawCell of cells) {
+      const marker = rawCell.replace(/\s/g, '');
+      if (!/^:?-{3,}:?$/.test(marker)) return null;
+      const left = marker.startsWith(':');
+      const right = marker.endsWith(':');
+      alignments.push(left && right ? 'center' : right ? 'right' : 'left');
+    }
+    return alignments;
+  }
+
+  function normalizeTableRow(cells, columnCount) {
+    if (cells.length === columnCount) return cells;
+    if (cells.length < columnCount) return cells.concat(Array(columnCount - cells.length).fill(''));
+    return cells.slice(0, columnCount - 1).concat(cells.slice(columnCount - 1).join(' | '));
+  }
+
+  function renderTable(headers, alignments, rows) {
+    const headerCells = headers.map((text, index) => el('th', {
+      class: `md-table-cell md-align-${alignments[index] || 'left'}`,
+      scope: 'col',
+    }, renderInline(text)));
+    const bodyRows = rows.map((row) => el('tr', null, row.map((text, index) => el('td', {
+      class: `md-table-cell md-align-${alignments[index] || 'left'}`,
+    }, renderInline(text)))));
+    const table = el('table', { class: 'md-table' }, [
+      el('thead', null, el('tr', null, headerCells)),
+      el('tbody', null, bodyRows),
+    ]);
+    return el('div', { class: 'md-table-wrap' }, table);
   }
 
   function renderInline(text) {
@@ -377,8 +490,10 @@
     return found ? found.name : lowerName;
   }
 
-  function isLearnState(name) {
-    return String(name || '').trim().toLowerCase() === 'learn';
+  function isDocumentState(name) {
+    const state = String(name || '').trim().toLowerCase();
+    // 'learn' is the legacy name of the Document lane (pre-rename boards).
+    return state === 'document' || state === 'learn';
   }
 
   function isBlockedState(name) {
@@ -745,6 +860,7 @@
     closeAnyMenu();
     closeDrawer();
     closeChatSocket();
+    cancelPreviewPoll();
     switch (state.route) {
       case 'board':
         renderBoardPage(view);
@@ -760,6 +876,9 @@
         break;
       case 'chat':
         renderChatPage(view);
+        break;
+      case 'preview':
+        renderPreviewPage(view);
         break;
       case 'settings':
         renderSettingsPage(view);
@@ -1037,6 +1156,20 @@
     }, attention.label || t('board.attention'));
   }
 
+  function blockedByIds(issue) {
+    if (!issue || !Array.isArray(issue.blocked_by)) return [];
+    return issue.blocked_by
+      .map((b) => (typeof b === 'string' ? b : (b && b.identifier) || ''))
+      .filter(Boolean);
+  }
+
+  function parseIdList(value) {
+    return String(value || '')
+      .split(',')
+      .map((s) => s.trim())
+      .filter(Boolean);
+  }
+
   function buildCardEl(issue, liveEntry, readOnly) {
     const card = el('div', {
       class: `card${liveEntry && liveEntry.paused ? ' paused' : ''}`,
@@ -1059,17 +1192,35 @@
     }
     for (const label of issue.labels) badges.appendChild(el('span', { class: 'chip-label' }, label));
     if (issue.agent_kind) badges.appendChild(el('span', { class: 'chip-agent' }, issue.agent_kind));
+    else if (issue.last_agent_kind) {
+      // Stage-routed board: no pin is written, so show who actually ran it.
+      badges.appendChild(el('span', {
+        class: 'chip-agent chip-agent-last',
+        title: t('board.lastAgentTitle'),
+      }, issue.last_agent_kind));
+    }
+    // The API has always returned `blocked_by` and `request`; without these
+    // chips the DAG the chat intake files is invisible on the board it points
+    // the operator at.
+    const blockerIds = blockedByIds(issue);
+    if (blockerIds.length) {
+      badges.appendChild(el('span', {
+        class: 'chip-blocked',
+        title: t('board.blockedByTitle', { ids: blockerIds.join(', ') }),
+      }, `⛓ ${blockerIds.join(', ')}`));
+    }
+    if (issue.request) badges.appendChild(el('span', { class: 'chip-request' }, issue.request));
     const attentionBadge = buildAttentionBadge(issue.attention);
     if (attentionBadge) badges.appendChild(attentionBadge);
     if (badges.childNodes.length) card.appendChild(badges);
-    if (!readOnly && isLearnState(issue.state) && !liveEntry) {
+    if (!readOnly && isDocumentState(issue.state) && !liveEntry) {
       card.appendChild(el('button', {
         class: 'btn btn-ghost btn-sm card-action',
         onClick: async (e) => {
           e.stopPropagation();
-          await runControlAction(api.skipLearn, issue.identifier, t('issue.skippedLearn'));
+          await runControlAction(api.skipDocument, issue.identifier, t('issue.skippedDocument'));
         },
-      }, t('issue.skipLearn')));
+      }, t('issue.skipDocument')));
     }
     if (!readOnly && isBlockedState(issue.state) && !liveEntry) {
       card.appendChild(el('button', {
@@ -1109,12 +1260,15 @@
     const labelsInput = el('input', { class: 'input', type: 'text', placeholder: t('board.labelsPlaceholder') });
     const agentSelect = buildAgentSelect('');
     const prefixInput = el('input', { class: 'input', type: 'text', placeholder: 'TASK', maxlength: 16 });
+    const blockedByInput = el('input', { class: 'input', type: 'text', placeholder: t('board.blockedByPlaceholder') });
+    const requestInput = el('input', { class: 'input', type: 'text', placeholder: t('board.requestPlaceholder') });
 
     const body = el('div', { class: 'form-stack' }, [
       field(t('common.title'), titleInput),
       field(t('common.description'), descInput),
       fieldRow([field(t('common.state'), stateSelect), field(t('common.priority'), prioritySelect)]),
       field(t('common.labels'), labelsInput),
+      fieldRow([field(t('common.blockedBy'), blockedByInput), field(t('common.request'), requestInput)]),
       fieldRow([field(t('common.agent'), agentSelect), field(t('settings.idPrefix'), prefixInput)]),
     ]);
 
@@ -1132,6 +1286,8 @@
           priority: prioritySelect.value === '' ? null : Number(prioritySelect.value),
           labels: parseLabels(labelsInput.value),
           agent_kind: agentSelect.value,
+          blocked_by: parseIdList(blockedByInput.value),
+          request: requestInput.value.trim(),
           prefix: prefixInput.value.trim() || 'TASK',
         });
         showToast(t('board.issueCreated', { id: created.identifier }), 'success');
@@ -1225,11 +1381,50 @@
     labelsInput.addEventListener('blur', commitLabels);
     labelsInput.addEventListener('keydown', (e) => { if (e.key === 'Enter') labelsInput.blur(); });
 
+    const blockedByInput = el('input', {
+      class: 'input',
+      type: 'text',
+      value: blockedByIds(detail).join(', '),
+      placeholder: t('board.blockedByPlaceholder'),
+    });
+    const commitBlockedBy = () => {
+      const ids = parseIdList(blockedByInput.value);
+      const current = blockedByIds(detail);
+      if (JSON.stringify(ids) === JSON.stringify(current)) return;
+      commitField(
+        detail.identifier, 'blocked_by', ids,
+        () => { blockedByInput.value = current.join(', '); },
+        () => { detail.blocked_by = ids.map((identifier) => ({ identifier, state: null })); },
+      );
+    };
+    blockedByInput.addEventListener('blur', commitBlockedBy);
+    blockedByInput.addEventListener('keydown', (e) => { if (e.key === 'Enter') blockedByInput.blur(); });
+
+    const requestInput = el('input', {
+      class: 'input',
+      type: 'text',
+      value: detail.request || '',
+      placeholder: t('board.requestPlaceholder'),
+    });
+    const commitRequest = () => {
+      const value = requestInput.value.trim();
+      if (value === (detail.request || '')) return;
+      commitField(
+        detail.identifier, 'request', value,
+        () => { requestInput.value = detail.request || ''; },
+        () => { detail.request = value; },
+      );
+    };
+    requestInput.addEventListener('blur', commitRequest);
+    requestInput.addEventListener('keydown', (e) => { if (e.key === 'Enter') requestInput.blur(); });
+
     const fieldsGrid = el('div', { class: 'drawer-fields' }, [
       field(t('common.state'), stateSelect),
       field(t('common.priority'), prioritySelect),
       field(t('common.agent'), agentSelect),
       field(t('common.labels'), labelsInput),
+      field(t('common.blockedBy'), blockedByInput),
+      field(t('common.request'), requestInput),
     ]);
 
     const deleteBtn = el('button', {
@@ -1257,13 +1452,13 @@
         el('span', null, detail.attention.message || ''),
       ]));
     }
-    if (!detail.live && isLearnState(detail.state)) {
+    if (!detail.live && isDocumentState(detail.state)) {
       container.appendChild(el('button', {
         class: 'btn btn-ghost',
         onClick: async () => {
-          await runControlAction(api.skipLearn, detail.identifier, t('issue.skippedLearn'));
+          await runControlAction(api.skipDocument, detail.identifier, t('issue.skippedDocument'));
         },
-      }, t('issue.skipLearn')));
+      }, t('issue.skipDocument')));
     }
     if (!detail.live && isBlockedState(detail.state)) {
       container.appendChild(el('button', {
@@ -1430,6 +1625,7 @@
       // regular poll loop will surface connectivity issues
     }
   }
+
 
   // ------------------------------------------------------------------
   // Page: Stats
@@ -2633,6 +2829,288 @@
   }
 
   // ------------------------------------------------------------------
+  // Page: Product Preview
+  // ------------------------------------------------------------------
+
+  let previewPollTimer = null;
+
+  function cancelPreviewPoll() {
+    if (previewPollTimer != null) {
+      clearTimeout(previewPollTimer);
+      previewPollTimer = null;
+    }
+  }
+
+  function safePreviewUrl(value) {
+    if (!value) return null;
+    try {
+      const url = new URL(String(value), window.location.href);
+      return url.protocol === 'http:' || url.protocol === 'https:' ? url.href : null;
+    } catch (_err) {
+      return null;
+    }
+  }
+
+  function previewPhase(data) {
+    const phase = String((data && data.phase) || '').toLowerCase();
+    if (data && data.running) {
+      if (data.healthy || data.ready) return 'running';
+      return phase === 'failed' ? 'failed' : 'starting';
+    }
+    if (phase === 'failed' || (data && data.last_error)) return 'failed';
+    return phase || 'stopped';
+  }
+
+  function previewPhaseLabel(phase) {
+    const labels = {
+      running: t('preview.phase.running'),
+      starting: t('preview.phase.starting'),
+      stopping: t('preview.phase.stopping'),
+      failed: t('preview.phase.failed'),
+      stopped: t('preview.phase.stopped'),
+      disabled: t('preview.phase.disabled'),
+    };
+    return labels[phase] || phase;
+  }
+
+  function previewValue(value) {
+    return value == null || value === '' ? '—' : String(value);
+  }
+
+  function buildPreviewMetric(label, value, extraClass) {
+    return el('div', { class: `preview-metric${extraClass ? ` ${extraClass}` : ''}` }, [
+      el('dt', null, label),
+      el('dd', null, previewValue(value)),
+    ]);
+  }
+
+  function buildPreviewActions(data, body) {
+    const configured = Boolean(data.configured);
+    const enabled = data.enabled !== false;
+    const running = Boolean(data.running);
+    const gateReady = !data.release_gate || data.release_gate.ready !== false;
+    const url = safePreviewUrl(data.url);
+
+    async function act(action, button) {
+      button.disabled = true;
+      body.setAttribute('aria-busy', 'true');
+      try {
+        const next = await api[action]();
+        showToast(t(`preview.${action === 'startPreview' ? 'launched' : action === 'stopPreview' ? 'stopped' : 'restarted'}`), 'success');
+        paintPreviewPage(body, next);
+      } catch (err) {
+        showToast(err.message, 'error');
+        await refreshPreviewPage(body, false);
+      } finally {
+        body.removeAttribute('aria-busy');
+      }
+    }
+
+    const launch = el('button', {
+      class: 'btn btn-primary preview-launch',
+      type: 'button',
+      disabled: !configured || !enabled || !gateReady || running,
+      onClick: (event) => act('startPreview', event.currentTarget),
+    }, t('preview.launch'));
+    const restart = el('button', {
+      class: 'btn',
+      type: 'button',
+      disabled: !configured || !enabled || !gateReady || !running,
+      onClick: (event) => act('restartPreview', event.currentTarget),
+    }, t('preview.restart'));
+    const stop = el('button', {
+      class: 'btn btn-danger-outline',
+      type: 'button',
+      disabled: !running,
+      onClick: (event) => act('stopPreview', event.currentTarget),
+    }, t('preview.stop'));
+    const open = url && running
+      ? el('a', {
+        class: 'btn preview-open',
+        href: url,
+        target: '_blank',
+        rel: 'noopener noreferrer',
+        'aria-label': t('preview.openAria'),
+      }, t('preview.open'))
+      : el('button', { class: 'btn preview-open', type: 'button', disabled: true }, t('preview.open'));
+
+    return el('div', { class: 'preview-actions', 'aria-label': t('preview.controls') }, [launch, open, restart, stop]);
+  }
+
+  function buildPreviewNotice(data) {
+    let title = '';
+    let detail = '';
+    let tone = 'info';
+    if (!data.configured) {
+      title = t('preview.unconfigured');
+      detail = data.last_error || t('preview.unconfiguredHint');
+      tone = 'warning';
+    } else if (data.enabled === false) {
+      title = t('preview.disabled');
+      detail = t('preview.disabledHint');
+      tone = 'warning';
+    } else if (previewPhase(data) === 'failed') {
+      title = t('preview.failed');
+      detail = data.last_error || t('preview.failedHint');
+      tone = 'danger';
+    } else if (data.running && !data.ready) {
+      title = t('preview.notReady');
+      detail = data.last_error || t('preview.notReadyHint');
+      tone = 'warning';
+    }
+    if (!title) return null;
+    return el('section', { class: `preview-notice ${tone}`, role: tone === 'danger' ? 'alert' : 'status' }, [
+      el('strong', null, title),
+      el('span', null, detail),
+    ]);
+  }
+
+  function buildPreviewStage(data) {
+    const url = safePreviewUrl(data.url);
+    if (data.running && url) {
+      return el('section', { class: 'preview-stage', 'aria-label': t('preview.productFrame') }, [
+        el('div', { class: 'preview-browser-bar' }, [
+          el('span', { class: 'preview-browser-light red', 'aria-hidden': 'true' }),
+          el('span', { class: 'preview-browser-light amber', 'aria-hidden': 'true' }),
+          el('span', { class: 'preview-browser-light green', 'aria-hidden': 'true' }),
+          el('span', { class: 'preview-address' }, url),
+        ]),
+        el('iframe', {
+          class: 'preview-frame',
+          src: url,
+          title: t('preview.iframeTitle'),
+          loading: 'eager',
+          referrerpolicy: 'no-referrer',
+        }),
+      ]);
+    }
+    return el('section', { class: 'preview-stage preview-stage-empty', 'aria-label': t('preview.productFrame') }, [
+      el('div', { class: 'preview-empty-mark', 'aria-hidden': 'true' }, '▱'),
+      el('h2', null, data.configured ? t('preview.awaitingLaunch') : t('preview.noTarget')),
+      el('p', null, data.configured ? t('preview.awaitingLaunchHint') : t('preview.noTargetHint')),
+    ]);
+  }
+
+  function buildPreviewAcceptance(data) {
+    const items = Array.isArray(data.acceptance) ? data.acceptance : [];
+    const gate = data.release_gate || {};
+    const gateReady = gate.ready === true;
+    const gateState = gate.state || (gateReady ? t('preview.gateReady') : t('preview.gatePending'));
+    const list = items.length
+      ? el('ul', { class: 'preview-checklist' }, items.map((item) =>
+        el('li', null, [el('span', { class: 'preview-check', 'aria-hidden': 'true' }, '□'), el('span', null, String(item))])
+      ))
+      : el('p', { class: 'preview-muted' }, t('preview.noAcceptance'));
+    return el('section', { class: 'preview-panel preview-acceptance' }, [
+      el('div', { class: 'preview-panel-heading' }, [
+        el('h2', null, t('preview.acceptance')),
+        el('span', { class: `preview-gate ${gateReady ? 'ready' : 'pending'}` }, gateState),
+      ]),
+      list,
+      el('div', { class: 'preview-release-ticket' }, [
+        el('span', null, t('preview.releaseTicket')),
+        el('strong', null, previewValue(gate.ticket)),
+      ]),
+      gate.reason ? el('p', { class: 'preview-gate-reason' }, gate.reason) : null,
+    ]);
+  }
+
+  function buildPreviewLogs(data, body) {
+    const logs = Array.isArray(data.logs) ? data.logs : [];
+    const refresh = el('button', {
+      class: 'btn btn-sm',
+      type: 'button',
+      onClick: async (event) => {
+        event.currentTarget.disabled = true;
+        await refreshPreviewPage(body, true);
+      },
+    }, t('preview.refreshLogs'));
+    const output = el('div', {
+      class: 'preview-log-output',
+      role: 'log',
+      'aria-live': 'polite',
+      'aria-label': t('preview.liveLogs'),
+      tabindex: '0',
+    }, logs.length
+      ? logs.map((entry) => {
+        const record = typeof entry === 'string' ? { line: entry } : (entry || {});
+        return el('div', { class: `preview-log-line ${record.stream === 'stderr' ? 'stderr' : ''}` }, [
+          el('span', { class: 'preview-log-stream' }, record.stream || 'out'),
+          el('span', null, previewValue(record.line)),
+        ]);
+      })
+      : el('div', { class: 'preview-log-empty' }, t('preview.noLogs')));
+    requestAnimationFrame(() => { output.scrollTop = output.scrollHeight; });
+    return el('section', { class: 'preview-panel preview-logs' }, [
+      el('div', { class: 'preview-panel-heading' }, [el('h2', null, t('preview.liveLogs')), refresh]),
+      output,
+    ]);
+  }
+
+  function paintPreviewPage(body, data) {
+    if (!body.isConnected || state.route !== 'preview') return;
+    cancelPreviewPoll();
+    clearNode(body);
+    const phase = previewPhase(data);
+    const header = el('section', { class: 'preview-command-deck' }, [
+      el('div', { class: 'preview-command-copy' }, [
+        el('span', { class: 'preview-eyebrow' }, t('preview.eyebrow')),
+        el('div', { class: 'preview-title-row' }, [
+          el('h1', null, t('preview.title')),
+          el('span', { class: `preview-status ${phase}`, role: 'status', 'aria-live': 'polite' }, previewPhaseLabel(phase)),
+        ]),
+        el('p', null, t('preview.subtitle')),
+      ]),
+      buildPreviewActions(data, body),
+    ]);
+    const notice = buildPreviewNotice(data);
+    const metrics = el('dl', { class: 'preview-metrics' }, [
+      buildPreviewMetric(t('preview.readiness'), data.ready ? t('preview.ready') : t('preview.notReadyValue'), data.ready ? 'good' : 'waiting'),
+      buildPreviewMetric(t('preview.health'), data.healthy ? t('preview.healthy') : t('preview.unhealthy'), data.healthy ? 'good' : 'waiting'),
+      buildPreviewMetric(t('preview.targetSha'), data.target_sha),
+      buildPreviewMetric(t('preview.targetBranch'), data.target_branch),
+      buildPreviewMetric(t('preview.url'), data.url),
+      buildPreviewMetric(t('preview.process'), data.pid ? `PID ${data.pid}${data.port ? ` · :${data.port}` : ''}` : '—'),
+    ]);
+    const lower = el('div', { class: 'preview-lower-grid' }, [buildPreviewAcceptance(data), buildPreviewLogs(data, body)]);
+    body.appendChild(header);
+    if (notice) body.appendChild(notice);
+    body.appendChild(metrics);
+    body.appendChild(buildPreviewStage(data));
+    body.appendChild(lower);
+    previewPollTimer = setTimeout(() => refreshPreviewPage(body, false), 3000);
+  }
+
+  async function refreshPreviewPage(body, announce) {
+    if (!body.isConnected || state.route !== 'preview') return;
+    try {
+      const data = await api.getPreview();
+      paintPreviewPage(body, data || {});
+      if (announce) showToast(t('preview.refreshed'), 'success');
+    } catch (err) {
+      if (!body.isConnected || state.route !== 'preview') return;
+      cancelPreviewPoll();
+      clearNode(body);
+      body.appendChild(el('div', { class: 'preview-load-error', role: 'alert' }, [
+        el('strong', null, t('preview.unavailable')),
+        el('span', null, err.message),
+        el('button', { class: 'btn', type: 'button', onClick: () => refreshPreviewPage(body, false) }, t('common.refresh')),
+      ]));
+      previewPollTimer = setTimeout(() => refreshPreviewPage(body, false), 5000);
+    }
+  }
+
+  function renderPreviewPage(container) {
+    const page = el('div', { class: 'page page-preview' });
+    const body = el('div', { class: 'preview-body' }, [
+      el('div', { class: 'preview-loading', role: 'status' }, [buildSkeletonBlock(), el('span', null, t('preview.loading'))]),
+    ]);
+    page.appendChild(body);
+    container.appendChild(page);
+    refreshPreviewPage(body, false);
+  }
+
+  // ------------------------------------------------------------------
   // Page: Settings
   // ------------------------------------------------------------------
 
@@ -2683,10 +3161,25 @@
     return options;
   }
 
+  // Improvement modes: one opt-in checkbox each. An empty selection keeps the
+  // original readiness-only heartbeat, which is what `enabled` alone meant
+  // before modes existed.
+  function ciModeCheckboxes(ci) {
+    const supported = ci.supported_modes || ['readiness'];
+    const selected = new Set(ci.modes || []);
+    return supported.map((mode) =>
+      el('label', { class: 'form-check', 'data-ci-mode': mode }, [
+        el('input', { type: 'checkbox', 'data-ci-mode-input': mode, checked: selected.has(mode) }),
+        el('span', null, t(`workflow.ciMode.${mode}`)),
+      ])
+    );
+  }
+
   function buildContinuousImprovementCard(wf, ciStatus) {
     const ci = wf.continuous_improvement || {};
     const status = ciStatus || {};
     const statusView = ciStatusView(ci, status);
+    const modeChecks = ciModeCheckboxes(ci);
     const enabledInput = el('input', { id: 'ci-enabled-toggle', type: 'checkbox', checked: Boolean(ci.enabled) });
     const intervalInput = el('input', { id: 'ci-interval-input', class: 'input', type: 'number', min: '60000', step: '60000', value: ci.interval_ms || 1800000 });
     const maxTurnsInput = el('input', { id: 'ci-max-turns-input', class: 'input', type: 'number', min: '0', step: '1', value: ci.max_turns == null ? 48 : ci.max_turns });
@@ -2719,6 +3212,9 @@
             interval_ms: Number(intervalInput.value),
             max_turns: Number(maxTurnsInput.value),
             agent_kind: agentSelect.value,
+            modes: modeChecks
+              .filter((node) => node.querySelector('input').checked)
+              .map((node) => node.getAttribute('data-ci-mode')),
           };
           const result = await api.putContinuousImprovement(payload);
           state.workflow = { ...wf, continuous_improvement: result.continuous_improvement };
@@ -2744,6 +3240,8 @@
         field(t('chat.maxTurns'), maxTurnsInput),
         field(t('issue.ticketAgent'), agentSelect),
       ]),
+      field(t('workflow.ciModes'), el('div', { class: 'ci-modes' }, modeChecks)),
+      el('div', { class: 'form-hint' }, t('workflow.ciModesHint')),
       el('div', { class: 'ci-status-grid' }, [
         kv(t('workflow.turnsUsed'), `${status.turns_used == null ? 0 : status.turns_used} / ${ci.max_turns === 0 ? t('workflow.unlimited') : ci.max_turns}`),
         kv(t('common.phase'), status.current_phase || '—'),
@@ -2753,6 +3251,50 @@
         kv(t('workflow.nextDue'), status.next_due_at || '—'),
       ]),
       el('div', { class: 'ci-actions' }, [saveButton, resetButton]),
+    ]);
+  }
+
+  function buildStageContractsRow(wf) {
+    // F-06: `agent.stage_contracts: auto` silently switches the mechanical
+    // evidence floor off as soon as a default lane is renamed. Say so here.
+    const agent = (wf && wf.agent) || {};
+    const enabled = agent.stage_contracts_enabled !== false;
+    const lanes = 'Todo, In Progress, Verify, Document';
+    return el('div', { class: enabled ? 'form-hint' : 'form-hint form-hint-warn' }, [
+      el('strong', null, t('settings.stageContracts') + ': '),
+      enabled ? t('settings.stageContractsOn') : t('settings.stageContractsOff', { lanes }),
+    ]);
+  }
+
+  function buildLanePresetCard(presets, wf) {
+    const select = el(
+      'select',
+      { class: 'select' },
+      presets.presets.map((p) =>
+        el('option', { value: p.name, selected: p.name === presets.current }, p.label)
+      )
+    );
+    const applyButton = el('button', {
+      class: 'btn btn-primary',
+      onClick: async (e) => {
+        e.target.disabled = true;
+        try {
+          const result = await api.applyLanePreset(select.value);
+          showToast(t('settings.lanePresetApplied', { name: result.applied }), 'success');
+          renderRoute();
+        } catch (err) {
+          showToast(err.message, 'error');
+        } finally {
+          e.target.disabled = false;
+        }
+      },
+    }, t('common.apply'));
+    return el('div', { class: 'card-panel' }, [
+      el('h3', null, t('settings.lanePreset')),
+      fieldRow([field(t('settings.lanePresetChoose'), select)]),
+      el('div', { class: 'form-hint' }, t('settings.lanePresetHint')),
+      buildStageContractsRow(wf),
+      applyButton,
     ]);
   }
 
@@ -2815,11 +3357,13 @@
         state.board ? Promise.resolve(state.board) : api.getBoard(),
       ]);
       const ciStatus = await api.getContinuousImprovementStatus();
+      const lanePresets = await api.getLanePresets();
       state.workflow = wf;
       state.branches = branchesResp.branches;
       if (!state.board) state.board = board;
       clearNode(body);
       body.appendChild(buildContinuousImprovementCard(wf, ciStatus));
+      body.appendChild(buildLanePresetCard(lanePresets, wf));
       body.appendChild(buildBranchPolicyCard(wf));
       body.appendChild(buildBoardInfoCard(wf));
       body.appendChild(buildInterfaceCard());
@@ -2844,12 +3388,17 @@
     return Boolean(active.closest('#overlay-root'));
   }
 
+  // Hold DOM updates while the user is mid-edit (overlay input focused) or
+  // mid-drag — a re-render would remove the drag-source node, which silently
+  // cancels an HTML5 drag. Shared with the run execution panel's poll.
+  function shouldHoldRender() {
+    return isEditingFocused() || Boolean(document.querySelector('.card.dragging'));
+  }
+
   async function pollBoard() {
-    // Hold DOM updates while the user is mid-edit (overlay input focused)
-    // or mid-drag — a re-render would remove the drag-source node, which
-    // silently cancels an HTML5 drag. The fetch itself still runs so the
-    // connection indicator stays truthful.
-    const holdRender = isEditingFocused() || Boolean(document.querySelector('.card.dragging'));
+    // The fetch itself still runs while held, so the connection indicator
+    // stays truthful.
+    const holdRender = shouldHoldRender();
     try {
       const board = await api.getBoard();
       state.connected = true;

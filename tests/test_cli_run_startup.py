@@ -157,14 +157,10 @@ def test_port_conflict_names_this_workflow_service(
             workflow_dir=workflow.parent,
             host="127.0.0.1",
             port=port,
-            viewer_port=None,
             orchestrator_pid=os.getpid(),
-            viewer_pid=None,
             log_path=tmp_path / "log" / "symphony.log",
-            viewer_log_path=None,
             started_at="2026-07-03T01:00:00Z",
             orchestrator_command=["symphony", str(workflow)],
-            viewer_command=[],
         )
     )
     try:

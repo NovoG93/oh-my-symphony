@@ -93,6 +93,12 @@ def _utc_iso() -> str:
 class PiBackend(BaseAgentBackend):
     """One subprocess per turn; speaks pi --mode json JSONL."""
 
+    _agent_name = "pi"
+
+    # Subclass override point: the CLI flag used for session resume.
+    # Pi uses ``--session <id>``; PrimeAgent uses ``--resume <id>``.
+    _resume_flag = "--session"
+
     def is_progress_event(self, event: dict[str, Any]) -> bool:
         return event.get("type") in _PROGRESS_EVENT_TYPES
 
@@ -151,7 +157,7 @@ class PiBackend(BaseAgentBackend):
         return None
 
     async def initialize(self) -> dict[str, Any]:
-        return {"agent": "pi"}
+        return {"agent": self._agent_name}
 
     async def start_session(
         self, *, initial_prompt: str, issue_title: str | None
@@ -166,6 +172,13 @@ class PiBackend(BaseAgentBackend):
         if self._closed:
             raise ResponseError("backend is closed")
 
+        # Both the assistant preview and stderr diagnostics belong to this
+        # subprocess. Clear them before every turn so a missing terminal event
+        # cannot make a later empty turn look successful (or repeat stale
+        # diagnostics from an earlier process).
+        self._last_message = ""
+        self._stderr_tail.clear()
+
         cmd = self._pi.command
         if (
             is_continuation
@@ -173,7 +186,7 @@ class PiBackend(BaseAgentBackend):
             and self._session_id
             and self._session_id != PENDING_SESSION_ID
         ):
-            cmd = f"{cmd} --session {shlex.quote(self._session_id)}"
+            cmd = f"{cmd} {self._resume_flag} {shlex.quote(self._session_id)}"
 
         try:
             proc = await asyncio.create_subprocess_exec(
@@ -210,7 +223,9 @@ class PiBackend(BaseAgentBackend):
                 await proc.stdin.drain()
                 proc.stdin.close()
             except (BrokenPipeError, ConnectionResetError) as exc:
-                raise PortExit("pi stdin closed", error=str(exc)) from exc
+                raise PortExit(
+                    f"{self._agent_name} stdin closed", error=str(exc)
+                ) from exc
 
             timeout_s = self._pi.turn_timeout_ms / 1000.0
             try:
@@ -220,16 +235,26 @@ class PiBackend(BaseAgentBackend):
             except asyncio.TimeoutError as exc:
                 await self._reap(proc)
                 await self._emit(EVENT_TURN_FAILED, {"reason": "turn_timeout"})
-                raise TurnTimeout("pi turn timed out") from exc
+                raise TurnTimeout(f"{self._agent_name} turn timed out") from exc
 
             safe_rc = await safe_proc_wait(proc, timeout=POST_STREAM_REAP_TIMEOUT_S)
             if safe_rc is None and proc.returncode is None:
                 # stdout closed but the process lingers — reap the tree
                 # instead of hanging the turn on an unbounded wait.
                 safe_rc = await terminate_process_tree(proc)
+            # The stream reader is cancelled when stdout closes, so collect
+            # any stderr lines written just before process exit after the
+            # bounded reap. This keeps process-level diagnostics actionable,
+            # without hanging on a child that leaves stderr open.
+            try:
+                await asyncio.wait_for(self._drain_stderr(proc), timeout=0.1)
+            except asyncio.TimeoutError:
+                pass
+            rc = safe_rc if safe_rc is not None else proc.returncode
             if self._stream_corrupt is not None:
                 err_msg = (
-                    f"pi stream unreadable: {MALFORMED_LINE_LIMIT} consecutive "
+                    f"{self._agent_name} stream unreadable: "
+                    f"{MALFORMED_LINE_LIMIT} consecutive "
                     f"malformed lines (last: {self._stream_corrupt[:200]!r})"
                 )
                 await self._emit(
@@ -237,38 +262,82 @@ class PiBackend(BaseAgentBackend):
                     {"reason": err_msg, "stderr_tail": list(self._stderr_tail)},
                 )
                 raise TurnFailed(err_msg)
-            if terminal is None:
-                stderr_blob = self._stderr_blob()
-                rc = safe_rc if safe_rc is not None else proc.returncode
-                err_msg = (
-                    f"pi exited with no agent_end event (rc={rc})"
-                    + (f"; stderr: {stderr_blob}" if stderr_blob else "")
-                )
-                await self._emit(
-                    EVENT_TURN_FAILED,
-                    {"reason": err_msg, "stderr_tail": list(self._stderr_tail)},
-                )
-                raise TurnFailed(err_msg)
 
-            failure_reason = _extract_failure_reason(terminal)
-            if failure_reason is not None:
-                stderr_blob = self._stderr_blob()
-                if stderr_blob:
-                    failure_reason = f"{failure_reason}; stderr: {stderr_blob}"
-                payload = {
-                    "reason": failure_reason,
-                    "stderr_tail": list(self._stderr_tail),
-                    **terminal,
+            if terminal is not None:
+                terminal_message = _extract_last_assistant_message(
+                    terminal.get("messages")
+                )
+                if terminal_message:
+                    self._last_message = terminal_message[:400]
+
+                failure_reason = _extract_failure_reason(
+                    terminal, agent_name=self._agent_name
+                )
+                if failure_reason is not None:
+                    stderr_blob = self._stderr_blob()
+                    if stderr_blob:
+                        failure_reason = f"{failure_reason}; stderr: {stderr_blob}"
+                    payload = {
+                        "reason": failure_reason,
+                        "stderr_tail": list(self._stderr_tail),
+                        **terminal,
+                    }
+                    await self._emit(EVENT_TURN_FAILED, payload)
+                    raise TurnFailed(failure_reason)
+
+                # A clean terminal event is not success if the CLI itself
+                # reports a non-zero process status.
+                if rc not in (None, 0):
+                    await self._raise_nonzero_exit(rc)
+
+                await self._emit(EVENT_TURN_COMPLETED, terminal)
+                return TurnResult(
+                    status=EVENT_TURN_COMPLETED,
+                    turn_id=self._session_id,
+                    last_message=self._last_message,
+                )
+
+            # Graceful exit with assistant output but no explicit agent_end:
+            # prime-agent's -p mode sometimes closes stdout before flushing
+            # the terminal event. Only rc=0 plus text from this turn qualifies;
+            # stale output from a previous turn was cleared above.
+            if rc not in (None, 0):
+                await self._raise_nonzero_exit(rc)
+            if rc == 0 and self._last_message:
+                synthetic = {
+                    "type": "agent_end",
+                    "messages": [
+                        {
+                            "role": "assistant",
+                            "content": [
+                                {"type": "text", "text": self._last_message}
+                            ],
+                            "stopReason": "stop",
+                        }
+                    ],
+                    "message": self._last_message,
                 }
-                await self._emit(EVENT_TURN_FAILED, payload)
-                raise TurnFailed(failure_reason)
+                log.info(
+                    f"{self._agent_name}_agent_end_missing_ok",
+                    reason="rc=0 with assistant output, no agent_end event",
+                )
+                await self._emit(EVENT_TURN_COMPLETED, synthetic)
+                return TurnResult(
+                    status=EVENT_TURN_COMPLETED,
+                    turn_id=self._session_id,
+                    last_message=self._last_message,
+                )
 
-            await self._emit(EVENT_TURN_COMPLETED, terminal)
-            return TurnResult(
-                status=EVENT_TURN_COMPLETED,
-                turn_id=self._session_id,
-                last_message=self._last_message,
+            stderr_blob = self._stderr_blob()
+            err_msg = (
+                f"{self._agent_name} exited with no agent_end event (rc={rc})"
+                + (f"; stderr: {stderr_blob}" if stderr_blob else "")
             )
+            await self._emit(
+                EVENT_TURN_FAILED,
+                {"reason": err_msg, "stderr_tail": list(self._stderr_tail)},
+            )
+            raise TurnFailed(err_msg)
         except asyncio.CancelledError:
             await self._reap(proc)
             raise
@@ -295,7 +364,9 @@ class PiBackend(BaseAgentBackend):
                 except asyncio.CancelledError:
                     raise
                 except Exception as exc:
-                    log.error("pi_stdout_read_error", error=str(exc))
+                    log.error(
+                        f"{self._agent_name}_stdout_read_error", error=str(exc)
+                    )
                     break
                 if not line:
                     break
@@ -327,16 +398,21 @@ class PiBackend(BaseAgentBackend):
                     message = msg.get("message") or {}
                     if isinstance(message, dict):
                         self._update_usage(message.get("usage") or {})
-                        last_text = _extract_text(message)
-                        if last_text:
-                            self._last_message = last_text[:400]
+                        if message.get("role") == "assistant":
+                            last_text = _extract_text(message)
+                            if last_text:
+                                self._last_message = last_text[:400]
                     await self._emit(EVENT_OTHER_MESSAGE, msg)
                 elif kind == "turn_end":
                     # `turn_end` carries the same AssistantMessage as the
                     # paired `message_end`; usage is already accumulated, so
                     # only refresh the last-message preview if missing.
                     message = msg.get("message") or {}
-                    if isinstance(message, dict) and not self._last_message:
+                    if (
+                        isinstance(message, dict)
+                        and message.get("role") == "assistant"
+                        and not self._last_message
+                    ):
                         last_text = _extract_text(message)
                         if last_text:
                             self._last_message = last_text[:400]
@@ -401,9 +477,18 @@ class PiBackend(BaseAgentBackend):
                 else:
                     await self._emit(EVENT_OTHER_MESSAGE, msg)
         finally:
-            stderr_task.cancel()
+            # Give a closed stdout a brief chance to flush stderr diagnostics;
+            # cancelling immediately can lose the auth/network error that
+            # explains a non-zero exit. Do not wait indefinitely if a child
+            # keeps stderr open after stdout closes.
             try:
-                await stderr_task
+                await asyncio.wait_for(stderr_task, timeout=0.1)
+            except asyncio.TimeoutError:
+                stderr_task.cancel()
+                try:
+                    await stderr_task
+                except (asyncio.CancelledError, Exception):
+                    pass
             except (asyncio.CancelledError, Exception):
                 pass
         return terminal
@@ -421,7 +506,7 @@ class PiBackend(BaseAgentBackend):
             text = line.decode("utf-8", errors="replace").rstrip()
             if text:
                 self._stderr_tail.append(text)
-            log.debug("pi_stderr", line=text)
+            log.debug(f"{self._agent_name}_stderr", line=text)
 
     def _stderr_blob(self) -> str:
         """Compact stderr tail for inclusion in failure messages (≤400 chars)."""
@@ -429,6 +514,23 @@ class PiBackend(BaseAgentBackend):
             return ""
         joined = " | ".join(self._stderr_tail)
         return joined if len(joined) <= 400 else joined[-400:]
+
+    async def _raise_nonzero_exit(self, rc: int) -> None:
+        """Turn a non-zero CLI status into a backend-specific failure."""
+        stderr_blob = self._stderr_blob()
+        err_msg = f"{self._agent_name} exited with code {rc}"
+        if stderr_blob:
+            err_msg += f"; stderr: {stderr_blob}"
+        await self._emit(
+            EVENT_TURN_FAILED,
+            {
+                "reason": err_msg,
+                "exit_code": rc,
+                "stderr": stderr_blob,
+                "stderr_tail": list(self._stderr_tail),
+            },
+        )
+        raise TurnFailed(err_msg)
 
     async def _reap(self, proc: asyncio.subprocess.Process) -> None:
         """Best-effort process-group teardown; mirrors `stop()`."""
@@ -484,7 +586,22 @@ def _extract_text(message: dict[str, Any]) -> str:
     return ""
 
 
-def _extract_failure_reason(terminal: dict[str, Any]) -> str | None:
+def _extract_last_assistant_message(messages: object) -> str:
+    """Return the last textual assistant message from an agent_end list."""
+    if not isinstance(messages, list):
+        return ""
+    for message in reversed(messages):
+        if not isinstance(message, dict) or message.get("role") != "assistant":
+            continue
+        text = _extract_text(message)
+        if text:
+            return text
+    return ""
+
+
+def _extract_failure_reason(
+    terminal: dict[str, Any], agent_name: str = "pi"
+) -> str | None:
     """Return a non-empty failure reason if the terminal `agent_end` event
     indicates the run ended in error; otherwise None.
 
@@ -505,5 +622,5 @@ def _extract_failure_reason(terminal: dict[str, Any]) -> str | None:
         err = last.get("errorMessage")
         if isinstance(err, str) and err:
             return err
-        return f"pi turn ended with stopReason={stop_reason!r}"
+        return f"{agent_name} turn ended with stopReason={stop_reason!r}"
     return None

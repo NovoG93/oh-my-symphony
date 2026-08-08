@@ -454,7 +454,7 @@ def build_prompt_env(
 
     `is_rewind` is True when this prompt is being rendered for a phase
     transition that moves *backwards* in the pipeline (Verify→In Progress
-    or Learn→In Progress). The orchestrator's `attempt` counter only fires on
+    or Document→In Progress). The orchestrator's `attempt` counter only fires on
     full worker re-dispatch from the retry path, so an in-flight rewind
     inside a single worker run otherwise has no signal to give the agent.
     Always present in the env (default False) so strict templates that
@@ -531,7 +531,7 @@ def build_first_turn_prompt(
 
     `is_rewind=True` is forwarded to the template env so WORKFLOW.md
     authors can branch the retry-preamble block on rewind specifically
-    (in-flight `Verify→In Progress` / `Learn→In Progress` handoffs that
+    (in-flight `Verify→In Progress` / `Document→In Progress` handoffs that
     don't trip the dispatch-level retry counter).
 
     `token_ema` / `token_budget` / `rewind_scope` plumb the C3 + A2

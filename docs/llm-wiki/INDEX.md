@@ -12,6 +12,6 @@ before any new ticket; Learn writes back to them after QA passes.
 | worktree-git-sandbox | Linked-worktree git dir vs common dir split + the writable roots every backend must grant + host-owned Final History Gate + Blocked-history recovery | 2026-08-06 |
 | workspace-auto-commit-excludes | Opt-in `symphony.autocommitExclude` git-config pathspec exclusions for final auto-commits, including base-squash safety and quoted pathspec handling | 2026-05-17 (SMA-25) |
 | agent-observability | Headless event log signal set + cache token split + stall signatures + cross-refs to orchestrator/doctor/workspace | 2026-05-17 |
-| board-viewer-theming | CSS variable token surface + `:root[data-theme="..."]` override pattern + UI Zoom micro-pattern mirrored for theme persistence | 2026-05-17 (SMA-23) |
+| board-viewer-theming | CSS variable token surface + `:root[data-theme="..."]` override pattern + UI Zoom micro-pattern mirrored for theme persistence. **Historical:** `tools/board-viewer/` was removed; the built-in web app is the only board | 2026-05-17 (SMA-23) |
 | session-persistence | Per-workspace `.symphony-session.json` + load on dispatch + save on session_started + per-backend honor-points + codex `thread/resume` fallback | 2026-05-10 (SMA-20) |
 | tui-rendering | Textual `KanbanApp` widget tree + diff-mount card refresh + heartbeat / observer / tracker poll cadence + invariants the helpers preserve | 2026-05-10 (Textual migration) |

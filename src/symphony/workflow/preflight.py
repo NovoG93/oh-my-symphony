@@ -91,6 +91,9 @@ def validate_for_dispatch(config: ServiceConfig) -> None:
     elif kind == "pi":
         if not config.pi.command.strip():
             raise ConfigValidationError("pi.command must be non-empty")
+    elif kind == "prime-agent":
+        if not config.prime_agent.command.strip():
+            raise ConfigValidationError("prime_agent.command must be non-empty")
     budget_error = stage_turn_budget_error(config)
     if budget_error is not None:
         raise ConfigValidationError(budget_error)

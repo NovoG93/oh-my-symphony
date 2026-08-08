@@ -3,11 +3,11 @@
 Symphony's default workflow now has four active agent lanes:
 
 ```text
-Todo -> In Progress -> Verify -> Learn -> Done
+Todo -> In Progress -> Verify -> Document -> Done
           ^              |        |
           |              |        +-> critical/manual intervention -> Human Review
           +--------------+
-             Verify or Learn findings rewind here
+             Verify or Document findings rewind here
 ```
 
 `WORKFLOW.md` remains the orchestration manifest. Worker instructions live in
@@ -18,8 +18,8 @@ plus the current state's stage prompt for each fresh turn.
 | --- | --- | --- |
 | Todo | triage/router | `## Triage`, then route actionable work to `In Progress` or explain `Blocked` |
 | In Progress | implementer | `## Plan`, `## Acceptance Tests`, `## Done Signals`, `## Implementation`, `## Self-Critique`, plus goal/before/after proof notes under `docs/<ID>/work/` |
-| Verify | reviewer + QA + merge gate | `## Security Audit`, clean `## Review` or `## Review Findings`, `## QA Evidence`, `## AC Scorecard`, `## Merge Status`, plus not-covered and rerun guidance |
-| Learn | distiller | `docs/llm-wiki/` updates, `## Wiki Updates`, `## As-Is -> To-Be Report`; may rewind real defects to `In Progress` |
+| Verify | reviewer + QA + merge preflight | `## Security Audit`, clean `## Review` or `## Review Findings`, `## QA Evidence`, `## AC Scorecard`, `## Merge Status`, plus not-covered and rerun guidance |
+| Document | distiller | `docs/llm-wiki/` updates, `## Wiki Updates`, `## As-Is -> To-Be Report`; may rewind real defects to `In Progress` |
 | Human Review | operator | manual intervention or explicit review before `Done` |
 | Done | reporter | `## As-Is -> To-Be Report` with goal, evidence, residual risk, and how to re-run |
 | Blocked | agent or operator | `## Blocker` describing the missing input or failed gate |
@@ -32,9 +32,9 @@ turns. The new shape keeps the important gates while reducing context loss:
 - Todo only decides whether a ticket is actionable.
 - In Progress owns planning and implementation together, so the worker does
   not hand its own plan to a different fresh context before writing code.
-- Verify keeps review, execution, acceptance scorecard, and merge proof in one
-  compulsory lane.
-- Learn remains a separate write-back lane because durable project knowledge is
+- Verify keeps review, execution, acceptance scorecard, and merge preflight in
+  one compulsory lane; the merge itself happens once, at Done.
+- Document remains a separate write-back lane because durable project knowledge is
   different from verification evidence.
 
 ## In Progress contract
@@ -49,8 +49,8 @@ In Progress must leave enough evidence for a fresh verifier to audit the work:
 - `docs/<ID>/work/` - at least one durable work artefact when a docs root is
   available.
 
-If Verify or Learn rewinds a ticket to In Progress, the worker reads the most
-recent `## Review Findings`, `## QA Failure`, or `## Learn Defect` first and
+If Verify or Document rewinds a ticket to In Progress, the worker reads the most
+recent `## Review Findings`, `## QA Failure`, or `## Document Defect` first and
 fixes that scope before opening new work.
 
 ## Verify contract
@@ -70,21 +70,43 @@ Verify must produce:
   and how to re-run the proof.
 - `## AC Scorecard` - acceptance criteria with signal, source, pass/fail
   status, and evidence path.
-- `## Merge Status` - target branch, merge or PR proof, and final commit/ref.
+- `## Merge Status` - target branch, feature branch, and the
+  `git merge-tree --write-tree` preflight result.
+
+## One merge per ticket
+
+There is exactly one merge, and the orchestrator makes it:
+
+> **Verify proves, Document documents, the orchestrator merges.** Verify runs a
+> `git merge-tree --write-tree` preflight and records the result; when the
+> ticket reaches `Done`, `agent.auto_merge_on_done` creates the single
+> `--no-ff` merge commit on the target branch.
+
+This ordering is also the wiki write-back rule. The wiki is a host-repo,
+tracked path (`<workflow-dir>/docs/llm-wiki/`, configurable via `wiki.root`).
+Workers write it **inside their worktree** at the same relative path; the
+per-turn wip commit carries it and the Done merge delivers it. The wiki is
+never symlinked into the workspace and never written directly to the host
+tree. If you do symlink it (to share it across tickets), add that path to
+`agent.auto_merge_capture_untracked` so the merge commit still carries it.
+
+A Verify lane that hand-merged produced two merge commits per ticket and landed
+code on the target branch *before* Document ran — which is why wiki write-back
+used to arrive inconsistently.
 
 Any CRITICAL/HIGH/MEDIUM review issue, failed command, failed AC, or failed
 security row rewinds to `In Progress`. Verify should not hide failures by
 retrying until the output looks clean.
 
-## Learn and Human Review
+## Document and Human Review
 
-Learn compares the ticket's plan, implementation, verification evidence, and
+Document compares the ticket's plan, implementation, verification evidence, and
 merge status against what future tickets need to know. It writes durable notes
 to `${LLM_WIKI_PATH:-./docs/llm-wiki}/`, appends `## Wiki Updates`, appends
 `## As-Is -> To-Be Report`, and moves normal successful work to `Done`.
 
-The operator can skip an idle Learn ticket through the TUI or web app. That
-action appends `## Learn Skipped` and moves the card to `Human Review` without
+The operator can skip an idle Document ticket through the TUI or web app. That
+action appends `## Document Skipped` and moves the card to `Human Review` without
 spawning an agent. Agents must not simulate this skip themselves, and should
 use `Human Review` only when a recorded critical/manual intervention remains.
 
@@ -99,7 +121,7 @@ prompts:
     Todo: ./docs/symphony-prompts/file/stages/todo.md
     "In Progress": ./docs/symphony-prompts/file/stages/in-progress.md
     Verify: ./docs/symphony-prompts/file/stages/verify.md
-    Learn: ./docs/symphony-prompts/file/stages/learn.md
+    Document: ./docs/symphony-prompts/file/stages/document.md
     Done: ./docs/symphony-prompts/file/stages/done.md
 ```
 
@@ -113,7 +135,7 @@ The supported production active states are:
 
 ```yaml
 tracker:
-  active_states: [Todo, "In Progress", Verify, Learn]
+  active_states: [Todo, "In Progress", Verify, Document]
   terminal_states: ["Human Review", Done, Blocked, Archive]
 ```
 
@@ -135,7 +157,7 @@ ports.
    (Linear) to `WORKFLOW.md` and customize.
 2. Confirm `tracker.active_states` contains exactly the active lanes you want.
    For the default production flow, keep `Todo`, `In Progress`, `Verify`, and
-   `Learn`.
+   `Document`.
 3. Confirm the `prompts:` block points at the matching prompt flavor.
 4. Confirm hooks land each agent in a workspace where tests, APIs, and browser
    checks can actually run.
@@ -154,7 +176,7 @@ docs/<TICKET-ID>/
   qa/          command output, traces, HAR files, screenshots
 ```
 
-Learn is the only default lane that writes outside the ticket root; it updates
+Document is the only default lane that writes outside the ticket root; it updates
 `${LLM_WIKI_PATH:-./docs/llm-wiki}/`.
 
 ## Reference ticket

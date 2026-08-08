@@ -179,7 +179,7 @@ def test_auto_merge_creates_no_ff_merge_commit(tmp_path: Path) -> None:
 def test_auto_merge_pushes_terminal_merge_to_target_upstream(tmp_path: Path) -> None:
     """Done must not leave the target branch ahead of its configured upstream.
 
-    Reproduces a Learn-stage push followed by a late fallback commit: the
+    Reproduces a Document-stage push followed by a late fallback commit: the
     terminal auto-merge creates a newer target commit after the worker's push.
     """
     repo = _make_repo(tmp_path)
@@ -446,6 +446,96 @@ def test_auto_merge_allows_non_overlapping_host_dirty(tmp_path: Path) -> None:
     ).stdout
     assert "?? local-note.txt" in status
 
+
+
+def test_auto_merge_preserves_non_overlapping_staged_change(tmp_path: Path) -> None:
+    repo = _make_repo(tmp_path)
+    operator = repo / "operator.txt"
+    operator.write_bytes(b"baseline\n")
+    _git(repo, "add", "operator.txt")
+    _git(repo, "commit", "-q", "-m", "operator baseline")
+    _make_symphony_branch(repo, "T-STAGED", with_symlinks=False)
+
+    operator.write_bytes(b"operator staged bytes\n")
+    _git(repo, "add", "operator.txt")
+    cached_before = _git_bytes(repo, "diff", "--cached", "--binary", "--no-ext-diff")
+
+    result = asyncio.run(
+        auto_merge_on_done_best_effort(
+            workflow_dir=repo,
+            branch="symphony/T-STAGED",
+            identifier="T-STAGED",
+            title="preserve staged operator work",
+            target_branch="main",
+            exclude_paths=(),
+        )
+    )
+
+    assert result.ok is True
+    assert _git_output(repo, "show", "HEAD:operator.txt") == "baseline"
+    assert operator.read_bytes() == b"operator staged bytes\n"
+    assert _git_bytes(repo, "diff", "--cached", "--binary", "--no-ext-diff") == cached_before
+    assert (repo / "feature.py").exists()
+
+
+def test_auto_merge_preserves_partially_staged_change(tmp_path: Path) -> None:
+    repo = _make_repo(tmp_path)
+    operator = repo / "operator.txt"
+    operator.write_bytes(b"one\ntwo\n")
+    _git(repo, "add", "operator.txt")
+    _git(repo, "commit", "-q", "-m", "operator baseline")
+    _make_symphony_branch(repo, "T-PARTIAL-STAGED", with_symlinks=False)
+
+    operator.write_bytes(b"ONE\ntwo\n")
+    _git(repo, "add", "operator.txt")
+    operator.write_bytes(b"ONE\nTWO\n")
+    cached_before = _git_bytes(repo, "diff", "--cached", "--binary", "--no-ext-diff")
+    worktree_before = _git_bytes(repo, "diff", "--binary", "--no-ext-diff")
+
+    result = asyncio.run(
+        auto_merge_on_done_best_effort(
+            workflow_dir=repo,
+            branch="symphony/T-PARTIAL-STAGED",
+            identifier="T-PARTIAL-STAGED",
+            title="preserve partial staging",
+            target_branch="main",
+            exclude_paths=(),
+        )
+    )
+
+    assert result.ok is True
+    assert _git_bytes(repo, "diff", "--cached", "--binary", "--no-ext-diff") == cached_before
+    assert _git_bytes(repo, "diff", "--binary", "--no-ext-diff") == worktree_before
+    assert operator.read_bytes() == b"ONE\nTWO\n"
+
+
+def test_auto_merge_skips_overlapping_staged_change_without_mutation(
+    tmp_path: Path,
+) -> None:
+    repo = _make_repo(tmp_path)
+    _git(repo, "checkout", "-q", "-b", "symphony/T-STAGED-OVERLAP")
+    (repo / "README.md").write_text("branch bytes\n")
+    _git(repo, "add", "README.md")
+    _git(repo, "commit", "-q", "-m", "branch readme")
+    _git(repo, "checkout", "-q", "main")
+    (repo / "README.md").write_text("operator staged bytes\n")
+    _git(repo, "add", "README.md")
+    before = _capture_repo_state(repo, (repo / "README.md",))
+
+    result = asyncio.run(
+        auto_merge_on_done_best_effort(
+            workflow_dir=repo,
+            branch="symphony/T-STAGED-OVERLAP",
+            identifier="T-STAGED-OVERLAP",
+            title="skip overlap",
+            target_branch="main",
+            exclude_paths=(),
+        )
+    )
+
+    assert result.ok is False
+    assert result.status == "dirty_overlap"
+    assert _capture_repo_state(repo, (repo / "README.md",)) == before
 
 def test_auto_merge_skips_missing_branch(tmp_path: Path) -> None:
     repo = _make_repo(tmp_path)
@@ -758,3 +848,91 @@ def test_auto_merge_commit_hook_failure_restores_captured_files(tmp_path: Path) 
     assert result.ok is False
     assert result.status == "commit_failed"
     assert _capture_repo_state(repo, (tracked, first, second)) == before
+
+
+def test_auto_merge_preserves_nonoverlapping_staged_change(tmp_path: Path) -> None:
+    repo = _make_repo(tmp_path)
+    local = repo / "operator.txt"
+    local.write_bytes(b"baseline\n")
+    _git(repo, "add", "operator.txt")
+    _git(repo, "commit", "-q", "-m", "operator baseline")
+    _make_symphony_branch(repo, "T-STAGED", with_symlinks=False)
+    local.write_bytes(b"operator staged\n")
+    _git(repo, "add", "operator.txt")
+
+    result = asyncio.run(
+        auto_merge_on_done_best_effort(
+            workflow_dir=repo,
+            branch="symphony/T-STAGED",
+            identifier="T-STAGED",
+            title="preserve staged state",
+            target_branch="main",
+            exclude_paths=(),
+        )
+    )
+
+    assert result.ok is True
+    assert _git_output(repo, "show", "HEAD:operator.txt") == "baseline"
+    assert _git_output(repo, "show", ":operator.txt") == "operator staged"
+    assert local.read_bytes() == b"operator staged\n"
+    assert _git_output(repo, "diff", "--cached", "--name-only") == "operator.txt"
+
+
+def test_auto_merge_preserves_nonoverlapping_partially_staged_unusual_path(
+    tmp_path: Path,
+) -> None:
+    repo = _make_repo(tmp_path)
+    relative = "odd space\tline\nname.txt"
+    local = repo / relative
+    local.write_bytes(b"baseline\n")
+    _git(repo, "add", "--", relative)
+    _git(repo, "commit", "-q", "-m", "operator baseline")
+    _make_symphony_branch(repo, "T-PART-STAGED", with_symlinks=False)
+    local.write_bytes(b"staged bytes\n")
+    _git(repo, "add", "--", relative)
+    local.write_bytes(b"unstaged bytes\n")
+
+    result = asyncio.run(
+        auto_merge_on_done_best_effort(
+            workflow_dir=repo,
+            branch="symphony/T-PART-STAGED",
+            identifier="T-PART-STAGED",
+            title="preserve partial staging",
+            target_branch="main",
+            exclude_paths=(),
+        )
+    )
+
+    assert result.ok is True
+    assert _git_output(repo, "show", f"HEAD:{relative}") == "baseline"
+    assert _git_output(repo, "show", f":{relative}") == "staged bytes"
+    assert local.read_bytes() == b"unstaged bytes\n"
+    assert _git_bytes(repo, "diff", "--cached", "--name-only", "-z") == os.fsencode(relative) + b"\0"
+    assert _git_bytes(repo, "diff", "--name-only", "-z") == os.fsencode(relative) + b"\0"
+
+
+def test_auto_merge_staged_overlap_is_rejected_without_mutation(tmp_path: Path) -> None:
+    repo = _make_repo(tmp_path)
+    _git(repo, "checkout", "-q", "-b", "symphony/T-STAGED-OVERLAP")
+    (repo / "README.md").write_bytes(b"branch bytes\n")
+    _git(repo, "add", "README.md")
+    _git(repo, "commit", "-q", "-m", "branch overlap")
+    _git(repo, "checkout", "-q", "main")
+    (repo / "README.md").write_bytes(b"operator staged bytes\n")
+    _git(repo, "add", "README.md")
+    before = _capture_repo_state(repo, (repo / "README.md",))
+
+    result = asyncio.run(
+        auto_merge_on_done_best_effort(
+            workflow_dir=repo,
+            branch="symphony/T-STAGED-OVERLAP",
+            identifier="T-STAGED-OVERLAP",
+            title="reject overlap",
+            target_branch="main",
+            exclude_paths=(),
+        )
+    )
+
+    assert result.ok is False
+    assert result.status == "dirty_overlap"
+    assert _capture_repo_state(repo, (repo / "README.md",)) == before

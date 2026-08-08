@@ -41,13 +41,13 @@ WORKFLOW_TEXT = """---
 tracker:
   kind: file
   board_root: ./kanban
-  active_states: [Todo, "In Progress", Verify, Learn]
+  active_states: [Todo, "In Progress", Verify, Document]
   terminal_states: ["Human Review", Done, Blocked, Archive]
   state_descriptions:
     Todo: "Triage"
     "In Progress": "Plan + implement"
     Verify: "Review + QA"
-    Learn: "Wiki write-back"
+    Document: "Docs + wiki write-back"
     "Human Review": "Human confirmation"
     Done: "Complete"
     Blocked: "Blocked"
@@ -61,7 +61,7 @@ prompts:
     Todo: ./prompts/stages/todo.md
     "In Progress": ./prompts/stages/in-progress.md
     Verify: ./prompts/stages/verify.md
-    Learn: ./prompts/stages/learn.md
+    Document: ./prompts/stages/document.md
 ---
 
 QA prompt for {{ issue.identifier }}.
@@ -136,7 +136,7 @@ def board_dir(tmp_path: Path) -> Path:
     (tmp_path / "WORKFLOW.md").write_text(WORKFLOW_TEXT, encoding="utf-8")
     stages = tmp_path / "prompts" / "stages"
     stages.mkdir(parents=True)
-    for name in ("todo", "in-progress", "verify", "learn"):
+    for name in ("todo", "in-progress", "verify", "document"):
         (stages / f"{name}.md").write_text(f"{name} prompt", encoding="utf-8")
 
     kanban = tmp_path / "kanban"
@@ -197,7 +197,7 @@ async def _assert_no_element_overflow(page: Any, selector: str, label: str) -> N
 async def _exercise_column_scope(page: Any, web_base_url: str) -> None:
     await page.goto(f"{web_base_url}/#/board", wait_until="networkidle")
     await page.locator(".board-columns > .column").first.wait_for()
-    assert await _column_titles(page) == ["Todo", "In Progress", "Verify", "Learn"]
+    assert await _column_titles(page) == ["Todo", "In Progress", "Verify", "Document"]
 
     terminal_text = await page.locator(".terminal-section").inner_text()
     assert "Human Review" in terminal_text
@@ -214,7 +214,7 @@ async def _exercise_column_scope(page: Any, web_base_url: str) -> None:
         "Todo",
         "In Progress",
         "Verify",
-        "Learn",
+        "Document",
         "Human Review",
         "Done",
         "Blocked",
@@ -229,7 +229,13 @@ async def _exercise_issue_crud(page: Any) -> None:
     await page.get_by_role("button", name="+ New Issue").click()
     modal = page.locator(".modal-form").last
     await modal.get_by_label("Title").fill(title)
-    await modal.get_by_label("Description").fill("Created by browser E2E.")
+    await modal.get_by_label("Description").fill(
+        "## QA evidence\n\n"
+        "| Check | Result |\n"
+        "| :--- | :---: |\n"
+        "| Markdown table | **PASS** |\n"
+        "| Safety | <script>window.__xss=1</script> |"
+    )
     await modal.get_by_label("State").select_option("Human Review")
     await modal.get_by_label("Labels").fill("browser, e2e")
     await modal.get_by_label("ID prefix").fill("UIE2E")
@@ -238,6 +244,13 @@ async def _exercise_issue_crud(page: Any) -> None:
 
     await page.locator(".card", has_text=title).click()
     drawer = page.locator("#drawer-panel")
+    await drawer.locator(".description-body .md-table").wait_for()
+    assert await drawer.locator(".description-body .md-heading").count() == 1
+    assert await drawer.locator(".description-body thead th").all_text_contents() == ["Check", "Result"]
+    cells = await drawer.locator(".description-body tbody td").all_text_contents()
+    assert cells[:2] == ["Markdown table", "PASS"]
+    assert "<script>window.__xss=1</script>" in cells
+    assert await drawer.locator(".description-body script").count() == 0
     await drawer.locator(".drawer-title-input").fill(f"{title} updated")
     await drawer.locator(".drawer-title-input").press("Enter")
     await page.locator(".card", has_text=f"{title} updated").wait_for()
@@ -256,8 +269,8 @@ async def _exercise_mobile_layout(page: Any, web_base_url: str) -> None:
     await page.locator(".mobile-lane-tabs").wait_for()
     assert await page.locator(".board-columns > .column").count() == 1
     assert await page.locator(".add-column-ghost").count() == 0
-    await page.get_by_role("tab", name="Learn").click()
-    assert await _column_titles(page) == ["Learn"]
+    await page.get_by_role("tab", name="Document").click()
+    assert await _column_titles(page) == ["Document"]
     await _assert_no_document_overflow(page, "mobile active")
     await _assert_no_element_overflow(page, "#board-scroll", "mobile lane tabs")
 

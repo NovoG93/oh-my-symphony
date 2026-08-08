@@ -1429,3 +1429,109 @@ async def test_verify_branch_history_reports_a_missing_branch(tmp_path, monkeypa
 
     assert result.status == HISTORY_COMMIT_FAILED
     assert result.durable is False
+
+
+# ---------------------------------------------------------------------------
+# F-04 — workspace→board reachability (acceptance finding 1)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_board_link_mismatch_fails_dispatch_before_the_first_turn(tmp_path):
+    """A workspace board that is a private copy must fail loudly, not loop."""
+    from symphony.errors import WorkspaceBoardUnreachable
+
+    workflow = tmp_path / "repo"
+    board = workflow / "kanban"
+    board.mkdir(parents=True)
+    mgr = WorkspaceManager(
+        tmp_path / "ws",
+        _hooks(after_create="mkdir -p kanban"),  # real dir, not a link
+        workflow_dir=workflow,
+        board_root=board,
+    )
+
+    with pytest.raises(WorkspaceBoardUnreachable) as exc_info:
+        await mgr.create_or_reuse("MT-BOARDLINK")
+
+    assert "workspace board is not the host board" in str(exc_info.value)
+
+
+@pytest.mark.asyncio
+async def test_board_symlink_to_host_board_passes(tmp_path):
+    workflow = tmp_path / "repo"
+    board = workflow / "board"
+    board.mkdir(parents=True)
+    mgr = WorkspaceManager(
+        tmp_path / "ws",
+        _hooks(after_create='ln -s "$SYMPHONY_BOARD_ROOT" "$SYMPHONY_BOARD_ROOT_NAME"'),
+        workflow_dir=workflow,
+        board_root=board,
+        hook_env={
+            "SYMPHONY_BOARD_ROOT": str(board.resolve()),
+            "SYMPHONY_BOARD_ROOT_NAME": "board",
+        },
+    )
+
+    ws = await mgr.create_or_reuse("MT-BOARDOK")
+
+    assert (ws.path / "board").is_symlink()
+    assert (ws.path / "board").resolve() == board.resolve()
+
+
+@pytest.mark.asyncio
+async def test_out_of_tree_board_root_is_not_checked(tmp_path):
+    workflow = tmp_path / "repo"
+    workflow.mkdir()
+    board = tmp_path / "elsewhere"
+    board.mkdir()
+    mgr = WorkspaceManager(
+        tmp_path / "ws",
+        _hooks(),
+        workflow_dir=workflow,
+        board_root=board,
+    )
+
+    ws = await mgr.create_or_reuse("MT-OUTOFTREE")
+
+    assert ws.created_now is True
+
+
+def test_branch_hook_env_exports_board_root(tmp_path):
+    """`_branch_hook_env` must carry the configured board root to hooks."""
+    from symphony.orchestrator.helpers import _branch_hook_env
+
+    workflow_path = tmp_path / "WORKFLOW.md"
+    workflow_path.write_text(
+        "\n".join(
+            [
+                "---",
+                "tracker:",
+                "  kind: file",
+                "  board_root: ./my-board",
+                "  active_states: [Todo, In Progress]",
+                "  terminal_states: [Done]",
+                "agent:",
+                "  kind: codex",
+                "server:",
+                "  port: 9411",
+                "---",
+                "prompt",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    (tmp_path / "my-board").mkdir()
+    cfg = build_service_config(load_workflow(workflow_path))
+
+    env = _branch_hook_env(cfg)
+
+    assert env["SYMPHONY_BOARD_ROOT_NAME"] == "my-board"
+    assert env["SYMPHONY_BOARD_ROOT"] == str((tmp_path / "my-board").resolve())
+
+
+def test_setup_worktree_script_links_configured_board_root():
+    """F-04: the shipped hook must not hardcode `kanban`."""
+    script = Path("scripts/symphony-setup-worktree.sh").read_text(encoding="utf-8")
+    assert "for dir in ${SYMPHONY_BOARD_ROOT_NAME:-kanban}; do" in script
+    assert "for dir in kanban; do" not in script

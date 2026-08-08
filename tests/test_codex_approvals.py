@@ -21,6 +21,7 @@ from symphony.workflow import (
     HooksConfig,
     OpenCodeConfig,
     PiConfig,
+    PrimeAgentConfig,
     ServerConfig,
     ServiceConfig,
     TrackerConfig,
@@ -118,6 +119,13 @@ def _make_cfg(workspace_root: Path) -> ServiceConfig:
             stall_timeout_ms=30_000,
             resume_across_turns=True,
         ),
+prime_agent=PrimeAgentConfig(
+    command='prime-agent -p --mode json',
+    turn_timeout_ms=3_600_000,
+    read_timeout_ms=5_000,
+    stall_timeout_ms=300_000,
+    resume_across_turns=True,
+),
         server=ServerConfig(port=None),
         prompt_template="hi",
     )

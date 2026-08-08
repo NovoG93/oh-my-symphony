@@ -51,7 +51,7 @@ from __future__ import annotations
 
 import asyncio
 import re
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -72,6 +72,7 @@ from symphony.workflow import (
     GeminiConfig,
     HooksConfig,
     PiConfig,
+    PrimeAgentConfig,
     PromptConfig,
     ServerConfig,
     ServiceConfig,
@@ -371,6 +372,13 @@ def _make_file_tracker_config(
             stall_timeout_ms=300_000,
             resume_across_turns=True,
         ),
+prime_agent=PrimeAgentConfig(
+    command='prime-agent -p --mode json',
+    turn_timeout_ms=3_600_000,
+    read_timeout_ms=5_000,
+    stall_timeout_ms=300_000,
+    resume_across_turns=True,
+),
         server=ServerConfig(port=None),
         tui=TuiConfig(language="en", visible_lanes=5),
         prompts=PromptConfig(),
@@ -466,7 +474,7 @@ def test_contract_passes_when_disk_has_required_sections(
     )
     cfg = _make_file_tracker_config(
         board_root=board_root,
-            active_states=("In Progress", "Verify", "Learn"),
+            active_states=("In Progress", "Verify", "Document"),
             max_turns=2,
         )
 
@@ -518,7 +526,7 @@ def test_contract_fails_when_disk_missing_sections(
     )
     cfg = _make_file_tracker_config(
         board_root=board_root,
-        active_states=("In Progress", "Verify", "Learn"),
+        active_states=("In Progress", "Verify", "Document"),
         max_turns=2,
     )
 
@@ -569,14 +577,14 @@ def test_qa_scorecard_fail_warns_without_rewind(
     )
     cfg = _make_file_tracker_config(
         board_root=board_root,
-        active_states=("Verify", "Learn"),
+        active_states=("Verify", "Document"),
         max_turns=2,
     )
 
     _install_file_tracker_backend(
         monkeypatch,
         ticket_path=ticket_path,
-        transitions=[("Learn", _VERIFY_BODY_SCORECARD_FAIL)],
+        transitions=[("Document", _VERIFY_BODY_SCORECARD_FAIL)],
     )
 
     workspace_path = tmp_path / "workspace"
@@ -605,3 +613,58 @@ def test_qa_scorecard_fail_warns_without_rewind(
         "Soft scorecard warning incorrectly rewound the ticket instead of "
         f"advancing past Verify. Final state was {final_front['state']!r}."
     )
+
+
+def test_stage_kinds_route_backend_kind_into_backend_factory(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`agent.stage_kinds` routing must reach `BackendInit.cfg.agent.kind` —
+    the config the worker actually builds its agent process from — not just
+    the bookkeeping fields on the running entry."""
+    board_root = tmp_path / "board"
+    ticket_path = _write_initial_ticket(
+        board_root, state="In Progress", body=_IN_PROGRESS_BODY_COMPLETE
+    )
+    cfg = _make_file_tracker_config(
+        board_root=board_root,
+        active_states=("In Progress", "Verify", "Document"),
+        max_turns=2,
+    )
+    cfg = replace(
+        cfg,
+        agent=replace(
+            cfg.agent, stage_kinds={"in progress": "claude", "verify": "gemini"}
+        ),
+    )
+
+    instances = _install_file_tracker_backend(
+        monkeypatch,
+        ticket_path=ticket_path,
+        transitions=[("Verify", _IN_PROGRESS_BODY_COMPLETE)],
+    )
+
+    workspace_path = tmp_path / "workspace"
+    workspace_path.mkdir()
+    (workspace_path / "docs" / "MT-1" / "work").mkdir(parents=True)
+    (workspace_path / "docs" / "MT-1" / "work" / "notes.md").write_text("ok")
+    o = _orch(workspace_path)
+    issue = _make_issue_from_disk("In Progress", _IN_PROGRESS_BODY_COMPLETE)
+    _seed_running_entry(o, issue, workspace_path)
+
+    asyncio.run(o._run_agent_attempt(issue, attempt=None, cfg=cfg))
+
+    assert instances, "backend factory was never called"
+    assert instances[0].calls[0] == ("factory", {"agent_kind": "claude"})
+    # F-01: a ticket that walks In Progress -> Verify inside ONE dispatch must
+    # get Verify's backend on the rebuild, not the lane it started in.
+    assert len(instances) > 1, (
+        "phase transition did not rebuild a backend; the routing assertion "
+        "below would be vacuous"
+    )
+    assert instances[1].calls[0] == ("factory", {"agent_kind": "gemini"}), (
+        "stage_kinds was not re-resolved at the in-run phase transition — "
+        f"got {instances[1].calls[0]!r}"
+    )
+    entry = o._running.get("MT-1")
+    if entry is not None:
+        assert entry.agent_kind == "gemini"

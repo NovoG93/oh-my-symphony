@@ -12,7 +12,8 @@ htmlcov/
 .omc/
 .omx/
 .playwright-mcp/
-.symphony/
+# Local runtime state (state.db, token_ema.json, chat transcripts) stays out of git.
+.symphony/*
 .domain-agent/
 
 # Auto-generated kanban mirror (regenerated on every TUI launch)

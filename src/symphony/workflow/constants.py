@@ -19,7 +19,7 @@ LINEAR_API_KEY_ENV = "LINEAR_API_KEY"
 JIRA_API_TOKEN_ENV = "JIRA_API_TOKEN"
 JIRA_EMAIL_ENV = "JIRA_EMAIL"
 
-DEFAULT_ACTIVE_STATES = ("Todo", "In Progress", "Verify", "Learn")
+DEFAULT_ACTIVE_STATES = ("Todo", "In Progress", "Verify", "Document")
 DEFAULT_TERMINAL_STATES = (
     "Human Review",
     "Done",
@@ -62,7 +62,37 @@ DEFAULT_CI_MAX_TURNS = 48
 DEFAULT_CI_TICKET_PREFIX = "CI"
 DEFAULT_CI_MAX_TICKETS_PER_RUN = 5
 
-SUPPORTED_AGENT_KINDS = {"agy", "codex", "claude", "gemini", "kiro", "opencode", "pi"}
+# Improvement modes (experimental, each opt-in through
+# `continuous_improvement.modes`). `readiness` is the original
+# product-readiness inspection and stays the implicit default so an existing
+# `enabled: true` block keeps its old behaviour.
+CI_MODE_READINESS = "readiness"
+CI_MODE_BLOCKED_FIXES = "blocked_fixes"
+CI_MODE_SECURITY = "security"
+CI_MODE_MARKET_RESEARCH = "market_research"
+CI_MODE_FEATURE_IMPROVEMENTS = "feature_improvements"
+SUPPORTED_CI_MODES = (
+    CI_MODE_READINESS,
+    CI_MODE_BLOCKED_FIXES,
+    CI_MODE_SECURITY,
+    CI_MODE_MARKET_RESEARCH,
+    CI_MODE_FEATURE_IMPROVEMENTS,
+)
+# Modes that need a real agent turn (the orchestrator supplies the runner).
+CI_AGENT_MODES = (CI_MODE_MARKET_RESEARCH, CI_MODE_FEATURE_IMPROVEMENTS)
+# Per-mode cadence floor, in hours. 0 = every heartbeat.
+DEFAULT_CI_MODE_INTERVAL_HOURS: dict[str, float] = {
+    CI_MODE_READINESS: 0.0,
+    CI_MODE_BLOCKED_FIXES: 0.0,
+    CI_MODE_SECURITY: 24.0,
+    CI_MODE_MARKET_RESEARCH: 168.0,
+    CI_MODE_FEATURE_IMPROVEMENTS: 72.0,
+}
+# Agent/triage modes file proposals, not check failures — capped separately
+# from `max_tickets_per_run` so a chatty research turn cannot flood the board.
+DEFAULT_CI_MAX_IMPROVEMENT_TICKETS_PER_RUN = 3
+
+SUPPORTED_AGENT_KINDS = {"agy", "codex", "claude", "gemini", "kiro", "opencode", "pi", "prime-agent"}
 DEFAULT_AGENT_KIND = "codex"
 DEFAULT_CLAUDE_COMMAND = (
     "claude -p --output-format stream-json --include-partial-messages --verbose"
@@ -86,6 +116,9 @@ DEFAULT_KIRO_COMMAND = (
 # `--mode json` switches stdout to JSONL events so we can parse session id,
 # turn boundaries, and per-message token usage.
 DEFAULT_PI_COMMAND = 'pi --mode json -p ""'
+# Prime Agent CLI (https://github.com/cskwork/prime-agent) — same JSON
+# protocol as Pi; uses `--resume <id>` instead of `--session <id>`.
+DEFAULT_PRIME_AGENT_COMMAND = 'prime-agent -p --mode json'
 # OpenCode documents `opencode run [message..]` for scripting, with
 # `--format json` exposing raw JSON events and `--auto` allowing
 # non-interactive tool permission flow under the user's configured policy.

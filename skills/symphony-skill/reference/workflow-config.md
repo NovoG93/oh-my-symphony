@@ -17,7 +17,7 @@ legacy fallback.
 tracker:
   kind: file
   board_root: ./kanban
-  active_states: [Todo, "In Progress", Verify, Learn]
+  active_states: [Todo, "In Progress", Verify, Document]
   terminal_states: ["Human Review", Done, Blocked, Archive]
 
 workspace:
@@ -32,12 +32,17 @@ hooks:
     echo "run finished at $(date)"
 
 agent:
-  kind: claude          # codex | claude | gemini | opencode | pi
+  kind: claude          # codex | claude | gemini | opencode | pi | prime-agent
   max_concurrent_agents: 1
   max_turns: 20
 
 claude:
   command: claude -p --output-format stream-json --verbose
+  resume_across_turns: true
+  turn_timeout_ms: 3600000
+
+prime_agent:
+  command: prime-agent -p --mode json
   resume_across_turns: true
   turn_timeout_ms: 3600000
 
@@ -67,8 +72,9 @@ Set `agent.kind`:
 - **`gemini`** — Gemini CLI. Fresh subprocess per turn with JSON output; turn 1 uses a Symphony-minted `--session-id <uuid>` and same-state continuation turns use `--resume <uuid>`. State transitions rebuild the backend and start a fresh Gemini session.
 - **`opencode`** — OpenCode CLI (`opencode run --format json --auto`). Fresh subprocess per turn; Symphony passes the prompt as the documented `message` argument and adds `--session <id>` on continuation turns after OpenCode reports a session id. Usage parsing is best-effort from JSON events.
 - **`pi`** — Pi coding-agent (`pi --mode json -p ""`). Per-turn subprocess with `--session <id>` resume from turn 2 onward; JSONL events. Multiplexes Anthropic / OpenAI / Gemini / Bedrock backends behind one CLI — useful when you want to swap LLM providers without changing Symphony config. Auth: sign in once with `pi` → `/login` (OAuth); credentials cached at `~/.pi/agent/auth.json` and inherited by every subprocess Symphony spawns. `symphony doctor` warns if the auth file is missing.
+- **`prime-agent`** — Prime Agent (`prime-agent -p --mode json`). Per-turn subprocess with `--resume <id>` continuity; same JSONL event protocol as Pi. Authenticate with `prime-agent` → `/login` or a provider API key; credentials are cached at `~/.prime/agent/auth.json`. `symphony doctor` warns if the auth file is missing.
 
-Each backend reads its own block (`codex`, `claude`, `gemini`, `opencode`, `pi`); the
+Each backend reads its own block (`codex`, `claude`, `gemini`, `opencode`, `pi`, `prime_agent`); the
 others are ignored. The `codex.linear_graphql` client tool is only
 advertised when `agent.kind: codex`.
 
@@ -90,6 +96,22 @@ cards. The override chooses only the backend kind; command, timeout, resume,
 and sandbox settings still come from the matching global backend block in
 `WORKFLOW.md`. When creating a ticket from the file-board CLI, use
 `symphony board new TASK-001 "title" --agent-kind codex`.
+
+Between the ticket pin and the global default sits optional per-state
+routing: `agent.stage_kinds` maps board states to agent kinds, so cheap/fast
+agents can own light lanes while a strong default handles the heavy ones:
+
+```yaml
+agent:
+  kind: claude
+  stage_kinds:
+    Todo: gemini
+    Document: gemini
+```
+
+Resolution per dispatch: ticket `agent_kind` pin > `agent.stage_kinds[state]`
+> `agent.kind`. The backend is re-resolved at every stage change, including the
+in-run lane transitions one dispatch walks.
 
 ### Codex workspace sandbox and package registries
 
@@ -126,7 +148,7 @@ prompts:
     Todo: ./docs/symphony-prompts/file/stages/todo.md
     "In Progress": ./docs/symphony-prompts/file/stages/in-progress.md
     Verify: ./docs/symphony-prompts/file/stages/verify.md
-    Learn: ./docs/symphony-prompts/file/stages/learn.md
+    Document: ./docs/symphony-prompts/file/stages/document.md
     Done: ./docs/symphony-prompts/file/stages/done.md
 ```
 
@@ -159,9 +181,9 @@ worktree** of `$SYMPHONY_WORKFLOW_DIR` on a fresh `symphony/<ID>`
 branch. The host's working tree is never modified, and the operator
 sees each feature branch immediately. `agent.feature_base_branch` selects
 the start point for new `symphony/<ID>` branches; empty means the current
-host branch. The default Learn prompt merges `symphony/<ID>` into
+host branch. The default Document prompt merges `symphony/<ID>` into
 `agent.auto_merge_target_branch` before the ticket moves to `Done`; empty
-means the feature base/current host branch. The board viewer exposes both
+means the feature base/current host branch. The admin web app exposes both
 values as real local git branch dropdowns, and post-Done auto-merge is only
 a compatibility fallback for older prompt packs. Worktrees share the host's
 object DB so setup is near-instant compared to a full clone, and the branch
@@ -196,7 +218,7 @@ without any repo, use `: noop`.
    - `git commit -m "<ID>: <title>[ <suffix>]"` — single ticket commit
 
 Net result: `git log symphony/<ID>` shows exactly **base + 1 commit**.
-During Learn, that branch is merged into the target branch with a real
+During Document, that branch is merged into the target branch with a real
 merge/PR before the ticket is allowed to move to `Done`.
 
 Commit-message convention:
@@ -330,13 +352,13 @@ from the lane name alone.
 
 ```yaml
 tracker:
-  active_states: [Todo, "In Progress", Verify, Learn]
+  active_states: [Todo, "In Progress", Verify, Document]
   terminal_states: ["Human Review", Done, Blocked, Archive]
   state_descriptions:
     Todo: "Triage: decide if actionable"
     "In Progress": "Plan, implement, and self-critique"
     Verify: "Review, QA, and merge proof"
-    Learn: "Write back docs; Done unless intervention"
+    Document: "Write back docs; Done unless intervention"
     "Human Review": "Manual intervention or explicit review before Done"
 ```
 
@@ -478,3 +500,41 @@ script:
 
 If the operator declines, omit the block. If they want only "Done"
 events, set `notify_on_states: [Done]` and skip templates.
+
+
+## Product Preview
+
+`preview:` adds a one-click local product launcher to the admin UI. It always
+checks out the exact `agent.auto_merge_target_branch` commit into a
+preview-owned detached worktree; it never runs from the host checkout or a
+ticket workspace.
+
+In the hub, Product Preview needs no cross-project routing: every registered
+project runs an independent service from its own `WORKFLOW.md`, so preview
+naturally resolves that workflow's Git repository and target branch.
+
+```yaml
+preview:
+  enabled: true
+  cwd: todo-app
+  command: python3 -m http.server ${PORT} --bind ${HOST}
+  health_path: /
+  url_path: /
+  startup_timeout_ms: 10000
+  release_ticket: SMA-32
+  acceptance:
+    - All acceptance scenarios pass
+    - Browser console is clean
+    - README and screenshot evidence exist
+```
+
+The command is trusted operator configuration, parsed with `shlex`, and
+started without a shell. `${PORT}` and `${HOST}` are the only managed launch
+placeholders; `PORT`, `HOST`, and `SYMPHONY_PREVIEW_SHA` are also exported.
+`cwd` must be relative and remain inside the clean checkout. Health and product
+paths must begin with `/`. Start and restart are rejected until the configured
+release ticket is exactly `Done`. Preview process-control endpoints are
+available only when Symphony itself is bound to loopback. Restart stops the
+current process, removes its checkout, resolves the newest target-branch SHA,
+and relaunches. Stop and Symphony shutdown terminate the process group and
+remove the managed checkout.

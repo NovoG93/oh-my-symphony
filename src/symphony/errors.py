@@ -105,6 +105,17 @@ class InvalidWorkspaceCwd(SymphonyError):
     code = "invalid_workspace_cwd"
 
 
+class WorkspaceBoardUnreachable(SymphonyError):
+    """The workspace's board directory is not the host board.
+
+    Raised before the first turn is spent: a workspace whose board link
+    points at a private copy makes every ticket write invisible to the
+    orchestrator, which then re-dispatches the ticket forever.
+    """
+
+    code = "workspace_board_unreachable"
+
+
 class ResponseTimeout(SymphonyError):
     code = "response_timeout"
 
@@ -136,6 +147,17 @@ class TurnInputRequired(SymphonyError):
 # §6.3
 class ConfigValidationError(SymphonyError):
     code = "config_validation_error"
+
+
+class ProtectedSourceRepository(SymphonyError):
+    """A workflow points at the checkout that supplies Symphony's runtime."""
+
+    code = "protected_source_repository"
+
+
+# board dependency DAG (symphony.trackers.validate)
+class BoardDependencyError(SymphonyError):
+    code = "board_dependency_error"
 
 
 # operator chat (symphony.chat)
