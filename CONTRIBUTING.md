@@ -17,15 +17,18 @@ requests are welcome.
 ```bash
 python3 -m venv .venv
 source .venv/bin/activate
-pip install -e ".[dev]"
+python -m pip install -e ".[dev]"
 ```
 
 ## Required Verification
 
-Run the full test suite before opening or updating a PR:
+Run the full test suite and project checks after installing the development
+dependencies before opening or updating a PR:
 
 ```bash
-pytest -q
+python -m pytest -q
+python -m ruff check src tests
+symphony-pyright
 ```
 
 For workflow, service, or board changes, also run:

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 from pathlib import Path
 from typing import Any, AsyncIterator, cast
 
@@ -71,6 +72,8 @@ class _FakeBackend:
         self.turns: list[str] = []
         self.stopped = False
         self.gate: asyncio.Event | None = None
+        self.other_frames: list[dict[str, Any]] | None = None
+        self.terminal_payload: dict[str, Any] | None = None
 
     async def start(self) -> None:
         pass
@@ -88,14 +91,20 @@ class _FakeBackend:
         if self.gate is not None:
             await self.gate.wait()
         await self._emit(EVENT_TURN_STARTED, {})
+        frames = self.other_frames
+        if frames is None:
+            frames = [
+                {
+                    "type": "assistant",
+                    "message": {"content": [{"type": "text", "text": "thinking"}]},
+                }
+            ]
+        for frame in frames:
+            await self._emit(EVENT_OTHER_MESSAGE, frame)
         await self._emit(
-            EVENT_OTHER_MESSAGE,
-            {
-                "type": "assistant",
-                "message": {"content": [{"type": "text", "text": "thinking"}]},
-            },
+            EVENT_TURN_COMPLETED,
+            self.terminal_payload or {"message": "the answer"},
         )
-        await self._emit(EVENT_TURN_COMPLETED, {"message": "the answer"})
         return TurnResult(
             status=EVENT_TURN_COMPLETED, turn_id="t", last_message="the answer"
         )
@@ -266,6 +275,84 @@ async def test_chat_ws_streams_turn_events(client: TestClient) -> None:
     assert "turn_started" in types
     assert "agent_message" in types
     assert types[-1] == "turn_completed"
+    await ws.close()
+
+
+async def test_chat_ws_streams_prime_agent_snapshots_and_final_message(
+    client: TestClient, fake_backends: list[_FakeBackend]
+) -> None:
+    resp = await client.post(
+        "/api/v1/chat/sessions", json={"mode": "qa", "agent_kind": "prime-agent"}
+    )
+    session_id = (await resp.json())["session_id"]
+    backend = fake_backends[-1]
+    backend.other_frames = [
+        {
+            "type": "message_update",
+            "message": {
+                "role": "assistant",
+                "content": [
+                    {"type": "thinking", "thinking": "private reasoning"},
+                    {"type": "text", "text": "Hel"},
+                ],
+            },
+        },
+        {
+            "type": "message_update",
+            "message": {
+                "role": "assistant",
+                "content": [
+                    {"type": "thinking", "thinking": "private reasoning grows"},
+                    {"type": "text", "text": "Hello"},
+                ],
+            },
+        },
+        {
+            "type": "message_end",
+            "message": {
+                "role": "assistant",
+                "content": [{"type": "text", "text": "Hello"}],
+            },
+        },
+    ]
+    backend.terminal_payload = {
+        "type": "agent_end",
+        "messages": [
+            {
+                "role": "assistant",
+                "content": [{"type": "text", "text": "Hello"}],
+            }
+        ],
+    }
+
+    ws = await client.ws_connect(f"/api/v1/chat/ws?session={session_id}")
+    await asyncio.wait_for(ws.receive_json(), timeout=5)  # hello
+    await client.post(
+        f"/api/v1/chat/sessions/{session_id}/message", json={"text": "stream"}
+    )
+    frames: list[dict[str, Any]] = []
+    while True:
+        frame = await asyncio.wait_for(ws.receive_json(), timeout=5)
+        frames.append(frame)
+        if frame["type"] == "turn_completed":
+            break
+
+    snapshots = [frame for frame in frames if frame["type"] == "agent_snapshot"]
+    assert [frame["text"] for frame in snapshots] == ["Hel", "Hello"]
+    assert all(frame["seq"] is None for frame in snapshots)
+    assert [
+        frame["text"] for frame in frames if frame["type"] == "agent_message"
+    ] == ["Hello"]
+    assert "private reasoning" not in json.dumps(frames)
+
+    snapshot = await (
+        await client.get(f"/api/v1/chat/sessions/{session_id}")
+    ).json()
+    transcript = snapshot["transcript_tail"]
+    assert "agent_snapshot" not in [row["type"] for row in transcript]
+    assert [row["text"] for row in transcript if row["type"] == "agent_message"] == [
+        "Hello"
+    ]
     await ws.close()
 
 

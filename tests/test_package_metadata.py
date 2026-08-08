@@ -11,3 +11,10 @@ def test_pyproject_declares_pep639_license_metadata() -> None:
     assert "setuptools>=77" in config["build-system"]["requires"]
     assert config["project"]["license"] == "Apache-2.0"
     assert config["project"]["license-files"] == ["LICENSE", "NOTICE"]
+
+
+def test_pyright_wrapper_console_script_is_declared() -> None:
+    root = Path(__file__).resolve().parents[1]
+    config = tomllib.loads((root / "pyproject.toml").read_text(encoding="utf-8"))
+
+    assert config["project"]["scripts"]["symphony-pyright"] == "symphony.pyright:main"
