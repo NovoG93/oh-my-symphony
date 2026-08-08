@@ -1773,3 +1773,56 @@ def test_stage_contracts_enabled_board_logs_nothing(tmp_path):
         logger._streams.remove(buf)
 
     assert "stage_contracts_disabled" not in buf.getvalue()
+
+
+def test_preview_config_defaults_disabled(tmp_path):
+    cfg = build_service_config(load_workflow(_write(tmp_path, "Body")))
+    assert cfg.preview.enabled is False
+    assert cfg.preview.cwd == "."
+    assert cfg.preview.acceptance == ()
+
+
+def test_preview_config_parses_trusted_command_and_acceptance(tmp_path):
+    path = _write(
+        tmp_path,
+        textwrap.dedent(
+            """\
+            ---
+            preview:
+              enabled: true
+              cwd: todo-app
+              command: python3 -m http.server ${PORT} --bind ${HOST}
+              health_path: /
+              url_path: /index.html
+              startup_timeout_ms: 5000
+              release_ticket: SMA-32
+              acceptance: [Add a todo, Persists after reload]
+            ---
+            Body
+            """
+        ),
+    )
+    cfg = build_service_config(load_workflow(path))
+    assert cfg.preview.enabled is True
+    assert cfg.preview.cwd == "todo-app"
+    assert cfg.preview.release_ticket == "SMA-32"
+    assert cfg.preview.acceptance == ("Add a todo", "Persists after reload")
+
+
+@pytest.mark.parametrize("cwd", ["../outside", "/tmp/outside"])
+def test_preview_config_rejects_checkout_escape(tmp_path, cwd):
+    path = _write(
+        tmp_path,
+        f"---\npreview:\n  enabled: true\n  cwd: {cwd}\n  command: python3 -m http.server ${{PORT}}\n---\nBody",
+    )
+    with pytest.raises(ConfigValidationError, match="preview.cwd"):
+        build_service_config(load_workflow(path))
+
+
+def test_preview_config_requires_managed_loopback_host(tmp_path):
+    path = _write(
+        tmp_path,
+        "---\npreview:\n  enabled: true\n  command: python3 -m http.server ${PORT}\n---\nBody",
+    )
+    with pytest.raises(ConfigValidationError, match=r"include \$\{HOST\}"):
+        build_service_config(load_workflow(path))

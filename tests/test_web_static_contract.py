@@ -143,7 +143,7 @@ def test_web_chat_page_contract() -> None:
     html = (STATIC_ROOT / "index.html").read_text(encoding="utf-8")
 
     assert 'data-route="chat"' in html
-    assert "const ROUTES = ['board', 'stats', 'workflow', 'git', 'chat', 'settings']" in js
+    assert "const ROUTES = ['board', 'stats', 'workflow', 'git', 'chat', 'preview', 'settings']" in js
     assert "function renderChatPage(container)" in js
     assert "getChatSession: () => apiRequest('/chat/session')" in js
     assert "createChatSession: (payload)" in js
@@ -275,3 +275,34 @@ def test_web_markdown_renders_human_readable_tables() -> None:
     assert "class: `md-table-cell md-align-${alignments[index] || 'left'}`" in js
     assert ".md-table-wrap" in css
     assert ".md-table-cell" in css
+
+
+def test_web_product_preview_page_contract() -> None:
+    js = _script_bundle()
+    css = (STATIC_ROOT / "style.css").read_text(encoding="utf-8")
+    html = (STATIC_ROOT / "index.html").read_text(encoding="utf-8")
+
+    assert 'data-route="preview"' in html
+    assert 'data-i18n="nav.preview"' in html
+    assert "getPreview: () => apiRequest('/preview')" in js
+    assert "startPreview: () => apiRequest('/preview/start', { method: 'POST', body: '{}' })" in js
+    assert "stopPreview: () => apiRequest('/preview/stop', { method: 'POST', body: '{}' })" in js
+    assert "restartPreview: () => apiRequest('/preview/restart', { method: 'POST', body: '{}' })" in js
+    assert "function renderPreviewPage(container)" in js
+    assert "function paintPreviewPage(body, data)" in js
+    assert "function safePreviewUrl(value)" in js
+    assert "previewPollTimer = setTimeout(() => refreshPreviewPage(body, false), 3000)" in js
+    assert "role: 'log'" in js
+    assert "'aria-live': 'polite'" in js
+    assert "el('iframe'" in js
+    assert "title: t('preview.iframeTitle')" in js
+    assert "rel: 'noopener noreferrer'" in js
+    assert "data.release_gate || {}" in js
+    assert "Array.isArray(data.acceptance)" in js
+    assert "'preview.title': 'Product Preview'" in js
+    assert "'preview.title': '제품 프리뷰'" in js
+    assert ".preview-command-deck" in css
+    assert ".preview-status.running" in css
+    assert ".preview-frame" in css
+    assert ".preview-log-output" in css
+    assert "@media (max-width: 560px)" in css
