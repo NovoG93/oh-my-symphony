@@ -123,6 +123,52 @@ a { color: inherit; }
   text-overflow: ellipsis;
 }
 
+.sr-only {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  clip: rect(0, 0, 0, 0);
+  white-space: nowrap;
+  border: 0;
+}
+
+.project-header { display: grid; gap: 0.5556rem; }
+.project-selector {
+  width: 100%;
+  min-width: 0;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--surface);
+  color: var(--text);
+  padding: 0.4444rem 0.5185rem;
+  font-weight: 600;
+}
+.project-paths { margin: 0; display: grid; gap: 0.3333rem; }
+.project-paths div { min-width: 0; }
+.project-paths dt { color: var(--text-muted); font-size: 0.6667rem; font-weight: 600; }
+.project-paths dd {
+  margin: 0;
+  color: var(--text-muted);
+  font-family: var(--font-mono);
+  font-size: 0.6667rem;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.project-manage-button {
+  border: 0;
+  background: transparent;
+  color: var(--accent);
+  cursor: pointer;
+  padding: 0;
+  text-align: left;
+  font-size: 0.7407rem;
+}
+.project-manage-form { display: grid; gap: 0.8889rem; }
+
 .sidebar-nav {
   flex: 1;
   padding: 0.7407rem;
@@ -1241,7 +1287,10 @@ a { color: inherit; }
    room for them next to a board column. */
 @media (max-width: 1024px) {
   :root { --sidebar-w: 4.4444rem; }
-  .board-name, .nav-item span.nav-label { display: none; }
+  .board-name, .nav-item span.nav-label, .project-paths { display: none; }
+  .project-selector { font-size: 0.7407rem; padding: 0.4444rem 0.1852rem; }
+  .project-manage-button { font-size: 0; text-align: center; }
+  .project-manage-button::before { content: "+"; font-size: 1.3333rem; }
   .sidebar-header { padding: 1.037rem 0.5926rem; text-align: center; }
   .nav-item { justify-content: center; }
   .sidebar-footer span:last-child { display: none; }

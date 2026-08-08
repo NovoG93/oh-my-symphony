@@ -56,6 +56,9 @@
 
   const api = {
     getBoard: () => apiRequest('/board'),
+    getProjects: () => apiRequest('/projects'),
+    createOrAdoptProject: (payload) => apiRequest('/projects', { method: 'POST', body: JSON.stringify(payload) }),
+    openProject: (id) => apiRequest(`/projects/${encodeURIComponent(id)}/open`, { method: 'POST', body: '{}' }),
     createIssue: (payload) => apiRequest('/issues', { method: 'POST', body: JSON.stringify(payload) }),
     getIssue: (id) => apiRequest(`/issues/${encodeURIComponent(id)}`),
     patchIssue: (id, fields) => apiRequest(`/issues/${encodeURIComponent(id)}`, { method: 'PATCH', body: JSON.stringify(fields) }),
@@ -146,6 +149,8 @@
   const state = {
     route: 'board',
     board: null,
+    projects: [],
+    currentProject: null,
     workflow: null,
     branches: [],
     // Remotes + gh availability decide which Git page actions are usable.
@@ -545,7 +550,8 @@
   }
 
   function openFormModal({ title, body, submitLabel = t('common.save'), onSubmit, size }) {
-    const errorBox = el('div', { class: 'modal-error', style: 'display:none;' });
+    const titleId = 'form-modal-title';
+    const errorBox = el('div', { class: 'modal-error', style: 'display:none;', role: 'alert', 'aria-live': 'assertive' });
     const submitBtn = el('button', { class: 'btn btn-primary', type: 'submit' }, submitLabel);
     const form = el(
       'form',
@@ -568,7 +574,7 @@
       },
       [
         el('div', { class: 'modal-header' }, [
-          el('h2', null, title),
+          el('h2', { id: titleId }, title),
           el('button', { class: 'btn-icon modal-close', type: 'button', 'aria-label': t('common.close'), onClick: closeModal }, '✕'),
         ]),
         el('div', { class: 'modal-body' }, [body, errorBox]),
@@ -578,7 +584,8 @@
         ]),
       ]
     );
-    openModal(form, size);
+    const modal = openModal(form, size);
+    modal.setAttribute('aria-labelledby', titleId);
     const firstInput = form.querySelector('input, textarea, select');
     if (firstInput) firstInput.focus();
   }
@@ -829,6 +836,107 @@
       modalBody.className = 'empty-state';
       modalBody.appendChild(document.createTextNode(t('board.noPromptConfigured', { error: err.message })));
     }
+  }
+
+
+  // ------------------------------------------------------------------
+  // Project identity and switching
+  // ------------------------------------------------------------------
+
+  function renderProjectSwitcher() {
+    const selector = document.getElementById('project-selector');
+    const pathEl = document.getElementById('project-current-path');
+    const workflowPathEl = document.getElementById('project-workflow-path');
+    const boardPathEl = document.getElementById('project-board-path');
+    if (!selector) return;
+    clearNode(selector);
+    const current = state.currentProject;
+    const registeredCurrent = current && current.id;
+    if (current && !registeredCurrent) {
+      selector.appendChild(el('option', { value: '', selected: true }, current.name));
+    }
+    for (const project of state.projects) {
+      selector.appendChild(el('option', {
+        value: project.id,
+        selected: project.id === (current && current.id),
+      }, project.name));
+    }
+    selector.disabled = state.projects.length === 0;
+    if (pathEl && current) {
+      pathEl.textContent = current.repo_path;
+      pathEl.title = current.repo_path;
+    }
+    if (workflowPathEl && current) {
+      workflowPathEl.textContent = current.workflow_path;
+      workflowPathEl.title = current.workflow_path;
+    }
+    if (boardPathEl && current) {
+      boardPathEl.textContent = current.board_path || t('projects.notFileBoard');
+      boardPathEl.title = current.board_path || '';
+    }
+  }
+
+  async function switchProject(projectId) {
+    if (!projectId || projectId === (state.currentProject && state.currentProject.id)) return;
+    const selector = document.getElementById('project-selector');
+    if (selector) selector.disabled = true;
+    try {
+      const opened = await api.openProject(projectId);
+      window.location.assign(opened.url);
+    } catch (err) {
+      showToast(err.message, 'error');
+      renderProjectSwitcher();
+    }
+  }
+
+  async function loadProjects() {
+    try {
+      const data = await api.getProjects();
+      state.projects = data.projects || [];
+      state.currentProject = data.current || null;
+      renderProjectSwitcher();
+    } catch (err) {
+      showToast(err.message, 'error');
+    }
+  }
+
+  function openManageProjectsDialog() {
+    const nameInput = el('input', {
+      class: 'input',
+      id: 'project-name-input',
+      name: 'name',
+      type: 'text',
+      required: true,
+      autocomplete: 'off',
+      placeholder: t('projects.namePlaceholder'),
+    });
+    const pathInput = el('input', {
+      class: 'input',
+      id: 'project-path-input',
+      name: 'path',
+      type: 'text',
+      required: true,
+      autocomplete: 'off',
+      placeholder: t('projects.pathPlaceholder'),
+    });
+    const body = el('div', { class: 'project-manage-form' }, [
+      el('p', { class: 'form-help' }, t('projects.createOrAdoptHint')),
+      field(t('projects.nameLabel'), nameInput),
+      field(t('projects.pathLabel'), pathInput),
+    ]);
+    openFormModal({
+      title: t('projects.manageTitle'),
+      body,
+      submitLabel: t('projects.createOrAdopt'),
+      onSubmit: async () => {
+        const result = await api.createOrAdoptProject({
+          name: nameInput.value.trim(),
+          path: pathInput.value.trim(),
+        });
+        await loadProjects();
+        showToast(t('projects.added', { name: result.project.name }), 'success');
+      },
+    });
   }
 
   // ------------------------------------------------------------------
@@ -3465,7 +3573,12 @@
       updateConnectionIndicator();
     });
     wireGlobalShortcuts();
+    const selector = document.getElementById('project-selector');
+    if (selector) selector.addEventListener('change', () => switchProject(selector.value));
+    const manageButton = document.getElementById('manage-projects');
+    if (manageButton) manageButton.addEventListener('click', openManageProjectsDialog);
     handleRouteChange();
+    loadProjects();
     pollBoard();
   }
 
