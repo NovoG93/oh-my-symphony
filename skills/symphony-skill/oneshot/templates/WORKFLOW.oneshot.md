@@ -48,7 +48,11 @@ agent:
     Deliver: 1
 
 claude:
-  command: claude -p --output-format stream-json --verbose
+  # `--permission-mode acceptEdits` (unattended writes) and `--add-dir` for
+  # the host board directory the after_create hook links in — without both,
+  # the worker cannot write the ticket and the orchestrator re-dispatches it
+  # forever.
+  command: 'claude -p --output-format stream-json --verbose --permission-mode acceptEdits --add-dir "$SYMPHONY_WORKFLOW_DIR/kanban"'
   resume_across_turns: true
   turn_timeout_ms: 3600000
 

@@ -516,3 +516,129 @@ def test_tracker_update_fields_rejects_malformed_identifier(tmp_path: Path) -> N
     tracker.create(identifier="TKT-1", title="ok")
     with pytest.raises(BoardDependencyError):
         tracker.update_fields("../TKT-1", title="hijacked")
+
+
+# ---------------------------------------------------------------------------
+# F-09 — `symphony board update` (the write verb the prompts already assume)
+# ---------------------------------------------------------------------------
+
+
+def test_update_adds_a_blocker_keeping_the_existing_ones(tmp_path: Path) -> None:
+    workflow = _make_workflow(tmp_path)
+    board_cli.main(["new", "--workflow", str(workflow), "TKT-1", "root"])
+    board_cli.main(["new", "--workflow", str(workflow), "BUG-1", "bug"])
+    board_cli.main(["new", "--workflow", str(workflow), "BUG-2", "bug two"])
+    board_cli.main(
+        [
+            "new",
+            "--workflow",
+            str(workflow),
+            "TKT-2",
+            "child",
+            "--blocked-by",
+            "TKT-1",
+        ]
+    )
+
+    rc = board_cli.main(
+        [
+            "update",
+            "--workflow",
+            str(workflow),
+            "TKT-2",
+            "--add-blocked-by",
+            "BUG-1",
+            "--add-blocked-by",
+            "BUG-2",
+        ]
+    )
+
+    assert rc == 0
+    content = (tmp_path / "board" / "TKT-2.md").read_text(encoding="utf-8")
+    assert "TKT-1" in content and "BUG-1" in content and "BUG-2" in content
+
+
+def test_update_replaces_the_blocker_list(tmp_path: Path) -> None:
+    workflow = _make_workflow(tmp_path)
+    board_cli.main(["new", "--workflow", str(workflow), "TKT-1", "root"])
+    board_cli.main(["new", "--workflow", str(workflow), "TKT-3", "other"])
+    board_cli.main(
+        ["new", "--workflow", str(workflow), "TKT-2", "child", "--blocked-by", "TKT-1"]
+    )
+
+    rc = board_cli.main(
+        ["update", "--workflow", str(workflow), "TKT-2", "--blocked-by", "TKT-3"]
+    )
+
+    assert rc == 0
+    content = (tmp_path / "board" / "TKT-2.md").read_text(encoding="utf-8")
+    assert "TKT-3" in content
+    assert "TKT-1" not in content.split("---")[1]
+
+
+def test_update_changes_state(tmp_path: Path) -> None:
+    workflow = _make_workflow(tmp_path)
+    board_cli.main(["new", "--workflow", str(workflow), "TKT-1", "t"])
+
+    rc = board_cli.main(
+        ["update", "--workflow", str(workflow), "TKT-1", "--state", "in progress"]
+    )
+
+    assert rc == 0
+    content = (tmp_path / "board" / "TKT-1.md").read_text(encoding="utf-8")
+    assert "state: In Progress" in content
+
+
+def test_update_rejects_a_cycle(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The whole point of the verb: cycle validation, unlike hand-editing."""
+    workflow = _make_workflow(tmp_path)
+    board_cli.main(["new", "--workflow", str(workflow), "TKT-1", "root"])
+    board_cli.main(
+        ["new", "--workflow", str(workflow), "TKT-2", "child", "--blocked-by", "TKT-1"]
+    )
+    capsys.readouterr()
+
+    rc = board_cli.main(
+        ["update", "--workflow", str(workflow), "TKT-1", "--add-blocked-by", "TKT-2"]
+    )
+
+    assert rc == 1
+    assert "cycle" in capsys.readouterr().err
+
+
+def test_update_rejects_unknown_blocker_and_unknown_state(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    workflow = _make_workflow(tmp_path)
+    board_cli.main(["new", "--workflow", str(workflow), "TKT-1", "t"])
+    capsys.readouterr()
+
+    assert (
+        board_cli.main(
+            ["update", "--workflow", str(workflow), "TKT-1", "--add-blocked-by", "NOPE-9"]
+        )
+        == 1
+    )
+    assert "unknown blocked_by target" in capsys.readouterr().err
+
+    assert (
+        board_cli.main(
+            ["update", "--workflow", str(workflow), "TKT-1", "--state", "Nowhere"]
+        )
+        == 1
+    )
+    assert "unknown state" in capsys.readouterr().err
+
+
+def test_update_rejects_missing_ticket_and_malformed_id(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    workflow = _make_workflow(tmp_path)
+
+    assert board_cli.main(["update", "--workflow", str(workflow), "GHOST-1"]) == 1
+    assert "not found" in capsys.readouterr().err
+
+    assert board_cli.main(["update", "--workflow", str(workflow), "../../evil"]) == 1
+    assert "must match" in capsys.readouterr().err

@@ -5457,7 +5457,7 @@ def test_issue_attention_reports_tracker_error():
 
 def test_issue_attention_reports_unresolved_dependency():
     orch = _orch()
-    blocker = BlockerRef(id="TASK-999", identifier="TASK-999", state=None)
+    blocker = BlockerRef(id="TASK-999", identifier="TASK-999", state="Todo")
     issue = _issue("MT-BLOCKED", state="In Progress", blocked_by=(blocker,))
 
     attention = orch.issue_attention(issue)
@@ -5467,6 +5467,22 @@ def test_issue_attention_reports_unresolved_dependency():
     assert attention["label"] == "Blocked dependency"
     assert attention["severity"] == "warning"
     assert attention["message"] == "waiting on unresolved dependency: TASK-999"
+
+
+def test_issue_attention_names_a_blocker_that_is_not_on_the_board():
+    """F-13: a dangling id deadlocks the ticket; the card must say so."""
+    orch = _orch()
+    blocker = BlockerRef(id="TYPO-999", identifier="TYPO-999", state=None)
+    issue = _issue("MT-BLOCKED", state="In Progress", blocked_by=(blocker,))
+
+    attention = orch.issue_attention(issue)
+
+    assert attention is not None
+    assert attention["kind"] == "dangling_dependency"
+    assert attention["label"] == "Unknown blocker"
+    assert attention["severity"] == "error"
+    assert "TYPO-999 is not on the board" in attention["message"]
+    assert "symphony board update MT-BLOCKED" in attention["message"]
 
 
 def test_issue_attention_reports_failed_terminal_dependency(monkeypatch: pytest.MonkeyPatch):

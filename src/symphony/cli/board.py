@@ -5,6 +5,8 @@ Subcommands:
     ls    [--state STATE]              list tickets (optionally filtered)
     new   <id> <title> [--state ...]   create a validated ticket
     mv    <id> <new-state>             change a ticket's state
+    update <id> [--state] [--blocked-by ID] [--add-blocked-by ID] [--request]
+                                       update an existing ticket
     show  <id>                         print a ticket's contents
     graph [--request REQ]              print the dependency DAG
 
@@ -212,6 +214,80 @@ def cmd_mv(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_update(args: argparse.Namespace) -> int:
+    """Partial ticket update — the write path `verify.md` / `deep/*.md` need.
+
+    The prompts tell agents to add bug-ticket ids to an existing ticket's
+    `blocked_by` and to push another ticket back to an earlier lane, while
+    the chat preamble forbids hand-writing ticket markdown. Without this verb
+    the only path was hand-editing frontmatter, which bypasses cycle
+    validation entirely.
+    """
+    tracker = _get_tracker(args)
+    fbt = FileBoardTracker(tracker)
+    try:
+        identifier = validate_identifier(args.id)
+    except SymphonyError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+
+    state: str | None = None
+    if args.state is not None:
+        legal_states = {
+            s.lower(): s for s in (*tracker.active_states, *tracker.terminal_states)
+        }
+        state = legal_states.get(args.state.lower())
+        if state is None:
+            print(
+                f"error: unknown state {args.state!r}; "
+                f"expected one of {sorted(legal_states.values())}",
+                file=sys.stderr,
+            )
+            return 1
+
+    try:
+        issues = fbt.scan_all()
+        current = next((i for i in issues if i.identifier == identifier), None)
+        if current is None:
+            print(f"error: ticket {identifier} not found", file=sys.stderr)
+            return 1
+
+        blocked_by: list[str] | None = None
+        if args.blocked_by is not None:
+            blocked_by = list(dict.fromkeys(args.blocked_by))
+        if args.add_blocked_by:
+            existing = blocked_by if blocked_by is not None else blocker_ids(current)
+            blocked_by = list(dict.fromkeys([*existing, *args.add_blocked_by]))
+
+        if blocked_by is not None:
+            validate_ticket_dependencies(
+                issues,
+                identifier=identifier,
+                blocked_by=blocked_by,
+                new_ticket=False,
+            )
+
+        path = fbt.update_fields(
+            identifier,
+            state=state,
+            blocked_by=blocked_by,
+            request=args.request,
+        )
+    except (OSError, SymphonyError) as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+
+    changes = []
+    if state is not None:
+        changes.append(f"state={state}")
+    if blocked_by is not None:
+        changes.append(f"blocked_by={','.join(blocked_by) or '(cleared)'}")
+    if args.request is not None:
+        changes.append(f"request={args.request or '(cleared)'}")
+    print(f"updated {identifier} ({', '.join(changes) or 'no changes'}) -> {path}")
+    return 0
+
+
 def cmd_show(args: argparse.Namespace) -> int:
     tracker = _get_tracker(args)
     fbt = FileBoardTracker(tracker)
@@ -359,6 +435,32 @@ def build_parser() -> argparse.ArgumentParser:
     p_mv.add_argument("id", help="ticket identifier")
     p_mv.add_argument("state", help="new state")
     p_mv.set_defaults(func=cmd_mv)
+
+    p_update = sub.add_parser("update", help="update an existing ticket")
+    add_workflow_args(p_update)
+    p_update.add_argument("id", help="ticket identifier")
+    p_update.add_argument("--state", default=None, help="new state")
+    p_update.add_argument(
+        "--blocked-by",
+        action="append",
+        default=None,
+        metavar="ID",
+        help="replace the blocker list (repeatable; pass none to clear)",
+    )
+    p_update.add_argument(
+        "--add-blocked-by",
+        action="append",
+        default=None,
+        metavar="ID",
+        help="add one blocker, keeping the existing ones (repeatable)",
+    )
+    p_update.add_argument(
+        "--request",
+        default=None,
+        metavar="REQ",
+        help="request grouping id ('' clears it)",
+    )
+    p_update.set_defaults(func=cmd_update)
 
     p_show = sub.add_parser("show", help="print a ticket's contents")
     add_workflow_args(p_show)

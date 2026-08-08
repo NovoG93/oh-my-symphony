@@ -234,7 +234,7 @@ async def test_send_message_preamble_and_continuation(
     assert "switch the chat to edit mode" in prompt
     # Board protocol: validated CLI with the board's actual states, never
     # hand-written ticket markdown.
-    assert "symphony board new" in prompt
+    assert "${SYMPHONY_CLI:-symphony} board new" in prompt
     assert "Todo, Doing" in prompt
     assert "<IDENTIFIER>.md" not in prompt
     assert is_continuation is False
@@ -425,7 +425,7 @@ async def test_request_refresh_called_after_each_turn(
     assert calls == [1]
     prompt, _ = fake_backends[0].turns[0]
     assert "Symphony kanban board at" in prompt
-    assert "symphony board new" in prompt
+    assert "${SYMPHONY_CLI:-symphony} board new" in prompt
     await manager.stop_session()
 
 
@@ -765,7 +765,10 @@ def _cfg_with_states(tmp_path: Path, active_states: str) -> ServiceConfig:
 def test_board_preamble_default_board_routes_by_complexity(tmp_path: Path) -> None:
     preamble = _board_preamble(_cfg(tmp_path))
     # Validated CLI protocol, rendered with the board's actual states.
-    assert "symphony board new" in preamble
+    assert "${SYMPHONY_CLI:-symphony} board new" in preamble
+    # F-19: the CLI may live in a venv the worker's PATH does not carry.
+    assert "SYMPHONY_CLI is exported by the orchestrator" in preamble
+    assert "board update <ID>" in preamble
     assert "--description-file -" in preamble
     assert "Todo, Doing" in preamble
     assert "SIMPLE task: one ticket in Todo" in preamble

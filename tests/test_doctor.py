@@ -522,8 +522,8 @@ def test_run_checks_returns_one_result_per_check(tmp_path: Path) -> None:
     # port + shell + max_turns + agent + pi_auth + gemini_auth + agy_state + kiro_auth
     # + prompts + after_create + workspace + git_history + agent_git_grant
     # + tracker + board.reachable + deep_merge_contract + stage_contracts
-    # + state.db = 18
-    assert len(results) == 18
+    # + board.cli + board.dependencies + state.db = 20
+    assert len(results) == 20
     assert {r.name.split("=")[0].split(".")[0] for r in results} >= {
         "agent",
         "hooks",
@@ -1092,3 +1092,133 @@ def test_stage_contracts_doctor_row_warns_when_explicitly_off(tmp_path: Path) ->
     result = check_stage_contracts(cfg)
     assert result.status == "warn"
     assert "prompts are the only gate" in result.message
+
+
+# ---------------------------------------------------------------------------
+# F-19 — the board CLI must be reachable from a worker
+# ---------------------------------------------------------------------------
+
+
+def test_symphony_cli_check_skipped_for_non_file_trackers(tmp_path: Path) -> None:
+    from symphony.cli.doctor import check_symphony_cli_reachable
+
+    cfg = _build_cfg(
+        tmp_path,
+        """
+        tracker: { kind: linear, api_key: tok, project_slug: p }
+        agent: { kind: codex }
+        codex: { command: codex app-server }
+        """,
+    )
+    assert check_symphony_cli_reachable(cfg).status == "pass"
+
+
+def test_symphony_cli_check_warns_when_not_on_login_path(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import symphony.cli.doctor as doctor_module
+
+    cfg = _build_cfg(
+        tmp_path,
+        """
+        tracker: { kind: file, board_root: ./kanban }
+        agent: { kind: codex }
+        codex: { command: codex app-server }
+        """,
+    )
+
+    class _Missing:
+        returncode = 1
+        stdout = ""
+
+    monkeypatch.setattr(
+        doctor_module.subprocess, "run", lambda *a, **k: _Missing()
+    )
+    monkeypatch.setattr(
+        "symphony.orchestrator.helpers.resolve_symphony_cli",
+        lambda: "/opt/venv/bin/symphony",
+    )
+    result = doctor_module.check_symphony_cli_reachable(cfg)
+    assert result.status == "warn"
+    assert "SYMPHONY_CLI=/opt/venv/bin/symphony" in result.message
+
+
+def test_symphony_cli_check_passes_when_on_path(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import symphony.cli.doctor as doctor_module
+
+    cfg = _build_cfg(
+        tmp_path,
+        """
+        tracker: { kind: file, board_root: ./kanban }
+        agent: { kind: codex }
+        codex: { command: codex app-server }
+        """,
+    )
+
+    class _Found:
+        returncode = 0
+        stdout = "/usr/local/bin/symphony\n"
+
+    monkeypatch.setattr(doctor_module.subprocess, "run", lambda *a, **k: _Found())
+    assert doctor_module.check_symphony_cli_reachable(cfg).status == "pass"
+
+
+# ---------------------------------------------------------------------------
+# F-13 — dangling blockers / cycles are reported, not silently deadlocking
+# ---------------------------------------------------------------------------
+
+
+def _board_with(tmp_path: Path, tickets: dict[str, list[str]]) -> "ServiceConfig":
+    from symphony.trackers.file import write_ticket_atomic
+
+    board = tmp_path / "kanban"
+    board.mkdir(exist_ok=True)
+    for identifier, blockers in tickets.items():
+        front = {
+            "id": identifier,
+            "identifier": identifier,
+            "title": identifier,
+            "state": "Todo",
+            "created_at": "2026-01-01T00:00:00Z",
+        }
+        if blockers:
+            front["blocked_by"] = list(blockers)
+        write_ticket_atomic(board / f"{identifier}.md", front, "body")
+    return _build_cfg(
+        tmp_path,
+        """
+        tracker: { kind: file, board_root: ./kanban }
+        agent: { kind: codex }
+        codex: { command: codex app-server }
+        """,
+    )
+
+
+def test_board_dependencies_passes_on_a_clean_board(tmp_path: Path) -> None:
+    from symphony.cli.doctor import check_board_dependencies
+
+    cfg = _board_with(tmp_path, {"A-1": [], "A-2": ["A-1"]})
+    result = check_board_dependencies(cfg)
+    assert result.status == "pass"
+    assert "no dangling blockers" in result.message
+
+
+def test_board_dependencies_fails_on_a_dangling_blocker(tmp_path: Path) -> None:
+    from symphony.cli.doctor import check_board_dependencies
+
+    cfg = _board_with(tmp_path, {"A-1": ["TYPO-9"]})
+    result = check_board_dependencies(cfg)
+    assert result.status == "fail"
+    assert "TYPO-9" in result.message
+    assert "never be dispatched" in result.message
+
+
+def test_board_dependencies_fails_on_a_cycle(tmp_path: Path) -> None:
+    from symphony.cli.doctor import check_board_dependencies
+
+    cfg = _board_with(tmp_path, {"A-1": ["A-2"], "A-2": ["A-1"]})
+    result = check_board_dependencies(cfg)
+    assert result.status == "fail"
+    assert "cycle" in result.message

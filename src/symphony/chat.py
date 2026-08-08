@@ -120,8 +120,11 @@ _BOARD_PREAMBLE = (
     "(build/fix/feature/refactor): confirm scope in at most 2 short turns, "
     "and only if genuinely ambiguous; then file tickets with the validated "
     "CLI — NEVER hand-write ticket markdown files:\n"
-    '  symphony board new <ID> "<title>" --state <state> --request REQ-<n> '
-    "--blocked-by <ID> --description-file -\n"
+    '  ${{SYMPHONY_CLI:-symphony}} board new <ID> "<title>" --state <state> '
+    "--request REQ-<n> --blocked-by <ID> --description-file -\n"
+    "(SYMPHONY_CLI is exported by the orchestrator; use it when `symphony` "
+    "is not on PATH. `${{SYMPHONY_CLI:-symphony}} board update <ID> "
+    "--state <state> --add-blocked-by <ID>` edits an existing ticket.)\n"
     "(description on stdin; the CLI validates ids, states and DAG "
     "acyclicity; use the next free REQ-<n> as the request id).\n"
     "{routing}"
@@ -155,7 +158,7 @@ QA_MODE_NOTICE = (
 EDIT_MODE_NOTICE = (
     "[Chat mode changed to edit: you may now create and modify files in "
     "this working tree as requested, including filing board tickets with "
-    "`symphony board new`.]\n\n"
+    "`${SYMPHONY_CLI:-symphony} board new`.]\n\n"
 )
 
 

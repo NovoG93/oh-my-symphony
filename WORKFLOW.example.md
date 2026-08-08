@@ -279,7 +279,13 @@ codex:
   stall_timeout_ms: 300000
 
 claude:
-  command: claude -p --output-format stream-json --verbose
+  # `--permission-mode acceptEdits` is required for an unattended worker:
+  # without it every file write waits for an interactive approval that never
+  # arrives, and the ticket looks stalled. `--add-dir` extends Claude Code's
+  # write scope to host directories the `after_create` hook links into the
+  # worktree (a file board's `kanban/`); a Linear board needs no board dir,
+  # but keeping the flag costs nothing if the path does not exist.
+  command: 'claude -p --output-format stream-json --verbose --permission-mode acceptEdits --add-dir "$SYMPHONY_WORKFLOW_DIR"'
   resume_across_turns: true
   turn_timeout_ms: 3600000
   read_timeout_ms: 20000

@@ -428,11 +428,22 @@ symphony board new TASK-2 "Add regression test" \
   --description-file ./spec.md      # or `-` to read stdin
 ```
 
-`new` validates before writing: unique id, a state from
-`tracker.active_states`/`terminal_states`, every `--blocked-by` target must
-exist on the board, and the added edges must keep the dependency graph
-acyclic (violations print the cycle path and exit non-zero). The web API's
-issue create/update endpoints apply the same rules.
+`new` validates before writing: the identifier must match
+`^[A-Za-z][A-Za-z0-9_-]{0,63}$` (so a model-generated id can never escape the
+board root), a state from `tracker.active_states`/`terminal_states`, every
+`--blocked-by` target must exist on the board, and the added edges must keep
+the dependency graph acyclic (violations print the cycle path and exit
+non-zero). The web API's issue create/update endpoints apply the same rules.
+
+Edit an existing ticket through the same validation instead of hand-writing
+frontmatter:
+
+```bash
+symphony board update TASK-2 --add-blocked-by BUG-7   # keeps existing blockers
+symphony board update TASK-2 --blocked-by TASK-1      # replaces the list
+symphony board update BUILD-1 --state Build           # reopen a slice
+symphony board update TASK-2 --request REQ-2
+```
 
 Inspect:
 
@@ -574,6 +585,7 @@ Then `tail -F log/symphony.log` works.
 
 ```bash
 symphony board mv TASK-1 Blocked         # forces a state transition
+symphony board update TASK-1 --state Blocked --add-blocked-by BUG-7
 ```
 
 The orchestrator re-evaluates on the next poll tick. Manual transitions are

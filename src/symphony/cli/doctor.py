@@ -537,6 +537,91 @@ def check_stage_contracts(cfg: ServiceConfig) -> CheckResult:
         "on to enforce them anyway",
     )
 
+def check_symphony_cli_reachable(cfg: ServiceConfig) -> CheckResult:
+    """Can a dispatched worker actually run `symphony board ...`?
+
+    F-19: the stage prompts and the chat preamble now *require* the board
+    CLI, but Symphony is usually installed in a venv and launched by
+    absolute path, so `symphony` need not be on the worker's PATH. The
+    orchestrator exports `SYMPHONY_CLI`, and the prompts use
+    `${SYMPHONY_CLI:-symphony}`; this check reports both halves.
+    """
+    from ..orchestrator.helpers import resolve_symphony_cli
+
+    name = "board.cli"
+    if cfg.tracker.kind != "file":
+        return CheckResult(name, "pass", f"tracker.kind={cfg.tracker.kind} (skipped)")
+    resolved = resolve_symphony_cli()
+    bash = resolve_bash()
+    on_path = False
+    try:
+        probe = subprocess.run(
+            [bash, "-lc", "command -v symphony"],
+            capture_output=True,
+            text=True,
+            timeout=15,
+            check=False,
+        )
+        on_path = probe.returncode == 0 and bool(probe.stdout.strip())
+    except (OSError, subprocess.TimeoutExpired):
+        on_path = False
+    if on_path:
+        return CheckResult(name, "pass", f"`symphony` on the worker PATH; {resolved}")
+    if " -m " in resolved:
+        return CheckResult(
+            name,
+            "fail",
+            "`symphony` is not on a login-shell PATH and no console script was "
+            "found — prompts that call the board CLI will fail. Install the "
+            "package (`pip install -e .`) or add its venv bin to PATH.",
+        )
+    return CheckResult(
+        name,
+        "warn",
+        f"`symphony` is not on a login-shell PATH; workers get SYMPHONY_CLI="
+        f"{resolved}. Prompts must use ${{SYMPHONY_CLI:-symphony}} (the shipped "
+        "ones do); custom prompts calling bare `symphony` will fail.",
+    )
+
+def check_board_dependencies(cfg: ServiceConfig) -> CheckResult:
+    """Report dangling `blocked_by` ids and dependency cycles on the board.
+
+    F-13: a blocker id that does not exist (agent typo, deleted ticket)
+    never resolves, so the ticket is silently never dispatched again. The
+    only previous signal was one WARN line in the orchestrator log.
+    """
+    from ..trackers.file import FileBoardTracker
+    from ..trackers.validate import board_edges, dangling_blockers, find_cycle
+
+    name = "board.dependencies"
+    if cfg.tracker.kind != "file" or cfg.tracker.board_root is None:
+        return CheckResult(name, "pass", f"tracker.kind={cfg.tracker.kind} (skipped)")
+    if not cfg.tracker.board_root.exists():
+        return CheckResult(name, "pass", "no board directory yet")
+    try:
+        issues = FileBoardTracker(cfg.tracker).scan_all()
+    except SymphonyError as exc:
+        return CheckResult(name, "warn", f"could not scan the board: {exc}")
+    dangling = dangling_blockers(issues)
+    cycle = find_cycle(board_edges(issues))
+    problems: list[str] = []
+    for identifier, missing in sorted(dangling.items()):
+        problems.append(f"{identifier} blocked_by {', '.join(missing)} (not on board)")
+    if cycle:
+        problems.append(f"cycle: {' -> '.join(cycle)}")
+    if not problems:
+        return CheckResult(
+            name, "pass", f"{len(issues)} ticket(s), no dangling blockers or cycles"
+        )
+    sample = "; ".join(problems[:3])
+    suffix = "" if len(problems) <= 3 else f"; +{len(problems) - 3} more"
+    return CheckResult(
+        name,
+        "fail",
+        f"{sample}{suffix} — these tickets will never be dispatched; fix with "
+        "`symphony board update <ID> --blocked-by <ID>`",
+    )
+
 def check_prompts(cfg: ServiceConfig) -> CheckResult:
     paths = []
     if cfg.prompts.base_path is not None:
@@ -806,6 +891,8 @@ def run_checks(cfg: ServiceConfig, host: str = "127.0.0.1") -> list[CheckResult]
         check_board_reachable_from_workspace(cfg),
         check_deep_preset_merge_contract(cfg),
         check_stage_contracts(cfg),
+        check_symphony_cli_reachable(cfg),
+        check_board_dependencies(cfg),
         check_workflow_registry(cfg),
     ]
 

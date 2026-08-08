@@ -275,6 +275,9 @@ claude:
   # junctioned into the worktree. Without these, the agent silently
   # fails to flip ticket state to Done because the resolved path lands
   # outside its cwd, and Symphony's tracker keeps re-dispatching it.
+  # `--permission-mode acceptEdits` is also required for the CLI-driven lanes
+  # (`symphony board new/update`): a mode that gates every Bash call leaves
+  # the agent unable to run the tool its prompt mandates.
   command: 'claude -p --output-format stream-json --verbose --permission-mode acceptEdits --add-dir "$SYMPHONY_WORKFLOW_DIR/kanban"'
 
 gemini:

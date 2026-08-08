@@ -7,7 +7,7 @@ Write: append to the vault `verification.md`; ticket comments. Do NOT edit appli
 2. Run the FULL test suite, lint, and typecheck -- not just slice tests.
 3. Exercise integration points across slices (start the app, probe the API).
 4. Append to `verification.md`: per-claim result, full-suite result, integration probes, and a final line `verdict: GREEN` or `verdict: RED`.
-5. RED -> set each failed slice's BUILD ticket back to `Build` with `## Verify Failure` (discrepancy + repro command), spawn a fresh `VERIFY-<n+1>` ticket blocked by those builds, then close this ticket. A RED verdict must also block delivery: append `## Merge Hold` to the request ticket naming the reopened builds, and do NOT let `DOCUMENT-*` start (it has its own GREEN gate). You never merge or revert anything yourself — the orchestrator owns merges, and a reopened Build re-merges when it reaches `Done` again.
+5. RED -> reopen each failed slice's BUILD ticket with `${SYMPHONY_CLI:-symphony} board update <BUILD-ID> --state Build` and append `## Verify Failure` (discrepancy + repro command) to it, spawn a fresh `VERIFY-<n+1>` ticket blocked by those builds (`${SYMPHONY_CLI:-symphony} board new VERIFY-<n+1> "..." --state Verify --blocked-by <BUILD-ID>`), then close this ticket. Never hand-edit ticket frontmatter. A RED verdict must also block delivery: append `## Merge Hold` to the request ticket naming the reopened builds, and do NOT let `DOCUMENT-*` start (it has its own GREEN gate). You never merge or revert anything yourself — the orchestrator owns merges, and a reopened Build re-merges when it reaches `Done` again.
 
 Hard gate before closing:
 

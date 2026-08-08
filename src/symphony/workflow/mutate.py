@@ -531,6 +531,10 @@ def apply_lane_preset(workflow_path: Path, preset_name: str) -> StatesUpdatePlan
     except ValueError as exc:
         raise WorkflowMutationError(str(exc)) from exc
 
+    # Fail before touching WORKFLOW.md: a board without the preset's prompt
+    # bodies would otherwise switch lanes and lose every gate (F-11).
+    _require_preset_prompt_files(workflow_path, preset)
+
     data, body = _load_frontmatter(workflow_path)
     tracker = _ensure_map(data, "tracker")
     old_active = [str(s) for s in tracker.get("active_states") or []]
@@ -601,8 +605,6 @@ def apply_lane_preset(workflow_path: Path, preset_name: str) -> StatesUpdatePlan
         _rename_state_keyed_map(agent, "stall_timeout_ms_by_state", {}, removed)
         _rename_state_keyed_map(agent, "stage_kinds", {}, removed)
 
-    _ensure_preset_prompt_files(workflow_path, preset)
-
     _write_workflow_atomic(workflow_path, data, body)
     return StatesUpdatePlan(
         renamed={},
@@ -612,8 +614,17 @@ def apply_lane_preset(workflow_path: Path, preset_name: str) -> StatesUpdatePlan
     )
 
 
-def _ensure_preset_prompt_files(workflow_path: Path, preset: LanePreset) -> None:
-    """Create starter files for preset prompt paths missing on this board."""
+def _require_preset_prompt_files(workflow_path: Path, preset: LanePreset) -> None:
+    """Refuse a preset apply when the board lacks the preset's prompt bodies.
+
+    F-11: this used to write placeholder stubs ("Do the work this column
+    stands for…") and report success. That is the normal state of any repo
+    bootstrapped before a preset shipped, so the board silently degraded from
+    a gated pipeline to "do something" — with the mutation already written.
+    The prompt bodies are documentation files (`docs/symphony-prompts/**`),
+    not package data, so the honest answer is to name the missing files and
+    the one command that fixes them.
+    """
     workflow_dir = workflow_path.parent.resolve()
 
     def _resolved(rel: str) -> Path:
@@ -624,17 +635,16 @@ def _ensure_preset_prompt_files(workflow_path: Path, preset: LanePreset) -> None
             )
         return path
 
-    base_path = _resolved(preset.base_prompt)
-    if not base_path.exists():
-        base_path.parent.mkdir(parents=True, exist_ok=True)
-        base_path.write_text(
-            "You are working on {{ issue.identifier }}: {{ issue.title }}.\n"
-            "Current state: {{ issue.state }}.\n",
-            encoding="utf-8",
-        )
-    for state, rel in preset.stage_prompts.items():
-        path = _resolved(rel)
-        if not path.exists():
-            path.parent.mkdir(parents=True, exist_ok=True)
-            content = DEFAULT_STAGE_PROMPT.replace("{{ state_name }}", state)
-            path.write_text(content, encoding="utf-8")
+    missing = [
+        rel
+        for rel in (preset.base_prompt, *preset.stage_prompts.values())
+        if not _resolved(rel).is_file()
+    ]
+    if not missing:
+        return
+    raise WorkflowMutationError(
+        f"lane preset {preset.name!r} needs prompt files this board does not "
+        f"have: {', '.join(sorted(missing))}. Copy them from the Symphony "
+        "checkout first: `cp -R <symphony>/docs/symphony-prompts "
+        f"{workflow_dir}/docs/`. Nothing was changed."
+    )

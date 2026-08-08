@@ -7,6 +7,7 @@ stub orchestrator for the live-run surface.
 from __future__ import annotations
 
 import asyncio
+import shutil
 import subprocess
 from pathlib import Path
 from types import SimpleNamespace
@@ -226,6 +227,12 @@ def board_dir(tmp_path: Path) -> Path:
     (skill / "SKILL.md").write_text(
         "---\nname: tdd\ndescription: test first\n---\nWrite tests first.\n",
         encoding="utf-8",
+    )
+    # F-11: preset applies refuse a board without the shipped prompt bodies,
+    # so the fixture mirrors the documented `cp -R docs/symphony-prompts` step.
+    shutil.copytree(
+        Path(__file__).resolve().parents[1] / "docs" / "symphony-prompts",
+        tmp_path / "docs" / "symphony-prompts",
     )
     return tmp_path
 
