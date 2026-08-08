@@ -2484,10 +2484,9 @@ class Orchestrator:
         client = build_tracker_client(cfg)
         try:
             update_fields = getattr(client, "update_fields", None)
-            fetch_full = getattr(client, "fetch_issue_full_by_id", None)
-            if not callable(update_fields) or not callable(fetch_full):
+            if not callable(update_fields):
                 return False
-            persisted = fetch_full(source_issue.identifier)
+            persisted = client.fetch_issue_full_by_id(source_issue.identifier)
             if persisted is None:
                 return False
             current = [
