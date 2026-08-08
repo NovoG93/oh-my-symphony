@@ -63,6 +63,7 @@ from symphony.backends.pi import (
     _extract_failure_reason,
     _extract_text as _pi_extract_text,
 )
+from symphony.backends.prime_agent import PrimeAgentBackend
 from symphony.errors import ConfigValidationError, ResponseError, TurnFailed
 from symphony.workflow import (
     AgentConfig,
@@ -74,6 +75,7 @@ from symphony.workflow import (
     KiroConfig,
     OpenCodeConfig,
     PiConfig,
+    PrimeAgentConfig,
     ServerConfig,
     ServiceConfig,
     TrackerConfig,
@@ -147,6 +149,13 @@ def _make_cfg(kind: str, *, workspace_root: Path) -> ServiceConfig:
         ),
         pi=PiConfig(
             command='pi --mode json -p ""',
+            turn_timeout_ms=60_000,
+            read_timeout_ms=5_000,
+            stall_timeout_ms=30_000,
+            resume_across_turns=True,
+        ),
+        prime_agent=PrimeAgentConfig(
+            command='prime-agent -p --mode json',
             turn_timeout_ms=60_000,
             read_timeout_ms=5_000,
             stall_timeout_ms=30_000,
@@ -376,6 +385,7 @@ def test_factory_rejects_unknown_kind(tmp_path: Path) -> None:
         kiro=cfg.kiro,
         opencode=cfg.opencode,
         pi=cfg.pi,
+        prime_agent=cfg.prime_agent,
         server=cfg.server,
         prompt_template="hi",
     )
@@ -825,6 +835,153 @@ async def test_pi_fresh_backend_first_turn_does_not_reuse_session(
     await backend.run_turn(prompt="phase prompt", is_continuation=False)
 
     assert "--session" not in commands[0]
+
+
+@pytest.mark.parametrize(
+    ("kind", "backend_cls", "agent_label"),
+    [
+        ("pi", PiBackend, "pi"),
+        ("prime-agent", PrimeAgentBackend, "prime-agent"),
+    ],
+)
+@pytest.mark.asyncio
+async def test_json_backend_missing_agent_end_uses_only_current_turn_message(
+    kind: str,
+    backend_cls: type[PiBackend],
+    agent_label: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A clean stream without ``agent_end`` may fall back once, but must not
+    reuse that response to mark a later empty turn successful."""
+    cfg = _make_cfg(kind, workspace_root=tmp_path)
+    cwd = tmp_path / "ws"
+    cwd.mkdir()
+    events: list[dict] = []
+
+    async def collect(event: dict) -> None:
+        events.append(event)
+
+    commands = _install_subprocess_double(
+        monkeypatch,
+        pi_module,
+        [
+            _FakeSubprocess(
+                stdout_lines=[
+                    b'{"type":"session","id":"s1"}\n',
+                    b'{"type":"message_end","message":{"role":"assistant",'
+                    b'"content":[{"type":"text","text":"first answer"}]}}\n',
+                ]
+            ),
+            _FakeSubprocess(stdout_lines=[b'{"type":"session","id":"s1"}\n']),
+        ],
+    )
+    backend = backend_cls(
+        BackendInit(cfg=cfg, cwd=cwd, workspace_root=tmp_path, on_event=collect)
+    )
+
+    await backend.start_session(initial_prompt="hi", issue_title="Fix login")
+    first = await backend.run_turn(prompt="first", is_continuation=False)
+    assert first.last_message == "first answer"
+
+    with pytest.raises(TurnFailed) as exc_info:
+        await backend.run_turn(prompt="second", is_continuation=True)
+    assert "no agent_end event" in str(exc_info.value)
+    assert agent_label in str(exc_info.value)
+    assert "first answer" not in str(exc_info.value)
+    assert len(commands) == 2
+    assert any(event["event"] == EVENT_TURN_COMPLETED for event in events)
+    assert any(event["event"] == EVENT_TURN_FAILED for event in events)
+
+
+@pytest.mark.parametrize(
+    ("kind", "backend_cls", "agent_label"),
+    [
+        ("pi", PiBackend, "pi"),
+        ("prime-agent", PrimeAgentBackend, "prime-agent"),
+    ],
+)
+@pytest.mark.asyncio
+async def test_json_backend_nonzero_exit_fails_with_backend_diagnostics(
+    kind: str,
+    backend_cls: type[PiBackend],
+    agent_label: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A clean ``agent_end`` cannot hide a failed CLI process."""
+    cfg = _make_cfg(kind, workspace_root=tmp_path)
+    cwd = tmp_path / "ws"
+    cwd.mkdir()
+    events: list[dict] = []
+
+    async def collect(event: dict) -> None:
+        events.append(event)
+
+    _install_subprocess_double(
+        monkeypatch,
+        pi_module,
+        [
+            _FakeSubprocess(
+                stdout_lines=[
+                    b'{"type":"session","id":"s1"}\n',
+                    b'{"type":"agent_end","messages":[] }\n',
+                ],
+                stderr_blob=b"credential rejected\n",
+                returncode=23,
+            )
+        ],
+    )
+    backend = backend_cls(
+        BackendInit(cfg=cfg, cwd=cwd, workspace_root=tmp_path, on_event=collect)
+    )
+
+    await backend.start_session(initial_prompt="hi", issue_title="Fix login")
+    with pytest.raises(TurnFailed) as exc_info:
+        await backend.run_turn(prompt="fail", is_continuation=False)
+
+    reason = str(exc_info.value)
+    assert f"{agent_label} exited with code 23" in reason
+    assert "credential rejected" in reason
+    failed = [event for event in events if event["event"] == EVENT_TURN_FAILED]
+    assert failed and failed[-1]["payload"]["exit_code"] == 23
+    assert not [event for event in events if event["event"] == EVENT_TURN_COMPLETED]
+
+
+@pytest.mark.parametrize(
+    ("kind", "backend_cls"),
+    [("pi", PiBackend), ("prime-agent", PrimeAgentBackend)],
+)
+@pytest.mark.asyncio
+async def test_json_backend_reads_assistant_message_from_agent_end(
+    kind: str,
+    backend_cls: type[PiBackend],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    cfg = _make_cfg(kind, workspace_root=tmp_path)
+    cwd = tmp_path / "ws"
+    cwd.mkdir()
+    _install_subprocess_double(
+        monkeypatch,
+        pi_module,
+        [
+            _FakeSubprocess(
+                stdout_lines=[
+                    b'{"type":"session","id":"s1"}\n',
+                    b'{"type":"agent_end","messages":[{"role":"assistant",'
+                    b'"content":[{"type":"text","text":"terminal answer"}]}]}\n',
+                ]
+            )
+        ],
+    )
+    backend = backend_cls(
+        BackendInit(cfg=cfg, cwd=cwd, workspace_root=tmp_path, on_event=_noop_event)
+    )
+
+    await backend.start_session(initial_prompt="hi", issue_title="Fix login")
+    result = await backend.run_turn(prompt="answer", is_continuation=False)
+    assert result.last_message == "terminal answer"
 
 
 @pytest.mark.asyncio
@@ -2013,6 +2170,7 @@ def test_codex_start_command_prep_injects_when_symlinks_exist(
         claude=cfg.claude,
         gemini=cfg.gemini,
         pi=cfg.pi,
+        prime_agent=cfg.prime_agent,
         server=cfg.server,
         prompt_template=cfg.prompt_template,
     )
@@ -2054,6 +2212,7 @@ def test_codex_turn_payload_carries_symlink_writable_roots(tmp_path: Path) -> No
         claude=cfg.claude,
         gemini=cfg.gemini,
         pi=cfg.pi,
+        prime_agent=cfg.prime_agent,
         server=cfg.server,
         prompt_template=cfg.prompt_template,
     )
@@ -2114,6 +2273,7 @@ def test_codex_start_command_prep_noop_when_no_symlinks(tmp_path: Path) -> None:
         claude=cfg.claude,
         gemini=cfg.gemini,
         pi=cfg.pi,
+        prime_agent=cfg.prime_agent,
         server=cfg.server,
         prompt_template=cfg.prompt_template,
     )
@@ -2155,6 +2315,7 @@ def test_codex_start_command_prep_uses_env_var_for_wrapper(tmp_path: Path) -> No
         claude=cfg.claude,
         gemini=cfg.gemini,
         pi=cfg.pi,
+        prime_agent=cfg.prime_agent,
         server=cfg.server,
         prompt_template=cfg.prompt_template,
     )

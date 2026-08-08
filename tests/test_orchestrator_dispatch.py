@@ -42,6 +42,7 @@ from symphony.workflow import (
     GeminiConfig,
     HooksConfig,
     PiConfig,
+    PrimeAgentConfig,
     ServerConfig,
     ServiceConfig,
     TrackerConfig,
@@ -107,6 +108,13 @@ def _make_config(
         ),
         pi=PiConfig(
             command='pi --mode json -p ""',
+            turn_timeout_ms=3_600_000,
+            read_timeout_ms=5_000,
+            stall_timeout_ms=300_000,
+            resume_across_turns=True,
+        ),
+        prime_agent=PrimeAgentConfig(
+            command="prime-agent -p --mode json",
             turn_timeout_ms=3_600_000,
             read_timeout_ms=5_000,
             stall_timeout_ms=300_000,
@@ -7857,6 +7865,118 @@ def test_g2_empty_response_loop_resets_on_non_empty_turn(monkeypatch):
                 await worker_task
             except (asyncio.CancelledError, Exception):
                 pass
+
+    asyncio.run(_run())
+
+
+def test_g2_pi_nested_assistant_message_resets_empty_turn_counter(monkeypatch):
+    """Pi/Prime assistant text is nested under message/content."""
+    cfg = _replace_agent_field(
+        _make_config(max_concurrent=1), budget_exhausted_state="Blocked"
+    )
+    orch = _orch()
+    issue = _issue("MT-PI-ASSISTANT", state="In Progress")
+
+    async def _run() -> None:
+        orch._workflow_state.current = lambda: cfg  # type: ignore[assignment]
+        entry = _install_running_entry(orch, issue)
+        assistant = {
+            "role": "assistant",
+            "content": [{"type": "text", "text": "finished the turn"}],
+        }
+
+        # The terminal payload uses agent_end.messages; this also pins that
+        # path to assistant-only extraction.
+        assert (
+            Orchestrator._preview_from_payload(
+                {"type": "agent_end", "messages": [assistant]}
+            )
+            == "finished the turn"
+        )
+
+        await orch._on_codex_event(
+            issue.id,
+            {
+                "event": EVENT_TURN_COMPLETED,
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+                "payload": {},
+            },
+        )
+        assert entry.consecutive_empty_turns == 1
+
+        await orch._on_codex_event(
+            issue.id,
+            {
+                "event": "other_message",
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+                "payload": {"type": "message_end", "message": assistant},
+            },
+        )
+        await orch._on_codex_event(
+            issue.id,
+            {
+                "event": EVENT_TURN_COMPLETED,
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+                "payload": {"type": "agent_end", "messages": []},
+            },
+        )
+
+        assert entry.consecutive_empty_turns == 0
+
+    asyncio.run(_run())
+
+
+def test_g2_pi_nested_user_message_does_not_reset_empty_turn_counter(monkeypatch):
+    """Pi/Prime user messages and tool results are not model output."""
+    cfg = _replace_agent_field(
+        _make_config(max_concurrent=1), budget_exhausted_state="Blocked"
+    )
+    orch = _orch()
+    issue = _issue("MT-PI-USER", state="In Progress")
+
+    async def _run() -> None:
+        orch._workflow_state.current = lambda: cfg  # type: ignore[assignment]
+        entry = _install_running_entry(orch, issue)
+        user = {
+            "role": "user",
+            "content": [{"type": "text", "text": "the user prompt"}],
+        }
+        tool_result = {
+            "role": "tool",
+            "content": [{"type": "text", "text": "tool output"}],
+        }
+
+        await orch._on_codex_event(
+            issue.id,
+            {
+                "event": EVENT_TURN_COMPLETED,
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+                "payload": {},
+            },
+        )
+        assert entry.consecutive_empty_turns == 1
+
+        await orch._on_codex_event(
+            issue.id,
+            {
+                "event": "other_message",
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+                "payload": {"type": "message_end", "message": user},
+            },
+        )
+        await orch._on_codex_event(
+            issue.id,
+            {
+                "event": EVENT_TURN_COMPLETED,
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+                "payload": {
+                    "type": "agent_end",
+                    "messages": [user, tool_result],
+                },
+            },
+        )
+
+        assert entry.consecutive_empty_turns == 2
 
     asyncio.run(_run())
 

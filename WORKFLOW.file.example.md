@@ -187,7 +187,7 @@ hooks:
     git -C "$HOST_REPO" worktree remove --force "$WORKTREE_PATH" 2>/dev/null || true
 
 agent:
-  kind: codex          # codex | claude | gemini | agy | kiro | opencode | pi
+  kind: codex          # codex | claude | gemini | agy | kiro | opencode | pi | prime-agent
   # Optional per-state backend routing: cheap/fast agents on light lanes,
   # the default `kind` everywhere else. Precedence per dispatch:
   # per-ticket `agent_kind` frontmatter pin > stage_kinds > kind.
@@ -313,6 +313,13 @@ pi:
   # Auth: sign in once with `pi` → `/login` (OAuth). Credentials cached at
   # `~/.pi/agent/auth.json` are inherited automatically.
   command: 'pi --mode json -p ""'
+
+prime_agent:
+  # Prime Agent emits the same JSONL protocol and uses `--resume <id>` on
+  # continuation turns. Authenticate with `prime-agent` → `/login` or a
+  # provider API key; credentials are cached at `~/.prime/agent/auth.json`.
+  command: 'prime-agent -p --mode json'
+  resume_across_turns: true
 
 server:
   port: 9999            # optional JSON API; the primary UI is `symphony tui`

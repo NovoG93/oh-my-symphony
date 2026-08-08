@@ -43,6 +43,7 @@ from .constants import (
     DEFAULT_MAX_STATE_TURNS,
     DEFAULT_MAX_TOTAL_TURNS,
     DEFAULT_OPENCODE_COMMAND,
+    DEFAULT_PRIME_AGENT_COMMAND,
     DEFAULT_WORKSPACE_REUSE_POLICY,
     SUPPORTED_CI_MODES,
 )
@@ -383,6 +384,30 @@ class PiConfig:
 
 
 @dataclass(frozen=True)
+class PrimeAgentConfig:
+    """`agent.kind: prime-agent` — driving the Prime Agent CLI in print/json mode.
+
+    Same JSON protocol as Pi; uses ``--resume <id>`` instead of ``--session <id>``.
+    """
+
+    command: str
+    turn_timeout_ms: int
+    read_timeout_ms: int
+    stall_timeout_ms: int
+    resume_across_turns: bool
+
+
+def _default_prime_agent_config() -> PrimeAgentConfig:
+    return PrimeAgentConfig(
+        command=DEFAULT_PRIME_AGENT_COMMAND,
+        turn_timeout_ms=DEFAULT_BACKEND_TURN_TIMEOUT_MS,
+        read_timeout_ms=DEFAULT_BACKEND_READ_TIMEOUT_MS,
+        stall_timeout_ms=DEFAULT_BACKEND_STALL_TIMEOUT_MS,
+        resume_across_turns=True,
+    )
+
+
+@dataclass(frozen=True)
 class ServerConfig:
     """§13.7 optional HTTP extension."""
 
@@ -553,6 +578,9 @@ class ServiceConfig:
     raw: dict[str, Any] = field(default_factory=dict)
     prompt_template: str = ""
     workspace_reuse_policy: str = DEFAULT_WORKSPACE_REUSE_POLICY
+    # Appended after the original fields so positional ServiceConfig callers
+    # keep receiving the same values as before Prime Agent was added.
+    prime_agent: PrimeAgentConfig = field(default_factory=_default_prime_agent_config)
 
     def prompt_template_for_state(self, state: str) -> str:
         """Return the runtime prompt template for one tracker state."""
@@ -584,6 +612,12 @@ class ServiceConfig:
                 self.pi.read_timeout_ms,
                 self.pi.stall_timeout_ms,
             )
+        if kind == "prime-agent":
+            return (
+                self.prime_agent.turn_timeout_ms,
+                self.prime_agent.read_timeout_ms,
+                self.prime_agent.stall_timeout_ms,
+            )
         if kind == "gemini":
             return (
                 self.gemini.turn_timeout_ms,
@@ -609,6 +643,6 @@ class ServiceConfig:
                 self.opencode.stall_timeout_ms,
             )
         raise ConfigValidationError(
-            "agent.kind must be one of agy, codex, claude, gemini, kiro, opencode, pi",
+            "agent.kind must be one of agy, codex, claude, gemini, kiro, opencode, pi, prime-agent",
             value=kind,
         )

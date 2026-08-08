@@ -59,7 +59,16 @@ from tests.test_backends import (
     _make_cfg,
 )
 
-ALL_KINDS = ("codex", "claude", "gemini", "agy", "kiro", "opencode", "pi")
+ALL_KINDS = (
+    "codex",
+    "claude",
+    "gemini",
+    "agy",
+    "kiro",
+    "opencode",
+    "pi",
+    "prime-agent",
+)
 
 # Keys of the normalized event envelope every backend's `_emit` produces.
 EVENT_ENVELOPE_KEYS = {
@@ -361,6 +370,28 @@ class TestPiBackendContract(PerTurnBackendContract):
         ]
 
 
+class TestPrimeAgentBackendContract(PerTurnBackendContract):
+    kind = "prime-agent"
+    # PrimeAgentBackend inherits PiBackend's subprocess globals.
+    module = pi_module
+
+    def success_processes(self) -> list[_FakeSubprocess]:
+        return [
+            _FakeSubprocess(
+                stdout_lines=[
+                    b'{"type":"session","version":3,"id":"prime-c1"}\n',
+                    b'{"type":"message_end","message":{"role":"user",'
+                    b'"content":[{"type":"text","text":"prompt"}]}}\n',
+                    b'{"type":"message_end","message":{"role":"assistant",'
+                    b'"content":[{"type":"text","text":"done"}]}}\n',
+                    b'{"type":"agent_end","messages":[{"role":"assistant",'
+                    b'"content":[{"type":"text","text":"done"}],'
+                    b'"stopReason":"stop"}]}\n',
+                ]
+            )
+        ]
+
+
 # ---------------------------------------------------------------------------
 # git-root grant — every agent kind, not just the two Symphony can flag-inject
 #
@@ -380,6 +411,7 @@ _SPAWN_MODULES = {
     "kiro": per_turn_module,
     "opencode": per_turn_module,
     "pi": pi_module,
+    "prime-agent": pi_module,
 }
 
 

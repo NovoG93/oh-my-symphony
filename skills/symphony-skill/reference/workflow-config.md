@@ -32,12 +32,17 @@ hooks:
     echo "run finished at $(date)"
 
 agent:
-  kind: claude          # codex | claude | gemini | opencode | pi
+  kind: claude          # codex | claude | gemini | opencode | pi | prime-agent
   max_concurrent_agents: 1
   max_turns: 20
 
 claude:
   command: claude -p --output-format stream-json --verbose
+  resume_across_turns: true
+  turn_timeout_ms: 3600000
+
+prime_agent:
+  command: prime-agent -p --mode json
   resume_across_turns: true
   turn_timeout_ms: 3600000
 
@@ -67,8 +72,9 @@ Set `agent.kind`:
 - **`gemini`** — Gemini CLI. Fresh subprocess per turn with JSON output; turn 1 uses a Symphony-minted `--session-id <uuid>` and same-state continuation turns use `--resume <uuid>`. State transitions rebuild the backend and start a fresh Gemini session.
 - **`opencode`** — OpenCode CLI (`opencode run --format json --auto`). Fresh subprocess per turn; Symphony passes the prompt as the documented `message` argument and adds `--session <id>` on continuation turns after OpenCode reports a session id. Usage parsing is best-effort from JSON events.
 - **`pi`** — Pi coding-agent (`pi --mode json -p ""`). Per-turn subprocess with `--session <id>` resume from turn 2 onward; JSONL events. Multiplexes Anthropic / OpenAI / Gemini / Bedrock backends behind one CLI — useful when you want to swap LLM providers without changing Symphony config. Auth: sign in once with `pi` → `/login` (OAuth); credentials cached at `~/.pi/agent/auth.json` and inherited by every subprocess Symphony spawns. `symphony doctor` warns if the auth file is missing.
+- **`prime-agent`** — Prime Agent (`prime-agent -p --mode json`). Per-turn subprocess with `--resume <id>` continuity; same JSONL event protocol as Pi. Authenticate with `prime-agent` → `/login` or a provider API key; credentials are cached at `~/.prime/agent/auth.json`. `symphony doctor` warns if the auth file is missing.
 
-Each backend reads its own block (`codex`, `claude`, `gemini`, `opencode`, `pi`); the
+Each backend reads its own block (`codex`, `claude`, `gemini`, `opencode`, `pi`, `prime_agent`); the
 others are ignored. The `codex.linear_graphql` client tool is only
 advertised when `agent.kind: codex`.
 

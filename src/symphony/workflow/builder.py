@@ -43,6 +43,7 @@ from .config import (
     KiroConfig,
     OpenCodeConfig,
     PiConfig,
+    PrimeAgentConfig,
     ProgressConfig,
     PromptConfig,
     ServerConfig,
@@ -88,6 +89,7 @@ from .constants import (
     DEFAULT_MAX_TURNS,
     DEFAULT_OPENCODE_COMMAND,
     DEFAULT_PI_COMMAND,
+    DEFAULT_PRIME_AGENT_COMMAND,
     DEFAULT_POLL_INTERVAL_MS,
     DEFAULT_PROMPT,
     DEFAULT_TERMINAL_STATES,
@@ -545,6 +547,30 @@ def build_service_config(workflow: WorkflowDefinition) -> ServiceConfig:
         resume_across_turns=bool(pi_raw.get("resume_across_turns", True)),
     )
 
+    pa_raw = cfg.get("prime_agent") or {}
+    if not isinstance(pa_raw, dict):
+        pa_raw = {}
+    prime_agent = PrimeAgentConfig(
+        command=_as_str(pa_raw.get("command"), DEFAULT_PRIME_AGENT_COMMAND)
+        or DEFAULT_PRIME_AGENT_COMMAND,
+        turn_timeout_ms=_validated_positive_or_default(
+            pa_raw.get("turn_timeout_ms"),
+            DEFAULT_BACKEND_TURN_TIMEOUT_MS,
+            name="prime_agent.turn_timeout_ms",
+        ),
+        read_timeout_ms=_validated_positive_or_default(
+            pa_raw.get("read_timeout_ms"),
+            DEFAULT_BACKEND_READ_TIMEOUT_MS,
+            name="prime_agent.read_timeout_ms",
+        ),
+        stall_timeout_ms=_validated_positive_or_default(
+            pa_raw.get("stall_timeout_ms"),
+            DEFAULT_BACKEND_STALL_TIMEOUT_MS,
+            name="prime_agent.stall_timeout_ms",
+        ),
+        resume_across_turns=bool(pa_raw.get("resume_across_turns", True)),
+    )
+
     server_raw = cfg.get("server") or {}
     if not isinstance(server_raw, dict):
         server_raw = {}
@@ -685,6 +711,7 @@ def build_service_config(workflow: WorkflowDefinition) -> ServiceConfig:
         kiro=kiro,
         opencode=opencode,
         pi=pi,
+        prime_agent=prime_agent,
         server=server,
         tui=tui,
         progress=progress,

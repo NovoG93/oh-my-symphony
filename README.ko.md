@@ -7,9 +7,9 @@
 [![Tests](https://github.com/cskwork/oh-my-symphony/actions/workflows/tests.yml/badge.svg)](https://github.com/cskwork/oh-my-symphony/actions/workflows/tests.yml)
 [![GitHub stars](https://img.shields.io/github/stars/cskwork/oh-my-symphony?style=social)](https://github.com/cskwork/oh-my-symphony/stargazers)
 
-> 하나의 관리자 UI, 하나의 터미널, 하나의 칸반 보드, 일곱 개의 AI 코딩 에이전트
+> 하나의 관리자 UI, 하나의 터미널, 하나의 칸반 보드, 여덟 개의 AI 코딩 에이전트
 > (**Codex**, **Claude Code**, **Gemini**, **AGY/Antigravity**, **Kiro**,
-> **OpenCode**, **Pi**) — 티켓마다 골라 쓰고, 병렬로 실행하며, 실시간으로 지켜본다.
+> **OpenCode**, **Pi**, **Prime Agent**) — 티켓마다 골라 쓰고, 병렬로 실행하며, 실시간으로 지켜본다.
 
 ![Symphony 9999 admin UI screenshot](docs/admin-ui-screenshot.png)
 
@@ -45,7 +45,7 @@
 
 ## Why Symphony?
 
-- **벤더 종속 없음.** Codex ↔ Claude Code ↔ Gemini ↔ AGY ↔ Kiro ↔ OpenCode ↔ Pi를 YAML 한 줄로
+- **벤더 종속 없음.** Codex ↔ Claude Code ↔ Gemini ↔ AGY ↔ Kiro ↔ OpenCode ↔ Pi ↔ Prime Agent를 YAML 한 줄로
   바꾸거나, 티켓마다 백엔드를 섞어 쓴다. 새 에이전트(Ollama, 로컬 모델,
   CLI가 있는 무엇이든)는 오케스트레이터를 바꾸지 않고 얇은
   `AgentBackend` Protocol 뒤에 끼워 넣으면 된다.
@@ -63,7 +63,7 @@
   Symphony를 체험하는 데는 둘 다 필요하지 않다.
 - **검증된 기반 위에 로컬 운영 안정성을 더했다.**
   [OpenAI의 공식 Symphony 레퍼런스 구현](https://github.com/openai/symphony)에서
-  포크했다. 이 포크는 파일 우선 오케스트레이션 모델을 유지하면서 일곱 개의
+  포크했다. 이 포크는 파일 우선 오케스트레이션 모델을 유지하면서 여덟 개의
   백엔드, TUI / 웹 운영 화면, SQLite 실행 lease, 재시작에도 보존되는 이슈
   플래그, 잠금 기반 Markdown 티켓 쓰기를 더한다.
 - **뷰어가 아니라 진짜 웹 앱.** 오케스트레이터 포트가 Linear 스타일 보드를
@@ -82,7 +82,7 @@
 - 버그 수정, 문서 갱신, 마이그레이션 티켓을 여러 코딩 에이전트에 걸쳐 동시에
   병렬화하는 **팀**.
 - 동일한 프롬프트와 워크스페이스로 Codex, Claude Code, Gemini,
-  AGY/Antigravity, Kiro, OpenCode, Pi가 같은 작업을 어떻게 처리하는지 나란히
+  AGY/Antigravity, Kiro, OpenCode, Pi, Prime Agent가 같은 작업을 어떻게 처리하는지 나란히
   비교하는 **연구자와 리뷰어**.
 - "에이전트당 채팅 창 하나"의 한계에 부딪혀, 한눈에 읽히는 칸반을 갖춘 진짜
   오케스트레이터를 원하는 **누구든**.
@@ -120,7 +120,7 @@ q quit · r refresh · enter details · n new · e edit · s stats · S skip Doc
 안에서 Codex 세션을 실행한다. 이 포크는 그 오케스트레이터를 유지하면서 다음을
 더한다:
 
-1. 일곱 개의 구체 어댑터를 가진 플러그형 **AgentBackend** 레이어:
+1. 여덟 개의 구체 어댑터를 가진 플러그형 **AgentBackend** 레이어:
    - **Codex** — `codex app-server` (JSON-RPC stdio, 멀티턴) — 원본
    - **Claude Code** — `claude -p --output-format stream-json --verbose`
      (NDJSON 이벤트, `--resume`를 쓰는 턴별 서브프로세스)
@@ -135,6 +135,9 @@ q quit · r refresh · enter details · n new · e edit · s stats · S skip Doc
    - **Pi** — `pi --mode json -p ""` (JSONL 이벤트, `--session` 재개를 쓰는
      턴별 서브프로세스; 하나의 CLI 아래에서 Anthropic / OpenAI / Gemini / Bedrock
      백엔드를 지원 — [pi.dev](https://pi.dev) 참고)
+   - **Prime Agent** — `prime-agent -p --mode json` (Pi와 같은 JSONL 이벤트,
+     `--resume` 재개를 쓰는 턴별 서브프로세스; `/login` 또는 provider API 키 사용,
+     자격 증명은 `~/.prime/agent/auth.json`에 저장)
 2. [Textual](https://textual.textualize.io) 기반 **Jira 스타일 CLI 칸반 TUI**.
    컬럼은 트래커 상태이고, 카드는 현재 에이전트, 턴 수, 마지막 이벤트, 누적
    토큰을 보여준다. 카드는 포커스할 수 있고, 마우스 휠로 각 레인을 스크롤하며,
@@ -156,7 +159,7 @@ q quit · r refresh · enter details · n new · e edit · s stats · S skip Doc
 
 ```yaml
 agent:
-  kind: claude          # codex | claude | gemini | agy | kiro | opencode | pi
+  kind: claude          # codex | claude | gemini | agy | kiro | opencode | pi | prime-agent
 
 claude:
   command: claude -p --output-format stream-json --verbose
@@ -167,10 +170,15 @@ pi:
   command: pi --mode json -p ""
   resume_across_turns: true
   turn_timeout_ms: 3600000
+
+prime_agent:
+  command: prime-agent -p --mode json
+  resume_across_turns: true
+  turn_timeout_ms: 3600000
 ```
 
 각 백엔드는 자기 블록(`codex`, `claude`, `gemini`, `agy`, `kiro`,
-`opencode`, `pi`)을 읽으며, 런타임에는
+`opencode`, `pi`, `prime_agent`)을 읽으며, 런타임에는
 `agent.kind`에 맞는 것만 사용된다. Codex `linear_graphql` 클라이언트 도구는
 `agent.kind=codex`일 때만 노출된다.
 
@@ -184,7 +192,8 @@ agent:
 
 손으로 편집한 카드에는 플랫 별칭 `agent_kind: codex`도 허용된다.
 모든 백엔드 명령과 타임아웃 설정은 여전히 `WORKFLOW.md`의 해당 전역
-`codex:`, `claude:`, `gemini:`, `agy:`, `kiro:`, `opencode:`, `pi:` 블록에서 가져온다.
+`codex:`, `claude:`, `gemini:`, `agy:`, `kiro:`, `opencode:`, `pi:`,
+`prime_agent:` 블록에서 가져온다.
 CLI에서 파일 보드 티켓을 만들 때는
 `symphony board new TASK-2 "title" --agent-kind codex`를 쓴다.
 
@@ -220,6 +229,7 @@ pip install -e ".[dev]"
 | `kiro`       | `kiro-cli` (Kiro CLI — `https://cli.kiro.dev/install`에서 설치; headless 실행에는 `kiro-cli login` 또는 `KIRO_API_KEY` 필요) |
 | `opencode`   | `opencode` (OpenCode CLI — `npm install -g opencode-ai`로 설치, `opencode auth login`으로 provider 인증) |
 | `pi`         | `pi` (Pi coding-agent — `npm i -g @earendil-works/pi-coding-agent` or `curl -fsSL https://pi.dev/install.sh \| sh`; sign in once via `pi` → `/login` (OAuth, credentials cached at `~/.pi/agent/auth.json`) — no env var needed) |
+| `prime-agent` | `prime-agent` (Prime Agent — install from the Prime Agent installer; sign in via `prime-agent` → `/login`, or provide a provider API key; credentials cached at `~/.prime/agent/auth.json`) |
 
 ## Try it in 60 seconds (no agent CLI required)
 
@@ -824,7 +834,7 @@ symphony tui ./WORKFLOW.md
 src/symphony/
   backends/          AgentBackend Protocol + factory + normalized events;
                      codex.py, claude_code.py, gemini.py, agy.py, kiro.py,
-                     opencode.py, pi.py adapters
+                     opencode.py, pi.py, prime_agent.py adapters
   trackers/          TrackerClient Protocol + factory; file.py (locked
                      Markdown ticket mutations), jira.py, linear.py, _retry.py
   workflow/
@@ -878,7 +888,7 @@ CI에 포함하지 않았다 — 로컬에서 실행한다.
 
 ## Design notes
 
-### Why seven different lifecycles behind one Protocol?
+### Why eight different lifecycles behind one Protocol?
 
 - **Codex**는 이슈당 하나의 `app-server` 서브프로세스를 열고 현재의
   `codex app-server` JSON-RPC 프로토콜(`initialize` + `thread/start`
@@ -911,6 +921,11 @@ CI에 포함하지 않았다 — 로컬에서 실행한다.
   인증은 Pi에 위임된다: `/login`으로 채워진 `~/.pi/agent/auth.json`의
   OAuth/API 키 저장소를 서브프로세스가 상속하므로, Symphony 자체는 자격 증명을
   절대 다루지 않는다.
+- **Prime Agent**는 Pi에서 파생된 독립 CLI지만 `--resume <id>`를 사용하는
+  턴별 JSONL 서브프로세스다. `/login` OAuth 또는 provider API 키를 CLI에 맡기고,
+  Symphony는 `~/.prime/agent/auth.json`을 검사만 하며 자격 증명을 읽지 않는다.
+  파일 보드에서는 티켓이 terminal 상태에 도달한 뒤 Prime Agent가 `agent_end`를
+  flush하지 않고 정상 종료해도 완료로 인정하며, non-zero 종료는 계속 실패로 처리한다.
 
 `AgentBackend` Protocol이 이런 차이를 감춘다. 오케스트레이터는 정규화된
 이벤트(`session_started`, `turn_completed`, `turn_failed` 등)와 최신 사용량 /

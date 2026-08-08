@@ -31,6 +31,7 @@ AGENT_COLOR = {
     "codex": "bright_blue",
     "claude": "bright_magenta",
     "gemini": "bright_yellow",
+    "prime-agent": "bright_cyan",
 }
 
 
