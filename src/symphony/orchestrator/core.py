@@ -2248,7 +2248,12 @@ class Orchestrator:
         await self._auto_normalize_legacy_human_review_done(cfg)
         # Validate terminal FIX outcomes before fetching active candidates. A
         # source whose dependency only looks Done must never dispatch first.
-        await self._auto_reopen_sources_from_resolved_rcas(cfg)
+        try:
+            await self._auto_reopen_sources_from_resolved_rcas(cfg)
+        except Exception as exc:
+            log.warning("blocked_fix_safety_sweep_failed", error=str(exc))
+            await self._notify_observers()
+            return
 
         # Fetch candidates.
         try:
@@ -3166,6 +3171,42 @@ class Orchestrator:
             "Clarify the source request and acceptance criteria, verify the fix, "
             "then append `## Fix Resolution` before completing this ticket."
         )
+        # Demotion is the safety boundary: perform it before best-effort notes,
+        # and fail the whole tick closed if it cannot be persisted.
+        try:
+            await asyncio.to_thread(
+                self._tracker_call_update_state,
+                cfg,
+                fix_issue,
+                target_state,
+            )
+        except Exception as exc:
+            log.warning(
+                "blocked_fix_completion_hold_failed",
+                fix_identifier=fix_issue.identifier,
+                error=str(exc),
+            )
+            self._record_tracker_error(fix_issue.id, exc)
+            raise
+
+        if normalize_state(source_issue.state) != "blocked":
+            try:
+                await asyncio.to_thread(
+                    self._tracker_call_update_state,
+                    cfg,
+                    source_issue,
+                    "Blocked",
+                )
+            except Exception as exc:
+                # The now-unresolved FIX dependency still prevents dispatch.
+                log.warning(
+                    "blocked_fix_source_reblock_failed",
+                    fix_identifier=fix_issue.identifier,
+                    source_identifier=source_issue.identifier,
+                    error=str(exc),
+                )
+                self._record_tracker_error(source_issue.id, exc)
+
         try:
             await asyncio.to_thread(
                 self._tracker_call_append_note,
@@ -3174,27 +3215,13 @@ class Orchestrator:
                 "Fix Completion Blocked",
                 body,
             )
-            await asyncio.to_thread(
-                self._tracker_call_update_state,
-                cfg,
-                fix_issue,
-                target_state,
-            )
-            if normalize_state(source_issue.state) != "blocked":
-                await asyncio.to_thread(
-                    self._tracker_call_update_state,
-                    cfg,
-                    source_issue,
-                    "Blocked",
-                )
         except Exception as exc:
             log.warning(
-                "blocked_fix_completion_hold_failed",
+                "blocked_fix_completion_note_failed",
                 fix_identifier=fix_issue.identifier,
                 error=str(exc),
             )
-            self._record_tracker_error(fix_issue.id, exc)
-            return True
+
         self._clear_tracker_error(fix_issue.id)
         log.warning(
             "blocked_fix_completion_held",
@@ -3203,6 +3230,7 @@ class Orchestrator:
             reason=reason_code,
         )
         return True
+
 
     async def _hold_unproven_blocked_fix(
         self, cfg: ServiceConfig, fix_issue: Issue, source_issue: Issue
@@ -3243,7 +3271,7 @@ class Orchestrator:
             )
         except Exception as exc:
             log.warning("blocked_rca_resolution_fetch_failed", error=str(exc))
-            return 0
+            raise
         terminal_by_identifier = {
             issue.identifier.casefold(): issue
             for issue in terminal_issues
