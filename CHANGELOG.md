@@ -10,6 +10,25 @@ Versioning: [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.18.0] - 2026-08-08 - Reproducible installs and clean skill discovery
+
+### Added
+
+- Commit `uv.lock` so development and operator installs resolve the same tested
+  dependency set.
+- Add a regression test that detects broken symlinks in Claude Code skill
+  discovery.
+
+### Fixed
+
+- Remove the stale `.claude/skills/symphony-oneshot` symlink left behind after
+  operator routing was consolidated into `symphony-skill`.
+
+### Documentation
+
+- Record the verified recovery procedure and merge-safety evidence for a
+  botched ticket-branch rebase.
+
 ## [0.17.0] - 2026-08-08 - Minimal Symphony: chat-to-delivery ticket DAGs
 
 The "minimal" line: delete duplicate machinery, keep every operator-facing
