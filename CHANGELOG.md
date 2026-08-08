@@ -25,6 +25,8 @@ Versioning: [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - Adopt repositories whose ignore rules hide Symphony operator files by
   force-adding only files created by Symphony; unrelated ignored or modified
   project files remain untouched.
+- Skip ports already occupied by unregistered local services when allocating a
+  new project endpoint, so start-and-switch does not fail after registration.
 
 ## [0.18.1] - 2026-08-08 - Project workflow containment
 

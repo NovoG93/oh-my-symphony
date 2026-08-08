@@ -352,13 +352,26 @@ def _slug(value: str) -> str:
     return slug[:64].rstrip("-")
 
 
+def _port_is_available(host: str, port: int) -> bool:
+    bind_host = host.strip("[]") or "127.0.0.1"
+    family = socket.AF_INET6 if ":" in bind_host else socket.AF_INET
+    sock = socket.socket(family, socket.SOCK_STREAM)
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 0 if os.name == "nt" else 1)
+    try:
+        sock.bind((bind_host, port))
+    except OSError:
+        return False
+    finally:
+        sock.close()
+    return True
+
+
 def _next_port(projects: list[Project], host: str) -> int:
-    del host  # Ports are process-wide registry identities, independent of bind host.
     used = {project.port for project in projects}
     for port in range(9999, 65536):
-        if port not in used:
+        if port not in used and _port_is_available(host, port):
             return port
-    raise ProjectError("no available registry port")
+    raise ProjectError(f"no available registry port for host {host}")
 
 
 def _inside(path: Path, directory: Path) -> bool:
