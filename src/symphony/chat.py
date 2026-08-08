@@ -22,10 +22,11 @@ Other backend kinds cannot be forced read-only; the session reports
 ``mode_enforced: false`` and relies on the preamble alone.
 
 Two streams leave a turn. Numbered `ChatMessage` rows go to the transcript,
-the JSONL and every subscriber; ephemeral `agent_delta` chunks (claude token
-deltas) go to subscribers only — see `_broadcast_ephemeral`. The per-session
-token/turn budget is advisory: crossing it warns once and the session keeps
-running, because only the operator can judge when a conversation is done.
+the JSONL and every subscriber; ephemeral `agent_delta` chunks and cumulative
+`agent_snapshot` text go to subscribers only — see `_broadcast_ephemeral`.
+The per-session token/turn budget is advisory: crossing a limit warns once,
+and the session keeps running, because only the operator can judge when a
+conversation is done.
 """
 
 from __future__ import annotations
@@ -88,7 +89,7 @@ _RAW_PREVIEW_CHARS = 400
 # Frame types that are streamed to live subscribers but never numbered,
 # kept in the transcript or written to the JSONL: hundreds arrive per turn
 # and the terminal `agent_message` repeats the same text verbatim.
-EPHEMERAL_TYPES = frozenset({"agent_delta"})
+EPHEMERAL_TYPES = frozenset({"agent_delta", "agent_snapshot"})
 
 # Default per-session budget. Advisory only — crossing a limit raises a
 # warning banner, it never blocks a turn (the operator decides when to stop).
@@ -865,7 +866,7 @@ class ChatManager:
         elif event == EVENT_TURN_COMPLETED:
             usage = envelope.get("usage") or {}
             self._accumulate_usage(session, usage)
-            message = str(payload.get("message") or "").strip()
+            message = _terminal_agent_message(payload)
             if message and message != session.last_agent_text:
                 self._broadcast(session, "agent_message", message)
                 session.last_agent_text = message
@@ -1132,6 +1133,41 @@ def _load_transcript(path: Path) -> list[ChatMessage]:
 # ---------------------------------------------------------------------------
 
 
+def _assistant_text(message: object) -> str:
+    """Return visible assistant text without exposing thinking blocks."""
+    if not isinstance(message, dict) or message.get("role") != "assistant":
+        return ""
+    content = message.get("content")
+    if isinstance(content, str):
+        return content.strip()
+    if isinstance(content, list):
+        parts = [
+            str(block.get("text") or "")
+            for block in content
+            if isinstance(block, dict) and block.get("type") == "text"
+        ]
+        text = "".join(parts).strip()
+        if text:
+            return text
+    text = message.get("text")
+    return text.strip() if isinstance(text, str) else ""
+
+
+def _terminal_agent_message(payload: dict[str, Any]) -> str:
+    """Normalize terminal answer shapes used by every chat backend."""
+    message = payload.get("message")
+    if isinstance(message, str) and message.strip():
+        return message.strip()
+    messages = payload.get("messages")
+    if not isinstance(messages, list):
+        return ""
+    for candidate in reversed(messages):
+        text = _assistant_text(candidate)
+        if text:
+            return text
+    return ""
+
+
 def _summarize_frame(
     agent_kind: str, payload: dict[str, Any]
 ) -> list[tuple[str, str, dict[str, Any]]]:
@@ -1139,6 +1175,8 @@ def _summarize_frame(
         return _summarize_claude_frame(payload)
     if agent_kind == "codex":
         return _summarize_codex_frame(payload)
+    if agent_kind in {"pi", "prime-agent"}:
+        return _summarize_pi_frame(payload)
     raw = _preview(json.dumps(payload, ensure_ascii=False), _RAW_PREVIEW_CHARS)
     return [("tool_activity", "event", {"detail": raw})] if raw != "{}" else []
 
@@ -1209,6 +1247,36 @@ def _claude_text_delta(
     return [("agent_delta", text, {"index": event.get("index")})]
 
 
+def _summarize_pi_frame(
+    payload: dict[str, Any],
+) -> list[tuple[str, str, dict[str, Any]]]:
+    """Pi/Prime Agent cumulative JSON events -> safe chat frames.
+
+    `message_update` repeats the full assistant message so it is a snapshot,
+    not a delta. Thinking blocks and lifecycle echoes intentionally stay out
+    of both the UI and the persisted transcript.
+    """
+    kind = payload.get("type")
+    if kind in {"message_update", "message_end"}:
+        text = _assistant_text(payload.get("message"))
+        if not text:
+            return []
+        type_ = "agent_snapshot" if kind == "message_update" else "agent_message"
+        return [(type_, text, {})]
+    if kind == "tool_execution_start":
+        name = str(payload.get("toolName") or payload.get("tool") or "tool")
+        detail = _preview(
+            json.dumps(payload.get("args") or {}, ensure_ascii=False),
+            _TOOL_PREVIEW_CHARS,
+        )
+        return [("tool_activity", name, {"detail": detail})]
+    if kind == "tool_execution_end":
+        name = str(payload.get("toolName") or payload.get("tool") or "tool")
+        detail = _preview(str(payload.get("result") or ""), _TOOL_PREVIEW_CHARS)
+        return [("tool_activity", f"{name} result", {"detail": detail})]
+    return []
+
+
 def _tool_result_preview(block: dict[str, Any]) -> str:
     content = block.get("content")
     if isinstance(content, str):
@@ -1226,7 +1294,12 @@ def _tool_result_preview(block: dict[str, Any]) -> str:
 def _summarize_codex_frame(
     payload: dict[str, Any]
 ) -> list[tuple[str, str, dict[str, Any]]]:
-    """codex `item/completed` echoes -> chat messages."""
+    """Codex agent deltas and `item/completed` echoes -> chat messages."""
+    if payload.get("type") == "agent_delta":
+        text = payload.get("text")
+        if isinstance(text, str) and text:
+            return [("agent_delta", text, {"item_id": payload.get("item_id")})]
+        return []
     if payload.get("type") == "assistant" and isinstance(
         payload.get("message"), str
     ):

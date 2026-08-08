@@ -245,7 +245,7 @@ Todo prompt.
 ```bash
 python3 -m venv .venv
 source .venv/bin/activate
-pip install -e ".[dev]"
+python -m pip install -e ".[dev]"
 ```
 
 Make the relevant CLI available on `$PATH`:
@@ -304,7 +304,7 @@ ticks.
 git clone https://github.com/cskwork/oh-my-symphony.git
 cd oh-my-symphony
 python3 -m venv .venv && source .venv/bin/activate
-pip install -e ".[dev]"
+python -m pip install -e ".[dev]"
 
 # Keep the source checkout protected; create the demo as a separate project.
 symphony project create "Symphony Demo" --path ../symphony-demo
@@ -1040,8 +1040,13 @@ tui-open.bat           Windows equivalent
 
 ## Tests
 
+Run these commands after installing the development dependencies. The
+`symphony-pyright` command pins Pyright to the interpreter that runs it:
+
 ```bash
-pytest -q
+python -m pytest -q
+python -m ruff check src tests
+symphony-pyright
 ```
 
 The suite (1614 passed, 7 skipped) covers the upstream conformance suite,
@@ -1135,8 +1140,10 @@ PRs welcome. External contributions should target `dev` by default; see
 checklist. Before opening one:
 
 ```bash
-pip install -e ".[dev]"
-pytest -q          # must stay green
+python -m pip install -e ".[dev]"
+python -m pytest -q          # must stay green
+python -m ruff check src tests
+symphony-pyright
 ```
 
 Backend adapters live under `src/symphony/backends/`. Adding a new agent

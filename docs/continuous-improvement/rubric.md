@@ -191,7 +191,7 @@ unreachable, the baseline proof is `not_proven` and the run ends there.
 | --- | --- | --- |
 | Unit / integration tests | `python -m pytest -q` | `failed` on non-zero exit; `not_proven` on timeout/crash |
 | Lint | `python -m ruff check src tests` | `failed` on any reported violation |
-| Type check | `python -m pyright` | `failed` on any reported error |
+| Type check | `symphony-pyright` | `failed` on any reported error |
 | Browser QA | project-specific, optional | `not_available` unless dependencies and required environment flags are present |
 | Read-only DB probes | project-specific, optional | `not_available` unless explicit read-only configuration exists |
 
