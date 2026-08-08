@@ -234,6 +234,39 @@ def _from_monotonic_to_iso(due_at_ms: float) -> str:
     return datetime.fromtimestamp(target, tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
+def _terminal_state_matching(cfg: ServiceConfig, *keywords: str) -> str:
+    """First terminal lane whose normalized name contains any keyword.
+
+    F-32: `"Human Review"` and `"Blocked"` used to be hardcoded transition
+    targets, so a fully customized board (explicitly allowed) got a state
+    string its tracker does not know. Resolve through the configured lanes
+    and let the caller refuse cleanly when none matches.
+    """
+    normalized = [(state, normalize_state(state)) for state in cfg.tracker.terminal_states]
+    for keyword in keywords:
+        for state, low in normalized:
+            if keyword in low:
+                return state
+    return ""
+
+
+def _human_review_target_state(cfg: ServiceConfig) -> str:
+    """Lane for operator attention: `human`-ish, else `block`-ish, else the
+    first terminal lane. Empty when the board declares no terminal lane."""
+    resolved = _terminal_state_matching(cfg, "human", "review", "block")
+    if resolved:
+        return resolved
+    return cfg.tracker.terminal_states[0] if cfg.tracker.terminal_states else ""
+
+
+def _rewind_budget_target_state(cfg: ServiceConfig) -> str:
+    """Lane for a ticket that exhausted its rewind budget."""
+    resolved = _terminal_state_matching(cfg, "block", "human")
+    if resolved:
+        return resolved
+    return cfg.tracker.terminal_states[0] if cfg.tracker.terminal_states else ""
+
+
 def _max_turns_exhausted_target_state(cfg: ServiceConfig) -> str:
     if cfg.agent.budget_exhausted_state:
         return cfg.agent.budget_exhausted_state

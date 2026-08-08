@@ -21,6 +21,7 @@ from __future__ import annotations
 import asyncio
 import json
 import re
+from functools import partial
 from datetime import date, datetime
 from pathlib import Path
 from typing import Any, Awaitable, Callable
@@ -68,6 +69,7 @@ from .workflow.mutate import (
     set_continuous_improvement_settings,
     write_prompt,
 )
+from .workflow.preflight import stage_turn_budget_error
 from .workflow.presets import LANE_PRESETS, get_lane_preset, guess_lane_preset
 
 log = get_logger()
@@ -214,6 +216,9 @@ def _issue_card(
         "labels": list(issue.labels),
         "skills": list(issue.skills),
         "agent_kind": issue.agent_kind or "",
+        # Audit stamp on `stage_kinds`-routed boards, where the pin stays
+        # empty on purpose (F-20).
+        "last_agent_kind": issue.last_agent_kind or "",
         "request": issue.request or "",
         "blocked_by": [
             {"identifier": b.identifier, "state": b.state} for b in issue.blocked_by
@@ -610,21 +615,23 @@ def _register_issue_routes(
             "blocked_by": blocked_by or None,
             "request": _check_request(body.get("request")) or None,
         }
-        def _validate_dependencies(new_identifier: str | None) -> None:
+        # F-15: validate and write under the same board lock so concurrent
+        # creates cannot jointly introduce a cycle or race the allocator.
+        def _validate(issues: list[Issue], resolved: str) -> None:
             validate_ticket_dependencies(
-                tracker.scan_all(),
-                identifier=new_identifier,
+                issues,
+                identifier=resolved,
                 blocked_by=blocked_by,
                 new_ticket=True,
             )
 
         raw_identifier = body.get("identifier")
+        prefix = "TASK"
+        identifier_arg: str | None = None
         if raw_identifier:
             if not isinstance(raw_identifier, str):
                 raise WorkflowMutationError("identifier must be a string")
-            identifier = _check_identifier(raw_identifier)
-            await asyncio.to_thread(_validate_dependencies, identifier)
-            await asyncio.to_thread(tracker.create, identifier=identifier, **fields)
+            identifier_arg = _check_identifier(raw_identifier)
         else:
             prefix_raw = body.get("prefix")
             prefix = (
@@ -634,11 +641,15 @@ def _register_issue_routes(
             )
             if not re.match(r"^[A-Za-z][A-Za-z0-9]{0,15}$", prefix):
                 raise WorkflowMutationError("prefix must be 1-16 alphanumeric chars")
-
-            await asyncio.to_thread(_validate_dependencies, None)
-            identifier, _ = await asyncio.to_thread(
-                tracker.create_with_next_identifier, prefix, **fields
+        identifier, _ = await asyncio.to_thread(
+            partial(
+                tracker.create_validated,
+                identifier=identifier_arg,
+                prefix=prefix,
+                validate=_validate,
+                **fields,
             )
+        )
         await asyncio.to_thread(
             ctx.stats().record_transition,
             issue=identifier,
@@ -981,6 +992,17 @@ def _register_workflow_routes(
                 migrated[issue.identifier] = plan.fallback_state
         orchestrator.workflow_state.reload()
         orchestrator.request_refresh()
+        # F-23: an 8-lane preset needs `agent.max_turns >= len(active_states)`
+        # or the very next dispatch fails preflight. Report it in the response
+        # instead of letting the operator discover it at run time.
+        reloaded = orchestrator.workflow_state.current()
+        warning = (
+            stage_turn_budget_error(reloaded) if reloaded is not None else None
+        )
+        if warning:
+            log.warning(
+                "lane_preset_turn_budget_warning", preset=preset.name, detail=warning
+            )
         return web.json_response(
             {
                 "applied": preset.name,
@@ -989,6 +1011,7 @@ def _register_workflow_routes(
                 "migrated": migrated,
                 "skipped_running": skipped,
                 "fallback_state": plan.fallback_state,
+                "warning": warning,
             }
         )
 

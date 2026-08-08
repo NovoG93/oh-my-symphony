@@ -45,6 +45,23 @@ from ..workflow import (
 )
 
 
+def _operator_message(exc: BaseException) -> str:
+    """Operator-facing error text without the internal error code.
+
+    `SymphonyError.__str__` prefixes the machine code
+    (`board_dependency_error: ...`) which the JSON API needs and a human (or
+    an agent reading CLI output) does not. `WorkflowMutationError` already
+    strips it on operator surfaces; the CLI now agrees.
+    """
+    if isinstance(exc, SymphonyError):
+        message = exc.message
+        if exc.context:
+            details = " ".join(f"{k}={v!r}" for k, v in exc.context.items())
+            return f"{message} ({details})"
+        return message
+    return str(exc)
+
+
 def _resolve_tracker(args: argparse.Namespace) -> TrackerConfig | None:
     """Return TrackerConfig from WORKFLOW.md or None to fall back to --root."""
     workflow_path = resolve_workflow_path(args.workflow)
@@ -162,7 +179,7 @@ def cmd_new(args: argparse.Namespace) -> int:
     try:
         identifier = validate_identifier(args.id)
     except SymphonyError as exc:
-        print(f"error: {exc}", file=sys.stderr)
+        print(f"error: {_operator_message(exc)}", file=sys.stderr)
         return 1
     legal_states = {
         s.lower(): s for s in (*tracker.active_states, *tracker.terminal_states)
@@ -178,14 +195,20 @@ def cmd_new(args: argparse.Namespace) -> int:
     blocked_by = list(dict.fromkeys(args.blocked_by or []))
     try:
         description = _read_description(args)
-        validate_ticket_dependencies(
-            fbt.scan_all(),
+
+        def _validate(issues: list[Issue], resolved: str) -> None:
+            validate_ticket_dependencies(
+                issues,
+                identifier=resolved,
+                blocked_by=blocked_by,
+                new_ticket=True,
+            )
+
+        # Validate + write under one board lock: two concurrent `board new`
+        # calls must not each see an acyclic board and jointly create a cycle.
+        _, path = fbt.create_validated(
             identifier=identifier,
-            blocked_by=blocked_by,
-            new_ticket=True,
-        )
-        path = fbt.create(
-            identifier=identifier,
+            validate=_validate,
             title=args.title,
             state=state,
             priority=args.priority,
@@ -196,7 +219,7 @@ def cmd_new(args: argparse.Namespace) -> int:
             request=args.request,
         )
     except (OSError, SymphonyError) as exc:
-        print(f"error: {exc}", file=sys.stderr)
+        print(f"error: {_operator_message(exc)}", file=sys.stderr)
         return 1
     print(f"created {path}")
     return 0
@@ -208,7 +231,7 @@ def cmd_mv(args: argparse.Namespace) -> int:
     try:
         path = fbt.transition(args.id, args.state)
     except SymphonyError as exc:
-        print(f"error: {exc}", file=sys.stderr)
+        print(f"error: {_operator_message(exc)}", file=sys.stderr)
         return 1
     print(f"{args.id} -> {args.state} ({path})")
     return 0
@@ -228,7 +251,7 @@ def cmd_update(args: argparse.Namespace) -> int:
     try:
         identifier = validate_identifier(args.id)
     except SymphonyError as exc:
-        print(f"error: {exc}", file=sys.stderr)
+        print(f"error: {_operator_message(exc)}", file=sys.stderr)
         return 1
 
     state: str | None = None
@@ -274,7 +297,7 @@ def cmd_update(args: argparse.Namespace) -> int:
             request=args.request,
         )
     except (OSError, SymphonyError) as exc:
-        print(f"error: {exc}", file=sys.stderr)
+        print(f"error: {_operator_message(exc)}", file=sys.stderr)
         return 1
 
     changes = []

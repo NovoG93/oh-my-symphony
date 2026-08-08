@@ -1478,3 +1478,31 @@ async def test_lane_preset_apply_blocks_running_worker_in_removed_lane(
     assert resp.status == 409
     assert (await resp.json())["error"]["code"] == "state_in_use"
     assert (board_dir / "WORKFLOW.md").read_bytes() == before
+
+
+async def test_lane_preset_apply_warns_when_max_turns_cannot_cover_the_lanes(
+    client: TestClient, board_dir: Path
+) -> None:
+    """F-23: nothing validated the board after a preset switch."""
+    workflow = board_dir / "WORKFLOW.md"
+    text = workflow.read_text(encoding="utf-8")
+    assert "agent:" in text
+    workflow.write_text(text.replace("agent:", "agent:\n  max_turns: 3", 1), encoding="utf-8")
+    client.stub.workflow_state.reload()  # type: ignore[attr-defined]
+
+    resp = await client.post("/api/v1/workflow/presets/apply", json={"name": "deep"})
+
+    assert resp.status == 200
+    payload = await resp.json()
+    assert payload["applied"] == "deep"
+    assert payload["warning"] is not None
+    assert "agent.max_turns=3" in payload["warning"]
+
+
+async def test_lane_preset_apply_reports_no_warning_for_a_sane_budget(
+    client: TestClient,
+) -> None:
+    resp = await client.post("/api/v1/workflow/presets/apply", json={"name": "default"})
+
+    assert resp.status == 200
+    assert (await resp.json())["warning"] is None

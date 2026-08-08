@@ -120,7 +120,9 @@ from .helpers import (
     _from_monotonic_to_iso,
     _is_auto_triage_todo_candidate,
     _is_rewind_transition,
+    _human_review_target_state,
     _max_turns_exhausted_target_state,
+    _rewind_budget_target_state,
     _notify_state_transition,
     _requested_agent_kind,
     _sort_for_dispatch_fifo,
@@ -1826,6 +1828,12 @@ class Orchestrator:
         if self.find_running_issue_id(identifier) is not None:
             return False, f"{identifier} started running; retry after it stops"
 
+        target_state = _human_review_target_state(cfg)
+        if not target_state:
+            return False, (
+                "this board declares no terminal lane to skip into; add a "
+                "`Human Review`-style terminal state to tracker.terminal_states"
+            )
         await asyncio.to_thread(
             self._tracker_call_append_note,
             cfg,
@@ -1837,7 +1845,7 @@ class Orchestrator:
             self._tracker_call_update_state,
             cfg,
             issue,
-            "Human Review",
+            target_state,
         )
         self.request_refresh()
         return True, f"moved {identifier} to Human Review"
@@ -3882,19 +3890,25 @@ class Orchestrator:
         # `agent.stage_kinds` routing is active: the stamp is read back as
         # a per-ticket pin on later dispatches, which would freeze the
         # first stage's backend and defeat per-state routing.
-        if not cfg.agent.stage_kinds:
-            try:
+        try:
+            if cfg.agent.stage_kinds:
+                # Routed board: the pin must stay empty, but the audit value
+                # still belongs on the ticket (F-20).
+                self._tracker_call_record_last_agent_kind(
+                    cfg, issue.identifier, entry.agent_kind
+                )
+            else:
                 self._tracker_call_record_agent_kind(
                     cfg, issue.identifier, entry.agent_kind
                 )
-            except Exception as exc:
-                log.warning(
-                    "record_agent_kind_failed",
-                    issue_id=issue.id,
-                    identifier=issue.identifier,
-                    agent_kind=entry.agent_kind,
-                    error=str(exc),
-                )
+        except Exception as exc:
+            log.warning(
+                "record_agent_kind_failed",
+                issue_id=issue.id,
+                identifier=issue.identifier,
+                agent_kind=entry.agent_kind,
+                error=str(exc),
+            )
 
     def _on_worker_task_done(self, issue_id: str, task: asyncio.Task[None]) -> None:
         """Clean a registered worker whose coroutine never ran its cleanup.
@@ -4304,13 +4318,15 @@ class Orchestrator:
                                     cfg.agent.max_attempts > 0
                                     and debug.rewind_count > cfg.agent.max_attempts
                                 ):
-                                    await asyncio.to_thread(
-                                        self._tracker_call_update_state,
-                                        cfg,
-                                        issue,
-                                        "Blocked",
-                                    )
-                                    issue = replace(issue, state="Blocked")
+                                    rewind_target = _rewind_budget_target_state(cfg)
+                                    if rewind_target:
+                                        await asyncio.to_thread(
+                                            self._tracker_call_update_state,
+                                            cfg,
+                                            issue,
+                                            rewind_target,
+                                        )
+                                        issue = replace(issue, state=rewind_target)
                                     running_entry = self._running.get(
                                         running_issue_id
                                     )
@@ -4324,6 +4340,10 @@ class Orchestrator:
                                         to_state=current_state,
                                         rewind_count=debug.rewind_count,
                                         max_attempts=cfg.agent.max_attempts,
+                                        # F-32: a board with no block/human
+                                        # terminal lane keeps its state; the
+                                        # worker still stops.
+                                        target_state=rewind_target or "(none)",
                                     )
                                     break
                             running_entry = self._running.get(running_issue_id)
@@ -6629,6 +6649,24 @@ class Orchestrator:
         client = build_tracker_client(cfg)
         try:
             record = getattr(client, "record_agent_kind", None)
+            if record is None:
+                return
+            record(identifier, agent_kind)
+        finally:
+            client.close()
+
+    @staticmethod
+    def _tracker_call_record_last_agent_kind(
+        cfg: ServiceConfig, identifier: str, agent_kind: str
+    ) -> None:
+        """Best-effort: persist the audit-only `last_agent_kind` stamp.
+
+        Used instead of the pin on `stage_kinds`-routed boards, where writing
+        the pin would freeze the first lane's backend for the whole ticket.
+        """
+        client = build_tracker_client(cfg)
+        try:
+            record = getattr(client, "record_last_agent_kind", None)
             if record is None:
                 return
             record(identifier, agent_kind)

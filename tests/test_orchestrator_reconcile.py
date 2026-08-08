@@ -347,3 +347,56 @@ async def test_reconcile_does_not_cancel_a_pinned_worker_inside_its_own_budget(
     healthy_task.cancel()
     doomed_task.cancel()
     await asyncio.gather(healthy_task, doomed_task, return_exceptions=True)
+
+
+# ---------------------------------------------------------------------------
+# F-32 — transition targets resolve through the board's own terminal lanes
+# ---------------------------------------------------------------------------
+
+
+def test_human_review_target_prefers_a_human_lane_then_blocked():
+    from symphony.orchestrator.helpers import _human_review_target_state
+
+    cfg = _make_config(terminal_states=("Done", "Needs Human", "Blocked"))
+    assert _human_review_target_state(cfg) == "Needs Human"
+
+    cfg = _make_config(terminal_states=("Done", "Blocked"))
+    assert _human_review_target_state(cfg) == "Blocked"
+
+    # Fully customized board: fall back to the first terminal lane rather
+    # than writing a state the tracker does not know.
+    cfg = _make_config(terminal_states=("Shipped", "Parked"))
+    assert _human_review_target_state(cfg) == "Shipped"
+
+    cfg = _make_config(terminal_states=())
+    assert _human_review_target_state(cfg) == ""
+
+
+def test_rewind_budget_target_prefers_blocked_then_human():
+    from symphony.orchestrator.helpers import _rewind_budget_target_state
+
+    cfg = _make_config(terminal_states=("Done", "Needs Human", "Blocked"))
+    assert _rewind_budget_target_state(cfg) == "Blocked"
+
+    cfg = _make_config(terminal_states=("Done", "Needs Human"))
+    assert _rewind_budget_target_state(cfg) == "Needs Human"
+
+    cfg = _make_config(terminal_states=("Shipped",))
+    assert _rewind_budget_target_state(cfg) == "Shipped"
+
+
+async def test_skip_document_refuses_a_board_with_no_terminal_lane(monkeypatch):
+    orch = _orch()
+    cfg = _make_config(active_states=("Document",), terminal_states=())
+    monkeypatch.setattr(orch._workflow_state, "current", lambda: cfg)
+    issue = _issue("MT-DOC", state="Document")
+    monkeypatch.setattr(
+        Orchestrator,
+        "_tracker_call_fetch_issue_full_by_id",
+        staticmethod(lambda _cfg, _identifier: issue),
+    )
+
+    ok, message = await orch.skip_document("MT-DOC")
+
+    assert ok is False
+    assert "no terminal lane" in message

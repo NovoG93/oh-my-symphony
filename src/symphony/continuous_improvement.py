@@ -49,6 +49,7 @@ if TYPE_CHECKING:
 
 from ._shell import safe_proc_wait
 from .issue import Issue, normalize_state
+from .logging import get_logger
 from .trackers.file import FileBoardTracker
 from .workflow.constants import (
     CI_AGENT_MODES,
@@ -59,6 +60,8 @@ from .workflow.constants import (
     CI_MODE_SECURITY,
     SUPPORTED_CI_MODES,
 )
+
+log = get_logger()
 
 # Lockfile name under `<workflow_dir>/.symphony/`.
 LEASE_FILENAME = "continuous_improvement.lock"
@@ -737,6 +740,18 @@ def _slug(text: str) -> str:
     return re.sub(r"[^a-z0-9]+", "-", text.strip().lower()).strip("-")[:60]
 
 
+def _title_key(text: str) -> tuple[str, int]:
+    """Dedupe key: the truncated slug *and* the normalized title length.
+
+    F-30: two genuinely different proposals sharing a 60-char prefix used to
+    collapse into one, silently counted as a duplicate. Pairing the slug with
+    the length keeps the cheap prefix comparison while making a collision
+    require the same length as well.
+    """
+    normalized = re.sub(r"\s+", " ", text.strip().lower())
+    return _slug(text), len(normalized)
+
+
 def _merge_labels(base: tuple[str, ...], extra: tuple[str, ...]) -> list[str]:
     out = list(base)
     for label in extra:
@@ -819,7 +834,12 @@ def open_issues(tracker: FileBoardTracker) -> list[Issue]:
 
 
 def next_request_id(issues: list[Issue], *, today: str) -> str:
-    """`REQ-CI-<YYYYMMDD>-<n>`, first free n for today across the board."""
+    """`REQ-CI-<YYYYMMDD>-<n>`, first free n for today across the board.
+
+    F-29: callers must pass *every* ticket, not just the open ones. Scanning
+    open issues only meant a later run on the same day reused a request id
+    whose tickets had since closed, so request groups stopped being keys.
+    """
     base = f"REQ-CI-{today}"
     used = {issue.request for issue in issues if issue.request}
     index = 1
@@ -895,13 +915,30 @@ def register_proposals(
             r"CI Proposal:\s*(\S+)", issue.description or ""
         )
     }
-    seen_titles = {_slug(issue.title) for issue in issues}
+    seen_titles = {_title_key(issue.title) for issue in issues}
     state = cfg.tracker.active_states[0] if cfg.tracker.active_states else "Todo"
     created: list[str] = []
     duplicates = 0
     cap = max(1, ci.max_improvement_tickets_per_run)
     for proposal in proposals:
-        if proposal.dedupe_key in seen_markers or _slug(proposal.title) in seen_titles:
+        title_key = _title_key(proposal.title)
+        if proposal.dedupe_key in seen_markers:
+            log.info(
+                "ci_proposal_deduped",
+                mode=proposal.mode,
+                reason="marker",
+                marker=proposal.dedupe_key,
+                title=proposal.title[:120],
+            )
+            duplicates += 1
+            continue
+        if title_key in seen_titles:
+            log.info(
+                "ci_proposal_deduped",
+                mode=proposal.mode,
+                reason="title",
+                title=proposal.title[:120],
+            )
             duplicates += 1
             continue
         if len(created) >= cap:
@@ -920,7 +957,7 @@ def register_proposals(
         )
         created.append(identifier)
         seen_markers.add(proposal.dedupe_key)
-        seen_titles.add(_slug(proposal.title))
+        seen_titles.add(title_key)
         if proposal.blocks:
             _link_blocker(board, source=proposal.blocks, fix=identifier)
     skipped_due_to_cap = max(0, len(proposals) - duplicates - len(created))
@@ -972,6 +1009,74 @@ def _root_cause_note(issue: Issue) -> str:
     next_heading = re.search(r"^##\s+", tail, re.MULTILINE)
     section = tail[: next_heading.start()] if next_heading else tail
     return redact_output(section.strip()[:1500]) or "(empty blocker section)"
+
+
+
+_CI_RESOLVED_BLOCKER_STATES = frozenset({"done", "archive", "archived", "closed"})
+
+
+def _blocked_source_reopen_state(cfg: "ServiceConfig") -> str:
+    """First `Todo`-ish active lane, else the first active lane."""
+    for state in cfg.tracker.active_states:
+        if normalize_state(state) == "todo":
+            return state
+    return cfg.tracker.active_states[0] if cfg.tracker.active_states else "Todo"
+
+
+def reopen_resolved_blocked_sources(
+    cfg: "ServiceConfig",
+    *,
+    tracker: FileBoardTracker | None = None,
+) -> tuple[tuple[str, ...], str]:
+    """Hand a source ticket back to the pipeline once its CI fix is done.
+
+    F-17: `blocked_fixes` filed `fix -> blocks source` and stopped, so the
+    source stayed in `Blocked` forever even though the mode's own acceptance
+    criterion is "`X` can leave its stuck state". This closes that loop, and
+    only that loop: a source is reopened only when *every* blocker has reached
+    a successful terminal state and at least one of them is a CI-filed fix
+    ticket (carrying the `ci` label). Arbitrary operator-managed boards are
+    left alone.
+    """
+    board = tracker or _tracker_or_none(cfg)
+    if board is None:
+        return (), "unsupported tracker"
+    everything = {issue.identifier: issue for issue in board.scan_all()}
+    target_state = _blocked_source_reopen_state(cfg)
+    reopened: list[str] = []
+    for issue in everything.values():
+        if normalize_state(issue.state) != "blocked":
+            continue
+        blocker_ids = [b.identifier or b.id for b in issue.blocked_by]
+        blockers = [everything.get(bid or "") for bid in blocker_ids]
+        if not blockers or any(blocker is None for blocker in blockers):
+            continue
+        if any(
+            normalize_state(blocker.state) not in _CI_RESOLVED_BLOCKER_STATES
+            for blocker in blockers
+            if blocker is not None
+        ):
+            continue
+        if not any(
+            CI_LABEL in {label.strip().lower() for label in blocker.labels}
+            for blocker in blockers
+            if blocker is not None
+        ):
+            continue
+        board.append_note(
+            issue,
+            "Unblocked",
+            f"Every blocker is resolved ({', '.join(str(b) for b in blocker_ids)}); "
+            f"continuous improvement returned this ticket to `{target_state}`.",
+        )
+        board.transition(issue.identifier, target_state)
+        reopened.append(issue.identifier)
+    summary = (
+        f"{len(reopened)} source ticket(s) returned to {target_state}"
+        if reopened
+        else "no fully-unblocked source tickets"
+    )
+    return tuple(reopened), summary
 
 
 def collect_blocked_fix_proposals(
@@ -1511,11 +1616,20 @@ async def run_continuous_improvement(
 
     if CI_MODE_BLOCKED_FIXES in due:
         report_phase(CI_MODE_BLOCKED_FIXES)
+        # Close the loop first: a source whose CI fix is Done goes back to the
+        # pipeline before we look for newly stuck tickets (F-17).
+        reopened, reopen_summary = reopen_resolved_blocked_sources(cfg)
         triaged, summary = collect_blocked_fix_proposals(cfg)
         proposals.extend(triaged)
         proposal_modes.append(CI_MODE_BLOCKED_FIXES)
         outcomes.append(
-            ModeOutcome(CI_MODE_BLOCKED_FIXES, "passed", summary)
+            ModeOutcome(
+                CI_MODE_BLOCKED_FIXES,
+                "passed",
+                f"{summary}; {reopen_summary}"
+                if reopened
+                else summary,
+            )
         )
 
     for mode in CI_AGENT_MODES:
@@ -1550,7 +1664,7 @@ async def run_continuous_improvement(
             )
         else:
             request_id = next_request_id(
-                open_issues(board), today=time.strftime("%Y%m%d", time.gmtime())
+                board.scan_all(), today=time.strftime("%Y%m%d", time.gmtime())
             )
             proposal_registration = register_proposals(
                 cfg, tuple(proposals), request=request_id, tracker=board
@@ -1559,9 +1673,20 @@ async def run_continuous_improvement(
                 outcomes, tuple(proposals), proposal_registration, proposal_modes
             )
 
-    for mode in due:
+    # F-16: only stamp the cadence for modes that produced a real result.
+    # A `not_available` (no agent runner) or `not_proven` (dirty baseline,
+    # exception) mode never ran, so a weekly mode would otherwise wait
+    # another week before trying again.
+    stamped_status = {"passed", "failed"}
+    outcome_status = {outcome.mode: outcome.status for outcome in outcomes}
+    stamped = [
+        mode
+        for mode in due
+        if outcome_status.get(mode, "not_proven") in stamped_status
+    ]
+    for mode in stamped:
         mode_state[mode] = now_epoch
-    if due:
+    if stamped:
         save_mode_state(workflow_dir, mode_state)
 
     status = _run_status(baseline, tuple(checks), tuple(outcomes))

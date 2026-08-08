@@ -77,8 +77,73 @@ feature, and turn chat into a gated ticket-DAG pipeline.
   a `Learn` lane keep working — the orchestrator, contracts, rewinds, and the
   skip control all accept the legacy name, and `POST .../skip-learn` stays as
   a deprecated alias of `POST .../skip-document`).
+- `symphony doctor` **loses two rows** (`viewer.board-viewer` and
+  `workflow_engine`) with the subsystems they checked, and **gains six**:
+  `board.reachable`, `board.deep_merge_contract`, `agent.stage_contracts`,
+  `board.cli`, `board.dependencies`, plus the existing rows. Anything parsing
+  doctor output should expect the new set.
+- `WORKFLOW-PROGRESS.md`'s board URL now points at the orchestrator's
+  `server.port` instead of the removed viewer's `:8765`.
+- **One merge per ticket.** The Verify prompt runs a
+  `git merge-tree --write-tree` preflight and records
+  `## Merge Status: preflight clean, orchestrator will merge at Done`; the
+  orchestrator's `auto_merge_on_done` creates the single `--no-ff` merge
+  commit *after* the Document lane has written its docs and wiki entries.
+  Previously both merged, producing two merge commits per ticket and landing
+  code on the target branch before Document ran.
+- **Document lane write scope** now matches its charter: `docs/llm-wiki/`,
+  the user-facing docs the change touched (README / CHANGELOG / config and
+  policy references), the ticket vault, and ticket comments. Read-only git
+  history inspection (`git log`/`show`/`diff`) is explicitly expected; the
+  commit/branch/push/merge boundary stays.
+- `agent.stage_kinds` is now re-resolved at **every** stage change, including
+  the in-run lane transitions one dispatch walks.
+- The stall budget is resolved from the backend a ticket actually runs on
+  (pin or stage route), not the workflow default.
 
-Suite: 1582 passed, 7 skipped; ruff clean.
+### Added (hardening)
+
+- `agent.stall_timeout_ms_by_state` — per-lane stall budget for heavy stages.
+- `agent.stage_contracts: auto|on|off` — explicit control of the mechanical
+  evidence floor, with a load-time `stage_contracts_disabled` log line, a
+  doctor row, `agent.stage_contracts_enabled` on `GET /api/v1/workflow`, and
+  a Settings-page hint when a renamed lane turns it off.
+- `symphony board update <id> [--state] [--blocked-by] [--add-blocked-by]
+  [--request]` — the validated write verb the stage prompts already assumed.
+- `SYMPHONY_BOARD_ROOT` / `SYMPHONY_BOARD_ROOT_NAME` / `SYMPHONY_CLI` in the
+  dispatch and hook environments.
+- Ticket frontmatter `last_agent_kind` — audit-only record of the backend
+  that last ran a ticket on a `stage_kinds`-routed board (never a pin).
+- Web board cards render `⛓ blocked by …` and request chips, and both the
+  create modal and the drawer can set `blocked_by` / `request`.
+
+### Fixed
+
+- Board identifiers are validated everywhere (`^[A-Za-z][A-Za-z0-9_-]{0,63}$`):
+  `symphony board new "../../evil"` no longer writes outside the board root.
+- The worktree setup hook links the **configured** `tracker.board_root`
+  instead of a hardcoded `kanban`, and a workspace whose board is not the host
+  board now fails the dispatch with a named error instead of looping forever.
+- Transient backend stream faults (`stream unreadable`, `no result event`)
+  schedule a bounded retry instead of auto-pausing the ticket. Tickets already
+  paused for those reasons self-heal on restart, because
+  `_is_retryable_auto_pause_reason` releases matching persisted pauses.
+- A `blocked_by` id that is not on the board is reported as
+  "blocker X is not on the board" (card + `board.dependencies` doctor row)
+  instead of deadlocking silently.
+- Applying a lane preset on a board without the preset's prompt files now
+  refuses with the `cp -R docs/symphony-prompts` fix instead of writing
+  placeholder prompts and reporting success.
+- Continuous improvement: cadence is stamped only for modes that produced a
+  real result; a `blocked_fixes` source returns to the pipeline once its fix
+  is Done; request ids are unique across the whole board; proposal dedupe no
+  longer collapses two proposals sharing a 60-char title prefix; an agent turn
+  that writes outside its proposal file is discarded and recorded
+  `not_proven`.
+- `scripts/check_i18n.py` understands template-literal key prefixes (it was
+  failing on a clean tree) and now runs in CI and in the test suite.
+
+Suite: 1718 passed, 7 skipped; ruff clean.
 
 ## [0.16.1] - 2026-08-06 - Delivery commits survive the agent's sandbox
 

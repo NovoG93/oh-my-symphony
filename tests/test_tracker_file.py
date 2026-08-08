@@ -1318,3 +1318,38 @@ def test_scan_warns_once_for_dangling_blockers_and_cycles(tmp_path, monkeypatch)
     warnings.clear()
     fbt.fetch_candidate_issues()
     assert warnings == []
+
+
+def test_stage_routed_board_records_the_audit_stamp_not_the_pin(tmp_path):
+    """F-20: routed boards lost the "who ran this" field entirely."""
+    from symphony.trackers.file import FileBoardTracker, parse_ticket_file
+    from symphony.workflow import TrackerConfig
+
+    board = tmp_path / "kanban"
+    board.mkdir()
+    tracker = FileBoardTracker(
+        TrackerConfig(
+            kind="file",
+            endpoint="",
+            api_key="",
+            project_slug="",
+            active_states=("Todo",),
+            terminal_states=("Done",),
+            board_root=board,
+        )
+    )
+    tracker.create(identifier="MT-1", title="t")
+
+    tracker.record_last_agent_kind("MT-1", "gemini")
+
+    front, _ = parse_ticket_file(board / "MT-1.md")
+    assert front["last_agent_kind"] == "gemini"
+    assert "agent" not in front and "agent_kind" not in front
+    issue = tracker.fetch_issue_full_by_id("MT-1")
+    assert issue is not None
+    assert issue.last_agent_kind == "gemini"
+    # Never a dispatch pin.
+    assert issue.agent_kind is None
+    from symphony.orchestrator.helpers import _requested_agent_kind
+
+    assert _requested_agent_kind(issue) is None

@@ -86,6 +86,7 @@ _CANONICAL_FRONT_MATTER_KEYS = {
     "request",
     "agent",
     "agent_kind",
+    "last_agent_kind",
     "skills",
     "created_at",
     "updated_at",
@@ -343,6 +344,8 @@ def issue_from_file(path: Path) -> Issue | None:
         updated_at=parse_iso_timestamp(front.get("updated_at"))
         or parse_iso_timestamp(_file_mtime_iso(path)),
         agent_kind=_parse_agent_kind(front),
+        last_agent_kind=str(front.get("last_agent_kind") or "").strip().lower()
+        or None,
         skills=normalize_skill_names(front.get("skills")),
         request=str(front.get("request") or "").strip() or None,
     )
@@ -849,6 +852,30 @@ class FileBoardTracker:
 
         return self._mutate_ticket(identifier, mutate, missing_ok=True)
 
+    def record_last_agent_kind(self, identifier: str, agent_kind: str) -> Path | None:
+        """Audit stamp: which backend last ran this ticket.
+
+        F-20: on a `stage_kinds`-routed board the orchestrator must NOT write
+        the `agent`/`agent_kind` pin (it would freeze the first lane's backend
+        for the whole ticket), so the board previously lost the field
+        entirely. `last_agent_kind` is never read by `_requested_agent_kind`,
+        so it carries the audit value without becoming a pin.
+        """
+        normalized = agent_kind.strip().lower()
+
+        def mutate(
+            front: dict[str, Any], body: str
+        ) -> tuple[dict[str, Any], str] | None:
+            if not normalized or front.get("last_agent_kind") == normalized:
+                return None
+            front["last_agent_kind"] = normalized
+            front["updated_at"] = datetime.now(timezone.utc).strftime(
+                "%Y-%m-%dT%H:%M:%SZ"
+            )
+            return front, body
+
+        return self._mutate_ticket(identifier, mutate, missing_ok=True)
+
     def next_identifier(self, prefix: str) -> str:
         """`<PREFIX>-<n+1>` where n is the highest existing number for prefix."""
         with _exclusive_lock(self._allocator_lock_path()):
@@ -862,6 +889,69 @@ class FileBoardTracker:
             if match:
                 highest = max(highest, int(match.group(1)))
         return f"{prefix}-{highest + 1}"
+
+
+    def create_validated(
+        self,
+        *,
+        identifier: str | None,
+        prefix: str = "TASK",
+        validate: "Callable[[list[Issue], str], None] | None" = None,
+        title: str,
+        state: str = "Todo",
+        priority: int | None = None,
+        labels: list[str] | None = None,
+        description: str = "",
+        agent_kind: str | None = None,
+        skills: list[str] | None = None,
+        blocked_by: list[str] | None = None,
+        request: str | None = None,
+    ) -> tuple[str, Path]:
+        """Validate the board graph and create the ticket under one lock.
+
+        F-15: validate-then-write was not atomic. `validate_ticket_dependencies`
+        ran against a snapshot taken outside any lock while `create` took only
+        a *per-ticket* lock, so two concurrent `symphony board new` calls (the
+        deep Plan lane spawns several in a row, and workers may spawn
+        sub-tickets in parallel) could each observe an acyclic board and
+        jointly create a cycle — or race the id allocator.
+
+        `identifier=None` allocates `<prefix>-<n+1>` inside the same lock.
+        `validate` is called with the in-lock board snapshot and the resolved
+        identifier; raising from it aborts before anything is written.
+        """
+        with _exclusive_lock(self._allocator_lock_path()):
+            last_error: Exception | None = None
+            attempts = 1 if identifier is not None else _GENERATED_ID_ATTEMPTS
+            for _ in range(attempts):
+                issues = self.scan_all()
+                resolved = (
+                    identifier
+                    if identifier is not None
+                    else self._next_identifier_unlocked(prefix)
+                )
+                if validate is not None:
+                    validate(issues, resolved)
+                try:
+                    path = self.create(
+                        identifier=resolved,
+                        title=title,
+                        state=state,
+                        priority=priority,
+                        labels=labels,
+                        description=description,
+                        agent_kind=agent_kind,
+                        skills=skills,
+                        blocked_by=blocked_by,
+                        request=request,
+                    )
+                except SymphonyError as exc:
+                    last_error = exc
+                    if identifier is not None:
+                        raise
+                    continue
+                return resolved, path
+        raise last_error or SymphonyError("could not allocate ticket id", prefix=prefix)
 
     def create_with_next_identifier(
         self,

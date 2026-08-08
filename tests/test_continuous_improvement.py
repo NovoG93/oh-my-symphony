@@ -967,3 +967,197 @@ async def test_readiness_only_run_records_mode_outcome(tmp_path: Path) -> None:
     assert [(o.mode, o.status) for o in result.modes] == [("readiness", "passed")]
     assert load_mode_state(tmp_path) == {"readiness": 5.0}
     assert "| readiness | passed |" in render_report(result)
+
+
+# ---------------------------------------------------------------------------
+# F-16 — cadence is stamped only for modes that produced a real result
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_cadence_is_not_stamped_for_a_mode_that_could_not_run(
+    tmp_path: Path,
+) -> None:
+    """`not_available` (no agent runner) must retry on the next heartbeat.
+
+    Stamping it made a weekly `market_research` that never ran wait another
+    week — the mode silently disappeared for seven days.
+    """
+    cfg = _modes_workflow(
+        tmp_path,
+        "market_research",
+        extra_lines=("  mode_interval_hours:", "    market_research: 168"),
+    )
+
+    result = await run_continuous_improvement(
+        cfg, tmp_path, lambda _phase: None, clock=lambda: 1_000.0
+    )
+
+    outcomes = {o.mode: o.status for o in result.modes}
+    assert outcomes["market_research"] == "not_available"
+    assert load_mode_state(tmp_path) == {}
+    assert any_mode_due(cfg, tmp_path, clock=lambda: 1_100.0) is True
+
+
+@pytest.mark.asyncio
+async def test_cadence_is_not_stamped_when_the_agent_turn_raises(
+    tmp_path: Path,
+) -> None:
+    cfg = _modes_workflow(tmp_path, "market_research")
+
+    async def _boom(_task: AgentTask) -> str:
+        raise RuntimeError("backend exploded")
+
+    result = await run_continuous_improvement(
+        cfg,
+        tmp_path,
+        lambda _phase: None,
+        clock=lambda: 1_000.0,
+        agent_runner=_boom,
+    )
+
+    outcomes = {o.mode: o.status for o in result.modes}
+    assert outcomes["market_research"] == "not_proven"
+    assert load_mode_state(tmp_path) == {}
+
+
+@pytest.mark.asyncio
+async def test_cadence_is_stamped_for_a_real_result(tmp_path: Path) -> None:
+    cfg = _modes_workflow(tmp_path, "blocked_fixes")
+
+    result = await run_continuous_improvement(
+        cfg, tmp_path, lambda _phase: None, clock=lambda: 1_000.0
+    )
+
+    outcomes = {o.mode: o.status for o in result.modes}
+    assert outcomes["blocked_fixes"] == "passed"
+    assert load_mode_state(tmp_path) == {"blocked_fixes": 1_000.0}
+
+
+# ---------------------------------------------------------------------------
+# F-17 — blocked_fixes hands the source back once the fix is Done
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_blocked_source_returns_to_the_pipeline_when_its_fix_completes(
+    tmp_path: Path,
+) -> None:
+    cfg = _modes_workflow(tmp_path, "blocked_fixes")
+    _write_ticket(
+        tmp_path,
+        "TASK-1",
+        "title: Ship the importer\nstate: Blocked\npriority: 2\nlabels: []\n",
+        "## Blocker\n\nThe importer needs a DB credential nobody has.\n",
+    )
+
+    first = await run_continuous_improvement(
+        cfg, tmp_path, lambda _phase: None, clock=lambda: 100.0
+    )
+    (fix_id,) = first.ticket_ids
+
+    # The fix ticket completes.
+    fix_path = tmp_path / "kanban" / f"{fix_id}.md"
+    fix_path.write_text(
+        fix_path.read_text(encoding="utf-8").replace("state: Todo", "state: Done"),
+        encoding="utf-8",
+    )
+
+    await run_continuous_improvement(
+        cfg, tmp_path, lambda _phase: None, clock=lambda: 200.0
+    )
+
+    source_text = (tmp_path / "kanban" / "TASK-1.md").read_text(encoding="utf-8")
+    assert "state: Todo" in source_text, (
+        "the source ticket stayed Blocked forever after its fix completed"
+    )
+    assert "## Unblocked" in source_text
+    assert fix_id in source_text
+
+
+@pytest.mark.asyncio
+async def test_blocked_source_stays_put_while_its_fix_is_open(tmp_path: Path) -> None:
+    cfg = _modes_workflow(tmp_path, "blocked_fixes")
+    _write_ticket(
+        tmp_path,
+        "TASK-1",
+        "title: Ship the importer\nstate: Blocked\npriority: 2\nlabels: []\n",
+        "## Blocker\n\nStuck.\n",
+    )
+
+    await run_continuous_improvement(
+        cfg, tmp_path, lambda _phase: None, clock=lambda: 100.0
+    )
+    await run_continuous_improvement(
+        cfg, tmp_path, lambda _phase: None, clock=lambda: 200.0
+    )
+
+    source_text = (tmp_path / "kanban" / "TASK-1.md").read_text(encoding="utf-8")
+    assert "state: Blocked" in source_text
+
+
+def test_blocked_source_reopen_ignores_non_ci_blockers(tmp_path: Path) -> None:
+    """Only the loop blocked_fixes opened is closed here."""
+    from symphony.continuous_improvement import reopen_resolved_blocked_sources
+
+    cfg = _modes_workflow(tmp_path, "blocked_fixes")
+    _write_ticket(
+        tmp_path,
+        "DONE-1",
+        "title: An operator ticket\nstate: Done\npriority: 2\nlabels: []\n",
+    )
+    _write_ticket(
+        tmp_path,
+        "TASK-1",
+        "title: Stuck\nstate: Blocked\npriority: 2\nlabels: []\n"
+        "blocked_by:\n  - DONE-1\n",
+    )
+
+    reopened, _ = reopen_resolved_blocked_sources(cfg)
+
+    assert reopened == ()
+    assert "state: Blocked" in (
+        tmp_path / "kanban" / "TASK-1.md"
+    ).read_text(encoding="utf-8")
+
+
+# ---------------------------------------------------------------------------
+# F-29 / F-30 — request-id reuse and 60-char slug collisions
+# ---------------------------------------------------------------------------
+
+
+def test_next_request_id_does_not_reuse_a_closed_groups_id() -> None:
+    from symphony.continuous_improvement import next_request_id
+
+    closed = _issue_with_request("CI-1", "Done", "REQ-CI-20260101-1")
+    assert (
+        next_request_id([closed], today="20260101") == "REQ-CI-20260101-2"
+    ), "a closed request group's id was handed to a different batch"
+
+
+def test_title_dedupe_requires_the_same_length_not_just_a_prefix() -> None:
+    from symphony.continuous_improvement import _slug, _title_key
+
+    long_prefix = "Improve the continuous improvement proposal deduplication path"
+    a = f"{long_prefix} for market research"
+    b = f"{long_prefix} for security scanning and readiness"
+
+    assert _slug(a) == _slug(b), "fixture no longer shares a 60-char prefix"
+    assert _title_key(a) != _title_key(b)
+
+
+def _issue_with_request(identifier: str, state: str, request: str):
+    from datetime import datetime, timezone
+
+    from symphony.issue import Issue
+
+    return Issue(
+        id=identifier,
+        identifier=identifier,
+        title=identifier,
+        description="",
+        priority=2,
+        state=state,
+        request=request,
+        created_at=datetime(2026, 1, 1, tzinfo=timezone.utc),
+    )

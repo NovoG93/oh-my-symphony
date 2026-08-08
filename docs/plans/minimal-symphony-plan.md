@@ -43,7 +43,7 @@ with a closing Document/learning step.
 | `factory/` | 0 | empty package dir |
 | `docs/SMA-*`, `docs/REL-066/`, `docs/changelog/`, `docs/qa/`, `docs/dispatch-stability/`, `docs/superpowers/`, old `docs/improvements` archives | ~4.5 MB | this repo's own per-ticket work archives; history lives in git |
 | Root debris: `PLAN.md`, `WORKFLOW-PROGRESS.md` (generated), `.omc/RELEASE_RULE.md` (untrack), `tmp_workspaces/`, `log/`, caches, `.coverage`, `.playwright-mcp/`, `.bkit/ .omx/ .serena/ .domain-agent/` | ~17 MB | agent-harness droppings + runtime debris |
-| `WORKFLOW.file.example.md` (keep one canonical example + jira example) | — | duplicate |
+| ~~`WORKFLOW.file.example.md`~~ (keep one canonical example + jira example) | — | duplicate. **DEVIATION (kept):** it is the only example configured for a *file* board (host-board `--add-dir`, board symlink hook, `kanban/` excludes) and is referenced by `README:345`, `docs/PIPELINE.md:134`, two tests and the llm-wiki. Bootstrapping now branches on tracker kind: file → `WORKFLOW.file.example.md`, linear → `WORKFLOW.example.md`. |
 | `scripts/static_todo_browser_acceptance.py`, `capture_tui_screenshot.py`, `ui_shots.py` (+ mirror tests) | ~600 | one-off screenshot/demo tooling; regenerable |
 
 Net: `src/` ~40.5K → **~33K LOC**; repo −~22 MB. Everything else earns its keep as a feature.

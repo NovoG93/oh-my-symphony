@@ -20,8 +20,17 @@ This ticket depends on:
 ## Deep pipeline (8 lanes)
 
 ```
-Intake -> Research -> Plan <-> Review -> Build -> QA -> Verify -> Document -> Done
+request ticket:   Intake -> Research -> Plan <-> Review -> Done
+                                                    |
+                                    verdict: PASS releases the spawned DAG
+                                                    v
+spawned tickets:                    Build -> QA -> Verify -> Document -> Done
 ```
+
+Every lane above is a separate ticket that ends at `Done`. The request ticket
+reaching `Done` (Review's PASS) is what unblocks the spawned Build tickets;
+each spawned ticket then walks its own lane to `Done`. `Done` is intentionally
+unprompted in this preset — the lane gates live in the lane prompts.
 
 - A request ticket walks `Intake -> Research -> Plan -> Review`. Plan spawns the downstream `Build`/`QA`/`Verify`/`Document` tickets as a DAG (`--blocked-by`); Review red-teams the plan before any Build dispatches. Review's `verdict: PASS` moves the request ticket to `Done`, which is what releases the spawned Build tickets.
 - Merge contract: each ticket owns one `symphony/<ID>` branch in its own worktree. **The orchestrator merges a ticket's branch when that ticket reaches `Done` — no lane merges by hand.** Your worktree is cut from the merge target branch, so an earlier slice's code is present only because its ticket already reached `Done`. If you need a slice that is not yet merged, say so in the ticket and set `Blocked`; never cherry-pick or merge another ticket's branch yourself.
