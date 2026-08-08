@@ -992,7 +992,7 @@ def _link_blocker(tracker: FileBoardTracker, *, source: str, fix: str) -> None:
 # --- blocked_fixes ---------------------------------------------------------
 
 _BLOCKER_SECTION_RE = re.compile(
-    r"^##\s+(Blocker|Blocked RCA|QA Failure|Review Findings|Budget Exceeded)\s*$",
+    r"^##\s+(Blocker|Blocked (?:Fix|RCA)|QA Failure|Review Findings|Budget Exceeded)\s*$",
     re.IGNORECASE | re.MULTILINE,
 )
 _TRIAGE_STATE_KEYS = ("blocked", "human review")

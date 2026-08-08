@@ -455,7 +455,7 @@ def serialize_ticket(front: dict[str, Any], body: str) -> str:
 
 
 _WARNING_HEADING_RE = re.compile(
-    r"^##\s+(?:Conflict|Budget\s+Exceeded|Blocked\s+RCA)\s*$",
+    r"^##\s+(?:Conflict|Budget\s+Exceeded|Blocked\s+(?:Fix|RCA))\s*$",
     re.IGNORECASE | re.MULTILINE,
 )
 # A warning section ends at the next `##` heading *or* at a run-summary start

@@ -143,7 +143,10 @@ def test_web_chat_page_contract() -> None:
     html = (STATIC_ROOT / "index.html").read_text(encoding="utf-8")
 
     assert 'data-route="chat"' in html
-    assert "const ROUTES = ['board', 'stats', 'workflow', 'git', 'chat', 'preview', 'settings']" in js
+    assert (
+        "const ROUTES = ['board', 'stats', 'workflow', 'git', 'chat', 'preview', 'settings']"
+        in js
+    )
     assert "function renderChatPage(container)" in js
     assert "getChatSession: () => apiRequest('/chat/session')" in js
     assert "createChatSession: (payload)" in js
@@ -169,7 +172,10 @@ def test_web_chat_token_streaming_contract() -> None:
     assert "function finalizeChatLive(view, finalText)" in js
     assert "if (msg.type === 'agent_delta')" in js
     assert "requestAnimationFrame(" in js
-    assert "if (msg.type === 'agent_message' && finalizeChatLive(view, msg.text)) return;" in js
+    assert (
+        "if (msg.type === 'agent_message' && finalizeChatLive(view, msg.text)) return;"
+        in js
+    )
     assert ".chat-bubble-live" in css
     assert "white-space: pre-wrap" in css
 
@@ -201,7 +207,10 @@ def test_web_chat_budget_contract() -> None:
     css = (STATIC_ROOT / "style.css").read_text(encoding="utf-8")
 
     assert "function buildChatBudgetChip(budget)" in js
-    assert "if (snap.budget) view.controls.appendChild(buildChatBudgetChip(snap.budget));" in js
+    assert (
+        "if (snap.budget) view.controls.appendChild(buildChatBudgetChip(snap.budget));"
+        in js
+    )
     assert "chatState.snapshot.budget = msg.meta.budget;" in js
     assert ".chat-budget-chip" in css
     assert ".chat-budget-chip.over" in css
@@ -217,6 +226,35 @@ def test_web_chat_font_controls_contract() -> None:
     assert "function buildFontControls(view)" in js
     assert ".chat-font-controls" in css
     assert "font-size: inherit" in css
+
+
+def test_blocked_recovery_ui_uses_fix_ticket_language() -> None:
+    js = _script_bundle()
+
+    assert "'issue.openRca': 'Open fix'" in js
+    assert "'issue.rcaQueued': 'Fix queued'" in js
+    assert "'issue.openRca': '수정 티켓 열기'" in js
+
+
+def test_web_settings_visual_hierarchy_contract() -> None:
+    js = _script_bundle()
+    css = (STATIC_ROOT / "style.css").read_text(encoding="utf-8")
+
+    assert "function settingsSectionHeading(title, description)" in js
+    assert "settings-card--featured" in js
+    assert "settings-card--utility" in js
+    assert "settings.pageDescription" in js
+    assert "el('h2', { class: 'settings-section-kicker' }, title)" in js
+    assert "function bindBranchPolicyAutosave(select, key)" in js
+    assert "else select.value = savedValue" in js
+    settings_render = js[js.index("async function renderSettingsPage"):]
+    assert settings_render.index("settings.workspace") < settings_render.index("settings.workflowSetup")
+    assert settings_render.index("settings.workflowSetup") < settings_render.index("settings.automation")
+    assert "field(t('common.enabled'), el('span', { class: 'switch' }" in js
+    assert ".settings-section-heading" in css
+    assert ".settings-card-header" in css
+    assert "@media (max-width: 1200px)" in css
+    assert "@media (max-width: 768px)" in css
 
 
 def test_web_settings_lane_preset_contract() -> None:
@@ -285,13 +323,25 @@ def test_web_product_preview_page_contract() -> None:
     assert 'data-route="preview"' in html
     assert 'data-i18n="nav.preview"' in html
     assert "getPreview: () => apiRequest('/preview')" in js
-    assert "startPreview: () => apiRequest('/preview/start', { method: 'POST', body: '{}' })" in js
-    assert "stopPreview: () => apiRequest('/preview/stop', { method: 'POST', body: '{}' })" in js
-    assert "restartPreview: () => apiRequest('/preview/restart', { method: 'POST', body: '{}' })" in js
+    assert (
+        "startPreview: () => apiRequest('/preview/start', { method: 'POST', body: '{}' })"
+        in js
+    )
+    assert (
+        "stopPreview: () => apiRequest('/preview/stop', { method: 'POST', body: '{}' })"
+        in js
+    )
+    assert (
+        "restartPreview: () => apiRequest('/preview/restart', { method: 'POST', body: '{}' })"
+        in js
+    )
     assert "function renderPreviewPage(container)" in js
     assert "function paintPreviewPage(body, data)" in js
     assert "function safePreviewUrl(value)" in js
-    assert "previewPollTimer = setTimeout(() => refreshPreviewPage(body, false), 3000)" in js
+    assert (
+        "previewPollTimer = setTimeout(() => refreshPreviewPage(body, false), 3000)"
+        in js
+    )
     assert "role: 'log'" in js
     assert "'aria-live': 'polite'" in js
     assert "el('iframe'" in js
@@ -306,3 +356,34 @@ def test_web_product_preview_page_contract() -> None:
     assert ".preview-frame" in css
     assert ".preview-log-output" in css
     assert "@media (max-width: 560px)" in css
+
+
+def test_web_project_switcher_and_management_contract() -> None:
+    js = _script_bundle()
+    css = (STATIC_ROOT / "style.css").read_text(encoding="utf-8")
+    html = (STATIC_ROOT / "index.html").read_text(encoding="utf-8")
+
+    assert 'id="project-selector"' in html
+    assert 'data-i18n-attr="aria-label:projects.selectorLabel"' in html
+    assert 'id="project-current-path"' in html
+    assert 'id="project-workflow-path"' in html
+    assert 'id="project-board-path"' in html
+    assert "getProjects: () => apiRequest('/projects')" in js
+    assert "createOrAdoptProject: (payload)" in js
+    assert "openProject: (id)" in js
+    assert "method: 'POST', body: '{}'" in js
+    assert "modal.setAttribute('aria-labelledby', titleId)" in js
+    assert "role: 'alert', 'aria-live': 'assertive'" in js
+    assert "window.location.assign(opened.url)" in js
+    assert "function openManageProjectsDialog()" in js
+    assert "'projects.boardPath': 'Issues are stored here'" in js
+    assert "'projects.boardPath': '이슈 저장 위치'" in js
+    assert ".project-selector" in css
+    assert ".project-paths" in css
+    assert "direction: rtl" in css
+    assert "unicode-bidi: plaintext" in css
+    assert "function setProjectPath(element, value)" in js
+    assert "element.dataset.fullPath = value || '';" in js
+    assert ".project-paths dd:focus-visible::after" in css
+    assert "content: attr(data-full-path)" in css
+    assert ".project-selector { font-size: 0;" not in css

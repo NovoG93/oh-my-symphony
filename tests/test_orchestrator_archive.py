@@ -216,6 +216,9 @@ async def test_archive_sweep_throttled_across_ticks(monkeypatch) -> None:
 
     monkeypatch.setattr(orch, "_archive_sweep", _count_sweep)
     monkeypatch.setattr(orch, "_reconcile_running", _noop_reconcile)
+    monkeypatch.setattr(
+        orch, "_auto_reopen_sources_from_resolved_rcas", _noop_reconcile
+    )
     monkeypatch.setattr(orch, "_fetch_candidates", _no_candidates)
 
     await orch._on_tick()

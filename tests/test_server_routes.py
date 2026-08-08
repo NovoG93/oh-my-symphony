@@ -95,11 +95,13 @@ class _StubOrchestrator:
         )
         rca_state = target_state or "In Progress"
         agent = agent_kind or "codex"
-        return True, f"RCA-1 opened to unblock {identifier}", {
+        return True, f"FIX-1 opened to unblock {identifier}", {
             "original_state": "Blocked",
             "target_state": "Todo",
             "source_reopen_state": "Todo",
-            "rca_identifier": "RCA-1",
+            "fix_identifier": "FIX-1",
+            "fix_state": rca_state,
+            "rca_identifier": "FIX-1",
             "rca_state": rca_state,
             "agent_kind": agent,
         }
@@ -328,15 +330,18 @@ async def test_recover_blocked_route_returns_recovery_payload(
 ) -> None:
     resp = await client.post(
         "/api/v1/MT-1/recover-blocked",
-        json={"target_state": "In Progress", "agent_kind": "codex"},
+        json={"fix_state": "In Progress", "agent_kind": "codex"},
     )
     assert resp.status == 200
     payload = await resp.json()
     assert payload["issue_identifier"] == "MT-1"
-    assert payload["rca_created"] is True
+    assert payload["fix_created"] is True
+    assert payload["rca_created"] is True  # deprecated alias
     assert payload["target_state"] == "Todo"
     assert payload["source_reopen_state"] == "Todo"
-    assert payload["rca_identifier"] == "RCA-1"
+    assert payload["fix_identifier"] == "FIX-1"
+    assert payload["fix_state"] == "In Progress"
+    assert payload["rca_identifier"] == "FIX-1"  # deprecated alias
     assert payload["rca_state"] == "In Progress"
     assert payload["agent_kind"] == "codex"
 

@@ -194,14 +194,20 @@ class _StubOrchestrator:
         )
         rca_state = target_state or "Doing"
         agent = agent_kind or "claude"
-        return True, f"RCA-1 opened to unblock {identifier}", {
-            "original_state": "Blocked",
-            "target_state": "Todo",
-            "source_reopen_state": "Todo",
-            "rca_identifier": "RCA-1",
-            "rca_state": rca_state,
-            "agent_kind": agent,
-        }
+        return (
+            True,
+            f"FIX-1 opened to unblock {identifier}",
+            {
+                "original_state": "Blocked",
+                "target_state": "Todo",
+                "source_reopen_state": "Todo",
+                "fix_identifier": "FIX-1",
+                "fix_state": rca_state,
+                "rca_identifier": "FIX-1",
+                "rca_state": rca_state,
+                "agent_kind": agent,
+            },
+        )
 
     def continuous_improvement_status(self) -> dict[str, Any]:
         return dict(self.ci_status)
@@ -428,9 +434,7 @@ async def test_create_issue_rejects_malformed_blocked_by_and_request(
     client: TestClient,
 ) -> None:
     assert (
-        await client.post(
-            "/api/v1/issues", json={"title": "x", "blocked_by": "SEED-1"}
-        )
+        await client.post("/api/v1/issues", json={"title": "x", "blocked_by": "SEED-1"})
     ).status == 400
     assert (
         await client.post(
@@ -463,9 +467,7 @@ async def test_patch_updates_blocked_by_and_request(client: TestClient) -> None:
 
 
 async def test_patch_rejects_self_blocking_cycle(client: TestClient) -> None:
-    resp = await client.patch(
-        "/api/v1/issues/SEED-1", json={"blocked_by": ["SEED-1"]}
-    )
+    resp = await client.patch("/api/v1/issues/SEED-1", json={"blocked_by": ["SEED-1"]})
     assert resp.status == 400
     payload = await resp.json()
     assert payload["error"]["code"] == "board_dependency_error"
@@ -531,16 +533,19 @@ async def test_patch_unknown_issue_404_and_empty_400(client: TestClient) -> None
 async def test_recover_blocked_route_calls_orchestrator(client: TestClient) -> None:
     resp = await client.post(
         "/api/v1/issues/SEED-1/recover-blocked",
-        json={"target_state": "Doing", "agent_kind": "codex"},
+        json={"fix_state": "Doing", "agent_kind": "codex"},
     )
 
     assert resp.status == 200
     payload = await resp.json()
     assert payload["identifier"] == "SEED-1"
-    assert payload["rca_created"] is True
+    assert payload["fix_created"] is True
+    assert payload["rca_created"] is True  # deprecated alias
     assert payload["target_state"] == "Todo"
     assert payload["source_reopen_state"] == "Todo"
-    assert payload["rca_identifier"] == "RCA-1"
+    assert payload["fix_identifier"] == "FIX-1"
+    assert payload["fix_state"] == "Doing"
+    assert payload["rca_identifier"] == "FIX-1"  # deprecated alias
     assert payload["rca_state"] == "Doing"
     assert payload["agent_kind"] == "codex"
     stub = client.stub  # type: ignore[attr-defined]
@@ -669,9 +674,7 @@ async def test_prompt_get_put_roundtrip(client: TestClient) -> None:
 async def test_branch_policy_put_validates_and_persists(
     client: TestClient, board_dir: Path
 ) -> None:
-    assert (
-        await client.put("/api/v1/workflow/branch-policy", json={})
-    ).status == 400
+    assert (await client.put("/api/v1/workflow/branch-policy", json={})).status == 400
     assert (
         await client.put(
             "/api/v1/workflow/branch-policy",
@@ -737,9 +740,7 @@ async def test_continuous_improvement_put_validates_and_persists(
         {"enabled": True, "unexpected": True},
     ]
     for body in bad_payloads:
-        resp = await client.put(
-            "/api/v1/workflow/continuous-improvement", json=body
-        )
+        resp = await client.put("/api/v1/workflow/continuous-improvement", json=body)
         assert resp.status == 400, body
 
     resp = await client.put(
@@ -901,9 +902,7 @@ async def test_malformed_workflow_yaml_returns_400_not_500(
     client: TestClient, board_dir: Path
 ) -> None:
     workflow = board_dir / "WORKFLOW.md"
-    workflow.write_text(
-        "---\ntracker: [unclosed\n---\nbody\n", encoding="utf-8"
-    )
+    workflow.write_text("---\ntracker: [unclosed\n---\nbody\n", encoding="utf-8")
     resp = await client.put(
         "/api/v1/workflow/branch-policy", json={"feature_base_branch": "dev"}
     )
@@ -1065,9 +1064,7 @@ async def test_git_compare_defaults_target_to_current_branch(
     resp = await client.get("/api/v1/git/compare")
     assert resp.status == 400  # branch is required
 
-    resp = await client.get(
-        "/api/v1/git/compare?branch=symphony/SEED-1&target=no-such"
-    )
+    resp = await client.get("/api/v1/git/compare?branch=symphony/SEED-1&target=no-such")
     assert resp.status == 400
     assert (await resp.json())["error"]["code"] == "unknown_ref"
 
@@ -1080,9 +1077,7 @@ async def test_git_merge_validates_branch(client: TestClient) -> None:
     assert resp.status == 400
     assert "task branches" in (await resp.json())["error"]["message"]
 
-    resp = await client.post(
-        "/api/v1/git/merge", json={"branch": "symphony/../escape"}
-    )
+    resp = await client.post("/api/v1/git/merge", json={"branch": "symphony/../escape"})
     assert resp.status == 400
 
 
@@ -1090,9 +1085,7 @@ async def test_git_merge_blocks_running_worker(
     git_repo: Path, client: TestClient
 ) -> None:
     client.stub.running_identifiers["SEED-1"] = "id-SEED-1"  # type: ignore[attr-defined]
-    resp = await client.post(
-        "/api/v1/git/merge", json={"branch": "symphony/SEED-1"}
-    )
+    resp = await client.post("/api/v1/git/merge", json={"branch": "symphony/SEED-1"})
     assert resp.status == 409
     assert (await resp.json())["error"]["code"] == "state_in_use"
 
@@ -1100,9 +1093,7 @@ async def test_git_merge_blocks_running_worker(
 async def test_git_merge_merges_branch_and_appends_note(
     git_repo: Path, client: TestClient
 ) -> None:
-    resp = await client.post(
-        "/api/v1/git/merge", json={"branch": "symphony/SEED-1"}
-    )
+    resp = await client.post("/api/v1/git/merge", json={"branch": "symphony/SEED-1"})
     assert resp.status == 200
     payload = await resp.json()
     assert payload["ok"] is True
@@ -1136,12 +1127,8 @@ async def test_git_merge_maps_failure_statuses_to_409(
             ok=False, status="dirty_overlap", detail="host has overlapping dirty files"
         )
 
-    monkeypatch.setattr(
-        "symphony.webapi.auto_merge_on_done_best_effort", failing_merge
-    )
-    resp = await client.post(
-        "/api/v1/git/merge", json={"branch": "symphony/SEED-1"}
-    )
+    monkeypatch.setattr("symphony.webapi.auto_merge_on_done_best_effort", failing_merge)
+    resp = await client.post("/api/v1/git/merge", json={"branch": "symphony/SEED-1"})
     assert resp.status == 409
     error = (await resp.json())["error"]
     assert error["code"] == "merge_dirty_overlap"
@@ -1244,9 +1231,7 @@ async def test_git_branch_delete_allows_merged_branch(
     assert (await resp.json())["ok"] is True
 
 
-async def test_git_branch_delete_guards(
-    git_repo: Path, client: TestClient
-) -> None:
+async def test_git_branch_delete_guards(git_repo: Path, client: TestClient) -> None:
     resp = await client.post("/api/v1/git/branch/delete", json={"branch": "main"})
     assert resp.status == 400
     assert "task branches" in (await resp.json())["error"]["message"]
@@ -1347,7 +1332,9 @@ async def test_git_pr_creates_pull_request_with_ticket_title(
 ) -> None:
     calls: list[tuple[str, ...]] = []
 
-    def fake_create(workflow_dir: Path, branch: str, target: str, title: str, body: str):
+    def fake_create(
+        workflow_dir: Path, branch: str, target: str, title: str, body: str
+    ):
         calls.append((branch, target, title, body))
         return GitOpResult(True, "created", "", url="https://example.test/pr/1")
 
@@ -1378,9 +1365,7 @@ async def test_git_diff_returns_patch_for_branch_and_commit(
     assert "diff --git a/feature.py b/feature.py" in payload["patch"]
     assert payload["truncated"] is False
 
-    resp = await client.get(
-        "/api/v1/git/diff?branch=symphony/SEED-1&path=feature.py"
-    )
+    resp = await client.get("/api/v1/git/diff?branch=symphony/SEED-1&path=feature.py")
     assert "feature.py" in (await resp.json())["patch"]
 
     sha = subprocess.run(
@@ -1429,9 +1414,7 @@ async def test_lane_preset_apply_rewrites_workflow_and_migrates_tickets(
 ) -> None:
     await client.patch("/api/v1/issues/SEED-1", json={"state": "Doing"})
 
-    resp = await client.post(
-        "/api/v1/workflow/presets/apply", json={"name": "deep"}
-    )
+    resp = await client.post("/api/v1/workflow/presets/apply", json={"name": "deep"})
     assert resp.status == 200
     payload = await resp.json()
     assert payload["applied"] == "deep"
@@ -1455,9 +1438,7 @@ async def test_lane_preset_apply_rewrites_workflow_and_migrates_tickets(
 async def test_lane_preset_apply_rejects_bad_payloads(client: TestClient) -> None:
     resp = await client.post("/api/v1/workflow/presets/apply", json={})
     assert resp.status == 400
-    resp = await client.post(
-        "/api/v1/workflow/presets/apply", json={"name": "mystery"}
-    )
+    resp = await client.post("/api/v1/workflow/presets/apply", json={"name": "mystery"})
     assert resp.status == 400
     assert "unknown lane preset" in (await resp.json())["error"]["message"]
 
@@ -1471,9 +1452,7 @@ async def test_lane_preset_apply_blocks_running_worker_in_removed_lane(
     stub.iter_running_issues = lambda: (running,)
     before = (board_dir / "WORKFLOW.md").read_bytes()
 
-    resp = await client.post(
-        "/api/v1/workflow/presets/apply", json={"name": "deep"}
-    )
+    resp = await client.post("/api/v1/workflow/presets/apply", json={"name": "deep"})
 
     assert resp.status == 409
     assert (await resp.json())["error"]["code"] == "state_in_use"
@@ -1487,7 +1466,9 @@ async def test_lane_preset_apply_warns_when_max_turns_cannot_cover_the_lanes(
     workflow = board_dir / "WORKFLOW.md"
     text = workflow.read_text(encoding="utf-8")
     assert "agent:" in text
-    workflow.write_text(text.replace("agent:", "agent:\n  max_turns: 3", 1), encoding="utf-8")
+    workflow.write_text(
+        text.replace("agent:", "agent:\n  max_turns: 3", 1), encoding="utf-8"
+    )
     client.stub.workflow_state.reload()  # type: ignore[attr-defined]
 
     resp = await client.post("/api/v1/workflow/presets/apply", json={"name": "deep"})
@@ -1525,7 +1506,6 @@ async def test_product_preview_start_rejects_disabled(client: TestClient):
     assert payload["error"]["code"] == "preview_error"
 
 
-
 @pytest.mark.asyncio
 async def test_product_preview_process_controls_require_json(client: TestClient):
     response = await client.post("/api/v1/preview/stop")
@@ -1559,3 +1539,162 @@ async def test_product_preview_start_waits_for_done_release_ticket(
         assert payload["error"]["code"] == "release_not_ready"
     finally:
         await cli.close()
+
+
+# ---------------------------------------------------------------------------
+# project identity, management, and independent switching
+# ---------------------------------------------------------------------------
+
+
+class _FakeProjectRegistry:
+    def __init__(self, projects: list[Any], *, broken: set[str] | None = None) -> None:
+        self.projects = projects
+        self.broken = broken or set()
+        self.running: set[str] = set()
+        self.started: list[str] = []
+
+    def list(self) -> list[Any]:
+        return list(self.projects)
+
+    def get(self, project_id: str) -> Any:
+        for project in self.projects:
+            if project.id == project_id:
+                return project
+        from symphony.projects import ProjectError
+
+        raise ProjectError(
+            f"unknown project {project_id!r}; run `symphony project list`"
+        )
+
+    def status(self, project_id: str) -> Any:
+        if project_id in self.broken:
+            raise RuntimeError("private status detail")
+        project = self.get(project_id)
+        record = SimpleNamespace(host=project.host, port=project.port)
+        return SimpleNamespace(
+            state="running" if project_id in self.running else "stopped", record=record
+        )
+
+    def start(self, project_id: str) -> int:
+        self.started.append(project_id)
+        self.running.add(project_id)
+        return 0
+
+
+async def _project_client(
+    board_dir: Path, monkeypatch: pytest.MonkeyPatch, registry: Any
+) -> TestClient:
+    from symphony import webapi
+
+    state = WorkflowState(board_dir / "WORKFLOW.md")
+    cfg, err = state.reload()
+    assert err is None and cfg is not None
+    monkeypatch.setattr(webapi, "ProjectRegistry", lambda: registry)
+    app = build_app(cast(Orchestrator, _StubOrchestrator(state)))
+    client = TestClient(TestServer(app))
+    await client.start_server()
+    return client
+
+
+async def test_projects_expose_current_canonical_paths_and_isolate_broken_status(
+    board_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from symphony.projects import Project
+
+    current = Project(
+        "current",
+        "Current",
+        str(board_dir.resolve()),
+        str((board_dir / "WORKFLOW.md").resolve()),
+        "127.0.0.1",
+        9999,
+    )
+    other = Project(
+        "other",
+        "Other",
+        str((board_dir / "other").resolve()),
+        str((board_dir / "other" / "WORKFLOW.md").resolve()),
+        "127.0.0.1",
+        10000,
+    )
+    client = await _project_client(
+        board_dir, monkeypatch, _FakeProjectRegistry([current, other], broken={"other"})
+    )
+    try:
+        response = await client.get("/api/v1/projects")
+        assert response.status == 200
+        body = await response.json()
+        assert body["current"] == {
+            "id": "current",
+            "name": "Current",
+            "repo_path": str(board_dir.resolve()),
+            "workflow_path": str((board_dir / "WORKFLOW.md").resolve()),
+            "board_path": str((board_dir / "kanban").resolve()),
+            "registered": True,
+        }
+        assert body["projects"][0]["current"] is True
+        assert body["projects"][1]["status_error"] == "status unavailable"
+        assert "private status detail" not in await response.text()
+    finally:
+        await client.close()
+
+
+async def test_open_project_starts_only_destination_and_returns_independent_url(
+    board_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from symphony.projects import Project
+
+    destination = Project(
+        "other", "Other", "/tmp/other", "/tmp/other/WORKFLOW.md", "0.0.0.0", 10001
+    )
+    registry = _FakeProjectRegistry([destination])
+    client = await _project_client(board_dir, monkeypatch, registry)
+    try:
+        empty = await client.post("/api/v1/projects/other/open")
+        assert empty.status == 415
+        text = await client.post(
+            "/api/v1/projects/other/open",
+            data="{}",
+            headers={"Content-Type": "text/plain"},
+        )
+        assert text.status == 415
+        assert registry.started == []
+
+        response = await client.post("/api/v1/projects/other/open", json={})
+        assert response.status == 200
+        assert await response.json() == {
+            "project_id": "other",
+            "running": True,
+            "url": "http://127.0.0.1:10001/",
+        }
+        assert registry.started == ["other"]
+        assert client.server.app is not None
+    finally:
+        await client.close()
+
+
+async def test_project_mutations_reject_cross_origin(
+    board_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    client = await _project_client(board_dir, monkeypatch, _FakeProjectRegistry([]))
+    try:
+        response = await client.post(
+            "/api/v1/projects",
+            json={"name": "Demo", "path": "/tmp/demo"},
+            headers={"Origin": "https://attacker.example"},
+        )
+        assert response.status == 403
+        assert (await response.json())["error"]["code"] == "forbidden_origin"
+        wrong_scheme = await client.post(
+            "/api/v1/projects",
+            json={"name": "Demo", "path": "/tmp/demo"},
+            headers={
+                "Origin": str(client.make_url("/"))
+                .replace("http:", "https:", 1)
+                .rstrip("/")
+            },
+        )
+        assert wrong_scheme.status == 403
+        assert (await wrong_scheme.json())["error"]["code"] == "forbidden_origin"
+    finally:
+        await client.close()

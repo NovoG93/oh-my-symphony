@@ -268,15 +268,28 @@ that launched them.
 
 ```bash
 symphony project create "My App" --path ../my-app
-# or register an existing repository that already has WORKFLOW.md
-symphony project add /path/to/existing-repo --name "My App"
+# or adopt an existing directory; Git and missing Symphony files are added safely
+symphony project add /path/to/existing-project --name "My App"
 symphony project start my-app
 symphony hub
 ```
 
-The hub links to independent per-project services. Each service loads that
-project's workflow and repository, so its board, workspaces, and Product
-Preview stay naturally scoped to that project.
+The Hub and every project board show the canonical repository, workflow, and
+"Issues are stored here" board paths. Use **Manage projects** to enter a name
+and local path. A missing path becomes a new Git repository; an existing
+non-Git directory is initialized in place; and an existing Git repository keeps
+its metadata and files. Symphony adds only missing operator files and never
+stages unrelated changes.
+
+Selecting another project starts its service when needed and navigates to that
+independent board. Services and workers for the previous project keep running
+against their original repository, so project switching cannot retarget active
+jobs.
+
+> **Existing non-Git directories:** Symphony initializes Git and commits only
+> the Symphony files it adds. Existing product files remain untracked to avoid
+> accidentally committing secrets or local artifacts. Review and commit those
+> files before dispatching tickets so worker worktrees include them.
 
 ## Try it in 60 seconds (no agent CLI required)
 
