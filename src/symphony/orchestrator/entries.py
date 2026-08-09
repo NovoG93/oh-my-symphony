@@ -41,6 +41,10 @@ class RunningEntry:
     release_finalizer_rewind_state: str = ""
     release_gate_exhausted: bool = False
     release_authority_resolved: bool = False
+    # Ephemeral proof that this exact verifier run durably created its RED
+    # successor lifecycle. It is deliberately not serialized: restart recovery
+    # re-proves the handoff from the registry and finalizer link instead.
+    release_verifier_handoff_complete: bool = False
     # Live backend driver for this attempt. Populated by `_run_agent_attempt`
     # immediately after `build_backend(...)` so `_on_codex_event` can route
     # the stall-progress predicate through `backend.is_progress_event(...)`

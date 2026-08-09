@@ -177,6 +177,34 @@ def test_run_registry_survives_reopen_and_releases_completed_run(tmp_path: Path)
     assert reopened.get_run(run_id).status == "normal"
 
 
+def test_release_evidence_identity_lookup_by_issue_id_is_exact(tmp_path: Path) -> None:
+    registry = RunRegistry(tmp_path / "state.db")
+    verifier = _issue("RELEASE-VERIFY-LOOKUP")
+    gate = registry.replace_pending_release_gate(
+        ReleaseGate(
+            finalizer_identifier="APP-FINAL",
+            verifier_issue_id=verifier.id,
+            verifier_identifier=verifier.identifier,
+            expected_contract_sha256="a" * 64,
+            cycle_fingerprint="b" * 64,
+            approved_fingerprint=None,
+            status="pending",
+            target_branch=None,
+            approved_target_sha=None,
+            verifier_run_id=None,
+            updated_at=datetime(2026, 8, 9, tzinfo=timezone.utc),
+        )
+    )
+
+    identity = registry.get_release_evidence_identity_by_issue_id(verifier.id)
+
+    assert identity is not None
+    assert identity.issue_id == verifier.id
+    assert identity.identifier == verifier.identifier
+    assert identity.cycle_generation == gate.generation
+    assert registry.get_release_evidence_identity_by_issue_id("missing") is None
+
+
 def test_release_gate_survives_restart_approves_exact_tuple_and_invalidates(
     tmp_path: Path,
 ) -> None:

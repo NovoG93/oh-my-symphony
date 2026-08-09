@@ -1035,6 +1035,16 @@ class RunRegistry:
         ).fetchone()
         return _release_evidence_identity(row) if row is not None else None
 
+    def get_release_evidence_identity_by_issue_id(
+        self, issue_id: str
+    ) -> ReleaseEvidenceIdentity | None:
+        """Return one evidence identity by its stable tracker issue id."""
+        row = self._connect().execute(
+            "SELECT * FROM release_evidence_issues WHERE issue_id = ?",
+            (issue_id,),
+        ).fetchone()
+        return _release_evidence_identity(row) if row is not None else None
+
     def get_release_cycle_item(
         self,
         *,
