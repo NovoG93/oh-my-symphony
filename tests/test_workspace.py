@@ -10,6 +10,7 @@ from pathlib import Path
 
 import pytest
 
+from symphony import workspace as workspace_module
 from symphony._shell import resolve_bash
 from symphony.errors import InvalidWorkspaceCwd, SymphonyError
 from symphony.workflow import HooksConfig
@@ -466,6 +467,578 @@ def test_setup_worktree_script_supports_linked_workflow_dir(tmp_path, lock_backe
     assert (workspace / ".git").is_file()
     assert (workspace / "kanban").is_symlink()
     assert not (common_git_dir / "symphony-worktree.lock.d").exists()
+
+
+@pytest.mark.skipif(not _HAS_GIT, reason="git CLI required")
+@pytest.mark.parametrize(
+    ("merge_target", "should_refresh"),
+    [("main", True), ("v1.0", False)],
+)
+def test_setup_worktree_script_refreshes_only_exact_local_target(
+    tmp_path, merge_target, should_refresh
+):
+    """A reaped merged branch refreshes only from an exact local branch.
+
+    Without this refresh, the next after_run amend rewrites the old branch
+    tip and turns an already-merged ticket into a second, conflicting history.
+    A same-SHA tag must not be accepted as the configured branch authority.
+    """
+    host = tmp_path / "host"
+    host.mkdir()
+    _git(host, "init", "-q", "-b", "main")
+    (host / "seed.txt").write_text("base\n", encoding="utf-8")
+    _git(host, "add", "-A")
+    _git(host, "commit", "-q", "-m", "seed")
+
+    branch = "symphony/DEMO-REFRESH"
+    _git(host, "switch", "-c", branch)
+    (host / "feature.txt").write_text("feature\n", encoding="utf-8")
+    _git(host, "add", "-A")
+    _git(host, "commit", "-q", "-m", "ticket work")
+    old_branch_sha = _git(host, "rev-parse", branch).stdout.strip()
+    _git(host, "switch", "main")
+    _git(host, "merge", "--no-ff", "-m", "merge ticket", branch)
+    target_sha = _git(host, "rev-parse", "main").stdout.strip()
+    # A same-name tag makes an unqualified `${BRANCH}^{commit}` resolve to the
+    # tag instead of the feature branch. The hook must use refs/heads/<branch>.
+    _git(host, "tag", branch, "main")
+    _git(host, "tag", "v1.0", "main")
+    assert old_branch_sha != target_sha
+
+    workspace = tmp_path / "workspaces" / "DEMO-REFRESH"
+    workspace.mkdir(parents=True)
+    script = Path(__file__).parents[1] / "scripts" / "symphony-setup-worktree.sh"
+    result = subprocess.run(
+        [_BASH, str(script)],
+        cwd=str(workspace),
+        env={
+            **os.environ,
+            "SYMPHONY_WORKFLOW_DIR": str(host),
+            "SYMPHONY_FEATURE_BASE_BRANCH": "main",
+            "SYMPHONY_MERGE_TARGET_BRANCH": merge_target,
+            "PATH": _setup_script_test_path(tmp_path, include_flock=False),
+        },
+        capture_output=True,
+        text=True,
+        check=True,
+        timeout=10,
+    )
+
+    expected_sha = target_sha if should_refresh else old_branch_sha
+    assert (
+        _git(host, "rev-parse", "refs/heads/" + branch).stdout.strip()
+        == expected_sha
+    )
+    assert _git(workspace, "rev-parse", "HEAD").stdout.strip() == expected_sha
+    assert _git(host, "rev-parse", "main").stdout.strip() == target_sha
+    assert ("refreshing already-merged branch" in result.stdout) is should_refresh
+
+
+@pytest.mark.skipif(not _HAS_GIT, reason="git CLI required")
+def test_setup_worktree_script_preserves_unmerged_branch_tip(tmp_path):
+    """A branch with work not in main must remain unchanged on reopen."""
+    host = tmp_path / "host"
+    host.mkdir()
+    _git(host, "init", "-q", "-b", "main")
+    (host / "seed.txt").write_text("base\n", encoding="utf-8")
+    _git(host, "add", "-A")
+    _git(host, "commit", "-q", "-m", "seed")
+
+    branch = "symphony/DEMO-PRESERVE"
+    _git(host, "switch", "-c", branch)
+    (host / "feature.txt").write_text("unmerged feature\n", encoding="utf-8")
+    _git(host, "add", "-A")
+    _git(host, "commit", "-q", "-m", "unmerged ticket work")
+    branch_sha = _git(host, "rev-parse", branch).stdout.strip()
+    _git(host, "switch", "main")
+    (host / "target.txt").write_text("target-only\n", encoding="utf-8")
+    _git(host, "add", "-A")
+    _git(host, "commit", "-q", "-m", "target work")
+    target_sha = _git(host, "rev-parse", "main").stdout.strip()
+
+    workspace = tmp_path / "workspaces" / "DEMO-PRESERVE"
+    workspace.mkdir(parents=True)
+    script = Path(__file__).parents[1] / "scripts" / "symphony-setup-worktree.sh"
+    result = subprocess.run(
+        [_BASH, str(script)],
+        cwd=str(workspace),
+        env={
+            **os.environ,
+            "SYMPHONY_WORKFLOW_DIR": str(host),
+            "SYMPHONY_FEATURE_BASE_BRANCH": "main",
+            "SYMPHONY_MERGE_TARGET_BRANCH": "main",
+            "PATH": _setup_script_test_path(tmp_path, include_flock=False),
+        },
+        capture_output=True,
+        text=True,
+        check=True,
+        timeout=10,
+    )
+
+    assert _git(host, "rev-parse", branch).stdout.strip() == branch_sha
+    assert _git(workspace, "rev-parse", "HEAD").stdout.strip() == branch_sha
+    assert _git(host, "rev-parse", "main").stdout.strip() == target_sha
+    assert "refreshing already-merged branch" not in result.stdout
+
+
+def _preserve_worktree_manager(tmp_path: Path, host: Path, monkeypatch) -> WorkspaceManager:
+    """Build a preserve-policy manager using the canonical worktree hook."""
+    monkeypatch.setenv(
+        "PATH", _setup_script_test_path(tmp_path, include_flock=False)
+    )
+    script = Path(__file__).parents[1] / "scripts" / "symphony-setup-worktree.sh"
+    return WorkspaceManager(
+        tmp_path / "managed-workspaces",
+        _hooks(after_create=f'bash "{script}"'),
+        workflow_dir=host,
+        reuse_policy="preserve",
+        hook_env={
+            "SYMPHONY_FEATURE_BASE_BRANCH": "main",
+            "SYMPHONY_MERGE_TARGET_BRANCH": "main",
+        },
+    )
+
+
+@pytest.mark.skipif(not _HAS_GIT, reason="git CLI required")
+@pytest.mark.asyncio
+async def test_create_or_reuse_preserve_refreshes_clean_merged_worktree(
+    tmp_path, monkeypatch
+):
+    """Preserve policy still refreshes a clean, already-merged ticket branch."""
+    host = tmp_path / "host"
+    host.mkdir()
+    _git(host, "init", "-q", "-b", "main")
+    (host / "seed.txt").write_text("base\n", encoding="utf-8")
+    _git(host, "add", "-A")
+    _git(host, "commit", "-q", "-m", "seed")
+    manager = _preserve_worktree_manager(tmp_path, host, monkeypatch)
+
+    first = await manager.create_or_reuse("PRESERVE-MERGED")
+    (first.path / "feature.txt").write_text("feature\n", encoding="utf-8")
+    _git(first.path, "add", "feature.txt")
+    _git(first.path, "commit", "-q", "-m", "ticket work")
+    old_branch_sha = _git(host, "rev-parse", "symphony/PRESERVE-MERGED").stdout.strip()
+    _git(host, "merge", "--no-ff", "-m", "merge ticket", "symphony/PRESERVE-MERGED")
+    target_sha = _git(host, "rev-parse", "main").stdout.strip()
+
+    second = await manager.create_or_reuse("PRESERVE-MERGED")
+
+    assert second.created_now is False
+    assert old_branch_sha != target_sha
+    assert _git(host, "rev-parse", "symphony/PRESERVE-MERGED").stdout.strip() == target_sha
+    assert _git(second.path, "rev-parse", "HEAD").stdout.strip() == target_sha
+    assert _git(host, "rev-parse", "main").stdout.strip() == target_sha
+    assert _git(
+        second.path, "config", "--worktree", "--get", "symphony.basesha"
+    ).stdout.strip() == target_sha
+    assert _git(
+        second.path,
+        "config",
+        "--worktree",
+        "--get",
+        "symphony.mergetargetbranch",
+    ).stdout.strip() == "main"
+    assert _git(
+        second.path, "config", "--worktree", "--get", "symphony.basebranch"
+    ).stdout.strip() == "main"
+
+
+@pytest.mark.skipif(not _HAS_GIT, reason="git CLI required")
+@pytest.mark.asyncio
+async def test_create_or_reuse_preserve_keeps_dirty_merged_worktree(
+    tmp_path, monkeypatch
+):
+    """A dirty worktree is never reaped, even when its branch is merged."""
+    host = tmp_path / "host"
+    host.mkdir()
+    _git(host, "init", "-q", "-b", "main")
+    (host / "seed.txt").write_text("base\n", encoding="utf-8")
+    _git(host, "add", "-A")
+    _git(host, "commit", "-q", "-m", "seed")
+    manager = _preserve_worktree_manager(tmp_path, host, monkeypatch)
+
+    first = await manager.create_or_reuse("PRESERVE-DIRTY")
+    (first.path / "feature.txt").write_text("feature\n", encoding="utf-8")
+    _git(first.path, "add", "feature.txt")
+    _git(first.path, "commit", "-q", "-m", "ticket work")
+    branch = "symphony/PRESERVE-DIRTY"
+    old_branch_sha = _git(host, "rev-parse", branch).stdout.strip()
+    _git(host, "merge", "--no-ff", "-m", "merge ticket", branch)
+    target_sha = _git(host, "rev-parse", "main").stdout.strip()
+    (first.path / "uncommitted.txt").write_text("do not lose me\n", encoding="utf-8")
+
+    second = await manager.create_or_reuse("PRESERVE-DIRTY")
+
+    assert (second.path / "uncommitted.txt").read_text(encoding="utf-8") == "do not lose me\n"
+    assert _git(host, "rev-parse", branch).stdout.strip() == old_branch_sha
+    assert _git(second.path, "rev-parse", "HEAD").stdout.strip() == old_branch_sha
+    assert _git(host, "rev-parse", "main").stdout.strip() == target_sha
+
+
+@pytest.mark.skipif(not _HAS_GIT, reason="git CLI required")
+@pytest.mark.asyncio
+async def test_create_or_reuse_preserve_keeps_clean_divergent_worktree(
+    tmp_path, monkeypatch
+):
+    """A clean branch with unmerged commits is preserved on reuse."""
+    host = tmp_path / "host"
+    host.mkdir()
+    _git(host, "init", "-q", "-b", "main")
+    (host / "seed.txt").write_text("base\n", encoding="utf-8")
+    _git(host, "add", "-A")
+    _git(host, "commit", "-q", "-m", "seed")
+    manager = _preserve_worktree_manager(tmp_path, host, monkeypatch)
+
+    first = await manager.create_or_reuse("PRESERVE-DIVERGENT")
+    (first.path / "feature.txt").write_text("unmerged feature\n", encoding="utf-8")
+    _git(first.path, "add", "feature.txt")
+    _git(first.path, "commit", "-q", "-m", "unmerged ticket work")
+    branch = "symphony/PRESERVE-DIVERGENT"
+    branch_sha = _git(host, "rev-parse", branch).stdout.strip()
+    (host / "target.txt").write_text("target-only\n", encoding="utf-8")
+    _git(host, "add", "target.txt")
+    _git(host, "commit", "-q", "-m", "target work")
+    target_sha = _git(host, "rev-parse", "main").stdout.strip()
+
+    second = await manager.create_or_reuse("PRESERVE-DIVERGENT")
+
+    assert _git(host, "rev-parse", branch).stdout.strip() == branch_sha
+    assert _git(second.path, "rev-parse", "HEAD").stdout.strip() == branch_sha
+    assert _git(host, "rev-parse", "main").stdout.strip() == target_sha
+    assert (second.path / "feature.txt").read_text(encoding="utf-8") == "unmerged feature\n"
+
+
+@pytest.mark.skipif(not _HAS_GIT, reason="git CLI required")
+@pytest.mark.asyncio
+async def test_create_or_reuse_preserve_same_tip_is_unchanged(tmp_path, monkeypatch):
+    """A branch already at target is not rewritten or reconfigured."""
+    host = tmp_path / "host"
+    host.mkdir()
+    _git(host, "init", "-q", "-b", "main")
+    (host / "seed.txt").write_text("base\n", encoding="utf-8")
+    _git(host, "add", "-A")
+    _git(host, "commit", "-q", "-m", "seed")
+    manager = _preserve_worktree_manager(tmp_path, host, monkeypatch)
+
+    first = await manager.create_or_reuse("PRESERVE-SAME")
+    (first.path / "feature.txt").write_text("feature\n", encoding="utf-8")
+    _git(first.path, "add", "feature.txt")
+    _git(first.path, "commit", "-q", "-m", "ticket work")
+    branch = "symphony/PRESERVE-SAME"
+    _git(host, "merge", "--ff-only", branch)
+    target_sha = _git(host, "rev-parse", "main").stdout.strip()
+    basesha_before = _git(
+        first.path, "config", "--worktree", "--get", "symphony.basesha"
+    ).stdout.strip()
+
+    second = await manager.create_or_reuse("PRESERVE-SAME")
+
+    assert _git(host, "rev-parse", branch).stdout.strip() == target_sha
+    assert _git(second.path, "rev-parse", "HEAD").stdout.strip() == target_sha
+    assert _git(host, "rev-parse", "main").stdout.strip() == target_sha
+    assert _git(
+        second.path, "config", "--worktree", "--get", "symphony.basesha"
+    ).stdout.strip() == basesha_before
+
+
+@pytest.mark.skipif(not _HAS_GIT, reason="git CLI required")
+@pytest.mark.asyncio
+async def test_create_or_reuse_preserve_missing_target_is_unchanged(
+    tmp_path, monkeypatch
+):
+    """A missing configured target cannot trigger a branch mutation."""
+    host = tmp_path / "host"
+    host.mkdir()
+    _git(host, "init", "-q", "-b", "main")
+    (host / "seed.txt").write_text("base\n", encoding="utf-8")
+    _git(host, "add", "-A")
+    _git(host, "commit", "-q", "-m", "seed")
+    manager = _preserve_worktree_manager(tmp_path, host, monkeypatch)
+
+    first = await manager.create_or_reuse("PRESERVE-MISSING-TARGET")
+    (first.path / "feature.txt").write_text("feature\n", encoding="utf-8")
+    _git(first.path, "add", "feature.txt")
+    _git(first.path, "commit", "-q", "-m", "ticket work")
+    branch = "symphony/PRESERVE-MISSING-TARGET"
+    branch_sha = _git(host, "rev-parse", branch).stdout.strip()
+    basesha_before = _git(
+        first.path, "config", "--worktree", "--get", "symphony.basesha"
+    ).stdout.strip()
+    manager.update_hook_env(
+        {
+            "SYMPHONY_FEATURE_BASE_BRANCH": "main",
+            "SYMPHONY_MERGE_TARGET_BRANCH": "does-not-exist",
+        }
+    )
+
+    second = await manager.create_or_reuse("PRESERVE-MISSING-TARGET")
+
+    assert _git(host, "rev-parse", branch).stdout.strip() == branch_sha
+    assert _git(second.path, "rev-parse", "HEAD").stdout.strip() == branch_sha
+    assert _git(
+        second.path, "config", "--worktree", "--get", "symphony.basesha"
+    ).stdout.strip() == basesha_before
+
+
+@pytest.mark.skipif(not _HAS_GIT, reason="git CLI required")
+@pytest.mark.asyncio
+async def test_create_or_reuse_preserve_rejects_non_local_target_expressions(
+    tmp_path, monkeypatch
+):
+    """Tags, object IDs, and revision expressions are not local targets."""
+    host = tmp_path / "host"
+    host.mkdir()
+    _git(host, "init", "-q", "-b", "main")
+    (host / "seed.txt").write_text("base\n", encoding="utf-8")
+    _git(host, "add", "-A")
+    _git(host, "commit", "-q", "-m", "seed")
+    manager = _preserve_worktree_manager(tmp_path, host, monkeypatch)
+
+    first = await manager.create_or_reuse("PRESERVE-NON-LOCAL")
+    (first.path / "feature.txt").write_text("feature\n", encoding="utf-8")
+    _git(first.path, "add", "feature.txt")
+    _git(first.path, "commit", "-q", "-m", "ticket work")
+    branch = "symphony/PRESERVE-NON-LOCAL"
+    branch_sha = _git(host, "rev-parse", branch).stdout.strip()
+    _git(host, "merge", "--no-ff", "-m", "merge ticket", branch)
+    target_sha = _git(host, "rev-parse", "main").stdout.strip()
+    _git(host, "tag", "v1.0", "main")
+
+    for invalid_target in (
+        "main^{commit}",
+        "refs/heads/main",
+        "v1.0",
+        target_sha,
+    ):
+        manager.update_hook_env(
+            {
+                "SYMPHONY_FEATURE_BASE_BRANCH": "main",
+                "SYMPHONY_MERGE_TARGET_BRANCH": invalid_target,
+            }
+        )
+        second = await manager.create_or_reuse("PRESERVE-NON-LOCAL")
+        assert _git(host, "rev-parse", branch).stdout.strip() == branch_sha
+        assert _git(second.path, "rev-parse", "HEAD").stdout.strip() == branch_sha
+        assert _git(host, "rev-parse", "main").stdout.strip() == target_sha
+
+
+@pytest.mark.skipif(not _HAS_GIT, reason="git CLI required")
+@pytest.mark.asyncio
+async def test_create_or_reuse_preserve_does_not_touch_unexpected_repo(
+    tmp_path, monkeypatch
+):
+    """A regular repo at the workspace path is outside the refresh contract."""
+    host = tmp_path / "host"
+    host.mkdir()
+    _git(host, "init", "-q", "-b", "main")
+    (host / "seed.txt").write_text("base\n", encoding="utf-8")
+    _git(host, "add", "-A")
+    _git(host, "commit", "-q", "-m", "seed")
+
+    root = tmp_path / "managed-workspaces"
+    path = root / "PRESERVE-UNEXPECTED"
+    path.mkdir(parents=True)
+    _git(path, "init", "-q", "-b", "main")
+    (path / "local.txt").write_text("local\n", encoding="utf-8")
+    _git(path, "add", "local.txt")
+    _git(path, "commit", "-q", "-m", "local")
+    head_before = _git(path, "rev-parse", "HEAD").stdout.strip()
+    manager = WorkspaceManager(
+        root,
+        _hooks(after_create="echo reran > hook-ran"),
+        workflow_dir=host,
+        reuse_policy="preserve",
+        hook_env={
+            "SYMPHONY_FEATURE_BASE_BRANCH": "main",
+            "SYMPHONY_MERGE_TARGET_BRANCH": "main",
+        },
+    )
+
+    second = await manager.create_or_reuse("PRESERVE-UNEXPECTED")
+
+    assert _git(second.path, "rev-parse", "HEAD").stdout.strip() == head_before
+    assert not (second.path / "hook-ran").exists()
+
+
+@pytest.mark.skipif(not _HAS_GIT, reason="git CLI required")
+@pytest.mark.asyncio
+async def test_create_or_reuse_preserve_does_not_rerun_destructive_hook(
+    tmp_path, monkeypatch
+):
+    """Preserve refresh must not execute a newly configured destructive hook."""
+    host = tmp_path / "host"
+    host.mkdir()
+    _git(host, "init", "-q", "-b", "main")
+    (host / "seed.txt").write_text("base\n", encoding="utf-8")
+    _git(host, "add", "-A")
+    _git(host, "commit", "-q", "-m", "seed")
+    manager = _preserve_worktree_manager(tmp_path, host, monkeypatch)
+
+    first = await manager.create_or_reuse("PRESERVE-NO-HOOK")
+    (first.path / "keep.txt").write_text("keep\n", encoding="utf-8")
+    _git(first.path, "add", "keep.txt")
+    _git(first.path, "commit", "-q", "-m", "ticket work")
+    branch = "symphony/PRESERVE-NO-HOOK"
+    _git(host, "merge", "--no-ff", "-m", "merge ticket", branch)
+    target_sha = _git(host, "rev-parse", "main").stdout.strip()
+    manager.update_hooks(
+        _hooks(after_create="rm -f keep.txt; printf reran > hook-ran"),
+        workflow_dir=host,
+    )
+
+    second = await manager.create_or_reuse("PRESERVE-NO-HOOK")
+
+    assert (second.path / "keep.txt").read_text(encoding="utf-8") == "keep\n"
+    assert not (second.path / "hook-ran").exists()
+    assert _git(second.path, "rev-parse", "HEAD").stdout.strip() == target_sha
+
+
+@pytest.mark.skipif(not _HAS_GIT, reason="git CLI required")
+@pytest.mark.asyncio
+async def test_create_or_reuse_preserve_target_race_is_unchanged(
+    tmp_path, monkeypatch
+):
+    """A changed capture is fenced before merge and leaves the branch alone."""
+    host = tmp_path / "host"
+    host.mkdir()
+    _git(host, "init", "-q", "-b", "main")
+    (host / "seed.txt").write_text("base\n", encoding="utf-8")
+    _git(host, "add", "-A")
+    _git(host, "commit", "-q", "-m", "seed")
+    manager = _preserve_worktree_manager(tmp_path, host, monkeypatch)
+
+    first = await manager.create_or_reuse("PRESERVE-RACE")
+    (first.path / "feature.txt").write_text("feature\n", encoding="utf-8")
+    _git(first.path, "add", "feature.txt")
+    _git(first.path, "commit", "-q", "-m", "ticket work")
+    branch = "symphony/PRESERVE-RACE"
+    branch_sha = _git(host, "rev-parse", branch).stdout.strip()
+    _git(host, "merge", "--no-ff", "-m", "merge ticket", branch)
+    target_sha = _git(host, "rev-parse", "main").stdout.strip()
+    _git(host, "switch", "-c", "later")
+    (host / "later.txt").write_text("later\n", encoding="utf-8")
+    _git(host, "add", "later.txt")
+    _git(host, "commit", "-q", "-m", "later")
+    later_sha = _git(host, "rev-parse", "later").stdout.strip()
+    _git(host, "switch", "main")
+
+    plans = iter(
+        [
+            workspace_module._LinkedWorktreeRefreshPlan(
+                branch=branch, head_sha=branch_sha, target_sha=target_sha
+            ),
+            workspace_module._LinkedWorktreeRefreshPlan(
+                branch=branch, head_sha=branch_sha, target_sha=later_sha
+            ),
+        ]
+    )
+    monkeypatch.setattr(
+        workspace_module,
+        "_linked_worktree_refresh_plan",
+        lambda **_kwargs: next(plans),
+    )
+
+    second = await manager.create_or_reuse("PRESERVE-RACE")
+
+    assert _git(host, "rev-parse", branch).stdout.strip() == branch_sha
+    assert _git(second.path, "rev-parse", "HEAD").stdout.strip() == branch_sha
+    assert _git(host, "rev-parse", "main").stdout.strip() == target_sha
+
+
+@pytest.mark.skipif(not _HAS_GIT, reason="git CLI required")
+@pytest.mark.asyncio
+async def test_create_or_reuse_preserve_merge_failure_blocks_without_mutation(
+    tmp_path, monkeypatch
+):
+    """An attempted failed fast-forward blocks dispatch even at unchanged HEAD."""
+    host = tmp_path / "host"
+    host.mkdir()
+    _git(host, "init", "-q", "-b", "main")
+    (host / "seed.txt").write_text("base\n", encoding="utf-8")
+    _git(host, "add", "-A")
+    _git(host, "commit", "-q", "-m", "seed")
+    manager = _preserve_worktree_manager(tmp_path, host, monkeypatch)
+
+    first = await manager.create_or_reuse("PRESERVE-MERGE-FAILURE")
+    (first.path / "feature.txt").write_text("feature\n", encoding="utf-8")
+    _git(first.path, "add", "feature.txt")
+    _git(first.path, "commit", "-q", "-m", "ticket work")
+    branch = "symphony/PRESERVE-MERGE-FAILURE"
+    branch_before = _git(host, "rev-parse", "refs/heads/" + branch).stdout.strip()
+    _git(host, "merge", "--no-ff", "-m", "merge ticket", branch)
+    target_before = _git(host, "rev-parse", "refs/heads/main").stdout.strip()
+    head_before = _git(first.path, "rev-parse", "HEAD").stdout.strip()
+    merge_calls = []
+    real_git_command = workspace_module._git_command
+
+    def fail_merge(path, *args):
+        if args[:2] == ("merge", "--ff-only"):
+            merge_calls.append((path, args))
+            return subprocess.CompletedProcess(
+                ["git", "-C", str(path), *args],
+                1,
+                stdout=b"",
+                stderr=b"forced failure",
+            )
+        return real_git_command(path, *args)
+
+    monkeypatch.setattr(workspace_module, "_git_command", fail_merge)
+
+    with pytest.raises(SymphonyError):
+        await manager.create_or_reuse("PRESERVE-MERGE-FAILURE")
+
+    assert merge_calls
+    assert _git(host, "rev-parse", "refs/heads/" + branch).stdout.strip() == branch_before
+    assert _git(host, "rev-parse", "refs/heads/main").stdout.strip() == target_before
+    assert _git(first.path, "rev-parse", "HEAD").stdout.strip() == head_before
+
+
+@pytest.mark.skipif(not _HAS_GIT, reason="git CLI required")
+@pytest.mark.asyncio
+async def test_create_or_reuse_preserve_accepts_target_drift_after_fast_forward(
+    tmp_path, monkeypatch
+):
+    """A later target commit does not invalidate the captured safe refresh."""
+    host = tmp_path / "host"
+    host.mkdir()
+    _git(host, "init", "-q", "-b", "main")
+    (host / "seed.txt").write_text("base\n", encoding="utf-8")
+    _git(host, "add", "-A")
+    _git(host, "commit", "-q", "-m", "seed")
+    manager = _preserve_worktree_manager(tmp_path, host, monkeypatch)
+
+    first = await manager.create_or_reuse("PRESERVE-TARGET-DRIFT")
+    (first.path / "feature.txt").write_text("feature\n", encoding="utf-8")
+    _git(first.path, "add", "feature.txt")
+    _git(first.path, "commit", "-q", "-m", "ticket work")
+    branch = "symphony/PRESERVE-TARGET-DRIFT"
+    _git(host, "merge", "--no-ff", "-m", "merge ticket", branch)
+    captured_target = _git(host, "rev-parse", "main").stdout.strip()
+    real_git_command = workspace_module._git_command
+
+    def merge_then_advance_target(path, *args):
+        result = real_git_command(path, *args)
+        if (
+            args[:2] == ("merge", "--ff-only")
+            and result is not None
+            and result.returncode == 0
+        ):
+            (host / "drift.txt").write_text("target drift\n", encoding="utf-8")
+            _git(host, "add", "drift.txt")
+            _git(host, "commit", "-q", "-m", "target drift")
+        return result
+
+    monkeypatch.setattr(workspace_module, "_git_command", merge_then_advance_target)
+
+    second = await manager.create_or_reuse("PRESERVE-TARGET-DRIFT")
+
+    advanced_target = _git(host, "rev-parse", "main").stdout.strip()
+    assert advanced_target != captured_target
+    assert _git(host, "rev-parse", branch).stdout.strip() == captured_target
+    assert _git(second.path, "rev-parse", "HEAD").stdout.strip() == captured_target
+    assert _git(
+        second.path, "config", "--worktree", "--get", "symphony.basesha"
+    ).stdout.strip() == captured_target
 
 
 @pytest.mark.skipif(not _HAS_GIT, reason="git CLI required")
