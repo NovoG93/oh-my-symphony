@@ -106,8 +106,57 @@ trap _symphony_release_worktree_lock EXIT
 _symphony_acquire_worktree_lock
 git worktree remove --force "$WORKTREE_PATH" 2>/dev/null || true
 git worktree prune 2>/dev/null || true
+
+# A prior worktree may have been reaped after its branch was merged into the
+# configured target. Reusing that old tip is unsafe: the next after_run hook
+# can amend it into a new parallel history, and the eventual merge sees an
+# evidence-only conflict. Refresh only the feature ref when it is already
+# contained by the target. `git update-ref`'s expected-old argument makes this
+# a compare-and-swap, so a concurrent writer cannot silently overwrite work.
+_symphony_refresh_merged_branch() {
+  local branch_sha target_sha target_ref attempt branch_after
+  # A configured merge target is a local branch name, never a tag, SHA, or
+  # revision expression. Resolve only refs/heads/<name> so a tag with the
+  # same spelling cannot silently drive a branch refresh.
+  case "$MERGE_TARGET_BRANCH" in
+    ""|refs/*) return 0 ;;
+  esac
+  git check-ref-format --branch "$MERGE_TARGET_BRANCH" >/dev/null 2>&1 || return 0
+  target_ref="refs/heads/$MERGE_TARGET_BRANCH"
+  # Keep the host-side ref update bounded. The lock serializes Symphony's own
+  # setup hooks and the expected-old CAS protects against an external branch
+  # writer. A target branch may advance after its SHA is captured; the
+  # reopened ticket remains at that immutable captured ancestor and the later
+  # delivery gate evaluates the new target tip.
+  for attempt in 1 2 3; do
+    branch_sha="$(git rev-parse --verify --quiet "refs/heads/$BRANCH^{commit}" 2>/dev/null || true)"
+    target_sha="$(git rev-parse --verify --quiet "${target_ref}^{commit}" 2>/dev/null || true)"
+    [ -n "$branch_sha" ] || return 0
+    [ -n "$target_sha" ] || return 0
+    [ "$branch_sha" = "$target_sha" ] && return 0
+    if ! git merge-base --is-ancestor "$branch_sha" "$target_sha" 2>/dev/null; then
+      return 0
+    fi
+    if ! git update-ref --no-deref "refs/heads/$BRANCH" "$target_sha" "$branch_sha"; then
+      if [ "$attempt" -lt 3 ]; then
+        continue
+      fi
+      echo "after_create: failed to refresh already-merged branch $BRANCH; ref changed concurrently" >&2
+      exit 1
+    fi
+    branch_after="$(git rev-parse --verify --quiet "refs/heads/$BRANCH^{commit}" 2>/dev/null || true)"
+    if [ "$branch_after" != "$target_sha" ]; then
+      echo "after_create: feature branch changed during refresh; refusing to attach $BRANCH" >&2
+      exit 1
+    fi
+    echo "after_create: refreshing already-merged branch $BRANCH $branch_sha -> $target_sha (target $MERGE_TARGET_BRANCH)"
+    return 0
+  done
+}
+
+_symphony_refresh_merged_branch
 # Reuse the branch if a prior worktree was reaped without prune.
-if git rev-parse --verify "$BRANCH" >/dev/null 2>&1; then
+if git show-ref --verify --quiet "refs/heads/$BRANCH"; then
   git worktree add "$WORKTREE_PATH" "$BRANCH"
 elif [ -n "$FEATURE_BASE_BRANCH" ]; then
   git worktree add "$WORKTREE_PATH" -b "$BRANCH" "$FEATURE_BASE_BRANCH"

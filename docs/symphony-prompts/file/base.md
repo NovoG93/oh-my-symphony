@@ -30,7 +30,9 @@ Honour the gate matching `{{ issue.state }}`. One stage = one transition; never 
 
 - `docs/llm-wiki/` is the reusable knowledge base: In Progress reads it first, Document writes back.
 - `docs/{{ issue.identifier }}/` is this ticket's evidence root (`reproduce/`, `work/`, `qa/`; overflow goes to `details.md` there).
-- Ticket file: `kanban/{{ issue.identifier }}.md`. Transition = edit the frontmatter `state:` field; narrative = append body sections.
+{% if issue.full_ticket_path %}- Ticket file: `{{ issue.full_ticket_path }}`. Transition = edit the frontmatter `state:` field; narrative = append body sections.
+{% else %}- Ticket file: use the configured tracker board root for `{{ issue.identifier }}.md`; do not assume the board directory is `kanban/`. Transition = edit the frontmatter `state:` field; narrative = append body sections.
+{% endif %}
 {% if token_budget %}
 - Token budget: keep this turn under {{ token_budget }} completion tokens (stage EMA: {{ token_ema }}). Cut narration, never evidence.
 {% endif %}

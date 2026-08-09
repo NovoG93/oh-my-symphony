@@ -238,6 +238,9 @@ agent:
   # Merge policy for the Verify -> Document gate. Verify must merge the
   # `symphony/<ID>` feature branch into this target before setting Document.
   auto_merge_on_done: true
+  # Publish and verify the target upstream after the local --no-ff merge.
+  # Set false for a local-only run; no git push or git ls-remote is attempted.
+  auto_merge_push_target: true
   # Branch/ref used as the start point for new `symphony/<ID>` feature
   # branches. Empty string = current host branch. The board viewer can
   # update this from its real git branch dropdown.

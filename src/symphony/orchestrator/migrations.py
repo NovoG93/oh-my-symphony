@@ -22,6 +22,7 @@ recorded it as applied.
 from __future__ import annotations
 
 import sqlite3
+import uuid
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -35,6 +36,8 @@ from typing import Callable
 FIRST_LEGACY_FLOW_TABLE_VERSION = 2
 # Back-compat alias for anything still importing the old name.
 FIRST_GOVERNED_WORKFLOW_VERSION = FIRST_LEGACY_FLOW_TABLE_VERSION
+RELEASE_PROVENANCE_VERSION = 5
+RELEASE_CYCLE_AUTHORITY_VERSION = 6
 
 
 @dataclass(frozen=True)
@@ -289,11 +292,234 @@ def _migrate_002_legacy_flow_tables(conn: sqlite3.Connection) -> None:
     )
 
 
+def _migrate_003_release_gates(conn: sqlite3.Connection) -> None:
+    """Host-owned authority for pending and approved application releases.
+
+    Board labels and ticket bodies are worker-editable, so they remain useful
+    routing/audit signals but cannot authorize finalizer dispatch.  The single
+    row per finalizer is written as ``pending`` before verifier dispatch or
+    finalizer relinking, then upgraded atomically only after GREEN validation.
+    """
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS release_gates (
+            finalizer_identifier TEXT PRIMARY KEY,
+            verifier_issue_id TEXT NOT NULL,
+            verifier_identifier TEXT NOT NULL,
+            expected_contract_sha256 TEXT NOT NULL,
+            cycle_fingerprint TEXT NOT NULL,
+            approved_fingerprint TEXT,
+            status TEXT NOT NULL CHECK(status IN ('pending', 'approved')),
+            target_branch TEXT,
+            approved_target_sha TEXT,
+            verifier_run_id TEXT,
+            finalizer_run_id TEXT,
+            generation TEXT NOT NULL DEFAULT '',
+            finalizer_completed_at TEXT,
+            updated_at TEXT NOT NULL
+        )
+        """
+    )
+
+
+def _migrate_004_release_finalizer_run_binding(conn: sqlite3.Connection) -> None:
+    """Bind terminal finalizer state to one host-authorized run."""
+    columns = {
+        str(row[1]) for row in conn.execute("PRAGMA table_info(release_gates)")
+    }
+    if "finalizer_run_id" not in columns:
+        conn.execute(
+            "ALTER TABLE release_gates ADD COLUMN finalizer_run_id TEXT"
+        )
+    conn.execute(
+        """
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_release_gates_verifier
+        ON release_gates(verifier_identifier)
+        """
+    )
+
+
+def _migrate_005_release_provenance(conn: sqlite3.Connection) -> None:
+    """Durable cycle generations, finalizer proof, and evidence identity."""
+    _add_column_if_missing(
+        conn, "release_gates", "generation", "TEXT NOT NULL DEFAULT ''"
+    )
+    _add_column_if_missing(
+        conn, "release_gates", "finalizer_completed_at", "TEXT"
+    )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS release_evidence_issues (
+            issue_id TEXT PRIMARY KEY,
+            identifier TEXT NOT NULL UNIQUE,
+            finalizer_identifier TEXT NOT NULL,
+            role TEXT NOT NULL CHECK(role IN ('verifier', 'finalizer')),
+            cycle_generation TEXT NOT NULL,
+            retired INTEGER NOT NULL DEFAULT 0,
+            recorded_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        )
+        """
+    )
+    conn.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_release_evidence_finalizer
+        ON release_evidence_issues(finalizer_identifier, role, retired)
+        """
+    )
+    # v3/v4 rows predate host-owned cycle generations and durable evidence
+    # identity.  Never grandfather an old APPROVED row: it has no exact-cycle
+    # finalizer completion provenance, so force a fresh verification.  Pending
+    # rows also get a new timestamp and lose any pre-migration run binding so a
+    # lease started before this migration cannot authorize the new generation.
+    migrated_at = datetime.now(timezone.utc).isoformat()
+    rows = conn.execute(
+        """
+        SELECT finalizer_identifier, verifier_issue_id, verifier_identifier
+        FROM release_gates
+        """
+    ).fetchall()
+    for row in rows:
+        generation = uuid.uuid4().hex
+        conn.execute(
+            """
+            UPDATE release_gates
+            SET generation = ?,
+                approved_fingerprint = NULL,
+                status = 'pending',
+                target_branch = NULL,
+                approved_target_sha = NULL,
+                verifier_run_id = NULL,
+                finalizer_run_id = NULL,
+                finalizer_completed_at = NULL,
+                updated_at = ?
+            WHERE finalizer_identifier = ?
+            """,
+            (generation, migrated_at, str(row[0])),
+        )
+        conn.execute(
+            """
+            INSERT INTO release_evidence_issues (
+                issue_id, identifier, finalizer_identifier, role,
+                cycle_generation, retired, recorded_at, updated_at
+            ) VALUES (?, ?, ?, 'verifier', ?, 0, ?, ?)
+            ON CONFLICT(issue_id) DO UPDATE SET
+                identifier = excluded.identifier,
+                finalizer_identifier = excluded.finalizer_identifier,
+                role = 'verifier',
+                cycle_generation = excluded.cycle_generation,
+                retired = 0,
+                updated_at = excluded.updated_at
+            """,
+            (
+                str(row[1]),
+                str(row[2]),
+                str(row[0]),
+                generation,
+                migrated_at,
+                migrated_at,
+            ),
+        )
+
+
+def _migrate_006_release_cycle_authority(conn: sqlite3.Connection) -> None:
+    """Durable lifecycle-item identity and non-replayable completion proof.
+
+    Repair/verifier labels live on worker-editable board files, so they cannot
+    be the identity used to reconcile a partially written release cycle.  The
+    host records the exact ticket allocated for each fingerprint/role/key in
+    this table and restores mutable board metadata from that mapping.
+
+    Completed v5 finalizers have no ticket-version token.  They therefore
+    cannot prove that a later terminal board edit is the transition produced
+    by the bound run; invalidate those approvals and require fresh Verify.
+    """
+    _add_column_if_missing(
+        conn, "release_gates", "finalizer_completion_token", "TEXT"
+    )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS release_cycle_items (
+            finalizer_identifier TEXT NOT NULL,
+            cycle_fingerprint TEXT NOT NULL,
+            item_role TEXT NOT NULL CHECK(item_role IN ('repair', 'verifier')),
+            item_key TEXT NOT NULL,
+            issue_id TEXT NOT NULL UNIQUE,
+            identifier TEXT NOT NULL UNIQUE,
+            recorded_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            PRIMARY KEY (
+                finalizer_identifier, cycle_fingerprint, item_role, item_key
+            )
+        )
+        """
+    )
+    conn.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_release_cycle_items_ticket
+        ON release_cycle_items(identifier, item_role)
+        """
+    )
+
+    migrated_at = datetime.now(timezone.utc).isoformat()
+    completed = conn.execute(
+        """
+        SELECT finalizer_identifier, verifier_issue_id, verifier_identifier
+        FROM release_gates
+        WHERE finalizer_completed_at IS NOT NULL
+           OR (status = 'approved' AND finalizer_run_id IS NOT NULL)
+        """
+    ).fetchall()
+    for row in completed:
+        generation = uuid.uuid4().hex
+        conn.execute(
+            """
+            UPDATE release_gates
+            SET generation = ?,
+                approved_fingerprint = NULL,
+                status = 'pending',
+                target_branch = NULL,
+                approved_target_sha = NULL,
+                verifier_run_id = NULL,
+                finalizer_run_id = NULL,
+                finalizer_completed_at = NULL,
+                finalizer_completion_token = NULL,
+                updated_at = ?
+            WHERE finalizer_identifier = ?
+            """,
+            (generation, migrated_at, str(row[0])),
+        )
+        conn.execute(
+            """
+            UPDATE release_evidence_issues
+            SET cycle_generation = ?, retired = 0, updated_at = ?
+            WHERE issue_id = ? AND identifier = ?
+            """,
+            (generation, migrated_at, str(row[1]), str(row[2])),
+        )
+
+
 MIGRATIONS: tuple[Migration, ...] = (
     Migration(1, "baseline_runs_and_issue_flags", _migrate_001_baseline),
     # The recorded name stays "governed_workflow_ledger" so existing
     # `schema_migrations` rows keep matching; the tables it creates are inert.
     Migration(2, "governed_workflow_ledger", _migrate_002_legacy_flow_tables),
+    Migration(3, "release_gate_authority", _migrate_003_release_gates),
+    Migration(
+        4,
+        "release_finalizer_run_binding",
+        _migrate_004_release_finalizer_run_binding,
+    ),
+    Migration(
+        RELEASE_PROVENANCE_VERSION,
+        "release_provenance",
+        _migrate_005_release_provenance,
+    ),
+    Migration(
+        RELEASE_CYCLE_AUTHORITY_VERSION,
+        "release_cycle_authority",
+        _migrate_006_release_cycle_authority,
+    ),
 )
 
 LATEST_SCHEMA_VERSION = MIGRATIONS[-1].version
@@ -321,8 +547,10 @@ def backup_database(conn: sqlite3.Connection, path: Path) -> Path:
     WAL database's committed contents are split across `-wal` and the main
     file; a plain copy of one of them can lose recent writes.
     """
-    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-    destination = path.with_name(f"{path.name}.backup-{stamp}")
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S.%fZ")
+    destination = path.with_name(
+        f"{path.name}.backup-{stamp}-{uuid.uuid4().hex[:8]}"
+    )
     target = sqlite3.connect(destination)
     try:
         conn.backup(target)
@@ -348,12 +576,31 @@ def apply_migrations(conn: sqlite3.Connection, path: Path) -> list[int]:
     crosses_backup_line = version < FIRST_LEGACY_FLOW_TABLE_VERSION <= max(
         m.version for m in pending
     )
-    if crosses_backup_line and _has_existing_runs(conn):
+    release_provenance_backfill = (
+        version < RELEASE_PROVENANCE_VERSION
+        <= max(migration.version for migration in pending)
+        and _has_existing_release_gates(conn)
+    )
+    release_cycle_authority_backfill = (
+        version < RELEASE_CYCLE_AUTHORITY_VERSION
+        <= max(migration.version for migration in pending)
+        and _has_existing_release_gates(conn)
+    )
+    if (
+        crosses_backup_line and _has_existing_runs(conn)
+    ) or release_provenance_backfill or release_cycle_authority_backfill:
         backup_database(conn, path)
 
     for migration in pending:
         conn.execute("BEGIN IMMEDIATE")
         try:
+            # Another service may have migrated the shared WAL database after
+            # our optimistic `pending` snapshot but before this write lock.
+            # Re-read under the lock so concurrent starters never double-insert
+            # the same schema_migrations version.
+            if current_schema_version(conn) >= migration.version:
+                conn.execute("COMMIT")
+                continue
             migration.apply(conn)
             conn.execute(
                 """
@@ -382,3 +629,12 @@ def _has_existing_runs(conn: sqlite3.Connection) -> bool:
         return False
     row = conn.execute("SELECT 1 FROM runs LIMIT 1").fetchone()
     return row is not None
+
+
+def _has_existing_release_gates(conn: sqlite3.Connection) -> bool:
+    table = conn.execute(
+        "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'release_gates'"
+    ).fetchone()
+    if table is None:
+        return False
+    return conn.execute("SELECT 1 FROM release_gates LIMIT 1").fetchone() is not None

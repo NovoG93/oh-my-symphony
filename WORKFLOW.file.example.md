@@ -246,6 +246,9 @@ agent:
   # docs/ is intentionally branch-local and merges normally. The post-Done
   # auto-merge remains a best-effort fallback for older prompts.
   auto_merge_on_done: true
+  # Publish and verify the target upstream after the local --no-ff merge.
+  # Set false for a local-only run; no git push or git ls-remote is attempted.
+  auto_merge_push_target: true
   # Branch/ref used as the start point for new `symphony/<ID>` feature
   # branches. Empty string = current host branch. The board viewer can
   # update this from its real git branch dropdown.

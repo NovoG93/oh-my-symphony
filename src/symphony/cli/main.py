@@ -5,6 +5,7 @@ Subcommands:
     symphony tui [WORKFLOW]        run orchestrator + Jira-style CLI Kanban TUI
     symphony board ...             file-tracker board helper
     symphony doctor [WORKFLOW]     preflight checks for WORKFLOW.md
+    symphony release check ...     validate app release evidence
     symphony service ...           managed background orchestrator
     symphony wiki-sweep ...        scan docs/llm-wiki/ for dup/orphan/stale rows
     symphony runs [WORKFLOW]       recent run-registry attempts
@@ -411,6 +412,10 @@ def main(argv: list[str] | None = None) -> int:
         from . import doctor
 
         return doctor.main(raw_argv[1:])
+    if raw_argv and raw_argv[0] == "release":
+        from . import release
+
+        return release.main(raw_argv[1:])
     if raw_argv and raw_argv[0] == "project":
         from . import project
 
