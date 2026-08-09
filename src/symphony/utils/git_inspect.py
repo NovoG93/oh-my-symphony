@@ -11,7 +11,7 @@ injection via refs that look like `--flags`.
 from __future__ import annotations
 
 import subprocess
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 
 from ..workflow.constants import SYMPHONY_BRANCH_PREFIX
 
@@ -25,6 +25,30 @@ DEFAULT_LOG_LIMIT = 50
 COMPARE_COMMIT_CAP = 100
 MAX_PATCH_CHARS = 200_000
 
+# Ignored files can change what an application launches even though ordinary
+# Git diff/status queries omit them. These roots are the narrow exception for
+# Symphony's own control data and reproducible dependency/tool caches. Product
+# output roots such as dist/, build/, target/, and .next/ are intentionally not
+# exempt.
+_RELEASE_CONTROL_ROOTS = frozenset(
+    {"kanban", ".locks", "log", ".symphony", ".oneshot"}
+)
+_RELEASE_DEPENDENCY_CACHE_PARTS = frozenset(
+    {
+        "node_modules",
+        ".venv",
+        "venv",
+        ".tox",
+        ".nox",
+        "__pycache__",
+        ".pytest_cache",
+        ".ruff_cache",
+        ".mypy_cache",
+        ".pyright",
+        ".cache",
+    }
+)
+
 
 def _run_git(
     workflow_dir: Path, *args: str
@@ -35,6 +59,22 @@ def _run_git(
             cwd=str(workflow_dir),
             capture_output=True,
             text=True,
+            timeout=_GIT_TIMEOUT_S,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+
+
+def _run_git_bytes(
+    workflow_dir: Path, *args: str
+) -> subprocess.CompletedProcess[bytes] | None:
+    try:
+        return subprocess.run(
+            ["git", *args],
+            cwd=str(workflow_dir),
+            capture_output=True,
+            text=False,
             timeout=_GIT_TIMEOUT_S,
             check=False,
         )
@@ -72,6 +112,221 @@ def ref_exists(workflow_dir: Path, ref: str) -> bool:
         workflow_dir, "rev-parse", "--verify", "--quiet", f"{ref}^{{commit}}"
     )
     return proc is not None and proc.returncode == 0
+
+
+def resolve_commit(workflow_dir: Path, ref: str) -> str | None:
+    """Return the host-resolved full commit SHA for ``ref``.
+
+    Release validation must bind worker evidence to a host fact rather than
+    trusting a SHA copied into JSON.  Keep the query read-only and use the
+    same failure-to-``None`` convention as the other inspection helpers.
+    """
+    proc = _run_git(
+        workflow_dir, "rev-parse", "--verify", "--quiet", f"{ref}^{{commit}}"
+    )
+    if proc is None or proc.returncode != 0:
+        return None
+    sha = proc.stdout.strip().lower()
+    if len(sha) != 40 or any(char not in "0123456789abcdef" for char in sha):
+        return None
+    return sha
+
+
+def resolve_local_branch_commit(workflow_dir: Path, branch: str) -> str | None:
+    """Resolve only an actual local branch, never a commit-ish/reflog expression."""
+    if not branch or branch != branch.strip() or branch.startswith("-"):
+        return None
+    full_ref = f"refs/heads/{branch}"
+    valid = _run_git(workflow_dir, "check-ref-format", full_ref)
+    if valid is None or valid.returncode != 0:
+        return None
+    return resolve_commit(workflow_dir, full_ref)
+
+
+def changed_paths_since(
+    workflow_dir: Path, base_commit_sha: str
+) -> tuple[str, ...] | None:
+    """Return workspace paths that can differ from an exact release base.
+
+    This includes ignored untracked runtime files because they may influence
+    the launched application. Only Symphony control data and conventional
+    dependency/tool cache roots are omitted; generated product roots such as
+    ``dist``, ``build``, ``target``, and ``.next`` remain visible.
+    """
+    normalized_sha = base_commit_sha.strip().lower()
+    if len(normalized_sha) != 40 or any(
+        char not in "0123456789abcdef" for char in normalized_sha
+    ):
+        return None
+    tracked = _run_git_bytes(
+        workflow_dir,
+        "diff",
+        "--name-only",
+        "-z",
+        normalized_sha,
+        "--",
+    )
+    untracked = _run_git_bytes(
+        workflow_dir,
+        "ls-files",
+        "--others",
+        "--exclude-standard",
+        "-z",
+        "--",
+    )
+    ignored = _run_git_bytes(
+        workflow_dir,
+        "status",
+        "--porcelain=v1",
+        "-z",
+        "--ignored=matching",
+        "--untracked-files=normal",
+        "--",
+    )
+    if (
+        tracked is None
+        or tracked.returncode != 0
+        or untracked is None
+        or untracked.returncode != 0
+        or ignored is None
+        or ignored.returncode != 0
+    ):
+        return None
+    try:
+        tracked_paths = {
+            raw.decode("utf-8")
+            for raw in tracked.stdout.split(b"\0")
+            if raw
+        }
+        workspace_only_paths = {
+            raw.decode("utf-8")
+            for raw in untracked.stdout.split(b"\0")
+            if raw
+        }
+        workspace_only_paths.update(
+            raw[3:].decode("utf-8")
+            for raw in ignored.stdout.split(b"\0")
+            if raw.startswith(b"!! ")
+        )
+    except UnicodeDecodeError:
+        return None
+    return tuple(
+        sorted(
+            tracked_paths
+            | {
+                path
+                for path in workspace_only_paths
+                if not _is_release_infrastructure_path(PurePosixPath(path))
+            }
+        )
+    )
+
+
+def _is_release_infrastructure_path(path: PurePosixPath) -> bool:
+    if not path.parts:
+        return False
+    return path.parts[0] in _RELEASE_CONTROL_ROOTS or any(
+        part in _RELEASE_DEPENDENCY_CACHE_PARTS for part in path.parts
+    )
+
+
+def is_git_stageable_path(
+    workflow_dir: Path, repo_relative_path: str
+) -> bool | None:
+    """Whether a release evidence path is tracked or can be staged.
+
+    ``False`` means an untracked path is ignored. ``None`` means Git could not
+    establish the status, which release validation must treat as an error.
+    """
+    tracked = _run_git(
+        workflow_dir,
+        "ls-files",
+        "--error-unmatch",
+        "--",
+        repo_relative_path,
+    )
+    if tracked is None:
+        return None
+    if tracked.returncode == 0:
+        return True
+    if tracked.returncode != 1:
+        return None
+    ignored = _run_git(
+        workflow_dir,
+        "check-ignore",
+        "--quiet",
+        "--no-index",
+        "--",
+        repo_relative_path,
+    )
+    if ignored is None:
+        return None
+    if ignored.returncode == 0:
+        return False
+    if ignored.returncode == 1:
+        return True
+    return None
+
+
+def read_commit_blob(
+    workflow_dir: Path, commit_sha: str, repo_relative_path: str
+) -> bytes | None:
+    """Read one regular file from an exact commit without touching the checkout.
+
+    The commit must already be a host-resolved full SHA.  Paths use repository
+    POSIX syntax and are rejected before they can become part of Git's
+    ``<tree>:<path>`` revision syntax.  ``ls-tree`` also rejects symlink and
+    submodule entries, so callers never follow a checkout symlink by accident.
+    """
+    normalized_sha = commit_sha.strip().lower()
+    if len(normalized_sha) != 40 or any(
+        char not in "0123456789abcdef" for char in normalized_sha
+    ):
+        return None
+    if (
+        not repo_relative_path
+        or repo_relative_path.startswith(("/", "-"))
+        or "\\" in repo_relative_path
+        or ":" in repo_relative_path
+        or any(char.isspace() and char not in {" "} for char in repo_relative_path)
+    ):
+        return None
+    posix_path = PurePosixPath(repo_relative_path)
+    if (
+        str(posix_path) != repo_relative_path
+        or any(part in {"", ".", ".."} for part in posix_path.parts)
+    ):
+        return None
+
+    tree = _run_git_bytes(
+        workflow_dir,
+        "ls-tree",
+        "-z",
+        normalized_sha,
+        "--",
+        repo_relative_path,
+    )
+    if tree is None or tree.returncode != 0:
+        return None
+    records = [record for record in tree.stdout.split(b"\0") if record]
+    if len(records) != 1 or b"\t" not in records[0]:
+        return None
+    metadata, raw_name = records[0].split(b"\t", 1)
+    try:
+        mode, object_type, object_sha = metadata.decode("ascii").split(" ", 2)
+        expected_name = repo_relative_path.encode("utf-8")
+    except (UnicodeEncodeError, UnicodeDecodeError, ValueError):
+        return None
+    if (
+        raw_name != expected_name
+        or mode not in {"100644", "100755"}
+        or object_type != "blob"
+    ):
+        return None
+    blob = _run_git_bytes(workflow_dir, "cat-file", "blob", object_sha)
+    if blob is None or blob.returncode != 0:
+        return None
+    return blob.stdout
 
 
 def _parse_refs(decorations: str) -> list[str]:

@@ -118,10 +118,12 @@ Inputs:
 Outputs:
 - `$ONESHOT_ROOT/.oneshot/vault/brief.md` with sections: Goal, Audience, Done criteria, Constraints, Out of scope, Proof requirements
 - If the product appears to be a web/browser app (HTML, React, Vue, Svelte, Next, Astro, etc.), `touch $ONESHOT_ROOT/.oneshot/vault/.is_browser_app`
+- If the request is customer-facing app delivery or release integration, inventory every visible control and requirement and `touch $ONESHOT_ROOT/.oneshot/vault/.is_app_release`
 
 Rules:
 - Done criteria MUST be objective — commands that can be run, files that must exist, behaviors that can be checked.
 - For browser apps the Proof requirements section MUST include "Playwright spec covering <flows>" and "qa-report.pdf produced".
+- For app delivery the Proof requirements MUST include a repository-root `release-contract.yaml`, exact-target native evidence at desktop/tablet/mobile, and a fresh verifier after every repair.
 - Match scope to the prompt — a one-line bugfix needs a brief shorter than a whole product. Don't over-specify.
 - Do NOT plan or implement. Brief only.
 
@@ -147,6 +149,7 @@ Outputs:
 - `$ONESHOT_ROOT/.oneshot/vault/plan.md` (ticket table + per-ticket §spec sections)
 - `$ONESHOT_ROOT/.oneshot/vault/architecture.md` (system design, components, data model)
 - `$ONESHOT_ROOT/.oneshot/vault/contracts.md` (interface contracts between Build slices)
+- For `.is_app_release`, `.oneshot/vault/release-contract.draft.yaml` naming the target branch, `DELIVER-1` as finalizer, every implementation ticket, launch command, intended runner path/command, desktop/tablet/mobile viewports, and every requirement/control across all six required check kinds. Plan does not invent final runner hashes.
 
 Plan quality rules:
 - Each Build ticket owns one contract boundary: a route, data model, UI flow, CLI command, integration, or proof surface.
@@ -154,6 +157,8 @@ Plan quality rules:
 - Keep Build tickets small enough for one worker: roughly <=5 files and <=500 net lines.
 - Acceptance criteria must be observable: `WHEN <event> THEN <behavior>` or `IF <edge case> THEN <behavior>`.
 - Separate application development, verification, browser QA, and delivery work. Do not hide test/commit prep inside a giant Build ticket.
+- App delivery uses an `app-release` verifier and an `app-release-finalizer`. Its verifier writes release outputs only below `docs/<verifier>/qa/`, with the manifest fixed at `release-evidence.json`; a historical ledger GREEN never approves a changed target.
+- Every app-release plan includes a dedicated final Build slice after the application/test slices. That slice owns the final native release-runner sources and repository-root `release-contract.yaml`: it removes placeholders, hashes the final repo-relative runner bytes, validates the contract, and lands both on the target before `VERIFY-*` may start. The verifier depends on this slice and never edits either authority file.
 
 `plan.md` must contain:
 - a task table in execution order with ID, title, starting state, dependencies, owned contract, files/areas, acceptance summary, and verification command;
@@ -196,7 +201,9 @@ symphony board new BUILD-1 "<title>" --priority 2 --state Build \
 # Repeat the same description-file shape for BUILD-2, BUILD-3, etc. Each
 # ticket gets its own concrete goal/scope/dependencies/criteria/tests.
 
-symphony board new VERIFY-1 "Verify all build slices" --priority 2 --state Verify \
+verify_label=""
+[ -f "$ONESHOT_ROOT/.oneshot/vault/.is_app_release" ] && verify_label="--label app-release"
+symphony board new VERIFY-1 "Verify all build slices" --priority 2 --state Verify $verify_label \
   --description "Goal:
 - Re-run every Build claim and prove the integrated result.
 
@@ -205,11 +212,12 @@ Scope:
 - Out: application code edits.
 
 Dependencies:
-- blocked_by: all BUILD-* tickets.
+- blocked_by: all BUILD-* tickets, including the app-release runner/contract-finalization slice.
 
 Acceptance criteria:
 - WHEN each claim command is rerun THEN it SHALL pass from a clean checkout.
 - WHEN the full suite runs THEN it SHALL pass or record exact failing evidence.
+- IF app-release THEN the committed runner sources SHALL byte-match their non-placeholder hashes in the committed release contract before evidence is generated.
 
 Verification:
 - Use each claim's run-to-prove command.
@@ -240,7 +248,9 @@ Verification:
 - npx playwright test tests/e2e/qa.spec.ts --reporter=list,json
 - bash .claude/skills/symphony-skill/oneshot/templates/qa-pdf.sh"
 
-symphony board new DELIVER-1 "Final packaging + sign-off" --priority 2 --state Deliver \
+finalizer_label=""
+[ -f "$ONESHOT_ROOT/.oneshot/vault/.is_app_release" ] && finalizer_label="--label app-release-finalizer"
+symphony board new DELIVER-1 "Final packaging + sign-off" --priority 2 --state Deliver $finalizer_label \
   --description "Goal:
 - Run the delivery gate, write delivery.md, and commit the delivered result.
 
@@ -325,6 +335,7 @@ You are the Verify lane. You are an ADVERSARY to `claims.md` — re-prove every 
 Inputs:
 - `$ONESHOT_ROOT/.oneshot/vault/plan.md`
 - `$ONESHOT_ROOT/.oneshot/vault/claims.md`
+- For `app-release`, `$ONESHOT_ROOT/release-contract.yaml` and the exact merged target commit
 
 Outputs:
 - append to `$ONESHOT_ROOT/.oneshot/vault/verification.md`
@@ -334,6 +345,7 @@ Workflow:
 2. Exercise integration points across slices (start the dev server; curl the API; etc.).
 3. Run the FULL test suite — not just slice-specific tests.
 4. Type-check + lint the whole project.
+   For `app-release`, first confirm the dedicated runner/contract-finalization Build slice is merged, then rebase this evidence-only verifier branch onto the exact current target tip and confirm that SHA is an ancestor; inability to synchronize is an environment error that stays in `Verify`. Inventory the whole contract, run its already-finalized native browser/runtime matrix against that SHA at desktop/tablet/mobile as required, and write native JSON, non-empty hashed artifacts, and the fixed manifest `docs/{{ issue.identifier }}/qa/release-evidence.json`, all below that verifier's `qa/` directory. Never edit the contract or declared runner sources in Verify. Run `symphony release check "$ONESHOT_ROOT/WORKFLOW.md" --ticket {{ issue.identifier }} --workspace "$PWD"`; only exit 0 is current approval. The host snapshots this evidence branch but never merges it into the target.
 5. Append verdict:
 
 ```bash
@@ -352,8 +364,10 @@ EOF
    - For each verified Build ticket, set its state to `QA` (if `$ONESHOT_ROOT/.oneshot/vault/.is_browser_app` exists) or `Polish` (otherwise; or `Deliver` for tiny-scope plans where Polish is skipped).
    - Set this Verify ticket → `Done`.
 7. If RED:
-   - For each ticket whose claim didn't reproduce, set its state to `Build` and append `## Issues` to its kanban file with the exact discrepancy + repro command.
-   - Set this Verify ticket → `Done`. A fresh Verify ticket will be needed after fixes.
+   - For `app-release`, Evidence, schema, or environment errors stay in `Verify`; correct and rerun this verifier's evidence only. A structurally valid repairable RED must request the normal forward historical transition by setting this verifier to `Done`; the file-tracker host groups repairs, creates the fresh verifier, and relinks the finalizer. Do not reopen or spawn those tickets yourself.
+   - For non-app work, set each ticket whose claim didn't reproduce to `Build`, append `## Issues` with the exact discrepancy + repro command, set this Verify ticket to `Done`, and create the required fresh Verify ticket.
+
+For `app-release`, never use historical `verification.md` GREEN as approval. The app-release RED rule above replaces the non-app manual reopen workflow.
 
 Use `sed -i.bak 's/^state: .*/state: <STATE>/' "$ONESHOT_ROOT/kanban/<ID>.md" && rm -f "$ONESHOT_ROOT/kanban/<ID>.md.bak"` for transitions.
 
@@ -361,6 +375,8 @@ CONSTRAINT: do NOT edit application code. Verify is read-only on the codebase.
 
 {% elsif issue.state == "QA" %}
 You are the QA lane (browser apps only). Drive the running app via Playwright as a black-box.
+
+For `app-release`, the contract-declared native runner/spec was finalized by its Build slice before Verify. Execute it without edits. If selectors or coverage require a runner change, send that work back to Build and require a fresh target-bound verifier; do not mutate approved authority in QA.
 
 Inputs:
 - `$ONESHOT_ROOT/.oneshot/vault/brief.md` (Done criteria + Proof requirements)
@@ -377,29 +393,49 @@ Setup:
 ```bash
 cd "$ONESHOT_ROOT"
 mkdir -p .oneshot/vault/artifacts/screenshots .oneshot/vault/artifacts/test-results
-if [ ! -f tests/e2e/qa.spec.ts ]; then
-  mkdir -p tests/e2e
-  cp .claude/skills/symphony-skill/oneshot/templates/playwright-qa.spec.ts tests/e2e/qa.spec.ts
+if [ -f package.json ]; then
+  if [ ! -f tests/e2e/qa.spec.ts ]; then
+    mkdir -p tests/e2e
+    cp .claude/skills/symphony-skill/oneshot/templates/playwright-qa.spec.ts tests/e2e/qa.spec.ts
+  fi
+  npm i -D @playwright/test axe-playwright marked
+  npx playwright install chromium --with-deps
+else
+  echo "No package.json: use the project-native browser runner declared by release-contract.yaml."
 fi
-test -f package.json || { echo "QA lane requires a node project (no package.json found)" >&2; exit 1; }
-npm i -D @playwright/test axe-playwright marked
-npx playwright install chromium --with-deps
 ```
 
 Adapt `tests/e2e/qa.spec.ts` to cover every flow listed in brief.md's Proof requirements: golden path per persona; edge cases (empty/oversized/duplicate/network drop/back-button); auth boundary (if in scope); accessibility (axe-core; fail on serious+); one screenshot per visible step.
 
+Before any browser run, mechanically reject an unadapted spec: if the selected spec or runner config contains `EDIT-ME`, `placeholder`, or template selectors/URLs, stop and replace them with the real launch path and controls.
+
+```bash
+if [ -f tests/e2e/qa.spec.ts ] && grep -Eiq 'EDIT-ME|placeholder|replace-with-real' tests/e2e/qa.spec.ts; then
+  echo "browser QA spec still contains EDIT-ME/placeholder values" >&2
+  exit 1
+fi
+```
+
 Run:
 ```bash
-QA_BASE_URL="<the running app URL>" npx playwright test tests/e2e/qa.spec.ts \
-  --reporter=list,json \
-  --output=.oneshot/vault/artifacts/test-results
+if [ -f package.json ]; then
+  QA_BASE_URL="<the running app URL>" npx playwright test tests/e2e/qa.spec.ts \
+    --reporter=list,json --output=.oneshot/vault/artifacts/test-results
+else
+  <project-native-browser-runner-command-producing-JSON-and-screenshots>
+fi
 ```
 
 Build `qa-report.md` (see `.claude/skills/symphony-skill/oneshot/reference/qa-browser.md` for exact format). End with a single literal line: `Verdict: APPROVED FOR DELIVERY` or `Verdict: BLOCKED — see Findings`.
 
 Render PDF (writes the sha256 to a separate file the Deliver gate verifies):
 ```bash
-bash .claude/skills/symphony-skill/oneshot/templates/qa-pdf.sh
+if [ -f package.json ]; then
+  bash .claude/skills/symphony-skill/oneshot/templates/qa-pdf.sh
+else
+  <project-native-PDF-renderer-command>
+  shasum -a 256 .oneshot/vault/artifacts/qa-report.pdf > .oneshot/vault/artifacts/qa-report.pdf.sha256
+fi
 test -s .oneshot/vault/artifacts/qa-report.pdf || { echo "PDF not produced"; exit 1; }
 test -s .oneshot/vault/artifacts/qa-report.pdf.sha256 || { echo "sha256 not written"; exit 1; }
 ```
@@ -448,6 +484,8 @@ if [ -f .oneshot/vault/.is_browser_app ]; then
   grep -q '^Verdict: APPROVED FOR DELIVERY' .oneshot/vault/qa-report.md
 fi
 ```
+
+For `.is_app_release`, this Deliver ticket is the `app-release-finalizer`: do not start from historical ledger GREEN. Its current verifier blocker must have passed `symphony release check` in the host-owned current generation and exact run; a restarted or host-rewound verifier must return to Verify and regenerate evidence. After repairs, the host replaces that dependency with the fresh verifier before the old cycle may close.
 
 If gate passes:
 1. Write `.oneshot/vault/delivery.md` (artifacts + sha256 list, run instructions, brief.md done-criteria checklist with citations to verification.md timestamps).

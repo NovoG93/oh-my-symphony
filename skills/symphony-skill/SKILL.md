@@ -79,6 +79,22 @@ bad slices:
   and merged, the release-verification ticket runs full functionality QA on the
   merged target. Any defect becomes a new Kanban bug ticket with repro evidence
   and `blocked_by`; the release ticket loops until integration passes.
+- Machine app-release gate: for production application delivery, write
+  repository-root `release-contract.yaml`, label the verifier `app-release`,
+  and label the named delivery ticket `app-release-finalizer`. The verifier
+  writes strict `docs/<verifier>/qa/release-evidence.json` for the exact current
+  target and runs `symphony release check`; historical GREEN text is never
+  approval. Labels opt in, while the host-owned SQLite generation and exact
+  verifier/finalizer run bindings remain authority across label loss. A
+  continuation in the same live run may proceed after approval; a restarted
+  approved verifier is reset to pending Verify and must produce fresh evidence.
+  Repairable file-board failures create grouped repairs plus a fresh verifier,
+  and startup cleanup uses a peer-fenced lease. The target is the local branch
+  tip—synchronize it explicitly because Symphony does not fetch. Remote tracker
+  lifecycle mutation is unsupported: a labeled
+  transition stops before repair creation and an operator must rewind an
+  already-advanced remote card. Unselected remote workflows are not warned or
+  changed by doctor.
 - One contract owner: a ticket owns one behavior/API/data contract, not a
   grab bag.
 - Small enough for one worker: rough limit <=5 files and <=500 net lines for a

@@ -9,6 +9,8 @@ Hard gate before starting (Verify must be GREEN):
 grep -q '^verdict: GREEN' "<vault>/verification.md" || exit 1
 ```
 
+For app delivery, historical GREEN is not a start gate: the `app-release-finalizer` must depend on the fresh verifier for the current target, and its `symphony release check` result must be green. The file-tracker host creates this repair/fresh-verifier cycle; unsupported remote lifecycle mutation fails closed.
+
 1. Update every user-facing doc the change touched: README, CHANGELOG, policies, config references. Cite the verification evidence, do not restate hope.
 2. Write insight entries to `docs/llm-wiki/<topic-slug>.md` (what worked, gotchas, rejected approaches, decisions) with evidence citations, and add/refresh their `INDEX.md` rows.
 3. Write `delivery.md` in the vault: done-criteria checklist from `brief.md`, each row citing `verification.md`/`qa-report.md` evidence; run instructions; residual risk.

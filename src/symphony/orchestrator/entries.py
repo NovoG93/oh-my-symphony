@@ -28,6 +28,19 @@ class RunningEntry:
     attempt_kind: str = "initial"
     agent_kind: str = ""
     run_id: str = ""
+    # Monotonic application-release identity captured before the worker can
+    # mutate board labels.  `release_gate_*` comes from the host-owned SQLite
+    # authority row; labels remain routing/audit data only.
+    known_app_release: bool = False
+    known_release_cycle_verifier: bool = False
+    known_app_release_finalizer: bool = False
+    release_gate_finalizer: str = ""
+    release_gate_expected_contract_sha256: str = ""
+    release_gate_cycle_fingerprint: str = ""
+    release_gate_generation: str = ""
+    release_finalizer_rewind_state: str = ""
+    release_gate_exhausted: bool = False
+    release_authority_resolved: bool = False
     # Live backend driver for this attempt. Populated by `_run_agent_attempt`
     # immediately after `build_backend(...)` so `_on_codex_event` can route
     # the stall-progress predicate through `backend.is_progress_event(...)`
@@ -111,6 +124,10 @@ class RunningEntry:
     # terminal or inactive tracker move. Worker exit must not repeat that git
     # cleanup against the same worktree.
     workspace_cleanup_started: bool = False
+    workspace_cleanup_finished: asyncio.Event = field(
+        default_factory=asyncio.Event,
+        repr=False,
+    )
     # Set when the per-attempt `max_turns` ceiling halted the worker without
     # the ticket having reached a terminal state. Treated as an explicit
     # non-success outcome in `_on_worker_exit`: no automatic continuation is

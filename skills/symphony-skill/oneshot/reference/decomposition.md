@@ -101,7 +101,8 @@ BUILD-2    Auth: signup/login/session           (deps: DISCOVERY-1, BUILD-1)
 BUILD-3    API: <resource> CRUD                 (deps: DISCOVERY-1, BUILD-1, BUILD-2)
 BUILD-4    Web UI: primary customer workflow    (deps: BUILD-3)
 BUILD-5    Web UI: secondary/edge workflows     (deps: BUILD-2, BUILD-3)
-VERIFY-1   Merged-target release verification   (deps: BUILD-*)
+BUILD-6    Final release runner + contract hashes (deps: BUILD-1..5)
+VERIFY-1   Merged-target release verification   (deps: BUILD-1..6)
 QA-1       Playwright golden + accessibility    (deps: VERIFY-1)
 DELIVER-1  Package + README + tag               (deps: VERIFY-1, QA-1)
 ```
@@ -115,6 +116,21 @@ If defects appear, `VERIFY-1` runs a defect-registration loop: create new
 Kanban bug tickets with repro evidence, expected behavior, fix boundary, and
 verification commands; add them as blockers; rerun merged-target verification
 after those blockers complete.
+
+For an application release, Plan writes
+`.oneshot/vault/release-contract.draft.yaml`, labels the release verifier
+`app-release`, labels the named delivery ticket `app-release-finalizer`, and
+creates a final Build slice that depends on the application/test slices. That
+Build slice creates the native runner, removes placeholders, writes the final
+repository-root `release-contract.yaml`, fills non-empty hashes from the final
+repo-relative runner bytes, and lands both before Verify. The verifier writes
+native results, artifacts, and the fixed
+`docs/<verifier>/qa/release-evidence.json` manifest only below that verifier's
+`qa/` directory, bound to the exact target SHA; it never edits the contract or
+runner. The host verifies declared runner sources at both the exact target
+commit and workspace. A repairable result is historical after Symphony creates grouped
+repairs and a fresh verifier; the finalizer waits for that new cycle rather
+than trusting an earlier ledger verdict.
 
 ### CLI tool
 ```

@@ -667,6 +667,143 @@ stage-specific prompt files configured by `WORKFLOW.md`.
 
 Every artefact a ticket produces lives under `docs/<TICKET-ID>/<stage>/`. See [`docs/PIPELINE.md`](docs/PIPELINE.md#per-ticket-artefact-root) for the layout, what to commit, and the `${LLM_WIKI_PATH:-./docs/llm-wiki}/` carve-out.
 
+### Machine gate for application releases
+
+Production application delivery is opt-in. Add `app-release` to the Verify
+ticket, add `app-release-finalizer` to the delivery ticket named by the
+contract, and commit `release-contract.yaml` at the project root. Symphony
+then resolves the configured target branch on the host, requires the workspace
+contract bytes to exactly match `release-contract.yaml` at that commit, and
+checks every declared runner source against both the target blob and workspace
+hash on every forward Verify transition, even when `agent.stage_contracts` is
+off. Non-app tickets keep the v0.19.0 behavior.
+
+```yaml
+schema_version: 1
+target_branch: main
+finalizer_ticket: DELIVER-1
+implementation_tickets: [BUILD-1, BUILD-2]
+launch:
+  command: npm run dev
+  ready_url: http://127.0.0.1:3000
+runner:
+  command: npm run release:qa
+  sources:
+    - path: tools/release-runner.mjs
+      sha256: <64 lowercase hex>
+viewports:
+  desktop: {width: 1440, height: 900}
+  tablet: {width: 768, height: 1024}
+  mobile: {width: 390, height: 844}
+checks:
+  - {id: feature.primary-flow, kind: feature, description: Primary flow works, repair_group: workflow, required_viewports: [desktop, mobile]}
+  - {id: control.navigation, kind: control, description: Every navigation control works, repair_group: navigation, required_viewports: [desktop, mobile]}
+  - {id: visual.layout, kind: visual, description: Layout matches the product brief, repair_group: presentation, required_viewports: [desktop, tablet, mobile]}
+  - {id: responsive.no-clipping, kind: responsive, description: Content does not clip or overlap, repair_group: presentation, required_viewports: [desktop, tablet, mobile]}
+  - {id: accessibility.keyboard, kind: accessibility, description: Primary flow is keyboard operable, repair_group: accessibility, required_viewports: [desktop]}
+  - {id: reliability.runtime, kind: reliability, description: Runtime stays free of unexpected errors, repair_group: runtime, required_viewports: [desktop]}
+```
+
+Each verifier writes release outputs only below `docs/<VERIFIER>/qa/`. The
+manifest path is fixed at `release-evidence.json`; native results and cited
+artifacts sit beside it. The manifest binds the raw contract hash, full target
+SHA, runner output, exact check coverage, viewport coverage, and at least one
+contained non-empty hashed artifact per check. One check row is shown below
+for readability; a real evidence file must contain exactly one row for every
+contract check:
+
+```json
+{
+  "schema_version": 1,
+  "verifier_ticket": "VERIFY-1",
+  "contract_sha256": "<64 lowercase hex>",
+  "target_branch": "main",
+  "target_sha": "<full 40-character commit>",
+  "runner": {
+    "name": "project-native",
+    "command": "npm run release:qa",
+    "exit_code": 0,
+    "results_path": "docs/VERIFY-1/qa/native-results.json",
+    "results_sha256": "<64 lowercase hex>"
+  },
+  "checks": [{
+    "id": "feature.primary-flow", "status": "PASS",
+    "expected": "Primary flow completes", "actual": "Completed",
+    "repro": "npm run release:qa -- feature.primary-flow",
+    "viewports": ["desktop", "mobile"],
+    "artifacts": [{"path": "docs/VERIFY-1/qa/primary-flow.png", "sha256": "<64 lowercase hex>"}]
+  }],
+  "console_errors": [],
+  "failed_requests": []
+}
+```
+
+The hashed native result is itself a JSON object with exact fields
+`schema_version`, `verifier_ticket`, `contract_sha256`, `target_branch`,
+`target_sha`, and `checks`; each result check contains only `id` and `status`
+and must exactly match the evidence. Run the same host validator a transition
+uses:
+
+```bash
+symphony release check ./WORKFLOW.md --ticket VERIFY-1 --workspace /path/to/verifier-workspace
+```
+
+Missing, malformed, unsafe, or stale evidence rewinds the same verifier.
+The evidence runner command must exactly equal the contract command; its exit
+code is zero if and only if every exact native/evidence check status is PASS.
+A coherent nonzero RED creates only the product check, console/network, or
+ancestry repair groups—there is no derivative exit-code repair. Behavior,
+runtime, or ancestry failures are grouped into idempotent repair tickets and
+one fresh verifier before the finalizer may continue. The fresh verifier keeps
+the expected contract hash in a durable `release-contract-sha256-<hash>` label,
+binds its lineage with `release-finalizer-<ticket>`, and replaces only that
+finalizer's historical release-verifier blockers while preserving unrelated
+dependencies. App-release verifier execution and repair/fresh-verifier mutation
+currently require `tracker.kind: file`; Symphony refuses a labeled remote card
+before acquiring a run lease or starting an agent turn. Ordinary Linear/Jira
+boards that have not opted in remain unchanged and receive no doctor warning. Contracted source
+hashing makes the runner definition immutable for a verification cycle, but
+the declared external tooling and its runtime remain a deliberate trust
+boundary. Independent operator browser QA against the final target is still
+required.
+
+Labels opt in and aid diagnosis; they are not approval authority after the
+first dispatch. Symphony stores the verifier, finalizer, expected contract,
+unique cycle generation, and exact verifier/finalizer runs in
+`.symphony/state.db`. The finalizer cannot run until the verifier is in an
+explicit success terminal with no live lease, and it must record completion in
+the same bound run. The already bound live verifier run may continue after
+GREEN. If an approved verifier is redispatched after a restart or is returned
+to an active lane, Symphony creates a new pending generation, moves it back to
+Verify, and requires fresh evidence rather than lending old approval to a new
+run.
+
+Repair and fresh-verifier creation is also host-owned. Symphony reserves a
+deterministic file-board identifier in SQLite before creating each lifecycle
+ticket, then reconciles the exact reserved ticket. Process loss after the file
+write, concurrent services, or worker-edited labels cannot produce a second
+ticket for the same release fingerprint and repair key. Final delivery stores
+a completion token for the exact terminal ticket bytes and replacement
+generation; any later rewrite invalidates approval and starts a fresh Verify
+cycle.
+
+On startup, Symphony reopens stale or unproven terminal release state. It uses
+a dedicated cleanup lease before committing or removing a lingering evidence
+workspace, so a live peer run wins safely and a cleanup in progress fences gate
+replacement. Upgrading a database with pre-provenance release rows creates an
+online timestamped backup beside `.symphony/state.db`, assigns durable
+generations/evidence identity, and converts legacy pending or approved rows to
+fresh pending cycles. This deliberate invalidation is necessary because those
+rows cannot prove exact-run completion.
+
+Target resolution is local and read-only: `refs/heads/<target_branch>` in the
+workflow repository. Symphony does not fetch a remote, compare a deployed
+revision, or synchronize the branch for you. `symphony release check` validates
+evidence but does not grant host lifecycle authority. For a remote tracker,
+runtime refuses an opted-in release before a lease or agent turn and does not
+rewind the external card; an already-advanced card requires an operator rewind.
+Synchronize the local target and serialize external writers before release.
+
 ## Custom prompts
 
 `WORKFLOW.md` points at editable prompt files under `docs/` via the

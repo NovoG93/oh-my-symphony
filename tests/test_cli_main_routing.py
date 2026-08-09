@@ -75,6 +75,30 @@ def test_doctor_token_dispatches_to_doctor_main(
     assert captured["argv"] == ["--workflow", "WORKFLOW.md"]
 
 
+def test_release_token_dispatches_to_release_main(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: dict = {"argv": None}
+
+    def fake_release_main(argv: list[str]) -> int:
+        captured["argv"] = argv
+        return 4
+
+    monkeypatch.setattr("symphony.cli.release.main", fake_release_main)
+    rc = cli_main_mod.main(
+        ["release", "check", "WORKFLOW.md", "--ticket", "VERIFY-1", "--workspace", "."]
+    )
+    assert rc == 4
+    assert captured["argv"] == [
+        "check",
+        "WORKFLOW.md",
+        "--ticket",
+        "VERIFY-1",
+        "--workspace",
+        ".",
+    ]
+
+
 def test_hub_token_dispatches_to_hub_main(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
