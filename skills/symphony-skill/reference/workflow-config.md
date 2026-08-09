@@ -168,7 +168,7 @@ Each hook is a shell script that runs in the workspace directory:
 
 | Hook            | When                                | Common use                          |
 |-----------------|-------------------------------------|-------------------------------------|
-| `after_create`  | once, when workspace is first created | attach a `git worktree` of the host repo on a `symphony/<ID>` branch + record fork-point (`git config symphony.basesha <HEAD>`) for the end-of-run squash |
+| `after_create`  | when workspace is first created (`reuse_policy: preserve`); on every reuse with `reuse_policy: refresh` | attach a `git worktree` of the host repo on a `symphony/<ID>` branch + record fork-point (`git config symphony.basesha <HEAD>`) for the end-of-run squash |
 | `before_run`    | before every turn                   | `git fetch` to pull latest remote refs — **never `git reset --hard`**; that would discard the agent's mid-run work |
 | `after_run`     | after every turn                    | per-turn **commit-or-amend**: first turn creates `wip: turn …`, every subsequent turn `--amend --no-edit`s into it. Branch stays at one commit but each turn is durably written to `.git/objects` |
 | `before_remove` | before workspace cleanup            | `git worktree remove --force` to drop the registration before Symphony rmtree's the dir |
@@ -187,7 +187,21 @@ means the feature base/current host branch. The admin web app exposes both
 values as real local git branch dropdowns, and post-Done auto-merge is only
 a compatibility fallback for older prompt packs. Worktrees share the host's
 object DB so setup is near-instant compared to a full clone, and the branch
-is immediately visible to host-side `git` commands.
+is immediately visible to host-side `git` commands. Under the default
+`reuse_policy: preserve`, Symphony never reruns an arbitrary `after_create`
+body. For an existing workspace it only fast-forwards an exact linked
+worktree that shares this workflow repo, is clean (including non-ignored
+untracked files), and whose `symphony/<ID>` tip is strictly behind and
+contained by the configured local target branch. Symphony captures that
+branch's immutable SHA and uses it for the in-place `git merge --ff-only`; a
+later target commit is normal drift and is handled by the delivery gate. The
+worktree-local
+`symphony.basesha` then advances to the captured target SHA. Dirty, divergent,
+same-tip, missing-target, and unexpected/racing workspaces are left alone.
+When a workspace was reaped and the shell setup hook must recreate it, that
+hook uses a bounded compare-and-swap refresh of the branch ref before
+attaching the worktree. Set `reuse_policy: refresh` only when rerunning the
+configured lifecycle hook on reuse is intentional.
 
 The matching `before_remove` hook runs `git worktree remove --force`
 so cleanup also drops the `.git/worktrees/<ID>` registration; without
@@ -323,10 +337,12 @@ self-inflicted hook failures:
    sed-extracted value. Frontmatter authored on Windows is CRLF, and
    string values often pick up surrounding quotes that break shell
    substitution.
-6. **`after_create` runs once but is not idempotent.** Symphony removes
-   the workspace on hook failure before retrying, so from-scratch is
+6. **`after_create` is not assumed idempotent.** With the default
+   `reuse_policy: preserve`, Symphony does not rerun it on an existing
+   workspace; with `reuse_policy: refresh`, it intentionally does. Symphony
+   removes a workspace on hook failure before retrying, so from-scratch is
    safe — but a partial-success scenario (e.g. clone OK, checkout fail)
-   leaves you debugging in the workspace before symphony wipes it.
+   leaves you debugging in the workspace before Symphony wipes it.
    Defensive checks (`[ -d .git ] && exit 0` early, `git rev-parse
    HEAD` to validate clone, etc.) are worth the lines.
 
