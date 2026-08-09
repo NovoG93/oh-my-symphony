@@ -266,6 +266,14 @@ def _safe_repo_relative_path(value: object) -> str | None:
     return path_text
 
 
+def _safe_board_mount(value: object) -> PurePosixPath | None:
+    """Normalize a configured workspace mount path without allowing escapes."""
+    if isinstance(value, PurePosixPath):
+        value = value.as_posix()
+    safe = _safe_repo_relative_path(value)
+    return PurePosixPath(safe) if safe is not None else None
+
+
 def _duplicates(values: Iterable[str]) -> tuple[str, ...]:
     seen: set[str] = set()
     duplicates: set[str] = set()
@@ -809,6 +817,7 @@ def release_workspace_target_errors(
     repository_root: Path,
     target_sha: str,
     board_root: Path | None = None,
+    board_mount: PurePosixPath | None = None,
     allowed_roots: tuple[PurePosixPath, ...] = (),
     role: str = "release",
 ) -> tuple[str, ...]:
@@ -818,31 +827,64 @@ def release_workspace_target_errors(
     errors: list[str] = []
     if not is_merged(workspace_root, target_sha, "HEAD"):
         errors.append(f"{role} workspace HEAD must contain the approved target commit")
+    safe_board_mount = _safe_board_mount(board_mount)
+    if board_mount is not None and safe_board_mount is None:
+        errors.append(f"{role} configured workspace board mount is unsafe or empty")
     board_root_info = _repository_relative_board_root(
         repository_root=repository_root,
         board_root=board_root,
     )
     board_relative = board_root_info[0] if board_root_info is not None else None
-    if board_root is not None and board_root_info is None:
-        errors.append(
-            f"{role} "
-            + _configured_board_root_error(
-                repository_root=repository_root,
-                board_root=board_root,
-            )
-        )
-    board_mount: PurePosixPath | None = None
+    validated_board_mount: PurePosixPath | None = None
     if board_root_info is not None:
         relative_root, configured_root = board_root_info
+        if safe_board_mount is not None and safe_board_mount != relative_root:
+            errors.append(
+                f"{role} configured workspace board mount must match {relative_root}: "
+                f"{safe_board_mount}"
+            )
+        expected_mount = safe_board_mount or relative_root
         mount_error = _workspace_board_mount_error(
             workspace_root=workspace_root,
-            relative_root=relative_root,
+            relative_root=expected_mount,
             configured_root=configured_root,
         )
         if mount_error is None:
-            board_mount = relative_root
+            validated_board_mount = expected_mount
         else:
             errors.append(f"{role} {mount_error}")
+    elif board_root is not None:
+        configured_root = _resolved_configured_board_root(
+            repository_root=repository_root,
+            board_root=board_root,
+        )
+        if configured_root is None:
+            errors.append(
+                f"{role} "
+                + _configured_board_root_error(
+                    repository_root=repository_root,
+                    board_root=board_root,
+                )
+            )
+        elif safe_board_mount is None:
+            errors.append(
+                f"{role} "
+                + _configured_board_root_error(
+                    repository_root=repository_root,
+                    board_root=board_root,
+                )
+            )
+        else:
+            mount_error = _workspace_board_mount_error(
+                workspace_root=workspace_root,
+                relative_root=safe_board_mount,
+                configured_root=configured_root,
+            )
+            if mount_error is None:
+                board_relative = safe_board_mount
+                validated_board_mount = safe_board_mount
+            else:
+                errors.append(f"{role} {mount_error}")
     changed_paths = changed_paths_since(
         workspace_root,
         target_sha,
@@ -856,8 +898,8 @@ def release_workspace_target_errors(
         )
         return tuple(errors)
     control_roots = allowed_roots
-    if board_mount is not None:
-        control_roots = (*control_roots, board_mount)
+    if validated_board_mount is not None:
+        control_roots = (*control_roots, validated_board_mount)
     unexpected: list[str] = []
     for changed_path in changed_paths:
         candidate = PurePosixPath(changed_path)
@@ -935,6 +977,25 @@ def _repository_relative_board_root(
     *, repository_root: Path, board_root: Path | None
 ) -> tuple[PurePosixPath, Path] | None:
     """Resolve a configured board root and prove it is inside the repo."""
+    configured_root = _resolved_configured_board_root(
+        repository_root=repository_root,
+        board_root=board_root,
+    )
+    if configured_root is None:
+        return None
+    try:
+        relative_root = configured_root.relative_to(repository_root)
+    except ValueError:
+        return None
+    if not relative_root.parts:
+        return None
+    return PurePosixPath(relative_root.as_posix()), configured_root
+
+
+def _resolved_configured_board_root(
+    *, repository_root: Path, board_root: Path | None
+) -> Path | None:
+    """Resolve an existing configured board directory, even when out-of-tree."""
     if board_root is None:
         return None
     configured_root = board_root
@@ -942,12 +1003,9 @@ def _repository_relative_board_root(
         configured_root = repository_root / configured_root
     try:
         configured_root = configured_root.resolve(strict=True)
-        relative_root = configured_root.relative_to(repository_root)
-    except (FileNotFoundError, OSError, RuntimeError, ValueError):
+    except (FileNotFoundError, OSError, RuntimeError):
         return None
-    if not relative_root.parts or not configured_root.is_dir():
-        return None
-    return PurePosixPath(relative_root.as_posix()), configured_root
+    return configured_root if configured_root.is_dir() else None
 
 
 def _path_is_within(path: PurePosixPath, root: PurePosixPath) -> bool:
@@ -965,6 +1023,7 @@ def validate_release_contract(
     verifier_ticket: str,
     configured_target_branch: str,
     board_root: Path | None = None,
+    board_mount: PurePosixPath | None = None,
 ) -> ReleaseValidationResult:
     """Validate standard release contract/evidence paths without writes."""
     workspace_root = workspace_root.resolve()
@@ -1020,6 +1079,7 @@ def validate_release_contract(
                 repository_root=repository_root,
                 target_sha=target_sha,
                 board_root=board_root,
+                board_mount=board_mount,
                 allowed_roots=(PurePosixPath("docs") / safe_verifier,),
                 role="verifier",
             )
