@@ -221,6 +221,14 @@ Net result: `git log symphony/<ID>` shows exactly **base + 1 commit**.
 During Document, that branch is merged into the target branch with a real
 merge/PR before the ticket is allowed to move to `Done`.
 
+`agent.auto_merge_push_target` defaults to `true`: after the local
+`--no-ff` target merge, Symphony publishes and verifies the target's
+configured upstream. Set it to `false` for a local-only workflow; the same
+local merge safety gate still runs, but neither the feature branch's final
+history gate nor the target merge performs `git push` or `git ls-remote`.
+Release-evidence tickets remain local audit snapshots regardless of this
+setting.
+
 Commit-message convention:
 
 | Exit shape                         | Subject                                            |
