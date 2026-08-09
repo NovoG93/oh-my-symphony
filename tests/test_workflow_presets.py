@@ -95,13 +95,33 @@ def test_deep_prompts_are_succinct_and_carry_the_gates() -> None:
     assert "${SYMPHONY_CLI:-symphony} board new" in plan
     assert "--blocked-by" in plan
     assert "--request" in plan
+    assert "release-contract.yaml" in plan
+    assert "app-release-finalizer" in plan
     review = (deep_dir / "review.md").read_text(encoding="utf-8")
     assert "verdict: PASS" in review
     assert "Max 2 objection rounds" in review
     assert "Human Review" in review
     verify = (deep_dir / "verify.md").read_text(encoding="utf-8")
     assert "grep -q '^verdict: GREEN'" in verify
+    assert "symphony release check" in verify
+    assert "historical" in verify.lower()
+    assert '"$SYMPHONY_WORKFLOW_DIR/WORKFLOW.md"' in verify
+    assert "structurally valid repairable RED" in verify
+    assert "forward historical transition" in verify
+    assert "Evidence, schema, or environment errors stay in `Verify`" in verify
+    assert "rebase this evidence-only verifier branch" in verify
+    assert "never merges it into the target" in verify
+    assert "$SYMPHONY_WORKFLOW_PATH" not in verify
     document = (deep_dir / "document.md").read_text(encoding="utf-8")
     assert "docs/llm-wiki" in document
     assert "CHANGELOG" in document
     assert "grep -q '^verdict: GREEN'" in document
+    assert "fresh verifier" in document
+
+    intake = (deep_dir / "intake.md").read_text(encoding="utf-8")
+    assert "visible control" in intake
+    assert "release-contract.yaml" in intake
+    qa = (deep_dir / "qa.md").read_text(encoding="utf-8")
+    assert "exact target SHA" in qa
+    assert "desktop, tablet, and mobile" in qa
+    assert "release-evidence.json" in qa

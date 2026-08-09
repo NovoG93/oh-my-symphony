@@ -1176,11 +1176,22 @@ def test_worker_exit_rechecks_identity_after_finally_gate(monkeypatch):
         orch._workspace_manager = _BlockingWorkspaceManager()  # type: ignore[assignment]
         original_exit_impl = orch._on_worker_exit_impl
 
-        async def _delayed_exit_impl(issue_id, reason, error, *, owning_task=None):
+        async def _delayed_exit_impl(
+            issue_id,
+            reason,
+            error,
+            *,
+            owning_task=None,
+            defer_lease_finish=False,
+        ):
             entered_exit_impl.set()
             await release_exit_impl.wait()
             await original_exit_impl(
-                issue_id, reason, error, owning_task=owning_task
+                issue_id,
+                reason,
+                error,
+                owning_task=owning_task,
+                defer_lease_finish=defer_lease_finish,
             )
 
         monkeypatch.setattr(orch, "_on_worker_exit_impl", _delayed_exit_impl)

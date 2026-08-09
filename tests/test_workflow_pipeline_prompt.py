@@ -71,6 +71,22 @@ VERIFY_RULES = (
     "Set state to `Document`",
 )
 
+APP_RELEASE_VERIFY_RULES = (
+    "Tickets labeled `app-release`",
+    "release-contract.yaml",
+    "docs/DEMO-1/qa/release-evidence.json",
+    "exact target commit",
+    "desktop, tablet, and mobile",
+    "symphony release check",
+    "Historical Markdown or ledger GREEN text is never current approval",
+    '"$SYMPHONY_WORKFLOW_DIR/WORKFLOW.md"',
+    "structurally valid repairable RED",
+    "forward historical transition",
+    "Evidence, schema, or environment errors stay in `Verify`",
+    "rebase this evidence-only verifier branch",
+    "never merges it into the target",
+)
+
 DOCUMENT_RULES = (
     "llm-wiki",
     "INDEX.md",
@@ -229,6 +245,18 @@ def test_verify_stage_demands_review_qa_and_merge_evidence(workflow: str) -> Non
     assert "orchestrator will merge at Done" in rendered
     assert "Do NOT create the merge commit yourself" in rendered
     assert "create the explicit `--no-ff` merge commit" not in rendered
+
+
+def test_file_verify_stage_carries_the_app_release_machine_gate() -> None:
+    cfg = _load("WORKFLOW.file.example.md")
+    rendered = render(
+        cfg.prompt_template_for_state("Verify"),
+        build_prompt_env(_issue("Verify"), attempt=None),
+    )
+
+    for phrase in APP_RELEASE_VERIFY_RULES:
+        assert phrase in rendered
+    assert "$SYMPHONY_WORKFLOW_PATH" not in rendered
 
 
 @pytest.mark.parametrize("workflow", WORKFLOW_FILES)

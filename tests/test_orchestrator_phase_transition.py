@@ -281,6 +281,12 @@ def _seed_running_entry(o: Orchestrator, issue: Issue, tmp_path: Path) -> None:
         retry_attempt=None,
         worker_task=None,  # type: ignore[arg-type]
         workspace_path=tmp_path,
+        # This helper models the entry after `_dispatch`, which resolves
+        # release authority before registering the worker.  Leaving the
+        # default False makes direct worker-loop tests perform a second
+        # dispatch-preparation pass against the fixture's hard-coded
+        # workflow path and replace their isolated RunRegistry.
+        release_authority_resolved=True,
     )
 
 
@@ -1640,7 +1646,10 @@ def test_dispatch_registers_running_entry_before_eager_worker_start(
     if eager_factory is None:
         pytest.skip("asyncio.eager_task_factory requires Python 3.12+")
 
-    cfg = _make_config(max_turns=1)
+    cfg = replace(
+        _make_config(max_turns=1),
+        workflow_path=tmp_path / "WORKFLOW.md",
+    )
     issue = _make_issue(state="Todo")
     o = _orch(tmp_path)
     _install_fake_backend(monkeypatch)

@@ -37,10 +37,17 @@ from typing import Iterable, Literal
 from .._shell import _is_wsl_launcher, resolve_bash
 from ..backends.codex import _sandbox_uses_workspace_write
 from ..errors import SymphonyError
+from ..issue import normalize_state
 from ..runtime_safety import (
     PROTECTED_REPOSITORY_MESSAGE,
     workflow_uses_protected_source_repo,
 )
+from ..orchestrator.release_contracts import inspect_release_contract
+from ..orchestrator.release_cycle import (
+    has_release_finalizer_lane,
+    has_release_success_terminal,
+)
+from ..trackers.file import FileBoardTracker
 from ..utils.git_sandbox import resolve_git_common_dir, writable_git_roots
 from ..service import ProcessRunningPredicate, port_owner_hint
 from ..workflow import (
@@ -925,6 +932,93 @@ def check_source_repository(cfg: ServiceConfig) -> CheckResult:
     )
 
 
+def check_app_release_contract(cfg: ServiceConfig) -> CheckResult:
+    """Validate the shared contract only when a local board opts into app delivery."""
+    name = "app.release-contract"
+    if cfg.tracker.kind != "file":
+        return CheckResult(
+            name,
+            "pass",
+            "remote board labels are not inspected; app release delivery is not "
+            "enabled by local configuration, and a labeled runtime transition "
+            "will fail closed because repair cycles require tracker.kind=file",
+        )
+    try:
+        tracker = FileBoardTracker(cfg.tracker)
+        try:
+            states = tuple(
+                dict.fromkeys(
+                    (*cfg.tracker.active_states, *cfg.tracker.terminal_states, "Verify")
+                )
+            )
+            issues = tracker.fetch_issues_by_states(states)
+        finally:
+            tracker.close()
+    except Exception as exc:
+        return CheckResult(name, "fail", f"cannot inspect local app-release labels: {exc}")
+    release_enabled = any(_has_app_release_label(issue.labels) for issue in issues)
+    if not release_enabled:
+        from ..orchestrator.run_registry import (
+            RunRegistry,
+            registry_path_for_workflow,
+        )
+
+        try:
+            registry = RunRegistry(registry_path_for_workflow(cfg.workflow_path))
+            try:
+                release_enabled = registry.has_release_authority()
+            finally:
+                registry.close()
+        except Exception as exc:
+            return CheckResult(
+                name,
+                "fail",
+                f"cannot inspect durable app-release authority: {exc}",
+            )
+    if not release_enabled:
+        return CheckResult(name, "pass", "app release delivery is not enabled on this board")
+    if not any(
+        normalize_state(state) == "verify" for state in cfg.tracker.active_states
+    ):
+        return CheckResult(
+            name,
+            "fail",
+            "app release delivery requires an active Verify lane; fresh evidence "
+            "cannot be collected or rewound safely without one",
+        )
+    if not has_release_finalizer_lane(cfg):
+        return CheckResult(
+            name,
+            "fail",
+            "app release delivery requires a non-Verify active lane for the "
+            "host-controlled finalizer",
+        )
+    if not has_release_success_terminal(cfg):
+        return CheckResult(
+            name,
+            "fail",
+            "app release delivery requires an explicit successful terminal lane "
+            "such as Done or Completed; ambiguous terminals cannot authorize delivery",
+        )
+
+    contract_path = cfg.workflow_path.parent / "release-contract.yaml"
+    errors = inspect_release_contract(
+        contract_path,
+        configured_target_branch=cfg.agent.auto_merge_target_branch,
+    )
+    if errors:
+        return CheckResult(name, "fail", "; ".join(errors))
+    return CheckResult(
+        name,
+        "pass",
+        "release-contract.yaml is valid; atomic file-tracker lifecycle is available",
+    )
+
+
+def _has_app_release_label(labels: Iterable[str]) -> bool:
+    return any(label.strip().lower() == "app-release" for label in labels)
+
+
 def run_checks(cfg: ServiceConfig, host: str = "127.0.0.1") -> list[CheckResult]:
     return [
         check_source_repository(cfg),
@@ -946,6 +1040,7 @@ def run_checks(cfg: ServiceConfig, host: str = "127.0.0.1") -> list[CheckResult]
         check_board_reachable_from_workspace(cfg),
         check_deep_preset_merge_contract(cfg),
         check_stage_contracts(cfg),
+        check_app_release_contract(cfg),
         check_symphony_cli_reachable(cfg),
         check_board_dependencies(cfg),
         check_workflow_registry(cfg),
