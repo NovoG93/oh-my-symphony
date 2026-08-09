@@ -467,7 +467,11 @@ class WorkspaceManager:
             if self._workflow_dir
             else "",
         }
-        if name == "after_create" and self._hook_env:
+        # Host-computed hook values (board location, branch policy, etc.) are
+        # part of the lifecycle contract, not just workspace creation.  Every
+        # hook receives the same base values; lifecycle-specific values passed
+        # by the caller still win below.
+        if self._hook_env:
             env.update(self._hook_env)
         if extra_env:
             env.update(extra_env)
