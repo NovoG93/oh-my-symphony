@@ -5,6 +5,7 @@ Write: `plan.md` + `contracts.md` in the vault; spawn downstream tickets. Do NOT
 
 1. Write `plan.md`: an ordered task table (ID, title, lane, blocked_by, owned contract, files, acceptance summary, verification command) plus a `## <ID>` spec section per ticket. Acceptance criteria are observable: `WHEN <event> THEN <behavior>`.
 2. Write `contracts.md`: interface contracts between Build slices. One Build ticket = one contract boundary, independently testable, roughly <= 5 files / <= 500 net lines.
+   For app delivery also write repository-root `release-contract.yaml`: exact target branch, implementation tickets, launch command, exact runner command plus non-empty hashed repo-relative runner sources, desktop/tablet/mobile viewports, and every requirement/control check across all six required kinds. Name one `app-release-finalizer` ticket and one verifier labeled `app-release`; the finalizer depends on that verifier.
 3. Spawn the DAG from the board root (descriptions must be self-contained). `SYMPHONY_CLI` is exported by the orchestrator — use it when `symphony` is not on PATH:
 
    ```bash

@@ -176,6 +176,61 @@ def test_auto_merge_creates_no_ff_merge_commit(tmp_path: Path) -> None:
     assert len(parents) == 3, "auto merge must create an explicit merge commit"
 
 
+def test_auto_merge_local_only_skips_push_and_remote_verification(
+    tmp_path: Path,
+) -> None:
+    """Local-only gates keep merge safety but never contact a configured remote."""
+    repo = _make_repo(tmp_path)
+    origin = _add_bare_origin(repo, tmp_path)
+    _make_symphony_branch(repo, "T-LOCAL", with_symlinks=False)
+    missing_remote = tmp_path / "remote-does-not-exist.git"
+    _git(repo, "remote", "set-url", "origin", str(missing_remote))
+    _git(repo, "remote", "set-url", "--push", "origin", str(missing_remote))
+
+    script = _build_script(
+        branch="symphony/T-LOCAL",
+        target="main",
+        identifier="T-LOCAL",
+        title="local-only merge",
+        excludes=(),
+        push_target=False,
+    )
+    assert "git push" not in script
+    assert "git ls-remote" not in script
+
+    first = asyncio.run(
+        auto_merge_on_done_best_effort(
+            workflow_dir=repo,
+            branch="symphony/T-LOCAL",
+            identifier="T-LOCAL",
+            title="local-only merge",
+            target_branch="main",
+            exclude_paths=(),
+            push_target=False,
+        )
+    )
+    second = asyncio.run(
+        auto_merge_on_done_best_effort(
+            workflow_dir=repo,
+            branch="symphony/T-LOCAL",
+            identifier="T-LOCAL",
+            title="local-only retry",
+            target_branch="main",
+            exclude_paths=(),
+            push_target=False,
+        )
+    )
+
+    assert first.ok is True
+    assert first.status == "merged"
+    assert second.ok is True
+    assert second.status == "nothing_to_apply"
+    assert _git_output(repo, "rev-list", "--merges", "--count", "main") == "1"
+    assert _git_output(origin, "rev-parse", "main") != _git_output(
+        repo, "rev-parse", "main"
+    )
+
+
 def test_auto_merge_pushes_terminal_merge_to_target_upstream(tmp_path: Path) -> None:
     """Done must not leave the target branch ahead of its configured upstream.
 

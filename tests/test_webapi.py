@@ -689,6 +689,34 @@ async def test_branch_policy_put_validates_and_persists(
     assert "feature_base_branch: dev" in text
 
 
+async def test_git_merge_passes_local_only_policy(
+    git_repo: Path, client: TestClient, board_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    workflow = board_dir / "WORKFLOW.md"
+    workflow.write_text(
+        workflow.read_text(encoding="utf-8").replace(
+            "agent:\n  kind: claude",
+            "agent:\n  kind: claude\n  auto_merge_push_target: false",
+        ),
+        encoding="utf-8",
+    )
+    client.stub.workflow_state.reload()  # type: ignore[attr-defined]
+    captured: dict[str, object] = {}
+
+    async def local_only_merge(**kwargs: object) -> AutoMergeResult:
+        captured.update(kwargs)
+        return AutoMergeResult(ok=True, status="merged", detail="local")
+
+    monkeypatch.setattr(
+        "symphony.webapi.auto_merge_on_done_best_effort", local_only_merge
+    )
+
+    resp = await client.post("/api/v1/git/merge", json={"branch": "symphony/SEED-1"})
+
+    assert resp.status == 200
+    assert captured["push_target"] is False
+
+
 async def test_workflow_get_includes_continuous_improvement(
     client: TestClient,
 ) -> None:
@@ -726,6 +754,7 @@ async def test_workflow_get_includes_continuous_improvement(
     }
     assert "codex" in payload["agent_kinds"]
     assert "claude" in payload["agent_kinds"]
+    assert payload["agent"]["auto_merge_push_target"] is True
 
 
 async def test_continuous_improvement_put_validates_and_persists(

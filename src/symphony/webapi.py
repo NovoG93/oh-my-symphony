@@ -302,6 +302,12 @@ def _workflow_payload(cfg: ServiceConfig) -> dict[str, Any]:
             "feature_base_branch": cfg.agent.feature_base_branch,
             "auto_merge_target_branch": cfg.agent.auto_merge_target_branch,
             "auto_merge_on_done": cfg.agent.auto_merge_on_done,
+            "auto_merge_push_target": cfg.agent.auto_merge_push_target,
+            "merge_delivery": (
+                "upstream-publishing"
+                if cfg.agent.auto_merge_push_target
+                else "local-only"
+            ),
             # F-06: the mechanical evidence floor is lane-name gated by
             # default, so the UI must be able to say when it is off.
             "stage_contracts": cfg.agent.stage_contracts,
@@ -1177,6 +1183,12 @@ def _register_git_routes(
             {
                 "target_branch": target,
                 "auto_merge_enabled": cfg.agent.auto_merge_on_done,
+                "auto_merge_push_target": cfg.agent.auto_merge_push_target,
+                "merge_delivery": (
+                    "upstream-publishing"
+                    if cfg.agent.auto_merge_push_target
+                    else "local-only"
+                ),
                 "branches": rows,
                 "note": note,
             }
@@ -1323,6 +1335,7 @@ def _register_git_routes(
                 target_branch=resolved_target,
                 exclude_paths=cfg.agent.auto_merge_exclude_paths,
                 capture_untracked=cfg.agent.auto_merge_capture_untracked,
+                push_target=cfg.agent.auto_merge_push_target,
             )
         if not result.ok:
             return _json_error(

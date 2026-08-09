@@ -5,6 +5,14 @@ runs a black-box, end-to-end Playwright sweep, captures a screenshot per
 flow step, and emits an *officially signed* QA report PDF as the gate
 artifact for the Deliver lane.
 
+For an application release, the runner is selected by `release-contract.yaml`,
+not assumed from `package.json`. Its exact command and every non-empty hashed
+repo-relative source are part of the immutable contract. It must emit native structured results and
+non-empty hashed artifacts at the required viewports, followed by strict
+`docs/<verifier>/qa/release-evidence.json`. Specs containing `EDIT-ME` or
+placeholder selectors/URLs are rejected before execution. A failed repair
+never reuses this report: a fresh verifier proves the new exact target SHA.
+
 > **Why a PDF gate?** Markdown can be hand-edited at the last second to
 > claim approval. A PDF rendered fresh from the markdown + screenshots is a
 > snapshot — its sha256 is logged in `verification.md`, so any later edit
@@ -43,6 +51,10 @@ turns each user-visible item into a Playwright test. Required coverage:
 
 The stub at `templates/playwright-qa.spec.ts` shows all five categories
 wired up — adapt URLs/selectors to the product but don't drop categories.
+For an app release, adaptation belongs to the dedicated pre-Verify Build slice
+that finalizes the native runner and `release-contract.yaml` hashes. QA executes
+those committed bytes without editing them. A required runner change reopens
+that Build slice and requires a fresh target-bound release verifier.
 
 ## Screenshot naming convention
 

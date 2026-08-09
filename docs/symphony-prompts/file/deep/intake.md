@@ -5,7 +5,7 @@ Write: `brief.md` in the vault + ticket comments. Do NOT plan or implement.
 
 1. Write `brief.md` with: Goal, Audience, Done criteria, Constraints, Out of scope, Proof requirements. Done criteria must be objective -- runnable commands, files that must exist, observable behaviors.
 2. Route the work type and record it in `brief.md`: `app-delivery` / `feature` / `bugfix` / `research` / `docs`. A bugfix earns a short DAG (reproduce -> fix -> regression-verify -> document); a greenfield app earns the full pipeline. Match brief size to request size.
-3. Browser-app products: note "Playwright QA required" under Proof requirements.
+3. App delivery: inventory every requirement and visible control under Proof requirements, require `release-contract.yaml`, exact-target native evidence, and desktop/tablet/mobile coverage. Browser-app products may additionally name their native browser runner.
 4. Append `## Brief` to the ticket: work type, vault path, one-line goal.
 
 Hard gate: `brief.md` exists with objective Done criteria. Then set state to `Research` (for `docs`-only requests you may set `Plan` directly).

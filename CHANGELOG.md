@@ -10,8 +10,33 @@ Versioning: [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+
+- Add an opt-in, host-owned application release contract that binds strict
+  browser/runtime evidence, implementation ancestry, and immutable runner
+  sources to one exact local target commit. File-board RED cycles create
+  idempotent repair groups and a fresh verifier before delivery can continue.
+
+### Changed
+
+- Bind release approval and finalization to durable cycle generations and exact
+  active worker runs, including peer-fenced startup cleanup. The provenance
+  migration backs up databases with existing release gates and safely returns
+  legacy pending or approved gates to fresh verification.
+
 ### Fixed
 
+- Reserve deterministic repair and verifier identities before file-board
+  creation, fence RED lifecycle writes to the exact live verifier lease, and
+  bind delivery completion to the exact host-observed terminal ticket version.
+  Crashes, peer takeovers, label loss, and terminal-ticket replay now fail
+  closed without duplicate repair work or inherited approval.
+- Validate copied verifier workflows against the canonical host board: only a
+  safe relative mount resolving exactly to the configured board is accepted;
+  missing, traversing, wrong-target, and arbitrary external mounts fail closed.
+- Retire verifiers after they durably hand off a RED repair cycle and discard
+  their stale paused retries on restart, so repair tickets can dispatch without
+  weakening lost-lease or unrelated release-generation safeguards.
 - Pass the rendered prompt to AGY as its required `--print` argument instead
   of the literal `-`, which AGY 1.1.x treats as prompt text rather than stdin.
 
