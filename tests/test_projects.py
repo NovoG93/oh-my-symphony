@@ -2,7 +2,8 @@ from __future__ import annotations
 
 import json
 import subprocess
-from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor
+from multiprocessing import get_context
 from pathlib import Path
 
 import pytest
@@ -404,11 +405,32 @@ def test_concurrent_processes_serialize_registry_and_port_allocation(tmp_path: P
         for index in range(2)
     ]
 
-    with ProcessPoolExecutor(max_workers=2) as pool:
-        records = list(pool.map(create_project_in_process, payloads))
+    process_context = get_context("spawn")
+    processes = [
+        process_context.Process(
+            name=payload[2], target=create_project_in_process, args=(payload,)
+        )
+        for payload in payloads
+    ]
+    try:
+        for process in processes:
+            process.start()
+        for process in processes:
+            process.join(timeout=30)
+
+        assert {process.name: process.exitcode for process in processes} == {
+            payload[2]: 0 for payload in payloads
+        }
+    finally:
+        for process in processes:
+            if process.is_alive():
+                process.terminate()
+        for process in processes:
+            if process.pid is not None:
+                process.join()
 
     stored = ProjectRegistry(registry_path).list()
-    assert {item.id for item in stored} == {item.id for item in records}
+    assert {item.id for item in stored} == {payload[2] for payload in payloads}
     assert len({item.port for item in stored}) == 2
 
 
