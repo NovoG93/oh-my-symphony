@@ -694,17 +694,43 @@ async def test_branch_policy_env_exported_to_after_create(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_branch_policy_env_is_scoped_to_after_create(tmp_path):
+async def test_host_hook_env_exported_to_before_run(tmp_path):
     mgr = WorkspaceManager(
         tmp_path / "ws",
-        _hooks(before_run='printf "%s" "${SYMPHONY_FEATURE_BASE_BRANCH:-}" > before-env'),
-        hook_env={"SYMPHONY_FEATURE_BASE_BRANCH": "dev"},
+        _hooks(
+            before_run='printf "%s" "${SYMPHONY_BOARD_ROOT_NAME:-}" > before-env'
+        ),
+        hook_env={"SYMPHONY_BOARD_ROOT_NAME": "release-kanban"},
     )
     ws = await mgr.create_or_reuse("MT-BRANCH-SCOPE")
 
     await mgr.before_run(ws.path)
 
-    assert (ws.path / "before-env").read_text() == ""
+    assert (ws.path / "before-env").read_text() == "release-kanban"
+
+
+@pytest.mark.asyncio
+async def test_extra_env_overrides_host_hook_env(tmp_path):
+    mgr = WorkspaceManager(
+        tmp_path / "ws",
+        _hooks(
+            after_done=(
+                'printf "%s\\n%s" "$SYMPHONY_BOARD_ROOT" '
+                '"$SYMPHONY_ISSUE_ID" > after-done-env'
+            )
+        ),
+        hook_env={
+            "SYMPHONY_BOARD_ROOT": "host-board",
+            "SYMPHONY_ISSUE_ID": "host-issue",
+        },
+    )
+    ws = await mgr.create_or_reuse("MT-HOOK-OVERRIDE")
+
+    assert await mgr.after_done_best_effort(
+        ws.path, identifier="T-1", title="override precedence"
+    )
+
+    assert (ws.path / "after-done-env").read_text() == "host-board\nT-1"
 
 
 # ---------------------------------------------------------------------------
