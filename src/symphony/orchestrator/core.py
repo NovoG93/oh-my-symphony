@@ -1623,7 +1623,9 @@ class Orchestrator:
                     )
                 workspace_errors = release_workspace_target_errors(
                     workspace_root=workspace_path,
+                    repository_root=cfg.workflow_path.parent,
                     target_sha=gate.approved_target_sha,
+                    board_root=cfg.tracker.board_root,
                     allowed_roots=(PurePosixPath("docs") / entry.issue.identifier,),
                     role="finalizer",
                 )
@@ -6791,6 +6793,7 @@ class Orchestrator:
             repository_root=cfg.workflow_path.parent,
             verifier_ticket=issue.identifier,
             configured_target_branch=cfg.agent.auto_merge_target_branch,
+            board_root=cfg.tracker.board_root,
         )
         if enforce_bound_verifier_authority:
             assert running is not None

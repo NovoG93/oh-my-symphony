@@ -12,6 +12,7 @@ import yaml
 
 from symphony.orchestrator import release_contracts as release_contracts_module
 from symphony.orchestrator.release_contracts import (
+    release_workspace_target_errors,
     resolve_target_release_identity,
     validate_release_contract,
 )
@@ -188,6 +189,223 @@ def _validate(repo: Path):
         verifier_ticket="VERIFY-1",
         configured_target_branch="main",
     )
+
+
+def _workspace_with_board_entry(
+    release_repo: Path, tmp_path: Path
+) -> tuple[Path, Path, str]:
+    board_root = release_repo / "kanban"
+    board_root.mkdir()
+    workspace = tmp_path / "workspace"
+    _git(
+        release_repo,
+        "worktree",
+        "add",
+        "-q",
+        "-b",
+        "symphony/VERIFY-WORKSPACE",
+        str(workspace),
+        "main",
+    )
+    exclude = release_repo / ".git" / "info" / "exclude"
+    exclude.parent.mkdir(parents=True, exist_ok=True)
+    exclude.write_text(
+        exclude.read_text(encoding="utf-8") + "\nkanban\n",
+        encoding="utf-8",
+    )
+    target_sha = _git(workspace, "rev-parse", "HEAD")
+    return workspace, board_root, target_sha
+
+
+def _workspace_target_errors(
+    *, workspace: Path, board_root: Path | None, target_sha: str, repository_root: Path
+) -> tuple[str, ...]:
+    return release_workspace_target_errors(
+        workspace_root=workspace,
+        repository_root=repository_root,
+        target_sha=target_sha,
+        board_root=board_root,
+    )
+
+
+def test_configured_host_board_symlink_is_control_data(
+    release_repo: Path, tmp_path: Path
+) -> None:
+    workspace, board_root, target_sha = _workspace_with_board_entry(
+        release_repo, tmp_path
+    )
+    (workspace / "kanban").symlink_to(board_root, target_is_directory=True)
+
+    assert _workspace_target_errors(
+        workspace=workspace,
+        board_root=board_root,
+        target_sha=target_sha,
+        repository_root=release_repo,
+    ) == ()
+
+
+def test_configured_host_board_requires_workspace_mount(
+    release_repo: Path, tmp_path: Path
+) -> None:
+    workspace, board_root, target_sha = _workspace_with_board_entry(
+        release_repo, tmp_path
+    )
+
+    errors = _workspace_target_errors(
+        workspace=workspace,
+        board_root=board_root,
+        target_sha=target_sha,
+        repository_root=release_repo,
+    )
+
+    assert any("workspace board mount is missing" in error for error in errors)
+
+
+def test_configured_host_board_must_exist(
+    release_repo: Path, tmp_path: Path
+) -> None:
+    workspace, board_root, target_sha = _workspace_with_board_entry(
+        release_repo, tmp_path
+    )
+    board_root.rmdir()
+
+    errors = _workspace_target_errors(
+        workspace=workspace,
+        board_root=board_root,
+        target_sha=target_sha,
+        repository_root=release_repo,
+    )
+
+    assert any("configured host board root does not exist" in error for error in errors)
+
+
+def test_same_name_real_product_directory_is_not_control_data(
+    release_repo: Path, tmp_path: Path
+) -> None:
+    workspace, board_root, target_sha = _workspace_with_board_entry(
+        release_repo, tmp_path
+    )
+    del board_root
+    (workspace / "kanban").mkdir()
+    (workspace / "kanban" / "product.js").write_text(
+        "unapproved product change\n", encoding="utf-8"
+    )
+
+    errors = _workspace_target_errors(
+        workspace=workspace,
+        board_root=release_repo / "kanban",
+        target_sha=target_sha,
+        repository_root=release_repo,
+    )
+
+    assert errors
+    assert any("kanban" in error for error in errors)
+
+
+def test_wrong_target_board_symlink_is_not_control_data(
+    release_repo: Path, tmp_path: Path
+) -> None:
+    workspace, board_root, target_sha = _workspace_with_board_entry(
+        release_repo, tmp_path
+    )
+    wrong_board = release_repo / "other-board"
+    wrong_board.mkdir()
+    (workspace / "kanban").symlink_to(wrong_board, target_is_directory=True)
+
+    errors = _workspace_target_errors(
+        workspace=workspace,
+        board_root=board_root,
+        target_sha=target_sha,
+        repository_root=release_repo,
+    )
+
+    assert errors
+    assert any("kanban" in error for error in errors)
+
+
+def test_configured_real_board_directory_is_not_control_data(
+    release_repo: Path,
+) -> None:
+    board_root = release_repo / "kanban"
+    board_root.mkdir()
+    (board_root / "product.js").write_text(
+        "unapproved product change\n", encoding="utf-8"
+    )
+    target_sha = _git(release_repo, "rev-parse", "HEAD")
+
+    errors = _workspace_target_errors(
+        workspace=release_repo,
+        board_root=board_root,
+        target_sha=target_sha,
+        repository_root=release_repo,
+    )
+
+    assert errors
+    assert any("kanban" in error for error in errors)
+
+
+def test_external_configured_board_symlink_is_not_control_data(
+    release_repo: Path, tmp_path: Path
+) -> None:
+    workspace, _board_root, target_sha = _workspace_with_board_entry(
+        release_repo, tmp_path
+    )
+    external_board = tmp_path / "kanban"
+    external_board.mkdir()
+    (workspace / "kanban").symlink_to(external_board, target_is_directory=True)
+
+    errors = _workspace_target_errors(
+        workspace=workspace,
+        board_root=external_board,
+        target_sha=target_sha,
+        repository_root=release_repo,
+    )
+
+    assert errors
+    assert any("inside repository root" in error for error in errors)
+
+
+def test_external_board_does_not_accept_stale_workspace_kanban_mount(
+    release_repo: Path, tmp_path: Path
+) -> None:
+    workspace, _board_root, target_sha = _workspace_with_board_entry(
+        release_repo, tmp_path
+    )
+    external_board = tmp_path / "host-board"
+    external_board.mkdir()
+    (workspace / "kanban").symlink_to(
+        release_repo / "kanban", target_is_directory=True
+    )
+
+    errors = _workspace_target_errors(
+        workspace=workspace,
+        board_root=external_board,
+        target_sha=target_sha,
+        repository_root=release_repo,
+    )
+
+    assert any("inside repository root" in error for error in errors)
+
+
+def test_default_target_validation_still_rejects_product_changes(
+    release_repo: Path, tmp_path: Path
+) -> None:
+    workspace, board_root, target_sha = _workspace_with_board_entry(
+        release_repo, tmp_path
+    )
+    del board_root
+    (workspace / "product.js").write_text(
+        "unapproved product change\n", encoding="utf-8"
+    )
+
+    errors = _workspace_target_errors(
+        workspace=workspace,
+        board_root=None,
+        target_sha=target_sha,
+        repository_root=release_repo,
+    )
+
+    assert errors
 
 
 def _mutate_native(repo: Path, mutate) -> None:

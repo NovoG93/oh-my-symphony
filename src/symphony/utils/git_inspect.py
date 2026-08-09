@@ -144,7 +144,10 @@ def resolve_local_branch_commit(workflow_dir: Path, branch: str) -> str | None:
 
 
 def changed_paths_since(
-    workflow_dir: Path, base_commit_sha: str
+    workflow_dir: Path,
+    base_commit_sha: str,
+    *,
+    inspect_roots: tuple[PurePosixPath, ...] = (),
 ) -> tuple[str, ...] | None:
     """Return workspace paths that can differ from an exact release base.
 
@@ -217,6 +220,10 @@ def changed_paths_since(
                 path
                 for path in workspace_only_paths
                 if not _is_release_infrastructure_path(PurePosixPath(path))
+                or any(
+                    _path_is_within(PurePosixPath(path), root)
+                    for root in inspect_roots
+                )
             }
         )
     )
@@ -228,6 +235,14 @@ def _is_release_infrastructure_path(path: PurePosixPath) -> bool:
     return path.parts[0] in _RELEASE_CONTROL_ROOTS or any(
         part in _RELEASE_DEPENDENCY_CACHE_PARTS for part in path.parts
     )
+
+
+def _path_is_within(path: PurePosixPath, root: PurePosixPath) -> bool:
+    try:
+        path.relative_to(root)
+    except ValueError:
+        return False
+    return True
 
 
 def is_git_stageable_path(

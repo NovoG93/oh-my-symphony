@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import shutil
 from pathlib import Path
 
 from symphony.cli import release
@@ -10,7 +11,7 @@ from symphony.cli import release
 from tests.test_release_contracts import _git, _write_valid_release
 
 
-def _repo(tmp_path: Path) -> tuple[Path, Path]:
+def _repo(tmp_path: Path) -> tuple[Path, Path, Path]:
     repo = tmp_path / "repo"
     repo.mkdir()
     _git(repo, "init", "-b", "main")
@@ -43,13 +44,26 @@ Release workflow.
     _git(repo, "add", "WORKFLOW.md")
     _git(repo, "commit", "-m", "release workflow")
     _write_valid_release(repo)
-    return repo, workflow
+    workspace = tmp_path / "workspace"
+    _git(
+        repo,
+        "worktree",
+        "add",
+        "-q",
+        "-b",
+        "symphony/RELEASE-CLI-WORKSPACE",
+        str(workspace),
+        "main",
+    )
+    shutil.copytree(repo / "docs", workspace / "docs", dirs_exist_ok=True)
+    (workspace / "kanban").symlink_to(board, target_is_directory=True)
+    return repo, workflow, workspace
 
 
 def test_release_check_json_passes_current_target(
     tmp_path: Path, capsys
 ) -> None:
-    repo, workflow = _repo(tmp_path)
+    repo, workflow, workspace = _repo(tmp_path)
 
     rc = release.main(
         [
@@ -58,7 +72,7 @@ def test_release_check_json_passes_current_target(
             "--ticket",
             "VERIFY-1",
             "--workspace",
-            str(repo),
+            str(workspace),
             "--json",
         ]
     )
@@ -72,8 +86,8 @@ def test_release_check_json_passes_current_target(
 def test_release_check_is_nonzero_for_stale_evidence(
     tmp_path: Path, capsys
 ) -> None:
-    repo, workflow = _repo(tmp_path)
-    evidence_path = repo / "docs" / "VERIFY-1" / "qa" / "release-evidence.json"
+    repo, workflow, workspace = _repo(tmp_path)
+    evidence_path = workspace / "docs" / "VERIFY-1" / "qa" / "release-evidence.json"
     evidence = json.loads(evidence_path.read_text(encoding="utf-8"))
     evidence["target_sha"] = "0" * 40
     evidence_path.write_text(json.dumps(evidence), encoding="utf-8")
@@ -85,7 +99,7 @@ def test_release_check_is_nonzero_for_stale_evidence(
             "--ticket",
             "VERIFY-1",
             "--workspace",
-            str(repo),
+            str(workspace),
             "--json",
         ]
     )

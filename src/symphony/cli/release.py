@@ -63,6 +63,7 @@ def _check(args: argparse.Namespace) -> int:
         repository_root=cfg.workflow_path.parent,
         verifier_ticket=args.ticket,
         configured_target_branch=cfg.agent.auto_merge_target_branch,
+        board_root=cfg.tracker.board_root,
     )
     if args.json:
         print(json.dumps(asdict(result), indent=2, sort_keys=True))

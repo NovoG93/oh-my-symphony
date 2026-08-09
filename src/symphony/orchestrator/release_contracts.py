@@ -806,33 +806,148 @@ def _note_text(
 def release_workspace_target_errors(
     *,
     workspace_root: Path,
+    repository_root: Path,
     target_sha: str,
+    board_root: Path | None = None,
     allowed_roots: tuple[PurePosixPath, ...] = (),
     role: str = "release",
 ) -> tuple[str, ...]:
     """Prove a worker tree is derived from one exact target commit."""
     workspace_root = workspace_root.resolve()
+    repository_root = repository_root.resolve()
     errors: list[str] = []
     if not is_merged(workspace_root, target_sha, "HEAD"):
         errors.append(f"{role} workspace HEAD must contain the approved target commit")
-    changed_paths = changed_paths_since(workspace_root, target_sha)
+    board_root_info = _repository_relative_board_root(
+        repository_root=repository_root,
+        board_root=board_root,
+    )
+    board_relative = board_root_info[0] if board_root_info is not None else None
+    if board_root is not None and board_root_info is None:
+        errors.append(
+            f"{role} "
+            + _configured_board_root_error(
+                repository_root=repository_root,
+                board_root=board_root,
+            )
+        )
+    board_mount: PurePosixPath | None = None
+    if board_root_info is not None:
+        relative_root, configured_root = board_root_info
+        mount_error = _workspace_board_mount_error(
+            workspace_root=workspace_root,
+            relative_root=relative_root,
+            configured_root=configured_root,
+        )
+        if mount_error is None:
+            board_mount = relative_root
+        else:
+            errors.append(f"{role} {mount_error}")
+    changed_paths = changed_paths_since(
+        workspace_root,
+        target_sha,
+        inspect_roots=(board_relative,)
+        if board_relative is not None
+        else (),
+    )
     if changed_paths is None:
         errors.append(
             f"{role} workspace changes could not be compared with the approved target"
         )
         return tuple(errors)
+    control_roots = allowed_roots
+    if board_mount is not None:
+        control_roots = (*control_roots, board_mount)
     unexpected: list[str] = []
     for changed_path in changed_paths:
         candidate = PurePosixPath(changed_path)
-        if not any(_path_is_within(candidate, root) for root in allowed_roots):
+        if not any(_path_is_within(candidate, root) for root in control_roots):
             unexpected.append(changed_path)
     if unexpected:
-        allowed = ", ".join(str(root) for root in allowed_roots) or "no paths"
+        allowed = ", ".join(str(root) for root in control_roots) or "no paths"
         errors.append(
             f"{role} workspace differs from the approved target outside {allowed}: "
             + ", ".join(unexpected)
         )
     return tuple(errors)
+
+
+def _configured_board_root_error(
+    *, repository_root: Path, board_root: Path
+) -> str:
+    """Explain why a configured board cannot be an eligible host board."""
+    configured_path = board_root
+    if not configured_path.is_absolute():
+        configured_path = repository_root / configured_path
+    try:
+        configured_root = configured_path.resolve(strict=True)
+    except FileNotFoundError:
+        return f"configured host board root does not exist: {configured_path}"
+    except (OSError, RuntimeError):
+        return f"configured host board root could not be resolved: {configured_path}"
+    if not configured_root.is_dir():
+        return f"configured host board root must be a directory: {configured_root}"
+    try:
+        relative_root = configured_root.relative_to(repository_root)
+    except ValueError:
+        return (
+            "configured host board root must be inside repository root: "
+            f"{configured_root}"
+        )
+    if not relative_root.parts:
+        return (
+            "configured host board root must identify a directory below "
+            f"repository root: {configured_root}"
+        )
+    return "configured host board root is invalid"
+
+
+def _workspace_board_mount_error(
+    *, workspace_root: Path, relative_root: PurePosixPath, configured_root: Path
+) -> str | None:
+    """Explain why the workspace board entry is not the configured mount."""
+    workspace_entry = workspace_root.joinpath(*relative_root.parts)
+    try:
+        is_junction = workspace_entry.is_junction()
+    except (AttributeError, OSError):
+        is_junction = False
+    is_link = workspace_entry.is_symlink() or is_junction
+    if not workspace_entry.exists() and not is_link:
+        return f"workspace board mount is missing at {relative_root}"
+    if not is_link:
+        return (
+            "workspace board mount must be a symlink or directory junction at "
+            f"{relative_root}"
+        )
+    try:
+        resolved_entry = workspace_entry.resolve(strict=True)
+    except (FileNotFoundError, OSError, RuntimeError):
+        return f"workspace board mount could not be resolved at {relative_root}"
+    if resolved_entry != configured_root:
+        return (
+            f"workspace board mount at {relative_root} must resolve to "
+            f"configured host board {configured_root}; resolved to {resolved_entry}"
+        )
+    return None
+
+
+def _repository_relative_board_root(
+    *, repository_root: Path, board_root: Path | None
+) -> tuple[PurePosixPath, Path] | None:
+    """Resolve a configured board root and prove it is inside the repo."""
+    if board_root is None:
+        return None
+    configured_root = board_root
+    if not configured_root.is_absolute():
+        configured_root = repository_root / configured_root
+    try:
+        configured_root = configured_root.resolve(strict=True)
+        relative_root = configured_root.relative_to(repository_root)
+    except (FileNotFoundError, OSError, RuntimeError, ValueError):
+        return None
+    if not relative_root.parts or not configured_root.is_dir():
+        return None
+    return PurePosixPath(relative_root.as_posix()), configured_root
 
 
 def _path_is_within(path: PurePosixPath, root: PurePosixPath) -> bool:
@@ -849,6 +964,7 @@ def validate_release_contract(
     repository_root: Path,
     verifier_ticket: str,
     configured_target_branch: str,
+    board_root: Path | None = None,
 ) -> ReleaseValidationResult:
     """Validate standard release contract/evidence paths without writes."""
     workspace_root = workspace_root.resolve()
@@ -901,7 +1017,9 @@ def validate_release_contract(
         evidence_errors.extend(
             release_workspace_target_errors(
                 workspace_root=workspace_root,
+                repository_root=repository_root,
                 target_sha=target_sha,
+                board_root=board_root,
                 allowed_roots=(PurePosixPath("docs") / safe_verifier,),
                 role="verifier",
             )
