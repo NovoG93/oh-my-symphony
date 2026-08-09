@@ -1016,7 +1016,7 @@ class Orchestrator:
         if expired:
             log.info("run_leases_expired_on_start", count=expired, path=str(path))
         flags = self._registry_guard("list_issue_flags", registry.list_issue_flags, [])
-        self._rehydrate_issue_flags(flags)
+        self._rehydrate_issue_flags(flags, cfg=cfg, registry=registry)
 
     def _release_registry_required(self, cfg: ServiceConfig) -> RunRegistry:
         """Return the release authority store or fail closed.
@@ -1946,12 +1946,119 @@ class Orchestrator:
             return [], self._last_registry_error
         return [_run_record_payload(row) for row in rows], None
 
-    def _rehydrate_issue_flags(self, flags: list[Any]) -> None:
+    def _release_verifier_handoff_is_durable(
+        self,
+        *,
+        cfg: ServiceConfig,
+        registry: RunRegistry,
+        identity: ReleaseEvidenceIdentity,
+    ) -> bool:
+        """Prove that one retired verifier was replaced and durably relinked."""
+        if (
+            not identity.retired
+            or identity.role != "verifier"
+            or not identity.issue_id
+            or not identity.identifier
+            or not identity.finalizer_identifier
+            or not identity.cycle_generation
+            or registry.has_active_lease(identity.issue_id)
+        ):
+            return False
+        gate = registry.get_release_gate(identity.finalizer_identifier)
+        if (
+            gate is None
+            or not gate.generation
+            or gate.generation == identity.cycle_generation
+            or gate.verifier_issue_id == identity.issue_id
+            or gate.verifier_identifier == identity.identifier
+        ):
+            return False
+        current_identity = registry.get_release_evidence_identity_by_issue_id(
+            gate.verifier_issue_id
+        )
+        if current_identity is None or (
+            current_identity.issue_id,
+            current_identity.identifier,
+            current_identity.finalizer_identifier,
+            current_identity.role,
+            current_identity.cycle_generation,
+            current_identity.retired,
+        ) != (
+            gate.verifier_issue_id,
+            gate.verifier_identifier,
+            gate.finalizer_identifier,
+            "verifier",
+            gate.generation,
+            False,
+        ):
+            return False
+        finalizer = self._tracker_call_fetch_issue_full_by_id(
+            cfg, identity.finalizer_identifier
+        )
+        if finalizer is None or finalizer.identifier != identity.finalizer_identifier:
+            return False
+        blocker_identifiers = {
+            blocker.identifier for blocker in finalizer.blocked_by if blocker.identifier
+        }
+        return (
+            gate.verifier_identifier in blocker_identifiers
+            and identity.identifier not in blocker_identifiers
+        )
+
+    def _rehydrate_issue_flags(
+        self,
+        flags: list[Any],
+        *,
+        cfg: ServiceConfig,
+        registry: RunRegistry,
+    ) -> None:
         self._persisted_retry_attempts.clear()
         for flag in flags:
             issue_id = flag.issue_id
             if flag.budget_exhausted:
                 self._turn_budget_exhausted.add(issue_id)
+            identity: ReleaseEvidenceIdentity | None = None
+            handoff_complete = False
+            if flag.retry_attempt is not None:
+                try:
+                    identity = registry.get_release_evidence_identity_by_issue_id(
+                        issue_id
+                    )
+                    handoff_complete = bool(
+                        identity is not None
+                        and self._release_verifier_handoff_is_durable(
+                            cfg=cfg,
+                            registry=registry,
+                            identity=identity,
+                        )
+                    )
+                except Exception as exc:
+                    # Recovery is an allow-list: unreadable authority keeps the
+                    # existing retry/pause rather than forgiving it.
+                    log.warning(
+                        "historical_release_verifier_handoff_recovery_deferred",
+                        issue_id=issue_id,
+                        error=str(exc),
+                    )
+            if handoff_complete:
+                assert identity is not None
+                self._dispatch_state.cancel_pending_retry(issue_id)
+                self._persisted_retry_attempts.pop(issue_id, None)
+                self._paused_issue_ids.discard(issue_id)
+                self._pause_reasons.pop(issue_id, None)
+                self._clear_issue_flags(
+                    issue_id,
+                    retry_attempt=True,
+                    paused=True,
+                )
+                log.info(
+                    "historical_release_verifier_handoff_recovered",
+                    issue_id=issue_id,
+                    identifier=identity.identifier,
+                    finalizer=identity.finalizer_identifier,
+                    generation=identity.cycle_generation,
+                )
+                continue
             if flag.paused:
                 pause_reason = str(flag.pause_reason) if flag.pause_reason else None
                 if flag.retry_attempt is not None and _is_retryable_auto_pause_reason(
@@ -4394,6 +4501,29 @@ class Orchestrator:
             self._lease_blocked[issue.id] = reason
             return _EligibilityDecision(_EligibilityDisposition.WAIT_NON_SLOT, reason)
         self._lease_blocked.pop(issue.id, None)
+        registry = self._run_registry
+        if registry is None and self._last_registry_error is not None:
+            return _EligibilityDecision(
+                _EligibilityDisposition.WAIT_NON_SLOT,
+                "release evidence authority registry is unavailable",
+            )
+        if registry is not None:
+            unavailable = object()
+            identity = self._registry_guard(
+                "release_evidence_identity_by_issue_id",
+                lambda: registry.get_release_evidence_identity_by_issue_id(issue.id),
+                unavailable,
+            )
+            if identity is unavailable:
+                return _EligibilityDecision(
+                    _EligibilityDisposition.WAIT_NON_SLOT,
+                    "release evidence authority could not be read",
+                )
+            if identity is not None and identity.retired:
+                return _EligibilityDecision(
+                    _EligibilityDisposition.REJECT,
+                    "historical release verifier is evidence-only",
+                )
         if not owning_retry and issue.id in self._claimed:
             return _EligibilityDecision(
                 _EligibilityDisposition.REJECT, "issue already has a claim"
@@ -6232,6 +6362,8 @@ class Orchestrator:
                         )
                         running.issue = issue
                         state = normalize_state(issue.state)
+                    if running.release_verifier_handoff_complete:
+                        break
                     if release_rewound:
                         debug.rewind_count += 1
                         if (
@@ -7030,6 +7162,39 @@ class Orchestrator:
                 ),
             )
             return rewound, True
+
+        if running is not None:
+            retired_identity = cast(
+                ReleaseEvidenceIdentity | None,
+                self._release_registry_call(
+                    cfg,
+                    "read_completed_verifier_handoff",
+                    lambda registry: registry.get_release_evidence_identity_by_issue_id(
+                        issue.id
+                    ),
+                ),
+            )
+            if retired_identity is None or (
+                retired_identity.issue_id,
+                retired_identity.identifier,
+                retired_identity.finalizer_identifier,
+                retired_identity.role,
+                retired_identity.cycle_generation,
+                retired_identity.retired,
+            ) != (
+                issue.id,
+                issue.identifier,
+                running.release_gate_finalizer,
+                "verifier",
+                running.release_gate_generation,
+                True,
+            ):
+                raise SymphonyError(
+                    "completed release verifier handoff identity could not be proven",
+                    verifier=issue.identifier,
+                    finalizer=validation.finalizer_ticket,
+                )
+            running.release_verifier_handoff_complete = True
 
         log.warning(
             "app_release_repairs_created",
@@ -7866,6 +8031,46 @@ class Orchestrator:
                         error=str(exc),
                     )
                     return
+            if entry.release_verifier_handoff_complete:
+                self._dispatch_state.cancel_pending_retry(issue_id)
+                self._claimed.discard(issue_id)
+                self._persisted_retry_attempts.pop(issue_id, None)
+                self._clear_issue_flags(issue_id, retry_attempt=True)
+                cleanup_started = entry.workspace_cleanup_started
+                if (
+                    cfg is not None
+                    and cfg.agent.auto_commit_on_done
+                    and not cleanup_started
+                ):
+                    await commit_workspace_on_done(
+                        entry.workspace_path,
+                        identifier=entry.issue.identifier,
+                        title=entry.issue.title,
+                        exit_reason=reason,
+                        state=entry.issue.state,
+                    )
+                if (
+                    cfg is not None
+                    and not cleanup_started
+                    and self._workspace_manager is not None
+                ):
+                    await self._workspace_manager.remove(entry.workspace_path)
+                log.info(
+                    "release_verifier_handoff_completed",
+                    issue_id=issue_id,
+                    identifier=entry.issue.identifier,
+                    finalizer=entry.release_gate_finalizer,
+                    generation=entry.release_gate_generation,
+                )
+                log.info(
+                    "worker_exit",
+                    issue_id=issue_id,
+                    issue_identifier=entry.issue.identifier,
+                    reason=reason,
+                    error=error,
+                )
+                await self._notify_observers()
+                return
             self._persisted_retry_attempts.pop(issue_id, None)
             self._clear_issue_flags(issue_id, retry_attempt=True)
             if entry.release_gate_exhausted:

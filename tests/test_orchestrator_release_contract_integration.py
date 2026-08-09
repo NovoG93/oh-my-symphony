@@ -805,6 +805,24 @@ def test_concurrent_worker_and_reconcile_create_one_red_release_lifecycle(
             and "release-cycle-verifier" in item.labels
         ]
     ) == 1
+    assert entry.release_verifier_handoff_complete
+
+    # A serialized loser can observe the winner's retired identity, but that
+    # readback alone must not grant the ephemeral completion outcome.
+    entry.release_verifier_handoff_complete = False
+    loser_issue, loser_rewound = asyncio.run(
+        orchestrator._enforce_app_release_transition(
+            cfg=cfg,
+            issue=terminal_verifier,
+            workspace_path=worker,
+            producing_state="Verify",
+            known_app_release=True,
+            running_entry=entry,
+        )
+    )
+    assert loser_issue.state == "Done"
+    assert not loser_rewound
+    assert not entry.release_verifier_handoff_complete
 
 
 def test_pending_gate_callback_uses_worker_owned_registry_before_relink(
@@ -1168,6 +1186,15 @@ def test_repair_children_use_source_issue_backend_over_workflow_default(
     worker = _release_worker_workspace(repo)
     orchestrator = _orch(worker)
     source = replace(issue, agent_kind="opencode", state="Document")
+    _seed_active_release_verifier(
+        orchestrator=orchestrator,
+        cfg=cfg,
+        issue=issue,
+        workspace_path=worker,
+    )
+    entry = orchestrator._running[issue.id]
+    entry.issue = source
+    real_reconcile = Orchestrator._tracker_call_reconcile_release_cycle
 
     async def refresh_full(_cfg, _issue_id: str):
         return source
@@ -1181,7 +1208,13 @@ def test_repair_children_use_source_issue_backend_over_workflow_default(
         before_finalizer_relink=None,
     ):
         captured.append(source_agent_kind)
-        return _ReleaseCycleWriteResult(True, verifier_identifier="RELEASE-VERIFY-1")
+        return real_reconcile(
+            _cfg,
+            _issue,
+            _validation,
+            source_agent_kind,
+            before_finalizer_relink=before_finalizer_relink,
+        )
 
     monkeypatch.setattr(orchestrator, "_refresh_issue_full", refresh_full)
     monkeypatch.setattr(
@@ -3450,3 +3483,223 @@ def test_pending_contract_hash_drift_replaces_generation_and_requires_fresh_run(
         run_id=fresh_run_id,
         status="fresh-contract-run-proven",
     )
+
+
+
+def test_red_verifier_handoff_exits_normal_and_releases_its_slot(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repo = _setup_repo(tmp_path)
+    cfg, ticket_path, issue = _setup_board(repo)
+    cfg = replace(cfg, agent=replace(cfg.agent, auto_commit_on_done=True))
+
+    def fail_feature(evidence: dict[str, object]) -> None:
+        checks = evidence["checks"]
+        assert isinstance(checks, list)
+        checks[0]["status"] = "FAIL"
+        checks[0]["actual"] = "menu control is inert"
+        evidence["runner"]["exit_code"] = 1
+
+    _mutate_evidence(repo, fail_feature)
+    _sync_native_statuses(repo)
+    backends = _install_file_tracker_backend(
+        monkeypatch,
+        ticket_path=ticket_path,
+        transitions=[("Document", issue.description or "")],
+    )
+    worker = _release_worker_workspace(repo)
+    orchestrator = _orch(worker)
+    orchestrator._workflow_state._config = cfg
+    original_gate, run_id = _seed_active_release_verifier(
+        orchestrator=orchestrator,
+        cfg=cfg,
+        issue=issue,
+        workspace_path=worker,
+    )
+    entry = orchestrator._running[issue.id]
+    snapshots: list[Path] = []
+    removals: list[Path] = []
+
+    async def record_snapshot(path: Path, **_kwargs: object) -> None:
+        snapshots.append(path)
+
+    async def record_remove(path: Path) -> None:
+        removals.append(path)
+
+    async def forbidden_delivery(*_args: object, **_kwargs: object) -> bool:
+        raise AssertionError("historical verifier must not enter delivery")
+
+    monkeypatch.setattr(
+        "symphony.orchestrator.core.commit_workspace_on_done", record_snapshot
+    )
+    manager = orchestrator._workspace_manager
+    assert manager is not None
+    monkeypatch.setattr(manager, "remove", record_remove, raising=False)
+    monkeypatch.setattr(
+        orchestrator, "_auto_merge_done_gate_or_block", forbidden_delivery
+    )
+
+    async def exercise() -> None:
+        orchestrator._loop = asyncio.get_running_loop()
+        await orchestrator._run_agent_attempt(entry.issue, attempt=None, cfg=cfg)
+
+    asyncio.run(exercise())
+
+    registry = orchestrator._run_registry
+    assert registry is not None
+    retired = registry.get_release_evidence_identity_by_issue_id(issue.id)
+    assert retired is not None
+    assert retired.retired
+    assert retired.cycle_generation == original_gate.generation
+    assert registry.get_run(run_id).status == "normal"
+    assert entry.release_verifier_handoff_complete
+    assert len(backends) == 1
+    assert len([call for call in backends[0].calls if call[0] == "run_turn"]) == 1
+    assert issue.id not in orchestrator._running
+    assert issue.id not in orchestrator._retry
+    assert issue.id not in orchestrator._paused_issue_ids
+    assert issue.id not in orchestrator._persisted_retry_attempts
+    assert registry.get_issue_flags(issue.id) is None
+    assert orchestrator._dispatch_state.available_slots(1) == 1
+    assert snapshots == [worker]
+    assert removals == [worker]
+
+
+def test_restart_recovers_only_exact_completed_red_handoff_flags(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repo = _setup_repo(tmp_path)
+    cfg, ticket_path, issue = _setup_board(repo)
+
+    def fail_feature(evidence: dict[str, object]) -> None:
+        checks = evidence["checks"]
+        assert isinstance(checks, list)
+        checks[0]["status"] = "FAIL"
+        evidence["runner"]["exit_code"] = 1
+
+    _mutate_evidence(repo, fail_feature)
+    _sync_native_statuses(repo)
+    completed = _run_verify_transition(
+        repo=repo,
+        cfg=cfg,
+        ticket_path=ticket_path,
+        issue=issue,
+        monkeypatch=monkeypatch,
+    )
+    registry = completed._run_registry
+    assert registry is not None
+    current_gate = registry.get_release_gate("APP-FINAL")
+    assert current_gate is not None
+    assert current_gate.verifier_issue_id != issue.id
+    registry.set_issue_flags(
+        issue.id,
+        retry_attempt=2,
+        budget_exhausted=True,
+        paused=True,
+        pause_reason="worker error: release_authority_error",
+    )
+    registry.close()
+    completed._run_registry = None
+
+    restarted = _orch(repo)
+    restarted._ensure_run_registry(cfg)
+    recovered_registry = restarted._run_registry
+    assert recovered_registry is not None
+    recovered = recovered_registry.get_issue_flags(issue.id)
+    assert recovered is not None
+    assert recovered.retry_attempt is None
+    assert recovered.paused is False
+    assert recovered.pause_reason is None
+    assert recovered.budget_exhausted is True
+    assert issue.id not in restarted._persisted_retry_attempts
+    assert issue.id not in restarted._paused_issue_ids
+    assert issue.id in restarted._turn_budget_exhausted
+
+    tracker = FileBoardTracker(cfg.tracker)
+    source = tracker.fetch_issue_full_by_id(issue.identifier)
+    current_verifier = tracker.fetch_issue_full_by_id(current_gate.verifier_identifier)
+    assert source is not None
+    assert current_verifier is not None
+    decision = restarted._eligibility_ownership_decision(
+        source, cfg, owning_retry=True
+    )
+    assert decision is not None
+    assert "historical release verifier" in decision.reason
+
+    # A manual hold with no retry is not crash residue and must survive.
+    recovered_registry.set_issue_flags(
+        issue.id,
+        retry_attempt=None,
+        paused=True,
+        pause_reason="manual release review",
+    )
+    recovered_registry.close()
+    restarted._run_registry = None
+    manual_restart = _orch(repo)
+    manual_restart._ensure_run_registry(cfg)
+    manual_registry = manual_restart._run_registry
+    assert manual_registry is not None
+    manual_flags = manual_registry.get_issue_flags(issue.id)
+    assert manual_flags is not None
+    assert manual_flags.retry_attempt is None
+    assert manual_flags.paused is True
+    assert manual_flags.pause_reason == "manual release review"
+
+    # A retry is preserved when the finalizer no longer proves the exact
+    # old -> new relink, and a genuinely current verifier is never recovered
+    # merely because another issue has retired evidence.
+    tracker.update_fields(
+        "APP-FINAL",
+        blocked_by=[issue.identifier, "UNRELATED-1"],
+    )
+    tracker.close()
+    manual_registry.set_issue_flags(
+        issue.id,
+        retry_attempt=3,
+        paused=True,
+        pause_reason="worker error: release_authority_error",
+    )
+    manual_registry.set_issue_flags(
+        current_gate.verifier_issue_id,
+        retry_attempt=4,
+        paused=True,
+        pause_reason="worker error: lost lease",
+    )
+    manual_registry.close()
+    manual_restart._run_registry = None
+
+    negative_restart = _orch(repo)
+    negative_restart._ensure_run_registry(cfg)
+    negative_registry = negative_restart._run_registry
+    assert negative_registry is not None
+    unrelated_change = negative_registry.get_issue_flags(issue.id)
+    lost_lease = negative_registry.get_issue_flags(current_gate.verifier_issue_id)
+    assert unrelated_change is not None
+    assert unrelated_change.retry_attempt == 3
+    assert unrelated_change.paused is True
+    assert unrelated_change.budget_exhausted is True
+    assert lost_lease is not None
+    assert lost_lease.retry_attempt == 4
+    assert lost_lease.paused is True
+
+    def unreadable_identity(_issue_id: str):
+        raise sqlite3.OperationalError("registry unavailable")
+
+    monkeypatch.setattr(
+        negative_registry,
+        "get_release_evidence_identity_by_issue_id",
+        unreadable_identity,
+    )
+    unreadable = negative_restart._eligibility_ownership_decision(
+        source, cfg, owning_retry=False
+    )
+    assert unreadable is not None
+    assert unreadable.reason == "release evidence authority could not be read"
+
+    negative_restart._run_registry = None
+    negative_restart._last_registry_error = "open: registry unavailable"
+    unopened = negative_restart._eligibility_ownership_decision(
+        source, cfg, owning_retry=False
+    )
+    assert unopened is not None
+    assert unopened.reason == "release evidence authority registry is unavailable"
