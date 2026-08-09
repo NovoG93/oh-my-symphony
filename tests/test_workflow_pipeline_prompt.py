@@ -442,11 +442,11 @@ def test_file_base_prompt_renders_full_ticket_path_outside_description() -> None
         build_prompt_env(
             _issue("Verify", description="ticket body marker"),
             attempt=None,
-            full_ticket_path="kanban/DEMO-1.md",
+            full_ticket_path="release-kanban/DEMO-1.md",
         ),
     )
 
-    full_ticket_index = rendered.index("Full ticket: kanban/DEMO-1.md")
+    full_ticket_index = rendered.index("Full ticket: release-kanban/DEMO-1.md")
     description_index = rendered.index("## Description")
     description_block = rendered.split("## Description", 1)[1].split(
         "## Production pipeline",
@@ -455,7 +455,20 @@ def test_file_base_prompt_renders_full_ticket_path_outside_description() -> None
 
     assert full_ticket_index < description_index
     assert "ticket body marker" in description_block
-    assert "Full ticket: kanban/DEMO-1.md" not in description_block
+    assert "Full ticket: release-kanban/DEMO-1.md" not in description_block
+    assert "Ticket file: `release-kanban/DEMO-1.md`." in rendered
+    assert "Ticket file: `kanban/DEMO-1.md`." not in rendered
+
+
+def test_file_base_prompt_does_not_direct_workers_to_kanban_without_path() -> None:
+    cfg = _load("WORKFLOW.file.example.md")
+    rendered = render(
+        cfg.prompt_template_for_state("Verify"),
+        build_prompt_env(_issue("Verify"), attempt=None),
+    )
+
+    assert "use the configured tracker board root" in rendered
+    assert "kanban/{{ issue.identifier }}.md" not in rendered
 
 
 def test_contract_rewind_prompt_uses_failing_rows_not_full_history() -> None:
