@@ -6,6 +6,8 @@ import asyncio
 import hashlib
 import json
 import sqlite3
+import shutil
+import subprocess
 import threading
 from dataclasses import replace
 from datetime import datetime, timezone
@@ -121,6 +123,37 @@ def _setup_board(repo: Path):
     return cfg, ticket_path, issue
 
 
+def _release_worker_workspace(repo: Path) -> Path:
+    """Create a worker worktree with the host board mounted exactly."""
+    worker = repo.parent / "release-worker"
+    _git(
+        repo,
+        "worktree",
+        "add",
+        "-q",
+        "-b",
+        "symphony/RELEASE-WORKSPACE",
+        str(worker),
+        "main",
+    )
+    diff = subprocess.run(
+        ["git", "diff", "--binary"],
+        cwd=repo,
+        capture_output=True,
+        check=True,
+    ).stdout
+    if diff:
+        subprocess.run(
+            ["git", "apply", "--binary"],
+            cwd=worker,
+            input=diff,
+            check=True,
+        )
+    shutil.copytree(repo / "docs", worker / "docs", dirs_exist_ok=True)
+    (worker / "kanban").symlink_to(repo / "kanban", target_is_directory=True)
+    return worker
+
+
 def _run_verify_transition(
     *,
     repo: Path,
@@ -135,14 +168,15 @@ def _run_verify_transition(
         ticket_path=ticket_path,
         transitions=[(transition_state, issue.description or "")],
     )
-    orchestrator = _orch(repo)
+    worker = _release_worker_workspace(repo)
+    orchestrator = _orch(worker)
     authority = orchestrator._prepare_release_dispatch(issue, cfg)
     assert authority.gate is not None
     registry = orchestrator._run_registry
     assert registry is not None
     run_id = registry.acquire_run(
         authority.issue,
-        workspace_path=repo,
+        workspace_path=worker,
         attempt=None,
         attempt_kind="release-verification",
         agent_kind="codex",
@@ -152,7 +186,7 @@ def _run_verify_transition(
         gate=authority.gate,
         verifier_run_id=run_id,
     )
-    _seed_running_entry(orchestrator, authority.issue, repo)
+    _seed_running_entry(orchestrator, authority.issue, worker)
     running = orchestrator._running[issue.id]
     running.run_id = run_id
     running.known_app_release = True
@@ -542,12 +576,13 @@ def test_concurrent_worker_and_reconcile_accept_one_exact_green_approval(
 ) -> None:
     repo = _setup_repo(tmp_path)
     cfg, _ticket_path, verifier = _setup_board(repo)
-    orchestrator = _orch(repo)
+    worker = _release_worker_workspace(repo)
+    orchestrator = _orch(worker)
     _seed_active_release_verifier(
         orchestrator=orchestrator,
         cfg=cfg,
         issue=verifier,
-        workspace_path=repo,
+        workspace_path=worker,
     )
     entry = orchestrator._running[verifier.id]
     tracker = FileBoardTracker(cfg.tracker)
@@ -592,7 +627,7 @@ def test_concurrent_worker_and_reconcile_accept_one_exact_green_approval(
             result = await orchestrator._enforce_app_release_transition(
                 cfg=cfg,
                 issue=terminal_verifier,
-                workspace_path=repo,
+                workspace_path=worker,
                 producing_state="Verify",
                 known_app_release=True,
             )
@@ -651,12 +686,13 @@ def test_concurrent_worker_and_reconcile_create_one_red_release_lifecycle(
 
     _mutate_evidence(repo, fail_feature)
     _sync_native_statuses(repo)
-    orchestrator = _orch(repo)
+    worker = _release_worker_workspace(repo)
+    orchestrator = _orch(worker)
     original_gate, _run_id = _seed_active_release_verifier(
         orchestrator=orchestrator,
         cfg=cfg,
         issue=verifier,
-        workspace_path=repo,
+        workspace_path=worker,
     )
     entry = orchestrator._running[verifier.id]
     tracker = FileBoardTracker(cfg.tracker)
@@ -712,7 +748,7 @@ def test_concurrent_worker_and_reconcile_create_one_red_release_lifecycle(
             result = await orchestrator._enforce_app_release_transition(
                 cfg=cfg,
                 issue=terminal_verifier,
-                workspace_path=repo,
+                workspace_path=worker,
                 producing_state="Verify",
                 known_app_release=True,
             )
@@ -1129,7 +1165,8 @@ def test_repair_children_use_source_issue_backend_over_workflow_default(
     _mutate_evidence(repo, fail_feature)
     _sync_native_statuses(repo)
     captured: list[str] = []
-    orchestrator = _orch(repo)
+    worker = _release_worker_workspace(repo)
+    orchestrator = _orch(worker)
     source = replace(issue, agent_kind="opencode", state="Document")
 
     async def refresh_full(_cfg, _issue_id: str):
@@ -1157,7 +1194,7 @@ def test_repair_children_use_source_issue_backend_over_workflow_default(
         orchestrator._enforce_app_release_transition(
             cfg=cfg,
             issue=source,
-            workspace_path=repo,
+            workspace_path=worker,
             producing_state="Verify",
             known_app_release=True,
         )
@@ -1962,14 +1999,15 @@ def test_host_release_authority_green_verifier_approves_exact_gate(
 ) -> None:
     repo = _setup_repo(tmp_path)
     cfg, ticket_path, issue = _setup_board(repo)
-    orchestrator = _orch(repo)
+    worker = _release_worker_workspace(repo)
+    orchestrator = _orch(worker)
     authority = orchestrator._prepare_release_dispatch(issue, cfg)
     assert authority.gate is not None
     registry = orchestrator._run_registry
     assert registry is not None
     verifier_run_id = registry.acquire_run(
         authority.issue,
-        workspace_path=repo,
+        workspace_path=worker,
         attempt=None,
         attempt_kind="release-verification",
         agent_kind="codex",
@@ -1984,7 +2022,7 @@ def test_host_release_authority_green_verifier_approves_exact_gate(
         ticket_path=ticket_path,
         transitions=[("Done", authority.issue.description or "")],
     )
-    _seed_running_entry(orchestrator, authority.issue, repo)
+    _seed_running_entry(orchestrator, authority.issue, worker)
     running = orchestrator._running[issue.id]
     running.run_id = verifier_run_id
     running.known_app_release = True
@@ -2003,10 +2041,11 @@ def test_host_release_authority_green_verifier_approves_exact_gate(
 
     gate = _required_release_gate(orchestrator)
     validation = validate_release_contract(
-        workspace_root=repo,
+        workspace_root=worker,
         repository_root=repo,
         verifier_ticket=issue.identifier,
         configured_target_branch="main",
+        board_root=cfg.tracker.board_root,
     )
     assert gate.status == "approved"
     assert gate.approved_fingerprint == validation.fingerprint
@@ -2333,6 +2372,9 @@ def test_stale_finalizer_cannot_adopt_reapproved_cycle_between_turns(
     cfg, ticket_path, verifier = _setup_board(repo)
     finalizer_workspace = tmp_path / "finalizer-workspace"
     _git(tmp_path, "clone", str(repo), str(finalizer_workspace))
+    (finalizer_workspace / "kanban").symlink_to(
+        repo / "kanban", target_is_directory=True
+    )
     orchestrator = _orch(finalizer_workspace)
     authority = orchestrator._prepare_release_dispatch(verifier, cfg)
     assert authority.gate is not None
@@ -3070,12 +3112,13 @@ def test_normal_release_worker_exit_holds_lease_until_terminal_cleanup_finishes(
 ) -> None:
     repo = _setup_repo(tmp_path)
     cfg, _ticket_path, verifier = _setup_board(repo)
-    orchestrator = _orch(repo)
+    worker = _release_worker_workspace(repo)
+    orchestrator = _orch(worker)
     _seed_active_release_verifier(
         orchestrator=orchestrator,
         cfg=cfg,
         issue=verifier,
-        workspace_path=repo,
+        workspace_path=worker,
     )
     tracker = FileBoardTracker(cfg.tracker)
     tracker.update_fields(verifier.identifier, state="Done")
@@ -3090,7 +3133,7 @@ def test_normal_release_worker_exit_holds_lease_until_terminal_cleanup_finishes(
         transitioned, rewound = await orchestrator._enforce_app_release_transition(
             cfg=cfg,
             issue=terminal_verifier,
-            workspace_path=repo,
+            workspace_path=worker,
             producing_state="Verify",
             known_app_release=True,
         )
@@ -3137,7 +3180,7 @@ def test_normal_release_worker_exit_holds_lease_until_terminal_cleanup_finishes(
     finally:
         peer.close()
 
-    assert removed == [repo]
+    assert removed == [worker]
 
 
 def test_reconcile_terminal_release_holds_lease_until_cleanup_finishes(
@@ -3145,12 +3188,13 @@ def test_reconcile_terminal_release_holds_lease_until_cleanup_finishes(
 ) -> None:
     repo = _setup_repo(tmp_path)
     cfg, _ticket_path, verifier = _setup_board(repo)
-    orchestrator = _orch(repo)
+    worker = _release_worker_workspace(repo)
+    orchestrator = _orch(worker)
     _seed_active_release_verifier(
         orchestrator=orchestrator,
         cfg=cfg,
         issue=verifier,
-        workspace_path=repo,
+        workspace_path=worker,
     )
     tracker = FileBoardTracker(cfg.tracker)
     tracker.update_fields(verifier.identifier, state="Done")
@@ -3225,7 +3269,7 @@ def test_reconcile_terminal_release_holds_lease_until_cleanup_finishes(
     finally:
         peer.close()
 
-    assert removed == [repo]
+    assert removed == [worker]
 
 
 def test_reconcile_late_app_release_label_rewinds_before_cleanup_or_delivery(
