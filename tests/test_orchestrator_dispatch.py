@@ -3110,8 +3110,9 @@ def _stub_workflow_state_returning(
             {"path": path, "identifier": identifier, "title": title}
         )
 
-    async def _capture_gate(path, *, identifier, title, **_):
+    async def _capture_gate(path, *, identifier, title, **kwargs):
         await _capture(path, identifier=identifier, title=title)
+        captured[-1]["push"] = kwargs.get("push")
         return HistoryGateResult(HISTORY_LOCAL_ONLY)
 
     monkeypatch.setattr(core_module, "commit_workspace_on_done", _capture)
@@ -3135,6 +3136,32 @@ def test_on_worker_exit_commits_workspace_at_done(monkeypatch):
             assert len(captured) == 1, "commit must be invoked exactly once"
             assert captured[0]["identifier"] == "MT-DONE"
             assert captured[0]["title"] == "MT-DONE title"
+            assert captured[0]["push"] is True
+        finally:
+            for retry in list(orch._retry.values()):
+                retry.timer_handle.cancel()
+
+    asyncio.run(_run())
+
+
+def test_on_worker_exit_local_only_history_gate_does_not_publish_feature_branch(
+    monkeypatch,
+):
+    cfg = _replace_agent_field(
+        _make_config(max_concurrent=1), auto_merge_push_target=False
+    )
+    orch = _orch()
+    issue = _issue("MT-LOCAL-HISTORY", state="Done")
+
+    async def _run() -> None:
+        orch._loop = asyncio.get_running_loop()
+        _install_running_entry(orch, issue)
+        captured = _stub_workflow_state_returning(orch, cfg, monkeypatch)
+
+        try:
+            await orch._on_worker_exit(issue.id, reason="normal", error=None)
+            assert len(captured) == 1
+            assert captured[0]["push"] is False
         finally:
             for retry in list(orch._retry.values()):
                 retry.timer_handle.cancel()
@@ -4051,6 +4078,29 @@ def test_auto_merge_failure_blocks_done_ticket_and_preserves_workspace(monkeypat
                 retry.timer_handle.cancel()
 
     asyncio.run(_run())
+
+
+def test_auto_merge_done_gate_passes_local_only_policy(monkeypatch):
+    cfg = _make_config(max_concurrent=1)
+    cfg = replace(cfg, agent=replace(cfg.agent, auto_merge_push_target=False))
+    orch = _orch()
+    issue = _issue("MT-LOCAL-MERGE", state="Done")
+    captured: dict[str, object] = {}
+
+    async def _capture_merge(**kwargs):
+        captured.update(kwargs)
+        from symphony.utils.auto_merge import AutoMergeResult
+
+        return AutoMergeResult(ok=True, status="merged")
+
+    monkeypatch.setattr(core_module, "auto_merge_on_done_best_effort", _capture_merge)
+
+    assert asyncio.run(
+        orch._auto_merge_done_gate_or_block(
+            cfg, issue, Path("/tmp/ws-fake"), debug_target=None
+        )
+    ) is True
+    assert captured["push_target"] is False
 
 
 def test_after_done_failure_policy_warn_removes_workspace(monkeypatch):
@@ -5341,6 +5391,7 @@ def test_snapshot_includes_branch_policy_for_admin_ui():
         "merge_target_branch": "release",
         "merge_timing": "after Document, before Done",
         "auto_merge_enabled": True,
+        "merge_delivery": "upstream-publishing",
     }
 
 
@@ -9155,6 +9206,46 @@ def test_tick_recovers_sandbox_history_failure_instead_of_opening_rca(
     assert states == [("MT-BLOCKED", "Todo")]
     assert notes[0][1] == "History Recovery"
     assert "The delivery record is in git history" in notes[0][2]
+
+
+def test_local_only_history_recovery_never_publishes_feature_branch(
+    monkeypatch, tmp_path
+):
+    repo = tmp_path / "host"
+    repo.mkdir()
+    cfg = _make_config(
+        tracker_kind="file",
+        active_states=("Todo", "In Progress"),
+        terminal_states=("Done", "Blocked"),
+        workflow_path=repo / "WORKFLOW.md",
+    )
+    cfg = replace(cfg, agent=replace(cfg.agent, auto_merge_push_target=False))
+    issue = _issue(
+        "MT-LOCAL-RECOVERY",
+        state="Blocked",
+        description=_SANDBOX_HISTORY_FAILURE,
+    )
+    captured: dict[str, object] = {}
+
+    async def _verify(path: Path, *, branch: str, push: bool = True):
+        captured.update(path=path, branch=branch, push=push)
+        return HistoryGateResult(
+            HISTORY_LOCAL_ONLY,
+            branch=branch,
+            local_sha="a" * 40,
+        )
+
+    monkeypatch.setattr(core_module, "verify_branch_history", _verify)
+    orch = _orch()
+    monkeypatch.setattr(orch, "_tracker_call_append_note", lambda *_args: None)
+    monkeypatch.setattr(orch, "_tracker_call_update_state", lambda *_args: None)
+
+    assert asyncio.run(orch._recover_blocked_history_gate(cfg, issue)) is True
+    assert captured == {
+        "path": repo,
+        "branch": "symphony/MT-LOCAL-RECOVERY",
+        "push": False,
+    }
 
 
 @pytest.mark.skipif(shutil.which("git") is None, reason="git CLI required")

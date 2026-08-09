@@ -2515,6 +2515,7 @@ class Orchestrator:
                 "merge_target_branch": "current branch",
                 "merge_timing": "after Document, before Done",
                 "auto_merge_enabled": False,
+                "merge_delivery": "disabled",
             }
         base = cfg.agent.feature_base_branch or "current branch"
         target = cfg.agent.auto_merge_target_branch or base
@@ -2524,6 +2525,11 @@ class Orchestrator:
             "merge_target_branch": target,
             "merge_timing": "after Document, before Done",
             "auto_merge_enabled": bool(cfg.agent.auto_merge_on_done),
+            "merge_delivery": (
+                "upstream-publishing"
+                if cfg.agent.auto_merge_push_target
+                else "local-only"
+            ),
         }
 
     def issue_snapshot(self, identifier: str) -> dict[str, Any] | None:
@@ -3125,6 +3131,7 @@ class Orchestrator:
             target_branch=cfg.agent.auto_merge_target_branch,
             exclude_paths=cfg.agent.auto_merge_exclude_paths,
             capture_untracked=cfg.agent.auto_merge_capture_untracked,
+            push_target=cfg.agent.auto_merge_push_target,
         )
         if result is None or result.ok:
             return True
@@ -3744,7 +3751,11 @@ class Orchestrator:
         # not help, and looping a ticket through the pipeline forever is a
         # worse failure mode than handing it to a human.
         already_recovered = bool(_HISTORY_RECOVERY_HEADING_RE.search(description))
-        result = await verify_branch_history(cfg.workflow_path.parent, branch=branch)
+        result = await verify_branch_history(
+            cfg.workflow_path.parent,
+            branch=branch,
+            push=cfg.agent.auto_merge_push_target,
+        )
 
         if not result.durable:
             log.info(
@@ -8021,9 +8032,10 @@ class Orchestrator:
             # Final History Gate, host-side. The agent cannot be the one to
             # prove delivery: it runs sandboxed and may not reach the object
             # database at all (see `utils.git_sandbox`). The orchestrator is
-            # unsandboxed, so it commits, pushes and re-reads the remote tip
-            # itself, and only a genuinely unpublished history downgrades the
-            # card — never a permission limit.
+            # unsandboxed, so it always records the branch locally. It pushes
+            # and re-reads the remote tip only when
+            # `agent.auto_merge_push_target` is true; local-only workflows
+            # never publish the feature branch before the target merge.
             history_unpublished = False
             if (
                 release_evidence_only
@@ -8032,6 +8044,9 @@ class Orchestrator:
                 and not cleanup_started
             ):
                 await commit_workspace_on_done(
+                    # Release evidence is an audit snapshot of an already
+                    # host-authorized target; keep this path local-only even
+                    # when normal tickets publish their history.
                     entry.workspace_path,
                     identifier=entry.issue.identifier,
                     title=entry.issue.title,
@@ -8049,6 +8064,7 @@ class Orchestrator:
                     identifier=entry.issue.identifier,
                     title=entry.issue.title,
                     state=entry.issue.state,
+                    push=cfg.agent.auto_merge_push_target,
                 )
                 if history.status == HISTORY_PUSH_FAILED:
                     history_unpublished = True

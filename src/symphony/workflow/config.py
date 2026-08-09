@@ -149,6 +149,12 @@ class AgentConfig:
     # changes or any git error skips the merge and logs an event — no
     # exception propagates.
     auto_merge_on_done: bool = True
+    # When true (the default), a successful terminal merge is pushed to the
+    # target branch's configured upstream and verified with `git ls-remote`.
+    # Set false for an explicitly local-only merge gate: the host still
+    # performs the same safety checks and `git merge --no-ff`, but never
+    # contacts a remote. This is useful for disposable/local release runs.
+    auto_merge_push_target: bool = True
     # Target branch in the host repo. Empty string ("") = use whatever
     # branch is currently checked out in the host repo at fire time.
     auto_merge_target_branch: str = ""

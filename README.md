@@ -839,12 +839,21 @@ the branch policy part of the preset's contract:
 ```yaml
 agent:
   auto_merge_on_done: true        # the orchestrator merges each ticket at Done
+  auto_merge_push_target: true    # push + verify the target upstream (false = local-only)
   feature_base_branch: ""         # both empty = the host's current branch
   auto_merge_target_branch: ""    # must resolve to the SAME branch
 ```
 
 - The **orchestrator** merges a ticket's branch when the ticket reaches
   `Done`. No lane merges by hand — Verify proves, Document documents.
+- `auto_merge_push_target` defaults to `true`, so a successful merge also
+  pushes and verifies the target branch's configured upstream. Set it to
+  `false` for a local-only release run: the same dirty-tree, conflict, and
+  explicit `--no-ff` checks still run, but no `git push` or `git ls-remote`
+  is attempted. The local-only choice applies to both automatic Done merges
+  and the web UI's manual Git merge action; normal ticket final-history
+  snapshotting also stays local until the target merge. Release-evidence
+  snapshots remain local audit records in either mode.
 - Build merges are gated by the **Review** lane's `verdict: PASS` (spawned
   Build tickets stay `blocked_by` the request ticket, which only reaches
   `Done` after Review passes), *not* by Verify. A merged slice is a reviewed

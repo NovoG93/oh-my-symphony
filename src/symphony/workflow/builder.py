@@ -371,6 +371,9 @@ def build_service_config(workflow: WorkflowDefinition) -> ServiceConfig:
         auto_merge_on_done=bool(
             agent_raw.get("auto_merge_on_done", True)
         ),
+        auto_merge_push_target=bool(
+            agent_raw.get("auto_merge_push_target", True)
+        ),
         auto_merge_target_branch=_as_str(
             agent_raw.get("auto_merge_target_branch"), ""
         ) or "",
