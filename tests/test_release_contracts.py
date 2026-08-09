@@ -6,6 +6,7 @@ import hashlib
 import json
 import subprocess
 from pathlib import Path
+from pathlib import PurePosixPath
 
 import pytest
 import yaml
@@ -242,6 +243,25 @@ def test_configured_host_board_symlink_is_control_data(
         target_sha=target_sha,
         repository_root=release_repo,
     ) == ()
+
+
+def test_copied_workspace_accepts_exact_external_host_board_mount(
+    release_repo: Path, tmp_path: Path
+) -> None:
+    workspace, board_root, target_sha = _workspace_with_board_entry(
+        release_repo, tmp_path
+    )
+    (workspace / "kanban").symlink_to(board_root, target_is_directory=True)
+
+    errors = release_workspace_target_errors(
+        workspace_root=workspace,
+        repository_root=workspace,
+        target_sha=target_sha,
+        board_root=board_root,
+        board_mount=PurePosixPath("kanban"),
+    )
+
+    assert errors == ()
 
 
 def test_configured_host_board_requires_workspace_mount(
