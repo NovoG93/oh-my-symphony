@@ -3050,6 +3050,7 @@
     const phase = String((data && data.phase) || '').toLowerCase();
     if (data && data.running) {
       if (data.healthy || data.ready) return 'running';
+      if (phase === 'unhealthy') return 'unhealthy';
       return phase === 'failed' ? 'failed' : 'starting';
     }
     if (phase === 'failed' || (data && data.last_error)) return 'failed';
@@ -3061,6 +3062,7 @@
       running: t('preview.phase.running'),
       starting: t('preview.phase.starting'),
       stopping: t('preview.phase.stopping'),
+      unhealthy: t('preview.phase.unhealthy'),
       failed: t('preview.phase.failed'),
       stopped: t('preview.phase.stopped'),
       disabled: t('preview.phase.disabled'),

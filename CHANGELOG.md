@@ -26,6 +26,11 @@ Versioning: [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- Enable configured Product Preview recipes by default while preserving an
+  explicit opt-out and valid unconfigured workflows. Running previews now
+  refresh readiness from successful or redirect health responses, expose an
+  unhealthy state when a live process stops serving correctly, and recover
+  when its health endpoint succeeds again.
 - Bind release approval and finalization to durable cycle generations and exact
   active worker runs, including peer-fenced startup cleanup. The provenance
   migration backs up databases with existing release gates and safely returns

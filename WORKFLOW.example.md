@@ -368,20 +368,21 @@ prime_agent:
 server:
   port: 9999            # optional JSON API; the primary UI is `symphony tui`
 
-# Optional one-click Product Preview in the admin web UI. Commands are trusted
-# WORKFLOW config, executed argv-only in a clean checkout of the merge target.
-# The API cannot override command, cwd, branch, or port; preview stays loopback.
-preview:
-  enabled: false
-  cwd: web
-  command: npm run preview -- --host ${HOST} --port ${PORT}
-  health_path: /
-  url_path: /
-  startup_timeout_ms: 30000
-  release_ticket: RELEASE-001
-  acceptance:
-    - Final acceptance suite passes
-    - Release evidence is attached
+# Optional one-click Product Preview in the admin web UI. Tailor and uncomment
+# this recipe for the product; a configured command defaults to enabled, and
+# `enabled: false` opts out. Commands are trusted WORKFLOW config, executed
+# argv-only in a clean checkout of the merge target. The API cannot override
+# command, cwd, branch, or port; preview stays loopback.
+# preview:
+#   cwd: web
+#   command: npm run preview -- --host ${HOST} --port ${PORT}
+#   health_path: /
+#   url_path: /
+#   startup_timeout_ms: 30000
+#   release_ticket: RELEASE-001
+#   acceptance:
+#     - Final acceptance suite passes
+#     - Release evidence is attached
 
 # Slack (or future channels) notifications. Entirely opt-in: omit this whole
 # block and no messages are sent. The webhook URL is the only required field;
