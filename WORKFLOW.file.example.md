@@ -246,6 +246,9 @@ agent:
   # docs/ is intentionally branch-local and merges normally. The post-Done
   # auto-merge remains a best-effort fallback for older prompts.
   auto_merge_on_done: true
+  # Publish and verify the target upstream after the local --no-ff merge.
+  # Set false for a local-only run; no git push or git ls-remote is attempted.
+  auto_merge_push_target: true
   # Branch/ref used as the start point for new `symphony/<ID>` feature
   # branches. Empty string = current host branch. The board viewer can
   # update this from its real git branch dropdown.
@@ -328,20 +331,21 @@ prime_agent:
 server:
   port: 9999            # optional JSON API; the primary UI is `symphony tui`
 
-# Optional one-click Product Preview in the admin web UI. Commands are trusted
-# WORKFLOW config, executed argv-only in a clean checkout of the merge target.
-# The API cannot override command, cwd, branch, or port; preview stays loopback.
-preview:
-  enabled: false
-  cwd: web
-  command: npm run preview -- --host ${HOST} --port ${PORT}
-  health_path: /
-  url_path: /
-  startup_timeout_ms: 30000
-  release_ticket: RELEASE-001
-  acceptance:
-    - Final acceptance suite passes
-    - Release evidence is attached
+# Optional one-click Product Preview in the admin web UI. Tailor and uncomment
+# this recipe for the product; a configured command defaults to enabled, and
+# `enabled: false` opts out. Commands are trusted WORKFLOW config, executed
+# argv-only in a clean checkout of the merge target. The API cannot override
+# command, cwd, branch, or port; preview stays loopback.
+# preview:
+#   cwd: web
+#   command: npm run preview -- --host ${HOST} --port ${PORT}
+#   health_path: /
+#   url_path: /
+#   startup_timeout_ms: 30000
+#   release_ticket: RELEASE-001
+#   acceptance:
+#     - Final acceptance suite passes
+#     - Release evidence is attached
 
 tui:
   language: en               # `en` (default) or `ko`. SYMPHONY_LANG env overrides.

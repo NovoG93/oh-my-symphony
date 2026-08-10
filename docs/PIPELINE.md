@@ -80,7 +80,14 @@ There is exactly one merge, and the orchestrator makes it:
 > **Verify proves, Document documents, the orchestrator merges.** Verify runs a
 > `git merge-tree --write-tree` preflight and records the result; when the
 > ticket reaches `Done`, `agent.auto_merge_on_done` creates the single
-> `--no-ff` merge commit on the target branch.
+> `--no-ff` merge commit on the target branch. With the default
+> `agent.auto_merge_push_target: true`, it then pushes and verifies the
+> target's configured upstream. Set that option to `false` for a local-only
+> run: all local safety checks and the `--no-ff` merge remain active, while
+> neither `git push` nor `git ls-remote` is called (including no-op retries).
+> Normal ticket final-history snapshotting follows the same setting, so a
+> local-only ticket cannot publish its feature branch before the target merge;
+> release-evidence snapshots remain local audit records.
 
 This ordering is also the wiki write-back rule. The wiki is a host-repo,
 tracked path (`<workflow-dir>/docs/llm-wiki/`, configurable via `wiki.root`).

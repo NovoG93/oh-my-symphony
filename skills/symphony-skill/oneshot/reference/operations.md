@@ -90,6 +90,22 @@ At a minimum, Deliver requires:
 - Browser apps have `.oneshot/vault/artifacts/qa-report.pdf`.
 - Browser apps have `qa-report.md` ending with `Verdict: APPROVED FOR DELIVERY`.
 
+App delivery adds the repository-root `release-contract.yaml` and the strict
+`docs/<verifier>/qa/release-evidence.json` gate. Run `symphony release check
+./WORKFLOW.md --ticket <current-verifier> --workspace <verifier-workspace>`;
+the exact current target and native artifacts must pass. An old GREEN is only
+history: repairs require a fresh verifier, and the `app-release-finalizer`
+waits for it. Verifier execution and repair-cycle mutation are file-tracker-only;
+a labeled remote card is refused before an agent turn, while remote workflows
+that never opt in stay unchanged.
+
+The CLI check is read-only; the host-owned gate generation and exact run
+bindings grant lifecycle authority. The same live verifier run may continue
+when the host preserves approval, but a host rewind or restarted redispatch
+means rerun evidence in Verify. Synchronize the configured local target branch
+first—Symphony does not fetch remote state. Startup evidence cleanup is fenced
+by a dedicated lease, so do not bypass it by deleting workspaces manually.
+
 ## Bundled templates
 
 | File | Purpose |

@@ -105,6 +105,8 @@ The real defenses are:
 3. **Re-execution by Verify**: the Verify lane runs claims from scratch.
    It doesn't trust claims.md; it trusts what its own shell produces.
 
+For app delivery, `release-contract.yaml` adds a host-computed machine boundary: `docs/<verifier>/qa/release-evidence.json` must bind native runner results and hashed artifacts to the raw contract and exact local target SHA. Historical ledger GREEN is never approval. A repairable red cycle creates grouped repairs plus a fresh verifier and links the `app-release-finalizer`; malformed/stale evidence reruns the same verifier. Host approval belongs to one exact cycle generation and worker run: a restarted or host-rewound verifier must return to Verify and regenerate evidence. Verifier execution and this lifecycle are file-tracker-only; labeled remote cards are refused before an agent turn and an already-advanced remote card needs operator rewind.
+
 If you're tempted to relax a gate: don't. The gate is the cheapest
 honest mistake-catcher in the pipeline. If it's failing legitimately,
 fix the real cause; if it's failing because the work isn't done, it's

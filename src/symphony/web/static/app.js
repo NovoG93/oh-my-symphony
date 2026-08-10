@@ -2010,6 +2010,12 @@
         kv(t('chat.maxTurns'), String(agent.max_turns)),
         kv(t('settings.maxConcurrent'), String(agent.max_concurrent_agents)),
         kv(t('settings.maxAttempts'), String(agent.max_attempts)),
+        kv(
+          t('settings.mergeDelivery'),
+          agent.merge_delivery === 'local-only' || agent.auto_merge_push_target === false
+            ? t('settings.mergeDeliveryLocal')
+            : t('settings.mergeDeliveryUpstream'),
+        ),
       ]),
     ]);
   }
@@ -2068,6 +2074,13 @@
       el('span', { class: 'history-muted' }, t('git.mergeTarget')),
       el('span', { class: 'git-mono' }, data.target_branch || '(unknown)'),
       el('span', { class: 'chip-label' }, data.auto_merge_enabled ? t('git.autoMergeOn') : t('git.autoMergeOff')),
+      el(
+        'span',
+        { class: 'chip-label' },
+        data.merge_delivery === 'local-only' || data.auto_merge_push_target === false
+          ? t('git.localOnly')
+          : t('git.upstreamPublish'),
+      ),
     ];
     if (data.target_branch && remote.default_remote) {
       targetLine.push(el('button', {
@@ -3037,6 +3050,7 @@
     const phase = String((data && data.phase) || '').toLowerCase();
     if (data && data.running) {
       if (data.healthy || data.ready) return 'running';
+      if (phase === 'unhealthy') return 'unhealthy';
       return phase === 'failed' ? 'failed' : 'starting';
     }
     if (phase === 'failed' || (data && data.last_error)) return 'failed';
@@ -3048,6 +3062,7 @@
       running: t('preview.phase.running'),
       starting: t('preview.phase.starting'),
       stopping: t('preview.phase.stopping'),
+      unhealthy: t('preview.phase.unhealthy'),
       failed: t('preview.phase.failed'),
       stopped: t('preview.phase.stopped'),
       disabled: t('preview.phase.disabled'),

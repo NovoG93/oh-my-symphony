@@ -10,8 +10,51 @@ Versioning: [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.19.1] - 2026-08-10 - Production-gated delivery and agent reliability
+
+### Added
+
+- Let operators choose any supported agent backend when starting each Chat
+  session, while keeping the workflow's configured backend as the default.
+- Add explicit local-only delivery with `agent.auto_merge_push_target: false`.
+  Symphony keeps its dirty-tree, conflict, and merge checks while skipping
+  remote publication and verification by policy.
+- Add an opt-in, host-owned application release contract that binds strict
+  browser/runtime evidence, implementation ancestry, and immutable runner
+  sources to one exact local target commit. File-board RED cycles create
+  idempotent repair groups and a fresh verifier before delivery can continue.
+
+### Changed
+
+- Enable configured Product Preview recipes by default while preserving an
+  explicit opt-out and valid unconfigured workflows. Running previews now
+  refresh readiness from successful or redirect health responses, expose an
+  unhealthy state when a live process stops serving correctly, and recover
+  when its health endpoint succeeds again.
+- Bind release approval and finalization to durable cycle generations and exact
+  active worker runs, including peer-fenced startup cleanup. The provenance
+  migration backs up databases with existing release gates and safely returns
+  legacy pending or approved gates to fresh verification.
+
 ### Fixed
 
+- Reserve deterministic repair and verifier identities before file-board
+  creation, fence RED lifecycle writes to the exact live verifier lease, and
+  bind delivery completion to the exact host-observed terminal ticket version.
+  Crashes, peer takeovers, label loss, and terminal-ticket replay now fail
+  closed without duplicate repair work or inherited approval.
+- Validate copied verifier workflows against the canonical host board: only a
+  safe relative mount resolving exactly to the configured board is accepted;
+  missing, traversing, wrong-target, and arbitrary external mounts fail closed.
+- Retire verifiers after they durably hand off a RED repair cycle and discard
+  their stale paused retries on restart, so repair tickets can dispatch without
+  weakening lost-lease or unrelated release-generation safeguards.
+- Respect configured file-board roots in rendered worker prompts and pass the
+  configured Symphony environment to every workspace hook, so customized board
+  layouts behave consistently across setup, execution, and verification.
+- Safely refresh clean reused ticket worktrees when their feature branch has
+  already been merged into the configured target. Dirty or divergent worktrees
+  remain untouched, while unsafe or concurrently changing cases fail closed.
 - Pass the rendered prompt to AGY as its required `--print` argument instead
   of the literal `-`, which AGY 1.1.x treats as prompt text rather than stdin.
 
@@ -1387,7 +1430,9 @@ First public release of the multi-agent fork.
 - Per-state concurrency caps, `$VAR`/`~` expansion, dynamic WORKFLOW
   reload, structured stderr logging, `symphony doctor`.
 
-[Unreleased]: https://github.com/cskwork/oh-my-symphony/compare/v0.18.2...HEAD
+[Unreleased]: https://github.com/cskwork/oh-my-symphony/compare/v0.19.1...HEAD
+[0.19.1]: https://github.com/cskwork/oh-my-symphony/compare/v0.19.0...v0.19.1
+[0.19.0]: https://github.com/cskwork/oh-my-symphony/compare/v0.18.2...v0.19.0
 [0.18.2]: https://github.com/cskwork/oh-my-symphony/compare/v0.18.1...v0.18.2
 [0.18.1]: https://github.com/cskwork/oh-my-symphony/compare/v0.18.0...v0.18.1
 [0.18.0]: https://github.com/cskwork/oh-my-symphony/compare/v0.17.0...v0.18.0

@@ -69,6 +69,7 @@ async def auto_merge_on_done_best_effort(
     target_branch: str,
     exclude_paths: tuple[str, ...] | list[str],
     capture_untracked: tuple[str, ...] | list[str] = (),
+    push_target: bool = True,
 ) -> AutoMergeResult:
     """Selectively apply `branch` onto `target_branch` in `workflow_dir`.
 
@@ -87,6 +88,7 @@ async def auto_merge_on_done_best_effort(
         title=title or "",
         excludes=excludes,
         captures=captures,
+        push_target=push_target,
     )
 
     def _do_run() -> subprocess.CompletedProcess[bytes]:
@@ -105,6 +107,7 @@ async def auto_merge_on_done_best_effort(
         identifier=identifier,
         branch=branch,
         target=target or "(current)",
+        push_target=push_target,
     )
     try:
         result = await asyncio.to_thread(_do_run)
@@ -130,6 +133,7 @@ async def auto_merge_on_done_best_effort(
             path=str(workflow_dir),
             identifier=identifier,
             stdout=stdout[:400],
+            push_target=push_target,
         )
         return AutoMergeResult(True, "merged", stdout)
     elif rc == _RC_SKIP_DIRTY:
@@ -205,6 +209,7 @@ def _build_script(
     title: str,
     excludes: tuple[str, ...],
     captures: tuple[str, ...] = (),
+    push_target: bool = True,
 ) -> str:
     """Shell-out script for the branch merge.
 
@@ -222,7 +227,7 @@ def _build_script(
     )
     return (
         setup
-        + _build_upstream_sync_block()
+        + _build_upstream_sync_block(push_target=push_target)
         + _build_preflight_phase(
             has_captures=bool(captures), excludes=excludes
         )
@@ -492,8 +497,16 @@ def _build_capture_block(captures: tuple[str, ...]) -> str:
     )
 
 
-def _build_upstream_sync_block() -> str:
-    """Push and verify a terminal merge when the target tracks an upstream."""
+def _build_upstream_sync_block(*, push_target: bool = True) -> str:
+    """Push and verify a terminal merge when the target tracks an upstream.
+
+    A local-only merge gate still calls ``sync_upstream`` at both the normal
+    completion path and the nothing-to-apply retry path. Keeping that helper
+    as a no-op makes those paths identical while ensuring the false branch
+    contains no remote operation at all (including ``git ls-remote``).
+    """
+    if not push_target:
+        return "sync_upstream() { :; }\n"
     return (
         "sync_upstream() {\n"
         '  REMOTE="$(git config --get "branch.${TARGET}.remote" || true)"\n'

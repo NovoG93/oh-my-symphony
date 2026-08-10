@@ -371,6 +371,9 @@ def build_service_config(workflow: WorkflowDefinition) -> ServiceConfig:
         auto_merge_on_done=bool(
             agent_raw.get("auto_merge_on_done", True)
         ),
+        auto_merge_push_target=bool(
+            agent_raw.get("auto_merge_push_target", True)
+        ),
         auto_merge_target_branch=_as_str(
             agent_raw.get("auto_merge_target_branch"), ""
         ) or "",
@@ -587,10 +590,13 @@ def build_service_config(workflow: WorkflowDefinition) -> ServiceConfig:
     preview_raw = cfg.get("preview") or {}
     if not isinstance(preview_raw, dict):
         raise ConfigValidationError("preview must be a mapping", value=preview_raw)
-    preview_enabled = _validated_bool(
-        preview_raw.get("enabled"), False, name="preview.enabled"
-    )
     preview_command = _as_str(preview_raw.get("command"), "").strip()
+    # A launch recipe is usable by default.  Missing preview configuration
+    # remains disabled/unconfigured, while operators can still opt out of a
+    # checked-in recipe explicitly with ``enabled: false``.
+    preview_enabled = _validated_bool(
+        preview_raw.get("enabled"), bool(preview_command), name="preview.enabled"
+    )
     preview_cwd = _as_str(preview_raw.get("cwd"), ".").strip() or "."
     cwd_path = Path(preview_cwd)
     if cwd_path.is_absolute() or ".." in cwd_path.parts:

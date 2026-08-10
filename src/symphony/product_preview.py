@@ -36,6 +36,7 @@ class ProductPreviewManager:
         self._last_error: str | None = None
         self._port: int | None = None
         self._url: str | None = None
+        self._health_url: str | None = None
         self._target_branch: str | None = None
         self._target_sha: str | None = None
         self._started_at: str | None = None
@@ -79,6 +80,7 @@ class ProductPreviewManager:
         self._phase = "preparing"
         self._healthy = False
         self._last_error = None
+        self._health_url = None
         workflow_dir = cfg.workflow_path.parent.resolve()
         try:
             repo_text = await self._git(workflow_dir, "rev-parse", "--show-toplevel")
@@ -136,9 +138,10 @@ class ProductPreviewManager:
             ]
             self._port, self._target_branch, self._target_sha = port, branch, sha
             self._url = f"http://{host}:{port}{preview.url_path}"
+            self._health_url = f"http://{host}:{port}{preview.health_path}"
             self._started_at = datetime.now(timezone.utc).isoformat()
             deadline = time.monotonic() + preview.startup_timeout_ms / 1000
-            health_url = f"http://{host}:{port}{preview.health_path}"
+            health_url = self._health_url
             while time.monotonic() < deadline:
                 if self._process.returncode is not None:
                     raise ProductPreviewError(
@@ -157,6 +160,7 @@ class ProductPreviewManager:
         except Exception as exc:
             self._last_error = str(exc)
             await self._terminate_process()
+            self._health_url = None
             if self._repo is not None and self._checkout is not None:
                 with contextlib.suppress(Exception):
                     await self._remove_worktree(self._repo, self._checkout)
@@ -172,6 +176,17 @@ class ProductPreviewManager:
             self._phase = "failed"
             self._healthy = False
             self._last_error = f"preview process exited with code {proc.returncode}"
+        elif running and self._health_url is not None:
+            # Readiness is live state, not a startup latch.  The web UI polls
+            # this method, so re-probing here detects a serving process that
+            # remains alive while its product endpoint becomes unhealthy.
+            self._healthy = await self._probe(self._health_url)
+            if self._healthy:
+                self._phase = "healthy"
+                self._last_error = None
+            else:
+                self._phase = "unhealthy"
+                self._last_error = f"preview health check failed: {self._health_url}"
         return {
             "phase": self._phase,
             "running": running,
@@ -191,6 +206,10 @@ class ProductPreviewManager:
         if self._process is not None and self._process.returncode is None:
             self._phase = "stopping"
         await self._terminate_process()
+        # Stopping is an explicit recovery action. Do not let a transient live
+        # health failure make the now-stopped preview render as failed; retain
+        # only a cleanup error discovered during this stop operation.
+        self._last_error = None
         if remove_checkout and self._repo is not None and self._checkout is not None:
             try:
                 await self._remove_worktree(self._repo, self._checkout)
@@ -200,6 +219,7 @@ class ProductPreviewManager:
                 self._last_error = f"preview checkout cleanup failed: {exc}"
         self._phase = "stopped"
         self._healthy = False
+        self._health_url = None
         self._process = None
 
     async def _terminate_process(self) -> None:
@@ -261,7 +281,7 @@ class ProductPreviewManager:
         def get() -> bool:
             try:
                 with urlopen(url, timeout=0.5) as response:  # noqa: S310 - loopback URL
-                    return 200 <= int(response.status) < 500
+                    return 200 <= int(response.status) < 400
             except Exception:
                 return False
         return await asyncio.to_thread(get)
