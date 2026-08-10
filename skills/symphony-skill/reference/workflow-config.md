@@ -555,10 +555,20 @@ preview:
 The command is trusted operator configuration, parsed with `shlex`, and
 started without a shell. `${PORT}` and `${HOST}` are the only managed launch
 placeholders; `PORT`, `HOST`, and `SYMPHONY_PREVIEW_SHA` are also exported.
+When `command` is configured, Preview is enabled by default; set
+`enabled: false` to keep the launch recipe checked in without allowing it to
+run. Omitting the whole `preview:` block remains valid and leaves Preview
+unconfigured.
+Symphony asks the operating system for a currently free loopback port for each
+launch. Stop and restart terminate only the process group owned by that Project
+service; Symphony never kills an unrelated listener to reclaim a port. A rare
+race in which another process takes the selected port fails safely, and the
+next launch selects a new port.
 `cwd` must be relative and remain inside the clean checkout. Health and product
-paths must begin with `/`. Start and restart are rejected until the configured
-release ticket is exactly `Done`. Preview process-control endpoints are
-available only when Symphony itself is bound to loopback. Restart stops the
-current process, removes its checkout, resolves the newest target-branch SHA,
-and relaunches. Stop and Symphony shutdown terminate the process group and
-remove the managed checkout.
+paths must begin with `/`. Health checks accept only successful or redirect
+responses and are refreshed while the preview is running. Start and restart
+are rejected until the configured release ticket is exactly `Done`. Preview
+process-control endpoints are available only when Symphony itself is bound to
+loopback. Restart stops the current process, removes its checkout, resolves the
+newest target-branch SHA, and relaunches. Stop and Symphony shutdown terminate
+the process group and remove the managed checkout.

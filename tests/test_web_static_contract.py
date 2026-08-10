@@ -348,6 +348,7 @@ def test_web_product_preview_page_contract() -> None:
     assert "function renderPreviewPage(container)" in js
     assert "function paintPreviewPage(body, data)" in js
     assert "function safePreviewUrl(value)" in js
+    assert "if (phase === 'unhealthy') return 'unhealthy'" in js
     assert (
         "previewPollTimer = setTimeout(() => refreshPreviewPage(body, false), 3000)"
         in js
@@ -361,8 +362,11 @@ def test_web_product_preview_page_contract() -> None:
     assert "Array.isArray(data.acceptance)" in js
     assert "'preview.title': 'Product Preview'" in js
     assert "'preview.title': '제품 프리뷰'" in js
+    assert "'preview.phase.unhealthy': 'UNHEALTHY'" in js
+    assert "'preview.phase.unhealthy': '비정상'" in js
     assert ".preview-command-deck" in css
     assert ".preview-status.running" in css
+    assert ".preview-status.unhealthy" in css
     assert ".preview-frame" in css
     assert ".preview-log-output" in css
     assert "@media (max-width: 560px)" in css

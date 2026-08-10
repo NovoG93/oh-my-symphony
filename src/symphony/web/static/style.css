@@ -1824,6 +1824,7 @@ a { color: inherit; }
 }
 .preview-status.running { color: #84e6a2; border-color: #34894e; background: rgba(42, 135, 70, .15); }
 .preview-status.starting, .preview-status.stopping { color: #ffd269; border-color: #8c6d25; }
+.preview-status.unhealthy { color: #ffd269; border-color: #8c6d25; }
 .preview-status.failed { color: #ff8a7f; border-color: #a74840; }
 .preview-actions { display: flex; gap: .5rem; align-items: center; flex-wrap: wrap; position: relative; z-index: 1; }
 .preview-command-deck .btn { border-radius: 2px; border-color: #626761; background: #2c302e; color: #f3f1e9; }

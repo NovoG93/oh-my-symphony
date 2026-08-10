@@ -1801,11 +1801,29 @@ def test_stage_contracts_enabled_board_logs_nothing(tmp_path):
     assert "stage_contracts_disabled" not in buf.getvalue()
 
 
-def test_preview_config_defaults_disabled(tmp_path):
+def test_preview_config_without_command_stays_unconfigured_and_disabled(tmp_path):
     cfg = build_service_config(load_workflow(_write(tmp_path, "Body")))
     assert cfg.preview.enabled is False
     assert cfg.preview.cwd == "."
     assert cfg.preview.acceptance == ()
+
+
+def test_preview_configured_command_defaults_enabled(tmp_path):
+    path = _write(
+        tmp_path,
+        "---\npreview:\n  command: python3 -m http.server ${PORT} --bind ${HOST}\n---\nBody",
+    )
+    cfg = build_service_config(load_workflow(path))
+    assert cfg.preview.enabled is True
+
+
+def test_preview_configured_command_can_be_explicitly_disabled(tmp_path):
+    path = _write(
+        tmp_path,
+        "---\npreview:\n  enabled: false\n  command: custom-preview-command\n---\nBody",
+    )
+    cfg = build_service_config(load_workflow(path))
+    assert cfg.preview.enabled is False
 
 
 def test_preview_config_parses_trusted_command_and_acceptance(tmp_path):

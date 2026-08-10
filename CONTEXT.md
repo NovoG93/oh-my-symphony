@@ -20,6 +20,18 @@ Making an existing directory usable as a Project while preserving its contents. 
 
 A user-interface navigation from one independently running Project service to another. A switch can start the destination service, but it never retargets, redirects, or stops workers belonging to either Project.
 
+## Product Preview
+
+An operator-started, loopback-only process launched from one Project's trusted workflow recipe in a detached checkout of the exact target commit. Symphony asks the operating system for a currently free managed port. Each Project service owns only the preview process group it launched; it never stops an unrelated listener or another Project's preview. A rare bind race fails the launch rather than killing the process that acquired the port.
+
+## Configured Product Preview
+
+A Product Preview with a non-empty launch command. A configured preview is enabled unless its workflow explicitly sets `enabled: false`; an omitted preview block remains valid and unconfigured.
+
+## Preview health
+
+The latest successful `2xx` or `3xx` response from the configured health path while the owned preview process is still running. Readiness requires both a live owned process and current health; startup success is not permanently latched.
+
 ## Application release contract
 
 A versioned inventory of the launch path, viewports, visible behavior, and proof required before an application may be released.
