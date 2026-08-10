@@ -19,3 +19,55 @@ Making an existing directory usable as a Project while preserving its contents. 
 ## Project switch
 
 A user-interface navigation from one independently running Project service to another. A switch can start the destination service, but it never retargets, redirects, or stops workers belonging to either Project.
+
+## Product Preview
+
+An operator-started, loopback-only process launched from one Project's trusted workflow recipe in a detached checkout of the exact target commit. Symphony asks the operating system for a currently free managed port. Each Project service owns only the preview process group it launched; it never stops an unrelated listener or another Project's preview. A rare bind race fails the launch rather than killing the process that acquired the port.
+
+## Configured Product Preview
+
+A Product Preview with a non-empty launch command. A configured preview is enabled unless its workflow explicitly sets `enabled: false`; an omitted preview block remains valid and unconfigured.
+
+## Preview health
+
+The latest successful `2xx` or `3xx` response from the configured health path while the owned preview process is still running. Readiness requires both a live owned process and current health; startup success is not permanently latched.
+
+## Application release contract
+
+A versioned inventory of the launch path, viewports, visible behavior, and proof required before an application may be released.
+
+## Release verifier
+
+A ticket that independently proves an Application release contract against one exact Target commit. A failed cycle becomes historical evidence and never approves a later commit.
+
+## Release evidence cycle
+
+One Release verifier's contract-bound evidence for one Target commit, including native runner results and hashed artifacts. Each repaired target requires a fresh cycle.
+
+## Release gate
+
+The host-owned SQLite record that binds one Release finalizer to one Release verifier, expected contract hash, Cycle generation, and exact verifier/finalizer runs. Labels opt a ticket into the first cycle and remain useful diagnostics, but they are not approval authority.
+
+## Cycle generation
+
+A unique host-created identifier for one pending or approved Release gate. Replacing, restarting, or invalidating a cycle creates a new generation so an older worker run cannot inherit later approval.
+
+## Release cycle item reservation
+
+A host-owned SQLite binding from one release fingerprint, role, and repair key to an exact deterministic file-board ticket identifier. Symphony writes the reservation before creating the ticket, so a crash, concurrent service, or removed labels cannot allocate duplicate repair or verifier work.
+
+## Finalizer completion token
+
+A host-computed digest of the exact local finalizer ticket bytes and file-replacement generation observed in the authorized terminal run. Any later ticket rewrite invalidates completion and requires a fresh Release evidence cycle.
+
+## Repair group
+
+A stable product boundary that collects related failed release checks into one repair ticket. A failed check belongs to exactly one Repair group.
+
+## Release finalizer
+
+The delivery ticket named by an Application release contract. It can finish only in an exact host-bound run after the current Release verifier succeeds, its lease ends, and its approved Target commit, contract hash, and Cycle generation still match.
+
+## Target commit
+
+The full Git commit SHA at the local configured branch tip that a Release verifier proves. Symphony does not fetch or infer a remote/deployed commit; evidence for any other local commit is stale.

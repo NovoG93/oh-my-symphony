@@ -30,6 +30,10 @@ ONESHOT = REPO_ROOT / "skills" / "symphony-skill" / "oneshot"
 BOOTSTRAP = ONESHOT / "templates" / "bootstrap.sh"
 LANES = ONESHOT / "reference" / "lanes.md"
 WORKFLOW = ONESHOT / "templates" / "WORKFLOW.oneshot.md"
+SYSTEM = ONESHOT / "templates" / "SYSTEM.md"
+DECOMPOSITION = ONESHOT / "reference" / "decomposition.md"
+OPERATIONS = ONESHOT / "reference" / "operations.md"
+QA_BROWSER = ONESHOT / "reference" / "qa-browser.md"
 
 
 def _deliver_gate_vault_files() -> list[str]:
@@ -127,6 +131,44 @@ def test_oneshot_codex_allows_registry_access_without_full_sandbox() -> None:
         "turn_sandbox_policy: {type: workspaceWrite, networkAccess: true}" in workflow
     )
     assert "turn_sandbox_policy: danger-full-access" not in workflow
+
+
+def test_oneshot_app_release_uses_machine_contract_and_fresh_cycles() -> None:
+    workflow = WORKFLOW.read_text(encoding="utf-8")
+    system = SYSTEM.read_text(encoding="utf-8")
+    references = "\n".join(
+        path.read_text(encoding="utf-8")
+        for path in (DECOMPOSITION, OPERATIONS, QA_BROWSER)
+    )
+
+    for text in (workflow, system, references):
+        assert "release-contract.yaml" in text
+        assert "release-evidence.json" in text
+        assert "fresh verifier" in text.lower()
+
+    assert "symphony release check" in workflow
+    assert "structurally valid repairable RED" in workflow
+    assert "forward historical transition" in workflow
+    assert "Evidence, schema, or environment errors stay in `Verify`" in workflow
+    assert "rebase this evidence-only verifier branch" in workflow
+    assert "never merges it into the target" in workflow
+    assert "historical" in system.lower()
+    assert "EDIT-ME" in workflow
+    assert "placeholder" in workflow.lower()
+    assert "test -f package.json" not in workflow
+
+
+def test_oneshot_app_release_assigns_runner_contract_finalization_to_build() -> None:
+    workflow = WORKFLOW.read_text(encoding="utf-8")
+    decomposition = DECOMPOSITION.read_text(encoding="utf-8")
+    browser_qa = QA_BROWSER.read_text(encoding="utf-8")
+
+    assert ".oneshot/vault/release-contract.draft.yaml" in workflow
+    assert "dedicated final Build slice" in workflow
+    assert "runner/contract-finalization Build slice is merged" in workflow
+    assert "Never edit the contract or declared runner sources in Verify" in workflow
+    assert "Final release runner + contract hashes" in decomposition
+    assert "QA executes" in browser_qa
 
 
 @pytest.mark.skipif(

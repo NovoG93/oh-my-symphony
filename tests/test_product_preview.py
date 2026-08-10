@@ -70,6 +70,69 @@ async def test_preview_stop_is_idempotent():
 
 
 @pytest.mark.asyncio
+async def test_preview_status_rechecks_health_while_process_stays_running(
+    tmp_path: Path,
+):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _git(repo, "init", "-b", "dev")
+    _git(repo, "config", "user.email", "test@example.com")
+    _git(repo, "config", "user.name", "Test")
+    (repo / "kanban").mkdir()
+    app = repo / "app"
+    app.mkdir()
+    health_status = tmp_path / "health-status"
+    health_status.write_text("200", encoding="utf-8")
+    (app / "server.py").write_text(
+        "from http.server import BaseHTTPRequestHandler, HTTPServer\n"
+        "import pathlib, sys\n"
+        "status = pathlib.Path(sys.argv[2])\n"
+        "class Handler(BaseHTTPRequestHandler):\n"
+        "    def do_GET(self):\n"
+        "        self.send_response(int(status.read_text()))\n"
+        "        self.end_headers()\n"
+        "    def log_message(self, *args): pass\n"
+        "HTTPServer((sys.argv[3], int(sys.argv[1])), Handler).serve_forever()\n",
+        encoding="utf-8",
+    )
+    workflow = repo / "WORKFLOW.md"
+    workflow.write_text(
+        "---\ntracker:\n  kind: file\n  board_root: ./kanban\n"
+        "agent:\n  kind: claude\n  auto_merge_target_branch: dev\n"
+        "preview:\n  cwd: app\n"
+        f"  command: '{sys.executable} server.py ${{PORT}} {health_status} ${{HOST}}'\n"
+        "---\nBody\n",
+        encoding="utf-8",
+    )
+    _git(repo, "add", ".")
+    _git(repo, "commit", "-m", "product")
+    manager = ProductPreviewManager()
+    try:
+        status = await manager.start(build_service_config(load_workflow(workflow)))
+        assert status["healthy"] is True
+        health_status.write_text("404", encoding="utf-8")
+        status = await manager.status()
+        assert status["running"] is True
+        assert status["healthy"] is False
+        assert status["ready"] is False
+        assert status["phase"] == "unhealthy"
+        health_status.write_text("200", encoding="utf-8")
+        status = await manager.status()
+        assert status["healthy"] is True
+        assert status["ready"] is True
+        assert status["phase"] == "healthy"
+        assert status["last_error"] is None
+        health_status.write_text("404", encoding="utf-8")
+        status = await manager.status()
+        assert status["phase"] == "unhealthy"
+        status = await manager.stop()
+        assert status["phase"] == "stopped"
+        assert status["last_error"] is None
+    finally:
+        await manager.close()
+
+
+@pytest.mark.asyncio
 async def test_preview_start_failure_removes_owned_worktree(tmp_path: Path):
     repo = tmp_path / "repo"
     repo.mkdir()

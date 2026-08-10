@@ -127,7 +127,33 @@ def test_build_service_config_defaults(tmp_path, monkeypatch):
     assert cfg.agent.max_concurrent_agents == 1
     assert cfg.agent.max_attempts == 3
     assert cfg.agent.feature_base_branch == ""
+    assert cfg.agent.auto_merge_push_target is True
     assert cfg.prompt_template_for_state("Todo") == "Hello {{ issue.identifier }}"
+
+
+def test_build_service_config_parses_local_only_auto_merge_policy(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setenv("LINEAR_API_KEY", "lin_test_token")
+    path = _write(
+        tmp_path,
+        textwrap.dedent(
+            """\
+            ---
+            tracker:
+              kind: linear
+              project_slug: my-proj
+            agent:
+              auto_merge_push_target: false
+            ---
+            Prompt
+            """
+        ),
+    )
+
+    cfg = build_service_config(load_workflow(path))
+
+    assert cfg.agent.auto_merge_push_target is False
 
 
 def test_build_service_config_reads_tracker_network_timeout_seconds(tmp_path):
@@ -1775,11 +1801,29 @@ def test_stage_contracts_enabled_board_logs_nothing(tmp_path):
     assert "stage_contracts_disabled" not in buf.getvalue()
 
 
-def test_preview_config_defaults_disabled(tmp_path):
+def test_preview_config_without_command_stays_unconfigured_and_disabled(tmp_path):
     cfg = build_service_config(load_workflow(_write(tmp_path, "Body")))
     assert cfg.preview.enabled is False
     assert cfg.preview.cwd == "."
     assert cfg.preview.acceptance == ()
+
+
+def test_preview_configured_command_defaults_enabled(tmp_path):
+    path = _write(
+        tmp_path,
+        "---\npreview:\n  command: python3 -m http.server ${PORT} --bind ${HOST}\n---\nBody",
+    )
+    cfg = build_service_config(load_workflow(path))
+    assert cfg.preview.enabled is True
+
+
+def test_preview_configured_command_can_be_explicitly_disabled(tmp_path):
+    path = _write(
+        tmp_path,
+        "---\npreview:\n  enabled: false\n  command: custom-preview-command\n---\nBody",
+    )
+    cfg = build_service_config(load_workflow(path))
+    assert cfg.preview.enabled is False
 
 
 def test_preview_config_parses_trusted_command_and_acceptance(tmp_path):

@@ -6,14 +6,17 @@ import socket
 import subprocess
 import sys
 import textwrap
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
+import yaml
 
 from symphony import service as service_module
 from symphony.service import ServiceRecord, save_record
 from symphony.cli.doctor import (
     check_after_create_hook,
+    check_app_release_contract,
     check_agy_state_dir,
     check_agent_cli,
     check_gemini_auth,
@@ -524,8 +527,8 @@ def test_run_checks_returns_one_result_per_check(tmp_path: Path) -> None:
     # + prime_agent_auth + gemini_auth + agy_state + kiro_auth + prompts
     # + after_create + workspace + git_history + agent_git_grant + tracker
     # + board.reachable + deep_merge_contract + stage_contracts + board.cli
-    # + board.dependencies + state.db = 22
-    assert len(results) == 22
+    # + board.dependencies + app.release-contract + state.db = 23
+    assert len(results) == 23
     assert {r.name.split("=")[0].split(".")[0] for r in results} >= {
         "agent",
         "hooks",
@@ -1296,3 +1299,180 @@ def test_board_dependencies_fails_on_a_cycle(tmp_path: Path) -> None:
     result = check_board_dependencies(cfg)
     assert result.status == "fail"
     assert "cycle" in result.message
+
+
+def _app_release_cfg(tmp_path: Path, *, labeled: bool = True) -> ServiceConfig:
+    from symphony.trackers.file import write_ticket_atomic
+
+    board = tmp_path / "kanban"
+    board.mkdir(exist_ok=True)
+    write_ticket_atomic(
+        board / "VERIFY-1.md",
+        {
+            "id": "VERIFY-1",
+            "identifier": "VERIFY-1",
+            "title": "Release verifier",
+            "state": "Verify",
+            "labels": ["app-release"] if labeled else [],
+            "created_at": "2026-01-01T00:00:00Z",
+        },
+        "body",
+    )
+    return _build_cfg(
+        tmp_path,
+        """
+        tracker:
+          kind: file
+          board_root: ./kanban
+          active_states: [Build, Verify, Document]
+        agent:
+          kind: codex
+          auto_merge_target_branch: main
+        codex: { command: codex app-server }
+        """,
+    )
+
+
+def _write_doctor_contract(tmp_path: Path) -> None:
+    kinds = (
+        "feature",
+        "control",
+        "visual",
+        "responsive",
+        "accessibility",
+        "reliability",
+    )
+    contract = {
+        "schema_version": 1,
+        "target_branch": "main",
+        "finalizer_ticket": "APP-FINAL",
+        "implementation_tickets": ["APP-1"],
+        "launch": {"command": "npm run dev"},
+        "runner": {
+            "command": "python tools/release_runner.py",
+            "sources": [
+                {
+                    "path": "tools/release_runner.py",
+                    "sha256": "a" * 64,
+                }
+            ],
+        },
+        "viewports": {"desktop": {"width": 1440, "height": 900}},
+        "checks": [
+            {
+                "id": f"{kind}-check",
+                "kind": kind,
+                "description": f"{kind} passes",
+                "repair_group": kind,
+                "required_viewports": ["desktop"],
+            }
+            for kind in kinds
+        ],
+    }
+    (tmp_path / "release-contract.yaml").write_text(
+        yaml.safe_dump(contract, sort_keys=False), encoding="utf-8"
+    )
+
+
+def test_app_release_doctor_ignores_non_app_file_board(tmp_path: Path) -> None:
+    cfg = _app_release_cfg(tmp_path, labeled=False)
+
+    result = check_app_release_contract(cfg)
+
+    assert result.status == "pass"
+    assert "not enabled" in result.message
+
+
+def test_app_release_doctor_fails_labeled_board_without_contract(
+    tmp_path: Path,
+) -> None:
+    cfg = _app_release_cfg(tmp_path)
+
+    result = check_app_release_contract(cfg)
+
+    assert result.status == "fail"
+    assert "missing release contract" in result.message
+
+
+def test_app_release_doctor_validates_contract_schema(tmp_path: Path) -> None:
+    cfg = _app_release_cfg(tmp_path)
+    (tmp_path / "release-contract.yaml").write_text(
+        "schema_version: 1\ntarget_branch: main\n", encoding="utf-8"
+    )
+
+    result = check_app_release_contract(cfg)
+
+    assert result.status == "fail"
+    assert "missing field" in result.message
+
+
+def test_app_release_doctor_passes_valid_local_contract(tmp_path: Path) -> None:
+    cfg = _app_release_cfg(tmp_path)
+    _write_doctor_contract(tmp_path)
+
+    result = check_app_release_contract(cfg)
+
+    assert result.status == "pass"
+    assert "atomic file-tracker lifecycle" in result.message
+
+
+def test_app_release_doctor_requires_active_verify_lane(tmp_path: Path) -> None:
+    cfg = _app_release_cfg(tmp_path)
+    cfg = replace(
+        cfg,
+        tracker=replace(cfg.tracker, active_states=("Build", "Document")),
+    )
+    _write_doctor_contract(tmp_path)
+
+    result = check_app_release_contract(cfg)
+
+    assert result.status == "fail"
+    assert "active Verify" in result.message
+
+
+def test_app_release_doctor_requires_non_verify_finalizer_lane(
+    tmp_path: Path,
+) -> None:
+    cfg = _app_release_cfg(tmp_path)
+    cfg = replace(
+        cfg,
+        tracker=replace(cfg.tracker, active_states=("Verify",)),
+    )
+    _write_doctor_contract(tmp_path)
+
+    result = check_app_release_contract(cfg)
+
+    assert result.status == "fail"
+    assert "non-Verify active lane" in result.message
+
+
+def test_app_release_doctor_requires_explicit_success_terminal(tmp_path: Path) -> None:
+    cfg = _app_release_cfg(tmp_path)
+    cfg = replace(
+        cfg,
+        tracker=replace(cfg.tracker, terminal_states=("Failed", "Rejected")),
+    )
+    _write_doctor_contract(tmp_path)
+
+    result = check_app_release_contract(cfg)
+
+    assert result.status == "fail"
+    assert "successful terminal lane" in result.message
+
+
+def test_app_release_doctor_leaves_unselected_remote_tracker_quiet(
+    tmp_path: Path,
+) -> None:
+    cfg = _build_cfg(
+        tmp_path,
+        """
+        tracker: { kind: linear, project_slug: TEST, api_key: token }
+        agent: { kind: codex }
+        codex: { command: codex app-server }
+        """,
+    )
+
+    result = check_app_release_contract(cfg)
+
+    assert result.status == "pass"
+    assert "not inspected" in result.message

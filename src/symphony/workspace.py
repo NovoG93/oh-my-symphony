@@ -23,6 +23,7 @@ from .utils.git_sandbox import (
     classify_history_failure,
 )
 from .workflow import HooksConfig
+from .workflow.constants import SYMPHONY_BRANCH_PREFIX
 
 log = get_logger()
 
@@ -37,6 +38,16 @@ _SETUP_FAILURE_STRINGS = (
     "Traceback",
     "ModuleNotFoundError",
 )
+_WORKTREE_REFRESH_GIT_TIMEOUT_S = 5.0
+
+
+@dataclass(frozen=True)
+class _LinkedWorktreeRefreshPlan:
+    """The exact immutable state captured before a preserve fast-forward."""
+
+    branch: str
+    head_sha: str
+    target_sha: str
 
 
 def _try_rmtree_once(path: Path) -> tuple[bool, str | None, bool]:
@@ -93,6 +104,349 @@ def _git_repo_root(path: Path) -> str | None:
     if result.returncode != 0 or not root:
         return None
     return str(Path(root).resolve())
+
+
+def _git_query(path: Path, *args: str) -> str | None:
+    """Run one bounded, read-only Git query for workspace reuse safety."""
+    try:
+        result = subprocess.run(
+            ["git", "-C", str(path), *args],
+            capture_output=True,
+            text=True,
+            timeout=_WORKTREE_REFRESH_GIT_TIMEOUT_S,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if result.returncode != 0:
+        return None
+    return result.stdout
+
+
+def _resolve_git_path(cwd: Path, value: str) -> Path:
+    path = Path(value.strip())
+    if not path.is_absolute():
+        path = cwd / path
+    return path.resolve()
+
+
+def _local_branch_ref(workflow_dir: Path, branch: str) -> str | None:
+    """Return the exact local ref for a configured branch name.
+
+    Preserve refresh intentionally does not accept Git revision expressions,
+    tags, remote-tracking refs, or arbitrary object IDs. The workflow config
+    field is a branch *name*, and the host-side ref must therefore be exactly
+    ``refs/heads/<name>``.
+    """
+    candidate = branch.strip()
+    if not candidate or candidate != branch or candidate.startswith("refs/"):
+        return None
+    try:
+        result = subprocess.run(
+            [
+                "git",
+                "-C",
+                str(workflow_dir),
+                "check-ref-format",
+                "--branch",
+                candidate,
+            ],
+            capture_output=True,
+            text=True,
+            timeout=_WORKTREE_REFRESH_GIT_TIMEOUT_S,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if result.returncode != 0 or result.stdout.strip() != candidate:
+        return None
+    return f"refs/heads/{candidate}"
+
+
+def _linked_worktree_refresh_plan(
+    *,
+    path: Path,
+    workflow_dir: Path | None,
+    branch: str,
+    merge_target: str,
+) -> _LinkedWorktreeRefreshPlan | None:
+    """Capture a safe preserve fast-forward plan, or return ``None``.
+
+    This deliberately proves the complete managed-worktree topology before
+    allowing a preserve reuse to touch Git. A custom repository or a linked
+    worktree belonging to another host is never refreshed here. The caller
+    must still re-capture and compare this plan immediately before running
+    the fast-forward, because branch and target refs can move concurrently.
+    """
+    if workflow_dir is None or not (path / ".git").is_file():
+        return None
+    target_ref = _local_branch_ref(workflow_dir, merge_target)
+    if target_ref is None:
+        return None
+
+    workspace_root = _git_query(path, "rev-parse", "--show-toplevel")
+    if not workspace_root:
+        return None
+    try:
+        if Path(workspace_root.strip()).resolve() != path.resolve():
+            return None
+    except OSError:
+        return None
+
+    workspace_common = _git_query(path, "rev-parse", "--git-common-dir")
+    host_common = _git_query(
+        workflow_dir, "rev-parse", "--git-common-dir"
+    )
+    if not workspace_common or not host_common:
+        return None
+    try:
+        if _resolve_git_path(path, workspace_common) != _resolve_git_path(
+            workflow_dir, host_common
+        ):
+            return None
+    except OSError:
+        return None
+
+    current_branch = _git_query(
+        path, "symbolic-ref", "--quiet", "--short", "HEAD"
+    )
+    if not current_branch or current_branch.strip() != branch:
+        return None
+
+    # The canonical setup hook force-removes and re-adds the worktree. Do not
+    # let that discard uncommitted or untracked (non-ignored) work.
+    status = _git_query(
+        path, "status", "--porcelain=v1", "--untracked-files=all"
+    )
+    if status is None or status.strip():
+        return None
+
+    branch_sha = _git_query(
+        path, "rev-parse", "--verify", "--quiet", "HEAD^{commit}"
+    )
+    host_branch_sha = _git_query(
+        workflow_dir,
+        "rev-parse",
+        "--verify",
+        "--quiet",
+        f"refs/heads/{branch}^{{commit}}",
+    )
+    target_sha = _git_query(
+        workflow_dir,
+        "rev-parse",
+        "--verify",
+        "--quiet",
+        f"{target_ref}^{{commit}}",
+    )
+    if not branch_sha or not host_branch_sha or not target_sha:
+        return None
+    branch_sha = branch_sha.strip()
+    host_branch_sha = host_branch_sha.strip()
+    target_sha = target_sha.strip()
+    if branch_sha != host_branch_sha:
+        return None
+    if branch_sha == target_sha:
+        return None
+
+    try:
+        result = subprocess.run(
+            [
+                "git",
+                "-C",
+                str(workflow_dir),
+                "merge-base",
+                "--is-ancestor",
+                branch_sha.strip(),
+                target_sha.strip(),
+            ],
+            capture_output=True,
+            timeout=_WORKTREE_REFRESH_GIT_TIMEOUT_S,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if result.returncode != 0:
+        return None
+    return _LinkedWorktreeRefreshPlan(
+        branch=branch,
+        head_sha=branch_sha,
+        target_sha=target_sha,
+    )
+
+
+def _git_command(
+    path: Path, *args: str
+) -> subprocess.CompletedProcess[bytes] | None:
+    """Run one bounded Git mutation/query for preserve reuse."""
+    try:
+        return subprocess.run(
+            ["git", "-C", str(path), *args],
+            capture_output=True,
+            stdin=subprocess.DEVNULL,
+            timeout=_WORKTREE_REFRESH_GIT_TIMEOUT_S,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+
+
+def _refresh_linked_worktree_in_place(
+    *,
+    path: Path,
+    workflow_dir: Path,
+    branch: str,
+    merge_target: str,
+    base_branch: str,
+) -> bool:
+    """Fast-forward one clean managed worktree without executing hooks.
+
+    The target SHA is captured from the host and passed as an immutable
+    object ID to ``git merge --ff-only``. Re-capturing the plan immediately
+    before the mutation fences earlier branch/target races. The target may
+    advance after capture; the worktree deliberately remains at the captured
+    ancestor and the normal delivery gate handles that later drift. A failed
+    A pre-mutation eligibility check or capture race is a no-op from the
+    caller's point of view: preserve reuse never falls back to an arbitrary
+    ``after_create``. Once the guarded merge is attempted, any failure blocks
+    dispatch with ``SymphonyError``.
+    """
+    plan = _linked_worktree_refresh_plan(
+        path=path,
+        workflow_dir=workflow_dir,
+        branch=branch,
+        merge_target=merge_target,
+    )
+    if plan is None:
+        return False
+
+    # The first capture can become stale while the event loop is yielding to
+    # the thread. Re-capture and require byte-for-byte equality before Git is
+    # allowed to update the checked-out branch.
+    confirmed = _linked_worktree_refresh_plan(
+        path=path,
+        workflow_dir=workflow_dir,
+        branch=branch,
+        merge_target=merge_target,
+    )
+    if confirmed != plan:
+        return False
+
+    result = _git_command(path, "merge", "--ff-only", plan.target_sha)
+    if result is None:
+        raise SymphonyError(
+            "preserve worktree refresh could not complete the guarded fast-forward",
+            path=str(path),
+            branch=plan.branch,
+            target=plan.target_sha,
+        )
+    if result.returncode != 0:
+        raise SymphonyError(
+            "preserve worktree refresh failed during the guarded fast-forward",
+            path=str(path),
+            branch=plan.branch,
+            target=plan.target_sha,
+            returncode=result.returncode,
+        )
+
+    head_after = _git_query(
+        path, "rev-parse", "--verify", "--quiet", "HEAD^{commit}"
+    )
+    branch_after = _git_query(
+        workflow_dir,
+        "rev-parse",
+        "--verify",
+        "--quiet",
+        f"refs/heads/{branch}^{{commit}}",
+    )
+    if (
+        head_after is None
+        or branch_after is None
+        or head_after.strip() != plan.target_sha
+        or branch_after.strip() != plan.target_sha
+    ):
+        raise SymphonyError(
+            "preserve worktree refresh postcondition failed; refusing dispatch",
+            path=str(path),
+            branch=plan.branch,
+            expected=plan.target_sha,
+            head=head_after.strip() if head_after else "",
+            branch_ref=branch_after.strip() if branch_after else "",
+        )
+
+    # The setup hook normally enables worktree config. Keep the migration
+    # tolerant of older worktrees; the only branch mutation above was the
+    # guarded fast-forward to the captured target SHA.
+    config_result = _git_command(path, "config", "extensions.worktreeConfig", "true")
+    if config_result is None or config_result.returncode != 0:
+        raise SymphonyError(
+            "preserve worktree refresh could not enable worktree-local config",
+            path=str(path),
+            branch=plan.branch,
+        )
+    config_result = _git_command(
+        path, "config", "--worktree", "symphony.basesha", plan.target_sha
+    )
+    if config_result is None or config_result.returncode != 0:
+        raise SymphonyError(
+            "preserve worktree refresh could not update symphony.basesha",
+            path=str(path),
+            branch=plan.branch,
+            target=plan.target_sha,
+        )
+    config_result = _git_command(
+        path, "config", "--worktree", "symphony.mergetargetbranch", merge_target
+    )
+    if config_result is None or config_result.returncode != 0:
+        raise SymphonyError(
+            "preserve worktree refresh could not update symphony.mergetargetbranch",
+            path=str(path),
+            branch=plan.branch,
+            target=merge_target,
+        )
+    config_result = _git_command(
+        path, "config", "--worktree", "symphony.basebranch", base_branch
+    )
+    if config_result is None or config_result.returncode != 0:
+        raise SymphonyError(
+            "preserve worktree refresh could not update symphony.basebranch",
+            path=str(path),
+            branch=plan.branch,
+            base=base_branch,
+        )
+    basesha = _git_query(path, "config", "--worktree", "--get", "symphony.basesha")
+    if basesha is None or basesha.strip() != plan.target_sha:
+        raise SymphonyError(
+            "preserve worktree refresh did not persist symphony.basesha",
+            path=str(path),
+            branch=plan.branch,
+            expected=plan.target_sha,
+            actual=basesha.strip() if basesha else "",
+        )
+    final_head = _git_query(
+        path, "rev-parse", "--verify", "--quiet", "HEAD^{commit}"
+    )
+    final_branch = _git_query(
+        workflow_dir,
+        "rev-parse",
+        "--verify",
+        "--quiet",
+        f"refs/heads/{branch}^{{commit}}",
+    )
+    if (
+        final_head is None
+        or final_branch is None
+        or final_head.strip() != plan.target_sha
+        or final_branch.strip() != plan.target_sha
+    ):
+        raise SymphonyError(
+            "preserve worktree refresh raced after config update; refusing dispatch",
+            path=str(path),
+            branch=plan.branch,
+            expected=plan.target_sha,
+            head=final_head.strip() if final_head else "",
+            branch_ref=final_branch.strip() if final_branch else "",
+        )
+    return True
 
 
 @dataclass(frozen=True)
@@ -173,6 +527,63 @@ class WorkspaceManager:
         path.mkdir(parents=True, exist_ok=True)
 
         should_run_after_create = created_now or self._reuse_policy == "refresh"
+        if (
+            not created_now
+            and self._reuse_policy == "preserve"
+            and self._hooks.after_create
+            and self._workflow_dir is not None
+        ):
+            # Preserve never re-runs an arbitrary hook. For the exact linked
+            # worktree topology shipped by Symphony, it can safely repair a
+            # clean branch that has already been merged into the target in
+            # place. Every other reuse shape remains untouched.
+            merge_target = (
+                self._hook_env.get("SYMPHONY_MERGE_TARGET_BRANCH", "").strip()
+                or self._hook_env.get("SYMPHONY_FEATURE_BASE_BRANCH", "").strip()
+            )
+            if not merge_target:
+                merge_target = (
+                    await asyncio.to_thread(
+                        _git_query,
+                        self._workflow_dir,
+                        "symbolic-ref",
+                        "--quiet",
+                        "--short",
+                        "HEAD",
+                    )
+                    or ""
+                ).strip()
+            base_branch = self._hook_env.get(
+                "SYMPHONY_FEATURE_BASE_BRANCH", ""
+            ).strip()
+            if not base_branch and self._workflow_dir is not None:
+                base_branch = (
+                    await asyncio.to_thread(
+                        _git_query,
+                        self._workflow_dir,
+                        "symbolic-ref",
+                        "--quiet",
+                        "--short",
+                        "HEAD",
+                    )
+                    or ""
+                ).strip()
+            if merge_target:
+                refreshed = await asyncio.to_thread(
+                    _refresh_linked_worktree_in_place,
+                    path=path,
+                    workflow_dir=self._workflow_dir,
+                    branch=f"{SYMPHONY_BRANCH_PREFIX}{key}",
+                    merge_target=merge_target,
+                    base_branch=base_branch,
+                )
+                if refreshed:
+                    log.info(
+                        "workspace_reuse_fast_forward",
+                        path=str(path),
+                        branch=f"{SYMPHONY_BRANCH_PREFIX}{key}",
+                        target=merge_target,
+                    )
         if should_run_after_create and self._hooks.after_create:
             try:
                 await self._run_hook("after_create", self._hooks.after_create, path)
@@ -467,7 +878,11 @@ class WorkspaceManager:
             if self._workflow_dir
             else "",
         }
-        if name == "after_create" and self._hook_env:
+        # Host-computed hook values (board location, branch policy, etc.) are
+        # part of the lifecycle contract, not just workspace creation.  Every
+        # hook receives the same base values; lifecycle-specific values passed
+        # by the caller still win below.
+        if self._hook_env:
             env.update(self._hook_env)
         if extra_env:
             env.update(extra_env)
