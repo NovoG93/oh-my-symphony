@@ -76,8 +76,11 @@ def test_web_runs_page_contract() -> None:
     js = _script_bundle()
     css = (STATIC_ROOT / "style.css").read_text(encoding="utf-8")
     html = (STATIC_ROOT / "index.html").read_text(encoding="utf-8")
+    i18n = (STATIC_ROOT / "i18n.js").read_text(encoding="utf-8")
 
     assert 'data-route="runs"' in html
+    assert "'nav.runs': 'Run history'" in i18n
+    assert "'nav.runs': '실행 기록'" in i18n
     assert "'runs'" in js.split("const ROUTES = ", 1)[1].split("\n", 1)[0]
     assert "function renderRunsPage(container)" in js
     assert "getRunDetail: (runId)" in js
