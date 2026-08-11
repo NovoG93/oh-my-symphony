@@ -178,6 +178,52 @@ class _StubOrchestrator:
     def issue_attention(self, _issue: Any) -> dict[str, str] | None:
         return None
 
+    def schedule_snapshot(self) -> dict[str, Any]:
+        common = {
+            "starvation_promoted": False,
+            "retry": None,
+            "evaluated_updated_at": "2026-07-02T00:00:00+00:00",
+        }
+        return {
+            "schema_version": 1,
+            "available": True,
+            "reason": None,
+            "generated_at": "2026-07-02T00:00:00Z",
+            "stale": False,
+            "policy": "dag",
+            "policy_order": "starvation, priority, longest_dependency_chain, registration",
+            "slots": {"running": 0, "maximum": 2, "available_before": 2, "available_after": 2},
+            "entries": [
+                {
+                    **common,
+                    "identifier": "E2E-PLAN",
+                    "evaluated_state": "Todo",
+                    "status": "ready",
+                    "code": "ready",
+                    "reason": "eligible",
+                    "queue_rank": 1,
+                    "scan_position": 1,
+                    "wave": 0,
+                    "critical_path_length": 1,
+                },
+                {
+                    **common,
+                    "identifier": "E2E-BUILD",
+                    "evaluated_state": "In Progress",
+                    "status": "waiting",
+                    "code": "waiting_dependency",
+                    "reason": "blocked",
+                    "queue_rank": None,
+                    "scan_position": 2,
+                    "wave": 1,
+                    "critical_path_length": 0,
+                },
+            ],
+        }
+
+    def dependency_state_resolved(self, state: str | None) -> bool:
+        return (state or "").strip().lower() == "done"
+
 
 def _ticket(identifier: str, title: str, state: str, priority: int = 2) -> str:
     return f"""---
@@ -214,6 +260,27 @@ def board_dir(tmp_path: Path) -> Path:
     for identifier, title, state, priority in seeds:
         (kanban / f"{identifier}.md").write_text(
             _ticket(identifier, title, state, priority),
+            encoding="utf-8",
+        )
+    (kanban / "E2E-PLAN.md").write_text(
+        _ticket("E2E-PLAN", "Plan request", "Todo", 1).replace(
+            "labels:\n", "request: E2E-REQ\nlabels:\n"
+        ),
+        encoding="utf-8",
+    )
+    (kanban / "E2E-BUILD.md").write_text(
+        _ticket("E2E-BUILD", "Build request", "In Progress", 1).replace(
+            "labels:\n",
+            "request: E2E-REQ\nblocked_by: [E2E-PLAN]\nlabels:\n",
+        ),
+        encoding="utf-8",
+    )
+    for identifier, blocker in (("E2E-CYCLE-A", "E2E-CYCLE-B"), ("E2E-CYCLE-B", "E2E-CYCLE-A")):
+        (kanban / f"{identifier}.md").write_text(
+            _ticket(identifier, "Cycle request", "Todo", 2).replace(
+                "labels:\n",
+                f"request: E2E-CYCLE\nblocked_by: [{blocker}]\nlabels:\n",
+            ),
             encoding="utf-8",
         )
     return tmp_path
@@ -839,6 +906,47 @@ async def _exercise_runs_page(page: Any, base_url: str) -> None:
     await page.get_by_role("button", name="+ New Issue").wait_for()
 
 
+async def _exercise_request_schedule(
+    page: Any, base_url: str, errors: list[str]
+) -> None:
+    await page.goto(f"{base_url}/#/board")
+    await page.get_by_role("button", name="Request", exact=True).click()
+    await page.get_by_role("heading", name="Request schedule").wait_for()
+    picker = page.locator(".request-picker")
+    await picker.wait_for()
+    option = await picker.locator("option").filter(has_text="E2E-REQ").get_attribute("value")
+    assert option is not None
+    await picker.select_option(option)
+    await page.locator(".request-node-id", has_text="E2E-PLAN").wait_for()
+    await page.locator(".request-node-id", has_text="E2E-BUILD").wait_for()
+    assert await page.locator(".schedule-status", has_text="Ready").count() >= 1
+    assert await page.locator(".schedule-status", has_text="Waiting").count() >= 1
+    await page.locator(".request-node-details summary").first.click()
+    await page.get_by_text("Decision code", exact=True).first.wait_for()
+
+    cycle_option = await picker.locator("option").filter(has_text="E2E-CYCLE").get_attribute("value")
+    assert cycle_option is not None
+    await picker.select_option(cycle_option)
+    await page.get_by_text("Dependency cycle detected", exact=False).wait_for()
+    assert await page.locator(".cycle-node").count() == 2
+
+    async def _fail_schedule(route: Any) -> None:
+        await route.fulfill(
+            status=503,
+            content_type="application/json",
+            body='{"error":{"code":"test_failure","message":"temporary outage"}}',
+        )
+
+    await page.route("**/api/v1/requests/schedule?*", _fail_schedule)
+    await picker.select_option(option)
+    await page.get_by_text("Schedule unavailable", exact=False).wait_for()
+    errors[:] = [error for error in errors if "503" not in error]
+    await page.unroute("**/api/v1/requests/schedule?*", _fail_schedule)
+
+    await page.get_by_role("button", name="Lanes", exact=True).click()
+    await page.get_by_role("button", name="+ New Issue").wait_for()
+
+
 async def test_web_board_browser_e2e(web_base_url: str) -> None:
     assert async_playwright is not None
     async with async_playwright() as p:
@@ -854,6 +962,7 @@ async def test_web_board_browser_e2e(web_base_url: str) -> None:
             lambda msg: errors.append(msg.text) if msg.type == "error" else None,
         )
         try:
+            await _exercise_request_schedule(page, web_base_url, errors)
             await _exercise_column_scope(page, web_base_url)
             await _exercise_runs_page(page, web_base_url)
             await _exercise_issue_crud(page)

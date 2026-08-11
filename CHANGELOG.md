@@ -22,6 +22,10 @@ Versioning: [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   confirmed dead or managed-stopped predecessor is fenced and linked to one new
   Run attempt; exact supported backend sessions resume, unsupported or
   release-authority runs start fresh, and interrupted turns remain at-least-once.
+- Add opt-in explainable DAG scheduling with `agent.scheduling_policy: dag`.
+  Dispatch and read-only queue explanations consume one scheduler decision path;
+  the Board Request view shows dependency execution order, deterministic waves,
+  capacity/retry ownership, and final dispatch refusals for file boards.
 
 ## [0.19.1] - 2026-08-10 - Production-gated delivery and agent reliability
 

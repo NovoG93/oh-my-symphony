@@ -7,6 +7,7 @@ stub orchestrator for the live-run surface.
 from __future__ import annotations
 
 import asyncio
+import json
 import shutil
 import subprocess
 from pathlib import Path
@@ -21,7 +22,7 @@ from symphony.orchestrator import Orchestrator
 from symphony.server import build_app
 from symphony.utils.auto_merge import AutoMergeResult
 from symphony.utils.git_ops import GitOpResult
-from symphony.webapi import _request_is_loopback
+from symphony.webapi import _PUBLIC_SCHEDULE_REASONS, _request_is_loopback
 from symphony.workflow import WorkflowState
 
 WORKFLOW_TEXT = """---
@@ -69,6 +70,35 @@ class _StubOrchestrator:
         self.reset_ci_calls = 0
         self.recover_calls: list[dict[str, str | None]] = []
         self.skip_calls: list[str] = []
+        self.schedule_payload: dict[str, Any] = {
+            "schema_version": 1,
+            "available": True,
+            "reason": None,
+            "generated_at": "2026-07-02T00:00:00Z",
+            "stale": False,
+            "policy": "fifo",
+            "policy_order": "starvation, registration",
+            "slots": {
+                "running": 0,
+                "maximum": 2,
+                "available_before": 2,
+                "available_after": 2,
+            },
+            "entries": [
+                {
+                    "identifier": "SEED-1",
+                    "status": "ready",
+                    "code": "ready",
+                    "reason": "eligible",
+                    "queue_rank": 1,
+                    "scan_position": 1,
+                    "wave": 0,
+                    "critical_path_length": 0,
+                    "starvation_promoted": False,
+                    "retry": None,
+                }
+            ],
+        }
         self.ci_status: dict[str, Any] = {
             "enabled": True,
             "interval_ms": 60_000,
@@ -259,6 +289,12 @@ class _StubOrchestrator:
         self.ci_status["turns_used"] = 0
         self.ci_status["skipped_reason"] = None
 
+    def schedule_snapshot(self) -> dict[str, Any]:
+        return dict(self.schedule_payload)
+
+    def dependency_state_resolved(self, state: str | None) -> bool:
+        return (state or "").strip().lower() == "done"
+
 
 @pytest.fixture()
 def board_dir(tmp_path: Path) -> Path:
@@ -322,6 +358,221 @@ async def test_board_returns_columns_and_issues(client: TestClient) -> None:
     assert seed["attention"]["label"] == "Budget exhausted"
     assert seed["attention"]["severity"] == "warning"
     assert payload["board"]["read_only"] is False
+
+
+async def test_request_schedule_groups_explicit_request_and_explains_queue(
+    client: TestClient, board_dir: Path
+) -> None:
+    tickets = {
+        "EXT-0": """---
+id: EXT-0
+identifier: EXT-0
+title: transitive external prerequisite
+state: Todo
+---
+External root.
+""",
+        "EXT-1": """---
+id: EXT-1
+identifier: EXT-1
+title: external prerequisite
+state: Todo
+blocked_by: [EXT-0]
+---
+External.
+""",
+        "PLAN-1": """---
+id: PLAN-1
+identifier: PLAN-1
+title: plan
+state: Todo
+request: REQ-7
+blocked_by: [EXT-1]
+---
+Plan.
+""",
+        "BUILD-1": """---
+id: BUILD-1
+identifier: BUILD-1
+title: build
+state: Todo
+request: REQ-7
+blocked_by: [PLAN-1]
+---
+Build.
+""",
+    }
+    for identifier, body in tickets.items():
+        (board_dir / "kanban" / f"{identifier}.md").write_text(body, encoding="utf-8")
+    stub = client.stub  # type: ignore[attr-defined]
+    stub.schedule_payload["entries"] = [
+        {
+            "identifier": "EXT-1",
+            "status": "ready",
+            "code": "ready",
+            "reason": "private-session-abc /Users/operator/secret",
+            "queue_rank": 1,
+            "scan_position": 1,
+            "wave": 0,
+            "critical_path_length": 2,
+            "starvation_promoted": False,
+            "retry": None,
+        },
+        {
+            "identifier": "PLAN-1",
+            "status": "waiting",
+            "code": "waiting_dependency",
+            "reason": "blocker unresolved: EXT-1",
+            "queue_rank": None,
+            "scan_position": 2,
+            "wave": 1,
+            "critical_path_length": 1,
+            "starvation_promoted": False,
+            "retry": None,
+        },
+        {
+            "identifier": "BUILD-1",
+            "status": "waiting",
+            "code": "waiting_dependency",
+            "reason": "blocker unresolved: PLAN-1",
+            "queue_rank": None,
+            "scan_position": 3,
+            "wave": 2,
+            "critical_path_length": 0,
+            "starvation_promoted": False,
+            "retry": None,
+        },
+    ]
+
+    requests_resp = await client.get("/api/v1/requests")
+    assert requests_resp.status == 200
+    requests_payload = await requests_resp.json()
+    assert requests_payload["policy"] == "fifo"
+    assert {row["kind"] for row in requests_payload["requests"]} == {
+        "request",
+        "ticket",
+    }
+    request_row = next(
+        row for row in requests_payload["requests"] if row["id"] == "REQ-7"
+    )
+    assert request_row["node_count"] == 2
+    assert request_row["counts"]["waiting"] == 2
+
+    resp = await client.get("/api/v1/requests/REQ-7/schedule")
+    assert resp.status == 200
+    payload = await resp.json()
+    assert payload["request"] == {"kind": "request", "id": "REQ-7"}
+    assert payload["summary"]["longest_unresolved_chain_nodes"] == 4
+    assert payload["edges"] == [
+        {"from": "EXT-0", "to": "EXT-1"},
+        {"from": "EXT-1", "to": "PLAN-1"},
+        {"from": "PLAN-1", "to": "BUILD-1"},
+    ]
+    assert [node["identifier"] for node in payload["nodes"]] == [
+        "EXT-0",
+        "EXT-1",
+        "PLAN-1",
+        "BUILD-1",
+    ]
+    assert payload["nodes"][0]["scope"] == "external"
+    assert "private-session-abc" not in json.dumps(payload)
+    assert "/Users/operator/secret" not in json.dumps(payload)
+    assert payload["nodes"][2]["decision"]["code"] == "waiting_dependency"
+
+    standalone_resp = await client.get(
+        "/api/v1/requests/ticket/SEED-1/schedule"
+    )
+    assert standalone_resp.status == 200
+    standalone = await standalone_resp.json()
+    assert standalone["request"] == {"kind": "ticket", "id": "SEED-1"}
+
+
+async def test_request_schedule_marks_dependency_cycles_invalid(
+    client: TestClient, board_dir: Path
+) -> None:
+    for identifier, blocker in (("CYCLE-A", "CYCLE-B"), ("CYCLE-B", "CYCLE-A")):
+        (board_dir / "kanban" / f"{identifier}.md").write_text(
+            f"""---
+id: {identifier}
+identifier: {identifier}
+title: cyclic ticket
+state: Todo
+request: REQ-CYCLE
+blocked_by: [{blocker}]
+---
+Cycle.
+""",
+            encoding="utf-8",
+        )
+
+    resp = await client.get("/api/v1/requests/REQ-CYCLE/schedule")
+    assert resp.status == 200
+    payload = await resp.json()
+    assert payload["execution_valid"] is False
+    assert payload["warnings"] == ["dependency_cycle"]
+    assert payload["summary"]["longest_unresolved_chain_nodes"] is None
+    assert {node["identifier"] for node in payload["nodes"] if node["cycle"]} == {
+        "CYCLE-A",
+        "CYCLE-B",
+    }
+
+
+async def test_request_schedule_query_supports_any_explicit_nonblank_request_id(
+    client: TestClient, board_dir: Path
+) -> None:
+    (board_dir / "kanban" / "SPECIAL-1.md").write_text(
+        """---
+id: SPECIAL-1
+identifier: SPECIAL-1
+title: special request key
+state: Todo
+request: 'Release / Phase A'
+---
+Special.
+""",
+        encoding="utf-8",
+    )
+
+    resp = await client.get(
+        "/api/v1/requests/schedule",
+        params={"kind": "request", "id": "Release / Phase A"},
+    )
+    assert resp.status == 200
+    payload = await resp.json()
+    assert payload["request"] == {
+        "kind": "request",
+        "id": "Release / Phase A",
+    }
+    assert payload["nodes"][0]["identifier"] == "SPECIAL-1"
+
+
+async def test_request_schedule_explicitly_reports_unsupported_tracker(
+    client: TestClient, board_dir: Path
+) -> None:
+    workflow_path = board_dir / "WORKFLOW.md"
+    workflow = workflow_path.read_text(encoding="utf-8").replace(
+        "  kind: file\n  board_root: ./kanban",
+        "  kind: linear\n  endpoint: https://api.linear.app/graphql\n  api_key: tok\n  project_slug: demo",
+    )
+    workflow_path.write_text(workflow, encoding="utf-8")
+    cfg, err = client.stub.workflow_state.reload()  # type: ignore[attr-defined]
+    assert err is None and cfg is not None
+
+    resp = await client.get("/api/v1/requests")
+    assert resp.status == 200
+    payload = await resp.json()
+    assert payload == {
+        "available": False,
+        "reason": "unsupported_tracker",
+        "tracker_kind": "linear",
+        "requests": [],
+    }
+
+
+async def test_request_schedule_rejects_unknown_group(client: TestClient) -> None:
+    resp = await client.get("/api/v1/requests/request/REQ-404/schedule")
+    assert resp.status == 404
+    assert (await resp.json())["error"]["code"] == "request_not_found"
 
 
 async def test_issue_detail_includes_attention(client: TestClient) -> None:
@@ -1824,3 +2075,23 @@ async def test_run_detail_validates_ids_and_returns_not_found(client: TestClient
 def test_run_diagnostics_loopback_guard() -> None:
     assert _request_is_loopback(SimpleNamespace(remote="127.0.0.1", app={}))  # type: ignore[arg-type]
     assert not _request_is_loopback(SimpleNamespace(remote="10.0.0.8", app={}))  # type: ignore[arg-type]
+
+
+def test_schedule_reason_taxonomy_covers_every_authoritative_code() -> None:
+    required = {
+        "not_evaluated", "ready", "dispatched", "running",
+        "retry_scheduled", "auto_triage", "continuous_improvement",
+        "leased_elsewhere", "registry_unavailable",
+        "historical_release_verifier", "claimed", "paused",
+        "budget_exhausted", "finalizing", "inactive",
+        "incomplete_identity", "unsupported_agent",
+        "waiting_dependency", "waiting_global_capacity",
+        "waiting_state_capacity", "refused_conflict",
+        "refused_dispatch_authority", "terminal_success",
+        "terminal_needs_action", "dangling_dependency",
+        "snapshot_unavailable", "decision_stale",
+    }
+    assert required == set(_PUBLIC_SCHEDULE_REASONS)
+    app = Path("src/symphony/web/static/app.js").read_text(encoding="utf-8")
+    for code in required:
+        assert f"      {code}: t('schedule." in app

@@ -691,7 +691,10 @@ symphony ./WORKFLOW.md --port 9999
 - **Board** — 이슈 생성/수정/삭제, 드래그로 컬럼 이동, 실행 중 배지(턴 수,
   토큰), 워커 Pause / Resume, Document 스킵. 기본 화면은 네 개의 active agent
   lane만 보여주며, `Human Review`, `Done`, `Blocked`, `Archive`는 `All`로
-  펼치기 전까지 **Review and parked** 그룹에 작게 표시된다.
+  펼치기 전까지 **Review and parked** 그룹에 작게 표시된다. **레인**에서
+  **요청** 보기로 전환하면 스케줄러가 실제로 사용한 판단을 기반으로 의존성
+  실행 순서, 대기열 순위, 웨이브, 용량 대기, 재시도 소유권, 최종 거부 사유를
+  읽기 전용으로 확인할 수 있다. 전체 그래프는 파일 보드에서만 지원된다.
 - **Workflow** — 칸반 컬럼 추가/삭제/이름변경/순서변경, 컬럼별 스테이지
   프롬프트 편집. 변경은 주석을 보존한 채 `WORKFLOW.md` frontmatter로
   저장되고, 이름이 바뀌거나 삭제된 컬럼의 티켓은 자동 마이그레이션된다.
@@ -713,6 +716,8 @@ JSON API 엔드포인트:
 | GET    | `/api/v1/health`                  | tick loop / tracker / run registry 상태       |
 | GET    | `/api/v1/state`                   | Snapshot — running, retrying, totals, limits |
 | GET    | `/api/v1/board`                   | 컬럼 + 이슈 + 실행 중 정보                    |
+| GET    | `/api/v1/requests`                | 요청 그룹 + 스케줄러 요약 (파일 보드)         |
+| GET    | `/api/v1/requests/{id}/schedule` | 의존성 그래프 + 실제 스케줄러 판단       |
 | GET    | `/api/v1/runs?issue=&limit=`      | registry의 최근 실행 시도                     |
 | POST/PATCH/DELETE | `/api/v1/issues[...]`  | 이슈 CRUD (file tracker)                     |
 | PUT    | `/api/v1/workflow/states`         | 컬럼 추가 / 삭제 / 이름변경 / 순서변경        |

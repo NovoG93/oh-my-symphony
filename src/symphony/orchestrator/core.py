@@ -19,6 +19,7 @@ through this module's globals, so tests patch
 from __future__ import annotations
 
 import asyncio
+import copy
 import json
 import os
 import re
@@ -153,6 +154,13 @@ from .helpers import (
     _utc_iso_z,
 )
 from .parsing import _parse_findings_rows, _parse_touched_files
+from .scheduler import (
+    MAX_DEPENDENCY_EDGES,
+    MAX_DEPENDENCY_NODES,
+    DependencyAnalysis,
+    analyze_dependencies,
+    sort_candidates,
+)
 from .run_registry import (
     ContinuationCheckpoint,
     ReleaseEvidenceIdentity,
@@ -217,6 +225,7 @@ class _EligibilityDisposition(str, Enum):
 @dataclass(frozen=True)
 class _EligibilityDecision:
     disposition: _EligibilityDisposition
+    code: str
     reason: str
 
 
@@ -780,6 +789,12 @@ class Orchestrator:
         # are dropped as soon as the ticket dispatches (so a fresh
         # registration doesn't keep inheriting a stale wait-age bonus).
         self._claim_released_at: dict[str, datetime] = {}
+        self._schedule_snapshot: dict[str, Any] = {
+            "schema_version": 1,
+            "available": False,
+            "reason": "not_evaluated",
+            "entries": [],
+        }
         self._totals = _CodexTotals()
         self._latest_rate_limits: dict[str, Any] | None = None
         self._issue_debug: dict[str, _IssueDebug] = {}
@@ -2818,6 +2833,17 @@ class Orchestrator:
             "health": self._health_summary(),
         }
 
+    def schedule_snapshot(self) -> dict[str, Any]:
+        """Immutable projection authored by the last completed scheduler pass."""
+
+        return copy.deepcopy(self._schedule_snapshot)
+
+    def dependency_state_resolved(self, state: str | None) -> bool:
+        """Use the dispatcher's dependency-success contract for projections."""
+
+        cfg = self._workflow_state.current()
+        return _blocker_dependency_is_resolved(state, cfg)
+
     def health(self) -> dict[str, Any]:
         """A1 — liveness/degradation surface for /api/v1/health.
 
@@ -3562,6 +3588,9 @@ class Orchestrator:
             self._refresh_pending = False
 
     async def _on_tick(self) -> None:
+        if self._schedule_snapshot.get("generated_at"):
+            self._schedule_snapshot["stale"] = True
+            self._schedule_snapshot["reason"] = "scheduler_pass_incomplete"
         cfg, err = self._workflow_state.reload()
         if err is not None and cfg is None:
             cfg = self._workflow_state.current()
@@ -3650,6 +3679,9 @@ class Orchestrator:
             candidates = await self._fetch_candidates(cfg)
         except Exception as exc:
             self._consecutive_candidate_fetch_failures += 1
+            if self._schedule_snapshot.get("generated_at"):
+                self._schedule_snapshot["stale"] = True
+                self._schedule_snapshot["reason"] = "candidate_fetch_failed"
             log.warning(
                 "candidate_fetch_failed",
                 error=str(exc),
@@ -3663,32 +3695,274 @@ class Orchestrator:
             self._blocked_rca_source_ids.discard(issue.id)
             self._history_recovery_attempted.discard(issue.id)
 
-        for issue in self._sort_with_wait_age_bump(candidates, cfg):
-            if await self._auto_triage_todo_if_actionable(issue, cfg):
+        dependency_edge_count = sum(len(issue.blocked_by) for issue in candidates)
+        dependency_graph_within_bounds = (
+            len(candidates) <= MAX_DEPENDENCY_NODES
+            and dependency_edge_count <= MAX_DEPENDENCY_EDGES
+        )
+        if not dependency_graph_within_bounds:
+            log.error(
+                "dependency_graph_too_large",
+                nodes=len(candidates),
+                edges=dependency_edge_count,
+                policy=cfg.agent.scheduling_policy,
+            )
+            if cfg.agent.scheduling_policy == "dag":
+                self._schedule_snapshot = {
+                    "schema_version": 1,
+                    "available": False,
+                    "reason": "schedule_graph_too_large",
+                    "generated_at": _utc_iso_z(),
+                    "stale": False,
+                    "policy": "dag",
+                    "policy_order": (
+                        "starvation, priority, critical_path, registration"
+                    ),
+                    "slots": {},
+                    "entries": [],
+                }
+                await self._notify_observers()
+                return
+        if (
+            not dependency_graph_within_bounds
+            and cfg.agent.scheduling_policy == "fifo"
+        ):
+            slots_before = self._available_slots(cfg)
+            await self._dispatch_fifo_without_schedule_projection(candidates, cfg)
+            self._schedule_snapshot = {
+                "schema_version": 1,
+                "available": False,
+                "reason": "schedule_graph_too_large",
+                "generated_at": _utc_iso_z(),
+                "stale": False,
+                "policy": "fifo",
+                "policy_order": "starvation, registration",
+                "slots": {
+                    "running": len(self._running),
+                    "maximum": cfg.agent.max_concurrent_agents,
+                    "available_before": slots_before,
+                    "available_after": self._available_slots(cfg),
+                },
+                "entries": [],
+            }
+            if self._available_slots(cfg) > 0:
+                await self._auto_recover_blocked_sources(cfg)
+            now_monotonic = time.monotonic()
+            if (
+                self._last_archive_sweep_monotonic is None
+                or now_monotonic - self._last_archive_sweep_monotonic
+                >= ARCHIVE_SWEEP_INTERVAL_SEC
+            ):
+                self._last_archive_sweep_monotonic = now_monotonic
+                await self._archive_sweep(cfg)
+            self._maybe_schedule_continuous_improvement(cfg)
+            await self._notify_observers()
+            return
+
+        dependency_analysis = (
+            await asyncio.to_thread(analyze_dependencies, candidates)
+            if dependency_graph_within_bounds
+            and (
+                cfg.agent.scheduling_policy == "dag"
+                or cfg.tracker.kind == "file"
+            )
+            else DependencyAnalysis({}, {})
+        )
+        ordered_candidates = self._sort_with_wait_age_bump(
+            candidates, cfg, analysis=dependency_analysis
+        )
+        path_lengths = dependency_analysis.critical_path_lengths
+        waves = dependency_analysis.waves
+        schedule_entries: list[dict[str, Any]] = []
+        ready_rank = 0
+        slots_before = self._available_slots(cfg)
+        evaluated_at = datetime.now(timezone.utc)
+        mutating_scan_open = True
+        for scan_position, issue in enumerate(ordered_candidates, start=1):
+            released_at = self._claim_released_at.get(issue.id)
+            starvation_promoted = bool(
+                released_at is not None
+                and (evaluated_at - released_at).total_seconds() / 60.0
+                >= WAIT_AGE_BUMP_MIN
+            )
+            entry: dict[str, Any] = {
+                "issue_id": issue.id,
+                "identifier": issue.identifier,
+                "request": (issue.request or "").strip() or None,
+                "state": issue.state,
+                "evaluated_state": issue.state,
+                "evaluated_updated_at": (
+                    issue.updated_at.isoformat() if issue.updated_at else None
+                ),
+                "evaluated_priority": issue.priority,
+                "evaluated_request": (issue.request or "").strip() or None,
+                "evaluated_blocked_by": [
+                    {
+                        "id": blocker.id,
+                        "identifier": blocker.identifier,
+                        "state": blocker.state,
+                    }
+                    for blocker in issue.blocked_by
+                ],
+                "priority": issue.priority,
+                "critical_path_length": path_lengths.get(issue.id, 0),
+                "wave": waves.get(issue.id, 0),
+                "scan_position": scan_position,
+                "queue_rank": None,
+                "starvation_promoted": starvation_promoted,
+                "status": "waiting",
+                "code": "not_evaluated",
+                "reason": "not evaluated",
+                "dispatch_outcome": None,
+                "retry": None,
+            }
+            if dependency_graph_within_bounds:
+                schedule_entries.append(entry)
+
+            if mutating_scan_open and await self._auto_triage_todo_if_actionable(
+                issue, cfg
+            ):
+                entry.update(
+                    status="waiting",
+                    code="auto_triage",
+                    reason="ticket was advanced by automatic triage",
+                    dispatch_outcome="state_changed",
+                )
                 continue
-            if self._available_slots(cfg) <= 0:
-                break
-            if not self._should_dispatch(issue, cfg):
+            running = self._running.get(issue.id)
+            if running is not None:
+                entry.update(
+                    status="running",
+                    code="running",
+                    reason="worker is running",
+                    dispatch_outcome="running",
+                )
+                if mutating_scan_open and self._available_slots(cfg) <= 0:
+                    mutating_scan_open = False
                 continue
-            # C1 — system-level pre-check. An overlap with any in-flight
-            # ticket's `## Touched Files` would race two workers against
-            # the same paths. Move the candidate to Blocked instead of
-            # claiming the slot; the agent prompt no longer carries this
-            # check itself (workflow-v0.5.2 § C1).
+            retry = self._retry.get(issue.id)
+            if retry is not None:
+                entry.update(
+                    status="retrying",
+                    code="retry_scheduled",
+                    reason="owned by the retry timer",
+                    retry={
+                        "attempt": retry.attempt,
+                        "kind": retry.kind,
+                        "due_at": _from_monotonic_to_iso(retry.due_at_ms),
+                        "holds_slot": retry.holds_slot,
+                    },
+                )
+                if mutating_scan_open and self._available_slots(cfg) <= 0:
+                    mutating_scan_open = False
+                continue
+
+            if mutating_scan_open and self._available_slots(cfg) <= 0:
+                # Preserve the legacy loop's first capacity break. Remaining
+                # rows are projected without tracker writes or dispatch checks.
+                mutating_scan_open = False
+
+            decision = self._eligibility_decision(
+                issue,
+                cfg,
+                owning_retry=False,
+                include_global_slots=False,
+            )
+            entry.update(
+                status=(
+                    "ready"
+                    if decision.disposition is _EligibilityDisposition.READY
+                    else (
+                        "waiting"
+                        if decision.disposition
+                        in {
+                            _EligibilityDisposition.WAIT_SLOT,
+                            _EligibilityDisposition.WAIT_NON_SLOT,
+                        }
+                        else "needs_action"
+                    )
+                ),
+                code=decision.code,
+                reason=decision.reason,
+            )
+            if decision.disposition is not _EligibilityDisposition.READY:
+                continue
+
+            ready_rank += 1
+            entry["queue_rank"] = ready_rank
+            if not mutating_scan_open or self._available_slots(cfg) <= 0:
+                mutating_scan_open = False
+                entry.update(
+                    status="ready",
+                    code="waiting_global_capacity",
+                    reason="ready; waiting for an orchestrator slot",
+                    dispatch_outcome="queued",
+                )
+                continue
+
+            # C1 — this final pre-dispatch check can still invalidate a
+            # forecast because touched-file ownership changes with live runs.
             conflict = self._conflict_blocker(issue)
             if conflict is not None:
                 other_identifier, overlap = conflict
                 await self._block_ticket_for_conflict(
                     cfg, issue, other_identifier, overlap
                 )
+                entry.update(
+                    status="needs_action",
+                    code="refused_conflict",
+                    reason=f"touched files overlap with {other_identifier}",
+                    dispatch_outcome="blocked",
+                )
                 continue
             persisted_attempt = self._persisted_retry_attempts.get(issue.id)
-            self._dispatch(
+            started = self._dispatch(
                 issue,
                 cfg,
                 attempt=persisted_attempt,
                 attempt_kind="retry" if persisted_attempt is not None else None,
             )
+            entry.update(
+                status="running" if started else "needs_action",
+                code="dispatched" if started else "refused_dispatch_authority",
+                reason=(
+                    "selected and dispatched"
+                    if started
+                    else "selected but final dispatch authority refused the run"
+                ),
+                dispatch_outcome="started" if started else "refused",
+            )
+
+        self._schedule_snapshot = {
+            "schema_version": 1,
+            "available": (
+                cfg.tracker.kind == "file" and dependency_graph_within_bounds
+            ),
+            "reason": (
+                "unsupported_tracker"
+                if cfg.tracker.kind != "file"
+                else (
+                    None
+                    if dependency_graph_within_bounds
+                    else "schedule_graph_too_large"
+                )
+            ),
+            "generated_at": _utc_iso_z(),
+            "stale": False,
+            "policy": cfg.agent.scheduling_policy,
+            "policy_order": (
+                "starvation, priority, critical_path, registration"
+                if cfg.agent.scheduling_policy == "dag"
+                else "starvation, registration"
+            ),
+            "slots": {
+                "running": len(self._running),
+                "maximum": cfg.agent.max_concurrent_agents,
+                "available_before": slots_before,
+                "available_after": self._available_slots(cfg),
+            },
+            "entries": schedule_entries if cfg.tracker.kind == "file" else [],
+        }
 
         if self._available_slots(cfg) > 0:
             await self._auto_recover_blocked_sources(cfg)
@@ -3708,8 +3982,44 @@ class Orchestrator:
 
         await self._notify_observers()
 
-    def _sort_with_wait_age_bump(
+    async def _dispatch_fifo_without_schedule_projection(
         self, candidates: list[Issue], cfg: ServiceConfig
+    ) -> None:
+        """Preserve the legacy bounded loop when explanation limits are exceeded."""
+
+        empty_analysis = DependencyAnalysis({}, {})
+        for issue in self._sort_with_wait_age_bump(
+            candidates, cfg, analysis=empty_analysis
+        ):
+            if await self._auto_triage_todo_if_actionable(issue, cfg):
+                continue
+            if self._available_slots(cfg) <= 0:
+                break
+            if not self._should_dispatch(issue, cfg):
+                continue
+            conflict = self._conflict_blocker(issue)
+            if conflict is not None:
+                other_identifier, overlap = conflict
+                await self._block_ticket_for_conflict(
+                    cfg, issue, other_identifier, overlap
+                )
+                continue
+            persisted_attempt = self._persisted_retry_attempts.get(issue.id)
+            self._dispatch(
+                issue,
+                cfg,
+                attempt=persisted_attempt,
+                attempt_kind=(
+                    "retry" if persisted_attempt is not None else None
+                ),
+            )
+
+    def _sort_with_wait_age_bump(
+        self,
+        candidates: list[Issue],
+        cfg: ServiceConfig,
+        *,
+        analysis: DependencyAnalysis | None = None,
     ) -> list[Issue]:
         """G3 — promote candidates whose recovered wait age crossed the
         threshold ahead of registration-order FIFO. Candidates with no
@@ -3718,7 +4028,9 @@ class Orchestrator:
         wins so the most-starved ticket dispatches first.
         """
         if not self._claim_released_at:
-            return _sort_for_dispatch_fifo(candidates, cfg)
+            return sort_candidates(
+                candidates, cfg.agent.scheduling_policy, analysis=analysis
+            )
         now = datetime.now(timezone.utc)
         bumped: list[Issue] = []
         normal: list[Issue] = []
@@ -3733,7 +4045,9 @@ class Orchestrator:
             else:
                 normal.append(issue)
         bumped.sort(key=lambda i: self._claim_released_at.get(i.id) or now)
-        return bumped + _sort_for_dispatch_fifo(normal, cfg)
+        return bumped + sort_candidates(
+            normal, cfg.agent.scheduling_policy, analysis=analysis
+        )
 
     async def _archive_sweep(self, cfg: ServiceConfig) -> None:
         """Auto-archive terminal-state issues older than `archive_after_days`.
@@ -4750,7 +5064,9 @@ class Orchestrator:
     ) -> _EligibilityDecision | None:
         if issue.id in self._running:
             return _EligibilityDecision(
-                _EligibilityDisposition.REJECT, "duplicate running ownership"
+                _EligibilityDisposition.REJECT,
+                "running",
+                "duplicate running ownership",
             )
         ci_task = self._improvement_task
         if (
@@ -4760,17 +5076,21 @@ class Orchestrator:
         ):
             return _EligibilityDecision(
                 _EligibilityDisposition.WAIT_NON_SLOT,
+                "continuous_improvement",
                 "continuous improvement is using the idle board",
             )
         if self._has_active_run_lease(issue.id):
             reason = "another active run lease exists for this issue"
             self._lease_blocked[issue.id] = reason
-            return _EligibilityDecision(_EligibilityDisposition.WAIT_NON_SLOT, reason)
+            return _EligibilityDecision(
+                _EligibilityDisposition.WAIT_NON_SLOT, "leased_elsewhere", reason
+            )
         self._lease_blocked.pop(issue.id, None)
         registry = self._run_registry
         if registry is None and self._last_registry_error is not None:
             return _EligibilityDecision(
                 _EligibilityDisposition.WAIT_NON_SLOT,
+                "registry_unavailable",
                 "release evidence authority registry is unavailable",
             )
         if registry is not None:
@@ -4783,29 +5103,38 @@ class Orchestrator:
             if identity is unavailable:
                 return _EligibilityDecision(
                     _EligibilityDisposition.WAIT_NON_SLOT,
+                    "registry_unavailable",
                     "release evidence authority could not be read",
                 )
             if identity is not None and identity.retired:
                 return _EligibilityDecision(
                     _EligibilityDisposition.REJECT,
+                    "historical_release_verifier",
                     "historical release verifier is evidence-only",
                 )
         if not owning_retry and issue.id in self._claimed:
             return _EligibilityDecision(
-                _EligibilityDisposition.REJECT, "issue already has a claim"
+                _EligibilityDisposition.REJECT,
+                "claimed",
+                "issue already has a claim",
             )
         if issue.id in self._paused_issue_ids:
             return _EligibilityDecision(
                 _EligibilityDisposition.WAIT_SLOT,
+                "paused",
                 self._pause_reasons.get(issue.id, "paused"),
             )
         if issue.id in self._turn_budget_exhausted:
             return _EligibilityDecision(
-                _EligibilityDisposition.REJECT, "turn budget exhausted"
+                _EligibilityDisposition.REJECT,
+                "budget_exhausted",
+                "turn budget exhausted",
             )
         if issue.id in self._terminal_persist_pending:
             return _EligibilityDecision(
-                _EligibilityDisposition.REJECT, "finalization already owns issue"
+                _EligibilityDisposition.REJECT,
+                "finalizing",
+                "finalization already owns issue",
             )
         return None
 
@@ -4817,11 +5146,15 @@ class Orchestrator:
         state = normalize_state(issue.state)
         if state in terminal or state not in active:
             return _EligibilityDecision(
-                _EligibilityDisposition.REJECT, f"inactive state: {issue.state}"
+                _EligibilityDisposition.REJECT,
+                "inactive",
+                f"inactive state: {issue.state}",
             )
         if not (issue.id and issue.identifier and issue.title and issue.state):
             return _EligibilityDecision(
-                _EligibilityDisposition.REJECT, "incomplete issue identity"
+                _EligibilityDisposition.REJECT,
+                "incomplete_identity",
+                "incomplete issue identity",
             )
         requested_agent = _requested_agent_kind(issue)
         if requested_agent is not None and requested_agent not in SUPPORTED_AGENT_KINDS:
@@ -4834,12 +5167,17 @@ class Orchestrator:
             )
             return _EligibilityDecision(
                 _EligibilityDisposition.REJECT,
+                "unsupported_agent",
                 f"unsupported agent kind: {requested_agent}",
             )
         return None
 
     def _eligibility_contention_decision(
-        self, issue: Issue, cfg: ServiceConfig
+        self,
+        issue: Issue,
+        cfg: ServiceConfig,
+        *,
+        include_global_slots: bool = True,
     ) -> _EligibilityDecision | None:
         state = normalize_state(issue.state)
         per_state_cap = cfg.agent.max_concurrent_agents_by_state.get(state)
@@ -4852,28 +5190,37 @@ class Orchestrator:
             if current_in_state >= per_state_cap:
                 return _EligibilityDecision(
                     _EligibilityDisposition.WAIT_NON_SLOT,
+                    "waiting_state_capacity",
                     f"per-state capacity reached for {issue.state}",
                 )
         for blocker in issue.blocked_by:
             if self._blocker_is_in_flight(blocker):
                 return _EligibilityDecision(
                     _EligibilityDisposition.WAIT_NON_SLOT,
+                    "waiting_dependency",
                     f"blocker still in flight: {blocker.identifier}",
                 )
             if not _blocker_dependency_is_resolved(blocker.state, cfg):
                 return _EligibilityDecision(
                     _EligibilityDisposition.WAIT_NON_SLOT,
+                    "waiting_dependency",
                     f"blocker unresolved: {blocker.identifier}",
                 )
-        if self._available_slots(cfg) == 0:
+        if include_global_slots and self._available_slots(cfg) == 0:
             return _EligibilityDecision(
                 _EligibilityDisposition.WAIT_NON_SLOT,
+                "waiting_global_capacity",
                 "no available orchestrator slots",
             )
         return None
 
     def _eligibility_decision(
-        self, issue: Issue, cfg: ServiceConfig, *, owning_retry: bool
+        self,
+        issue: Issue,
+        cfg: ServiceConfig,
+        *,
+        owning_retry: bool,
+        include_global_slots: bool = True,
     ) -> _EligibilityDecision:
         decision = self._eligibility_ownership_decision(
             issue, cfg, owning_retry=owning_retry
@@ -4881,9 +5228,11 @@ class Orchestrator:
         if decision is None:
             decision = self._eligibility_contract_decision(issue, cfg)
         if decision is None:
-            decision = self._eligibility_contention_decision(issue, cfg)
+            decision = self._eligibility_contention_decision(
+                issue, cfg, include_global_slots=include_global_slots
+            )
         return decision or _EligibilityDecision(
-            _EligibilityDisposition.READY, "eligible"
+            _EligibilityDisposition.READY, "ready", "eligible"
         )
 
     def _blocker_is_in_flight(self, blocker: BlockerRef) -> bool:
@@ -5539,7 +5888,7 @@ class Orchestrator:
         *,
         attempt: int | None,
         attempt_kind: str | None = None,
-    ) -> None:
+    ) -> bool:
         try:
             release_authority = self._prepare_release_dispatch(issue, cfg)
         except SymphonyError as exc:
@@ -5550,7 +5899,7 @@ class Orchestrator:
                 tracker_kind=cfg.tracker.kind,
                 error=str(exc),
             )
-            return
+            return False
         issue = release_authority.issue
         self._dispatch_state.cancel_pending_retry(issue.id)
 
@@ -5577,7 +5926,7 @@ class Orchestrator:
             ),
         )
         if acquisition is None:
-            return
+            return False
         run_id = acquisition.run_id
         if acquisition.checkpoint is not None:
             resolved_attempt_kind = "recovery"
@@ -5694,7 +6043,7 @@ class Orchestrator:
                     identifier=issue.identifier,
                     error=str(exc),
                 )
-                return
+                return False
         entry = RunningEntry(
             issue=issue,
             started_at=datetime.now(timezone.utc),
@@ -5804,6 +6153,7 @@ class Orchestrator:
                 agent_kind=entry.agent_kind,
                 error=str(exc),
             )
+        return True
 
     def _on_worker_task_done(self, issue_id: str, task: asyncio.Task[None]) -> None:
         """Clean a registered worker whose coroutine never ran its cleanup.
