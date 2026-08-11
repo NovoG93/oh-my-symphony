@@ -21,6 +21,7 @@ from symphony.orchestrator import Orchestrator
 from symphony.server import build_app
 from symphony.utils.auto_merge import AutoMergeResult
 from symphony.utils.git_ops import GitOpResult
+from symphony.webapi import _request_is_loopback
 from symphony.workflow import WorkflowState
 
 WORKFLOW_TEXT = """---
@@ -136,7 +137,13 @@ class _StubOrchestrator:
         return None
 
     def recent_runs(
-        self, issue_id: str | None = None, limit: int = 50
+        self,
+        issue_id: str | None = None,
+        limit: int = 50,
+        *,
+        query: str | None = None,
+        status: str | None = None,
+        agent: str | None = None,
     ) -> tuple[list[dict[str, Any]], str | None]:
         if self.run_history_error is not None:
             return [], self.run_history_error
@@ -167,7 +174,42 @@ class _StubOrchestrator:
             },
         ]
         filtered = [r for r in rows if issue_id is None or r["issue_id"] == issue_id]
+        if query:
+            needle = query.lower()
+            filtered = [
+                r
+                for r in filtered
+                if any(
+                    needle in str(r[field]).lower()
+                    for field in ("identifier", "agent_kind", "status")
+                )
+            ]
+        if status:
+            filtered = [r for r in filtered if r["status"] == status]
+        if agent:
+            filtered = [r for r in filtered if r["agent_kind"] == agent]
         return filtered[:limit], None
+
+    def run_detail(self, run_id: str) -> tuple[dict[str, Any] | None, str | None]:
+        if run_id != "a" * 32:
+            return None, None
+        return {
+            "run": {
+                "run_id": run_id,
+                "identifier": "SEED-1",
+                "title": "seeded ticket",
+                "state": "Done",
+                "status": "normal",
+                "tokens": {"input": 1, "cache": 2, "output": 3, "total": 6},
+            },
+            "events": [{"event_type": "run_completed", "payload": {"status": "normal"}}],
+        }, None
+
+    def run_diagnostic(self, run_id: str) -> tuple[dict[str, Any] | None, str | None]:
+        detail, error = self.run_detail(run_id)
+        if detail is None:
+            return None, error
+        return {"schema_version": 1, **detail}, None
 
     def is_paused(self, _issue_id: str) -> bool:
         return False
@@ -1727,3 +1769,58 @@ async def test_project_mutations_reject_cross_origin(
         assert (await wrong_scheme.json())["error"]["code"] == "forbidden_origin"
     finally:
         await client.close()
+
+
+@pytest.mark.asyncio
+async def test_runs_endpoint_supports_explorer_filters(client: TestClient) -> None:
+    resp = await client.get("/api/v1/runs?query=other&status=force_ejected_zombie&agent=codex")
+    assert resp.status == 200
+    payload = await resp.json()
+    assert [row["identifier"] for row in payload["runs"]] == ["OTHER-1"]
+    agent_query = await client.get("/api/v1/runs?query=codex")
+    assert [row["identifier"] for row in (await agent_query.json())["runs"]] == [
+        "OTHER-1"
+    ]
+    status_query = await client.get("/api/v1/runs?query=force_ejected_zombie")
+    assert [row["identifier"] for row in (await status_query.json())["runs"]] == [
+        "OTHER-1"
+    ]
+
+
+@pytest.mark.asyncio
+async def test_run_detail_and_attachment_diagnostic_endpoints(client: TestClient) -> None:
+    run_id = "a" * 32
+    detail_resp = await client.get(f"/api/v1/runs/{run_id}")
+    assert detail_resp.status == 200
+    assert detail_resp.headers["Cache-Control"] == "no-store"
+    detail = await detail_resp.json()
+    assert detail["run"]["title"] == "seeded ticket"
+    assert detail["events"][0]["event_type"] == "run_completed"
+
+    diagnostic_resp = await client.get(f"/api/v1/runs/{run_id}/diagnostic")
+    assert diagnostic_resp.status == 200
+    assert diagnostic_resp.headers["Content-Type"].startswith("application/json")
+    assert diagnostic_resp.headers["Cache-Control"] == "no-store, private"
+    assert diagnostic_resp.headers["X-Content-Type-Options"] == "nosniff"
+    assert diagnostic_resp.headers["Content-Disposition"] == (
+        f'attachment; filename="symphony-run-{run_id}-diagnostic.json"'
+    )
+    diagnostic = await diagnostic_resp.json()
+    assert diagnostic["schema_version"] == 1
+
+
+@pytest.mark.asyncio
+async def test_run_detail_validates_ids_and_returns_not_found(client: TestClient) -> None:
+    invalid = await client.get("/api/v1/runs/not-a-run")
+    assert invalid.status == 400
+    assert (await invalid.json())["error"]["code"] == "invalid_run_id"
+    uppercase = await client.get(f"/api/v1/runs/{'A' * 32}")
+    assert uppercase.status == 400
+
+    missing = await client.get(f"/api/v1/runs/{'b' * 32}")
+    assert missing.status == 404
+    assert (await missing.json())["error"]["code"] == "run_not_found"
+
+def test_run_diagnostics_loopback_guard() -> None:
+    assert _request_is_loopback(SimpleNamespace(remote="127.0.0.1", app={}))  # type: ignore[arg-type]
+    assert not _request_is_loopback(SimpleNamespace(remote="10.0.0.8", app={}))  # type: ignore[arg-type]

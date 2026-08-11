@@ -47,6 +47,7 @@ from ..backends import (
 )
 from ..backends import build_backend
 from ..chat import cfg_for_mode
+from ..utils import git_inspect
 from ..utils.archive import select_archivable
 from ..backends.codex import linear_graphql_tool
 from ..errors import (
@@ -361,15 +362,26 @@ def _run_record_payload(record: RunRecord) -> dict[str, Any]:
         "run_id": record.run_id,
         "issue_id": record.issue_id,
         "identifier": record.identifier,
+        "title": record.title,
+        "state": record.state,
         "attempt": record.attempt,
         "attempt_kind": record.attempt_kind,
         "agent_kind": record.agent_kind,
         "status": record.status,
         "started_at": record.started_at.isoformat() if record.started_at else None,
-        "completed_at": (
-            record.completed_at.isoformat() if record.completed_at else None
-        ),
+        "updated_at": record.updated_at.isoformat() if record.updated_at else None,
+        "completed_at": record.completed_at.isoformat() if record.completed_at else None,
         "workspace_path": str(record.workspace_path) if record.workspace_path else None,
+        "branch_name": record.branch_name or f"{SYMPHONY_BRANCH_PREFIX}{record.identifier}",
+        "commit_sha": record.commit_sha,
+        "tokens": {
+            "input": record.input_tokens,
+            "cache": record.cache_input_tokens,
+            "output": record.output_tokens,
+            "total": record.total_tokens,
+        },
+        "failure_class": record.failure_class,
+        "failure_message": record.failure_message,
     }
 
 
@@ -1926,7 +1938,13 @@ class Orchestrator:
         )
 
     def recent_runs(
-        self, issue_id: str | None = None, limit: int = 50
+        self,
+        issue_id: str | None = None,
+        limit: int = 50,
+        *,
+        query: str | None = None,
+        status: str | None = None,
+        agent: str | None = None,
     ) -> tuple[list[dict[str, Any]], str | None]:
         registry = self._run_registry
         if registry is None:
@@ -1939,12 +1957,73 @@ class Orchestrator:
 
         rows = self._registry_guard(
             "recent_runs",
-            lambda: registry.recent_runs(issue_id=issue_id, limit=limit),
+            lambda: registry.recent_runs(
+                issue_id=issue_id,
+                limit=limit,
+                query=query,
+                status=status,
+                agent=agent,
+            ),
             None,
         )
         if rows is None:
             return [], self._last_registry_error
         return [_run_record_payload(row) for row in rows], None
+
+    def run_detail(self, run_id: str) -> tuple[dict[str, Any] | None, str | None]:
+        registry = self._run_registry
+        if registry is None:
+            cfg = self._workflow_state.current()
+            if cfg is not None:
+                self._ensure_run_registry(cfg)
+                registry = self._run_registry
+        if registry is None:
+            return None, "run registry unavailable"
+        try:
+            return registry.run_detail(run_id), None
+        except KeyError:
+            return None, None
+        except Exception as exc:
+            self._registry_error_count += 1
+            self._last_registry_error = f"run_detail: {exc}"
+            return None, self._last_registry_error
+
+    def run_diagnostic(self, run_id: str) -> tuple[dict[str, Any] | None, str | None]:
+        registry = self._run_registry
+        if registry is None:
+            cfg = self._workflow_state.current()
+            if cfg is not None:
+                self._ensure_run_registry(cfg)
+                registry = self._run_registry
+        if registry is None:
+            return None, "run registry unavailable"
+        try:
+            return registry.diagnostic_json(run_id), None
+        except KeyError:
+            return None, None
+        except Exception as exc:
+            self._registry_error_count += 1
+            self._last_registry_error = f"run_diagnostic: {exc}"
+            return None, self._last_registry_error
+
+    def _append_run_event(
+        self,
+        entry: RunningEntry,
+        event_type: str,
+        payload: dict[str, Any] | None = None,
+    ) -> None:
+        registry = self._run_registry
+        if registry is None or not entry.run_id:
+            return
+        self._registry_guard(
+            "append_attempt_event",
+            lambda: registry.append_attempt_event(
+                run_id=entry.run_id,
+                event_type=event_type,
+                payload=payload,
+            ),
+            False,
+        )
 
     def _release_verifier_handoff_is_durable(
         self,
@@ -2293,7 +2372,11 @@ class Orchestrator:
                 entry.cancelled_at = datetime.now(timezone.utc)
 
     def _finish_run_lease(
-        self, issue_id: str, entry: RunningEntry, status: str
+        self,
+        issue_id: str,
+        entry: RunningEntry,
+        status: str,
+        error: str | None = None,
     ) -> None:
         registry = self._run_registry
         if registry is None or not entry.run_id:
@@ -2304,6 +2387,13 @@ class Orchestrator:
                 issue_id=issue_id,
                 run_id=entry.run_id,
                 status=status,
+                state=entry.issue.state,
+                input_tokens=entry.codex_input_tokens,
+                cache_input_tokens=entry.codex_cache_input_tokens,
+                output_tokens=entry.codex_output_tokens,
+                total_tokens=entry.codex_total_tokens,
+                failure_class=(None if status == "normal" else status),
+                failure_message=error,
             ),
             None,
         )
@@ -5490,6 +5580,7 @@ class Orchestrator:
         worker_task.add_done_callback(
             lambda task, issue_id=issue.id: self._on_worker_task_done(issue_id, task)
         )
+        self._append_run_event(entry, "run_started", {"state": issue.state})
         debug = self._issue_debug.setdefault(issue.id, _IssueDebug())
         if attempt is not None:
             debug.restart_count += 1
@@ -6110,6 +6201,18 @@ class Orchestrator:
                                 is_rewind=is_rewind,
                                 workspace=str(workspace.path),
                             )
+                            if running_entry is not None:
+                                self._append_run_event(
+                                    running_entry,
+                                    "phase_transition",
+                                    {
+                                        "from_state": prev_phase_state,
+                                        "to_state": current_state,
+                                        "turn": turn_number,
+                                        "attempt": attempt,
+                                        "is_rewind": is_rewind,
+                                    },
+                                )
                             self._record_stats_transition(
                                 issue.identifier, prev_phase_state, current_state
                             )
@@ -6193,6 +6296,15 @@ class Orchestrator:
                         max_turns=cfg.agent.max_turns,
                         is_continuation=is_continuation,
                     )
+                    self._append_run_event(
+                        running,
+                        "turn_started",
+                        {
+                            "turn": turn_number,
+                            "state": running.issue.state,
+                            "continuation": is_continuation,
+                        },
+                    )
                     if turn_number > 1:
                         try:
                             await self._workspace_manager.before_run(workspace.path)
@@ -6244,6 +6356,22 @@ class Orchestrator:
 
                     await self._workspace_manager.after_run_best_effort(workspace.path)
                     after_run_pending = False
+                    # The hook may commit or amend the turn's changes. Resolve
+                    # HEAD only after it finishes so the explorer never reports
+                    # the base/prior-turn commit as this turn's result.
+                    commit_sha = None
+                    if (workspace.path / ".git").exists():
+                        commit_sha = await asyncio.to_thread(
+                            git_inspect.resolve_commit, workspace.path, "HEAD"
+                        )
+                    if commit_sha:
+                        running_entry = self._running.get(running_issue_id)
+                        if running_entry is not None:
+                            self._append_run_event(
+                                running_entry,
+                                "workspace_updated",
+                                {"turn": turn_number, "commit_sha": commit_sha},
+                            )
 
                     # Record the state the backend just operated on so the
                     # next iteration can detect a phase transition against
@@ -7524,6 +7652,9 @@ class Orchestrator:
                     debug.last_error = f"approval denied: {reason} ({command})"
                 else:
                     debug.last_error = f"approval denied: {reason}"
+                self._append_run_event(
+                    entry, "approval_denied", {"reason": reason}
+                )
                 log.warning(
                     "approval_denied",
                     issue_id=issue_id,
@@ -7643,6 +7774,7 @@ class Orchestrator:
                 identifier=entry.issue.identifier,
                 session_id=entry.session_id,
             )
+            self._append_run_event(entry, "session_started")
         if ev_name == EVENT_TURN_COMPLETED:
             turn_id = payload.get("turnId") or payload.get("turn_id")
             if turn_id and entry.thread_id:
@@ -7658,6 +7790,17 @@ class Orchestrator:
                 output_tokens=entry.codex_output_tokens,
                 total_tokens=entry.codex_total_tokens,
                 last_message=(entry.last_codex_message or "")[:160],
+            )
+            self._append_run_event(
+                entry,
+                "turn_completed",
+                {
+                    "turn": entry.turn_count,
+                    "input_tokens": entry.codex_input_tokens,
+                    "cache_input_tokens": entry.codex_cache_input_tokens,
+                    "output_tokens": entry.codex_output_tokens,
+                    "total_tokens": entry.codex_total_tokens,
+                },
             )
             self._record_token_attention_for_turn(entry, cfg)
             self._record_stats_turn(entry)
@@ -7722,31 +7865,64 @@ class Orchestrator:
                 reason=str(reason) if reason else "",
                 stderr_tail=stderr_tail if isinstance(stderr_tail, list) else None,
             )
+            self._append_run_event(
+                entry,
+                "turn_failed",
+                {
+                    "turn": entry.turn_count,
+                    "reason": reason,
+                    "stderr_lines": stderr_tail,
+                },
+            )
         if ev_name == EVENT_COMPACTION:
             phase = payload.get("phase") if isinstance(payload, dict) else None
+            compaction_reason = (
+                payload.get("reason") if isinstance(payload, dict) else None
+            )
+            tokens_before = (
+                payload.get("tokens_before") if isinstance(payload, dict) else None
+            )
             log.info(
                 "agent_compaction",
                 issue_id=issue_id,
                 identifier=entry.issue.identifier,
                 phase=str(phase) if phase else "",
-                reason=str(payload.get("reason") or "")
-                if isinstance(payload, dict)
-                else "",
-                tokens_before=payload.get("tokens_before")
-                if isinstance(payload, dict)
-                else None,
+                reason=str(compaction_reason or ""),
+                tokens_before=tokens_before,
+            )
+            self._append_run_event(
+                entry,
+                "compaction",
+                {
+                    "phase": phase,
+                    "reason": compaction_reason,
+                    "tokens_before": tokens_before,
+                },
             )
         if ev_name == EVENT_AGENT_RETRY:
             phase = payload.get("phase") if isinstance(payload, dict) else None
+            retry_attempt = payload.get("attempt") if isinstance(payload, dict) else None
+            retry_error = (
+                payload.get("error") or payload.get("final_error")
+                if isinstance(payload, dict)
+                else None
+            )
             log.info(
                 "agent_internal_retry",
                 issue_id=issue_id,
                 identifier=entry.issue.identifier,
                 phase=str(phase) if phase else "",
-                attempt=payload.get("attempt") if isinstance(payload, dict) else None,
-                error=str(payload.get("error") or payload.get("final_error") or "")
-                if isinstance(payload, dict)
-                else "",
+                attempt=retry_attempt,
+                error=str(retry_error or ""),
+            )
+            self._append_run_event(
+                entry,
+                "retry",
+                {
+                    "phase": phase,
+                    "attempt": retry_attempt,
+                    "error": retry_error,
+                },
             )
 
         # Track recent events.
@@ -7867,7 +8043,7 @@ class Orchestrator:
                 owned_entry is not None
                 and self._running.get(issue_id) is not owned_entry
             ):
-                self._finish_run_lease(issue_id, owned_entry, reason)
+                self._finish_run_lease(issue_id, owned_entry, reason, error)
             self._terminal_persist_pending.discard(issue_id)
 
     async def _on_worker_exit_impl(
@@ -7937,7 +8113,7 @@ class Orchestrator:
         if entry is None:
             return
         if not defer_lease_finish:
-            self._finish_run_lease(issue_id, entry, reason)
+            self._finish_run_lease(issue_id, entry, reason, error)
         elapsed = (datetime.now(timezone.utc) - entry.started_at).total_seconds()
         self._totals.seconds_running += elapsed
         debug = self._issue_debug.setdefault(issue_id, _IssueDebug())

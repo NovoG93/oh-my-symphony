@@ -10,6 +10,15 @@ Versioning: [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+
+- Add an attempt-centric Runs explorer with search/filter controls, polling,
+  per-run lifecycle timelines, bounded/redacted failure diagnostics, token and
+  Git/workspace references, and downloadable diagnostic JSON.
+- Add the additive SQLite v7 diagnostic schema and run detail/download API.
+  Persisted diagnostic events are allowlisted, redacted before storage, capped
+  per string/event/run, and remain non-authoritative telemetry.
+
 ## [0.19.1] - 2026-08-10 - Production-gated delivery and agent reliability
 
 ### Added

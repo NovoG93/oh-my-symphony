@@ -38,6 +38,7 @@ FIRST_LEGACY_FLOW_TABLE_VERSION = 2
 FIRST_GOVERNED_WORKFLOW_VERSION = FIRST_LEGACY_FLOW_TABLE_VERSION
 RELEASE_PROVENANCE_VERSION = 5
 RELEASE_CYCLE_AUTHORITY_VERSION = 6
+RUN_EXPLORER_VERSION = 7
 
 
 @dataclass(frozen=True)
@@ -499,6 +500,58 @@ def _migrate_006_release_cycle_authority(conn: sqlite3.Connection) -> None:
         )
 
 
+def _migrate_007_run_explorer(conn: sqlite3.Connection) -> None:
+    """Add bounded diagnostic metadata without reviving legacy ``run_events``."""
+    # Some early test/repair databases recorded v1 without retaining its tables.
+    # Recreate the idempotent baseline rather than making this additive upgrade
+    # fail halfway through.
+    if not _table_columns(conn, "runs"):
+        _migrate_001_baseline(conn)
+    for column, declaration in (
+        ("input_tokens", "INTEGER"),
+        ("cache_input_tokens", "INTEGER"),
+        ("output_tokens", "INTEGER"),
+        ("total_tokens", "INTEGER"),
+        ("failure_class", "TEXT"),
+        ("failure_message", "TEXT"),
+        ("branch_name", "TEXT"),
+        ("commit_sha", "TEXT"),
+    ):
+        _add_column_if_missing(conn, "runs", column, declaration)
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS attempt_events (
+            event_id INTEGER PRIMARY KEY AUTOINCREMENT,
+            run_id TEXT NOT NULL,
+            event_type TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            payload_json TEXT NOT NULL
+        )
+        """
+    )
+    conn.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_attempt_events_run_event
+        ON attempt_events(run_id, event_id)
+        """
+    )
+    conn.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_runs_completed_at
+        ON runs(completed_at DESC)
+        """
+    )
+    conn.execute(
+        """
+        CREATE TRIGGER IF NOT EXISTS delete_attempt_events_with_run
+        AFTER DELETE ON runs
+        BEGIN
+            DELETE FROM attempt_events WHERE run_id = OLD.run_id;
+        END
+        """
+    )
+
+
 MIGRATIONS: tuple[Migration, ...] = (
     Migration(1, "baseline_runs_and_issue_flags", _migrate_001_baseline),
     # The recorded name stays "governed_workflow_ledger" so existing
@@ -519,6 +572,11 @@ MIGRATIONS: tuple[Migration, ...] = (
         RELEASE_CYCLE_AUTHORITY_VERSION,
         "release_cycle_authority",
         _migrate_006_release_cycle_authority,
+    ),
+    Migration(
+        RUN_EXPLORER_VERSION,
+        "run_explorer_diagnostics",
+        _migrate_007_run_explorer,
     ),
 )
 

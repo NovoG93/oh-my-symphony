@@ -64,12 +64,36 @@
     patchIssue: (id, fields) => apiRequest(`/issues/${encodeURIComponent(id)}`, { method: 'PATCH', body: JSON.stringify(fields) }),
     deleteIssue: (id) => apiRequest(`/issues/${encodeURIComponent(id)}`, { method: 'DELETE' }),
     getWorkflow: () => apiRequest('/workflow'),
-    getRuns: ({ issue, limit } = {}) => {
+    getRuns: ({ issue, limit, query, status, agent } = {}) => {
       const params = new URLSearchParams();
       if (issue) params.set('issue', issue);
       if (limit != null) params.set('limit', String(limit));
-      const query = params.toString();
-      return apiRequest(`/runs${query ? `?${query}` : ''}`);
+      if (query) params.set('query', query);
+      if (status) params.set('status', status);
+      if (agent) params.set('agent', agent);
+      const search = params.toString();
+      return apiRequest(`/runs${search ? `?${search}` : ''}`);
+    },
+    getRunDetail: (runId) => apiRequest(`/runs/${encodeURIComponent(runId)}`),
+    downloadRunDiagnostic: async (runId) => {
+      const res = await fetch(`${API_BASE}/runs/${encodeURIComponent(runId)}/diagnostic`);
+      if (!res.ok) {
+        let message = t('api.requestFailed', { status: res.status });
+        try {
+          const payload = await res.json();
+          message = (payload.error && payload.error.message) || message;
+        } catch (_err) { /* keep the status-based message */ }
+        throw new ApiError(message, 'diagnostic_download_failed', res.status);
+      }
+      const blob = await res.blob();
+      const href = URL.createObjectURL(blob);
+      const link = document.createElement('a');
+      link.href = href;
+      link.download = `symphony-run-${runId}.json`;
+      document.body.appendChild(link);
+      link.click();
+      link.remove();
+      URL.revokeObjectURL(href);
     },
     putWorkflowStates: (states) => apiRequest('/workflow/states', { method: 'PUT', body: JSON.stringify({ states }) }),
     getPrompt: (stateName) => apiRequest(`/workflow/prompts/${encodeURIComponent(stateName)}`),
@@ -136,7 +160,7 @@
   // State store
   // ------------------------------------------------------------------
 
-  const ROUTES = ['board', 'stats', 'workflow', 'git', 'chat', 'preview', 'settings'];
+  const ROUTES = ['board', 'runs', 'stats', 'workflow', 'git', 'chat', 'preview', 'settings'];
 
   const PRIORITY_META = {
     0: { label: t('priority.urgent'), short: 'P0', className: 'p0' },
@@ -160,6 +184,7 @@
     boardScope: 'active',
     mobileColumnIndex: 0,
     statsDays: 30,
+    selectedRunId: null,
     drawerIssue: null,
     workflowDraft: null,
     openModalBackdrop: null,
@@ -973,9 +998,13 @@
     closeDrawer();
     closeChatSocket();
     cancelPreviewPoll();
+    cancelRunsPoll();
     switch (state.route) {
       case 'board':
         renderBoardPage(view);
+        break;
+      case 'runs':
+        renderRunsPage(view);
         break;
       case 'stats':
         renderStatsPage(view);
@@ -1631,7 +1660,15 @@
     const status = run.status || t('common.unknown');
     const start = formatShortDateTime(run.started_at);
     const end = run.completed_at ? formatShortDateTime(run.completed_at) : t('common.openEnded');
-    return el('div', { class: 'run-history-row' }, [
+    return el('button', {
+      class: 'run-history-row',
+      type: 'button',
+      title: t('runs.openExplorer'),
+      onClick: () => {
+        state.selectedRunId = run.run_id;
+        navigate('runs');
+      },
+    }, [
       el('span', { class: 'run-history-main' }, `${attempt} ${agent}`),
       el('span', { class: 'run-history-status' }, status),
       el('span', { class: 'run-history-time' }, `${start} -> ${end}`),
@@ -1738,6 +1775,314 @@
     }
   }
 
+
+  // ------------------------------------------------------------------
+  // Page: Runs
+  // ------------------------------------------------------------------
+
+  let runsPollTimer = null;
+
+  function cancelRunsPoll() {
+    if (runsPollTimer != null) clearTimeout(runsPollTimer);
+    runsPollTimer = null;
+  }
+
+  function scheduleRunsPoll(page) {
+    cancelRunsPoll();
+    runsPollTimer = setTimeout(async () => {
+      if (state.route !== 'runs' || !document.body.contains(page)) return;
+      await loadRunsPage(page, { quiet: true });
+      if (state.route === 'runs' && document.body.contains(page)) scheduleRunsPoll(page);
+    }, 5000);
+  }
+
+  function renderRunsPage(container) {
+    const page = el('div', { class: 'page page-runs' });
+    page._runs = [];
+    page._detail = null;
+
+    const search = el('input', {
+      id: 'runs-search',
+      class: 'input runs-search',
+      type: 'search',
+      placeholder: t('runs.searchPlaceholder'),
+      onInput: () => applyRunFilters(page, { debounce: true }),
+    });
+    const statusFilter = el('select', {
+      id: 'runs-status-filter',
+      class: 'select',
+      onChange: () => applyRunFilters(page),
+    }, [el('option', { value: '' }, t('runs.allStatuses'))]);
+    const agentFilter = el('select', {
+      id: 'runs-agent-filter',
+      class: 'select',
+      onChange: () => applyRunFilters(page),
+    }, [el('option', { value: '' }, t('runs.allAgents'))]);
+    const refresh = el('button', {
+      class: 'btn btn-ghost',
+      onClick: () => loadRunsPage(page),
+    }, t('common.refresh'));
+
+    page._runsControls = { search, statusFilter, agentFilter };
+    page.appendChild(el('div', { class: 'topbar runs-topbar' }, [
+      el('div', { class: 'topbar-left' }, [
+        el('h1', { class: 'page-title' }, t('nav.runs')),
+        el('span', { class: 'page-subtitle' }, t('runs.subtitle')),
+      ]),
+      el('div', { class: 'topbar-right runs-filters' }, [search, statusFilter, agentFilter, refresh]),
+    ]));
+
+    const list = el('div', { class: 'run-attempt-list', id: 'run-attempt-list' }, [buildSkeletonBlock()]);
+    const detail = el('div', { class: 'run-attempt-detail', id: 'run-attempt-detail' }, [
+      el('div', { class: 'empty-state' }, t('runs.selectAttempt')),
+    ]);
+    page.appendChild(el('div', { class: 'runs-layout' }, [list, detail]));
+    container.appendChild(page);
+    loadRunsPage(page).finally(() => {
+      if (state.route === 'runs' && document.body.contains(page)) scheduleRunsPoll(page);
+    });
+  }
+
+  function applyRunFilters(page, { debounce = false } = {}) {
+    if (page._runsSearchTimer) clearTimeout(page._runsSearchTimer);
+    state.selectedRunId = null;
+    const refresh = () => loadRunsPage(page);
+    if (debounce) page._runsSearchTimer = setTimeout(refresh, 250);
+    else refresh();
+  }
+
+  async function loadRunsPage(page, { quiet = false } = {}) {
+    try {
+      const { search, statusFilter, agentFilter } = page._runsControls;
+      const data = await api.getRuns({
+        limit: 200,
+        query: search.value.trim() || undefined,
+        status: statusFilter.value || undefined,
+        agent: agentFilter.value || undefined,
+      });
+      if (state.route !== 'runs' || !document.body.contains(page)) return;
+      page._runs = data.runs || [];
+      populateRunFilters(page);
+      renderRunAttemptList(page);
+      const selected = state.selectedRunId || (page._runs[0] && page._runs[0].run_id);
+      if (selected) {
+        state.selectedRunId = selected;
+        await loadRunDetail(page, selected, { quiet });
+      } else {
+        renderRunDetail(page, null);
+      }
+    } catch (err) {
+      if (quiet || state.route !== 'runs' || !document.body.contains(page)) return;
+      const list = page.querySelector('#run-attempt-list');
+      clearNode(list);
+      list.appendChild(el('div', { class: 'empty-state' }, t('runs.loadFailed', { error: err.message })));
+    }
+  }
+
+  function populateRunFilters(page) {
+    const { statusFilter, agentFilter } = page._runsControls;
+    const currentStatus = statusFilter.value;
+    const currentAgent = agentFilter.value;
+    const statuses = [...new Set(page._runs.map((run) => run.status).filter(Boolean))].sort();
+    const agents = [...new Set(page._runs.map((run) => run.agent_kind).filter(Boolean))].sort();
+    clearNode(statusFilter);
+    statusFilter.appendChild(el('option', { value: '' }, t('runs.allStatuses')));
+    for (const status of statuses) statusFilter.appendChild(el('option', { value: status }, status));
+    clearNode(agentFilter);
+    agentFilter.appendChild(el('option', { value: '' }, t('runs.allAgents')));
+    for (const agent of agents) agentFilter.appendChild(el('option', { value: agent }, agent));
+    statusFilter.value = statuses.includes(currentStatus) ? currentStatus : '';
+    agentFilter.value = agents.includes(currentAgent) ? currentAgent : '';
+  }
+
+  function filteredRuns(page) {
+    const { search, statusFilter, agentFilter } = page._runsControls;
+    const query = search.value.trim().toLowerCase();
+    return page._runs.filter((run) => {
+      if (statusFilter.value && run.status !== statusFilter.value) return false;
+      if (agentFilter.value && run.agent_kind !== agentFilter.value) return false;
+      if (!query) return true;
+      return [
+        run.identifier,
+        run.title,
+        run.status,
+        run.agent_kind,
+        run.attempt_kind,
+        run.failure_class,
+        run.error_class,
+      ].some((value) => String(value || '').toLowerCase().includes(query));
+    });
+  }
+
+  function renderRunAttemptList(page) {
+    const list = page.querySelector('#run-attempt-list');
+    if (!list) return;
+    clearNode(list);
+    const runs = filteredRuns(page);
+    if (!runs.length) {
+      list.appendChild(el('div', { class: 'empty-state' }, t('runs.noAttempts')));
+      return;
+    }
+    for (const run of runs) list.appendChild(buildRunAttemptRow(page, run));
+  }
+
+  function buildRunAttemptRow(page, run) {
+    const selected = state.selectedRunId === run.run_id;
+    const totalTokens = run.tokens ? run.tokens.total : run.total_tokens;
+    const tokenTotal = totalTokens == null ? null : formatCompactNumber(totalTokens);
+    const title = run.title || run.identifier || run.run_id;
+    return el('button', {
+      class: `run-attempt-row${selected ? ' selected' : ''}`,
+      type: 'button',
+      onClick: async () => {
+        state.selectedRunId = run.run_id;
+        renderRunAttemptList(page);
+        await loadRunDetail(page, run.run_id);
+      },
+    }, [
+      el('div', { class: 'run-attempt-heading' }, [
+        el('strong', null, run.identifier || run.run_id),
+        el('span', { class: `run-status run-status-${runStatusTone(run.status)}` }, run.status || t('common.unknown')),
+      ]),
+      el('div', { class: 'run-attempt-title' }, title),
+      el('div', { class: 'run-attempt-meta' }, [
+        el('span', null, `${run.attempt_kind || 'run'} · ${run.agent_kind || t('common.unknown')}`),
+        el('span', null, formatShortDateTime(run.started_at)),
+        tokenTotal != null ? el('span', null, t('runs.tokenCount', { count: tokenTotal })) : null,
+      ]),
+    ]);
+  }
+
+  function runStatusTone(status) {
+    const value = String(status || '').toLowerCase();
+    if (value === 'active' || value === 'reclaiming') return 'active';
+    if (value === 'normal' || value === 'completed' || value === 'done') return 'ok';
+    if (value === 'cancelled' || value === 'paused' || value === 'manual_stop') return 'neutral';
+    return value ? 'failed' : 'neutral';
+  }
+
+  function runEventLabel(eventType) {
+    if (!eventType) return t('common.unknown');
+    return t(`runs.event.${eventType}`);
+  }
+
+  async function loadRunDetail(page, runId, { quiet = false } = {}) {
+    try {
+      const detail = await api.getRunDetail(runId);
+      if (state.route !== 'runs' || !document.body.contains(page) || state.selectedRunId !== runId) return;
+      page._detail = detail;
+      if (detail.run && !page._runs.some((run) => run.run_id === detail.run.run_id)) {
+        page._runs.unshift(detail.run);
+        populateRunFilters(page);
+      }
+      renderRunDetail(page, detail);
+      renderRunAttemptList(page);
+    } catch (err) {
+      if (quiet || state.route !== 'runs' || !document.body.contains(page)) return;
+      const target = page.querySelector('#run-attempt-detail');
+      clearNode(target);
+      target.appendChild(el('div', { class: 'empty-state' }, t('runs.detailFailed', { error: err.message })));
+    }
+  }
+
+  function renderRunDetail(page, detail) {
+    const target = page.querySelector('#run-attempt-detail');
+    if (!target) return;
+    clearNode(target);
+    if (!detail || !detail.run) {
+      target.appendChild(el('div', { class: 'empty-state' }, t('runs.selectAttempt')));
+      return;
+    }
+    const run = detail.run;
+    const download = el('button', {
+      class: 'btn btn-ghost',
+      onClick: async () => {
+        try {
+          await api.downloadRunDiagnostic(run.run_id);
+          showToast(t('runs.diagnosticDownloaded'), 'success');
+        } catch (err) {
+          showToast(err.message, 'error');
+        }
+      },
+    }, t('runs.downloadDiagnostic'));
+    target.appendChild(el('div', { class: 'run-detail-header' }, [
+      el('div', null, [
+        el('div', { class: 'eyebrow' }, `${run.attempt_kind || 'run'} / ${run.agent_kind || t('common.unknown')}`),
+        el('h2', null, `${run.identifier || run.run_id}: ${run.title || ''}`),
+      ]),
+      download,
+    ]));
+    target.appendChild(el('div', { class: 'run-summary-grid' }, [
+      runSummaryValue(t('common.status'), run.status || t('common.unknown')),
+      runSummaryValue(t('common.state'), run.state || '—'),
+      runSummaryValue(t('runs.duration'), runDuration(run)),
+      runSummaryValue(t('common.tokens'), (run.tokens ? run.tokens.total : run.total_tokens) == null ? '—' : formatCompactNumber(run.tokens ? run.tokens.total : run.total_tokens)),
+      runSummaryValue(t('runs.failureClass'), run.failure_class || run.error_class || '—'),
+    ]));
+    target.appendChild(buildRunMetadata(run));
+    if (run.failure_message || run.error_message_redacted) {
+      target.appendChild(el('div', { class: 'run-error-block' }, [
+        el('strong', null, run.failure_class || run.error_class || t('common.failed')),
+        el('pre', null, run.failure_message || run.error_message_redacted),
+      ]));
+    }
+    target.appendChild(el('div', { class: 'section-heading' }, t('runs.timeline')));
+    target.appendChild(buildRunTimeline(detail.events || []));
+  }
+
+  function runSummaryValue(label, value) {
+    return el('div', { class: 'run-summary-value' }, [
+      el('span', null, label),
+      el('strong', null, value),
+    ]);
+  }
+
+  function runDuration(run) {
+    if (!run.started_at) return '—';
+    const start = Date.parse(run.started_at);
+    const end = run.completed_at ? Date.parse(run.completed_at) : Date.now();
+    if (!Number.isFinite(start) || !Number.isFinite(end) || end < start) return '—';
+    return humanizeSeconds((end - start) / 1000);
+  }
+
+  function buildRunMetadata(run) {
+    const rows = [
+      [t('runs.started'), formatShortDateTime(run.started_at)],
+      [t('runs.completed'), run.completed_at ? formatShortDateTime(run.completed_at) : t('common.openEnded')],
+      [t('runs.workspace'), run.workspace_path || '—'],
+      [t('common.branch'), run.branch_name || '—'],
+      [t('runs.commit'), run.commit_sha || '—'],
+      [t('runs.tokensIn'), (run.tokens ? run.tokens.input : run.input_tokens) == null ? '—' : formatCompactNumber(run.tokens ? run.tokens.input : run.input_tokens)],
+      [t('runs.tokensCache'), (run.tokens ? run.tokens.cache : run.cache_input_tokens) == null ? '—' : formatCompactNumber(run.tokens ? run.tokens.cache : run.cache_input_tokens)],
+      [t('runs.tokensOut'), (run.tokens ? run.tokens.output : run.output_tokens) == null ? '—' : formatCompactNumber(run.tokens ? run.tokens.output : run.output_tokens)],
+    ];
+    return el('dl', { class: 'run-metadata' }, rows.flatMap(([label, value]) => [
+      el('dt', null, label),
+      el('dd', { title: String(value) }, String(value)),
+    ]));
+  }
+
+  function buildRunTimeline(events) {
+    if (!events.length) return el('div', { class: 'empty-state run-timeline-empty' }, t('runs.noEvents'));
+    return el('ol', { class: 'run-timeline' }, events.map((event) => {
+      const payload = event.payload && typeof event.payload === 'object' ? event.payload : {};
+      const details = Object.entries(payload)
+        .filter(([, value]) => value != null && value !== '')
+        .map(([key, value]) => `${key}: ${typeof value === 'object' ? JSON.stringify(value) : value}`)
+        .join(' · ');
+      return el('li', { class: `run-timeline-event severity-${event.severity || 'info'}` }, [
+        el('div', { class: 'run-timeline-marker', 'aria-hidden': 'true' }),
+        el('div', { class: 'run-timeline-content' }, [
+          el('div', { class: 'run-timeline-heading' }, [
+            el('strong', null, runEventLabel(event.event_type || event.type)),
+            el('time', null, formatShortDateTime(event.created_at)),
+          ]),
+          event.message ? el('div', { class: 'run-timeline-message' }, event.message) : null,
+          details ? el('div', { class: 'run-timeline-payload' }, details) : null,
+        ]),
+      ]);
+    }));
+  }
 
   // ------------------------------------------------------------------
   // Page: Stats
