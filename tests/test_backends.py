@@ -507,6 +507,44 @@ async def test_pi_stop_reaps_with_safe_proc_wait(
     assert calls == [proc.pid]
 
 
+@pytest.mark.parametrize(
+    ("kind", "backend_cls", "module", "process_attr"),
+    [
+        ("codex", CodexAppServerBackend, codex_module, "_process"),
+        ("claude", ClaudeCodeBackend, claude_module, "_active_proc"),
+        ("gemini", GeminiBackend, per_turn_module, "_active_proc"),
+        ("pi", PiBackend, pi_module, "_active_proc"),
+    ],
+)
+@pytest.mark.asyncio
+async def test_backend_stop_raises_when_process_cleanup_is_unconfirmed(
+    kind: str,
+    backend_cls: type,
+    module: object,
+    process_attr: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    cfg = _make_cfg(kind, workspace_root=tmp_path)
+    cwd = tmp_path / "ws"
+    cwd.mkdir()
+    backend = backend_cls(
+        BackendInit(cfg=cfg, cwd=cwd, workspace_root=tmp_path, on_event=_noop_event)
+    )
+    proc = _FakeProcess()
+    setattr(backend, process_attr, proc)
+
+    async def _unconfirmed(_proc):
+        return None
+
+    monkeypatch.setattr(module, "terminate_process_tree", _unconfirmed)
+
+    with pytest.raises(RuntimeError, match="cleanup could not be confirmed"):
+        await backend.stop()
+    assert getattr(backend, process_attr) is proc
+    assert proc.returncode is None
+
+
 def test_codex_event_name_normalization() -> None:
     assert _normalize_event_name("thread/turn/completed") == EVENT_TURN_COMPLETED
     assert _normalize_event_name("thread/turn/failed") == EVENT_TURN_FAILED
@@ -654,6 +692,67 @@ async def test_claude_run_turn_cancellation_terminates_active_subprocess(
     with pytest.raises(asyncio.CancelledError):
         await task
     assert terminated == [proc]
+
+
+@pytest.mark.parametrize(
+    ("kind", "module", "backend_cls", "stdout_lines"),
+    [
+        (
+            "claude",
+            claude_module,
+            ClaudeCodeBackend,
+            [
+                b'{"type":"system","subtype":"init","session_id":"s1"}\n',
+                b'{"type":"result","subtype":"success","result":"done",'
+                b'"session_id":"s1","usage":{}}\n',
+            ],
+        ),
+        (
+            "pi",
+            pi_module,
+            PiBackend,
+            [
+                b'{"type":"session","id":"s1"}\n',
+                b'{"type":"agent_end","messages":[{"role":"assistant",'
+                b'"content":[{"type":"text","text":"done"}]}]}\n',
+            ],
+        ),
+    ],
+)
+@pytest.mark.asyncio
+async def test_terminal_success_does_not_complete_when_inline_reap_is_unconfirmed(
+    kind: str,
+    module: object,
+    backend_cls: type,
+    stdout_lines: list[bytes],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    cfg = _make_cfg(kind, workspace_root=tmp_path)
+    cwd = tmp_path / "ws"
+    cwd.mkdir()
+    proc = _FakeSubprocess(stdout_lines=stdout_lines, returncode=None)
+    _install_subprocess_double(monkeypatch, module, [proc])
+    events: list[dict[str, Any]] = []
+
+    async def _unconfirmed(wait_proc):  # noqa: ANN001
+        assert wait_proc is proc
+        return None
+
+    async def _capture(event: dict[str, Any]) -> None:
+        events.append(event)
+
+    monkeypatch.setattr(module, "terminate_process_tree", _unconfirmed)
+    backend = backend_cls(
+        BackendInit(cfg=cfg, cwd=cwd, workspace_root=tmp_path, on_event=_capture)
+    )
+
+    await backend.start_session(initial_prompt="hi", issue_title="Fix login")
+    with pytest.raises(RuntimeError, match="cleanup could not be confirmed"):
+        await backend.run_turn(prompt="first", is_continuation=False)
+
+    assert EVENT_TURN_COMPLETED not in [event["event"] for event in events]
+    assert backend.pid == proc.pid
 
 
 @pytest.mark.asyncio
@@ -3251,3 +3350,480 @@ def test_codex_backend_is_progress_event_filters_to_assistant(tmp_path: Path) ->
     assert backend.is_progress_event({"type": "toolCall"}) is False
     assert backend.is_progress_event({"item": {"type": "agentMessage"}}) is False
     assert backend.is_progress_event({}) is False
+
+
+# ---------------------------------------------------------------------------
+# Durable crash-continuation backend seam
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("kind", ["gemini", "agy", "kiro"])
+@pytest.mark.asyncio
+async def test_resume_session_support_matrix_defaults_to_unsupported(
+    kind: str, tmp_path: Path
+) -> None:
+    cfg = _make_cfg(kind, workspace_root=tmp_path)
+    cwd = tmp_path / "ws"
+    cwd.mkdir()
+    backend = build_backend(
+        BackendInit(cfg=cfg, cwd=cwd, workspace_root=tmp_path, on_event=_noop_event)
+    )
+
+    assert await backend.resume_session("checkpoint-session") is False
+    assert backend.session_id is None
+
+
+@pytest.mark.parametrize(
+    "invalid_id", ["", "   ", "bad\nvalue", "bad\x7fvalue", "x" * 513]
+)
+@pytest.mark.asyncio
+async def test_resume_session_rejects_invalid_ids_without_mutating_state(
+    invalid_id: str, tmp_path: Path
+) -> None:
+    cfg = _make_cfg("claude", workspace_root=tmp_path)
+    cwd = tmp_path / "ws"
+    cwd.mkdir()
+    backend = ClaudeCodeBackend(
+        BackendInit(cfg=cfg, cwd=cwd, workspace_root=tmp_path, on_event=_noop_event)
+    )
+
+    assert await backend.resume_session(invalid_id) is False
+    assert backend.session_id is None
+
+
+@pytest.mark.asyncio
+async def test_resume_session_accepts_id_at_length_bound(tmp_path: Path) -> None:
+    cfg = _make_cfg("claude", workspace_root=tmp_path)
+    cwd = tmp_path / "ws"
+    cwd.mkdir()
+    backend = ClaudeCodeBackend(
+        BackendInit(cfg=cfg, cwd=cwd, workspace_root=tmp_path, on_event=_noop_event)
+    )
+    bounded_id = "x" * 512
+
+    assert await backend.resume_session(bounded_id) is True
+    assert backend.session_id == bounded_id
+
+
+@pytest.mark.asyncio
+async def test_claude_resume_session_uses_exact_id_on_next_turn(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    cfg = _make_cfg("claude", workspace_root=tmp_path)
+    cfg = replace(cfg, claude=replace(cfg.claude, resume_across_turns=False))
+    cwd = tmp_path / "ws"
+    cwd.mkdir()
+    exact_id = "claude session;$(literal)"
+    commands = _install_subprocess_double(
+        monkeypatch,
+        claude_module,
+        [
+            _FakeSubprocess(
+                stdout_lines=[
+                    (
+                        json.dumps(
+                            {
+                                "type": "system",
+                                "subtype": "init",
+                                "session_id": exact_id,
+                            }
+                        )
+                        + "\n"
+                    ).encode(),
+                    (
+                        json.dumps(
+                            {
+                                "type": "result",
+                                "subtype": "success",
+                                "is_error": False,
+                                "result": "resumed",
+                                "session_id": exact_id,
+                                "usage": {},
+                            }
+                        )
+                        + "\n"
+                    ).encode(),
+                ]
+            )
+        ],
+    )
+    backend = ClaudeCodeBackend(
+        BackendInit(cfg=cfg, cwd=cwd, workspace_root=tmp_path, on_event=_noop_event)
+    )
+
+    assert await backend.resume_session(exact_id) is True
+    assert backend.session_id == exact_id
+    await backend.run_turn(prompt="recover", is_continuation=False)
+
+    assert f"--resume {shlex.quote(exact_id)}" in commands[0]
+
+
+@pytest.mark.parametrize(
+    ("kind", "backend_cls", "flag"),
+    [
+        ("pi", PiBackend, "--session"),
+        ("prime-agent", PrimeAgentBackend, "--resume"),
+    ],
+)
+@pytest.mark.asyncio
+async def test_pi_family_resume_session_uses_exact_id_on_next_turn(
+    kind: str,
+    backend_cls: type[PiBackend],
+    flag: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    cfg = _make_cfg(kind, workspace_root=tmp_path)
+    if kind == "pi":
+        cfg = replace(cfg, pi=replace(cfg.pi, resume_across_turns=False))
+    else:
+        cfg = replace(
+            cfg,
+            prime_agent=replace(cfg.prime_agent, resume_across_turns=False),
+        )
+    cwd = tmp_path / "ws"
+    cwd.mkdir()
+    exact_id = f"{kind} session;$(literal)"
+    commands = _install_subprocess_double(
+        monkeypatch,
+        pi_module,
+        [
+            _FakeSubprocess(
+                stdout_lines=[
+                    (
+                        json.dumps({"type": "session", "version": 3, "id": exact_id})
+                        + "\n"
+                    ).encode(),
+                    b'{"type":"agent_end","messages":[]}\n',
+                ]
+            )
+        ],
+    )
+    backend = backend_cls(
+        BackendInit(cfg=cfg, cwd=cwd, workspace_root=tmp_path, on_event=_noop_event)
+    )
+
+    assert await backend.resume_session(exact_id) is True
+    assert backend.session_id == exact_id
+    await backend.run_turn(prompt="recover", is_continuation=False)
+
+    assert f"{flag} {shlex.quote(exact_id)}" in commands[0]
+
+
+@pytest.mark.asyncio
+async def test_opencode_resume_session_uses_exact_id_on_next_turn(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    cfg = _make_cfg("opencode", workspace_root=tmp_path)
+    cfg = replace(cfg, opencode=replace(cfg.opencode, resume_across_turns=False))
+    cwd = tmp_path / "ws"
+    cwd.mkdir()
+    exact_id = "opencode session;$(literal)"
+    commands = _install_subprocess_double(
+        monkeypatch,
+        per_turn_module,
+        [
+            _FakeSubprocess(
+                stdout_blob=(
+                    json.dumps(
+                        {
+                            "type": "text",
+                            "sessionID": exact_id,
+                            "part": {"type": "text", "text": "resumed"},
+                        }
+                    )
+                    + "\n"
+                ).encode()
+            )
+        ],
+    )
+    lifecycle: list[tuple[str, object]] = []
+
+    async def _capture(event: dict[str, Any]) -> None:
+        lifecycle.append(("event", event["event"]))
+
+    backend = OpenCodeBackend(
+        BackendInit(
+            cfg=cfg,
+            cwd=cwd,
+            workspace_root=tmp_path,
+            on_event=_capture,
+            on_process_started=lambda pid: lifecycle.append(("pid", pid)),
+        )
+    )
+
+    assert await backend.resume_session(exact_id) is True
+    assert backend.session_id == exact_id
+    await backend.run_turn(prompt="recover", is_continuation=False)
+
+    assert f"--session {shlex.quote(exact_id)}" in commands[0]
+    assert lifecycle[0] == ("pid", 98765)
+    assert lifecycle[1][0] == "event"
+
+
+@pytest.mark.parametrize(
+    ("kind", "backend_cls", "spawn_module"),
+    [
+        ("claude", ClaudeCodeBackend, claude_module),
+        ("pi", PiBackend, pi_module),
+        ("prime-agent", PrimeAgentBackend, pi_module),
+        ("opencode", OpenCodeBackend, per_turn_module),
+    ],
+)
+@pytest.mark.asyncio
+async def test_resumed_cli_rejects_mismatched_reported_session_id(
+    kind: str,
+    backend_cls: type,
+    spawn_module: object,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    requested = f"private-requested-{kind}"
+    emitted = f"private-emitted-{kind}"
+    if kind == "claude":
+        proc = _FakeSubprocess(
+            stdout_lines=[
+                (
+                    json.dumps(
+                        {
+                            "type": "system",
+                            "subtype": "init",
+                            "session_id": requested,
+                        }
+                    )
+                    + "\n"
+                ).encode(),
+                (
+                    json.dumps(
+                        {
+                            "type": "result",
+                            "subtype": "success",
+                            "result": "wrong session",
+                            "session_id": emitted,
+                            "usage": {},
+                        }
+                    )
+                    + "\n"
+                ).encode(),
+            ]
+        )
+    elif kind in {"pi", "prime-agent"}:
+        proc = _FakeSubprocess(
+            stdout_lines=[
+                (json.dumps({"type": "session", "id": requested}) + "\n").encode(),
+                (json.dumps({"type": "session", "id": emitted}) + "\n").encode(),
+                b'{"type":"agent_end","messages":[]}\n',
+            ]
+        )
+    else:
+        proc = _FakeSubprocess(
+            stdout_blob=(
+                (
+                    json.dumps(
+                        {
+                            "type": "step_start",
+                            "sessionID": requested,
+                            "part": {"type": "step-start"},
+                        }
+                    )
+                    + "\n"
+                    + json.dumps(
+                        {
+                            "type": "text",
+                            "sessionID": emitted,
+                            "part": {"type": "text", "text": "wrong session"},
+                        }
+                    )
+                    + "\n"
+                ).encode()
+            )
+        )
+    _install_subprocess_double(monkeypatch, spawn_module, [proc])
+    cfg = _make_cfg(kind, workspace_root=tmp_path)
+    cwd = tmp_path / "ws"
+    cwd.mkdir()
+    events: list[dict[str, Any]] = []
+
+    async def _capture(event: dict[str, Any]) -> None:
+        events.append(event)
+
+    backend = backend_cls(
+        BackendInit(cfg=cfg, cwd=cwd, workspace_root=tmp_path, on_event=_capture)
+    )
+    assert await backend.resume_session(requested) is True
+
+    with pytest.raises(TurnFailed, match="different recovered session"):
+        await backend.run_turn(prompt="recover", is_continuation=False)
+
+    assert backend.session_id == requested
+    assert EVENT_TURN_COMPLETED not in [event["event"] for event in events]
+    assert requested not in str(events)
+    assert emitted not in str(events)
+
+
+@pytest.mark.parametrize(
+    ("kind", "backend_cls"),
+    [("pi", PiBackend), ("prime-agent", PrimeAgentBackend)],
+)
+@pytest.mark.asyncio
+async def test_pi_family_synthetic_success_requires_resume_confirmation(
+    kind: str,
+    backend_cls: type[PiBackend],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    requested = f"private-requested-{kind}"
+    proc = _FakeSubprocess(
+        stdout_lines=[
+            (
+                json.dumps(
+                    {
+                        "type": "message_end",
+                        "message": {
+                            "role": "assistant",
+                            "content": [{"type": "text", "text": "done"}],
+                            "usage": {},
+                        },
+                    }
+                )
+                + "\n"
+            ).encode()
+        ],
+        returncode=0,
+    )
+    _install_subprocess_double(monkeypatch, pi_module, [proc])
+    cfg = _make_cfg(kind, workspace_root=tmp_path)
+    cwd = tmp_path / "ws"
+    cwd.mkdir()
+    events: list[dict[str, Any]] = []
+
+    async def _capture(event: dict[str, Any]) -> None:
+        events.append(event)
+
+    backend = backend_cls(
+        BackendInit(cfg=cfg, cwd=cwd, workspace_root=tmp_path, on_event=_capture)
+    )
+    assert await backend.resume_session(requested) is True
+
+    with pytest.raises(TurnFailed, match="did not confirm"):
+        await backend.run_turn(prompt="recover", is_continuation=False)
+
+    assert EVENT_TURN_COMPLETED not in [event["event"] for event in events]
+    assert requested not in str(events)
+
+
+@pytest.mark.parametrize("kind", ["claude", "pi", "opencode"])
+@pytest.mark.asyncio
+async def test_resumed_cli_failure_redacts_private_session_id(
+    kind: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    exact_id = f"private-{kind}-session"
+    stderr = f"rejected session {exact_id}\n".encode()
+    events: list[dict[str, Any]] = []
+
+    async def _capture(event: dict[str, Any]) -> None:
+        events.append(event)
+
+    cfg = _make_cfg(kind, workspace_root=tmp_path)
+    cwd = tmp_path / "ws"
+    cwd.mkdir()
+    if kind == "claude":
+        module = claude_module
+        backend = ClaudeCodeBackend(
+            BackendInit(cfg=cfg, cwd=cwd, workspace_root=tmp_path, on_event=_capture)
+        )
+        process = _FakeSubprocess(stderr_blob=stderr, returncode=1)
+    elif kind == "pi":
+        module = pi_module
+        backend = PiBackend(
+            BackendInit(cfg=cfg, cwd=cwd, workspace_root=tmp_path, on_event=_capture)
+        )
+        process = _FakeSubprocess(stderr_blob=stderr, returncode=1)
+    else:
+        module = per_turn_module
+        backend = OpenCodeBackend(
+            BackendInit(cfg=cfg, cwd=cwd, workspace_root=tmp_path, on_event=_capture)
+        )
+        process = _FakeSubprocess(
+            stdout_blob=b"", stderr_blob=stderr, returncode=1
+        )
+    _install_subprocess_double(monkeypatch, module, [process])
+
+    assert await backend.resume_session(exact_id) is True
+    with pytest.raises(TurnFailed) as caught:
+        await backend.run_turn(prompt="recover", is_continuation=False)
+
+    evidence = json.dumps(events) + str(caught.value)
+    assert exact_id not in evidence
+
+
+@pytest.mark.asyncio
+async def test_codex_resume_session_uses_thread_resume_and_verified_exact_id(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    cfg = _make_cfg("codex", workspace_root=tmp_path)
+    cwd = tmp_path / "ws"
+    cwd.mkdir()
+    backend = CodexAppServerBackend(
+        BackendInit(cfg=cfg, cwd=cwd, workspace_root=tmp_path, on_event=_noop_event)
+    )
+    calls: list[tuple[str, dict[str, Any]]] = []
+    exact_id = "codex-thread-exact"
+
+    async def fake_request(method: str, params: dict[str, Any]) -> dict[str, Any]:
+        calls.append((method, params))
+        return {"thread": {"id": exact_id}}
+
+    monkeypatch.setattr(backend, "_request", fake_request)
+
+    assert await backend.resume_session(exact_id) is True
+    assert calls == [("thread/resume", {"threadId": exact_id})]
+    assert backend.session_id == exact_id
+
+
+@pytest.mark.parametrize(
+    "response",
+    [{}, {"thread": {}}, {"thread": {"id": "different-thread"}}],
+)
+@pytest.mark.asyncio
+async def test_codex_resume_session_unverified_response_falls_back_without_mutation(
+    response: dict[str, Any], tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    cfg = _make_cfg("codex", workspace_root=tmp_path)
+    cwd = tmp_path / "ws"
+    cwd.mkdir()
+    backend = CodexAppServerBackend(
+        BackendInit(cfg=cfg, cwd=cwd, workspace_root=tmp_path, on_event=_noop_event)
+    )
+    backend._thread_id = "existing-thread"
+
+    async def fake_request(method: str, params: dict[str, Any]) -> dict[str, Any]:
+        del method, params
+        return response
+
+    monkeypatch.setattr(backend, "_request", fake_request)
+
+    assert await backend.resume_session("checkpoint-thread") is False
+    assert backend.session_id == "existing-thread"
+
+
+@pytest.mark.asyncio
+async def test_codex_resume_session_rpc_rejection_falls_back_without_mutation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    cfg = _make_cfg("codex", workspace_root=tmp_path)
+    cwd = tmp_path / "ws"
+    cwd.mkdir()
+    backend = CodexAppServerBackend(
+        BackendInit(cfg=cfg, cwd=cwd, workspace_root=tmp_path, on_event=_noop_event)
+    )
+    backend._thread_id = "existing-thread"
+
+    async def fake_request(method: str, params: dict[str, Any]) -> dict[str, Any]:
+        del method, params
+        raise ResponseError("resume unavailable")
+
+    monkeypatch.setattr(backend, "_request", fake_request)
+
+    assert await backend.resume_session("checkpoint-thread") is False
+    assert backend.session_id == "existing-thread"

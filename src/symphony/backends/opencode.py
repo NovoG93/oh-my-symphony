@@ -14,12 +14,15 @@ import shlex
 from collections import Counter
 from typing import Any, Iterable
 
+from ..errors import TurnFailed
 from . import (
     EVENT_OTHER_MESSAGE,
     EVENT_SESSION_STARTED,
     EVENT_TURN_COMPLETED,
+    EVENT_TURN_FAILED,
     BackendInit,
     TurnResult,
+    _is_valid_session_id,
 )
 from .per_turn import PerTurnCliBackend
 
@@ -61,6 +64,9 @@ class OpenCodeBackend(PerTurnCliBackend):
         )
         self._opencode = cfg
         self._opencode_session_id: str | None = None
+        self._resume_on_next_turn = False
+        self._expected_resume_session_id: str | None = None
+        self._resume_session_confirmed = False
         self._streamed_event_counts: Counter[str] = Counter()
 
     # ------------------------------------------------------------------
@@ -74,18 +80,28 @@ class OpenCodeBackend(PerTurnCliBackend):
     def session_id(self) -> str | None:
         return self._opencode_session_id or self._session_id
 
+    async def resume_session(self, session_id: str) -> bool:
+        """Select an exact OpenCode session for the next CLI process."""
+        if self._closed or not _is_valid_session_id(session_id):
+            return False
+        self._opencode_session_id = session_id
+        self._expected_resume_session_id = session_id
+        self._resume_session_confirmed = False
+        self._resume_on_next_turn = True
+        return True
+
     def _stdin_payload(self, prompt: str) -> str | None:
         del prompt  # travels in the command line
         return None
 
     def _command_for_turn(self, *, prompt: str, is_continuation: bool) -> str:
         cmd = self._opencode.command
-        if (
-            is_continuation
-            and self._opencode.resume_across_turns
-            and self._opencode_session_id
-        ):
+        should_resume = self._resume_on_next_turn or (
+            is_continuation and self._opencode.resume_across_turns
+        )
+        if should_resume and self._opencode_session_id:
             cmd = f"{cmd} --session {shlex.quote(self._opencode_session_id)}"
+        self._resume_on_next_turn = False
         return f"{cmd} {shlex.quote(prompt)}"
 
     def _start_watchers(
@@ -118,12 +134,20 @@ class OpenCodeBackend(PerTurnCliBackend):
 
     async def _publish_stream_event(self, event: dict[str, Any]) -> None:
         new_sid = _extract_session_id(event)
-        if new_sid and new_sid != self._opencode_session_id:
-            self._opencode_session_id = new_sid
-            await self._emit(
-                EVENT_SESSION_STARTED,
-                {"session_id": new_sid, "thread_id": new_sid},
-            )
+        if new_sid:
+            expected = self._expected_resume_session_id
+            if expected is not None:
+                if new_sid != expected:
+                    reason = "opencode returned a different recovered session"
+                    await self._emit(EVENT_TURN_FAILED, {"reason": reason})
+                    raise TurnFailed(reason)
+                self._resume_session_confirmed = True
+            if new_sid != self._opencode_session_id:
+                self._opencode_session_id = new_sid
+                await self._emit(
+                    EVENT_SESSION_STARTED,
+                    {"session_id": new_sid, "thread_id": new_sid},
+                )
         previous_usage = self.latest_usage
         self._update_usage_from_events((event,))
         if self.latest_usage != previous_usage:
@@ -139,6 +163,13 @@ class OpenCodeBackend(PerTurnCliBackend):
             else:
                 await self._publish_stream_event(event)
         self._streamed_event_counts.clear()
+        if self._expected_resume_session_id is not None:
+            if not self._resume_session_confirmed:
+                reason = "opencode did not confirm the requested recovered session"
+                await self._emit(EVENT_TURN_FAILED, {"reason": reason})
+                raise TurnFailed(reason)
+            self._expected_resume_session_id = None
+            self._resume_session_confirmed = False
         response = self._response_from_events(events) if events else stdout_text
         # `message` key feeds _preview_from_payload -> current_turn_message so a
         # productive turn resets the G2 empty-loop counter. Streaming frames

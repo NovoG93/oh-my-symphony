@@ -55,6 +55,7 @@ from . import (
     BaseAgentBackend,
     ToolDescriptor,
     TurnResult,
+    _is_valid_session_id,
 )
 from .approval_policy import dangerous_command_reason
 
@@ -68,6 +69,7 @@ MAX_LINE_BYTES = 10 * 1024 * 1024  # upstream §10.1 — 10 MB
 # — see commit history if you need to support a legacy app-server.
 METHOD_INITIALIZE = "initialize"
 METHOD_THREAD_START = "thread/start"
+METHOD_THREAD_RESUME = "thread/resume"
 METHOD_TURN_START = "turn/start"
 METHOD_THREAD_ARCHIVE = "thread/archive"
 # `thread/approveGuardianDeniedAction` is the rough equivalent of the legacy
@@ -266,6 +268,7 @@ class CodexAppServerBackend(BaseAgentBackend):
         self._cwd = init.cwd
         self._workspace_root = init.workspace_root
         self._on_event = init.on_event
+        self._on_process_started = init.on_process_started
         self._client_tools = init.client_tools
         self._approval_policy = codex.approval_policy
         self._sandbox_policy = codex.turn_sandbox_policy
@@ -314,6 +317,8 @@ class CodexAppServerBackend(BaseAgentBackend):
             )
         except FileNotFoundError as exc:
             raise CodexNotFound("bash not available", error=str(exc)) from exc
+        if self._on_process_started is not None:
+            self._on_process_started(self._process.pid)
         if self._process.stdout is None or self._process.stdin is None:
             raise CodexNotFound("subprocess pipes not available")
         self._reader_task = asyncio.create_task(self._stdout_reader())
@@ -373,9 +378,10 @@ class CodexAppServerBackend(BaseAgentBackend):
         # v2 has no `thread/stop` — `thread/archive` exists but only
         # finalizes server-side bookkeeping. Symphony already terminates
         # the subprocess below, which is sufficient for cleanup.
-        if self._process is not None:
-            if self._process.returncode is None:
-                await terminate_process_tree(self._process)
+        cleanup_unconfirmed = False
+        if self._process is not None and self._process.returncode is None:
+            result = await terminate_process_tree(self._process)
+            cleanup_unconfirmed = result is None and self._process.returncode is None
         for task in (self._reader_task, self._stderr_task):
             if task is not None:
                 task.cancel()
@@ -383,6 +389,8 @@ class CodexAppServerBackend(BaseAgentBackend):
                     await task
                 except (asyncio.CancelledError, Exception):
                     pass
+        if cleanup_unconfirmed:
+            raise RuntimeError("backend process cleanup could not be confirmed")
 
     @property
     def session_id(self) -> str | None:
@@ -443,6 +451,36 @@ class CodexAppServerBackend(BaseAgentBackend):
             {"thread_id": self._thread_id, "session_id": self._thread_id},
         )
         return self._thread_id
+
+    async def resume_session(self, session_id: str) -> bool:
+        """Resume an exact Codex thread when the app-server verifies it.
+
+        RPC rejection, transport failure, or a response that does not echo the
+        requested thread id is an unsupported recovery attempt. Leave the
+        current thread untouched so the caller can fall back to
+        :meth:`start_session` without inheriting unverified state.
+        """
+        if not _is_valid_session_id(session_id):
+            return False
+        try:
+            result = await self._request(
+                METHOD_THREAD_RESUME,
+                {"threadId": session_id},
+            )
+        except (ResponseError, ResponseTimeout, PortExit):
+            return False
+
+        thread = result.get("thread")
+        resumed_id = thread.get("id") if isinstance(thread, dict) else None
+        if resumed_id != session_id:
+            return False
+
+        self._thread_id = session_id
+        await self._emit(
+            EVENT_SESSION_STARTED,
+            {"thread_id": session_id, "session_id": session_id},
+        )
+        return True
 
     async def run_turn(self, *, prompt: str, is_continuation: bool) -> TurnResult:
         if self._thread_id is None:

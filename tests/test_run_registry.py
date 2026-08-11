@@ -4,6 +4,7 @@ import json
 import sqlite3
 import threading
 import time
+from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -986,7 +987,7 @@ def test_v4_release_gate_migration_backfills_generation_and_evidence_identity(
 
     registry = RunRegistry(path)
 
-    assert registry.applied_migrations == (5, 6, 7)
+    assert registry.applied_migrations == (5, 6, 7, 8)
     assert len(list(tmp_path.glob("state.db.backup-*"))) == 1
     for finalizer, verifier in (
         ("PENDING-FINAL", "PENDING-VERIFY"),
@@ -1109,7 +1110,7 @@ def test_v5_release_completion_without_ticket_token_is_invalidated(
     gate = registry.get_release_gate("APP-FINAL")
     evidence = registry.get_release_evidence_identity("VERIFY-1")
 
-    assert registry.applied_migrations == (6, 7)
+    assert registry.applied_migrations == (6, 7, 8)
     assert gate is not None and evidence is not None
     assert gate.status == "pending"
     assert gate.generation and gate.generation != "old-generation"
@@ -1228,7 +1229,7 @@ def test_concurrent_v4_to_v6_migration_backfills_once_after_same_version_read(
     assert not any(starter.is_alive() for starter in starters)
     assert errors == []
     assert len(results) == 2
-    assert sorted(applied for applied, _generation in results) == [(), (5, 6, 7)]
+    assert sorted(applied for applied, _generation in results) == [(), (5, 6, 7, 8)]
     generations = {generation for _applied, generation in results}
     assert len(generations) == 1
     assert next(iter(generations))
@@ -1405,7 +1406,7 @@ def test_run_explorer_v7_summary_events_and_diagnostic_are_bounded(tmp_path: Pat
         now=datetime(2026, 9, 1, tzinfo=timezone.utc),
     )
     assert run_id is not None
-    assert registry.schema_version() == 7
+    assert registry.schema_version() == 8
 
     registry.append_attempt_event(
         run_id=run_id,
@@ -1742,3 +1743,480 @@ def test_v7_migration_preserves_unknown_tokens_for_historical_runs(
     assert migrated.cache_input_tokens is None
     assert migrated.output_tokens is None
     assert migrated.total_tokens is None
+
+
+# Feature 2: durable crash continuation.
+
+def test_checkpoint_completed_turn_is_owner_fenced_bounded_and_private(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "state.db"
+    now = datetime(2026, 10, 1, tzinfo=timezone.utc)
+    issue = _issue("CONT-1")
+    owner = RunRegistry(path, owner_pid=4242, boot_id="owner")
+    run_id = owner.acquire_run(
+        issue,
+        workspace_path=tmp_path / issue.identifier,
+        attempt=None,
+        attempt_kind="initial",
+        agent_kind="codex",
+        now=now,
+    )
+    assert run_id is not None
+
+    foreign = RunRegistry(path, owner_pid=4343, boot_id="foreign")
+    assert not foreign.checkpoint_completed_turn(
+        issue_id=issue.id,
+        run_id=run_id,
+        resume_session_id="private-session",
+        state=issue.state,
+        turn=1,
+        now=now + timedelta(seconds=1),
+    )
+    assert owner.checkpoint_completed_turn(
+        issue_id=issue.id,
+        run_id=run_id,
+        resume_session_id="private-session",
+        state=issue.state,
+        turn=1,
+        now=now + timedelta(seconds=2),
+    )
+    # Older and duplicate turns cannot replace the latest completed boundary.
+    assert not owner.checkpoint_completed_turn(
+        issue_id=issue.id,
+        run_id=run_id,
+        resume_session_id="replacement-session",
+        state=issue.state,
+        turn=1,
+        now=now + timedelta(seconds=3),
+    )
+    for invalid_session_id in ("x" * 513, "session\nforged"):
+        with pytest.raises(ValueError):
+            owner.checkpoint_completed_turn(
+                issue_id=issue.id,
+                run_id=run_id,
+                resume_session_id=invalid_session_id,
+                state=issue.state,
+                turn=2,
+            )
+
+    record = owner.get_run(run_id)
+    assert record.checkpoint_state == issue.state
+    assert record.checkpoint_turn == 1
+    assert record.checkpointed_at == now + timedelta(seconds=2)
+    encoded_detail = json.dumps(owner.run_detail(run_id))
+    encoded_diagnostic = json.dumps(owner.diagnostic_json(run_id))
+    assert "private-session" not in encoded_detail
+    assert "private-session" not in encoded_diagnostic
+    assert "resume_session_id" not in encoded_detail
+    assert owner.run_detail(run_id)["run"]["checkpoint"] == {
+        "state": issue.state,
+        "turn": 1,
+        "checkpointed_at": (now + timedelta(seconds=2)).isoformat(),
+    }
+
+
+def test_rejected_cli_recovery_consumes_source_then_allows_fresh_run(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "state.db"
+    now = datetime(2026, 10, 1, tzinfo=timezone.utc)
+    issue = _issue("CONT-REJECTED")
+    registry = RunRegistry(path)
+    predecessor = registry.acquire_run(
+        issue,
+        workspace_path=tmp_path / issue.identifier,
+        attempt=None,
+        attempt_kind="initial",
+        agent_kind="claude",
+        now=now,
+    )
+    assert predecessor is not None
+    assert registry.checkpoint_completed_turn(
+        issue_id=issue.id,
+        run_id=predecessor,
+        resume_session_id="private-session",
+        state=issue.state,
+        turn=1,
+        now=now + timedelta(seconds=1),
+    )
+    assert registry.complete_run(
+        issue_id=issue.id,
+        run_id=predecessor,
+        status="shutdown_interrupted",
+        now=now + timedelta(seconds=2),
+    )
+    recovered = registry.acquire_continuation_run(
+        issue,
+        continued_from_run_id=predecessor,
+        workspace_path=tmp_path / issue.identifier,
+        attempt=None,
+        attempt_kind="recovery",
+        agent_kind="claude",
+        now=now + timedelta(seconds=3),
+    )
+    assert recovered is not None
+    assert registry.complete_run(
+        issue_id=issue.id,
+        run_id=recovered.run_id,
+        status="turn_error",
+        now=now + timedelta(seconds=4),
+    )
+    assert registry.latest_continuation_source(
+        issue_id=issue.id, agent_kind="claude", state=issue.state
+    ) is None
+
+    fresh = registry.acquire_run(
+        issue,
+        workspace_path=tmp_path / issue.identifier,
+        attempt=1,
+        attempt_kind="retry",
+        agent_kind="claude",
+        now=now + timedelta(seconds=5),
+    )
+    assert fresh is not None
+    assert registry.get_run(fresh).continued_from_run_id is None
+
+
+def test_ticket_edit_after_checkpoint_forces_fresh_dispatch(tmp_path: Path) -> None:
+    path = tmp_path / "state.db"
+    now = datetime(2026, 10, 1, tzinfo=timezone.utc)
+    issue = _issue("CONT-EDIT")
+    registry = RunRegistry(path)
+    predecessor = registry.acquire_run(
+        issue,
+        workspace_path=tmp_path / issue.identifier,
+        attempt=None,
+        attempt_kind="initial",
+        agent_kind="codex",
+        now=now,
+    )
+    assert predecessor is not None
+    assert registry.checkpoint_completed_turn(
+        issue_id=issue.id,
+        run_id=predecessor,
+        resume_session_id="private-session",
+        state=issue.state,
+        turn=1,
+        now=now + timedelta(seconds=1),
+    )
+    assert registry.complete_run(
+        issue_id=issue.id,
+        run_id=predecessor,
+        status="shutdown_interrupted",
+        now=now + timedelta(seconds=2),
+    )
+    edited = replace(issue, updated_at=now + timedelta(seconds=3))
+
+    assert registry.latest_continuation_source(
+        issue_id=edited.id,
+        agent_kind="codex",
+        state=edited.state,
+        issue_updated_at=edited.updated_at,
+    ) is None
+    assert registry.acquire_continuation_run(
+        edited,
+        continued_from_run_id=predecessor,
+        workspace_path=tmp_path / issue.identifier,
+        attempt=None,
+        attempt_kind="recovery",
+        agent_kind="codex",
+        now=now + timedelta(seconds=4),
+    ) is None
+
+
+def test_newer_fresh_attempt_invalidates_an_unconsumed_checkpoint(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "state.db"
+    now = datetime(2026, 10, 1, tzinfo=timezone.utc)
+    issue = _issue("CONT-OPT-OUT")
+    registry = RunRegistry(path)
+    predecessor = registry.acquire_run(
+        issue,
+        workspace_path=tmp_path / issue.identifier,
+        attempt=None,
+        attempt_kind="initial",
+        agent_kind="codex",
+        now=now,
+    )
+    assert predecessor is not None
+    assert registry.checkpoint_completed_turn(
+        issue_id=issue.id,
+        run_id=predecessor,
+        resume_session_id="old-private-session",
+        state=issue.state,
+        turn=1,
+        now=now + timedelta(seconds=1),
+    )
+    assert registry.complete_run(
+        issue_id=issue.id,
+        run_id=predecessor,
+        status="shutdown_interrupted",
+        now=now + timedelta(seconds=2),
+    )
+    assert registry.latest_continuation_source(
+        issue_id=issue.id, agent_kind="codex", state=issue.state
+    ) == predecessor
+
+    # This models agent.crash_continuation=false: the next dispatch starts a
+    # normal run rather than consuming the private predecessor checkpoint.
+    fresh = registry.acquire_run(
+        issue,
+        workspace_path=tmp_path / issue.identifier,
+        attempt=None,
+        attempt_kind="initial",
+        agent_kind="codex",
+        now=now + timedelta(seconds=3),
+    )
+    assert fresh is not None
+    assert registry.complete_run(
+        issue_id=issue.id,
+        run_id=fresh,
+        status="normal",
+        now=now + timedelta(seconds=4),
+    )
+
+    assert registry.latest_continuation_source(
+        issue_id=issue.id, agent_kind="codex", state=issue.state
+    ) is None
+    assert registry.acquire_continuation_run(
+        issue,
+        continued_from_run_id=predecessor,
+        workspace_path=tmp_path / issue.identifier,
+        attempt=None,
+        attempt_kind="recovery",
+        agent_kind="codex",
+        now=now + timedelta(seconds=5),
+    ) is None
+
+
+def test_acquire_continuation_run_is_atomic_fail_closed_and_inherits_checkpoint(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "state.db"
+    now = datetime(2026, 10, 2, tzinfo=timezone.utc)
+    issue = _issue("CONT-2")
+    crashed = RunRegistry(path, owner_pid=4242, boot_id="crashed")
+    predecessor = crashed.acquire_run(
+        issue,
+        workspace_path=tmp_path / issue.identifier,
+        attempt=None,
+        attempt_kind="initial",
+        agent_kind="codex",
+        now=now,
+    )
+    assert predecessor is not None
+    assert crashed.checkpoint_completed_turn(
+        issue_id=issue.id,
+        run_id=predecessor,
+        resume_session_id="resume-me",
+        state=issue.state,
+        turn=3,
+        now=now + timedelta(seconds=1),
+    )
+    assert crashed.heartbeat(
+        issue_id=issue.id,
+        run_id=predecessor,
+        backend_agent_pid=7777,
+        now=now + timedelta(seconds=2),
+    )
+    crashed.close()
+
+    recovery = RunRegistry(path, owner_pid=4343, boot_id="recovery")
+    reclaimed = recovery.reclaim_dead_owner_leases(
+        now=now + timedelta(minutes=10), pid_alive=lambda _pid: False
+    )
+    assert [record.run_id for record in reclaimed] == [predecessor]
+    assert reclaimed[0].backend_agent_pid == 7777
+    assert recovery.finalize_reclaimed_lease(
+        predecessor, now=now + timedelta(minutes=10, seconds=1)
+    )
+    assert recovery.get_run(predecessor).backend_agent_pid is None
+    assert recovery.latest_continuation_source(
+        issue_id=issue.id, agent_kind="codex", state=issue.state
+    ) == predecessor
+    assert recovery.latest_continuation_source(
+        issue_id=issue.id, agent_kind="claude", state=issue.state
+    ) is None
+
+    wrong_state = Issue(**{**issue.__dict__, "state": "Verify"})
+    for candidate_issue, candidate_agent in (
+        (_issue("OTHER"), "codex"),
+        (wrong_state, "codex"),
+        (issue, "claude"),
+    ):
+        assert recovery.acquire_continuation_run(
+            candidate_issue,
+            continued_from_run_id=predecessor,
+            workspace_path=tmp_path / candidate_issue.identifier,
+            attempt=1,
+            attempt_kind="retry",
+            agent_kind=candidate_agent,
+            now=now + timedelta(minutes=10, seconds=2),
+        ) is None
+
+    acquired = recovery.acquire_continuation_run(
+        issue,
+        continued_from_run_id=predecessor,
+        workspace_path=tmp_path / issue.identifier,
+        attempt=1,
+        attempt_kind="retry",
+        agent_kind="codex",
+        now=now + timedelta(minutes=10, seconds=3),
+    )
+    assert acquired is not None
+    assert acquired.continued_from_run_id == predecessor
+    assert acquired.checkpoint.resume_session_id == "resume-me"
+    assert acquired.checkpoint.state == issue.state
+    assert acquired.checkpoint.turn == 3
+    assert acquired.run_id != predecessor
+
+    successor = recovery.get_run(acquired.run_id)
+    assert successor.status == "active"
+    assert successor.continued_from_run_id == predecessor
+    assert successor.checkpoint_state == issue.state
+    assert successor.checkpoint_turn == 3
+    assert recovery.run_detail(acquired.run_id)["run"]["continued_from_run_id"] == predecessor
+    # The partial unique link and active-issue fence make the checkpoint one-shot.
+    assert recovery.acquire_continuation_run(
+        issue,
+        continued_from_run_id=predecessor,
+        workspace_path=tmp_path / issue.identifier,
+        attempt=2,
+        attempt_kind="retry",
+        agent_kind="codex",
+        now=now + timedelta(minutes=10, seconds=4),
+    ) is None
+    assert recovery.latest_continuation_source(
+        issue_id=issue.id, agent_kind="codex", state=issue.state
+    ) is None
+
+
+def test_graceful_shutdown_checkpoint_requires_cleared_backend_pid(
+    tmp_path: Path,
+) -> None:
+    now = datetime(2026, 10, 3, tzinfo=timezone.utc)
+    issue = _issue("CONT-3")
+    registry = RunRegistry(tmp_path / "state.db", owner_pid=4242, boot_id="owner")
+    predecessor = registry.acquire_run(
+        issue,
+        workspace_path=tmp_path / issue.identifier,
+        attempt=None,
+        attempt_kind="initial",
+        agent_kind="codex",
+        now=now,
+    )
+    assert predecessor is not None
+    assert registry.checkpoint_completed_turn(
+        issue_id=issue.id,
+        run_id=predecessor,
+        resume_session_id="resume-graceful",
+        state=issue.state,
+        turn=2,
+        now=now + timedelta(seconds=1),
+    )
+    assert registry.heartbeat(
+        issue_id=issue.id,
+        run_id=predecessor,
+        backend_agent_pid=9999,
+        now=now + timedelta(seconds=2),
+    )
+    assert registry.complete_run(
+        issue_id=issue.id,
+        run_id=predecessor,
+        status="shutdown_interrupted",
+        now=now + timedelta(seconds=3),
+    )
+    assert registry.acquire_continuation_run(
+        issue,
+        continued_from_run_id=predecessor,
+        workspace_path=tmp_path / issue.identifier,
+        attempt=1,
+        attempt_kind="retry",
+        agent_kind="codex",
+        now=now + timedelta(seconds=4),
+    ) is None
+
+    with sqlite3.connect(registry.path) as conn:
+        conn.execute(
+            "UPDATE runs SET backend_agent_pid = NULL WHERE run_id = ?",
+            (predecessor,),
+        )
+    acquired = registry.acquire_continuation_run(
+        issue,
+        continued_from_run_id=predecessor,
+        workspace_path=tmp_path / issue.identifier,
+        attempt=1,
+        attempt_kind="retry",
+        agent_kind="codex",
+        now=now + timedelta(seconds=5),
+    )
+    assert acquired is not None
+
+
+def test_continuation_acquisition_race_has_exactly_one_successor(tmp_path: Path) -> None:
+    path = tmp_path / "state.db"
+    now = datetime(2026, 10, 4, tzinfo=timezone.utc)
+    issue = _issue("CONT-RACE")
+    crashed = RunRegistry(path, owner_pid=4242, boot_id="crashed")
+    predecessor = crashed.acquire_run(
+        issue,
+        workspace_path=tmp_path / issue.identifier,
+        attempt=None,
+        attempt_kind="initial",
+        agent_kind="codex",
+        now=now,
+    )
+    assert predecessor is not None
+    assert crashed.checkpoint_completed_turn(
+        issue_id=issue.id,
+        run_id=predecessor,
+        resume_session_id="race-session",
+        state=issue.state,
+        turn=1,
+        now=now + timedelta(seconds=1),
+    )
+    crashed.close()
+    recovery = RunRegistry(path, boot_id="recovery")
+    assert recovery.reclaim_dead_owner_leases(
+        now=now + timedelta(seconds=2), pid_alive=lambda _pid: False
+    )
+    assert recovery.finalize_reclaimed_lease(predecessor, now=now + timedelta(seconds=3))
+    recovery.close()
+
+    barrier = threading.Barrier(2)
+    results: list[object] = []
+    errors: list[BaseException] = []
+
+    def acquire(index: int) -> None:
+        try:
+            contender = RunRegistry(path, boot_id=f"contender-{index}")
+            barrier.wait()
+            results.append(
+                contender.acquire_continuation_run(
+                    issue,
+                    continued_from_run_id=predecessor,
+                    workspace_path=tmp_path / issue.identifier,
+                    attempt=1,
+                    attempt_kind="retry",
+                    agent_kind="codex",
+                    now=now + timedelta(seconds=4),
+                )
+            )
+            contender.close()
+        except BaseException as exc:  # pragma: no cover - assertion reports it
+            errors.append(exc)
+
+    threads = [threading.Thread(target=acquire, args=(index,)) for index in range(2)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+    assert errors == []
+    assert sum(result is not None for result in results) == 1
+    with sqlite3.connect(path) as conn:
+        assert conn.execute(
+            "SELECT COUNT(*) FROM runs WHERE continued_from_run_id = ?",
+            (predecessor,),
+        ).fetchone() == (1,)
