@@ -1703,6 +1703,33 @@ a { color: inherit; }
 }
 .chat-tool-name { font-weight: 600; flex-shrink: 0; }
 .chat-error { color: var(--danger); font-size: 0.86em; }
+.chat-project-setup {
+  align-self: flex-start;
+  max-width: min(76%, 37.037rem);
+  display: grid;
+  gap: 0.4444rem;
+  padding: 0.7407rem 0.8889rem;
+  border: 1px solid var(--accent);
+  border-left-width: 0.2963rem;
+  border-radius: var(--radius);
+  background: var(--surface-2);
+}
+.chat-project-setup-heading { display: flex; align-items: center; gap: 0.5926rem; justify-content: space-between; }
+.chat-project-setup-status { font-size: 0.8148rem; color: var(--text-muted); }
+.chat-project-setup.succeeded { border-color: var(--success); }
+.chat-project-setup.succeeded .chat-project-setup-status { color: var(--success); }
+.chat-project-setup.failed,
+.chat-project-setup.expired { border-color: var(--danger); }
+.chat-project-setup.failed .chat-project-setup-status,
+.chat-project-setup.expired .chat-project-setup-status,
+.chat-project-setup-error { color: var(--danger); }
+.chat-project-setup-name,
+.chat-project-setup-operation,
+.chat-project-setup-result,
+.chat-project-setup-error { margin: 0; }
+.chat-project-setup-operation { color: var(--text-muted); font-size: 0.88em; }
+.chat-project-setup-path { overflow-wrap: anywhere; color: var(--text-muted); }
+.chat-project-setup-select { justify-self: start; }
 .chat-status { text-align: center; color: var(--text-muted); font-size: 0.78em; }
 .chat-top-actions { display: flex; gap: 0.5926rem; align-items: center; }
 .chat-session-bar {

@@ -171,3 +171,15 @@ class ChatSessionExistsError(SymphonyError):
 
 class ChatNoSessionError(SymphonyError):
     code = "chat_no_session"
+
+
+class ChatProjectActionError(SymphonyError):
+    """A requested server-owned Chat project action cannot proceed."""
+
+    code = "chat_project_action"
+
+
+class ChatProjectAuthorizationError(SymphonyError):
+    """A project action lacks its browser-held confirmation capability."""
+
+    code = "chat_project_confirmation_forbidden"

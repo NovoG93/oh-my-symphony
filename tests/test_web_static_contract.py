@@ -191,6 +191,31 @@ def test_web_chat_page_contract() -> None:
     assert ".chat-composer" in css
 
 
+def test_web_chat_project_setup_action_contract() -> None:
+    js = _script_bundle()
+    css = (STATIC_ROOT / "style.css").read_text(encoding="utf-8")
+
+    assert "selectChatProjectSetup: (sessionId, actionId, confirmationToken)" in js
+    assert "X-Symphony-Chat-Confirmation" in js
+    assert "/project-setup/${encodeURIComponent(actionId)}/select" in js
+    assert "function buildChatProjectSetupNode(view, action)" in js
+    assert "function chatProjectSetupForChoice(text)" in js
+    assert "matches.length === 1" in js
+    assert "project_setup_actions" in js
+    assert "project_setup_completed" in js
+    assert "project_setup_expired" in js
+    assert "project_setup_removed" in js
+    assert "function forgetChatProjectSetup(actionId)" in js
+    assert "function reconcileChatProjectSetupActions(view, snapshot)" in js
+    assert "function scheduleChatProjectSetupExpiry(view, action)" in js
+    assert "projectSetupExpiryTimers" in js
+    assert "if (chatState.currentId !== sessionId) return" in js
+    assert "'chat.projectSetupSelect': 'Select option {choice}'" in js
+    assert "'chat.projectSetupSelect': '선택지 {choice} 선택'" in js
+    assert ".chat-project-setup" in css
+    assert ".chat-project-setup-select" in css
+
+
 def test_web_chat_token_streaming_contract() -> None:
     js = _script_bundle()
     css = (STATIC_ROOT / "style.css").read_text(encoding="utf-8")
@@ -215,11 +240,12 @@ def test_web_chat_multi_session_contract() -> None:
 
     assert "getChatSessions: () => apiRequest('/chat/sessions')" in js
     assert "createChatSession2: (payload)" in js
-    assert "reattachChatSession: (id)" in js
+    assert "reattachChatSession: (id, confirmationToken)" in js
+    assert "createChatSessionWithConfirmation" in js
     assert "deleteChatSessionById: (id, { forget } = {})" in js
     assert "postChatMessageTo: (id, payload)" in js
     assert "async function ensureDefaultChatSession()" in js
-    assert "api.createChatSession2({ mode: 'qa' })" in js
+    assert "createChatSessionWithConfirmation({ mode: 'qa' })" in js
     assert "async function refreshChatSessions(view)" in js
     assert "Keep the successfully fetched resumable-session listing visible" in js
     assert "showToast(err.message, 'error')" in js

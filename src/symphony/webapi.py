@@ -35,6 +35,8 @@ from .chat import ChatManager
 from .errors import (
     ChatBusyError,
     ChatNoSessionError,
+    ChatProjectActionError,
+    ChatProjectAuthorizationError,
     ChatSessionExistsError,
     ConfigValidationError,
     SymphonyError,
@@ -55,7 +57,13 @@ from .utils.auto_merge import auto_merge_on_done_best_effort
 from .utils.git_ops import GitOpResult
 from .orchestrator import Orchestrator
 from .product_preview import ProductPreviewError, ProductPreviewManager
-from .projects import Project, ProjectError, ProjectRegistry, canonical_project_repo
+from .projects import (
+    Project,
+    ProjectError,
+    ProjectRegistry,
+    ProjectTargetExpectation,
+    canonical_project_repo,
+)
 from .orchestrator.run_registry import clamp_run_history_limit
 from .orchestrator.scheduler import (
     MAX_DEPENDENCY_EDGES,
@@ -92,6 +100,8 @@ _BRANCH_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/-]{0,199}$")
 _COMMIT_RE = re.compile(r"^[0-9a-fA-F]{4,64}$")
 # `ChatManager` mints these as <UTC date>-<UTC time>-<6 hex>.
 _CHAT_SESSION_RE = re.compile(r"^\d{8}-\d{6}-[0-9a-f]{6}$")
+_PROJECT_SETUP_ACTION_RE = re.compile(r"^project-[0-9a-f]{32}$")
+_CHAT_CONFIRMATION_TOKEN_RE = re.compile(r"^[A-Za-z0-9_-]{32,256}$")
 _RUN_ID_RE = re.compile(r"^[0-9a-f]{32}$")
 _MAX_TITLE = 300
 _MAX_BODY = 128_000
@@ -792,6 +802,21 @@ def _check_chat_session_id(raw: Any) -> str:
     if not _CHAT_SESSION_RE.match(session_id):
         raise WorkflowMutationError(f"invalid chat session id {session_id!r}")
     return session_id
+
+
+def _check_project_setup_action_id(raw: Any) -> str:
+    action_id = raw.strip() if isinstance(raw, str) else ""
+    if not _PROJECT_SETUP_ACTION_RE.fullmatch(action_id):
+        raise WorkflowMutationError(f"invalid project setup action id {action_id!r}")
+    return action_id
+
+
+def _check_chat_confirmation_token(raw: Any) -> str | None:
+    if raw is None:
+        return None
+    if not isinstance(raw, str) or not _CHAT_CONFIRMATION_TOKEN_RE.fullmatch(raw):
+        raise WorkflowMutationError("invalid chat confirmation token")
+    return raw
 
 
 def _check_budget(raw: Any, key: str) -> int | None:
@@ -2182,7 +2207,14 @@ def _register_chat_routes(
 ) -> None:
     # request_refresh lets board tickets the chat agent files in edit mode
     # dispatch on the next tick instead of waiting out the poll interval.
-    manager = ChatManager(ctx.config, request_refresh=orchestrator.request_refresh)
+    project_registry = ProjectRegistry()
+    manager = ChatManager(
+        ctx.config,
+        request_refresh=orchestrator.request_refresh,
+        project_creator=lambda name, path, *, expected_target: _create_or_adopt_registered_project(
+            project_registry, name=name, path=path, expected_target=expected_target
+        ),
+    )
     app[CHAT_MANAGER_KEY] = manager
     websockets: set[web.WebSocketResponse] = set()
 
@@ -2199,9 +2231,16 @@ def _register_chat_routes(
             agent_kind = _check_agent_kind(body.get("agent_kind"))
         max_turns = _check_budget(body.get("max_turns"), "max_turns")
         max_tokens = _check_budget(body.get("max_tokens"), "max_tokens")
+        confirmation_token = _check_chat_confirmation_token(
+            body.get("confirmation_token")
+        )
         try:
             snapshot = await manager.start_session(
-                mode, agent_kind, max_turns=max_turns, max_tokens=max_tokens
+                mode,
+                agent_kind,
+                max_turns=max_turns,
+                max_tokens=max_tokens,
+                confirmation_token=confirmation_token,
             )
         except ChatSessionExistsError as exc:
             return _json_error(409, exc.code, exc.message)
@@ -2226,7 +2265,45 @@ def _register_chat_routes(
             return _json_error(404, exc.code, exc.message)
         return web.json_response({"stopped": True, "forgotten": forget})
 
-    async def _send(body: dict[str, Any], session_id: str | None) -> web.Response:
+    async def _confirm_project_setup(
+        request: web.Request, session_id: str | None, action_id: str
+    ) -> web.Response:
+        # This crosses from chat into global registry/Git mutation. Preserve the
+        # same loopback + same-origin boundary as the Project management form.
+        denied = _project_mutation_error(request)
+        if denied is not None:
+            return denied
+        try:
+            action = await manager.confirm_project_setup(
+                action_id,
+                session_id,
+                confirmation_token=request.headers.get("X-Symphony-Chat-Confirmation"),
+            )
+        except ChatNoSessionError as exc:
+            return _json_error(404, exc.code, exc.message)
+        except ChatProjectAuthorizationError as exc:
+            return _json_error(403, exc.code, exc.message)
+        except ChatProjectActionError as exc:
+            status = 404 if exc.message.startswith("unknown project setup action") else 409
+            return _json_error(status, exc.code, exc.message)
+        if action["status"] == "failed":
+            return web.json_response(
+                {
+                    "error": {
+                        "code": "project_setup_failed",
+                        "message": str(
+                            action.get("error") or "project setup failed"
+                        ),
+                    },
+                    "action": action,
+                },
+                status=409,
+            )
+        return web.json_response({"action": action})
+
+    async def _send(
+        request: web.Request, body: dict[str, Any], session_id: str | None
+    ) -> web.Response:
         text = body.get("text")
         if not isinstance(text, str) or not text.strip():
             raise WorkflowMutationError("text is required")
@@ -2234,6 +2311,14 @@ def _register_chat_routes(
             raise WorkflowMutationError(
                 f"text too long (max {_MAX_CHAT_MESSAGE} chars)"
             )
+        try:
+            selected = manager.project_setup_for_choice(text, session_id)
+        except ChatNoSessionError as exc:
+            return _json_error(404, exc.code, exc.message)
+        # A bare numeric response is an action only when it matches a live,
+        # server-issued choice. All other text remains ordinary conversation.
+        if selected is not None:
+            return await _confirm_project_setup(request, session_id, selected.action_id)
         try:
             snapshot = await manager.send_message(text, session_id)
         except ChatNoSessionError as exc:
@@ -2263,7 +2348,7 @@ def _register_chat_routes(
         return await _stop(None)
 
     async def handle_chat_message_post(request: web.Request) -> web.Response:
-        return await _send(await _read_json(request), None)
+        return await _send(request, await _read_json(request), None)
 
     async def handle_chat_sessions_get(_request: web.Request) -> web.Response:
         return web.json_response(manager.list_sessions())
@@ -2291,12 +2376,24 @@ def _register_chat_routes(
 
     async def handle_chat_session_id_message(request: web.Request) -> web.Response:
         session_id = _check_chat_session_id(request.match_info["session_id"])
-        return await _send(await _read_json(request), session_id)
+        return await _send(request, await _read_json(request), session_id)
+
+    async def handle_chat_project_setup_select(request: web.Request) -> web.Response:
+        session_id = _check_chat_session_id(request.match_info["session_id"])
+        action_id = _check_project_setup_action_id(request.match_info["action_id"])
+        body = await _read_json(request)
+        if body:
+            return _json_error(400, "invalid_body", "project setup selection takes no fields")
+        return await _confirm_project_setup(request, session_id, action_id)
 
     async def handle_chat_session_reattach(request: web.Request) -> web.Response:
         session_id = _check_chat_session_id(request.match_info["session_id"])
+        body = await _read_json(request)
+        if set(body) - {"confirmation_token"}:
+            raise WorkflowMutationError("reattach accepts only confirmation_token")
+        token = _check_chat_confirmation_token(body.get("confirmation_token"))
         try:
-            snapshot = await manager.reattach(session_id)
+            snapshot = await manager.reattach(session_id, confirmation_token=token)
         except ChatNoSessionError as exc:
             return _json_error(404, exc.code, exc.message)
         except ChatSessionExistsError as exc:
@@ -2408,6 +2505,10 @@ def _register_chat_routes(
     app.router.add_post(
         "/api/v1/chat/sessions/{session_id}/message",
         _wrap(handle_chat_session_id_message),
+    )
+    app.router.add_post(
+        "/api/v1/chat/sessions/{session_id}/project-setup/{action_id}/select",
+        _wrap(handle_chat_project_setup_select),
     )
     app.router.add_post(
         "/api/v1/chat/sessions/{session_id}/reattach",
@@ -2559,13 +2660,21 @@ def _project_url(project: Project, status: Any | None = None) -> str:
 
 
 def _create_or_adopt_registered_project(
-    registry: ProjectRegistry, *, name: str, path: Path
+    registry: ProjectRegistry,
+    *,
+    name: str,
+    path: Path,
+    expected_target: ProjectTargetExpectation | None = None,
 ) -> Project:
     """Keep the web boundary thin around the shared project setup service."""
     from .projects import create_or_adopt_project, source_checkout
 
     return create_or_adopt_project(
-        path, source=source_checkout(), registry=registry, name=name
+        path,
+        source=source_checkout(),
+        registry=registry,
+        name=name,
+        expected_target=expected_target,
     )
 
 

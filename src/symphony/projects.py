@@ -7,6 +7,7 @@ import os
 import re
 import shutil
 import socket
+import stat
 import subprocess
 import threading
 import time
@@ -321,6 +322,20 @@ def _git_toplevel(candidate: Path) -> Path | None:
         return None
 
 
+@dataclass(frozen=True)
+class ProjectTargetExpectation:
+    """Proposal-time identity for a project root awaiting confirmation."""
+
+    repo: Path
+    path_exists: bool
+    path_file_type: int | None
+    path_device: int | None
+    path_inode: int | None
+    git_common_dir: Path | None
+    git_device: int | None
+    git_inode: int | None
+
+
 def canonical_project_repo(candidate: str | Path) -> Path:
     """Return an existing Git top-level, otherwise the resolved candidate path."""
     path = Path(candidate).expanduser().resolve()
@@ -332,6 +347,45 @@ def canonical_project_repo(candidate: str | Path) -> Path:
 def _git_common_dir(repo: Path) -> Path:
     raw = Path(_run_git(repo, "rev-parse", "--git-common-dir"))
     return (raw if raw.is_absolute() else repo / raw).resolve()
+
+
+def project_target_expectation(candidate: str | Path) -> ProjectTargetExpectation:
+    """Capture the canonical root and current Git identity for confirmation."""
+
+    repo = canonical_project_repo(candidate)
+    try:
+        path_info = repo.lstat()
+    except FileNotFoundError:
+        path_exists = False
+        path_file_type = path_device = path_inode = None
+    else:
+        path_exists = True
+        path_file_type = stat.S_IFMT(path_info.st_mode)
+        path_device = path_info.st_dev
+        path_inode = path_info.st_ino
+    if _git_toplevel(repo) is None:
+        return ProjectTargetExpectation(
+            repo,
+            path_exists,
+            path_file_type,
+            path_device,
+            path_inode,
+            None,
+            None,
+            None,
+        )
+    common = _git_common_dir(repo)
+    info = common.stat()
+    return ProjectTargetExpectation(
+        repo,
+        path_exists,
+        path_file_type,
+        path_device,
+        path_inode,
+        common,
+        info.st_dev,
+        info.st_ino,
+    )
 
 
 def source_checkout() -> Path:
@@ -635,6 +689,8 @@ def _create_or_adopt_project_locked(
     host: str = "127.0.0.1",
     port: int | None = None,
     registry: ProjectRegistry | None = None,
+    expected_repo: str | Path | None = None,
+    expected_target: ProjectTargetExpectation | None = None,
 ) -> Project:
     """Create or safely adopt a repository and register it.
 
@@ -654,6 +710,50 @@ def _create_or_adopt_project_locked(
     candidate_existed = candidate.exists()
     existing_toplevel = _git_toplevel(candidate) if candidate_existed else None
     repo = existing_toplevel or candidate
+    def target_changed() -> ProjectError:
+        return ProjectError("project target changed; request a new project setup proposal")
+
+    if expected_repo is not None:
+        # ``expected_repo`` is the already-canonical string shown to the
+        # operator. Normalize it lexically only: resolving it again would let
+        # a symlink replacement redefine the expected target during the wait.
+        expected = Path(os.path.abspath(os.fspath(Path(expected_repo).expanduser())))
+        if repo != expected:
+            raise target_changed()
+    if expected_target is not None:
+        expected = Path(os.path.abspath(os.fspath(expected_target.repo)))
+        if repo != expected:
+            raise target_changed()
+        try:
+            actual_path_info = repo.lstat()
+        except FileNotFoundError:
+            actual_exists = False
+            actual_file_type = actual_device = actual_inode = None
+        else:
+            actual_exists = True
+            actual_file_type = stat.S_IFMT(actual_path_info.st_mode)
+            actual_device = actual_path_info.st_dev
+            actual_inode = actual_path_info.st_ino
+        if (
+            actual_exists != expected_target.path_exists
+            or actual_file_type != expected_target.path_file_type
+            or actual_device != expected_target.path_device
+            or actual_inode != expected_target.path_inode
+        ):
+            raise target_changed()
+        actual_common = _git_common_dir(repo) if existing_toplevel is not None else None
+        if expected_target.git_common_dir is None:
+            if actual_common is not None:
+                raise target_changed()
+        else:
+            if actual_common is None or actual_common != expected_target.git_common_dir:
+                raise target_changed()
+            info = actual_common.stat()
+            if (
+                info.st_dev != expected_target.git_device
+                or info.st_ino != expected_target.git_inode
+            ):
+                raise target_changed()
 
     source_repo = _git_toplevel(source_path)
     if source_repo is None:
@@ -800,8 +900,15 @@ def create_or_adopt_project(
     host: str = "127.0.0.1",
     port: int | None = None,
     registry: ProjectRegistry | None = None,
+    expected_repo: str | Path | None = None,
+    expected_target: ProjectTargetExpectation | None = None,
 ) -> Project:
-    """Serialize and perform one complete project create/adopt transaction."""
+    """Serialize and perform one complete project create/adopt transaction.
+
+    ``expected_repo`` binds a prior confirmation to an exact canonical root.
+    ``expected_target`` additionally binds its Git/non-Git identity. Both are
+    checked inside the registry transaction before any setup mutation.
+    """
     resolved_registry = registry or ProjectRegistry()
     with resolved_registry.transaction():
         return _create_or_adopt_project_locked(
@@ -813,4 +920,6 @@ def create_or_adopt_project(
             host=host,
             port=port,
             registry=resolved_registry,
+            expected_repo=expected_repo,
+            expected_target=expected_target,
         )

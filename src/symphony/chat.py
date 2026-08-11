@@ -32,6 +32,8 @@ conversation is done.
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import hmac
 import json
 import os
 import re
@@ -39,10 +41,10 @@ import shlex
 import uuid
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field, replace
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from functools import partial
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, Protocol
 
 from .backends import (
     EVENT_OTHER_MESSAGE,
@@ -57,10 +59,13 @@ from .backends import (
 from .errors import (
     ChatBusyError,
     ChatNoSessionError,
+    ChatProjectActionError,
+    ChatProjectAuthorizationError,
     ChatSessionExistsError,
     SymphonyError,
 )
 from .logging import get_logger
+from .projects import ProjectTargetExpectation, project_target_expectation
 from .workflow import SUPPORTED_AGENT_KINDS, ServiceConfig
 
 log = get_logger()
@@ -81,6 +86,9 @@ INDEX_VERSION = 1
 # be large, so only the last slice of the file is ever parsed.
 _INDEX_NAME = "index.json"
 _REPLAY_TAIL_BYTES = 2 * 1024 * 1024
+_MAX_INDEX_BYTES = 1 * 1024 * 1024
+_MAX_JSON_SAFE_INTEGER = 9_007_199_254_740_991
+_SESSION_ID_RE = re.compile(r"^\d{8}-\d{6}-[0-9a-f]{6}$")
 _TITLE_CHARS = 80
 MAX_INDEX_ENTRIES = 50
 _TOOL_PREVIEW_CHARS = 200
@@ -109,7 +117,38 @@ EDIT_PREAMBLE = (
     "You are pair-working with the operator of the repository at {path}. "
     "You may read and modify files in this working tree as requested. "
     "Keep changes minimal and report exactly what you changed.\n{board}\n"
+    "{project_setup}\n\n"
 )
+
+# A separate Project changes the global registry and may bootstrap a Git
+# repository. It is therefore a server-owned, explicitly confirmed action,
+# not an ambient shell capability granted to the chat backend.
+_PROJECT_SETUP_PREAMBLE = (
+    "A separate Symphony project is a control-plane action. When offering an "
+    "option to create or adopt one, do NOT run `symphony project`, create its "
+    "files yourself, or claim it was registered. Instead include exactly one "
+    "machine-readable proposal for that option, after the human explanation:\n"
+    "<symphony-project-setup>{\"choice\": 1, \"name\": \"Project name\", "
+    "\"path\": \"/absolute/project/path\"}</symphony-project-setup>\n"
+    "Use a positive option number, a non-empty name, and an absolute path. "
+    "The server shows the choice and creates/registers it only if the operator "
+    "selects that number. It reports the authoritative result; do not auto-start "
+    "or switch to the new project, and do not file work on its board until the "
+    "operator explicitly asks."
+)
+_PROJECT_SETUP_OPEN = "<symphony-project-setup>"
+_PROJECT_SETUP_CLOSE = "</symphony-project-setup>"
+_PROJECT_SETUP_MAX_NAME = 100
+_PROJECT_SETUP_MAX_PATH = 4096
+_PROJECT_SETUP_MAX_PAYLOAD = 8 * 1024
+_PROJECT_SETUP_TTL = timedelta(minutes=15)
+# Browser-generated capability; it is never placed in snapshots, transcripts,
+# prompts, or the workspace. Its SHA-256 digest is process-local only. It
+# prevents accidental/raw-chat and cross-origin confirmation, not a hostile
+# same-UID process; that threat requires OS/network/process isolation.
+_CHAT_CONFIRMATION_TOKEN_RE = re.compile(r"^[A-Za-z0-9_-]{32,256}$")
+_MAX_PROJECT_ACTIONS_PER_SESSION = 20
+
 
 # Build-request protocol taught to the chat agent. Rendered with the
 # board's ACTUAL active states; the routing paragraph differs between the
@@ -159,7 +198,10 @@ QA_MODE_NOTICE = (
 EDIT_MODE_NOTICE = (
     "[Chat mode changed to edit: you may now create and modify files in "
     "this working tree as requested, including filing board tickets with "
-    "`${SYMPHONY_CLI:-symphony} board new`.]\n\n"
+    "`${SYMPHONY_CLI:-symphony} board new`. A separate project still requires "
+    "the explicit server-owned project-setup proposal below.]\n\n"
+    + _PROJECT_SETUP_PREAMBLE
+    + "\n\n"
 )
 
 
@@ -186,6 +228,43 @@ _PERMISSION_MODE_RE = re.compile(r"\s--permission-mode(?:[ =]\S+)?")
 
 def _utc_iso() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _project_setup_expiry() -> str:
+    return (datetime.now(timezone.utc) + _PROJECT_SETUP_TTL).strftime(
+        "%Y-%m-%dT%H:%M:%SZ"
+    )
+
+
+def _project_setup_is_expired(expires_at: str) -> bool:
+    """Malformed or legacy unbounded actions fail closed."""
+
+    try:
+        expiry = datetime.strptime(expires_at, "%Y-%m-%dT%H:%M:%SZ").replace(
+            tzinfo=timezone.utc
+        )
+    except (TypeError, ValueError):
+        return True
+    return datetime.now(timezone.utc) >= expiry
+
+
+def _project_setup_error(exc: Exception) -> str:
+    """Bound and redact an error before it reaches a durable Chat transcript."""
+
+    # Import lazily: the orchestrator package re-exports core, whose imports
+    # ultimately include chat during normal service startup.
+    from .orchestrator.diagnostics import redact_text
+
+    return redact_text(exc, maximum=800) or "project setup failed"
+
+
+def _confirmation_token_hash(value: object) -> str | None:
+    """Hash one browser-held confirmation capability without retaining it."""
+
+    token = value.strip() if isinstance(value, str) else ""
+    if not _CHAT_CONFIRMATION_TOKEN_RE.fullmatch(token):
+        return None
+    return hashlib.sha256(token.encode("ascii")).hexdigest()
 
 
 def _preview(text: str, limit: int) -> str:
@@ -258,6 +337,140 @@ class ChatMessage:
 
 
 @dataclass
+class ProjectSetupAction:
+    """One explicit, server-owned project setup choice emitted by Chat."""
+
+    action_id: str
+    choice: int
+    name: str
+    path: str
+    operation: str = "unknown"
+    status: str = "pending"
+    project: dict[str, Any] | None = None
+    error: str | None = None
+    choice_active: bool = True
+    expires_at: str = field(default_factory=_project_setup_expiry)
+    task: asyncio.Task[None] | None = field(default=None, repr=False, compare=False)
+    target_expectation: ProjectTargetExpectation | None = field(
+        default=None, repr=False, compare=False
+    )
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "action_id": self.action_id,
+            "choice": self.choice,
+            "name": self.name,
+            "path": self.path,
+            "operation": self.operation,
+            "status": self.status,
+            "project": self.project,
+            "error": self.error,
+            "choice_active": self.choice_active,
+            "expires_at": self.expires_at,
+        }
+
+
+def _project_setup_operation(expectation: ProjectTargetExpectation) -> str:
+    if not expectation.path_exists:
+        return "create"
+    return "adopt" if expectation.git_common_dir is not None else "initialize"
+
+
+def _strict_json_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    """Reject duplicate JSON members at every object depth."""
+
+    value: dict[str, Any] = {}
+    for key, item in pairs:
+        if key in value:
+            raise ValueError("duplicate JSON member")
+        value[key] = item
+    return value
+
+
+def _project_setup_spec(text: str) -> tuple[str, ProjectSetupAction | None]:
+    """Extract one strictly shaped server-owned project proposal from agent text.
+
+    Ordinary prose remains ordinary chat. Only the documented marker becomes a
+    selectable action, so a later bare numeric reply cannot turn arbitrary
+    model output into a filesystem mutation.
+    """
+
+    # Do not run a dot-star regex over backend-controlled output: repeated
+    # unmatched opening tags otherwise cause quadratic rescans.
+    if text.count(_PROJECT_SETUP_OPEN) != 1 or text.count(_PROJECT_SETUP_CLOSE) != 1:
+        return text, None
+    open_start = text.find(_PROJECT_SETUP_OPEN)
+    start = open_start + len(_PROJECT_SETUP_OPEN)
+    end = text.find(_PROJECT_SETUP_CLOSE)
+    if end < start:
+        return text, None
+    payload = text[start:end].strip()
+    if len(payload) > _PROJECT_SETUP_MAX_PAYLOAD:
+        return text, None
+    try:
+        value = json.loads(payload, object_pairs_hook=_strict_json_object)
+    except (json.JSONDecodeError, RecursionError, ValueError):
+        return text, None
+    if not isinstance(value, dict) or set(value) != {"choice", "name", "path"}:
+        return text, None
+    choice = value.get("choice")
+    name = value.get("name")
+    raw_path = value.get("path")
+    if (
+        not isinstance(choice, int)
+        or isinstance(choice, bool)
+        or not 1 <= choice <= 99
+        or not isinstance(name, str)
+        or not 0 < len(name.strip()) <= _PROJECT_SETUP_MAX_NAME
+        or not isinstance(raw_path, str)
+        or not 0 < len(raw_path.strip()) <= _PROJECT_SETUP_MAX_PATH
+    ):
+        return text, None
+    try:
+        candidate = Path(raw_path).expanduser()
+        if not candidate.is_absolute() or (
+            candidate.exists() and not candidate.is_dir()
+        ):
+            return text, None
+        # A nested directory in an existing Git checkout is not a distinct
+        # Project: the shared creation service canonicalizes it to the repo
+        # root. Capture the topology too, so confirmation cannot silently turn
+        # a proposed new directory into adoption of a later Git checkout.
+        target_expectation = project_target_expectation(candidate)
+        path = str(target_expectation.repo)
+    except (OSError, RuntimeError, UnicodeError, ValueError):
+        return text, None
+    resolved_name = name.strip()
+    # A fresh, server-generated nonce lets an operator receive a new card for
+    # an identical proposal after an earlier card expires or fails.
+    action_id = "project-" + uuid.uuid4().hex
+    visible = (
+        text[:open_start] + text[end + len(_PROJECT_SETUP_CLOSE) :]
+    ).strip()
+    return visible, ProjectSetupAction(
+        action_id=action_id,
+        choice=choice,
+        name=resolved_name,
+        path=path,
+        operation=_project_setup_operation(target_expectation),
+        target_expectation=target_expectation,
+    )
+
+
+def _project_setup_target_at_confirmation(
+    expectation: ProjectTargetExpectation,
+) -> Path:
+    """Refuse a root or Git-identity change after the operator saw the card."""
+
+    current = project_target_expectation(expectation.repo)
+    if current != expectation:
+        raise ChatProjectActionError(
+            "project target changed; request a new project setup proposal"
+        )
+    return current.repo
+
+
+@dataclass
 class ChatSession:
     session_id: str
     mode: str
@@ -295,6 +508,13 @@ class ChatSession:
     used_tokens: int = 0
     token_base: int = 0
     budget_warned: bool = False
+    # This SHA-256 digest originates from a browser-held random capability.
+    # It is deliberately absent from transcript/index/workspace persistence.
+    confirmation_token_hash: str | None = None
+    # These choices are created only from strict project-setup markers in an
+    # edit-mode response. They are process-local: restart/reattach intentionally
+    # drops them rather than trusting the agent-writable transcript/index.
+    project_setup_actions: dict[str, ProjectSetupAction] = field(default_factory=dict)
 
     def budget(self) -> dict[str, Any]:
         return {
@@ -363,6 +583,37 @@ class _TranscriptWriter:
         self._executor.shutdown(wait=False)
 
 
+def _default_project_creator(
+    name: str,
+    path: Path,
+    *,
+    expected_target: ProjectTargetExpectation | None = None,
+) -> Any:
+    """Use the same guarded domain operation as CLI and project management."""
+
+    from .projects import ProjectRegistry, create_or_adopt_project, source_checkout
+
+    return create_or_adopt_project(
+        target=path,
+        source=source_checkout(),
+        registry=ProjectRegistry(),
+        name=name,
+        expected_target=expected_target,
+    )
+
+
+class ProjectSetupCreator(Protocol):
+    """Control-plane creator bound to the canonical root shown on the card."""
+
+    def __call__(
+        self,
+        name: str,
+        path: Path,
+        *,
+        expected_target: ProjectTargetExpectation,
+    ) -> Any: ...
+
+
 class ChatManager:
     """Up to `MAX_SESSIONS` operator chat sessions against the host repo.
 
@@ -381,12 +632,16 @@ class ChatManager:
         self,
         config_provider: Callable[[], ServiceConfig],
         request_refresh: Callable[[], object] | None = None,
+        project_creator: ProjectSetupCreator | None = None,
     ) -> None:
         self._config_provider = config_provider
-        # Called after each turn so board tickets the agent files (edit mode
+        # Called after each turn so board tickets the chat agent files (edit mode
         # writes straight into the file board) dispatch on the next tick
         # instead of waiting out the poll interval.
         self._request_refresh = request_refresh
+        # Project setup is deliberately injected at the control-plane boundary.
+        # Backends never receive a shell capability for global registry writes.
+        self._project_creator = project_creator or _default_project_creator
         self._sessions: dict[str, ChatSession] = {}
         self._active_id: str | None = None
         # queue -> focused session id. Numbered frames go to every
@@ -425,6 +680,7 @@ class ChatManager:
         agent_kind: str | None = None,
         max_turns: int | None = None,
         max_tokens: int | None = None,
+        confirmation_token: str | None = None,
     ) -> dict[str, Any]:
         if self._closed:
             raise ChatNoSessionError("chat manager is shut down")
@@ -449,7 +705,10 @@ class ChatManager:
             created_at=_utc_iso(),
             max_turns=DEFAULT_MAX_TURNS if max_turns is None else max_turns,
             max_tokens=DEFAULT_MAX_TOKENS if max_tokens is None else max_tokens,
+            confirmation_token_hash=_confirmation_token_hash(confirmation_token),
         )
+        # A session without a browser-held capability remains usable for chat,
+        # but it cannot confirm a global project mutation.
         session.writer = _TranscriptWriter(self._transcript_path(session_id))
         self._sessions[session_id] = session
         self._active_id = session_id
@@ -467,14 +726,15 @@ class ChatManager:
         self._save_index()
         return self.snapshot(session_id)
 
-    async def reattach(self, session_id: str) -> dict[str, Any]:
+    async def reattach(
+        self, session_id: str, confirmation_token: str | None = None
+    ) -> dict[str, Any]:
         """Bring a session recorded in the index back to life.
 
-        The agent process is gone, so a fresh backend is built; with claude
-        it resumes the agent-side conversation by id, other kinds start with
-        an empty context and get the preamble again on the next message.
-        The transcript is replayed from the JSONL so the operator sees the
-        conversation they left.
+        The session index and transcript share the editable workflow tree, so
+        reattach restores only display history. It starts a configured Q&A
+        backend without an agent-side resume; the operator must explicitly
+        switch back to edit mode after reattach.
         """
         if self._closed:
             raise ChatNoSessionError("chat manager is shut down")
@@ -489,12 +749,12 @@ class ChatManager:
         if entry is None:
             raise ChatNoSessionError(f"unknown chat session {session_id!r}")
         cfg = self._config_provider()
-        kind = str(entry.get("agent_kind") or cfg.agent.kind)
+        kind = cfg.agent.kind
         if kind not in SUPPORTED_AGENT_KINDS:
             raise SymphonyError(f"unsupported agent kind {kind!r}")
         session = ChatSession(
             session_id=session_id,
-            mode=_check_mode(str(entry.get("mode") or "qa")),
+            mode="qa",
             agent_kind=kind,
             mode_enforced=kind in MODE_ENFORCED_KINDS,
             created_at=str(entry.get("created_at") or _utc_iso()),
@@ -503,17 +763,12 @@ class ChatManager:
             max_tokens=_as_int(entry.get("max_tokens"), DEFAULT_MAX_TOKENS),
             used_tokens=_as_int(entry.get("used_tokens")),
             title=str(entry.get("title") or ""),
+            confirmation_token_hash=_confirmation_token_hash(confirmation_token),
         )
-        agent_session_id = entry.get("agent_session_id")
-        resume_id = (
-            agent_session_id
-            if kind == "claude" and isinstance(agent_session_id, str) and agent_session_id
-            else None
-        )
-        session.agent_session_id = resume_id
-        # Without a resume the agent has no memory of the conversation, so
-        # the next message has to carry the preamble again.
-        session.pending_preamble = resume_id is None
+        # Chat transcripts and indexes share the editable workflow tree. A
+        # completed server process never restores mode, backend, resume, or
+        # project-action authority from either source.
+        session.pending_preamble = True
         transcript = await asyncio.to_thread(
             _load_transcript, self._transcript_path(session_id)
         )
@@ -523,16 +778,15 @@ class ChatManager:
         self._sessions[session_id] = session
         self._active_id = session_id
         try:
-            await self._build_backend(cfg, session, resume_session_id=resume_id)
+            await self._build_backend(cfg, session)
         except BaseException:
             self._forget_live(session)
             raise
         self._broadcast(
             session,
             "session_status",
-            "session reattached"
-            + ("" if resume_id else " — agent context could not be restored"),
-            meta={"reattached": True, "context_preserved": bool(resume_id)},
+            "session reattached — Q&A mode restored; switch to edit to make changes",
+            meta={"reattached": True, "context_preserved": False},
         )
         self._save_index()
         return self.snapshot(session_id)
@@ -549,6 +803,12 @@ class ChatManager:
             except (asyncio.CancelledError, Exception):
                 pass
         session.turn_task = None
+        # Project setup is a protected control-plane mutation. Do not close its
+        # transcript writer while its domain call can still commit; the task is
+        # intentionally shielded from request cancellation in confirmation.
+        for action in session.project_setup_actions.values():
+            if action.task is not None:
+                await asyncio.shield(action.task)
         if session.backend is not None:
             try:
                 await session.backend.stop()
@@ -592,9 +852,13 @@ class ChatManager:
             except Exception as exc:
                 log.warning("chat_backend_stop_failed", error=str(exc))
         session.mode = mode
+        self._close_project_setup_choice_windows(session, reason="a mode change")
         session.backend = None
         session.backend_turns = 0
-        session.pending_mode_notice = True
+        # A restarted backend has no memory of the original safety and board
+        # rules. Give it the full preamble instead of the terse mode notice.
+        session.pending_preamble = not context_preserved
+        session.pending_mode_notice = context_preserved
         await self._build_backend(cfg, session, resume_session_id=resume_id)
         self._broadcast(
             session,
@@ -625,7 +889,11 @@ class ChatManager:
         if session.turn_count == 0 or session.pending_preamble:
             prompt = (
                 preamble.format(
-                    path=cfg.workflow_path.parent, board=_board_preamble(cfg)
+                    path=cfg.workflow_path.parent,
+                    board=_board_preamble(cfg),
+                    project_setup=(
+                        _PROJECT_SETUP_PREAMBLE if session.mode == "edit" else ""
+                    ),
                 )
                 + text
             )
@@ -637,6 +905,10 @@ class ChatManager:
             prompt = notice + text
         session.pending_mode_notice = False
         session.pending_preamble = False
+        # Any ordinary message ends the bare-numeric selection window. The
+        # visible action card remains explicitly confirmable until its expiry;
+        # this prevents a later unrelated ``1`` from mutating the registry.
+        self._close_project_setup_choice_windows(session, reason="an ordinary message")
         # Counted at send time, not on completion: the turn's tokens are
         # already committed, and `turn_completed` carries a budget snapshot
         # that would otherwise be one turn stale. Must follow the preamble
@@ -697,11 +969,15 @@ class ChatManager:
         )
         if session is None:
             return {"active": False}
+        self._prune_project_setup_actions(session)
         return {
             **_session_meta(session),
             "active": True,
             "transcript_tail": [
                 m.as_dict() for m in session.transcript[-SNAPSHOT_TAIL:]
+            ],
+            "project_setup_actions": [
+                action.as_dict() for action in session.project_setup_actions.values()
             ],
         }
 
@@ -724,6 +1000,208 @@ class ChatManager:
         }
 
     # ------------------------------------------------------------------
+    # server-owned project setup choices
+    # ------------------------------------------------------------------
+
+    def _close_project_setup_choice_windows(
+        self, session: ChatSession, *, reason: str
+    ) -> None:
+        """Stop treating bare numbers as project confirmations."""
+
+        for action in session.project_setup_actions.values():
+            if not action.choice_active:
+                continue
+            action.choice_active = False
+            self._broadcast(
+                session,
+                "project_setup_status",
+                f"numeric selection closed for {action.name} after {reason}",
+                meta={"project_setup": action.as_dict()},
+            )
+
+    def _expire_project_setup_actions(self, session: ChatSession) -> None:
+        """Make passive expiry visible without trusting persisted action rows."""
+
+        for action in session.project_setup_actions.values():
+            if action.status in {"pending", "failed"} and _project_setup_is_expired(
+                action.expires_at
+            ):
+                action.status = "expired"
+                action.choice_active = False
+
+    def _prune_project_setup_actions(
+        self, session: ChatSession, *, reserve: int = 0
+    ) -> list[str]:
+        """Bound live action state without evicting live confirmations."""
+
+        self._expire_project_setup_actions(session)
+        removed: list[str] = []
+        target = max(_MAX_PROJECT_ACTIONS_PER_SESSION - reserve, 0)
+        while len(session.project_setup_actions) > target:
+            stale_id = next(
+                (
+                    action_id
+                    for action_id, action in session.project_setup_actions.items()
+                    if action.status in {"succeeded", "expired"}
+                ),
+                None,
+            )
+            if stale_id is None:
+                # Pending/running cards remain an explicit operator choice.
+                # A new proposal is refused until one is resolved or expires.
+                return removed
+            del session.project_setup_actions[stale_id]
+            removed.append(stale_id)
+        return removed
+
+    def project_setup_for_choice(
+        self, choice_text: str, session_id: str | None = None
+    ) -> ProjectSetupAction | None:
+        """Return the active server-issued action selected by a bare number."""
+
+        session = self._resolve(session_id)
+        if session.mode != "edit":
+            return None
+        self._expire_project_setup_actions(session)
+        try:
+            choice = int(choice_text)
+        except (TypeError, ValueError):
+            return None
+        if str(choice) != choice_text.strip():
+            return None
+        matches = [
+            action
+            for action in session.project_setup_actions.values()
+            if (
+                action.choice == choice
+                and action.choice_active
+                and action.status in {"pending", "failed"}
+                and not _project_setup_is_expired(action.expires_at)
+            )
+        ]
+        return matches[0] if len(matches) == 1 else None
+
+    async def confirm_project_setup(
+        self,
+        action_id: str,
+        session_id: str | None = None,
+        confirmation_token: str | None = None,
+    ) -> dict[str, Any]:
+        """Create/adopt a proposed project once the operator selects it.
+
+        The backing task is shielded from a disconnected HTTP request: project
+        setup may have already committed a Git repository, so abandoning it
+        midway would leave the transcript falsely pending.
+        """
+
+        session = self._resolve(session_id)
+        action = session.project_setup_actions.get(action_id)
+        if action is None:
+            raise ChatProjectActionError(f"unknown project setup action {action_id!r}")
+        if session.mode != "edit":
+            raise ChatProjectActionError("project setup requires an edit-mode session")
+        token_hash = _confirmation_token_hash(confirmation_token)
+        if (
+            session.confirmation_token_hash is None
+            or token_hash is None
+            or not hmac.compare_digest(session.confirmation_token_hash, token_hash)
+        ):
+            raise ChatProjectAuthorizationError(
+                "project setup requires confirmation from its originating browser"
+            )
+        if action.status == "succeeded":
+            return action.as_dict()
+        # The first confirmation established authority before expiry. A retry
+        # racing that in-flight task must await its exact outcome rather than
+        # relabeling a potentially committed setup as expired.
+        if action.task is not None:
+            await asyncio.shield(action.task)
+            return action.as_dict()
+        if action.status == "expired" or _project_setup_is_expired(action.expires_at):
+            action.status = "expired"
+            action.choice_active = False
+            self._broadcast(
+                session,
+                "project_setup_expired",
+                f"project setup expired for {action.name}",
+                meta={"project_setup": action.as_dict()},
+            )
+            raise ChatProjectActionError("project setup action has expired")
+        action.status = "running"
+        action.choice_active = False
+        action.error = None
+        self._broadcast(
+            session,
+            "project_setup_status",
+            f"creating and registering {action.name}",
+            meta={"project_setup": action.as_dict()},
+        )
+        action.task = asyncio.create_task(
+            self._run_project_setup(session, action),
+            name=f"symphony-chat-project-setup-{action.action_id}",
+        )
+        await asyncio.shield(action.task)
+        return action.as_dict()
+
+    async def _run_project_setup(
+        self, session: ChatSession, action: ProjectSetupAction
+    ) -> None:
+        try:
+            def create_checked() -> Any:
+                expectation = action.target_expectation
+                if expectation is None:
+                    raise ChatProjectActionError(
+                        "project setup target binding is unavailable; request a new proposal"
+                    )
+                target = _project_setup_target_at_confirmation(expectation)
+                return self._project_creator(
+                    action.name, target, expected_target=expectation
+                )
+
+            project = await asyncio.to_thread(create_checked)
+        except Exception as exc:
+            action.status = "failed"
+            action.error = _project_setup_error(exc)
+            log.warning(
+                "chat_project_setup_failed",
+                action_id=action.action_id,
+                path=action.path,
+                error=action.error,
+            )
+            self._broadcast(
+                session,
+                "project_setup_failed",
+                f"could not create or register {action.name}",
+                meta={"project_setup": action.as_dict()},
+            )
+        else:
+            action.status = "succeeded"
+            action.choice_active = False
+            action.project = self._project_setup_payload(project)
+            self._broadcast(
+                session,
+                "project_setup_completed",
+                f"created and registered {action.name}",
+                meta={"project_setup": action.as_dict()},
+            )
+        finally:
+            action.task = None
+            self._save_index()
+
+    @staticmethod
+    def _project_setup_payload(project: Any) -> dict[str, Any]:
+        """Return the non-secret project facts a Chat confirmation may show."""
+
+        return {
+            "id": str(getattr(project, "id", "")),
+            "name": str(getattr(project, "name", "")),
+            "repo_path": str(getattr(project, "git_repo", "")),
+            "workflow_path": str(getattr(project, "workflow", "")),
+            "host": str(getattr(project, "host", "")),
+            "port": getattr(project, "port", None),
+        }
+
+    # ------------------------------------------------------------------
     # internals
     # ------------------------------------------------------------------
 
@@ -736,6 +1214,70 @@ class ChatManager:
         if session is None:
             raise ChatNoSessionError(f"no live chat session {session_id!r}")
         return session
+
+    def _record_agent_message(
+        self,
+        session: ChatSession,
+        text: str,
+        meta: dict[str, Any] | None = None,
+    ) -> None:
+        """Persist visible model text and any strict server-owned action."""
+
+        visible = text
+        proposal: ProjectSetupAction | None = None
+        if session.mode == "edit":
+            visible, proposal = _project_setup_spec(text)
+        removed: list[str] = []
+        if proposal is not None and proposal.action_id not in session.project_setup_actions:
+            self._expire_project_setup_actions(session)
+            duplicate_choice = any(
+                action.choice == proposal.choice
+                and (
+                    (action.status == "pending" and action.choice_active)
+                    or action.status == "running"
+                )
+                for action in session.project_setup_actions.values()
+            )
+            if duplicate_choice:
+                proposal = None
+                visible = (
+                    f"{visible}\n\n"
+                    "Project setup could not be safely prepared: that option number "
+                    "is already in use."
+                ).strip()
+            else:
+                removed = self._prune_project_setup_actions(session, reserve=1)
+                if (
+                    session.confirmation_token_hash is not None
+                    and len(session.project_setup_actions)
+                    < _MAX_PROJECT_ACTIONS_PER_SESSION
+                ):
+                    session.project_setup_actions[proposal.action_id] = proposal
+                else:
+                    proposal = None
+                    unavailable = "Project setup could not be safely prepared."
+                    visible = f"{visible}\n\n{unavailable}".strip()
+        # The explanation must precede its control in the live stream just as
+        # it does in the model response and accessibility reading order.
+        if visible:
+            self._broadcast(session, "agent_message", visible, meta=meta)
+        for action_id in removed:
+            self._broadcast(
+                session,
+                "project_setup_removed",
+                "",
+                meta={"project_setup_action_id": action_id},
+            )
+        if proposal is not None:
+            self._broadcast(
+                session,
+                "project_setup_action",
+                "",
+                meta={"project_setup": proposal.as_dict()},
+            )
+        # Keep the raw backend message for terminal-event de-duplication. The
+        # visible string intentionally has the protocol marker removed.
+        session.last_agent_text = text
 
     def _forget_live(self, session: ChatSession) -> None:
         """Drop a session from the live map and release its writer."""
@@ -871,8 +1413,7 @@ class ChatManager:
             self._accumulate_usage(session, usage)
             message = _terminal_agent_message(payload)
             if message and message != session.last_agent_text:
-                self._broadcast(session, "agent_message", message)
-                session.last_agent_text = message
+                self._record_agent_message(session, message)
             self._broadcast(
                 session,
                 "turn_completed",
@@ -891,7 +1432,8 @@ class ChatManager:
                     self._broadcast_ephemeral(session, type_, text, meta)
                     continue
                 if type_ == "agent_message":
-                    session.last_agent_text = text
+                    self._record_agent_message(session, text, meta)
+                    continue
                 self._broadcast(session, type_, text, meta=meta)
         # remaining events (malformed, notifications, approvals) stay internal
 
@@ -988,10 +1530,13 @@ class ChatManager:
         return self._chat_dir() / f"{session_id}.jsonl"
 
     def _read_index(self) -> list[dict[str, Any]]:
+        path = self._chat_dir() / _INDEX_NAME
         try:
-            raw = (self._chat_dir() / _INDEX_NAME).read_text(encoding="utf-8")
+            if path.stat().st_size > _MAX_INDEX_BYTES:
+                return []
+            raw = path.read_text(encoding="utf-8")
             data = json.loads(raw)
-        except (OSError, json.JSONDecodeError):
+        except (OSError, RecursionError, ValueError, json.JSONDecodeError):
             return []
         rows = data.get("sessions") if isinstance(data, dict) else None
         if not isinstance(rows, list):
@@ -999,7 +1544,11 @@ class ChatManager:
         return [
             row
             for row in rows
-            if isinstance(row, dict) and isinstance(row.get("session_id"), str)
+            if (
+                isinstance(row, dict)
+                and isinstance(row.get("session_id"), str)
+                and _SESSION_ID_RE.fullmatch(row["session_id"])
+            )
         ]
 
     def _find_index_entry(self, session_id: str) -> dict[str, Any] | None:
@@ -1050,11 +1599,13 @@ def _check_mode(raw: str) -> str:
 
 
 def _as_int(raw: Any, default: int = 0) -> int:
+    if isinstance(raw, bool):
+        return default
     try:
         value = int(raw)
     except (TypeError, ValueError):
         return default
-    return value if value >= 0 else default
+    return value if 0 <= value <= _MAX_JSON_SAFE_INTEGER else default
 
 
 def _session_meta(session: ChatSession) -> dict[str, Any]:
@@ -1114,14 +1665,19 @@ def _load_transcript(path: Path) -> list[ChatMessage]:
             continue
         try:
             row = json.loads(line)
-        except json.JSONDecodeError:
+        except (json.JSONDecodeError, RecursionError, ValueError):
             continue
-        if not isinstance(row, dict) or not isinstance(row.get("seq"), int):
+        seq = row.get("seq") if isinstance(row, dict) else None
+        if (
+            not isinstance(seq, int)
+            or isinstance(seq, bool)
+            or not 0 <= seq <= _MAX_JSON_SAFE_INTEGER
+        ):
             continue
         meta = row.get("meta")
         messages.append(
             ChatMessage(
-                seq=row["seq"],
+                seq=seq,
                 type=str(row.get("type") or ""),
                 text=str(row.get("text") or ""),
                 timestamp=str(row.get("timestamp") or ""),
