@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import os
 import shutil
 import subprocess
@@ -29,7 +30,11 @@ from symphony.orchestrator import (
     _IssueDebug,
     _sort_for_dispatch_fifo,
 )
-from symphony.orchestrator.run_registry import RunRegistry
+from symphony.orchestrator.run_registry import (
+    ContinuationCheckpoint,
+    RunRecord,
+    RunRegistry,
+)
 from symphony.workspace import (
     HISTORY_LOCAL_ONLY,
     HistoryGateResult,
@@ -1423,6 +1428,38 @@ def test_worker_task_done_logs_exception_from_stale_pop_race(monkeypatch):
     )
 
 
+def test_initialized_missing_registry_fails_closed_when_continuation_enabled(
+    tmp_path,
+):
+    cfg = _make_config(
+        workflow_path=tmp_path / "WORKFLOW.md", workspace_root=tmp_path / "ws"
+    )
+    issue = _issue("MT-NO-REGISTRY", state="Todo")
+    orch = _orch()
+    orch._run_registry_initialized = True
+
+    assert orch._try_acquire_run_lease(
+        cfg=cfg,
+        issue=issue,
+        workspace_path=tmp_path / "ws" / issue.identifier,
+        attempt=None,
+        attempt_kind="initial",
+        agent_kind="codex",
+    ) is None
+
+    opted_out = replace(cfg, agent=replace(cfg.agent, crash_continuation=False))
+    acquisition = orch._try_acquire_run_lease(
+        cfg=opted_out,
+        issue=issue,
+        workspace_path=tmp_path / "ws" / issue.identifier,
+        attempt=None,
+        attempt_kind="initial",
+        agent_kind="codex",
+    )
+    assert acquisition is not None
+    assert acquisition.run_id == ""
+
+
 def test_persisted_lease_blocks_fresh_orchestrator_dispatch(tmp_path, monkeypatch):
     """A crash-restarted process must not ignore another live lease."""
     cfg = _make_config(workflow_path=tmp_path / "WORKFLOW.md", workspace_root=tmp_path / "ws")
@@ -1459,6 +1496,44 @@ def test_persisted_lease_blocks_fresh_orchestrator_dispatch(tmp_path, monkeypatc
             pass
 
     asyncio.run(_run())
+
+
+def test_unconfirmed_backend_cleanup_keeps_active_lease_for_startup_reap(tmp_path):
+    issue = _issue("MT-UNCLEAN", state="Todo")
+    registry = RunRegistry(tmp_path / ".symphony" / "state.db")
+    run_id = registry.acquire_run(
+        issue,
+        workspace_path=tmp_path / "ws" / issue.identifier,
+        attempt=None,
+        attempt_kind="initial",
+        agent_kind="codex",
+    )
+    assert run_id
+    assert registry.heartbeat(
+        issue_id=issue.id,
+        run_id=run_id,
+        backend_agent_pid=4545,
+    )
+
+    orch = _orch()
+    orch._run_registry = registry
+    entry = RunningEntry(
+        issue=issue,
+        started_at=datetime.now(timezone.utc),
+        retry_attempt=None,
+        worker_task=None,  # type: ignore[arg-type]
+        workspace_path=tmp_path / "ws" / issue.identifier,
+        run_id=run_id,
+        agent_pgid=4545,
+        backend_cleanup_unconfirmed=True,
+    )
+
+    orch._finish_run_lease(issue.id, entry, "shutdown_interrupted")
+
+    saved = registry.get_run(run_id)
+    assert saved.status == "active"
+    assert saved.backend_agent_pid == 4545
+    assert registry.has_active_lease(issue.id)
 
 
 def test_worker_exit_releases_persisted_lease(tmp_path, monkeypatch):
@@ -1527,6 +1602,14 @@ def test_startup_reclaim_kills_recorded_orphan_agent_before_return(
     """AF-10 — startup reaps a dead owner's recorded live agent group."""
     import symphony.orchestrator.run_registry as run_registry_module
 
+    monkeypatch.setattr(run_registry_module, "process_identity", lambda _pid: "proc-1")
+    monkeypatch.setattr(core_module, "process_identity", lambda _pid: "proc-1")
+    group_states = iter((True, False))
+    monkeypatch.setattr(
+        core_module,
+        "process_group_exists",
+        lambda _pid: next(group_states, False),
+    )
     cfg = _make_config(
         workflow_path=tmp_path / "WORKFLOW.md", workspace_root=tmp_path / "ws"
     )
@@ -1592,6 +1675,271 @@ def test_startup_reclaim_kills_recorded_orphan_agent_before_return(
     assert restarted._run_registry.get_run(run_id).status == "orphaned"
 
 
+def test_startup_reclaim_keeps_fence_when_kill_is_not_confirmed(
+    tmp_path, monkeypatch
+):
+    finalized: list[str] = []
+
+    class _Registry:
+        path = tmp_path / "state.db"
+
+        def finalize_reclaimed_lease(self, run_id):
+            finalized.append(run_id)
+            return True
+
+    record = RunRecord(
+        run_id="run-1",
+        issue_id="issue-1",
+        identifier="MT-UNREAPED",
+        title="Unreaped",
+        state="Todo",
+        status="reclaiming",
+        workspace_path=tmp_path,
+        lease_expires_at=None,
+        last_progress_at=None,
+        backend_agent_pid=4343,
+        backend_process_identity="proc-1",
+    )
+    ticks = iter((0.0, 2.0))
+    monkeypatch.setattr(core_module, "process_identity", lambda _pid: "proc-1")
+    monkeypatch.setattr(core_module, "process_group_exists", lambda _pid: True)
+    monkeypatch.setattr(core_module, "kill_process_group", lambda _pid: True)
+    monkeypatch.setattr(core_module.time, "monotonic", lambda: next(ticks, 2.0))
+
+    assert _orch()._reap_and_finalize_reclaimed_run(_Registry(), record) is False  # type: ignore[arg-type]
+    assert finalized == []
+
+
+def test_startup_reclaim_does_not_kill_reused_backend_pid(tmp_path, monkeypatch):
+    import symphony.orchestrator.run_registry as run_registry_module
+
+    cfg = _make_config(
+        workflow_path=tmp_path / "WORKFLOW.md", workspace_root=tmp_path / "ws"
+    )
+    issue = _issue("MT-PID-REUSED", state="Todo")
+    state_db = tmp_path / ".symphony" / "state.db"
+    monkeypatch.setattr(
+        run_registry_module, "process_identity", lambda _pid: "old-incarnation"
+    )
+    crashed = RunRegistry(state_db, owner_pid=4242, boot_id="crashed")
+    run_id = crashed.acquire_run(
+        issue,
+        workspace_path=tmp_path / "ws" / issue.identifier,
+        attempt=None,
+        attempt_kind="initial",
+        agent_kind="codex",
+    )
+    assert run_id
+    assert crashed.heartbeat(
+        issue_id=issue.id, run_id=run_id, backend_agent_pid=4343
+    )
+    crashed.close()
+
+    killed: list[int] = []
+    monkeypatch.setattr(run_registry_module, "_pid_alive", lambda _pid: False)
+    monkeypatch.setattr(core_module, "process_identity", lambda _pid: "new-incarnation")
+    monkeypatch.setattr(core_module, "process_group_exists", lambda _pid: True)
+    monkeypatch.setattr(
+        core_module, "kill_process_group", lambda pid: killed.append(pid) or True
+    )
+    restarted = _orch()
+    restarted._ensure_run_registry(cfg)
+
+    assert killed == []
+    assert restarted._run_registry is not None
+    assert restarted._run_registry.get_run(run_id).status == "orphaned"
+
+
+def test_dispatch_after_restart_acquires_linked_continuation_checkpoint(
+    tmp_path, monkeypatch
+):
+    """A confirmed dead owner resumes exactly one new run at its completed turn."""
+    import symphony.orchestrator.run_registry as run_registry_module
+
+    cfg = _make_config(
+        workflow_path=tmp_path / "WORKFLOW.md",
+        workspace_root=tmp_path / "ws",
+        active_states=("Todo",),
+    )
+    issue = _issue("MT-CONTINUE", state="Todo")
+    state_db = tmp_path / ".symphony" / "state.db"
+    crashed = RunRegistry(
+        state_db,
+        lease_ttl=timedelta(minutes=5),
+        owner_pid=4242,
+        boot_id="crashed",
+    )
+    source_run_id = crashed.acquire_run(
+        issue,
+        workspace_path=tmp_path / "ws" / issue.identifier,
+        attempt=None,
+        attempt_kind="initial",
+        agent_kind="codex",
+    )
+    assert source_run_id
+    assert crashed.checkpoint_completed_turn(
+        issue_id=issue.id,
+        run_id=source_run_id,
+        resume_session_id="codex-thread-1",
+        state=issue.state,
+        turn=3,
+    )
+    crashed.close()
+
+    monkeypatch.setattr(run_registry_module, "_pid_alive", lambda _pid: False)
+    monkeypatch.setattr(
+        Orchestrator,
+        "_tracker_call_record_agent_kind",
+        staticmethod(lambda _cfg, _identifier, _agent_kind: None),
+    )
+
+    class _Workspace:
+        def path_for(self, identifier):
+            return tmp_path / "ws" / identifier
+
+    async def _parked_worker(_issue, _attempt, _cfg):
+        await asyncio.Event().wait()
+
+    async def _run() -> None:
+        restarted = _orch()
+        restarted._loop = asyncio.get_running_loop()
+        restarted._workspace_manager = _Workspace()  # type: ignore[assignment]
+        restarted._ensure_run_registry(cfg)
+        monkeypatch.setattr(restarted, "_run_agent_attempt", _parked_worker)
+
+        restarted._dispatch(issue, cfg, attempt=None)
+        entry = restarted._running[issue.id]
+        task = entry.worker_task
+        assert task is not None
+        try:
+            assert entry.run_id != source_run_id
+            assert entry.attempt_kind == "recovery"
+            assert entry.continued_from_run_id == source_run_id
+            assert entry.continuation_checkpoint is not None
+            assert entry.continuation_checkpoint.resume_session_id == "codex-thread-1"
+            assert entry.continuation_checkpoint.turn == 3
+            assert restarted._issue_debug[issue.id].completed_turn_count == 3
+        finally:
+            task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await task
+
+    asyncio.run(_run())
+
+
+def test_service_stop_finalizes_active_run_as_shutdown_interrupted(
+    tmp_path, monkeypatch
+):
+    cfg = _make_config(
+        workflow_path=tmp_path / "WORKFLOW.md",
+        workspace_root=tmp_path / "ws",
+        active_states=("Todo",),
+    )
+    issue = _issue("MT-STOP-CONTINUE", state="Todo")
+    state_db = tmp_path / ".symphony" / "state.db"
+    interrupted_turn_started = asyncio.Event()
+
+    class _Backend:
+        def __init__(self, on_event):
+            self._on_event = on_event
+            self._turns = 0
+
+        async def start(self):
+            return None
+
+        async def initialize(self):
+            return None
+
+        async def resume_session(self, session_id):
+            return False
+
+        async def start_session(self, *, initial_prompt, issue_title):
+            await self._on_event(
+                {
+                    "event": EVENT_SESSION_STARTED,
+                    "timestamp": "2026-10-01T00:00:00Z",
+                    "payload": {"session_id": "managed-stop-session"},
+                }
+            )
+            return "managed-stop-session"
+
+        async def run_turn(self, *, prompt, is_continuation):
+            self._turns += 1
+            if self._turns == 1:
+                await self._on_event(
+                    {
+                        "event": EVENT_TURN_COMPLETED,
+                        "timestamp": "2026-10-01T00:00:01Z",
+                        "payload": {"turn_id": "managed-turn-1"},
+                    }
+                )
+                return None
+            interrupted_turn_started.set()
+            await asyncio.Event().wait()
+
+        async def stop(self):
+            return None
+
+    class _Workspace:
+        def __init__(self, path):
+            self.path = path
+
+    class _StubWS:
+        def path_for(self, identifier):
+            return tmp_path / "ws" / identifier
+
+        async def create_or_reuse(self, identifier):
+            return _Workspace(self.path_for(identifier))
+
+        async def before_run(self, path):
+            return None
+
+        async def after_run_best_effort(self, path):
+            return None
+
+    monkeypatch.setattr(
+        Orchestrator,
+        "_tracker_call_record_agent_kind",
+        staticmethod(lambda _cfg, _identifier, _agent_kind: None),
+    )
+    monkeypatch.setattr(
+        core_module, "build_backend", lambda init: _Backend(init.on_event)
+    )
+
+    async def _run() -> str:
+        orch = _orch()
+        orch._loop = asyncio.get_running_loop()
+        orch._workspace_manager = _StubWS()  # type: ignore[assignment]
+        orch._run_registry = RunRegistry(state_db)
+        _stub_workflow_state_returning(orch, cfg, monkeypatch)
+        monkeypatch.setattr(
+            orch, "_tracker_call_states_by_ids", lambda _cfg, _ids: [issue]
+        )
+
+        orch._dispatch(issue, cfg, attempt=None)
+        run_id = orch._running[issue.id].run_id
+        await asyncio.wait_for(interrupted_turn_started.wait(), timeout=1)
+        await orch.stop()
+        return run_id
+
+    run_id = asyncio.run(_run())
+    reopened = RunRegistry(state_db)
+    try:
+        saved = reopened.get_run(run_id)
+        assert saved.status == "shutdown_interrupted"
+        assert saved.failure_class == "shutdown_interrupted"
+        assert saved.backend_agent_pid is None
+        assert saved.checkpoint_state == issue.state
+        assert saved.checkpoint_turn == 1
+        assert reopened.latest_continuation_source(
+            issue_id=issue.id, agent_kind="codex", state=issue.state
+        ) == run_id
+        flags = reopened.get_issue_flags(issue.id)
+        assert flags is None or flags.paused is False
+    finally:
+        reopened.close()
+
+
 @pytest.mark.parametrize("invalid_pid", [0, -1])
 def test_startup_reclaim_skips_invalid_recorded_orphan_agent_pid(
     tmp_path, monkeypatch, invalid_pid
@@ -1638,7 +1986,8 @@ def test_startup_reclaim_skips_invalid_recorded_orphan_agent_pid(
 
     assert killed == []
     assert restarted._run_registry is not None
-    assert restarted._run_registry.get_run(run_id).status == "orphaned"
+    assert restarted._run_registry.get_run(run_id).status == "reclaiming"
+    assert restarted._run_registry.has_active_lease(issue.id)
 
 
 @pytest.mark.skipif(sys.platform == "win32", reason="process groups are POSIX-only")
@@ -3079,11 +3428,46 @@ def test_running_snapshot_carries_live_telemetry_for_supported_agent_kinds():
         row = asyncio.run(_run())
 
         assert row["agent_kind"] == agent_kind
-        assert row["session_id"] == f"{agent_kind}-session"
+        assert "session_id" not in row
+        assert entry.resume_session_id == f"{agent_kind}-session"
+        assert "resume_session_id" not in row
         assert "attention" in row
         assert row["tokens"]["input_tokens"] == 100 + index
         assert row["tokens"]["output_tokens"] == 10 + index
         assert row["tokens"]["total_tokens"] == 110 + (2 * index)
+
+
+def test_turn_completion_keeps_exact_resume_id_separate_from_display_id():
+    orch = _orch()
+    issue = _issue("SESSION-BOUNDARY", state="In Progress")
+    entry = _install_running_entry(orch, issue)
+    entry.turn_count = 1
+
+    async def _run() -> None:
+        await orch._on_codex_event(
+            issue.id,
+            {
+                "event": EVENT_SESSION_STARTED,
+                "payload": {"thread_id": "exact-thread"},
+            },
+        )
+        await orch._on_codex_event(
+            issue.id,
+            {
+                "event": EVENT_TURN_COMPLETED,
+                "payload": {"turn_id": "display-turn"},
+            },
+        )
+
+    asyncio.run(_run())
+
+    assert entry.thread_id == "exact-thread"
+    assert entry.session_id == "exact-thread-display-turn"
+    assert entry.resume_session_id == "exact-thread"
+    assert entry.last_completed_turn_event == 1
+    row = orch.snapshot()["running"][0]
+    assert "session_id" not in row
+    assert "resume_session_id" not in row
 
 
 def _stub_workflow_state_returning(
@@ -6757,6 +7141,207 @@ def test_turn_budget_exhaustion_survives_next_tick_claim_prune(monkeypatch):
         assert issue.id not in orch._claimed
 
     asyncio.run(_run())
+
+
+@pytest.mark.parametrize("resume_result", [True, False])
+def test_recovered_worker_resumes_or_starts_fresh_before_first_turn(
+    monkeypatch, tmp_path, resume_result
+):
+    issue = _issue("MT-RESUME", state="In Progress")
+    cfg = _make_config(
+        max_concurrent=1,
+        active_states=("In Progress",),
+        terminal_states=("Done", "Blocked"),
+    )
+    cfg = replace(
+        cfg,
+        agent=replace(
+            cfg.agent,
+            max_turns=1,
+            max_total_turns=3,
+            auto_commit_on_done=False,
+        ),
+    )
+    calls: list[object] = []
+
+    class _Backend:
+        async def start(self):
+            calls.append("start")
+
+        async def initialize(self):
+            calls.append("initialize")
+
+        async def resume_session(self, session_id):
+            calls.append(("resume", session_id))
+            return resume_result
+
+        async def start_session(self, *, initial_prompt, issue_title):
+            calls.append(("fresh", issue_title))
+            return "unexpected"
+
+        async def run_turn(self, *, prompt, is_continuation):
+            calls.append(("turn", is_continuation, prompt))
+            return None
+
+        async def stop(self):
+            calls.append("stop")
+
+    class _Workspace:
+        path = tmp_path
+
+    class _StubWS:
+        async def create_or_reuse(self, identifier):
+            return _Workspace()
+
+        async def before_run(self, path):
+            return None
+
+        async def after_run_best_effort(self, path):
+            return None
+
+    async def _run() -> None:
+        orch = _orch()
+        orch._loop = asyncio.get_running_loop()
+        entry = _install_running_entry(orch, issue)
+        entry.continued_from_run_id = "source-run"
+        entry.continuation_checkpoint = ContinuationCheckpoint(
+            resume_session_id="exact-session",
+            state=issue.state,
+            turn=2,
+            checkpointed_at=datetime.now(timezone.utc),
+        )
+        orch._issue_debug[issue.id] = _IssueDebug(completed_turn_count=2)
+        _stub_workflow_state_returning(orch, cfg, monkeypatch)
+        orch._workspace_manager = _StubWS()  # type: ignore[assignment]
+        monkeypatch.setattr(core_module, "build_backend", lambda _init: _Backend())
+        monkeypatch.setattr(
+            orch, "_tracker_call_states_by_ids", lambda _cfg, _ids: [issue]
+        )
+
+        await orch._run_agent_attempt(issue, attempt=None, cfg=cfg)
+
+    asyncio.run(_run())
+
+    assert calls[:3] == ["start", "initialize", ("resume", "exact-session")]
+    fresh_calls = [
+        call for call in calls if isinstance(call, tuple) and call[0] == "fresh"
+    ]
+    turn = next(call for call in calls if isinstance(call, tuple) and call[0] == "turn")
+    if resume_result:
+        assert fresh_calls == []
+        assert turn[1] is True
+        assert "3" in turn[2]
+    else:
+        assert len(fresh_calls) == 1
+        assert turn[1] is False
+        assert turn[2].endswith("hi")
+
+
+@pytest.mark.parametrize("reports_completion", [True, False])
+def test_turn_checkpoints_require_completion_event_and_workspace_hook(
+    monkeypatch, tmp_path, reports_completion
+):
+    issue = _issue("MT-CHECKPOINT", state="In Progress")
+    cfg = _make_config(
+        workflow_path=tmp_path / "WORKFLOW.md",
+        workspace_root=tmp_path / "ws",
+        active_states=("In Progress",),
+        terminal_states=("Done", "Blocked"),
+    )
+    cfg = replace(
+        cfg,
+        agent=replace(
+            cfg.agent,
+            max_turns=1,
+            max_total_turns=10,
+            auto_commit_on_done=False,
+        ),
+    )
+    order: list[str] = []
+
+    class _Backend:
+        async def start(self):
+            return None
+
+        async def initialize(self):
+            return None
+
+        async def resume_session(self, session_id):
+            return False
+
+        async def start_session(self, *, initial_prompt, issue_title):
+            entry.resume_session_id = "fresh-session"
+            return "fresh-session"
+
+        async def run_turn(self, *, prompt, is_continuation):
+            order.append("turn")
+            if reports_completion:
+                entry.last_completed_turn_event = entry.turn_count
+            return None
+
+        async def stop(self):
+            return None
+
+    class _Workspace:
+        path = tmp_path / "ws" / issue.identifier
+
+    class _StubWS:
+        async def create_or_reuse(self, identifier):
+            return _Workspace()
+
+        async def before_run(self, path):
+            return None
+
+        async def after_run_best_effort(self, path):
+            order.append("hook")
+
+    registry = RunRegistry(tmp_path / ".symphony" / "state.db")
+    run_id = registry.acquire_run(
+        issue,
+        workspace_path=_Workspace.path,
+        attempt=None,
+        attempt_kind="initial",
+        agent_kind="codex",
+    )
+    assert run_id
+    original_checkpoint = registry.checkpoint_completed_turn
+
+    def _checkpoint(**kwargs):
+        order.append("checkpoint")
+        assert order[-2] == "hook"
+        return original_checkpoint(**kwargs)
+
+    monkeypatch.setattr(registry, "checkpoint_completed_turn", _checkpoint)
+
+    async def _run() -> None:
+        nonlocal entry
+        orch = _orch()
+        orch._loop = asyncio.get_running_loop()
+        orch._run_registry = registry
+        entry = _install_running_entry(orch, issue)
+        entry.run_id = run_id
+        entry.agent_kind = "codex"
+        _stub_workflow_state_returning(orch, cfg, monkeypatch)
+        orch._workspace_manager = _StubWS()  # type: ignore[assignment]
+        monkeypatch.setattr(core_module, "build_backend", lambda _init: _Backend())
+        monkeypatch.setattr(
+            orch, "_tracker_call_states_by_ids", lambda _cfg, _ids: [issue]
+        )
+
+        await orch._run_agent_attempt(issue, attempt=None, cfg=cfg)
+
+    entry: RunningEntry
+    asyncio.run(_run())
+
+    saved = registry.get_run(run_id)
+    if reports_completion:
+        assert order[:3] == ["turn", "hook", "checkpoint"]
+        assert saved.checkpoint_state == issue.state
+        assert saved.checkpoint_turn == 1
+    else:
+        assert order == ["turn", "hook"]
+        assert saved.checkpoint_state is None
+        assert saved.checkpoint_turn is None
 
 
 def test_worker_loop_stops_before_starting_past_total_turn_budget(monkeypatch, tmp_path):

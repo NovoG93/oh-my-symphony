@@ -83,3 +83,11 @@ A bounded, redacted lifecycle fact attached to one Run attempt. Attempt events d
 ## Diagnostic bundle
 
 A downloadable JSON projection of one Run attempt and its retained Attempt events. It is size-bounded and redacted before persistence. A Diagnostic bundle is operational evidence for debugging, not a secret store, complete audit log, or replay protocol.
+
+## Continuation checkpoint
+
+A private, host-owned recovery fact recorded only after a worker turn completes. It identifies the completed boundary, workflow state, and resumable agent conversation needed to continue safely. A turn that was merely started or interrupted never becomes a Continuation checkpoint.
+
+## Durable continuation
+
+A new Run attempt that succeeds an interrupted Run attempt from its latest eligible Continuation checkpoint. Symphony first confirms that the predecessor no longer owns a live worker, then gives exactly one successor the checkpoint. Durable continuation preserves completed progress but does not promise exactly-once execution of an interrupted turn.

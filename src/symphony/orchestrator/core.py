@@ -33,7 +33,7 @@ from pathlib import Path, PurePosixPath
 from typing import Any, Awaitable, Callable, Coroutine, cast
 
 from .. import __version__
-from .._shell import kill_process_group
+from .._shell import kill_process_group, process_group_exists, process_identity
 from ..backends import (
     EVENT_AGENT_RETRY,
     EVENT_APPROVAL_DENIED,
@@ -44,6 +44,7 @@ from ..backends import (
     EVENT_TURN_COMPLETED,
     AgentBackend,
     BackendInit,
+    redact_session_id,
 )
 from ..backends import build_backend
 from ..chat import cfg_for_mode
@@ -153,6 +154,7 @@ from .helpers import (
 )
 from .parsing import _parse_findings_rows, _parse_touched_files
 from .run_registry import (
+    ContinuationCheckpoint,
     ReleaseEvidenceIdentity,
     ReleaseGate,
     RunRecord,
@@ -216,6 +218,15 @@ class _EligibilityDisposition(str, Enum):
 class _EligibilityDecision:
     disposition: _EligibilityDisposition
     reason: str
+
+
+@dataclass(frozen=True)
+class _RunLeaseAcquisition:
+    """One new lease and an optional predecessor checkpoint."""
+
+    run_id: str
+    continued_from_run_id: str = ""
+    checkpoint: ContinuationCheckpoint | None = None
 
 
 @dataclass(frozen=True)
@@ -374,6 +385,21 @@ def _run_record_payload(record: RunRecord) -> dict[str, Any]:
         "workspace_path": str(record.workspace_path) if record.workspace_path else None,
         "branch_name": record.branch_name or f"{SYMPHONY_BRANCH_PREFIX}{record.identifier}",
         "commit_sha": record.commit_sha,
+        "continued_from_run_id": record.continued_from_run_id,
+        "checkpoint": (
+            {
+                "state": record.checkpoint_state,
+                "turn": record.checkpoint_turn,
+                "checkpointed_at": (
+                    record.checkpointed_at.isoformat()
+                    if record.checkpointed_at is not None
+                    else None
+                ),
+            }
+            if record.checkpoint_state is not None
+            and record.checkpoint_turn is not None
+            else None
+        ),
         "tokens": {
             "input": record.input_tokens,
             "cache": record.cache_input_tokens,
@@ -790,6 +816,7 @@ class Orchestrator:
         # tolerant inside StatsStore, so hooks never guard beyond None.
         self._stats: StatsStore | None = None
         self._run_registry: RunRegistry | None = None
+        self._run_registry_initialized = False
         # R1/A1 — supervision + health counters. One bad tick must degrade
         # the tick, never kill the loop; these counters make the difference
         # between "idle and healthy" and "silently dead" observable.
@@ -994,6 +1021,7 @@ class Orchestrator:
         return result
 
     def _ensure_run_registry(self, cfg: ServiceConfig) -> None:
+        self._run_registry_initialized = True
         path = registry_path_for_workflow(cfg.workflow_path)
         if self._run_registry is not None and self._run_registry.path == path:
             return
@@ -1008,27 +1036,33 @@ class Orchestrator:
             log.error("run_registry_open_failed", path=str(path), error=str(exc))
             return
         registry = self._run_registry
-        reclaimed = self._registry_guard(
-            "reclaim_dead_owner", registry.reclaim_dead_owner_leases, []
-        )
-        if reclaimed:
-            finalized = [
-                record
-                for record in reclaimed
-                if self._reap_and_finalize_reclaimed_run(registry, record)
-            ]
-            log.info(
-                "run_leases_reclaimed_dead_owner",
-                count=len(finalized),
-                pending_count=len(reclaimed) - len(finalized),
-                identifiers=[r.identifier for r in finalized],
-                path=str(path),
-            )
+        self._reclaim_dead_owner_runs(registry, path=path)
         expired = self._registry_guard("expire_stale", registry.expire_stale, 0)
         if expired:
             log.info("run_leases_expired_on_start", count=expired, path=str(path))
         flags = self._registry_guard("list_issue_flags", registry.list_issue_flags, [])
         self._rehydrate_issue_flags(flags, cfg=cfg, registry=registry)
+
+    def _reclaim_dead_owner_runs(
+        self, registry: RunRegistry, *, path: Path | None = None
+    ) -> None:
+        reclaimed = self._registry_guard(
+            "reclaim_dead_owner", registry.reclaim_dead_owner_leases, []
+        )
+        if not reclaimed:
+            return
+        finalized = [
+            record
+            for record in reclaimed
+            if self._reap_and_finalize_reclaimed_run(registry, record)
+        ]
+        log.info(
+            "run_leases_reclaimed_dead_owner",
+            count=len(finalized),
+            pending_count=len(reclaimed) - len(finalized),
+            identifiers=[record.identifier for record in finalized],
+            path=str(path or registry.path),
+        )
 
     def _release_registry_required(self, cfg: ServiceConfig) -> RunRegistry:
         """Return the release authority store or fail closed.
@@ -1901,7 +1935,7 @@ class Orchestrator:
     def _reap_and_finalize_reclaimed_run(
         self, registry: RunRegistry, record: RunRecord
     ) -> bool:
-        """Kill outside SQLite, then release the persisted reclaim fence."""
+        """Verify process incarnation, reap it, then release the SQLite fence."""
         pid = record.backend_agent_pid
         if pid is not None and pid <= 0:
             log.warning(
@@ -1910,24 +1944,80 @@ class Orchestrator:
                 identifier=record.identifier,
                 pid=pid,
             )
-        elif pid is not None:
-            try:
-                killed = kill_process_group(pid)
-            except Exception as exc:
+            return False
+        if pid is not None:
+            expected_identity = record.backend_process_identity
+            current_identity = process_identity(pid)
+            group_exists = process_group_exists(pid)
+            if current_identity is None:
+                if group_exists is not False:
+                    log.warning(
+                        "reclaim_backend_identity_ambiguous",
+                        issue_id=record.issue_id,
+                        identifier=record.identifier,
+                        pid=pid,
+                    )
+                    return False
+                outcome = "not_found"
+            elif expected_identity is None:
+                # Pre-v8 or failed identity capture: never signal a reusable
+                # numeric pid without proving it is the recorded incarnation.
                 log.warning(
-                    "reclaim_killed_orphan_agent",
+                    "reclaim_backend_identity_missing",
                     issue_id=record.issue_id,
                     identifier=record.identifier,
                     pid=pid,
-                    outcome=f"error: {exc}",
                 )
                 return False
+            elif current_identity != expected_identity:
+                # The recorded process incarnation is gone and this pid was
+                # reused. Do not signal the unrelated replacement.
+                outcome = "identity_mismatch"
+            else:
+                try:
+                    killed = kill_process_group(pid)
+                except Exception as exc:
+                    log.warning(
+                        "reclaim_killed_orphan_agent",
+                        issue_id=record.issue_id,
+                        identifier=record.identifier,
+                        pid=pid,
+                        outcome=f"error: {type(exc).__name__}",
+                    )
+                    return False
+                if killed:
+                    deadline = time.monotonic() + 1.0
+                    confirmed_gone = process_group_exists(pid) is False
+                    while not confirmed_gone and time.monotonic() < deadline:
+                        time.sleep(0.05)
+                        confirmed_gone = process_group_exists(pid) is False
+                    if not confirmed_gone:
+                        log.warning(
+                            "reclaim_killed_orphan_agent",
+                            issue_id=record.issue_id,
+                            identifier=record.identifier,
+                            pid=pid,
+                            outcome="unconfirmed",
+                        )
+                        return False
+                    outcome = "killed"
+                elif process_group_exists(pid) is False:
+                    outcome = "not_found"
+                else:
+                    log.warning(
+                        "reclaim_killed_orphan_agent",
+                        issue_id=record.issue_id,
+                        identifier=record.identifier,
+                        pid=pid,
+                        outcome="ambiguous",
+                    )
+                    return False
             log.warning(
                 "reclaim_killed_orphan_agent",
                 issue_id=record.issue_id,
                 identifier=record.identifier,
                 pid=pid,
-                outcome="killed" if killed else "not_found",
+                outcome=outcome,
             )
         return bool(
             self._registry_guard(
@@ -1936,6 +2026,7 @@ class Orchestrator:
                 False,
             )
         )
+
 
     def recent_runs(
         self,
@@ -2229,13 +2320,20 @@ class Orchestrator:
             or entry.known_release_cycle_verifier
             or entry.known_app_release_finalizer
         )
+        current_cfg = self._workflow_state.current()
+        continuation_authority_required = bool(
+            current_cfg is not None and current_cfg.agent.crash_continuation
+        )
         if registry is None or not entry.run_id:
-            if release_required:
+            if release_required or (
+                continuation_authority_required and self._run_registry_initialized
+            ):
                 entry.lease_lost = True
                 log.error(
-                    "release_run_lease_unavailable",
+                    "run_lease_authority_unavailable",
                     issue_id=issue_id,
                     issue_identifier=entry.issue.identifier,
+                    release_required=release_required,
                 )
                 return False
             return True
@@ -2253,6 +2351,26 @@ class Orchestrator:
                 entry.lease_lost = True
                 log.error(
                     "release_registry_error",
+                    op="heartbeat",
+                    issue_id=issue_id,
+                    error=str(exc),
+                )
+                return False
+            self._last_registry_error = None
+        elif continuation_authority_required:
+            try:
+                ok = registry.heartbeat(
+                    issue_id=issue_id,
+                    run_id=entry.run_id,
+                    progress_at=progress,
+                    backend_agent_pid=backend_agent_pid or entry.agent_pgid,
+                )
+            except Exception as exc:
+                self._registry_error_count += 1
+                self._last_registry_error = f"continuation_heartbeat: {exc}"
+                entry.lease_lost = True
+                log.error(
+                    "continuation_registry_error",
                     op="heartbeat",
                     issue_id=issue_id,
                     error=str(exc),
@@ -2381,6 +2499,18 @@ class Orchestrator:
         registry = self._run_registry
         if registry is None or not entry.run_id:
             return
+        if entry.backend_cleanup_unconfirmed:
+            # Preserve the active owner/backend fence. The next service
+            # instance must reclaim, kill/not-found the recorded process
+            # group, and only then finalize the predecessor.
+            log.warning(
+                "run_lease_finish_deferred_for_backend_reap",
+                issue_id=issue_id,
+                issue_identifier=entry.issue.identifier,
+                status=status,
+                backend_agent_pid=entry.agent_pgid,
+            )
+            return
         self._registry_guard(
             "complete_run",
             lambda: registry.complete_run(
@@ -2408,7 +2538,7 @@ class Orchestrator:
         attempt_kind: str,
         agent_kind: str,
         release_required: bool = False,
-    ) -> str | None:
+    ) -> _RunLeaseAcquisition | None:
         if release_required:
             try:
                 run_id = self._release_registry_call(
@@ -2425,7 +2555,7 @@ class Orchestrator:
             except SymphonyError:
                 return None
             if run_id:
-                return cast(str, run_id)
+                return _RunLeaseAcquisition(run_id=cast(str, run_id))
             log.info(
                 "dispatch_lease_held",
                 issue_id=issue.id,
@@ -2434,7 +2564,51 @@ class Orchestrator:
             return None
         registry = self._run_registry
         if registry is None:
-            return ""
+            if cfg.agent.crash_continuation and self._run_registry_initialized:
+                return None
+            return _RunLeaseAcquisition(run_id="")
+
+        if cfg.agent.crash_continuation:
+            try:
+                source_run_id = registry.latest_continuation_source(
+                    issue_id=issue.id,
+                    agent_kind=agent_kind,
+                    state=issue.state,
+                    issue_updated_at=issue.updated_at,
+                )
+                if source_run_id is not None:
+                    recovered = registry.acquire_continuation_run(
+                        issue,
+                        continued_from_run_id=source_run_id,
+                        workspace_path=workspace_path,
+                        attempt=attempt,
+                        attempt_kind="recovery",
+                        agent_kind=agent_kind,
+                    )
+                    if recovered is None:
+                        # Discovery raced or the source became ineligible. Do
+                        # not degrade an authoritative continuation decision
+                        # into a second fresh writer on this tick.
+                        return None
+                    self._last_registry_error = None
+                    return _RunLeaseAcquisition(
+                        run_id=recovered.run_id,
+                        continued_from_run_id=recovered.continued_from_run_id,
+                        checkpoint=recovered.checkpoint,
+                    )
+            except Exception as exc:
+                # Session continuation is authority, not telemetry. A broken
+                # read/claim fails closed even though ordinary lease
+                # bookkeeping retains its historical fail-open behavior.
+                self._registry_error_count += 1
+                self._last_registry_error = f"acquire_continuation: {exc}"
+                log.error(
+                    "run_registry_error",
+                    op="acquire_continuation",
+                    error=str(exc),
+                )
+                return None
+
         run_id = self._registry_guard(
             "acquire_run",
             lambda: registry.acquire_run(
@@ -2447,11 +2621,13 @@ class Orchestrator:
             "",
         )
         if run_id == "":
-            # Registry error: dispatch proceeds leaseless (same as
-            # registry-disabled) and health reports degraded.
-            return ""
+            if cfg.agent.crash_continuation:
+                # Recovery authority cannot degrade into a leaseless writer.
+                return None
+            # Explicit opt-out preserves the historical fail-open lease path.
+            return _RunLeaseAcquisition(run_id="")
         if run_id:
-            return run_id
+            return _RunLeaseAcquisition(run_id=run_id)
         log.info(
             "dispatch_lease_held",
             issue_id=issue.id,
@@ -2915,7 +3091,6 @@ class Orchestrator:
             "issue_identifier": entry.issue.identifier,
             "state": entry.issue.state,
             "agent_kind": self._entry_agent_kind(entry),
-            "session_id": entry.session_id,
             "turn_count": total_turn_count,
             "total_turn_count": total_turn_count,
             "attempt_turn_count": entry.turn_count,
@@ -3422,6 +3597,7 @@ class Orchestrator:
         self._heartbeat_running_leases()
         if self._run_registry is not None:
             registry = self._run_registry
+            self._reclaim_dead_owner_runs(registry)
             expired = self._registry_guard("expire_stale", registry.expire_stale, 0)
             if expired:
                 log.info("run_leases_expired", count=expired)
@@ -5387,7 +5563,7 @@ class Orchestrator:
             "retry" if attempt is not None else "initial"
         )
         agent_kind = cfg.agent.kind_for_state(issue.state, _requested_agent_kind(issue))
-        run_id = self._try_acquire_run_lease(
+        acquisition = self._try_acquire_run_lease(
             cfg=cfg,
             issue=issue,
             workspace_path=workspace_path,
@@ -5400,8 +5576,11 @@ class Orchestrator:
                 or release_authority.finalizer
             ),
         )
-        if run_id is None:
+        if acquisition is None:
             return
+        run_id = acquisition.run_id
+        if acquisition.checkpoint is not None:
+            resolved_attempt_kind = "recovery"
         if release_authority.gate is not None:
             try:
                 gate = release_authority.gate
@@ -5525,6 +5704,8 @@ class Orchestrator:
             attempt_kind=resolved_attempt_kind,
             agent_kind=agent_kind,
             run_id=run_id,
+            continued_from_run_id=acquisition.continued_from_run_id,
+            continuation_checkpoint=acquisition.checkpoint,
             known_app_release=release_authority.app_release,
             known_release_cycle_verifier=release_authority.cycle_verifier,
             known_app_release_finalizer=release_authority.finalizer,
@@ -5582,7 +5763,12 @@ class Orchestrator:
         )
         self._append_run_event(entry, "run_started", {"state": issue.state})
         debug = self._issue_debug.setdefault(issue.id, _IssueDebug())
-        if attempt is not None:
+        if acquisition.checkpoint is not None:
+            debug.completed_turn_count = max(
+                debug.completed_turn_count, acquisition.checkpoint.turn
+            )
+            debug.restart_count += 1
+        elif attempt is not None:
             debug.restart_count += 1
         debug.current_attempt_kind = entry.attempt_kind
         log.info(
@@ -5669,7 +5855,10 @@ class Orchestrator:
                 exit_started_at=entry.exit_started_at.isoformat(),
             )
             return
-        if cancelled_before_start:
+        if cancelled_before_start and self._stopping:
+            reason = "shutdown_interrupted"
+            error = None
+        elif cancelled_before_start:
             reason = "worker_task_cancelled_before_start"
             error = "asyncio task was cancelled before worker cleanup ran"
         else:
@@ -5830,6 +6019,9 @@ class Orchestrator:
                     on_event=lambda ev, issue_id=running_issue_id: self._on_codex_event(
                         issue_id, ev
                     ),
+                    on_process_started=lambda pid, issue_id=running_issue_id: (
+                        self._sync_backend_agent_pid(issue_id, pid)
+                    ),
                     client_tools=tools,
                 )
             )
@@ -5880,10 +6072,47 @@ class Orchestrator:
                     full_ticket_path=self._ticket_prompt_path(cfg, issue),
                     extra_context=skill_context,
                 )
-                await client.start_session(
-                    initial_prompt=first_prompt,
-                    issue_title=f"{issue.identifier}: {issue.title}",
-                )
+                resumed_checkpoint = False
+                checkpoint = running.continuation_checkpoint
+                if checkpoint is not None:
+                    try:
+                        resumed_checkpoint = await client.resume_session(
+                            checkpoint.resume_session_id
+                        )
+                    except Exception as exc:
+                        log.error(
+                            "session_continuation_resume_error",
+                            issue_id=running_issue_id,
+                            issue_identifier=issue.identifier,
+                            agent_kind=cfg.agent.kind,
+                            error_type=type(exc).__name__,
+                        )
+                        raise SymphonyError(
+                            "exact session continuation failed before turn start"
+                        ) from None
+                    running.recovery_session_resumed = resumed_checkpoint
+                    if resumed_checkpoint:
+                        running.resume_session_id = checkpoint.resume_session_id
+                        self._append_run_event(running, "session_started", {})
+                        log.info(
+                            "session_continuation_resumed",
+                            issue_id=running_issue_id,
+                            issue_identifier=issue.identifier,
+                            checkpoint_turn=checkpoint.turn,
+                        )
+                    else:
+                        log.info(
+                            "session_continuation_fresh_fallback",
+                            issue_id=running_issue_id,
+                            issue_identifier=issue.identifier,
+                            checkpoint_turn=checkpoint.turn,
+                            agent_kind=cfg.agent.kind,
+                        )
+                if not resumed_checkpoint:
+                    await client.start_session(
+                        initial_prompt=first_prompt,
+                        issue_title=f"{issue.identifier}: {issue.title}",
+                    )
 
                 # Track which kanban state the backend is currently
                 # operating on. When the issue moves to a new state mid-run
@@ -6163,6 +6392,8 @@ class Orchestrator:
                                 running_entry.thread_id = None
                                 running_entry.session_id = None
                                 running_entry.turn_id = None
+                                running_entry.resume_session_id = None
+                                running_entry.last_completed_turn_event = 0
                                 # New backend session reports absolute token
                                 # totals from 0; the high-water marks below
                                 # MUST reset or `_apply_token_totals` computes
@@ -6234,7 +6465,10 @@ class Orchestrator:
                         )
                         break
 
-                    is_continuation = turn_number > 1 and not is_phase_transition
+                    is_continuation = (
+                        (running.recovery_session_resumed and turn_number == 1)
+                        or (turn_number > 1 and not is_phase_transition)
+                    )
                     if is_continuation:
                         debug = self._issue_debug.setdefault(
                             running_issue_id, _IssueDebug()
@@ -6327,7 +6561,9 @@ class Orchestrator:
                         TurnInputRequired,
                     ) as exc:
                         outcome = "turn_error"
-                        error = str(exc)
+                        error = str(
+                            redact_session_id(str(exc), running.resume_session_id)
+                        )
                         return
                     finally:
                         self._sync_backend_agent_pid(
@@ -6372,6 +6608,36 @@ class Orchestrator:
                                 "workspace_updated",
                                 {"turn": turn_number, "commit_sha": commit_sha},
                             )
+
+                    running_entry = self._running.get(running_issue_id)
+                    registry = self._run_registry
+                    if (
+                        cfg.agent.crash_continuation
+                        and registry is not None
+                        and running_entry is not None
+                        and running_entry.run_id
+                        and running_entry.resume_session_id
+                        and running_entry.last_completed_turn_event == turn_number
+                        and not running_entry.known_app_release
+                        and not running_entry.known_release_cycle_verifier
+                        and not running_entry.known_app_release_finalizer
+                    ):
+                        checkpoint_turn = debug.completed_turn_count + turn_number
+                        checkpoint_registry = cast(RunRegistry, registry)
+                        checkpoint_run_id = running_entry.run_id
+                        checkpoint_session_id = running_entry.resume_session_id
+                        checkpoint_state = running_entry.issue.state
+                        self._registry_guard(
+                            "checkpoint_completed_turn",
+                            lambda: checkpoint_registry.checkpoint_completed_turn(
+                                issue_id=running_issue_id,
+                                run_id=checkpoint_run_id,
+                                resume_session_id=checkpoint_session_id,
+                                state=checkpoint_state,
+                                turn=checkpoint_turn,
+                            ),
+                            False,
+                        )
 
                     # Record the state the backend just operated on so the
                     # next iteration can detect a phase transition against
@@ -6562,6 +6828,9 @@ class Orchestrator:
                 try:
                     await client.stop()
                 except Exception as stop_exc:
+                    running = self._running.get(running_issue_id)
+                    if running is not None:
+                        running.backend_cleanup_unconfirmed = True
                     log.warning(
                         "worker_final_stop_failed",
                         issue_id=issue.id,
@@ -6581,18 +6850,28 @@ class Orchestrator:
                         self._sync_backend_agent_pid(running_issue_id, None)
                 if after_run_pending:
                     await self._workspace_manager.after_run_best_effort(workspace.path)
+        except asyncio.CancelledError:
+            outcome = "shutdown_interrupted" if self._stopping else "cancelled"
+            error = None
+            raise
         except SymphonyError as exc:
             outcome = "error"
-            error = str(exc)
+            running = self._running.get(running_issue_id)
+            private_session_id = running.resume_session_id if running is not None else None
+            error = str(redact_session_id(str(exc), private_session_id))
         except Exception as exc:
             outcome = "error"
-            error = str(exc)
+            running = self._running.get(running_issue_id)
+            private_session_id = running.resume_session_id if running is not None else None
+            error = str(redact_session_id(str(exc), private_session_id))
             log.error(
                 "worker_unhandled_error",
                 issue_id=running_issue_id,
-                error=str(exc),
+                error=error,
                 exc_type=type(exc).__name__,
-                traceback=traceback.format_exc(),
+                traceback=str(
+                    redact_session_id(traceback.format_exc(), private_session_id)
+                ),
             )
         finally:
             # Diagnostic marker — pairs with `worker_task_done_without_cleanup`
@@ -6685,6 +6964,9 @@ class Orchestrator:
                 workspace_root=cfg.workspace_root,
                 on_event=lambda ev, issue_id=running_issue_id: self._on_codex_event(
                     issue_id, ev
+                ),
+                on_process_started=lambda pid, issue_id=running_issue_id: (
+                    self._sync_backend_agent_pid(issue_id, pid)
                 ),
                 client_tools=tools,
             )
@@ -7616,6 +7898,10 @@ class Orchestrator:
         if entry is None:
             return
         ev_name = str(event.get("event") or "")
+        if ev_name != EVENT_SESSION_STARTED and entry.resume_session_id:
+            sanitized = redact_session_id(event, entry.resume_session_id)
+            if isinstance(sanitized, dict):
+                event = sanitized
         entry.last_codex_event = ev_name
         ts_text = event.get("timestamp")
         if isinstance(ts_text, str):
@@ -7768,14 +8054,17 @@ class Orchestrator:
             if sid:
                 entry.thread_id = str(sid)
                 entry.session_id = entry.thread_id
+                entry.resume_session_id = entry.thread_id
             log.info(
                 "agent_session_started",
                 issue_id=issue_id,
                 identifier=entry.issue.identifier,
-                session_id=entry.session_id,
             )
             self._append_run_event(entry, "session_started")
         if ev_name == EVENT_TURN_COMPLETED:
+            entry.last_completed_turn_event = max(
+                entry.last_completed_turn_event, entry.turn_count
+            )
             turn_id = payload.get("turnId") or payload.get("turn_id")
             if turn_id and entry.thread_id:
                 entry.turn_id = str(turn_id)
@@ -8608,6 +8897,16 @@ class Orchestrator:
                     else " — operator action required"
                 )
                 debug.last_error = f"max_turns reached ({attempt_cap}/attempt){suffix}"
+        elif reason == "shutdown_interrupted":
+            # A managed stop is a recovery boundary, not a worker failure.
+            # Do not persist pause/retry flags; the next service instance will
+            # atomically claim the latest completed-turn checkpoint.
+            debug.last_error = None
+            log.info(
+                "worker_shutdown_interrupted",
+                issue_id=issue_id,
+                issue_identifier=entry.issue.identifier,
+            )
         else:
             failure_reason = f"{reason}: {error}" if error else reason
             cleaned_failure = _clean_board_error_message(failure_reason)
@@ -9865,7 +10164,7 @@ class Orchestrator:
             path = self._workspace_manager.path_for(issue.identifier)
             if path.exists():
                 if release_evidence_only:
-                    cleanup_run_id = self._try_acquire_run_lease(
+                    cleanup_acquisition = self._try_acquire_run_lease(
                         cfg=cfg,
                         issue=issue,
                         workspace_path=path,
@@ -9876,13 +10175,13 @@ class Orchestrator:
                         ),
                         release_required=True,
                     )
-                    if cleanup_run_id is None:
+                    if cleanup_acquisition is None:
                         log.info(
                             "startup_release_cleanup_claim_refused",
                             identifier=issue.identifier,
                         )
                         continue
-                    claimed_run_id: str = cleanup_run_id
+                    claimed_run_id = cleanup_acquisition.run_id
                     try:
                         (
                             issue,

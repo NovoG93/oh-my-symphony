@@ -60,6 +60,36 @@ MALFORMED_LINE_LIMIT = 10
 # hang the turn forever on an untimed safe_proc_wait.
 POST_STREAM_REAP_TIMEOUT_S = 10.0
 
+# Session identifiers cross a persistence/process boundary during crash
+# recovery. Keep the accepted surface deliberately small and bounded before a
+# concrete backend forwards an exact id to a CLI or app-server.
+MAX_SESSION_ID_LENGTH = 512
+
+
+def _is_valid_session_id(session_id: object) -> bool:
+    """Return whether *session_id* is safe to forward to an agent backend."""
+    return (
+        isinstance(session_id, str)
+        and bool(session_id.strip())
+        and len(session_id) <= MAX_SESSION_ID_LENGTH
+        and all(char.isprintable() for char in session_id)
+    )
+
+
+def redact_session_id(value: Any, session_id: str | None) -> Any:
+    """Remove an exact private session handle from nested backend evidence."""
+    if not session_id:
+        return value
+    if isinstance(value, str):
+        return value.replace(session_id, "[REDACTED_SESSION]")
+    if isinstance(value, dict):
+        return {key: redact_session_id(item, session_id) for key, item in value.items()}
+    if isinstance(value, list):
+        return [redact_session_id(item, session_id) for item in value]
+    if isinstance(value, tuple):
+        return tuple(redact_session_id(item, session_id) for item in value)
+    return value
+
 
 EventCallback = Callable[[dict[str, Any]], Awaitable[None]]
 
@@ -91,6 +121,7 @@ class BackendInit:
     cwd: Path
     workspace_root: Path
     on_event: EventCallback
+    on_process_started: Callable[[int], None] | None = None
     client_tools: list[ToolDescriptor] = field(default_factory=list)
 
 
@@ -123,6 +154,8 @@ class AgentBackend(Protocol):
         self, *, initial_prompt: str, issue_title: str | None
     ) -> str: ...
 
+    async def resume_session(self, session_id: str) -> bool: ...
+
     async def run_turn(
         self, *, prompt: str, is_continuation: bool
     ) -> TurnResult: ...
@@ -154,6 +187,16 @@ class BaseAgentBackend:
     Backends still match the `AgentBackend` Protocol structurally — the
     base class is purely additive and does not constrain construction.
     """
+
+    async def resume_session(self, session_id: str) -> bool:
+        """Try to continue an exact prior session.
+
+        Unsupported backends fail closed. Concrete backends must validate ids
+        before forwarding them and return ``False`` when exact continuation
+        cannot be established so the caller can safely start a fresh session.
+        """
+        del session_id
+        return False
 
     def is_progress_event(self, event: dict[str, Any]) -> bool:
         """Return True when an event should reset the stall-progress timer.

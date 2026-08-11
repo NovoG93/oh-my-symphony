@@ -35,6 +35,7 @@ agent:
   kind: claude          # codex | claude | gemini | opencode | pi | prime-agent
   max_concurrent_agents: 1
   max_turns: 20
+  crash_continuation: true
 
 claude:
   command: claude -p --output-format stream-json --verbose
@@ -69,7 +70,7 @@ You are picking up ticket {{ issue.identifier }}: {{ issue.title }}.
 Set `agent.kind`:
 - **`codex`** — Codex `app-server`. Best for multi-turn JSON-RPC sessions; most mature backend. Long-running stdio JSON-RPC connection; one process for the whole run.
 - **`claude`** — Claude Code. Fresh subprocess per turn with `--resume <session-id>` from turn 2 onward. NDJSON event stream.
-- **`gemini`** — Gemini CLI. Fresh subprocess per turn with JSON output; turn 1 uses a Symphony-minted `--session-id <uuid>` and same-state continuation turns use `--resume <uuid>`. State transitions rebuild the backend and start a fresh Gemini session.
+- **`gemini`** — Gemini CLI. Fresh subprocess per turn. Current releases expose no exact session-resume flag, so Symphony treats each invocation as a one-shot turn and uses a local session UUID only for telemetry.
 - **`opencode`** — OpenCode CLI (`opencode run --format json --auto`). Fresh subprocess per turn; Symphony passes the prompt as the documented `message` argument and adds `--session <id>` on continuation turns after OpenCode reports a session id. Usage parsing is best-effort from JSON events.
 - **`pi`** — Pi coding-agent (`pi --mode json -p ""`). Per-turn subprocess with `--session <id>` resume from turn 2 onward; JSONL events. Multiplexes Anthropic / OpenAI / Gemini / Bedrock backends behind one CLI — useful when you want to swap LLM providers without changing Symphony config. Auth: sign in once with `pi` → `/login` (OAuth); credentials cached at `~/.pi/agent/auth.json` and inherited by every subprocess Symphony spawns. `symphony doctor` warns if the auth file is missing.
 - **`prime-agent`** — Prime Agent (`prime-agent -p --mode json`). Per-turn subprocess with `--resume <id>` continuity; same JSONL event protocol as Pi. Authenticate with `prime-agent` → `/login` or a provider API key; credentials are cached at `~/.prime/agent/auth.json`. `symphony doctor` warns if the auth file is missing.
@@ -112,6 +113,20 @@ agent:
 Resolution per dispatch: ticket `agent_kind` pin > `agent.stage_kinds[state]`
 > `agent.kind`. The backend is re-resolved at every stage change, including the
 in-run lane transitions one dispatch walks.
+
+### Crash continuation
+
+`agent.crash_continuation` defaults to `true`. After a hard crash or managed
+service restart, Symphony first fences and terminates the prior backend process,
+then creates a new Run attempt from the latest completed-turn checkpoint. Codex,
+Claude Code, OpenCode, Pi, and Prime Agent resume an exact session identifier.
+Gemini, AGY, Kiro, agent/state mismatches, and application-release verifier or
+finalizer runs start a fresh session against the preserved workspace instead.
+Codex can reject a missing session before work and fall back immediately. A
+per-turn CLI binds its first invocation to the exact ID; rejection fails that
+recovery attempt closed, and the later retry starts fresh. The interrupted turn
+may run again; arbitrary external tool actions are not exactly-once. Set
+`crash_continuation: false` to keep fresh-session restart behavior.
 
 ### Codex workspace sandbox and package registries
 

@@ -155,8 +155,10 @@ adds:
    drag-and-drop state moves, Document skip, column add/delete/rename, per-column
    prompt editing, branch policy, and a dedicated stats page.
 4. A **single-node reliability ledger** in `.symphony/state.db` — active run
-   leases block duplicate dispatch across restarts, dead-owner leases are
-   reclaimed, and retry / pause / budget-exhausted flags survive process exit.
+   leases block duplicate dispatch across restarts, dead-owner processes are
+   fenced and reaped, and the next Run attempt can resume from the latest
+   completed-turn checkpoint. Retry / pause / budget-exhausted flags also
+   survive process exit.
 
 The architecture is still intentionally local and file-first: Markdown tickets
 remain the human source of truth, while SQLite stores runtime coordination

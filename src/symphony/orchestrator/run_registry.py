@@ -11,6 +11,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable, Mapping, cast, overload
 
+from .._shell import process_identity
 from ..issue import Issue
 from .diagnostics import (
     MAX_DIAGNOSTIC_COUNTER,
@@ -28,6 +29,43 @@ DEFAULT_LEASE_TTL = timedelta(minutes=5)
 # inline on the event loop (sqlite connections are thread-affine), so this
 # is the worst-case tick delay a contended WAL database can inflict.
 SQLITE_BUSY_TIMEOUT_S = 5.0
+
+# Checkpoints contain only the opaque backend session handle and the completed
+# workflow boundary needed for recovery. Reject rather than truncate: a
+# truncated session id could resume the wrong conversation or silently fall
+# back to a fresh one.
+MAX_RESUME_SESSION_ID_BYTES = 4_096
+MAX_RESUME_SESSION_ID_CHARS = 512
+MAX_CHECKPOINT_STATE_BYTES = 256
+
+
+@dataclass(frozen=True)
+class ContinuationCheckpoint:
+    """Bounded private value handed only to the backend continuation path."""
+
+    resume_session_id: str
+    state: str
+    turn: int
+    checkpointed_at: datetime
+
+    def __post_init__(self) -> None:
+        _validate_checkpoint_fields(
+            resume_session_id=self.resume_session_id,
+            state=self.state,
+            turn=self.turn,
+        )
+        if not isinstance(self.checkpointed_at, datetime):
+            raise ValueError("checkpointed_at must be a datetime")
+        object.__setattr__(self, "checkpointed_at", _utc(self.checkpointed_at))
+
+
+@dataclass(frozen=True)
+class ContinuationAcquisition:
+    """A new run lease plus the exact predecessor boundary it consumed."""
+
+    run_id: str
+    continued_from_run_id: str
+    checkpoint: ContinuationCheckpoint
 
 
 @dataclass(frozen=True)
@@ -50,6 +88,7 @@ class RunRecord:
     owner_pid: int | None = None
     owner_boot_id: str | None = None
     backend_agent_pid: int | None = None
+    backend_process_identity: str | None = None
     input_tokens: int | None = None
     cache_input_tokens: int | None = None
     output_tokens: int | None = None
@@ -58,6 +97,10 @@ class RunRecord:
     failure_message: str | None = None
     branch_name: str | None = None
     commit_sha: str | None = None
+    continued_from_run_id: str | None = None
+    checkpoint_state: str | None = None
+    checkpoint_turn: int | None = None
+    checkpointed_at: datetime | None = None
 
 
 @dataclass(frozen=True)
@@ -251,6 +294,281 @@ class RunRegistry:
             conn.execute("ROLLBACK")
             raise
 
+    def latest_continuation_source(
+        self,
+        *,
+        issue_id: str,
+        agent_kind: str,
+        state: str,
+        issue_updated_at: datetime | None = None,
+    ) -> str | None:
+        """Return the newest eligible, unconsumed recovery source.
+
+        This is intentionally only a discovery hint. Acquisition repeats all
+        predicates under ``BEGIN IMMEDIATE`` so a stale answer is harmless.
+        """
+        row = self._connect().execute(
+            """
+            SELECT source.*
+            FROM runs AS source
+            WHERE source.issue_id = ?
+              AND source.agent_kind = ?
+              AND source.state = ?
+              AND source.checkpoint_state = ?
+              AND ((source.status = 'orphaned' AND source.failure_class = 'orphaned')
+                   OR source.status = 'shutdown_interrupted')
+              AND source.backend_agent_pid IS NULL
+              AND source.completed_at IS NOT NULL
+              AND source.lease_expires_at IS NULL
+              AND source.resume_session_id IS NOT NULL
+              AND length(CAST(source.resume_session_id AS BLOB)) BETWEEN 1 AND ?
+              AND source.checkpoint_turn BETWEEN 1 AND ?
+              AND source.checkpointed_at IS NOT NULL
+              AND source.checkpointed_at >= ?
+              AND NOT EXISTS (
+                  SELECT 1 FROM runs AS successor
+                  WHERE successor.continued_from_run_id = source.run_id
+              )
+              AND NOT EXISTS (
+                  SELECT 1 FROM runs AS newer
+                  WHERE newer.issue_id = source.issue_id
+                    AND newer.rowid > source.rowid
+              )
+            ORDER BY source.checkpointed_at DESC, source.rowid DESC
+            LIMIT 1
+            """,
+            (
+                issue_id,
+                agent_kind,
+                state,
+                state,
+                MAX_RESUME_SESSION_ID_BYTES,
+                MAX_DIAGNOSTIC_COUNTER,
+                _iso(issue_updated_at) if issue_updated_at is not None else "",
+            ),
+        ).fetchone()
+        if row is None:
+            return None
+        try:
+            checkpointed_at = _parse(str(row["checkpointed_at"]))
+            if checkpointed_at is None:
+                return None
+            ContinuationCheckpoint(
+                resume_session_id=str(row["resume_session_id"]),
+                state=str(row["checkpoint_state"]),
+                turn=int(row["checkpoint_turn"]),
+                checkpointed_at=checkpointed_at,
+            )
+        except (TypeError, ValueError, OverflowError):
+            return None
+        return str(row["run_id"])
+
+    def acquire_continuation_run(
+        self,
+        issue: Issue,
+        *,
+        continued_from_run_id: str,
+        workspace_path: Path,
+        attempt: int | None,
+        attempt_kind: str,
+        agent_kind: str,
+        now: datetime | None = None,
+    ) -> ContinuationAcquisition | None:
+        """Atomically consume one safe checkpoint into a new active run.
+
+        Only kill-confirmed orphan rows and gracefully stopped rows whose
+        backend pid was cleared are eligible. The explicit predecessor id and
+        exact issue/identifier/agent/state tuple prevent a stale discovery
+        result from resuming into a different dispatch.
+        """
+        now = _utc(now)
+        expires = now + self._lease_ttl
+        run_id = uuid.uuid4().hex
+        conn = self._connect()
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            # Preserve ordinary lease compatibility, while never selecting an
+            # active/reclaiming predecessor as a continuation source.
+            self._expire_stale_locked(now)
+            if self._active_issue_locked(issue.id, now) is not None:
+                conn.execute("COMMIT")
+                return None
+            source = conn.execute(
+                """
+                SELECT * FROM runs AS source
+                WHERE source.run_id = ?
+                  AND source.issue_id = ?
+                  AND source.identifier = ?
+                  AND source.agent_kind = ?
+                  AND source.state = ?
+                  AND source.checkpoint_state = ?
+                  AND ((source.status = 'orphaned' AND source.failure_class = 'orphaned')
+                   OR source.status = 'shutdown_interrupted')
+                  AND source.backend_agent_pid IS NULL
+                  AND source.completed_at IS NOT NULL
+                  AND source.lease_expires_at IS NULL
+                  AND source.resume_session_id IS NOT NULL
+                  AND source.checkpoint_turn IS NOT NULL
+                  AND source.checkpointed_at IS NOT NULL
+                  AND NOT EXISTS (
+                      SELECT 1 FROM runs AS successor
+                      WHERE successor.continued_from_run_id = source.run_id
+                  )
+                  AND NOT EXISTS (
+                      SELECT 1 FROM runs AS newer
+                      WHERE newer.issue_id = source.issue_id
+                        AND newer.rowid > source.rowid
+                  )
+                LIMIT 1
+                """,
+                (
+                    continued_from_run_id,
+                    issue.id,
+                    issue.identifier,
+                    agent_kind,
+                    issue.state,
+                    issue.state,
+                ),
+            ).fetchone()
+            if source is None:
+                conn.execute("COMMIT")
+                return None
+            try:
+                checkpointed_at = _parse(str(source["checkpointed_at"]))
+                if checkpointed_at is None:
+                    conn.execute("ROLLBACK")
+                    return None
+                checkpoint = ContinuationCheckpoint(
+                    resume_session_id=str(source["resume_session_id"]),
+                    state=str(source["checkpoint_state"]),
+                    turn=int(source["checkpoint_turn"]),
+                    checkpointed_at=checkpointed_at,
+                )
+                if issue.updated_at is not None and _utc(issue.updated_at) > checkpointed_at:
+                    conn.execute("ROLLBACK")
+                    return None
+            except (TypeError, ValueError, OverflowError):
+                # Corrupt or manually edited recovery material never degrades
+                # into a fresh-looking continuation lease.
+                conn.execute("ROLLBACK")
+                return None
+            try:
+                conn.execute(
+                    """
+                    INSERT INTO runs (
+                        run_id, issue_id, identifier, title, state, attempt,
+                        attempt_kind, agent_kind, workspace_path, status,
+                        started_at, updated_at, lease_expires_at,
+                        last_progress_at, completed_at, owner_pid,
+                        owner_boot_id, branch_name, resume_session_id,
+                        checkpoint_state, checkpoint_turn, checkpointed_at,
+                        continued_from_run_id
+                    ) VALUES (
+                        ?, ?, ?, ?, ?, ?, ?, ?, ?, 'active', ?, ?, ?, ?, NULL,
+                        ?, ?, ?, ?, ?, ?, ?, ?
+                    )
+                    """,
+                    (
+                        run_id,
+                        issue.id,
+                        issue.identifier,
+                        issue.title,
+                        issue.state,
+                        attempt,
+                        attempt_kind,
+                        agent_kind,
+                        str(workspace_path),
+                        _iso(now),
+                        _iso(now),
+                        _iso(expires),
+                        _iso(now),
+                        self._owner_pid,
+                        self._boot_id,
+                        f"symphony/{issue.identifier}",
+                        checkpoint.resume_session_id,
+                        checkpoint.state,
+                        checkpoint.turn,
+                        _iso(checkpoint.checkpointed_at),
+                        continued_from_run_id,
+                    ),
+                )
+            except sqlite3.IntegrityError as exc:
+                # The partial unique index is the final cross-process
+                # one-successor fence if discovery raced. Other integrity
+                # failures are registry errors and must not look like "no
+                # eligible checkpoint" to a caller that may fall back fresh.
+                if "runs.continued_from_run_id" not in str(exc):
+                    raise
+                conn.execute("ROLLBACK")
+                return None
+            self._append_attempt_event_best_effort_locked(
+                run_id=run_id,
+                event_type="run_acquired",
+                payload={
+                    "attempt": attempt,
+                    "attempt_kind": attempt_kind,
+                    "agent_kind": agent_kind,
+                    "state": issue.state,
+                },
+                now=now,
+            )
+            conn.execute("COMMIT")
+            return ContinuationAcquisition(
+                run_id=run_id,
+                continued_from_run_id=continued_from_run_id,
+                checkpoint=checkpoint,
+            )
+        except Exception:
+            if conn.in_transaction:
+                conn.execute("ROLLBACK")
+            raise
+
+    def checkpoint_completed_turn(
+        self,
+        *,
+        issue_id: str,
+        run_id: str,
+        resume_session_id: str,
+        state: str,
+        turn: int,
+        now: datetime | None = None,
+    ) -> bool:
+        """Persist the newest fully completed turn for this exact run owner."""
+        _validate_checkpoint_fields(
+            resume_session_id=resume_session_id,
+            state=state,
+            turn=turn,
+        )
+        now = _utc(now)
+        cur = self._connect().execute(
+            """
+            UPDATE runs
+            SET resume_session_id = ?, checkpoint_state = ?,
+                checkpoint_turn = ?, checkpointed_at = ?, state = ?,
+                updated_at = ?
+            WHERE issue_id = ?
+              AND run_id = ?
+              AND status = 'active'
+              AND owner_pid = ?
+              AND owner_boot_id = ?
+              AND (checkpoint_turn IS NULL OR checkpoint_turn < ?)
+            """,
+            (
+                resume_session_id,
+                state,
+                turn,
+                _iso(now),
+                state,
+                _iso(now),
+                issue_id,
+                run_id,
+                self._owner_pid,
+                self._boot_id,
+                turn,
+            ),
+        )
+        return cur.rowcount == 1
+
     def heartbeat(
         self,
         *,
@@ -263,6 +581,24 @@ class RunRegistry:
         now = _utc(now)
         expires = now + self._lease_ttl
         progress = _utc(progress_at) if progress_at is not None else None
+        conn = self._connect()
+        backend_identity: str | None = None
+        if backend_agent_pid is not None:
+            existing = conn.execute(
+                """
+                SELECT backend_agent_pid, backend_process_identity
+                FROM runs WHERE issue_id = ? AND run_id = ? AND status = 'active'
+                """,
+                (issue_id, run_id),
+            ).fetchone()
+            if (
+                existing is not None
+                and existing["backend_agent_pid"] == backend_agent_pid
+                and existing["backend_process_identity"]
+            ):
+                backend_identity = str(existing["backend_process_identity"])
+            else:
+                backend_identity = process_identity(backend_agent_pid)
         if progress is None and backend_agent_pid is None:
             sql = """
                 UPDATE runs
@@ -273,10 +609,18 @@ class RunRegistry:
         elif progress is None:
             sql = """
                 UPDATE runs
-                SET updated_at = ?, lease_expires_at = ?, backend_agent_pid = ?
+                SET updated_at = ?, lease_expires_at = ?, backend_agent_pid = ?,
+                    backend_process_identity = ?
                 WHERE issue_id = ? AND run_id = ? AND status = 'active'
             """
-            args = (_iso(now), _iso(expires), backend_agent_pid, issue_id, run_id)
+            args = (
+                _iso(now),
+                _iso(expires),
+                backend_agent_pid,
+                backend_identity,
+                issue_id,
+                run_id,
+            )
         elif backend_agent_pid is None:
             sql = """
                 UPDATE runs
@@ -288,7 +632,7 @@ class RunRegistry:
             sql = """
                 UPDATE runs
                 SET updated_at = ?, lease_expires_at = ?, last_progress_at = ?,
-                    backend_agent_pid = ?
+                    backend_agent_pid = ?, backend_process_identity = ?
                 WHERE issue_id = ? AND run_id = ? AND status = 'active'
             """
             args = (
@@ -296,11 +640,13 @@ class RunRegistry:
                 _iso(expires),
                 _iso(progress),
                 backend_agent_pid,
+                backend_identity,
                 issue_id,
                 run_id,
             )
-        cur = self._connect().execute(sql, args)
+        cur = conn.execute(sql, args)
         return cur.rowcount > 0
+
 
     def clear_backend_agent_pid(
         self,
@@ -315,7 +661,8 @@ class RunRegistry:
         cur = self._connect().execute(
             """
             UPDATE runs
-            SET updated_at = ?, lease_expires_at = ?, backend_agent_pid = NULL
+            SET updated_at = ?, lease_expires_at = ?, backend_agent_pid = NULL,
+                backend_process_identity = NULL
             WHERE issue_id = ? AND run_id = ? AND status = 'active'
             """,
             (_iso(now), _iso(expires), issue_id, run_id),
@@ -1560,11 +1907,9 @@ class RunRegistry:
             rows = conn.execute(
                 """
                 SELECT * FROM runs
-                WHERE status = 'reclaiming'
-                   OR (status = 'active' AND lease_expires_at > ?)
+                WHERE status IN ('reclaiming', 'active')
                 ORDER BY started_at, run_id
-                """,
-                (_iso(now),),
+                """
             ).fetchall()
             reclaimed: list[RunRecord] = []
             for row in rows:
@@ -1574,7 +1919,11 @@ class RunRegistry:
                 if row["owner_boot_id"] == self._boot_id:
                     continue
                 pid = row["owner_pid"]
-                if pid is not None and alive(int(pid)):
+                lease_expires_at = _parse(row["lease_expires_at"])
+                lease_expired = (
+                    lease_expires_at is not None and lease_expires_at <= now
+                )
+                if pid is not None and alive(int(pid)) and not lease_expired:
                     continue
                 conn.execute(
                     """
@@ -1607,7 +1956,8 @@ class RunRegistry:
                 """
                 UPDATE runs
                 SET status = 'orphaned', updated_at = ?, completed_at = ?,
-                    lease_expires_at = NULL, failure_class = 'orphaned'
+                    lease_expires_at = NULL, backend_agent_pid = NULL,
+                    backend_process_identity = NULL, failure_class = 'orphaned'
                 WHERE run_id = ? AND status = 'reclaiming'
                 """,
                 (_iso(now), _iso(now), run_id),
@@ -1892,6 +2242,7 @@ class RunRegistry:
             """
             SELECT run_id FROM runs
             WHERE status = 'active'
+              AND backend_agent_pid IS NULL
               AND lease_expires_at IS NOT NULL
               AND lease_expires_at <= ?
             ORDER BY rowid
@@ -1904,6 +2255,7 @@ class RunRegistry:
             SET status = 'expired', updated_at = ?, completed_at = ?,
                 lease_expires_at = NULL, failure_class = 'lease_expired'
             WHERE status = 'active'
+              AND backend_agent_pid IS NULL
               AND lease_expires_at IS NOT NULL
               AND lease_expires_at <= ?
             """,
@@ -1921,6 +2273,28 @@ class RunRegistry:
                 prune_terminal=index == len(expired) - 1,
             )
         return cur.rowcount
+
+
+def _validate_checkpoint_fields(
+    *, resume_session_id: str, state: str, turn: int
+) -> None:
+    if not isinstance(resume_session_id, str) or not resume_session_id.strip():
+        raise ValueError("resume_session_id must be a non-empty string")
+    if (
+        len(resume_session_id) > MAX_RESUME_SESSION_ID_CHARS
+        or len(resume_session_id.encode("utf-8")) > MAX_RESUME_SESSION_ID_BYTES
+    ):
+        raise ValueError("resume_session_id exceeds the private checkpoint bound")
+    if not all(char.isprintable() for char in resume_session_id):
+        raise ValueError("resume_session_id contains control characters")
+    if not isinstance(state, str) or not state.strip():
+        raise ValueError("checkpoint state must be a non-empty string")
+    if len(state.encode("utf-8")) > MAX_CHECKPOINT_STATE_BYTES:
+        raise ValueError("checkpoint state exceeds the checkpoint bound")
+    if isinstance(turn, bool) or not isinstance(turn, int):
+        raise ValueError("checkpoint turn must be an integer")
+    if turn < 1 or turn > MAX_DIAGNOSTIC_COUNTER:
+        raise ValueError("checkpoint turn is outside the supported range")
 
 
 def _optional_nonnegative(value: int | None, fallback: Any = None) -> int | None:
@@ -1968,6 +2342,18 @@ def _run_summary(record: RunRecord) -> dict[str, Any]:
         "workspace_path": str(record.workspace_path),
         "branch_name": record.branch_name or f"symphony/{record.identifier}",
         "commit_sha": record.commit_sha,
+        "continued_from_run_id": record.continued_from_run_id,
+        "checkpoint": (
+            {
+                "state": record.checkpoint_state,
+                "turn": record.checkpoint_turn,
+                "checkpointed_at": _iso(record.checkpointed_at),
+            }
+            if record.checkpoint_state is not None
+            and record.checkpoint_turn is not None
+            and record.checkpointed_at is not None
+            else None
+        ),
         "tokens": {
             "input": record.input_tokens,
             "cache": record.cache_input_tokens,
@@ -2031,6 +2417,11 @@ def _record(row: sqlite3.Row) -> RunRecord:
         backend_agent_pid=(
             int(backend_agent_pid) if backend_agent_pid is not None else None
         ),
+        backend_process_identity=(
+            str(row["backend_process_identity"])
+            if row["backend_process_identity"]
+            else None
+        ),
         input_tokens=(int(row["input_tokens"]) if row["input_tokens"] is not None else None),
         cache_input_tokens=(int(row["cache_input_tokens"]) if row["cache_input_tokens"] is not None else None),
         output_tokens=(int(row["output_tokens"]) if row["output_tokens"] is not None else None),
@@ -2039,6 +2430,20 @@ def _record(row: sqlite3.Row) -> RunRecord:
         failure_message=str(row["failure_message"]) if row["failure_message"] else None,
         branch_name=str(row["branch_name"]) if row["branch_name"] else None,
         commit_sha=str(row["commit_sha"]) if row["commit_sha"] else None,
+        continued_from_run_id=(
+            str(row["continued_from_run_id"])
+            if row["continued_from_run_id"]
+            else None
+        ),
+        checkpoint_state=(
+            str(row["checkpoint_state"]) if row["checkpoint_state"] else None
+        ),
+        checkpoint_turn=(
+            int(row["checkpoint_turn"])
+            if row["checkpoint_turn"] is not None
+            else None
+        ),
+        checkpointed_at=_parse(row["checkpointed_at"]),
     )
 
 
