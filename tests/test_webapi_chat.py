@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any, AsyncIterator, cast
 
 import aiohttp
@@ -37,6 +38,8 @@ agent:
 
 You are working on {{ issue.identifier }}.
 """
+
+CONFIRMATION_TOKEN = "c" * 64
 
 
 class _StubOrchestrator:
@@ -255,6 +258,163 @@ async def test_chat_message_validation_and_busy(
         headers={"Content-Type": "text/plain"},
     )
     assert resp.status == 415
+
+
+async def test_chat_numeric_project_choice_uses_server_owned_registration(
+    board_dir: Path,
+    fake_backends: list[_FakeBackend],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from symphony import webapi
+
+    calls: list[tuple[str, Path]] = []
+
+    def create_project(
+        _registry: Any,
+        *,
+        name: str,
+        path: Path,
+        expected_target: Any | None = None,
+    ) -> Any:
+        assert expected_target is not None and expected_target.repo == path
+        calls.append((name, path))
+        if name == "Broken":
+            raise RuntimeError("simulated project setup failure")
+        return SimpleNamespace(
+            id="todo-app",
+            name=name,
+            git_repo=str(path),
+            workflow=str(path / "WORKFLOW.md"),
+            host="127.0.0.1",
+            port=10000,
+        )
+
+    monkeypatch.setattr(webapi, "_create_or_adopt_registered_project", create_project)
+    monkeypatch.setattr(webapi, "ProjectRegistry", lambda: object())
+    state = WorkflowState(board_dir / "WORKFLOW.md")
+    cfg, err = state.reload()
+    assert err is None and cfg is not None
+    app = build_app(cast(Orchestrator, _StubOrchestrator(state)))
+    cli = TestClient(TestServer(app))
+    await cli.start_server()
+    try:
+        created = await cli.post(
+            "/api/v1/chat/sessions",
+            json={"mode": "edit", "confirmation_token": CONFIRMATION_TOKEN},
+        )
+        assert created.status == 201
+        session_id = (await created.json())["session_id"]
+        target = board_dir.parent / "todo-app"
+        fake_backends[-1].other_frames = [
+            {
+                "type": "assistant",
+                "message": {
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": (
+                                "1. Create a separate Todo app.\n"
+                                '<symphony-project-setup>{"choice": 1, '
+                                '"name": "Todo App", '
+                                f'"path": "{target}"}}</symphony-project-setup>'
+                            ),
+                        }
+                    ]
+                },
+            }
+        ]
+        response = await cli.post(
+            f"/api/v1/chat/sessions/{session_id}/message", json={"text": "offer"}
+        )
+        assert response.status == 202
+        manager = app[webapi.CHAT_MANAGER_KEY]
+        session = manager.session(session_id)
+        assert session is not None and session.turn_task is not None
+        await session.turn_task
+        snapshot = await (
+            await cli.get(f"/api/v1/chat/sessions/{session_id}")
+        ).json()
+        [action] = snapshot["project_setup_actions"]
+        assert action["choice"] == 1
+        assert action["operation"] == "create"
+        assert "symphony-project-setup" not in " ".join(
+            row["text"] for row in snapshot["transcript_tail"]
+        )
+
+        denied = await cli.post(
+            f"/api/v1/chat/sessions/{session_id}/message",
+            json={"text": "1"},
+            headers={"Origin": "http://evil.example"},
+        )
+        assert denied.status == 403
+        assert calls == []
+
+        missing_capability = await cli.post(
+            f"/api/v1/chat/sessions/{session_id}/message", json={"text": "1"}
+        )
+        assert missing_capability.status == 403
+        assert calls == []
+
+        selected = await cli.post(
+            f"/api/v1/chat/sessions/{session_id}/message",
+            json={"text": "1"},
+            headers={"X-Symphony-Chat-Confirmation": CONFIRMATION_TOKEN},
+        )
+        assert selected.status == 200
+        result = await selected.json()
+        assert result["action"]["status"] == "succeeded"
+        assert result["action"]["project"]["id"] == "todo-app"
+        # Duplicate delivery stays on the server-owned action, never a second
+        # backend turn or project setup.
+        duplicate = await cli.post(
+            f"/api/v1/chat/sessions/{session_id}/project-setup/"
+            f"{action['action_id']}/select",
+            json={},
+            headers={"X-Symphony-Chat-Confirmation": CONFIRMATION_TOKEN},
+        )
+        assert duplicate.status == 200
+        assert calls == [("Todo App", target)]
+
+        broken_target = board_dir.parent / "broken"
+        fake_backends[-1].other_frames = [
+            {
+                "type": "assistant",
+                "message": {
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": (
+                                '<symphony-project-setup>{"choice": 2, '
+                                '"name": "Broken", '
+                                f'"path": "{broken_target}"}}'
+                                "</symphony-project-setup>"
+                            ),
+                        }
+                    ]
+                },
+            }
+        ]
+        response = await cli.post(
+            f"/api/v1/chat/sessions/{session_id}/message", json={"text": "offer broken"}
+        )
+        assert response.status == 202
+        assert session.turn_task is not None
+        await session.turn_task
+        actions = (await (await cli.get(f"/api/v1/chat/sessions/{session_id}")).json())["project_setup_actions"]
+        broken = next(action for action in actions if action["choice"] == 2)
+        failed = await cli.post(
+            f"/api/v1/chat/sessions/{session_id}/project-setup/{broken['action_id']}/select",
+            json={},
+            headers={"X-Symphony-Chat-Confirmation": CONFIRMATION_TOKEN},
+        )
+        assert failed.status == 409
+        failed_body = await failed.json()
+        assert failed_body["error"]["code"] == "project_setup_failed"
+        assert failed_body["action"]["status"] == "failed"
+        assert fake_backends[-1].turns[-2].endswith("offer")
+        assert fake_backends[-1].turns[-1].endswith("offer broken")
+    finally:
+        await cli.close()
 
 
 async def test_chat_ws_streams_turn_events(client: TestClient) -> None:

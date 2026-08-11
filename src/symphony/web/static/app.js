@@ -20,18 +20,19 @@
   const API_BASE = '/api/v1';
 
   class ApiError extends Error {
-    constructor(message, code, status) {
+    constructor(message, code, status, data = null) {
       super(message);
       this.code = code;
       this.status = status;
+      this.data = data;
     }
   }
 
-  async function apiRequest(path, { method = 'GET', body } = {}) {
-    const init = { method };
+  async function apiRequest(path, { method = 'GET', body, headers = {} } = {}) {
+    const init = { method, headers: { ...headers } };
     if (body !== undefined) {
       init.body = body;
-      init.headers = { 'Content-Type': 'application/json' };
+      init.headers['Content-Type'] = 'application/json';
     }
     const res = await fetch(API_BASE + path, init);
     const text = await res.text();
@@ -48,7 +49,8 @@
       throw new ApiError(
         (err && err.message) || t('api.requestFailed', { status: res.status }),
         (err && err.code) || 'unknown_error',
-        res.status
+        res.status,
+        data
       );
     }
     return data;
@@ -143,7 +145,21 @@
     patchChatSessionById: (id, payload) => apiRequest(`/chat/sessions/${encodeURIComponent(id)}`, { method: 'PATCH', body: JSON.stringify(payload) }),
     deleteChatSessionById: (id, { forget } = {}) => apiRequest(`/chat/sessions/${encodeURIComponent(id)}${forget ? '?forget=true' : ''}`, { method: 'DELETE' }),
     postChatMessageTo: (id, payload) => apiRequest(`/chat/sessions/${encodeURIComponent(id)}/message`, { method: 'POST', body: JSON.stringify(payload) }),
-    reattachChatSession: (id) => apiRequest(`/chat/sessions/${encodeURIComponent(id)}/reattach`, { method: 'POST', body: '{}' }),
+    selectChatProjectSetup: (sessionId, actionId, confirmationToken) => apiRequest(
+      `/chat/sessions/${encodeURIComponent(sessionId)}/project-setup/${encodeURIComponent(actionId)}/select`,
+      {
+        method: 'POST',
+        body: '{}',
+        headers: { 'X-Symphony-Chat-Confirmation': confirmationToken },
+      }
+    ),
+    reattachChatSession: (id, confirmationToken) => apiRequest(
+      `/chat/sessions/${encodeURIComponent(id)}/reattach`,
+      {
+        method: 'POST',
+        body: JSON.stringify({ confirmation_token: confirmationToken }),
+      }
+    ),
     getChatSession: () => apiRequest('/chat/session'),
     createChatSession: (payload) => apiRequest('/chat/session', { method: 'POST', body: JSON.stringify(payload) }),
     patchChatSession: (payload) => apiRequest('/chat/session', { method: 'PATCH', body: JSON.stringify(payload) }),
@@ -3185,7 +3201,8 @@
     liveBubble: null, liveText: '', liveFrame: 0,
     // Several sessions can run at once; the page shows one at a time and
     // tells the socket which one so only its deltas are streamed.
-    currentId: null, sessions: null, autoCreatePromise: null,
+    currentId: null, sessions: null, autoCreatePromise: null, projectSetupActions: {},
+    projectSetupExpiryTimers: {}, confirmationTokens: {},
   };
 
   const CHAT_AGENT_LABELS = {
@@ -3198,6 +3215,42 @@
     pi: 'Pi',
     'prime-agent': 'Prime Agent',
   };
+
+  const CHAT_CONFIRMATION_KEY_PREFIX = 'symphony.chatConfirmation.';
+
+  function newChatConfirmationToken() {
+    const bytes = new Uint8Array(32);
+    crypto.getRandomValues(bytes);
+    return Array.from(bytes, (byte) => byte.toString(16).padStart(2, '0')).join('');
+  }
+
+  function rememberChatConfirmationToken(sessionId, token) {
+    if (!sessionId || !token) return;
+    chatState.confirmationTokens[sessionId] = token;
+    try {
+      localStorage.setItem(`${CHAT_CONFIRMATION_KEY_PREFIX}${sessionId}`, token);
+    } catch (_err) { /* memory-only token is still valid until this page closes */ }
+  }
+
+  function chatConfirmationToken(sessionId) {
+    if (!sessionId) return null;
+    if (chatState.confirmationTokens[sessionId]) return chatState.confirmationTokens[sessionId];
+    try {
+      const token = localStorage.getItem(`${CHAT_CONFIRMATION_KEY_PREFIX}${sessionId}`);
+      if (/^[A-Za-z0-9_-]{32,256}$/.test(token || '')) {
+        chatState.confirmationTokens[sessionId] = token;
+        return token;
+      }
+    } catch (_err) { /* storage unavailable */ }
+    return null;
+  }
+
+  async function createChatSessionWithConfirmation(payload) {
+    const token = newChatConfirmationToken();
+    const snapshot = await api.createChatSession2({ ...payload, confirmation_token: token });
+    rememberChatConfirmationToken(snapshot.session_id, token);
+    return snapshot;
+  }
 
   const CHAT_FONT_KEY = 'symphony.chatFontSize';
   const CHAT_FONT_MIN = 12;
@@ -3275,15 +3328,138 @@
     refreshChatSessions(view);
   }
 
+  function rememberChatProjectSetup(action) {
+    if (!action || !action.action_id) return;
+    chatState.projectSetupActions[action.action_id] = action;
+    if (chatState.snapshot) {
+      chatState.snapshot.project_setup_actions = Object.values(chatState.projectSetupActions);
+    }
+  }
+
+  function forgetChatProjectSetup(actionId) {
+    if (!actionId) return;
+    const timer = chatState.projectSetupExpiryTimers[actionId];
+    if (timer) clearTimeout(timer);
+    delete chatState.projectSetupExpiryTimers[actionId];
+    delete chatState.projectSetupActions[actionId];
+    if (chatState.snapshot) {
+      chatState.snapshot.project_setup_actions = Object.values(chatState.projectSetupActions);
+    }
+  }
+
+  function renderChatProjectSetupAction(view, action) {
+    if (!action || !action.action_id) return;
+    const existing = view.transcript.querySelector(`[data-project-setup-id="${action.action_id}"]`);
+    const node = buildChatProjectSetupNode(view, action);
+    if (existing) existing.replaceWith(node);
+    else view.transcript.appendChild(node);
+  }
+
+  function clearChatProjectSetupActions(view) {
+    for (const timer of Object.values(chatState.projectSetupExpiryTimers)) clearTimeout(timer);
+    chatState.projectSetupExpiryTimers = {};
+    chatState.projectSetupActions = {};
+    if (chatState.snapshot) chatState.snapshot.project_setup_actions = [];
+    for (const node of view.transcript.querySelectorAll('[data-project-setup-id]')) {
+      node.remove();
+    }
+  }
+
+  function reconcileChatProjectSetupActions(view, snapshot) {
+    if (!snapshot || !snapshot.active) {
+      clearChatProjectSetupActions(view);
+      return;
+    }
+    const actions = {};
+    for (const action of snapshot.project_setup_actions || []) {
+      if (action && action.action_id) actions[action.action_id] = action;
+    }
+    for (const actionId of Object.keys(chatState.projectSetupActions)) {
+      if (!actions[actionId]) {
+        const timer = chatState.projectSetupExpiryTimers[actionId];
+        if (timer) clearTimeout(timer);
+        delete chatState.projectSetupExpiryTimers[actionId];
+      }
+    }
+    chatState.projectSetupActions = actions;
+    snapshot.project_setup_actions = Object.values(actions);
+    for (const node of view.transcript.querySelectorAll('[data-project-setup-id]')) {
+      if (!actions[node.dataset.projectSetupId]) node.remove();
+    }
+    for (const action of Object.values(actions)) renderChatProjectSetupAction(view, action);
+  }
+
+  function chatProjectSetupForChoice(text) {
+    if (!chatState.snapshot || chatState.snapshot.mode !== 'edit') return null;
+    const matches = Object.values(chatState.projectSetupActions).filter((action) =>
+      action && action.choice_active &&
+      (action.status === 'pending' || action.status === 'failed') &&
+      !chatProjectSetupExpired(action) && String(action.choice) === text
+    );
+    return matches.length === 1 ? matches[0] : null;
+  }
+
+  async function selectChatProjectSetup(view, action) {
+    const sessionId = chatState.currentId;
+    if (!sessionId) throw new ApiError(t('chat.noSessionSelected'), 'chat_no_session', 404);
+    const confirmationToken = chatConfirmationToken(sessionId);
+    if (!confirmationToken) {
+      throw new ApiError(
+        t('chat.projectSetupConfirmationUnavailable'),
+        'chat_project_confirmation_forbidden',
+        403
+      );
+    }
+    try {
+      const result = await api.selectChatProjectSetup(
+        sessionId, action.action_id, confirmationToken
+      );
+      if (chatState.currentId !== sessionId) return result && result.action || action;
+      if (result && result.action) {
+        rememberChatProjectSetup(result.action);
+        renderChatProjectSetupAction(view, result.action);
+      }
+      return chatState.projectSetupActions[action.action_id] || action;
+    } catch (err) {
+      if (chatState.currentId === sessionId) {
+        const failedAction = err.data && err.data.action;
+        if (failedAction) {
+          rememberChatProjectSetup(failedAction);
+          renderChatProjectSetupAction(view, failedAction);
+        }
+        try {
+          const snapshot = await api.getChatSessionById(sessionId);
+          if (chatState.currentId === sessionId) {
+            chatState.snapshot = snapshot;
+            reconcileChatProjectSetupActions(view, snapshot);
+          }
+        } catch (_refreshErr) { /* preserve the original confirmation error */ }
+      }
+      throw err;
+    }
+  }
+
   async function sendChatMessage(view) {
     const text = view.input.value.trim();
+    const sessionId = chatState.currentId;
     if (!text) return;
     try {
-      if (chatState.currentId) await api.postChatMessageTo(chatState.currentId, { text });
-      else await api.postChatMessage({ text });
-      view.input.value = '';
+      const action = chatProjectSetupForChoice(text);
+      if (action) {
+        await selectChatProjectSetup(view, action);
+        if (chatState.currentId === sessionId) {
+          showToast(t('chat.projectSetupSelected'), 'success');
+        }
+      } else if (sessionId) {
+        await api.postChatMessageTo(sessionId, { text });
+      } else {
+        await api.postChatMessage({ text });
+      }
+      if (chatState.currentId === sessionId && view.input.value.trim() === text) {
+        view.input.value = '';
+      }
     } catch (err) {
-      showToast(err.message, 'error');
+      if (chatState.currentId === sessionId) showToast(err.message, 'error');
     }
   }
 
@@ -3293,7 +3469,7 @@
     if (!chatState.autoCreatePromise) {
       // Opening Chat should be immediately useful, but must not start an
       // agent turn. Creating an idle QA session is cheap and read-only.
-      chatState.autoCreatePromise = api.createChatSession2({ mode: 'qa' });
+      chatState.autoCreatePromise = createChatSessionWithConfirmation({ mode: 'qa' });
     }
     try {
       return await chatState.autoCreatePromise;
@@ -3339,8 +3515,11 @@
       return;
     }
     try {
-      applyChatSnapshot(view, await api.getChatSessionById(sessionId));
+      const snapshot = await api.getChatSessionById(sessionId);
+      if (chatState.currentId !== sessionId) return;
+      applyChatSnapshot(view, snapshot);
     } catch (_err) {
+      if (chatState.currentId !== sessionId) return;
       applyChatSnapshot(view, { active: false });
     }
     renderChatSessionBar(view);
@@ -3389,7 +3568,12 @@
       select.value = '';
       if (!sessionId) return;
       try {
-        const snapshot = await api.reattachChatSession(sessionId);
+        let confirmationToken = chatConfirmationToken(sessionId);
+        if (!confirmationToken) {
+          confirmationToken = newChatConfirmationToken();
+          rememberChatConfirmationToken(sessionId, confirmationToken);
+        }
+        const snapshot = await api.reattachChatSession(sessionId, confirmationToken);
         showToast(t('chat.sessionReattached'), 'success');
         await refreshChatSessions(view);
         await selectChatSession(view, snapshot.session_id);
@@ -3427,7 +3611,7 @@
       ]),
       submitLabel: t('chat.startSession'),
       onSubmit: async () => {
-        const snapshot = await api.createChatSession2({
+        const snapshot = await createChatSessionWithConfirmation({
           agent_kind: agentSelect.value,
           mode: modeSelect.value,
           max_turns: Math.max(0, Number(turnsInput.value) || 0),
@@ -3505,12 +3689,18 @@
   async function refreshChatControls(view) {
     const sessionId = chatState.currentId;
     try {
-      chatState.snapshot = sessionId
+      const snapshot = sessionId
         ? await api.getChatSessionById(sessionId)
         : await api.getChatSession();
-      chatState.busy = Boolean(chatState.snapshot.busy);
+      if (chatState.currentId !== sessionId) return;
+      chatState.snapshot = snapshot;
+      chatState.busy = Boolean(snapshot.busy);
+      reconcileChatProjectSetupActions(view, snapshot);
     } catch (_err) {
+      if (chatState.currentId !== sessionId) return;
       chatState.snapshot = { active: false };
+      chatState.busy = false;
+      clearChatProjectSetupActions(view);
     }
     renderChatControls(view);
     updateChatComposer(view);
@@ -3518,6 +3708,10 @@
 
   function applyChatSnapshot(view, snapshot) {
     chatState.snapshot = snapshot;
+    for (const timer of Object.values(chatState.projectSetupExpiryTimers)) clearTimeout(timer);
+    chatState.projectSetupExpiryTimers = {};
+    chatState.projectSetupActions = {};
+    for (const action of snapshot.project_setup_actions || []) rememberChatProjectSetup(action);
     if (snapshot.session_id) chatState.currentId = snapshot.session_id;
     chatState.busy = Boolean(snapshot.busy);
     chatState.seqSeen = 0;
@@ -3526,7 +3720,10 @@
     renderChatControls(view);
     clearNode(view.transcript);
     const tail = snapshot.transcript_tail || [];
-    for (const msg of tail) appendChatMessage(view, msg);
+    for (const msg of tail) appendChatMessage(view, msg, true);
+    for (const action of Object.values(chatState.projectSetupActions)) {
+      renderChatProjectSetupAction(view, action);
+    }
     if (!snapshot.active && !tail.length) {
       view.transcript.appendChild(el('div', { class: 'empty-state' }, t('chat.startHint')));
     }
@@ -3589,7 +3786,7 @@
     return true;
   }
 
-  function appendChatMessage(view, msg) {
+  function appendChatMessage(view, msg, fromSnapshot = false) {
     if (msg.type === 'agent_delta') {
       appendChatDelta(view, msg.text);
       return;
@@ -3601,6 +3798,34 @@
     if (msg.seq != null) {
       if (msg.seq <= chatState.seqSeen) return;
       chatState.seqSeen = msg.seq;
+    }
+    if (msg.type === 'project_setup_removed') {
+      // The JSONL transcript is not control-plane state. Snapshot replay
+      // already starts from the server's current action set.
+      if (!fromSnapshot) {
+        const actionId = msg.meta && msg.meta.project_setup_action_id;
+        if (actionId) {
+          forgetChatProjectSetup(actionId);
+          view.transcript.querySelector(`[data-project-setup-id="${actionId}"]`)?.remove();
+        }
+      }
+      return;
+    }
+    if (msg.type === 'project_setup_action' || msg.type === 'project_setup_status' ||
+        msg.type === 'project_setup_completed' || msg.type === 'project_setup_failed' ||
+        msg.type === 'project_setup_expired') {
+      let action = msg.meta && msg.meta.project_setup;
+      if (action && fromSnapshot) {
+        // Transcript files live in the editable workflow tree. On replay,
+        // only the live server snapshot may render a confirmation card.
+        action = chatState.projectSetupActions[action.action_id] || null;
+      }
+      if (action) {
+        if (!fromSnapshot) rememberChatProjectSetup(action);
+        renderChatProjectSetupAction(view, action);
+        view.transcript.scrollTop = view.transcript.scrollHeight;
+      }
+      return;
     }
     if (msg.type === 'user_message') {
       chatState.busy = true;
@@ -3628,6 +3853,104 @@
       view.transcript.appendChild(node);
       view.transcript.scrollTop = view.transcript.scrollHeight;
     }
+  }
+
+  function chatProjectSetupExpired(action) {
+    const expiresAt = Date.parse(action.expires_at || '');
+    return !Number.isFinite(expiresAt) || expiresAt <= Date.now();
+  }
+
+  function chatProjectSetupStatus(action) {
+    const statuses = {
+      pending: t('chat.projectSetupPending'),
+      running: t('chat.projectSetupRunning'),
+      succeeded: t('chat.projectSetupSucceeded'),
+      failed: t('chat.projectSetupFailed'),
+      expired: t('chat.projectSetupExpired'),
+    };
+    return statuses[action.status] || action.status;
+  }
+
+  function chatProjectSetupOperation(action) {
+    const operations = {
+      create: 'chat.projectSetupCreate',
+      initialize: 'chat.projectSetupInitialize',
+      adopt: 'chat.projectSetupAdopt',
+    };
+    const key = operations[action.operation];
+    return key ? t(key) : '';
+  }
+
+  function scheduleChatProjectSetupExpiry(view, action) {
+    if (!action || !action.action_id) return;
+    const existing = chatState.projectSetupExpiryTimers[action.action_id];
+    if (existing) clearTimeout(existing);
+    delete chatState.projectSetupExpiryTimers[action.action_id];
+    const expiresAt = Date.parse(action.expires_at || '');
+    const delay = expiresAt - Date.now();
+    if (!Number.isFinite(delay) || delay <= 0 || delay > 2_147_000_000) return;
+    chatState.projectSetupExpiryTimers[action.action_id] = setTimeout(() => {
+      delete chatState.projectSetupExpiryTimers[action.action_id];
+      const current = chatState.projectSetupActions[action.action_id];
+      if (current && chatProjectSetupExpired(current)) {
+        renderChatProjectSetupAction(view, current);
+      }
+    }, delay + 1);
+  }
+
+  function buildChatProjectSetupNode(view, action) {
+    const expired = chatProjectSetupExpired(action);
+    const status = expired && (action.status === 'pending' || action.status === 'failed')
+      ? 'expired' : (action.status || 'pending');
+    const project = action.project || null;
+    const canSelect = (status === 'pending' || status === 'failed') &&
+      !chatProjectSetupExpired(action) &&
+      chatState.snapshot && chatState.snapshot.mode === 'edit' &&
+      Boolean(chatConfirmationToken(chatState.currentId));
+    const actionButton = canSelect
+      ? el('button', {
+        class: 'btn btn-primary btn-sm chat-project-setup-select',
+        type: 'button',
+        onClick: async (event) => {
+          const button = event.currentTarget;
+          const sessionId = chatState.currentId;
+          button.disabled = true;
+          try {
+            await selectChatProjectSetup(view, action);
+            if (chatState.currentId === sessionId) {
+              showToast(t('chat.projectSetupSelected'), 'success');
+            }
+          } catch (err) {
+            if (chatState.currentId === sessionId) {
+              showToast(err.message, 'error');
+              button.disabled = false;
+            }
+          }
+        },
+      }, t('chat.projectSetupSelect', { choice: action.choice }))
+      : null;
+    const node = el('section', {
+      class: `chat-project-setup ${status}`,
+      'data-project-setup-id': action.action_id,
+      'aria-live': 'polite',
+    }, [
+      el('div', { class: 'chat-project-setup-heading' }, [
+        el('strong', null, t('chat.projectSetupTitle', { choice: action.choice })),
+        el('span', { class: `chat-project-setup-status ${status}` },
+          chatProjectSetupStatus({ ...action, status })),
+      ]),
+      el('p', { class: 'chat-project-setup-name' }, action.name),
+      el('code', { class: 'chat-project-setup-path' }, action.path),
+      chatProjectSetupOperation(action)
+        ? el('p', { class: 'chat-project-setup-operation' }, chatProjectSetupOperation(action))
+        : null,
+      project ? el('p', { class: 'chat-project-setup-result' },
+        t('chat.projectSetupRegistered', { id: project.id || action.name })) : null,
+      action.error ? el('p', { class: 'chat-project-setup-error', role: 'alert' }, action.error) : null,
+      actionButton,
+    ]);
+    scheduleChatProjectSetupExpiry(view, action);
+    return node;
   }
 
   function buildChatMessageNode(msg) {

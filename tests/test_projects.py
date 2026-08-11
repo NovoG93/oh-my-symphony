@@ -14,6 +14,7 @@ from symphony.projects import (
     ProjectError,
     ProjectRegistry,
     create_or_adopt_project,
+    project_target_expectation,
 )
 
 
@@ -202,6 +203,80 @@ def test_adopt_non_git_directory_preserves_contents_and_commits_only_created_fil
     assert "notes.txt" not in git(target, "show", "--format=", "--name-only", "HEAD").splitlines()
     assert git(target, "status", "--porcelain", "--", "notes.txt") == "?? notes.txt"
     assert (target / ".git").is_dir()
+
+
+def test_create_or_adopt_rejects_directory_created_after_missing_target_confirmation(
+    tmp_path: Path,
+) -> None:
+    source = source_bundle(tmp_path / "source")
+    target = tmp_path / "target"
+    expected = project_target_expectation(target)
+    target.mkdir()
+    registry = ProjectRegistry(tmp_path / "projects.json")
+
+    with pytest.raises(ProjectError, match="project target changed"):
+        create_or_adopt_project(
+            target,
+            source=source,
+            name="Target",
+            project_id="target",
+            registry=registry,
+            expected_target=expected,
+        )
+
+    assert registry.load() == []
+    assert not (target / "kanban").exists()
+
+
+def test_create_or_adopt_rejects_git_adoption_after_new_target_confirmation(
+    tmp_path: Path,
+) -> None:
+    source = source_bundle(tmp_path / "source")
+    target = tmp_path / "target"
+    target.mkdir()
+    expected = project_target_expectation(target)
+    subprocess.run(
+        ["git", "init", "-b", "main", str(target)],
+        check=True,
+        capture_output=True,
+    )
+    registry = ProjectRegistry(tmp_path / "projects.json")
+
+    with pytest.raises(ProjectError, match="project target changed"):
+        create_or_adopt_project(
+            target,
+            source=source,
+            name="Target",
+            project_id="target",
+            registry=registry,
+            expected_target=expected,
+        )
+
+    assert registry.load() == []
+    assert not (target / "kanban").exists()
+
+
+def test_create_or_adopt_rejects_changed_expected_repo_before_mutation(
+    tmp_path: Path,
+) -> None:
+    source = source_bundle(tmp_path / "source")
+    parent = init_repo(tmp_path / "parent")
+    target = parent / "nested"
+    target.mkdir()
+    registry = ProjectRegistry(tmp_path / "projects.json")
+
+    with pytest.raises(ProjectError, match="project target changed"):
+        create_or_adopt_project(
+            target,
+            source=source,
+            name="Nested",
+            project_id="nested",
+            registry=registry,
+            expected_repo=target,
+        )
+
+    assert registry.load() == []
+    assert not (parent / "kanban").exists()
 
 
 def test_adopt_git_repo_never_stages_unrelated_changes_or_overwrites_bundle(

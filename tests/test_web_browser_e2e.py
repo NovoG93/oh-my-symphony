@@ -4,6 +4,7 @@ import asyncio
 import os
 import subprocess
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any, AsyncIterator, cast
 
 import pytest
@@ -11,6 +12,7 @@ import pytest_asyncio
 from aiohttp.test_utils import TestClient, TestServer
 
 from symphony import chat as chat_module
+from symphony import webapi as webapi_module
 from symphony.backends import (
     EVENT_OTHER_MESSAGE,
     EVENT_TURN_COMPLETED,
@@ -485,9 +487,17 @@ class _FakeChatBackend:
     async def run_turn(self, *, prompt: str, is_continuation: bool) -> TurnResult:
         del is_continuation
         self.turns.append(prompt)
+        answer = _ANSWER
+        if "offer a separate project" in prompt:
+            target = self.init.cwd.parent / "chat-todo-app"
+            answer = (
+                "1. Create and register a separate Todo app.\n"
+                '<symphony-project-setup>{"choice": 1, "name": "Todo App", '
+                f'"path": "{target}"}}</symphony-project-setup>'
+            )
         await self._emit(EVENT_TURN_STARTED, {})
         if self.init.cfg.agent.kind == "prime-agent":
-            for text in ("Two files:", _ANSWER):
+            for text in ("Two files:", answer):
                 await self._emit(
                     EVENT_OTHER_MESSAGE,
                     {
@@ -519,7 +529,7 @@ class _FakeChatBackend:
         if self.init.cfg.agent.kind == "prime-agent":
             message = {
                 "role": "assistant",
-                "content": [{"type": "text", "text": _ANSWER}],
+                "content": [{"type": "text", "text": answer}],
             }
             await self._emit(
                 EVENT_OTHER_MESSAGE, {"type": "message_end", "message": message}
@@ -533,12 +543,12 @@ class _FakeChatBackend:
                 EVENT_OTHER_MESSAGE,
                 {
                     "type": "assistant",
-                    "message": {"content": [{"type": "text", "text": _ANSWER}]},
+                    "message": {"content": [{"type": "text", "text": answer}]},
                 },
             )
-            await self._emit(EVENT_TURN_COMPLETED, {"message": _ANSWER})
+            await self._emit(EVENT_TURN_COMPLETED, {"message": answer})
         return TurnResult(
-            status=EVENT_TURN_COMPLETED, turn_id="t", last_message=_ANSWER
+            status=EVENT_TURN_COMPLETED, turn_id="t", last_message=answer
         )
 
     async def stop(self) -> None:
@@ -632,9 +642,33 @@ def git_board_dir(tmp_path: Path) -> Path:
 
 @pytest_asyncio.fixture()
 async def git_web_base_url(
-    git_board_dir: Path, chat_backends: list[_FakeChatBackend]
+    git_board_dir: Path,
+    chat_backends: list[_FakeChatBackend],
+    monkeypatch: pytest.MonkeyPatch,
 ) -> AsyncIterator[str]:
     del chat_backends  # ordering only: patch the backend before the server runs
+
+    def create_project(
+        _registry: Any,
+        *,
+        name: str,
+        path: Path,
+        expected_target: Any | None = None,
+    ) -> Any:
+        assert expected_target is not None and expected_target.repo == path
+        return SimpleNamespace(
+            id="chat-todo-app",
+            name=name,
+            git_repo=str(path),
+            workflow=str(path / "WORKFLOW.md"),
+            host="127.0.0.1",
+            port=10000,
+        )
+
+    # This browser test proves the Chat UI/API handshake; the domain service's
+    # real Git/registry behavior is covered separately without a global fixture.
+    monkeypatch.setattr(webapi_module, "ProjectRegistry", lambda: object())
+    monkeypatch.setattr(webapi_module, "_create_or_adopt_registered_project", create_project)
     state = WorkflowState(git_board_dir / "WORKFLOW.md")
     cfg, err = state.reload()
     assert err is None and cfg is not None
@@ -832,6 +866,97 @@ async def _exercise_chat_reattach(
     await page.wait_for_function(
         "() => document.querySelectorAll('.chat-tab').length === 2"
     )
+
+
+async def test_chat_project_setup_browser_e2e(
+    git_web_base_url: str, git_board_dir: Path, chat_backends: list[_FakeChatBackend]
+) -> None:
+    assert async_playwright is not None
+    async with async_playwright() as p:
+        try:
+            browser = await p.chromium.launch()
+        except Exception as exc:
+            pytest.skip(f"Playwright Chromium unavailable: {exc}")
+        page = await browser.new_page(viewport={"width": 1440, "height": 960})
+        page_errors: list[str] = []
+        page.on("pageerror", lambda exc: page_errors.append(str(exc)))
+        try:
+            await page.goto(f"{git_web_base_url}/#/chat", wait_until="networkidle")
+            await page.locator(".chat-session-bar").wait_for()
+            await page.locator(".chat-mode-toggle").get_by_role(
+                "button", name="Edit", exact=True
+            ).click()
+            await page.locator(".chat-mode-btn.active", has_text="Edit").wait_for()
+            await page.locator(".chat-input").fill("offer a separate project")
+            await page.get_by_role("button", name="Send", exact=True).click()
+
+            card = page.locator(".chat-project-setup")
+            await card.wait_for()
+            assert "Todo App" in await card.inner_text()
+            assert "New directory" in await card.inner_text()
+            assert "symphony-project-setup" not in await page.locator(
+                ".chat-transcript"
+            ).inner_text()
+            await card.get_by_role("button", name="Select option 1").click()
+            await card.locator(
+                ".chat-project-setup-status", has_text="Registered"
+            ).wait_for()
+            listing = await (
+                await page.request.get(f"{git_web_base_url}/api/v1/chat/sessions")
+            ).json()
+            session_id = listing["active_id"]
+            snapshot = await (
+                await page.request.get(
+                    f"{git_web_base_url}/api/v1/chat/sessions/{session_id}"
+                )
+            ).json()
+            [action] = snapshot["project_setup_actions"]
+            assert action["status"] == "succeeded"
+            assert action["project"]["id"] == "chat-todo-app"
+            assert chat_backends[-1].turns[-1].endswith("offer a separate project")
+            # The registration action is distinct from filing a current-board ticket.
+            assert sorted(path.name for path in (git_board_dir / "kanban").iterdir()) == [
+                "E2E-1.md"
+            ]
+            assert page_errors == []
+        finally:
+            await browser.close()
+
+
+async def test_chat_pending_project_setup_card_disappears_after_stop(
+    git_web_base_url: str, chat_backends: list[_FakeChatBackend]
+) -> None:
+    assert async_playwright is not None
+    async with async_playwright() as p:
+        try:
+            browser = await p.chromium.launch()
+        except Exception as exc:
+            pytest.skip(f"Playwright Chromium unavailable: {exc}")
+        page = await browser.new_page(viewport={"width": 1440, "height": 960})
+        page_errors: list[str] = []
+        page.on("pageerror", lambda exc: page_errors.append(str(exc)))
+        try:
+            await page.goto(f"{git_web_base_url}/#/chat", wait_until="networkidle")
+            await page.locator(".chat-mode-toggle").get_by_role(
+                "button", name="Edit", exact=True
+            ).click()
+            await page.locator(".chat-mode-btn.active", has_text="Edit").wait_for()
+            await page.locator(".chat-input").fill("offer a separate project")
+            await page.get_by_role("button", name="Send", exact=True).click()
+            await page.locator(".chat-project-setup").wait_for()
+
+            await page.get_by_role("button", name="Stop").click()
+
+            await page.wait_for_function(
+                "() => document.querySelectorAll('.chat-project-setup').length === 0"
+            )
+            assert page_errors == []
+            assert any(
+                backend.turns and backend.turns[-1].endswith("offer a separate project")
+                for backend in chat_backends
+            )
+        finally:
+            await browser.close()
 
 
 async def test_web_git_and_chat_browser_e2e(
