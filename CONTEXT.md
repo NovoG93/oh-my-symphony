@@ -71,3 +71,15 @@ The delivery ticket named by an Application release contract. It can finish only
 ## Target commit
 
 The full Git commit SHA at the local configured branch tip that a Release verifier proves. Symphony does not fetch or infer a remote/deployed commit; evidence for any other local commit is stale.
+
+## Run attempt
+
+One durable dispatch lease for one issue execution, identified only by `run_id`. A Run attempt has one resolved agent kind, one workspace, one start time, and one terminal outcome. Continuation turns, phase changes, and in-process backend retries remain events within that attempt; a later redispatch after terminal exit acquires a new `run_id`. The nullable numeric `attempt` field is metadata, not identity.
+
+## Attempt event
+
+A bounded, redacted lifecycle fact attached to one Run attempt. Attempt events describe Symphony-controlled milestones such as acquisition, session start, turn completion, failure, retry, and completion. They are diagnostic summaries, not raw agent transcripts or authoritative workflow state.
+
+## Diagnostic bundle
+
+A downloadable JSON projection of one Run attempt and its retained Attempt events. It is size-bounded and redacted before persistence. A Diagnostic bundle is operational evidence for debugging, not a secret store, complete audit log, or replay protocol.

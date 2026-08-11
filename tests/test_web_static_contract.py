@@ -32,7 +32,7 @@ def test_web_board_defaults_to_active_lanes_with_terminal_group() -> None:
     assert "state.boardScope === 'all' ? columns : activeColumns(columns)" in js
     assert "function buildTerminalSectionEl(groups, live, readOnly)" in js
     assert "function buildAttentionBadge(attention)" in js
-    assert "getRuns: ({ issue, limit } = {})" in js
+    assert "getRuns: ({ issue, limit, query, status, agent } = {})" in js
     assert "putContinuousImprovement: (payload)" in js
     assert "getContinuousImprovementStatus: ()" in js
     assert "resetContinuousImprovementTurns: ()" in js
@@ -70,6 +70,25 @@ def test_web_board_defaults_to_active_lanes_with_terminal_group() -> None:
     assert ".ci-status-pill" in css
     assert ".mobile-lane-tabs" in css
     assert ".mobile-lane-tab.active" in css
+
+
+def test_web_runs_page_contract() -> None:
+    js = _script_bundle()
+    css = (STATIC_ROOT / "style.css").read_text(encoding="utf-8")
+    html = (STATIC_ROOT / "index.html").read_text(encoding="utf-8")
+
+    assert 'data-route="runs"' in html
+    assert "'runs'" in js.split("const ROUTES = ", 1)[1].split("\n", 1)[0]
+    assert "function renderRunsPage(container)" in js
+    assert "getRunDetail: (runId)" in js
+    assert "downloadRunDiagnostic: async (runId)" in js
+    assert "function buildRunTimeline(events)" in js
+    assert "runs-search" in js
+    assert "runs-status-filter" in js
+    assert "runs-agent-filter" in js
+    assert ".runs-layout" in css
+    assert ".run-attempt-row" in css
+    assert ".run-timeline" in css
 
 
 def test_web_git_page_contract() -> None:
@@ -144,7 +163,7 @@ def test_web_chat_page_contract() -> None:
 
     assert 'data-route="chat"' in html
     assert (
-        "const ROUTES = ['board', 'stats', 'workflow', 'git', 'chat', 'preview', 'settings']"
+        "const ROUTES = ['board', 'runs', 'stats', 'workflow', 'git', 'chat', 'preview', 'settings']"
         in js
     )
     assert "function renderChatPage(container)" in js

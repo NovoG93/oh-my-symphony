@@ -84,6 +84,7 @@ _BRANCH_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/-]{0,199}$")
 _COMMIT_RE = re.compile(r"^[0-9a-fA-F]{4,64}$")
 # `ChatManager` mints these as <UTC date>-<UTC time>-<6 hex>.
 _CHAT_SESSION_RE = re.compile(r"^\d{8}-\d{6}-[0-9a-f]{6}$")
+_RUN_ID_RE = re.compile(r"^[0-9a-f]{32}$")
 _MAX_TITLE = 300
 _MAX_BODY = 128_000
 _MAX_LABELS = 20
@@ -104,6 +105,18 @@ def _json_error(status: int, code: str, message: str) -> web.Response:
 # ---------------------------------------------------------------------------
 # request plumbing
 # ---------------------------------------------------------------------------
+
+
+def _request_is_loopback(request: web.Request) -> bool:
+    """Keep sensitive run diagnostics on the operator's local machine."""
+    remote = request.remote
+    if remote is None:
+        bind = str(request.app.get(BIND_HOST_KEY) or "127.0.0.1").lower()
+        return bind in _LOOPBACK_BINDS
+    try:
+        return ipaddress.ip_address(remote).is_loopback
+    except ValueError:
+        return False
 
 
 def _request_host(request: web.Request) -> str:
@@ -570,17 +583,74 @@ def _register_issue_routes(
     app: web.Application, ctx: _Ctx, orchestrator: Orchestrator
 ) -> None:
     async def handle_runs(request: web.Request) -> web.Response:
+        if not _request_is_loopback(request):
+            return _json_error(
+                403,
+                "run_diagnostics_local_only",
+                "run diagnostics are available only from the local machine",
+            )
         raw_limit = request.query.get("limit", "50")
         try:
             limit = clamp_run_history_limit(int(raw_limit))
         except (TypeError, ValueError):
             limit = clamp_run_history_limit(50)
         issue_id = request.query.get("issue") or None
-        runs, registry_error = orchestrator.recent_runs(issue_id=issue_id, limit=limit)
+        query = (request.query.get("query") or "").strip()[:300] or None
+        status = (request.query.get("status") or "").strip()[:100] or None
+        agent = (request.query.get("agent") or "").strip()[:100] or None
+        runs, registry_error = orchestrator.recent_runs(
+            issue_id=issue_id,
+            limit=limit,
+            query=query,
+            status=status,
+            agent=agent,
+        )
         payload: dict[str, Any] = {"runs": runs, "count": len(runs)}
         if registry_error:
             payload["registry_error"] = registry_error
-        return web.json_response(payload)
+        return web.json_response(payload, headers={"Cache-Control": "no-store"})
+
+    async def handle_run_detail(request: web.Request) -> web.Response:
+        if not _request_is_loopback(request):
+            return _json_error(
+                403,
+                "run_diagnostics_local_only",
+                "run diagnostics are available only from the local machine",
+            )
+        run_id = request.match_info["run_id"].strip()
+        if not _RUN_ID_RE.fullmatch(run_id):
+            return _json_error(400, "invalid_run_id", "run_id must be 32 lowercase hex characters")
+        detail, registry_error = orchestrator.run_detail(run_id)
+        if registry_error:
+            return _json_error(503, "run_registry_unavailable", registry_error)
+        if detail is None:
+            return _json_error(404, "run_not_found", f"unknown run {run_id}")
+        return web.json_response(detail, headers={"Cache-Control": "no-store"})
+
+    async def handle_run_diagnostic(request: web.Request) -> web.Response:
+        if not _request_is_loopback(request):
+            return _json_error(
+                403,
+                "run_diagnostics_local_only",
+                "run diagnostics are available only from the local machine",
+            )
+        run_id = request.match_info["run_id"].strip()
+        if not _RUN_ID_RE.fullmatch(run_id):
+            return _json_error(400, "invalid_run_id", "run_id must be 32 lowercase hex characters")
+        diagnostic, registry_error = orchestrator.run_diagnostic(run_id)
+        if registry_error:
+            return _json_error(503, "run_registry_unavailable", registry_error)
+        if diagnostic is None:
+            return _json_error(404, "run_not_found", f"unknown run {run_id}")
+        filename = f"symphony-run-{run_id}-diagnostic.json"
+        return web.json_response(
+            diagnostic,
+            headers={
+                "Content-Disposition": f'attachment; filename="{filename}"',
+                "Cache-Control": "no-store, private",
+                "X-Content-Type-Options": "nosniff",
+            },
+        )
 
     async def handle_board(_request: web.Request) -> web.Response:
         cfg = ctx.config()
@@ -830,6 +900,10 @@ def _register_issue_routes(
         )
 
     app.router.add_get("/api/v1/runs", _wrap(handle_runs))
+    app.router.add_get("/api/v1/runs/{run_id}", _wrap(handle_run_detail))
+    app.router.add_get(
+        "/api/v1/runs/{run_id}/diagnostic", _wrap(handle_run_diagnostic)
+    )
     app.router.add_get("/api/v1/board", _wrap(handle_board))
     app.router.add_post("/api/v1/issues", _wrap(handle_issue_create))
     app.router.add_get("/api/v1/issues/{identifier}", _wrap(handle_issue_detail))

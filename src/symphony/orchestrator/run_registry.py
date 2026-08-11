@@ -2,15 +2,23 @@
 
 from __future__ import annotations
 
+import json
 import os
 import sqlite3
 import uuid
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Callable, cast, overload
+from typing import Any, Callable, Mapping, cast, overload
 
 from ..issue import Issue
+from .diagnostics import (
+    MAX_DIAGNOSTIC_COUNTER,
+    MAX_EVENTS_PER_RUN,
+    MAX_RUNS_WITH_DIAGNOSTIC_EVENTS,
+    event_payload_json,
+    redact_text,
+)
 from .migrations import LATEST_SCHEMA_VERSION, apply_migrations, current_schema_version
 
 
@@ -27,6 +35,8 @@ class RunRecord:
     run_id: str
     issue_id: str
     identifier: str
+    title: str
+    state: str
     status: str
     workspace_path: Path
     lease_expires_at: datetime | None
@@ -40,6 +50,14 @@ class RunRecord:
     owner_pid: int | None = None
     owner_boot_id: str | None = None
     backend_agent_pid: int | None = None
+    input_tokens: int | None = None
+    cache_input_tokens: int | None = None
+    output_tokens: int | None = None
+    total_tokens: int | None = None
+    failure_class: str | None = None
+    failure_message: str | None = None
+    branch_name: str | None = None
+    commit_sha: str | None = None
 
 
 @dataclass(frozen=True)
@@ -194,8 +212,8 @@ class RunRegistry:
                     run_id, issue_id, identifier, title, state, attempt,
                     attempt_kind, agent_kind, workspace_path, status, started_at,
                     updated_at, lease_expires_at, last_progress_at, completed_at,
-                    owner_pid, owner_boot_id
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'active', ?, ?, ?, ?, NULL, ?, ?)
+                    owner_pid, owner_boot_id, branch_name
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'active', ?, ?, ?, ?, NULL, ?, ?, ?)
                 """,
                 (
                     run_id,
@@ -213,7 +231,19 @@ class RunRegistry:
                     _iso(now),
                     self._owner_pid,
                     self._boot_id,
+                    f"symphony/{issue.identifier}",
                 ),
+            )
+            self._append_attempt_event_best_effort_locked(
+                run_id=run_id,
+                event_type="run_acquired",
+                payload={
+                    "attempt": attempt,
+                    "attempt_kind": attempt_kind,
+                    "agent_kind": agent_kind,
+                    "state": issue.state,
+                },
+                now=now,
             )
             conn.execute("COMMIT")
             return run_id
@@ -299,17 +329,255 @@ class RunRegistry:
         run_id: str,
         status: str,
         now: datetime | None = None,
+        state: str | None = None,
+        input_tokens: int | None = None,
+        cache_input_tokens: int | None = None,
+        output_tokens: int | None = None,
+        total_tokens: int | None = None,
+        failure_class: str | None = None,
+        failure_message: str | None = None,
+        commit_sha: str | None = None,
     ) -> bool:
+        """Complete a run while preserving source compatibility for old callers.
+
+        The terminal status and lease release are authoritative. Explorer
+        summary fields and the completion event are best-effort inside a
+        savepoint, so malformed or unavailable telemetry cannot strand a run.
+        """
         now = _utc(now)
-        cur = self._connect().execute(
-            """
-            UPDATE runs
-            SET status = ?, updated_at = ?, completed_at = ?, lease_expires_at = NULL
-            WHERE issue_id = ? AND run_id = ?
-            """,
-            (status, _iso(now), _iso(now), issue_id, run_id),
+        conn = self._connect()
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            current = conn.execute(
+                "SELECT * FROM runs WHERE issue_id = ? AND run_id = ?",
+                (issue_id, run_id),
+            ).fetchone()
+            if current is None:
+                conn.execute("ROLLBACK")
+                return False
+            conn.execute(
+                """
+                UPDATE runs
+                SET status = ?, updated_at = ?, completed_at = ?,
+                    lease_expires_at = NULL
+                WHERE issue_id = ? AND run_id = ?
+                """,
+                (status, _iso(now), _iso(now), issue_id, run_id),
+            )
+            try:
+                conn.execute("SAVEPOINT run_diagnostic")
+            except Exception:
+                conn.execute("COMMIT")
+                return True
+            try:
+                values = {
+                    "state": state if state is not None else str(current["state"]),
+                    "input_tokens": _optional_nonnegative(
+                        input_tokens, current["input_tokens"]
+                    ),
+                    "cache_input_tokens": _optional_nonnegative(
+                        cache_input_tokens, current["cache_input_tokens"]
+                    ),
+                    "output_tokens": _optional_nonnegative(
+                        output_tokens, current["output_tokens"]
+                    ),
+                    "total_tokens": _optional_nonnegative(
+                        total_tokens, current["total_tokens"]
+                    ),
+                    "failure_class": (
+                        redact_text(failure_class, 256) if failure_class else None
+                    ),
+                    "failure_message": (
+                        redact_text(failure_message) if failure_message else None
+                    ),
+                    "commit_sha": _valid_sha(commit_sha) or current["commit_sha"],
+                }
+                conn.execute(
+                    """
+                    UPDATE runs
+                    SET state = ?, input_tokens = ?, cache_input_tokens = ?,
+                        output_tokens = ?, total_tokens = ?, failure_class = ?,
+                        failure_message = ?, commit_sha = ?
+                    WHERE issue_id = ? AND run_id = ?
+                    """,
+                    (
+                        values["state"],
+                        values["input_tokens"],
+                        values["cache_input_tokens"],
+                        values["output_tokens"],
+                        values["total_tokens"],
+                        values["failure_class"],
+                        values["failure_message"],
+                        values["commit_sha"],
+                        issue_id,
+                        run_id,
+                    ),
+                )
+                self._append_attempt_event_locked(
+                    run_id=run_id,
+                    event_type="run_completed",
+                    payload={"status": status, **values},
+                    now=now,
+                )
+                self._prune_terminal_diagnostics_locked()
+            except Exception:
+                conn.execute("ROLLBACK TO run_diagnostic")
+            finally:
+                conn.execute("RELEASE run_diagnostic")
+            conn.execute("COMMIT")
+            return True
+        except Exception:
+            conn.execute("ROLLBACK")
+            raise
+
+    def append_attempt_event(
+        self,
+        *,
+        run_id: str,
+        event_type: str,
+        payload: Mapping[str, Any] | None = None,
+        now: datetime | None = None,
+    ) -> bool:
+        """Append one bounded event without waiting behind authoritative writers."""
+        now = _utc(now)
+        conn = self._connect()
+        row = conn.execute("PRAGMA busy_timeout").fetchone()
+        prior_busy_timeout_ms = int(row[0]) if row is not None else 0
+        began = False
+        try:
+            # This method is observational and runs on the asyncio control
+            # thread. Drop on cross-process contention instead of delaying
+            # worker events or authoritative lease heartbeats for up to 5s.
+            conn.execute("PRAGMA busy_timeout = 0")
+            conn.execute("BEGIN IMMEDIATE")
+            began = True
+            owned = conn.execute(
+                """
+                SELECT status, owner_pid, owner_boot_id
+                FROM runs WHERE run_id = ?
+                """,
+                (run_id,),
+            ).fetchone()
+            if (
+                owned is None
+                or str(owned["status"]) != "active"
+                or owned["owner_pid"] != self._owner_pid
+                or owned["owner_boot_id"] != self._boot_id
+            ):
+                conn.execute("ROLLBACK")
+                began = False
+                return False
+            normalized_json = event_payload_json(event_type, payload)
+            self._append_attempt_event_locked(
+                run_id=run_id,
+                event_type=event_type,
+                payload_json=normalized_json,
+                now=now,
+            )
+            if event_type in {"turn_completed", "workspace_updated"}:
+                normalized = json.loads(normalized_json)
+                assignments: list[str] = []
+                values: list[Any] = []
+                for field in (
+                    "input_tokens",
+                    "cache_input_tokens",
+                    "output_tokens",
+                    "total_tokens",
+                ):
+                    if field in normalized:
+                        assignments.append(f"{field} = ?")
+                        values.append(normalized[field])
+                if normalized.get("commit_sha"):
+                    assignments.append("commit_sha = ?")
+                    values.append(normalized["commit_sha"])
+                if assignments:
+                    values.append(run_id)
+                    conn.execute(
+                        f"UPDATE runs SET {', '.join(assignments)} WHERE run_id = ?",
+                        values,
+                    )
+            conn.execute("COMMIT")
+            began = False
+            return True
+        except Exception:
+            if began and conn.in_transaction:
+                conn.execute("ROLLBACK")
+            raise
+        finally:
+            conn.execute(f"PRAGMA busy_timeout = {prior_busy_timeout_ms}")
+
+    def _append_attempt_event_locked(
+        self,
+        *,
+        run_id: str,
+        event_type: str,
+        now: datetime,
+        payload: Mapping[str, Any] | None = None,
+        payload_json: str | None = None,
+    ) -> None:
+        encoded = payload_json if payload_json is not None else event_payload_json(event_type, payload)
+        conn = self._connect()
+        conn.execute(
+            "INSERT INTO attempt_events(run_id, event_type, created_at, payload_json) VALUES (?, ?, ?, ?)",
+            (run_id, event_type, _iso(now), encoded),
         )
-        return cur.rowcount > 0
+        conn.execute(
+            """
+            DELETE FROM attempt_events
+            WHERE run_id = ? AND event_id NOT IN (
+                SELECT event_id FROM attempt_events
+                WHERE run_id = ? ORDER BY event_id DESC LIMIT ?
+            )
+            """,
+            (run_id, run_id, MAX_EVENTS_PER_RUN),
+        )
+
+    def _append_attempt_event_best_effort_locked(
+        self,
+        *,
+        run_id: str,
+        event_type: str,
+        now: datetime,
+        payload: Mapping[str, Any] | None = None,
+        prune_terminal: bool = False,
+    ) -> None:
+        """Fence optional telemetry so it cannot roll back an owning transaction."""
+        conn = self._connect()
+        try:
+            conn.execute("SAVEPOINT run_diagnostic")
+        except Exception:
+            return
+        try:
+            self._append_attempt_event_locked(
+                run_id=run_id,
+                event_type=event_type,
+                payload=payload,
+                now=now,
+            )
+            if prune_terminal:
+                self._prune_terminal_diagnostics_locked()
+        except Exception:
+            conn.execute("ROLLBACK TO run_diagnostic")
+        finally:
+            conn.execute("RELEASE run_diagnostic")
+
+    def _prune_terminal_diagnostics_locked(self) -> None:
+        """Keep events/excerpts only for the newest bounded terminal run set."""
+        conn = self._connect()
+        stale = """
+            SELECT run_id FROM runs
+            WHERE status NOT IN ('active', 'reclaiming')
+            ORDER BY completed_at DESC, rowid DESC
+            LIMIT -1 OFFSET ?
+        """
+        conn.execute(
+            f"DELETE FROM attempt_events WHERE run_id IN ({stale})",
+            (MAX_RUNS_WITH_DIAGNOSTIC_EVENTS,),
+        )
+        conn.execute(
+            f"UPDATE runs SET failure_message = NULL WHERE run_id IN ({stale})",
+            (MAX_RUNS_WITH_DIAGNOSTIC_EVENTS,),
+        )
 
     def has_active_lease(self, issue_id: str, now: datetime | None = None) -> bool:
         now = _utc(now)
@@ -1332,16 +1600,31 @@ class RunRegistry:
     ) -> bool:
         """Release a reclaim fence after external process cleanup completes."""
         now = _utc(now)
-        cur = self._connect().execute(
-            """
-            UPDATE runs
-            SET status = 'orphaned', updated_at = ?, completed_at = ?,
-                lease_expires_at = NULL
-            WHERE run_id = ? AND status = 'reclaiming'
-            """,
-            (_iso(now), _iso(now), run_id),
-        )
-        return cur.rowcount > 0
+        conn = self._connect()
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            cur = conn.execute(
+                """
+                UPDATE runs
+                SET status = 'orphaned', updated_at = ?, completed_at = ?,
+                    lease_expires_at = NULL, failure_class = 'orphaned'
+                WHERE run_id = ? AND status = 'reclaiming'
+                """,
+                (_iso(now), _iso(now), run_id),
+            )
+            if cur.rowcount:
+                self._append_attempt_event_best_effort_locked(
+                    run_id=run_id,
+                    event_type="run_completed",
+                    payload={"status": "orphaned", "failure_class": "orphaned"},
+                    now=now,
+                    prune_terminal=True,
+                )
+            conn.execute("COMMIT")
+            return cur.rowcount > 0
+        except Exception:
+            conn.execute("ROLLBACK")
+            raise
 
     def get_run(self, run_id: str) -> RunRecord:
         row = self._connect().execute(
@@ -1353,30 +1636,77 @@ class RunRegistry:
         return _record(row)
 
     def recent_runs(
-        self, issue_id: str | None = None, limit: int = 50
+        self,
+        issue_id: str | None = None,
+        limit: int = 50,
+        *,
+        query: str | None = None,
+        status: str | None = None,
+        agent: str | None = None,
     ) -> list[RunRecord]:
-        """Return newest run rows, clamping limit into [1, 200]."""
+        """Return newest rows with optional, backwards-compatible filters."""
         limit = clamp_run_history_limit(limit)
+        clauses: list[str] = []
+        params: list[Any] = []
         if issue_id:
-            rows = self._connect().execute(
-                """
-                SELECT * FROM runs
-                WHERE issue_id = ? OR identifier = ?
-                ORDER BY rowid DESC
-                LIMIT ?
-                """,
-                (issue_id, issue_id, limit),
-            ).fetchall()
-        else:
-            rows = self._connect().execute(
-                """
-                SELECT * FROM runs
-                ORDER BY rowid DESC
-                LIMIT ?
-                """,
-                (limit,),
-            ).fetchall()
+            clauses.append("(issue_id = ? OR identifier = ?)")
+            params.extend((issue_id, issue_id))
+        if query:
+            escaped = _like_pattern(query)
+            clauses.append(
+                "(issue_id LIKE ? ESCAPE '\\' OR identifier LIKE ? ESCAPE '\\' "
+                "OR title LIKE ? ESCAPE '\\' OR agent_kind LIKE ? ESCAPE '\\' "
+                "OR status LIKE ? ESCAPE '\\')"
+            )
+            params.extend((escaped, escaped, escaped, escaped, escaped))
+        if status:
+            clauses.append("status = ?")
+            params.append(status)
+        if agent:
+            clauses.append("agent_kind = ?")
+            params.append(agent)
+        where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+        params.append(limit)
+        rows = self._connect().execute(
+            f"SELECT * FROM runs {where} ORDER BY rowid DESC LIMIT ?",
+            params,
+        ).fetchall()
         return [_record(row) for row in rows]
+
+    def run_events(self, run_id: str) -> list[dict[str, Any]]:
+        rows = self._connect().execute(
+            """
+            SELECT event_id, event_type, created_at, payload_json
+            FROM attempt_events WHERE run_id = ? ORDER BY event_id
+            """,
+            (run_id,),
+        ).fetchall()
+        return [
+            {
+                "event_id": int(row["event_id"]),
+                "event_type": str(row["event_type"]),
+                "created_at": str(row["created_at"]),
+                "payload": json.loads(str(row["payload_json"])),
+            }
+            for row in rows
+        ]
+
+    def run_detail(self, run_id: str) -> dict[str, Any]:
+        """Read summary and events from one SQLite snapshot."""
+        conn = self._connect()
+        conn.execute("BEGIN")
+        try:
+            record = self.get_run(run_id)
+            events = self.run_events(run_id)
+            conn.execute("COMMIT")
+            return {"run": _run_summary(record), "events": events}
+        except Exception:
+            conn.execute("ROLLBACK")
+            raise
+
+    def diagnostic_json(self, run_id: str) -> dict[str, Any]:
+        detail = self.run_detail(run_id)
+        return {"schema_version": 1, **detail}
 
     def get_issue_flags(self, issue_id: str) -> IssueFlags | None:
         row = self._connect().execute(
@@ -1557,17 +1887,96 @@ class RunRegistry:
         ).fetchone()
 
     def _expire_stale_locked(self, now: datetime) -> int:
-        cur = self._connect().execute(
+        conn = self._connect()
+        expired = conn.execute(
+            """
+            SELECT run_id FROM runs
+            WHERE status = 'active'
+              AND lease_expires_at IS NOT NULL
+              AND lease_expires_at <= ?
+            ORDER BY rowid
+            """,
+            (_iso(now),),
+        ).fetchall()
+        cur = conn.execute(
             """
             UPDATE runs
-            SET status = 'expired', updated_at = ?, completed_at = ?
+            SET status = 'expired', updated_at = ?, completed_at = ?,
+                lease_expires_at = NULL, failure_class = 'lease_expired'
             WHERE status = 'active'
               AND lease_expires_at IS NOT NULL
               AND lease_expires_at <= ?
             """,
             (_iso(now), _iso(now), _iso(now)),
         )
+        for index, row in enumerate(expired):
+            self._append_attempt_event_best_effort_locked(
+                run_id=str(row["run_id"]),
+                event_type="run_completed",
+                payload={
+                    "status": "expired",
+                    "failure_class": "lease_expired",
+                },
+                now=now,
+                prune_terminal=index == len(expired) - 1,
+            )
         return cur.rowcount
+
+
+def _optional_nonnegative(value: int | None, fallback: Any = None) -> int | None:
+    if value is None and fallback is None:
+        return None
+    return _nonnegative(value, fallback)
+
+
+def _nonnegative(value: int | None, fallback: Any = 0) -> int:
+    candidate = fallback if value is None else value
+    try:
+        return min(max(int(candidate or 0), 0), MAX_DIAGNOSTIC_COUNTER)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _valid_sha(value: str | None) -> str | None:
+    if value is None:
+        return None
+    candidate = str(value).strip().lower()
+    if 4 <= len(candidate) <= 64 and all(char in "0123456789abcdef" for char in candidate):
+        return candidate
+    return None
+
+
+def _like_pattern(value: str) -> str:
+    escaped = value.strip().lower().replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+    return f"%{escaped}%"
+
+
+def _run_summary(record: RunRecord) -> dict[str, Any]:
+    return {
+        "run_id": record.run_id,
+        "issue_id": record.issue_id,
+        "identifier": record.identifier,
+        "title": record.title,
+        "state": record.state,
+        "attempt": record.attempt,
+        "attempt_kind": record.attempt_kind,
+        "agent_kind": record.agent_kind,
+        "status": record.status,
+        "started_at": _iso(record.started_at),
+        "updated_at": _iso(record.updated_at),
+        "completed_at": _iso(record.completed_at),
+        "workspace_path": str(record.workspace_path),
+        "branch_name": record.branch_name or f"symphony/{record.identifier}",
+        "commit_sha": record.commit_sha,
+        "tokens": {
+            "input": record.input_tokens,
+            "cache": record.cache_input_tokens,
+            "output": record.output_tokens,
+            "total": record.total_tokens,
+        },
+        "failure_class": record.failure_class,
+        "failure_message": record.failure_message,
+    }
 
 
 def _utc(value: datetime | None) -> datetime:
@@ -1605,6 +2014,8 @@ def _record(row: sqlite3.Row) -> RunRecord:
         run_id=str(row["run_id"]),
         issue_id=str(row["issue_id"]),
         identifier=str(row["identifier"]),
+        title=str(row["title"]),
+        state=str(row["state"]),
         status=str(row["status"]),
         workspace_path=Path(str(row["workspace_path"])),
         lease_expires_at=_parse(row["lease_expires_at"]),
@@ -1620,6 +2031,14 @@ def _record(row: sqlite3.Row) -> RunRecord:
         backend_agent_pid=(
             int(backend_agent_pid) if backend_agent_pid is not None else None
         ),
+        input_tokens=(int(row["input_tokens"]) if row["input_tokens"] is not None else None),
+        cache_input_tokens=(int(row["cache_input_tokens"]) if row["cache_input_tokens"] is not None else None),
+        output_tokens=(int(row["output_tokens"]) if row["output_tokens"] is not None else None),
+        total_tokens=(int(row["total_tokens"]) if row["total_tokens"] is not None else None),
+        failure_class=str(row["failure_class"]) if row["failure_class"] else None,
+        failure_message=str(row["failure_message"]) if row["failure_message"] else None,
+        branch_name=str(row["branch_name"]) if row["branch_name"] else None,
+        commit_sha=str(row["commit_sha"]) if row["commit_sha"] else None,
     )
 
 
