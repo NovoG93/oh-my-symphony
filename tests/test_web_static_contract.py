@@ -428,3 +428,23 @@ def test_web_project_switcher_and_management_contract() -> None:
     assert ".project-paths dd:focus-visible::after" in css
     assert "content: attr(data-full-path)" in css
     assert ".project-selector { font-size: 0;" not in css
+
+
+def test_board_request_view_ships_accessible_explainable_schedule_contract() -> None:
+    js = _script_bundle()
+    css = (STATIC_ROOT / "style.css").read_text(encoding="utf-8")
+
+    assert "boardView: 'lanes'" in js
+    assert "getRequests: () => apiRequest('/requests')" in js
+    assert "getRequestSchedule: (kind, id)" in js
+    assert "new URLSearchParams({ kind, id })" in js
+    assert "function renderRequestView(scrollEl)" in js
+    assert "function buildScheduleNode(node, index)" in js
+    assert "t('schedule.invalidExecutionOrder')" in js
+    assert "'aria-busy': state.requestLoading ? 'true' : 'false'" in js
+    assert "Request schedule" in js
+    assert "요청 스케줄" in js
+    assert "available only for file boards" in js
+    assert "파일 보드에서만 지원" in js
+    assert ".request-node-main:focus-visible" in css
+    assert ".schedule-details-list" in css

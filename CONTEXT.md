@@ -91,3 +91,19 @@ A private, host-owned recovery fact recorded only after a worker turn completes.
 ## Durable continuation
 
 A new Run attempt that succeeds an interrupted Run attempt from its latest eligible Continuation checkpoint. Symphony first confirms that the predecessor no longer owns a live worker, then gives exactly one successor the checkpoint. Durable continuation preserves completed progress but does not promise exactly-once execution of an interrupted turn.
+
+## Request DAG
+
+A dependency graph rooted at tickets carrying the same explicit, non-empty `request` value. Its read-only execution projection includes the transitive prerequisite closure even when a blocker belongs to another request; grouping metadata never hides a real dependency edge. A ticket without a request belongs to a standalone request group, and malformed cycles are reported as invalid rather than presented as an executable order.
+
+## Scheduling policy
+
+The configured ordering rule applied after eligibility and starvation recovery. `fifo` preserves ticket registration order. `dag` orders non-starved candidates by declared priority, remaining downstream Critical path, then registration order. A Scheduling policy never bypasses an unresolved dependency or another dispatch-safety gate.
+
+## Queue forecast
+
+A deterministic projection of current scheduler order, dispatch position, and dependency wave. It explains the present board snapshot and does not predict wall-clock completion time.
+
+## Critical path
+
+The longest remaining downstream dependency chain from a ticket through active work. In DAG scheduling it is a tie-breaker after declared priority, so work that unlocks a longer chain is preferred without overriding starvation recovery.

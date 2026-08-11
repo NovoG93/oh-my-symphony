@@ -998,7 +998,10 @@ only). From the browser you can:
   skip Document for tickets that do not need wiki write-back. The board defaults
   to the four active agent lanes; `Human Review`, `Done`, `Blocked`, and
   `Archive` stay visible in the compact **Review and parked** group until
-  you switch to `All`.
+  you switch to `All`. Switch from **Lanes** to **Request** for a read-only,
+  scheduler-authored dependency execution list with queue ranks, waves, capacity
+  waits, retry ownership, and final dispatch refusals. Full request graphs are
+  file-board-only; Linear/Jira show an explicit unsupported state.
 - **Workflow** — add / delete / rename / reorder kanban columns and edit
   each column's stage prompt. Changes write back into `WORKFLOW.md`
   frontmatter with your comments preserved; tickets in renamed or removed
@@ -1025,6 +1028,8 @@ JSON API endpoints:
 | GET    | `/api/v1/health`                  | Tick-loop / tracker / run-registry health    |
 | GET    | `/api/v1/state`                   | Snapshot — running, retrying, totals, limits |
 | GET    | `/api/v1/board`                   | Columns + issues + live run info             |
+| GET    | `/api/v1/requests`                | Request groups + scheduler summary (file board) |
+| GET    | `/api/v1/requests/{id}/schedule` | Read-only dependency graph + consumed scheduler decisions |
 | GET    | `/api/v1/runs?issue=&limit=&query=&status=&agent=` | Search/filter run attempts       |
 | GET    | `/api/v1/runs/{run_id}`           | Bounded run metadata and lifecycle timeline  |
 | GET    | `/api/v1/runs/{run_id}/diagnostic`| Download redacted diagnostic JSON            |

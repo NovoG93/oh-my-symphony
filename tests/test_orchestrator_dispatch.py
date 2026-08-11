@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import json
 import os
 import shutil
 import subprocess
@@ -8160,6 +8161,273 @@ def test_g2_empty_response_loop_does_not_block_phase_transitions(
     assert not orch.is_paused(issue.id)
     debug = orch._issue_debug.get(issue.id)
     assert debug is None or "empty_response_loop" not in (debug.last_error or "")
+
+
+@pytest.mark.parametrize(
+    ("policy", "expected_dispatches"),
+    (("fifo", ["TKT-001"]), ("dag", [])),
+)
+def test_oversized_dependency_graph_degrades_without_unbounded_analysis(
+    monkeypatch, policy, expected_dispatches
+):
+    cfg = _make_config(
+        max_concurrent=2,
+        tracker_kind="file",
+        auto_triage_actionable_todo=False,
+    )
+    cfg = replace(cfg, agent=replace(cfg.agent, scheduling_policy=policy))
+    issues = [_issue("TKT-001", state="Todo"), _issue("TKT-002", state="Todo")]
+    orch = _orch()
+    monkeypatch.setattr(orch._workflow_state, "reload", lambda: (cfg, None))
+    monkeypatch.setattr(core_module, "MAX_DEPENDENCY_NODES", 1)
+    monkeypatch.setattr(
+        core_module,
+        "analyze_dependencies",
+        lambda _issues: pytest.fail("oversized graph must not be analyzed"),
+    )
+    dispatched: list[str] = []
+
+    async def _fetch(_cfg):
+        return issues
+
+    async def _archive(_cfg):
+        return None
+
+    def _dispatch(issue, _cfg, *, attempt, attempt_kind=None):
+        del attempt, attempt_kind
+        dispatched.append(issue.identifier)
+        return True
+
+    monkeypatch.setattr(orch, "_fetch_candidates", _fetch)
+    monkeypatch.setattr(orch, "_archive_sweep", _archive)
+    monkeypatch.setattr(orch, "_dispatch", _dispatch)
+    monkeypatch.setattr(
+        orch, "_available_slots", lambda _cfg: 0 if dispatched else 1
+    )
+
+    asyncio.run(orch._on_tick())
+
+    assert dispatched == expected_dispatches
+    snapshot = orch.schedule_snapshot()
+    assert snapshot["available"] is False
+    assert snapshot["reason"] == "schedule_graph_too_large"
+    assert snapshot["entries"] == []
+
+
+def test_schedule_snapshot_never_exposes_retry_error_or_private_session(monkeypatch):
+    cfg = _make_config(tracker_kind="file")
+    issue = _issue("TKT-PRIVATE", state="Todo")
+    orch = _orch()
+    monkeypatch.setattr(orch._workflow_state, "reload", lambda: (cfg, None))
+
+    async def _run():
+        orch._loop = asyncio.get_running_loop()
+        orch._schedule_retry(
+            issue.id,
+            identifier=issue.identifier,
+            attempt=1,
+            delay_ms=60_000,
+            error="backend failed private-session-abc /Users/operator/secret",
+        )
+
+        async def _fetch(_cfg):
+            return [issue]
+
+        async def _archive(_cfg):
+            return None
+
+        monkeypatch.setattr(orch, "_fetch_candidates", _fetch)
+        monkeypatch.setattr(orch, "_archive_sweep", _archive)
+        await orch._on_tick()
+        for retry in orch._retry.values():
+            retry.timer_handle.cancel()
+
+    asyncio.run(_run())
+    encoded = json.dumps(orch.schedule_snapshot())
+    assert "private-session-abc" not in encoded
+    assert "/Users/operator/secret" not in encoded
+    assert "owned by the retry timer" in encoded
+
+
+def test_incomplete_scheduler_pass_marks_previous_snapshot_stale(monkeypatch):
+    cfg = _make_config(tracker_kind="file")
+    orch = _orch()
+    orch._schedule_snapshot = {
+        "schema_version": 1,
+        "available": True,
+        "reason": None,
+        "generated_at": "2026-01-01T00:00:00Z",
+        "stale": False,
+        "entries": [],
+    }
+    monkeypatch.setattr(orch._workflow_state, "reload", lambda: (cfg, None))
+
+    async def _fail(_cfg):
+        raise RuntimeError("safety sweep failed")
+
+    monkeypatch.setattr(orch, "_auto_reopen_sources_from_resolved_rcas", _fail)
+    asyncio.run(orch._on_tick())
+
+    snapshot = orch.schedule_snapshot()
+    assert snapshot["stale"] is True
+    assert snapshot["reason"] == "scheduler_pass_incomplete"
+
+
+@pytest.mark.parametrize("prefix_kind", ("running", "retry"))
+def test_capacity_break_closes_mutating_scan_after_owned_prefix(
+    monkeypatch, prefix_kind
+):
+    cfg = _make_config(
+        max_concurrent=1,
+        tracker_kind="file",
+        active_states=("Todo", "In Progress"),
+    )
+    prefix_issue = _issue("TKT-001", state="In Progress")
+    actionable = _issue("TKT-002", state="Todo")
+    orch = _orch()
+    monkeypatch.setattr(orch._workflow_state, "reload", lambda: (cfg, None))
+    monkeypatch.setattr(orch, "_heartbeat_running_leases", lambda: None)
+    triaged: list[str] = []
+
+    async def _fetch(_cfg):
+        return [prefix_issue, actionable]
+
+    async def _archive(_cfg):
+        return None
+
+    async def _reconcile(_cfg):
+        return None
+
+    async def _triage(issue, _cfg):
+        triaged.append(issue.identifier)
+        return issue.identifier == actionable.identifier
+
+    monkeypatch.setattr(orch, "_fetch_candidates", _fetch)
+    monkeypatch.setattr(orch, "_archive_sweep", _archive)
+    monkeypatch.setattr(orch, "_reconcile_running", _reconcile)
+    monkeypatch.setattr(orch, "_auto_triage_todo_if_actionable", _triage)
+    monkeypatch.setattr(orch, "_available_slots", lambda _cfg: 0)
+
+    async def _run():
+        if prefix_kind == "running":
+            orch._running[prefix_issue.id] = RunningEntry(
+                issue=prefix_issue,
+                started_at=datetime.now(timezone.utc),
+                retry_attempt=None,
+                worker_task=None,  # type: ignore[arg-type]
+                workspace_path=Path("/tmp"),
+            )
+        else:
+            orch._loop = asyncio.get_running_loop()
+            orch._schedule_retry(
+                prefix_issue.id,
+                identifier=prefix_issue.identifier,
+                attempt=1,
+                delay_ms=60_000,
+                error="retry",
+            )
+        await orch._on_tick()
+        for retry in orch._retry.values():
+            retry.timer_handle.cancel()
+
+    asyncio.run(_run())
+
+    assert triaged == ["TKT-001"]
+
+
+def test_schedule_forecast_has_no_tracker_side_effects_after_capacity_break(
+    monkeypatch,
+):
+    cfg = _make_config(
+        max_concurrent=1,
+        tracker_kind="file",
+        active_states=("Todo", "In Progress"),
+    )
+    issues = [_issue(f"TKT-00{n}", state="Todo") for n in (1, 2, 3)]
+    orch = _orch()
+    monkeypatch.setattr(orch._workflow_state, "reload", lambda: (cfg, None))
+    triaged: list[str] = []
+
+    async def _fetch(_cfg):
+        return issues
+
+    async def _archive(_cfg):
+        return None
+
+    async def _triage(issue, _cfg):
+        triaged.append(issue.identifier)
+        return issue.identifier != "TKT-001"
+
+    monkeypatch.setattr(orch, "_fetch_candidates", _fetch)
+    monkeypatch.setattr(orch, "_archive_sweep", _archive)
+    monkeypatch.setattr(orch, "_auto_triage_todo_if_actionable", _triage)
+    monkeypatch.setattr(orch, "_available_slots", lambda _cfg: 0)
+
+    asyncio.run(orch._on_tick())
+
+    assert triaged == ["TKT-001"]
+    assert [row["identifier"] for row in orch.schedule_snapshot()["entries"]] == [
+        "TKT-001",
+        "TKT-002",
+        "TKT-003",
+    ]
+
+
+def test_dag_policy_snapshot_order_matches_consumed_dispatch_order(monkeypatch):
+    cfg = _make_config(
+        max_concurrent=1,
+        tracker_kind="file",
+        active_states=("Todo", "In Progress"),
+        auto_triage_actionable_todo=False,
+    )
+    cfg = replace(cfg, agent=replace(cfg.agent, scheduling_policy="dag"))
+    root = replace(_issue("TKT-020", state="Todo"), priority=1)
+    leaf = replace(
+        _issue("TKT-021", state="Todo"),
+        priority=1,
+        blocked_by=(
+            BlockerRef(id=root.id, identifier=root.identifier, state="Todo"),
+        ),
+    )
+    urgent = replace(_issue("TKT-030", state="Todo"), priority=0)
+    orch = _orch()
+    monkeypatch.setattr(orch._workflow_state, "reload", lambda: (cfg, None))
+    dispatched: list[str] = []
+
+    async def _fetch(_cfg):
+        return [leaf, root, urgent]
+
+    async def _archive(_cfg):
+        return None
+
+    def _dispatch(issue, _cfg, *, attempt, attempt_kind=None):
+        del attempt, attempt_kind
+        dispatched.append(issue.identifier)
+        return True
+
+    monkeypatch.setattr(orch, "_fetch_candidates", _fetch)
+    monkeypatch.setattr(orch, "_archive_sweep", _archive)
+    monkeypatch.setattr(orch, "_dispatch", _dispatch)
+    monkeypatch.setattr(
+        orch, "_available_slots", lambda _cfg: 0 if dispatched else 1
+    )
+
+    asyncio.run(orch._on_tick())
+
+    snapshot = orch.schedule_snapshot()
+    assert dispatched == ["TKT-030"]
+    assert snapshot["policy"] == "dag"
+    assert snapshot["entries"][0]["identifier"] == dispatched[0]
+    assert snapshot["entries"][0]["dispatch_outcome"] == "started"
+    root_entry = next(
+        row for row in snapshot["entries"] if row["identifier"] == "TKT-020"
+    )
+    assert root_entry["queue_rank"] == 2
+    assert root_entry["code"] == "waiting_global_capacity"
+    leaf_entry = next(
+        row for row in snapshot["entries"] if row["identifier"] == "TKT-021"
+    )
+    assert leaf_entry["code"] == "waiting_dependency"
 
 
 def test_g3_wait_age_bumps_starved_recovered_ticket_ahead_of_fifo(monkeypatch):

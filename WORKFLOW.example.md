@@ -192,6 +192,10 @@ agent:
   # Continue interrupted work from the latest completed turn after a confirmed
   # process cleanup. Set false to force a fresh agent session after restart.
   crash_continuation: true
+  # Dispatch ordering: fifo preserves registration order; dag is opt-in and
+  # ranks by priority, longest downstream dependency chain, then registration.
+  # Starvation promotion always remains first.
+  scheduling_policy: fifo
   # Hard token ceiling by workflow state. The global cap is the default for
   # Document; In Progress and Verify get larger build/verification budgets.
   max_total_tokens: 100000000
