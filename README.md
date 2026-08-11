@@ -1007,6 +1007,10 @@ only). From the browser you can:
   (see [Chat intake](#chat-intake--type-a-request-the-board-delivers)).
 - **Preview** — start, restart, or stop a loopback-only product preview from
   a detached target-branch checkout, with a health check, URL, and bounded logs.
+- **Runs** — search and filter recorded attempts; inspect bounded, redacted
+  lifecycle timelines, token usage, workspace/branch/commit references, and
+  download a diagnostic JSON bundle. Because this surface includes local paths
+  and failure excerpts, its API is available only to loopback clients.
 - **Stats** — tokens per day, throughput, per-column dwell time, per-agent
   totals, average cycle time (from `.symphony/stats.jsonl`).
 - **Settings** — branch policy (feature base / merge target) from a real
@@ -1019,7 +1023,9 @@ JSON API endpoints:
 | GET    | `/api/v1/health`                  | Tick-loop / tracker / run-registry health    |
 | GET    | `/api/v1/state`                   | Snapshot — running, retrying, totals, limits |
 | GET    | `/api/v1/board`                   | Columns + issues + live run info             |
-| GET    | `/api/v1/runs?issue=&limit=`      | Recent run attempts from the registry        |
+| GET    | `/api/v1/runs?issue=&limit=&query=&status=&agent=` | Search/filter run attempts       |
+| GET    | `/api/v1/runs/{run_id}`           | Bounded run metadata and lifecycle timeline  |
+| GET    | `/api/v1/runs/{run_id}/diagnostic`| Download redacted diagnostic JSON            |
 | POST/PATCH/DELETE | `/api/v1/issues[...]`  | Issue CRUD (file tracker)                    |
 | PUT    | `/api/v1/workflow/states`         | Column add / delete / rename / reorder       |
 | GET/PUT| `/api/v1/workflow/prompts/<state>`| Read / edit a column's stage prompt          |

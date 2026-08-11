@@ -1,13 +1,16 @@
 from __future__ import annotations
 
+import json
 import sqlite3
 import threading
+import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import pytest
 
 import symphony.orchestrator.migrations as migration_mod
+import symphony.orchestrator.run_registry as run_registry_mod
 from symphony.issue import Issue
 from symphony.orchestrator.run_registry import ReleaseGate, RunRegistry
 
@@ -141,7 +144,10 @@ def test_run_registry_expires_stale_lease_before_reclaim(tmp_path: Path) -> None
     )
     assert second_run
     assert second_run != first_run
-    assert registry.get_run(first_run).status == "expired"
+    expired = registry.get_run(first_run)
+    assert expired.status == "expired"
+    assert expired.failure_class == "lease_expired"
+    assert registry.run_events(first_run)[-1]["event_type"] == "run_completed"
     assert registry.get_run(second_run).status == "active"
 
 
@@ -771,7 +777,10 @@ def test_run_registry_reclaims_dead_owner_lease_before_ttl(tmp_path: Path) -> No
     )
     assert fresh.finalize_reclaimed_lease(run_id, now=now + timedelta(seconds=4))
     assert fresh.has_active_lease(issue.id, now=now + timedelta(seconds=5)) is False
-    assert fresh.get_run(run_id).status == "orphaned"
+    orphaned = fresh.get_run(run_id)
+    assert orphaned.status == "orphaned"
+    assert orphaned.failure_class == "orphaned"
+    assert fresh.run_events(run_id)[-1]["event_type"] == "run_completed"
 
 
 def test_run_registry_retries_interrupted_reclaim_after_reopen(tmp_path: Path) -> None:
@@ -977,7 +986,7 @@ def test_v4_release_gate_migration_backfills_generation_and_evidence_identity(
 
     registry = RunRegistry(path)
 
-    assert registry.applied_migrations == (5, 6)
+    assert registry.applied_migrations == (5, 6, 7)
     assert len(list(tmp_path.glob("state.db.backup-*"))) == 1
     for finalizer, verifier in (
         ("PENDING-FINAL", "PENDING-VERIFY"),
@@ -1100,7 +1109,7 @@ def test_v5_release_completion_without_ticket_token_is_invalidated(
     gate = registry.get_release_gate("APP-FINAL")
     evidence = registry.get_release_evidence_identity("VERIFY-1")
 
-    assert registry.applied_migrations == (6,)
+    assert registry.applied_migrations == (6, 7)
     assert gate is not None and evidence is not None
     assert gate.status == "pending"
     assert gate.generation and gate.generation != "old-generation"
@@ -1219,7 +1228,7 @@ def test_concurrent_v4_to_v6_migration_backfills_once_after_same_version_read(
     assert not any(starter.is_alive() for starter in starters)
     assert errors == []
     assert len(results) == 2
-    assert sorted(applied for applied, _generation in results) == [(), (5, 6)]
+    assert sorted(applied for applied, _generation in results) == [(), (5, 6, 7)]
     generations = {generation for _applied, generation in results}
     assert len(generations) == 1
     assert next(iter(generations))
@@ -1382,3 +1391,354 @@ def test_recent_runs_limit_clamped(tmp_path: Path) -> None:
     assert len(registry.recent_runs(limit=0)) == 1
     assert len(registry.recent_runs(limit=-10)) == 1
     assert len(registry.recent_runs(limit=500)) == 3
+
+
+def test_run_explorer_v7_summary_events_and_diagnostic_are_bounded(tmp_path: Path) -> None:
+    registry = RunRegistry(tmp_path / "state.db")
+    issue = _issue("EXP-1")
+    run_id = registry.acquire_run(
+        issue,
+        workspace_path=tmp_path / "EXP-1",
+        attempt=None,
+        attempt_kind="initial",
+        agent_kind="codex",
+        now=datetime(2026, 9, 1, tzinfo=timezone.utc),
+    )
+    assert run_id is not None
+    assert registry.schema_version() == 7
+
+    registry.append_attempt_event(
+        run_id=run_id,
+        event_type="turn_completed",
+        payload={
+            "turn": 1,
+            "message": "assistant output must not persist",
+            "input_tokens": 11,
+            "cache_input_tokens": 3,
+            "output_tokens": 5,
+            "total_tokens": 19,
+            "ignored_raw_payload": {"tool_transcript": "must-not-survive"},
+        },
+    )
+    registry.append_attempt_event(
+        run_id=run_id,
+        event_type="workspace_updated",
+        payload={"turn": 1, "commit_sha": "a" * 40},
+    )
+    assert registry.complete_run(
+        issue_id=issue.id,
+        run_id=run_id,
+        status="turn_error",
+        state="Verify",
+        input_tokens=11,
+        cache_input_tokens=3,
+        output_tokens=5,
+        total_tokens=19,
+        failure_class="TurnFailed",
+        failure_message="api_key=top-secret failed",
+    )
+
+    detail = registry.run_detail(run_id)
+    assert detail["run"]["title"] == issue.title
+    assert detail["run"]["state"] == "Verify"
+    assert detail["run"]["branch_name"] == f"symphony/{issue.identifier}"
+    assert detail["run"]["commit_sha"] == "a" * 40
+    assert detail["run"]["tokens"] == {
+        "input": 11, "cache": 3, "output": 5, "total": 19
+    }
+    assert detail["run"]["failure_class"] == "TurnFailed"
+    assert "top-secret" not in detail["run"]["failure_message"]
+    assert detail["events"][0]["event_type"] == "run_acquired"
+    completed = detail["events"][-1]
+    encoded = json.dumps(completed["payload"])
+    all_events = json.dumps(detail["events"])
+    assert "assistant output must not persist" not in all_events
+    assert "ignored_raw_payload" not in all_events
+    assert len(encoded.encode()) <= 4096
+
+    diagnostic = registry.diagnostic_json(run_id)
+    assert diagnostic["schema_version"] == 1
+    assert diagnostic["run"] == detail["run"]
+    assert diagnostic["events"] == detail["events"]
+
+
+def test_attempt_events_drop_oldest_deterministically(tmp_path: Path) -> None:
+    registry = RunRegistry(tmp_path / "state.db")
+    issue = _issue("EXP-2")
+    run_id = registry.acquire_run(
+        issue, workspace_path=tmp_path, attempt=None,
+        attempt_kind="initial", agent_kind="claude"
+    )
+    assert run_id is not None
+    for turn in range(250):
+        registry.append_attempt_event(
+            run_id=run_id, event_type="turn_started", payload={"turn": turn}
+        )
+    events = registry.run_events(run_id)
+    assert len(events) == 200
+    # run_acquired and the earliest turn events were evicted first.
+    assert events[0]["payload"]["turn"] == 50
+    assert events[-1]["payload"]["turn"] == 249
+
+
+def test_recent_runs_supports_compatible_explorer_filters(tmp_path: Path) -> None:
+    registry = RunRegistry(tmp_path / "state.db")
+    first = _issue("SEARCH-1")
+    second = _issue("SEARCH-2")
+    first_run = registry.acquire_run(
+        first, workspace_path=tmp_path, attempt=None,
+        attempt_kind="initial", agent_kind="codex"
+    )
+    assert first_run
+    registry.complete_run(issue_id=first.id, run_id=first_run, status="normal")
+    second_run = registry.acquire_run(
+        second, workspace_path=tmp_path, attempt=None,
+        attempt_kind="initial", agent_kind="claude"
+    )
+    assert second_run
+    registry.complete_run(issue_id=second.id, run_id=second_run, status="turn_error")
+
+    assert [r.run_id for r in registry.recent_runs(query="search-1")] == [first_run]
+    assert [r.run_id for r in registry.recent_runs(query="codex")] == [first_run]
+    assert [r.run_id for r in registry.recent_runs(query="turn_error")] == [second_run]
+    assert [r.run_id for r in registry.recent_runs(status="turn_error")] == [second_run]
+    assert [r.run_id for r in registry.recent_runs(agent="codex")] == [first_run]
+
+
+def test_attempt_events_reject_unknown_event_types(tmp_path: Path) -> None:
+    registry = RunRegistry(tmp_path / "state.db")
+    issue = _issue("EXP-3")
+    run_id = registry.acquire_run(
+        issue, workspace_path=tmp_path, attempt=None,
+        attempt_kind="initial", agent_kind="codex"
+    )
+    assert run_id
+    with pytest.raises(ValueError):
+        registry.append_attempt_event(
+            run_id=run_id, event_type="raw_tool_transcript", payload={"raw": "secret"}
+        )
+
+def test_run_completion_survives_diagnostic_write_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    registry = RunRegistry(tmp_path / "state.db")
+    issue = _issue("EXP-4")
+    run_id = registry.acquire_run(
+        issue,
+        workspace_path=tmp_path,
+        attempt=None,
+        attempt_kind="initial",
+        agent_kind="codex",
+    )
+    assert run_id
+
+    def fail_diagnostic_write(**_kwargs: object) -> None:
+        raise sqlite3.OperationalError("diagnostic table unavailable")
+
+    monkeypatch.setattr(registry, "_append_attempt_event_locked", fail_diagnostic_write)
+
+    assert registry.complete_run(
+        issue_id=issue.id,
+        run_id=run_id,
+        status="normal",
+        state="Done",
+    )
+    completed = registry.get_run(run_id)
+    assert completed.status == "normal"
+    assert completed.completed_at is not None
+    assert not registry.has_active_lease(issue.id)
+
+def test_run_acquisition_survives_diagnostic_write_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    registry = RunRegistry(tmp_path / "state.db")
+
+    def fail_diagnostic_write(**_kwargs: object) -> None:
+        raise sqlite3.OperationalError("diagnostic table unavailable")
+
+    monkeypatch.setattr(registry, "_append_attempt_event_locked", fail_diagnostic_write)
+    issue = _issue("EXP-5")
+    run_id = registry.acquire_run(
+        issue,
+        workspace_path=tmp_path,
+        attempt=None,
+        attempt_kind="initial",
+        agent_kind="codex",
+    )
+
+    assert run_id
+    assert registry.has_active_lease(issue.id)
+
+def test_run_completion_clamps_diagnostic_counters_to_sqlite_range(
+    tmp_path: Path,
+) -> None:
+    registry = RunRegistry(tmp_path / "state.db")
+    issue = _issue("EXP-6")
+    run_id = registry.acquire_run(
+        issue,
+        workspace_path=tmp_path,
+        attempt=None,
+        attempt_kind="initial",
+        agent_kind="codex",
+    )
+    assert run_id
+
+    assert registry.complete_run(
+        issue_id=issue.id,
+        run_id=run_id,
+        status="normal",
+        total_tokens=10**100,
+    )
+    assert registry.get_run(run_id).total_tokens == (2**63) - 1
+
+def test_diagnostic_append_drops_immediately_on_writer_contention(
+    tmp_path: Path,
+) -> None:
+    db_path = tmp_path / "state.db"
+    registry = RunRegistry(db_path)
+    issue = _issue("EXP-7")
+    run_id = registry.acquire_run(
+        issue,
+        workspace_path=tmp_path,
+        attempt=None,
+        attempt_kind="initial",
+        agent_kind="codex",
+    )
+    assert run_id
+    blocker = sqlite3.connect(db_path, isolation_level=None)
+    blocker.execute("BEGIN IMMEDIATE")
+    started = time.monotonic()
+    try:
+        with pytest.raises(sqlite3.OperationalError, match="locked"):
+            registry.append_attempt_event(
+                run_id=run_id,
+                event_type="turn_started",
+                payload={"turn": 1},
+            )
+    finally:
+        blocker.execute("ROLLBACK")
+        blocker.close()
+    assert time.monotonic() - started < 1.0
+
+def test_terminal_diagnostic_retention_prunes_old_events_and_excerpt(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(run_registry_mod, "MAX_RUNS_WITH_DIAGNOSTIC_EVENTS", 2)
+    registry = RunRegistry(tmp_path / "state.db")
+    run_ids: list[str] = []
+    for index in range(3):
+        issue = _issue(f"RET-{index}")
+        run_id = registry.acquire_run(
+            issue,
+            workspace_path=tmp_path / issue.identifier,
+            attempt=None,
+            attempt_kind="initial",
+            agent_kind="codex",
+        )
+        assert run_id
+        assert registry.complete_run(
+            issue_id=issue.id,
+            run_id=run_id,
+            status="worker_exit",
+            failure_class="worker_exit",
+            failure_message=f"bounded excerpt {index}",
+            now=datetime(2026, 8, 1, 0, index, tzinfo=timezone.utc),
+        )
+        run_ids.append(run_id)
+
+    assert registry.run_events(run_ids[0]) == []
+    assert registry.get_run(run_ids[0]).failure_message is None
+    assert registry.run_events(run_ids[1])
+    assert registry.run_events(run_ids[2])
+
+def test_deleting_run_cleans_attempt_events(tmp_path: Path) -> None:
+    registry = RunRegistry(tmp_path / "state.db")
+    issue = _issue("EXP-8")
+    run_id = registry.acquire_run(
+        issue,
+        workspace_path=tmp_path,
+        attempt=None,
+        attempt_kind="initial",
+        agent_kind="codex",
+    )
+    assert run_id
+    assert registry.run_events(run_id)
+
+    registry._connect().execute("DELETE FROM runs WHERE run_id = ?", (run_id,))
+
+    remaining = registry._connect().execute(
+        "SELECT COUNT(*) FROM attempt_events WHERE run_id = ?", (run_id,)
+    ).fetchone()
+    assert remaining is not None
+    assert remaining[0] == 0
+
+def test_terminal_run_rejects_late_event_and_summary_mutation(tmp_path: Path) -> None:
+    registry = RunRegistry(tmp_path / "state.db")
+    issue = _issue("EXP-9")
+    run_id = registry.acquire_run(
+        issue,
+        workspace_path=tmp_path,
+        attempt=None,
+        attempt_kind="initial",
+        agent_kind="codex",
+    )
+    assert run_id
+    assert registry.complete_run(
+        issue_id=issue.id,
+        run_id=run_id,
+        status="normal",
+        total_tokens=1,
+    )
+    event_count = len(registry.run_events(run_id))
+
+    assert not registry.append_attempt_event(
+        run_id=run_id,
+        event_type="turn_completed",
+        payload={"turn": 99, "total_tokens": 999},
+    )
+    assert registry.get_run(run_id).total_tokens == 1
+    assert len(registry.run_events(run_id)) == event_count
+
+def test_v7_migration_preserves_unknown_tokens_for_historical_runs(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = tmp_path / "state.db"
+    conn = sqlite3.connect(path, isolation_level=None)
+    original_migrations = migration_mod.MIGRATIONS
+    monkeypatch.setattr(migration_mod, "MIGRATIONS", original_migrations[:6])
+    migration_mod.apply_migrations(conn, path)
+    conn.execute(
+        """
+        INSERT INTO runs (
+            run_id, issue_id, identifier, title, state, attempt, attempt_kind,
+            agent_kind, workspace_path, status, started_at, updated_at,
+            lease_expires_at, last_progress_at, completed_at, owner_pid,
+            owner_boot_id, backend_agent_pid
+        ) VALUES (?, ?, ?, ?, ?, NULL, ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?, ?, NULL)
+        """,
+        (
+            "f" * 32,
+            "id-HIST-1",
+            "HIST-1",
+            "historical run",
+            "Done",
+            "initial",
+            "codex",
+            str(tmp_path),
+            "normal",
+            "2026-01-01T00:00:00+00:00",
+            "2026-01-01T00:01:00+00:00",
+            "2026-01-01T00:01:00+00:00",
+            "2026-01-01T00:01:00+00:00",
+            123,
+            "old-boot",
+        ),
+    )
+    conn.close()
+    monkeypatch.setattr(migration_mod, "MIGRATIONS", original_migrations)
+
+    migrated = RunRegistry(path).get_run("f" * 32)
+    assert migrated.input_tokens is None
+    assert migrated.cache_input_tokens is None
+    assert migrated.output_tokens is None
+    assert migrated.total_tokens is None
