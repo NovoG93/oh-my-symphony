@@ -56,6 +56,11 @@
 
   const api = {
     getBoard: () => apiRequest('/board'),
+    getRequests: () => apiRequest('/requests'),
+    getRequestSchedule: (kind, id) => {
+      const params = new URLSearchParams({ kind, id });
+      return apiRequest(`/requests/schedule?${params.toString()}`);
+    },
     getProjects: () => apiRequest('/projects'),
     createOrAdoptProject: (payload) => apiRequest('/projects', { method: 'POST', body: JSON.stringify(payload) }),
     openProject: (id) => apiRequest(`/projects/${encodeURIComponent(id)}/open`, { method: 'POST', body: '{}' }),
@@ -182,6 +187,12 @@
     connected: false,
     search: '',
     boardScope: 'active',
+    boardView: 'lanes',
+    requestCatalog: null,
+    requestSchedule: null,
+    selectedRequestKey: null,
+    requestLoading: false,
+    requestEpoch: 0,
     mobileColumnIndex: 0,
     statsDays: 30,
     selectedRunId: null,
@@ -1094,7 +1105,30 @@
     page.appendChild(scroll);
     container.appendChild(page);
     if (!state.board) scroll.appendChild(buildBoardSkeleton());
-    else renderBoardColumns(scroll);
+    else renderBoardSurface(scroll);
+  }
+
+  function renderBoardSurface(scrollEl) {
+    if (state.boardView === 'request') renderRequestView(scrollEl);
+    else renderBoardColumns(scrollEl);
+  }
+
+  function buildBoardViewToggle() {
+    return el('div', { class: 'segmented board-view-toggle', role: 'group', 'aria-label': t('board.viewMode') }, [
+      ['lanes', t('board.viewLanes')],
+      ['request', t('board.viewRequest')],
+    ].map(([value, label]) => el('button', {
+      class: `segmented-btn${state.boardView === value ? ' active' : ''}`,
+      type: 'button',
+      'aria-pressed': state.boardView === value ? 'true' : 'false',
+      onClick: () => {
+        if (state.boardView === value) return;
+        state.requestEpoch += 1;
+        state.boardView = value;
+        renderRoute();
+        if (value === 'request') loadRequestCatalog();
+      },
+    }, label)));
   }
 
   function buildBoardTopbar() {
@@ -1108,14 +1142,14 @@
       value: state.search,
       oninput: (e) => {
         state.search = e.target.value;
-        renderBoardColumns(document.getElementById('board-scroll'));
+        renderBoardSurface(document.getElementById('board-scroll'));
       },
     });
-    const rightControls = [];
-    if (hasTerminalColumns) rightControls.push(buildBoardScopeToggle());
-    if (!readOnly) rightControls.push(el('button', { class: 'btn btn-primary', onClick: () => openIssueModal() }, t('board.newIssueButton')));
+    const rightControls = [buildBoardViewToggle()];
+    if (state.boardView === 'lanes' && hasTerminalColumns) rightControls.push(buildBoardScopeToggle());
+    if (!readOnly && state.boardView === 'lanes') rightControls.push(el('button', { class: 'btn btn-primary', onClick: () => openIssueModal() }, t('board.newIssueButton')));
     const bar = el('div', { class: 'topbar' }, [
-      el('div', { class: 'topbar-left' }, [search]),
+      el('div', { class: 'topbar-left' }, state.boardView === 'lanes' ? [search] : []),
       el('div', { class: 'topbar-right' }, rightControls),
     ]);
     if (!readOnly) return bar;
@@ -1177,6 +1211,289 @@
         },
       }, col.name))
     );
+  }
+
+  function requestKey(row) {
+    return `${row.kind}:${row.id}`;
+  }
+
+  function requestViewIsCurrent(epoch, selectedKey = null) {
+    return state.route === 'board'
+      && state.boardView === 'request'
+      && state.requestEpoch === epoch
+      && (selectedKey == null || state.selectedRequestKey === selectedKey);
+  }
+
+  async function loadRequestCatalog() {
+    const epoch = ++state.requestEpoch;
+    state.requestLoading = true;
+    renderRequestView(document.getElementById('board-scroll'));
+    try {
+      const catalog = await api.getRequests();
+      if (!requestViewIsCurrent(epoch)) return;
+      state.requestCatalog = catalog;
+      const rows = catalog.requests || [];
+      if (!rows.some((row) => requestKey(row) === state.selectedRequestKey)) {
+        state.selectedRequestKey = rows.length ? requestKey(rows[0]) : null;
+      }
+      if (state.selectedRequestKey && catalog.reason !== 'unsupported_tracker') {
+        await loadSelectedRequestSchedule(false, epoch);
+      } else {
+        state.requestSchedule = null;
+      }
+    } catch (err) {
+      if (!requestViewIsCurrent(epoch)) return;
+      state.requestCatalog = { available: false, reason: 'load_failed', error: err.message, requests: [] };
+      state.requestSchedule = null;
+    } finally {
+      if (requestViewIsCurrent(epoch)) {
+        state.requestLoading = false;
+        renderRequestView(document.getElementById('board-scroll'));
+      }
+    }
+  }
+
+  async function loadSelectedRequestSchedule(renderLoading = true, parentEpoch = null) {
+    const epoch = parentEpoch == null ? ++state.requestEpoch : parentEpoch;
+    const rows = (state.requestCatalog && state.requestCatalog.requests) || [];
+    const selected = rows.find((row) => requestKey(row) === state.selectedRequestKey);
+    if (!selected) return;
+    const selectedKey = requestKey(selected);
+    if (renderLoading) {
+      state.requestLoading = true;
+      renderRequestView(document.getElementById('board-scroll'));
+    }
+    try {
+      const schedule = await api.getRequestSchedule(selected.kind, selected.id);
+      if (!requestViewIsCurrent(epoch, selectedKey)) return;
+      state.requestSchedule = schedule;
+    } catch (err) {
+      if (!requestViewIsCurrent(epoch, selectedKey)) return;
+      state.requestSchedule = { available: false, reason: 'load_failed', error: err.message };
+    } finally {
+      if (renderLoading && requestViewIsCurrent(epoch, selectedKey)) {
+        state.requestLoading = false;
+        renderRequestView(document.getElementById('board-scroll'));
+        const picker = document.querySelector('.request-picker');
+        if (picker) picker.focus();
+      }
+    }
+  }
+
+  function scheduleStatusLabel(status) {
+    const labels = {
+      running: t('schedule.running'),
+      ready: t('schedule.ready'),
+      waiting: t('schedule.waiting'),
+      retrying: t('schedule.retrying'),
+      successful: t('schedule.successful'),
+      needs_action: t('schedule.needsAction'),
+    };
+    return labels[status] || status || t('schedule.waiting');
+  }
+
+  function scheduleReasonLabel(decision) {
+    if (!decision) return t('schedule.notEvaluated');
+    const labels = {
+      not_evaluated: t('schedule.reasonNotEvaluated'),
+      ready: t('schedule.reasonReady'),
+      dispatched: t('schedule.reasonDispatched'),
+      running: t('schedule.reasonRunning'),
+      retry_scheduled: t('schedule.reasonRetry'),
+      auto_triage: t('schedule.reasonAutoTriage'),
+      continuous_improvement: t('schedule.reasonContinuousImprovement'),
+      leased_elsewhere: t('schedule.reasonLease'),
+      registry_unavailable: t('schedule.reasonRegistryUnavailable'),
+      historical_release_verifier: t('schedule.reasonHistoricalVerifier'),
+      claimed: t('schedule.reasonClaim'),
+      paused: t('schedule.reasonPaused'),
+      budget_exhausted: t('schedule.reasonBudgetExhausted'),
+      finalizing: t('schedule.reasonFinalizing'),
+      inactive: t('schedule.reasonInactive'),
+      incomplete_identity: t('schedule.reasonIncompleteIdentity'),
+      unsupported_agent: t('schedule.reasonUnsupportedAgent'),
+      waiting_dependency: t('schedule.reasonDependency'),
+      waiting_global_capacity: t('schedule.reasonCapacity'),
+      waiting_state_capacity: t('schedule.reasonStateCapacity'),
+      refused_conflict: t('schedule.reasonConflict'),
+      refused_dispatch_authority: t('schedule.reasonAuthority'),
+      terminal_success: t('schedule.reasonComplete'),
+      terminal_needs_action: t('schedule.reasonTerminal'),
+      dangling_dependency: t('schedule.reasonDangling'),
+      snapshot_unavailable: t('schedule.reasonSnapshotUnavailable'),
+      decision_stale: t('schedule.reasonDecisionStale'),
+    };
+    return labels[decision.code] || t('schedule.reasonUnknown');
+  }
+
+  function buildScheduleSummary(schedule) {
+    const counts = (schedule.summary && schedule.summary.counts) || {};
+    const metrics = [
+      ['running', t('schedule.running')],
+      ['ready', t('schedule.ready')],
+      ['waiting', t('schedule.waiting')],
+      ['retrying', t('schedule.retrying')],
+      ['needs_action', t('schedule.needsAction')],
+      ['successful', t('schedule.successful')],
+    ];
+    const grid = el('div', { class: 'request-summary-grid' });
+    for (const [key, label] of metrics) {
+      grid.appendChild(el('div', { class: `request-summary-card status-${key}` }, [
+        el('span', { class: 'request-summary-value' }, String(counts[key] || 0)),
+        el('span', { class: 'request-summary-label' }, label),
+      ]));
+    }
+    grid.appendChild(el('div', { class: 'request-summary-card' }, [
+      el('span', { class: 'request-summary-value' }, schedule.summary.longest_unresolved_chain_nodes == null ? '—' : String(schedule.summary.longest_unresolved_chain_nodes)),
+      el('span', { class: 'request-summary-label' }, t('schedule.longestChain')),
+    ]));
+    grid.appendChild(el('div', { class: 'request-summary-card' }, [
+      el('span', { class: 'request-summary-value request-policy-value' }, String(schedule.policy || 'fifo').toUpperCase()),
+      el('span', { class: 'request-summary-label' }, t('schedule.policy')),
+    ]));
+    return grid;
+  }
+
+  function buildScheduleNode(node, index) {
+    const decision = node.decision || {};
+    const status = decision.status || 'waiting';
+    const row = el('li', { class: `request-node status-${status}${node.cycle ? ' cycle-node' : ''}` });
+    const wave = node.wave == null ? '—' : String(node.wave);
+    const queue = node.queue_rank == null ? '—' : `#${node.queue_rank}`;
+    const blockerIds = (node.blocked_by || []).map((blocker) => blocker.identifier);
+    const header = el(node.exists ? 'button' : 'div', node.exists ? {
+      type: 'button',
+      class: 'request-node-main',
+      onClick: () => openDrawer(node.identifier),
+      'aria-label': t('schedule.openTicket', { id: node.identifier }),
+    } : {
+      class: 'request-node-main missing-node',
+      'aria-label': t('schedule.missingTicket', { id: node.identifier }),
+    }, [
+      el('span', { class: 'request-node-order', 'aria-hidden': 'true' }, node.cycle ? '!' : String(index + 1)),
+      el('span', { class: 'request-node-copy' }, [
+        el('span', { class: 'request-node-id' }, node.identifier),
+        el('span', { class: 'request-node-title' }, node.title || node.identifier),
+      ]),
+      el('span', { class: `schedule-status status-${status}` }, scheduleStatusLabel(status)),
+    ]);
+    row.appendChild(header);
+    row.appendChild(el('div', { class: 'request-node-meta' }, [
+      el('span', {}, t('schedule.stateValue', { value: node.state || '—' })),
+      el('span', {}, t('schedule.queueValue', { value: queue })),
+      el('span', {}, t('schedule.waveValue', { value: wave })),
+      node.scope === 'external' ? el('span', { class: 'external-chip' }, t('schedule.external')) : null,
+      node.cycle ? el('span', { class: 'cycle-chip' }, t('schedule.cycle')) : null,
+    ].filter(Boolean)));
+    row.appendChild(el('p', { class: 'request-node-reason' }, scheduleReasonLabel(decision)));
+    const details = el('details', { class: 'request-node-details' });
+    details.appendChild(el('summary', {}, t('schedule.details')));
+    const list = el('dl', { class: 'schedule-details-list' });
+    const values = [
+      [t('schedule.blockedBy'), blockerIds.length ? blockerIds.join(', ') : t('schedule.none')],
+      [t('schedule.unlocks'), (node.unlocks || []).length ? node.unlocks.join(', ') : t('schedule.none')],
+      [t('schedule.globalCriticalPath'), node.global_critical_path_length == null ? '—' : String(node.global_critical_path_length + 1)],
+      [t('schedule.decisionCode'), decision.code || '—'],
+      [t('schedule.starvation'), node.starvation_promoted ? t('schedule.yes') : t('schedule.no')],
+    ];
+    for (const [term, value] of values) {
+      list.appendChild(el('dt', {}, term));
+      list.appendChild(el('dd', {}, value));
+    }
+    details.appendChild(list);
+    row.appendChild(details);
+    return row;
+  }
+
+  function renderRequestView(scrollEl) {
+    if (!scrollEl) return;
+    clearNode(scrollEl);
+    const panel = el('section', {
+      class: 'request-view',
+      'aria-labelledby': 'request-view-title',
+      'aria-busy': state.requestLoading ? 'true' : 'false',
+    });
+    panel.appendChild(el('div', { class: 'request-view-heading' }, [
+      el('div', {}, [
+        el('h2', { id: 'request-view-title' }, t('schedule.title')),
+        el('p', { class: 'page-subtitle' }, t('schedule.subtitle')),
+      ]),
+      el('button', { class: 'btn btn-ghost', type: 'button', onClick: loadRequestCatalog }, t('common.refresh')),
+    ]));
+    if (state.requestLoading && !state.requestCatalog) {
+      panel.appendChild(el('div', { role: 'status', class: 'request-loading-status' }, [
+        buildSkeletonBlock(),
+        el('span', { class: 'sr-only' }, t('schedule.loading')),
+      ]));
+      scrollEl.appendChild(panel);
+      return;
+    }
+    const catalog = state.requestCatalog;
+    if (!catalog) {
+      panel.appendChild(el('div', { class: 'empty-state' }, t('schedule.chooseRequest')));
+      scrollEl.appendChild(panel);
+      return;
+    }
+    if (catalog.reason === 'unsupported_tracker' || catalog.reason === 'load_failed') {
+      const message = catalog.reason === 'unsupported_tracker'
+        ? t('schedule.unsupportedTracker')
+        : t('schedule.unavailable', { error: catalog.error || catalog.reason || 'unknown' });
+      panel.appendChild(el('div', { class: 'banner banner-info' }, message));
+      scrollEl.appendChild(panel);
+      return;
+    }
+    const rows = catalog.requests || [];
+    if (!rows.length) {
+      panel.appendChild(el('div', { class: 'empty-state' }, t('schedule.noRequests')));
+      scrollEl.appendChild(panel);
+      return;
+    }
+    const picker = el('select', {
+      class: 'input request-picker',
+      'aria-label': t('schedule.requestPicker'),
+      onChange: (event) => {
+        state.selectedRequestKey = event.target.value;
+        state.requestSchedule = null;
+        loadSelectedRequestSchedule();
+      },
+    });
+    for (const row of rows) {
+      picker.appendChild(el('option', {
+        value: requestKey(row),
+        selected: requestKey(row) === state.selectedRequestKey,
+      }, row.kind === 'request'
+        ? t('schedule.requestOption', { id: row.id, n: row.node_count })
+        : t('schedule.ticketOption', { id: row.id })));
+    }
+    panel.appendChild(el('div', { class: 'request-picker-row' }, [
+      el('label', {}, [el('span', { class: 'field-label' }, t('schedule.requestPicker')), picker]),
+      el('span', { class: 'snapshot-time' }, catalog.generated_at ? t('schedule.generatedAt', { time: formatShortDateTime(catalog.generated_at) }) : t('schedule.notEvaluated')),
+    ]));
+    if (state.requestLoading || !state.requestSchedule) {
+      panel.appendChild(el('div', { role: 'status', class: 'request-loading-status' }, [
+        buildSkeletonBlock(),
+        el('span', { class: 'sr-only' }, t('schedule.loading')),
+      ]));
+      scrollEl.appendChild(panel);
+      return;
+    }
+    const schedule = state.requestSchedule;
+    if (schedule.reason === 'load_failed') {
+      panel.appendChild(el('div', { class: 'banner banner-info', role: 'alert' }, t('schedule.unavailable', { error: schedule.error || 'unknown' })));
+      scrollEl.appendChild(panel);
+      return;
+    }
+    if (schedule.stale) panel.appendChild(el('div', { class: 'banner banner-warning' }, t('schedule.stale')));
+    if (schedule.decision_drifted) panel.appendChild(el('div', { class: 'banner banner-warning' }, t('schedule.decisionDrifted')));
+    if ((schedule.warnings || []).includes('dependency_cycle')) panel.appendChild(el('div', { class: 'banner banner-warning', role: 'alert' }, t('schedule.cycleWarning')));
+    if (!schedule.available) panel.appendChild(el('div', { class: 'banner banner-info' }, t('schedule.notEvaluated')));
+    panel.appendChild(buildScheduleSummary(schedule));
+    panel.appendChild(el('h3', { class: 'request-list-title' }, t('schedule.executionOrder')));
+    panel.appendChild(el('p', { class: 'request-list-help' }, t('schedule.executionHelp')));
+    const list = el(schedule.execution_valid === false ? 'ul' : 'ol', { class: 'request-node-list', 'aria-label': schedule.execution_valid === false ? t('schedule.invalidExecutionOrder') : t('schedule.executionOrder') });
+    for (const [index, node] of (schedule.nodes || []).entries()) list.appendChild(buildScheduleNode(node, index));
+    panel.appendChild(list);
+    scrollEl.appendChild(panel);
   }
 
   function renderBoardColumns(scrollEl) {
@@ -1769,7 +2086,7 @@
       state.board = board;
       state.connected = true;
       updateConnectionIndicator();
-      if (state.route === 'board') renderBoardColumns(document.getElementById('board-scroll'));
+      if (state.route === 'board') renderBoardSurface(document.getElementById('board-scroll'));
     } catch (_err) {
       // regular poll loop will surface connectivity issues
     }
@@ -4025,7 +4342,7 @@
         }
         if (state.route === 'board') {
           if (firstLoad || !document.getElementById('board-scroll')) renderRoute();
-          else renderBoardColumns(document.getElementById('board-scroll'));
+          else if (state.boardView === 'lanes') renderBoardColumns(document.getElementById('board-scroll'));
         }
       }
     } catch (_err) {

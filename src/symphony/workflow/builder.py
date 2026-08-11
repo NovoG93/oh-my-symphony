@@ -370,6 +370,9 @@ def build_service_config(workflow: WorkflowDefinition) -> ServiceConfig:
             True,
             name="agent.crash_continuation",
         ),
+        scheduling_policy=_validated_scheduling_policy(
+            agent_raw.get("scheduling_policy")
+        ),
         auto_commit_on_done=bool(
             agent_raw.get("auto_commit_on_done", True)
         ),
@@ -970,6 +973,17 @@ def _validated_stall_timeout_by_state(
                 known_states=sorted(known),
             )
     return out
+
+
+def _validated_scheduling_policy(value: Any) -> str:
+    if value is None:
+        return "fifo"
+    if not isinstance(value, str) or value.strip().lower() not in {"fifo", "dag"}:
+        raise ConfigValidationError(
+            "agent.scheduling_policy must be one of ['fifo', 'dag']",
+            value=value,
+        )
+    return value.strip().lower()
 
 
 def _validated_after_done_failure_policy(value: Any) -> str:

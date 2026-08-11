@@ -671,6 +671,69 @@ def test_build_service_config_crash_continuation_can_opt_out(tmp_path):
     assert cfg.agent.crash_continuation is False
 
 
+def test_build_service_config_scheduling_policy_defaults_fifo(tmp_path):
+    path = _write(
+        tmp_path,
+        textwrap.dedent(
+            """\
+            ---
+            tracker:
+              kind: file
+              board_root: ./board
+            ---
+            Hello
+            """
+        ),
+    )
+
+    cfg = build_service_config(load_workflow(path))
+
+    assert cfg.agent.scheduling_policy == "fifo"
+
+
+def test_build_service_config_scheduling_policy_accepts_dag(tmp_path):
+    path = _write(
+        tmp_path,
+        textwrap.dedent(
+            """\
+            ---
+            tracker:
+              kind: file
+              board_root: ./board
+            agent:
+              scheduling_policy: dag
+            ---
+            Hello
+            """
+        ),
+    )
+
+    cfg = build_service_config(load_workflow(path))
+
+    assert cfg.agent.scheduling_policy == "dag"
+
+
+def test_build_service_config_scheduling_policy_rejects_unknown_value(tmp_path):
+    path = _write(
+        tmp_path,
+        textwrap.dedent(
+            """\
+            ---
+            tracker:
+              kind: file
+              board_root: ./board
+            agent:
+              scheduling_policy: magic
+            ---
+            Hello
+            """
+        ),
+    )
+
+    with pytest.raises(ConfigValidationError, match="scheduling_policy"):
+        build_service_config(load_workflow(path))
+
+
 def test_build_service_config_reads_codex_model_and_reasoning(tmp_path):
     path = _write(
         tmp_path,

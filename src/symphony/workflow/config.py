@@ -135,6 +135,10 @@ class AgentConfig:
     # Resume an interrupted ticket from its latest completed-turn checkpoint.
     # Set false to preserve fresh-session dispatch after service/host restarts.
     crash_continuation: bool = True
+    # Candidate ordering policy. "fifo" preserves stable registration order;
+    # "dag" adds declared priority and downstream critical-path depth while
+    # keeping starvation recovery ahead of both.
+    scheduling_policy: str = "fifo"
     # When a ticket reaches the Done state cleanly, snapshot the workspace
     # into a single git commit (`git init` if no enclosing repo found).
     # Default ON so a fresh `pip install oh-my-symphony` plus a
