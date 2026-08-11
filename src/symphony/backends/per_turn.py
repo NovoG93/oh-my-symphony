@@ -38,6 +38,7 @@ from . import (
     BackendInit,
     BaseAgentBackend,
     TurnResult,
+    redact_session_id,
 )
 
 
@@ -85,6 +86,7 @@ class PerTurnCliBackend(BaseAgentBackend):
         self._turn_timeout_ms = turn_timeout_ms
         self._cwd = init.cwd
         self._on_event = init.on_event
+        self._on_process_started = init.on_process_started
         self._session_id: str | None = None
         self._closed = False
         self._active_proc: asyncio.subprocess.Process | None = None
@@ -138,7 +140,9 @@ class PerTurnCliBackend(BaseAgentBackend):
         self._closed = True
         proc = self._active_proc
         if proc is not None and proc.returncode is None:
-            await terminate_process_tree(proc)
+            result = await terminate_process_tree(proc)
+            if result is None and proc.returncode is None:
+                raise RuntimeError("backend process cleanup could not be confirmed")
 
     @property
     def session_id(self) -> str | None:
@@ -178,13 +182,16 @@ class PerTurnCliBackend(BaseAgentBackend):
         )
         stdin_payload = self._stdin_payload(prompt)
         proc = await self._spawn(command, pipe_stdin=stdin_payload is not None)
+        if self._on_process_started is not None:
+            self._on_process_started(proc.pid)
+        self._active_proc = proc
         # `stop()` may have flipped `_closed` while we awaited spawn — the
         # process is orphaned because `stop()` only inspects `_active_proc`
         # and we hadn't published yet. Reap and bail.
         if self._closed:
             await self._reap(proc)
+            self._active_proc = None
             raise ResponseError("backend closed during spawn")
-        self._active_proc = proc
         watchers = self._start_watchers(proc)
         try:
             await self._emit(EVENT_TURN_STARTED, {})
@@ -213,7 +220,8 @@ class PerTurnCliBackend(BaseAgentBackend):
         finally:
             for watcher in watchers:
                 watcher.cancel()
-            self._active_proc = None
+            if proc.returncode is not None:
+                self._active_proc = None
 
     # ------------------------------------------------------------------
     # skeleton steps
@@ -288,6 +296,8 @@ class PerTurnCliBackend(BaseAgentBackend):
 
     def _capture_stderr(self, stderr: bytes) -> None:
         text = stderr.decode("utf-8", errors="replace")
+        session_id = getattr(self, "_opencode_session_id", None)
+        text = redact_session_id(text, session_id)
         for line in text.splitlines():
             if line:
                 self._stderr_tail.append(line)
@@ -299,8 +309,10 @@ class PerTurnCliBackend(BaseAgentBackend):
         return joined if len(joined) <= 400 else joined[-400:]
 
     async def _reap(self, proc: asyncio.subprocess.Process) -> None:
-        """Best-effort process-group teardown; mirrors `stop()`."""
-        await terminate_process_tree(proc)
+        """Tear down a process group or surface ambiguous cleanup."""
+        result = await terminate_process_tree(proc)
+        if result is None and proc.returncode is None:
+            raise RuntimeError("backend process cleanup could not be confirmed")
 
     async def _emit(self, event: str, payload: dict[str, Any]) -> None:
         try:
@@ -308,9 +320,12 @@ class PerTurnCliBackend(BaseAgentBackend):
                 {
                     "event": event,
                     "timestamp": _utc_iso(),
-                    "payload": payload
-                    if isinstance(payload, dict)
-                    else {"data": payload},
+                    "payload": redact_session_id(
+                        payload if isinstance(payload, dict) else {"data": payload},
+                        None
+                        if event == EVENT_SESSION_STARTED
+                        else getattr(self, "_opencode_session_id", None),
+                    ),
                     "usage": dict(self._latest_usage),
                     "rate_limits": None,
                     "agent_pid": self.pid,

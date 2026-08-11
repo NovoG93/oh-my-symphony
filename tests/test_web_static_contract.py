@@ -92,6 +92,11 @@ def test_web_runs_page_contract() -> None:
     assert ".runs-layout" in css
     assert ".run-attempt-row" in css
     assert ".run-timeline" in css
+    assert "run.continued_from_run_id" in js
+    assert "run.checkpoint.checkpointed_at" in js
+    assert "'runs.continuedFrom': 'Continued from'" in i18n
+    assert "'runs.continuedFrom': '이전 실행'" in i18n
+    assert ".run-metadata-link" in css
 
 
 def test_web_git_page_contract() -> None:

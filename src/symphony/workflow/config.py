@@ -132,6 +132,9 @@ class AgentConfig:
     # of the whole accumulating Markdown body. Workflows can opt out when a
     # custom ticket format needs full raw history in every worker prompt.
     compact_issue_context: bool = True
+    # Resume an interrupted ticket from its latest completed-turn checkpoint.
+    # Set false to preserve fresh-session dispatch after service/host restarts.
+    crash_continuation: bool = True
     # When a ticket reaches the Done state cleanly, snapshot the workspace
     # into a single git commit (`git init` if no enclosing repo found).
     # Default ON so a fresh `pip install oh-my-symphony` plus a

@@ -65,6 +65,8 @@ from . import (
     BackendInit,
     BaseAgentBackend,
     TurnResult,
+    _is_valid_session_id,
+    redact_session_id,
 )
 
 
@@ -107,7 +109,11 @@ class PiBackend(BaseAgentBackend):
         self._pi = init.cfg.pi
         self._cwd = init.cwd
         self._on_event = init.on_event
+        self._on_process_started = init.on_process_started
         self._session_id: str | None = None
+        self._resume_on_next_turn = False
+        self._expected_resume_session_id: str | None = None
+        self._resume_session_confirmed = False
         self._closed = False
         self._active_proc: asyncio.subprocess.Process | None = None
         self._latest_usage: dict[str, int] = {
@@ -137,7 +143,9 @@ class PiBackend(BaseAgentBackend):
         self._closed = True
         proc = self._active_proc
         if proc is not None and proc.returncode is None:
-            await terminate_process_tree(proc)
+            result = await terminate_process_tree(proc)
+            if result is None and proc.returncode is None:
+                raise RuntimeError("backend process cleanup could not be confirmed")
 
     @property
     def session_id(self) -> str | None:
@@ -168,6 +176,16 @@ class PiBackend(BaseAgentBackend):
         del initial_prompt, issue_title
         return PENDING_SESSION_ID
 
+    async def resume_session(self, session_id: str) -> bool:
+        """Select an exact Pi-family session for the next CLI process."""
+        if self._closed or not _is_valid_session_id(session_id):
+            return False
+        self._session_id = session_id
+        self._expected_resume_session_id = session_id
+        self._resume_session_confirmed = False
+        self._resume_on_next_turn = True
+        return True
+
     async def run_turn(self, *, prompt: str, is_continuation: bool) -> TurnResult:
         if self._closed:
             raise ResponseError("backend is closed")
@@ -180,11 +198,9 @@ class PiBackend(BaseAgentBackend):
         self._stderr_tail.clear()
 
         cmd = self._pi.command
-        if (
-            is_continuation
-            and self._pi.resume_across_turns
-            and self._session_id
-            and self._session_id != PENDING_SESSION_ID
+        if self._session_id and self._session_id != PENDING_SESSION_ID and (
+            self._resume_on_next_turn
+            or (is_continuation and self._pi.resume_across_turns)
         ):
             cmd = f"{cmd} {self._resume_flag} {shlex.quote(self._session_id)}"
 
@@ -205,13 +221,17 @@ class PiBackend(BaseAgentBackend):
             )
         except FileNotFoundError as exc:
             raise PortExit("bash not available", error=str(exc)) from exc
+        self._resume_on_next_turn = False
 
+        if self._on_process_started is not None:
+            self._on_process_started(proc.pid)
+        self._active_proc = proc
         # `stop()` may have flipped `_closed` while we awaited spawn — reap
         # the orphaned process and bail.
         if self._closed:
             await self._reap(proc)
+            self._active_proc = None
             raise ResponseError("backend closed during spawn")
-        self._active_proc = proc
         try:
             await self._emit(EVENT_TURN_STARTED, {})
             assert proc.stdin is not None and proc.stdout is not None
@@ -242,6 +262,10 @@ class PiBackend(BaseAgentBackend):
                 # stdout closed but the process lingers — reap the tree
                 # instead of hanging the turn on an unbounded wait.
                 safe_rc = await terminate_process_tree(proc)
+                if safe_rc is None and proc.returncode is None:
+                    raise RuntimeError(
+                        "backend process cleanup could not be confirmed"
+                    )
             # The stream reader is cancelled when stdout closes, so collect
             # any stderr lines written just before process exit after the
             # bounded reap. This keeps process-level diagnostics actionable,
@@ -264,6 +288,7 @@ class PiBackend(BaseAgentBackend):
                 raise TurnFailed(err_msg)
 
             if terminal is not None:
+                await self._require_resume_confirmation()
                 terminal_message = _extract_last_assistant_message(
                     terminal.get("messages")
                 )
@@ -304,6 +329,7 @@ class PiBackend(BaseAgentBackend):
             if rc not in (None, 0):
                 await self._raise_nonzero_exit(rc)
             if rc == 0 and self._last_message:
+                await self._require_resume_confirmation()
                 synthetic = {
                     "type": "agent_end",
                     "messages": [
@@ -342,7 +368,8 @@ class PiBackend(BaseAgentBackend):
             await self._reap(proc)
             raise
         finally:
-            self._active_proc = None
+            if proc.returncode is not None:
+                self._active_proc = None
 
     # ------------------------------------------------------------------
     # JSONL parsing
@@ -389,11 +416,7 @@ class PiBackend(BaseAgentBackend):
                 if kind == "session":
                     sid = msg.get("id")
                     if isinstance(sid, str) and sid:
-                        self._session_id = sid
-                        await self._emit(
-                            EVENT_SESSION_STARTED,
-                            {"session_id": sid, "thread_id": sid},
-                        )
+                        await self._observe_session_id(sid)
                 elif kind == "message_end":
                     message = msg.get("message") or {}
                     if isinstance(message, dict):
@@ -504,6 +527,7 @@ class PiBackend(BaseAgentBackend):
             if not line:
                 break
             text = line.decode("utf-8", errors="replace").rstrip()
+            text = redact_session_id(text, self._session_id)
             if text:
                 self._stderr_tail.append(text)
             log.debug(f"{self._agent_name}_stderr", line=text)
@@ -532,9 +556,38 @@ class PiBackend(BaseAgentBackend):
         )
         raise TurnFailed(err_msg)
 
+    async def _require_resume_confirmation(self) -> None:
+        if self._expected_resume_session_id is None:
+            return
+        if not self._resume_session_confirmed:
+            reason = (
+                f"{self._agent_name} did not confirm the requested recovered session"
+            )
+            await self._emit(EVENT_TURN_FAILED, {"reason": reason})
+            raise TurnFailed(reason)
+        self._expected_resume_session_id = None
+        self._resume_session_confirmed = False
+
+    async def _observe_session_id(self, session_id: str) -> None:
+        expected = self._expected_resume_session_id
+        if expected is not None:
+            if session_id != expected:
+                reason = f"{self._agent_name} returned a different recovered session"
+                await self._emit(EVENT_TURN_FAILED, {"reason": reason})
+                raise TurnFailed(reason)
+            self._resume_session_confirmed = True
+        if session_id != self._session_id:
+            self._session_id = session_id
+            await self._emit(
+                EVENT_SESSION_STARTED,
+                {"session_id": session_id, "thread_id": session_id},
+            )
+
     async def _reap(self, proc: asyncio.subprocess.Process) -> None:
-        """Best-effort process-group teardown; mirrors `stop()`."""
-        await terminate_process_tree(proc)
+        """Tear down a process group or surface ambiguous cleanup."""
+        result = await terminate_process_tree(proc)
+        if result is None and proc.returncode is None:
+            raise RuntimeError("backend process cleanup could not be confirmed")
 
     def _update_usage(self, usage: dict[str, Any]) -> None:
         """Accumulate Pi's per-message Usage into the running totals."""
@@ -557,7 +610,10 @@ class PiBackend(BaseAgentBackend):
                 {
                     "event": event,
                     "timestamp": _utc_iso(),
-                    "payload": payload if isinstance(payload, dict) else {"data": payload},
+                    "payload": redact_session_id(
+                        payload if isinstance(payload, dict) else {"data": payload},
+                        None if event == EVENT_SESSION_STARTED else self._session_id,
+                    ),
                     "usage": dict(self._latest_usage),
                     "rate_limits": None,
                     "agent_pid": self.pid,

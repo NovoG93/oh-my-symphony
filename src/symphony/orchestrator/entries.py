@@ -12,9 +12,12 @@ import asyncio
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from ..backends import AgentBackend
+
+if TYPE_CHECKING:
+    from .run_registry import ContinuationCheckpoint
 from ..issue import Issue
 
 
@@ -28,6 +31,12 @@ class RunningEntry:
     attempt_kind: str = "initial"
     agent_kind: str = ""
     run_id: str = ""
+    # A recovered attempt always owns a new run id. The predecessor link is
+    # public history; the private checkpoint is consumed only by the backend
+    # startup path and never serialized from this in-memory entry.
+    continued_from_run_id: str = ""
+    continuation_checkpoint: "ContinuationCheckpoint | None" = None
+    recovery_session_resumed: bool = False
     # Monotonic application-release identity captured before the worker can
     # mutate board labels.  `release_gate_*` comes from the host-owned SQLite
     # authority row; labels remain routing/audit data only.
@@ -53,6 +62,11 @@ class RunningEntry:
     session_id: str | None = None
     thread_id: str | None = None
     turn_id: str | None = None
+    # Exact backend conversation id used only for authority checkpointing.
+    # Unlike `session_id`, it is never decorated with a turn id or serialized.
+    resume_session_id: str | None = None
+    # Latest local turn for which EVENT_TURN_COMPLETED was observed.
+    last_completed_turn_event: int = 0
     turn_count: int = 0
     last_codex_event: str | None = None
     last_codex_message: str = ""

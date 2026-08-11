@@ -189,6 +189,9 @@ agent:
   # Hard per-ticket budget across continuation attempts. Prevents an
   # active-state ticket from restarting forever and wasting tokens.
   max_total_turns: 200
+  # Continue interrupted work from the latest completed turn after a confirmed
+  # process cleanup. Set false to force a fresh agent session after restart.
+  crash_continuation: true
   # Hard token ceiling by workflow state. The global cap is the default for
   # Document; In Progress and Verify get larger build/verification budgets.
   max_total_tokens: 100000000
