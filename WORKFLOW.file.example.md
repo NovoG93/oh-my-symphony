@@ -205,6 +205,9 @@ agent:
   # Hard per-ticket budget across continuation attempts. Prevents an
   # active-state ticket from restarting forever and wasting tokens.
   max_total_turns: 200
+  # Continue interrupted work from the latest completed turn after confirmed
+  # process cleanup. Set false to force a fresh agent session after restart.
+  crash_continuation: true
   max_total_tokens: 100000000
   max_total_tokens_by_state:
     "In Progress": 500000000

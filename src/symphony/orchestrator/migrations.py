@@ -39,6 +39,7 @@ FIRST_GOVERNED_WORKFLOW_VERSION = FIRST_LEGACY_FLOW_TABLE_VERSION
 RELEASE_PROVENANCE_VERSION = 5
 RELEASE_CYCLE_AUTHORITY_VERSION = 6
 RUN_EXPLORER_VERSION = 7
+DURABLE_CONTINUATION_VERSION = 8
 
 
 @dataclass(frozen=True)
@@ -552,6 +553,31 @@ def _migrate_007_run_explorer(conn: sqlite3.Connection) -> None:
     )
 
 
+def _migrate_008_durable_continuation(conn: sqlite3.Connection) -> None:
+    """Add private recovery checkpoints and one-shot successor provenance."""
+    if not _table_columns(conn, "runs"):
+        _migrate_001_baseline(conn)
+    # Keep the upgrade additive so older binaries can still read ordinary run
+    # history. The private session id deliberately has no diagnostic index or
+    # projection; only the continuation acquisition path reads it.
+    for column, declaration in (
+        ("backend_process_identity", "TEXT"),
+        ("resume_session_id", "TEXT"),
+        ("checkpoint_state", "TEXT"),
+        ("checkpoint_turn", "INTEGER"),
+        ("checkpointed_at", "TEXT"),
+        ("continued_from_run_id", "TEXT"),
+    ):
+        _add_column_if_missing(conn, "runs", column, declaration)
+    conn.execute(
+        """
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_runs_continued_from_unique
+        ON runs(continued_from_run_id)
+        WHERE continued_from_run_id IS NOT NULL
+        """
+    )
+
+
 MIGRATIONS: tuple[Migration, ...] = (
     Migration(1, "baseline_runs_and_issue_flags", _migrate_001_baseline),
     # The recorded name stays "governed_workflow_ledger" so existing
@@ -577,6 +603,11 @@ MIGRATIONS: tuple[Migration, ...] = (
         RUN_EXPLORER_VERSION,
         "run_explorer_diagnostics",
         _migrate_007_run_explorer,
+    ),
+    Migration(
+        DURABLE_CONTINUATION_VERSION,
+        "durable_crash_continuation",
+        _migrate_008_durable_continuation,
     ),
 )
 

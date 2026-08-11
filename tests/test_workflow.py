@@ -629,6 +629,48 @@ def test_build_service_config_compact_issue_context_can_opt_out(tmp_path):
     assert cfg.agent.compact_issue_context is False
 
 
+def test_build_service_config_crash_continuation_defaults_true(tmp_path):
+    path = _write(
+        tmp_path,
+        textwrap.dedent(
+            """\
+            ---
+            tracker:
+              kind: file
+              board_root: ./board
+            ---
+            Hello
+            """
+        ),
+    )
+
+    cfg = build_service_config(load_workflow(path))
+
+    assert cfg.agent.crash_continuation is True
+
+
+def test_build_service_config_crash_continuation_can_opt_out(tmp_path):
+    path = _write(
+        tmp_path,
+        textwrap.dedent(
+            """\
+            ---
+            tracker:
+              kind: file
+              board_root: ./board
+            agent:
+              crash_continuation: false
+            ---
+            Hello
+            """
+        ),
+    )
+
+    cfg = build_service_config(load_workflow(path))
+
+    assert cfg.agent.crash_continuation is False
+
+
 def test_build_service_config_reads_codex_model_and_reasoning(tmp_path):
     path = _write(
         tmp_path,

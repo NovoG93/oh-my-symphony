@@ -2019,7 +2019,7 @@
       runSummaryValue(t('common.tokens'), (run.tokens ? run.tokens.total : run.total_tokens) == null ? '—' : formatCompactNumber(run.tokens ? run.tokens.total : run.total_tokens)),
       runSummaryValue(t('runs.failureClass'), run.failure_class || run.error_class || '—'),
     ]));
-    target.appendChild(buildRunMetadata(run));
+    target.appendChild(buildRunMetadata(page, run));
     if (run.failure_message || run.error_message_redacted) {
       target.appendChild(el('div', { class: 'run-error-block' }, [
         el('strong', null, run.failure_class || run.error_class || t('common.failed')),
@@ -2045,7 +2045,7 @@
     return humanizeSeconds((end - start) / 1000);
   }
 
-  function buildRunMetadata(run) {
+  function buildRunMetadata(page, run) {
     const rows = [
       [t('runs.started'), formatShortDateTime(run.started_at)],
       [t('runs.completed'), run.completed_at ? formatShortDateTime(run.completed_at) : t('common.openEnded')],
@@ -2056,10 +2056,32 @@
       [t('runs.tokensCache'), (run.tokens ? run.tokens.cache : run.cache_input_tokens) == null ? '—' : formatCompactNumber(run.tokens ? run.tokens.cache : run.cache_input_tokens)],
       [t('runs.tokensOut'), (run.tokens ? run.tokens.output : run.output_tokens) == null ? '—' : formatCompactNumber(run.tokens ? run.tokens.output : run.output_tokens)],
     ];
-    return el('dl', { class: 'run-metadata' }, rows.flatMap(([label, value]) => [
-      el('dt', null, label),
-      el('dd', { title: String(value) }, String(value)),
-    ]));
+    if (run.continued_from_run_id) {
+      rows.push([t('runs.continuedFrom'), el('button', {
+        class: 'run-metadata-link',
+        type: 'button',
+        title: run.continued_from_run_id,
+        onClick: async () => {
+          state.selectedRunId = run.continued_from_run_id;
+          renderRunAttemptList(page);
+          await loadRunDetail(page, run.continued_from_run_id);
+        },
+      }, run.continued_from_run_id)]);
+    }
+    if (run.checkpoint && run.checkpoint.state && run.checkpoint.turn != null) {
+      rows.push([t('runs.checkpoint'), t('runs.checkpointValue', {
+        state: run.checkpoint.state,
+        turn: run.checkpoint.turn,
+        time: formatShortDateTime(run.checkpoint.checkpointed_at),
+      })]);
+    }
+    return el('dl', { class: 'run-metadata' }, rows.flatMap(([label, value]) => {
+      const isNode = value && typeof value === 'object' && value.nodeType;
+      return [
+        el('dt', null, label),
+        el('dd', isNode ? null : { title: String(value) }, isNode ? value : String(value)),
+      ];
+    }));
   }
 
   function buildRunTimeline(events) {

@@ -208,3 +208,15 @@ def test_safe_proc_wait_windows_timeout_returns_none(
     rc = asyncio.run(safe_proc_wait(fake, timeout=0.01))
     assert rc is None
     assert fake.wait_calls == 1
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX process identity")
+def test_process_identity_is_stable_for_current_process() -> None:
+    import os
+
+    first = _shell.process_identity(os.getpid())
+    second = _shell.process_identity(os.getpid())
+
+    assert first is not None
+    assert first == second
+    assert _shell.process_identity(-1) is None

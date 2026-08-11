@@ -18,6 +18,10 @@ Versioning: [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - Add the additive SQLite v7 diagnostic schema and run detail/download API.
   Persisted diagnostic events are allowlisted, redacted before storage, capped
   per string/event/run, and remain non-authoritative telemetry.
+- Add durable crash continuation from private completed-turn checkpoints. A
+  confirmed dead or managed-stopped predecessor is fenced and linked to one new
+  Run attempt; exact supported backend sessions resume, unsupported or
+  release-authority runs start fresh, and interrupted turns remain at-least-once.
 
 ## [0.19.1] - 2026-08-10 - Production-gated delivery and agent reliability
 

@@ -148,8 +148,9 @@ q quit · r refresh · enter details · n new · e edit · s stats · S skip Doc
    드래그 앤 드롭 상태 이동, 컬럼 추가/삭제/이름변경, 컬럼별 프롬프트
    편집, 브랜치 정책, 전용 통계 페이지.
 4. `.symphony/state.db`의 **단일 노드 신뢰성 ledger** — 활성 실행 lease가
-   재시작 뒤 중복 디스패치를 막고, 죽은 프로세스 소유 lease를 회수하며,
-   retry / pause / budget-exhausted 플래그를 프로세스 종료 뒤에도 보존한다.
+   재시작 뒤 중복 디스패치를 막고, 죽은 소유자의 프로세스를 펜싱·종료한 뒤
+   다음 Run attempt가 마지막 완료 턴 체크포인트에서 이어갈 수 있다. retry /
+   pause / budget-exhausted 플래그도 프로세스 종료 뒤에 보존된다.
 
 아키텍처는 의도적으로 로컬 / 파일 우선이다. Markdown 티켓은 사람이 읽고 고치는
 진실의 원천이고, SQLite는 손으로 편집하지 않아야 하는 런타임 조정 상태를 저장한다.

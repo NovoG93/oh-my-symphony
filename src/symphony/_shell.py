@@ -20,11 +20,14 @@ from __future__ import annotations
 
 import asyncio
 import errno
+import hashlib
 import os
 import shutil
 import signal
+import subprocess
 import sys
 from functools import lru_cache
+from pathlib import Path
 from typing import Any
 
 
@@ -188,6 +191,93 @@ def _signal_process_group(pid: int, sig: int) -> bool:
             return True
         except OSError:
             return False
+
+
+@lru_cache(maxsize=1)
+def _host_boot_token() -> str | None:
+    """Return a stable token for the current OS boot when available."""
+    if sys.platform.startswith("linux"):
+        try:
+            return Path("/proc/sys/kernel/random/boot_id").read_text(encoding="utf-8").strip()
+        except OSError:
+            return None
+    if sys.platform == "darwin":
+        try:
+            result = subprocess.run(
+                ["sysctl", "-n", "kern.boottime"],
+                capture_output=True,
+                check=False,
+                text=True,
+                timeout=1,
+            )
+        except (OSError, subprocess.SubprocessError):
+            return None
+        return result.stdout.strip() or None
+    return None
+
+
+def process_identity(pid: int) -> str | None:
+    """Fingerprint one process incarnation, not merely its reusable pid."""
+    if pid <= 0:
+        return None
+    boot = _host_boot_token()
+    if not boot:
+        return None
+    started: str | None = None
+    if sys.platform.startswith("linux"):
+        try:
+            raw = Path(f"/proc/{pid}/stat").read_text(encoding="utf-8")
+            # Field 2 is parenthesized and may contain spaces. Fields after its
+            # final ')' start at process state; starttime is field 22 => index 19.
+            fields = raw.rsplit(")", 1)[1].split()
+            started = fields[19]
+        except (OSError, IndexError):
+            return None
+    elif sys.platform == "darwin":
+        try:
+            result = subprocess.run(
+                ["ps", "-o", "lstart=", "-p", str(pid)],
+                capture_output=True,
+                check=False,
+                text=True,
+                timeout=1,
+            )
+        except (OSError, subprocess.SubprocessError):
+            return None
+        if result.returncode == 0:
+            started = result.stdout.strip() or None
+    if not started:
+        return None
+    return hashlib.sha256(f"{boot}\0{pid}\0{started}".encode()).hexdigest()
+
+
+def process_group_exists(pid: int) -> bool | None:
+    """Return whether a process group has a non-zombie member."""
+    if pid <= 0 or sys.platform == "win32":
+        return None
+    try:
+        os.killpg(pid, 0)
+    except ProcessLookupError:
+        return False
+    except (PermissionError, OSError):
+        return None
+    try:
+        group_flag = "--pgroup" if sys.platform.startswith("linux") else "-g"
+        result = subprocess.run(
+            ["ps", "-o", "stat=", group_flag, str(pid)],
+            capture_output=True,
+            check=False,
+            text=True,
+            timeout=1,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if result.returncode not in (0, 1):
+        return None
+    statuses = [line.strip() for line in result.stdout.splitlines() if line.strip()]
+    if not statuses:
+        return False if result.returncode == 1 else None
+    return any(not status.upper().startswith("Z") for status in statuses)
 
 
 def kill_process_group(pid: int) -> bool:

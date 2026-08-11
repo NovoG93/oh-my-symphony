@@ -365,6 +365,11 @@ def build_service_config(workflow: WorkflowDefinition) -> ServiceConfig:
         compact_issue_context=bool(
             agent_raw.get("compact_issue_context", True)
         ),
+        crash_continuation=_validated_bool(
+            agent_raw.get("crash_continuation"),
+            True,
+            name="agent.crash_continuation",
+        ),
         auto_commit_on_done=bool(
             agent_raw.get("auto_commit_on_done", True)
         ),
