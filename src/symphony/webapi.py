@@ -19,6 +19,7 @@ explicit operator opt-in to network exposure and disables the Host check.
 from __future__ import annotations
 
 import asyncio
+import heapq
 import ipaddress
 import json
 import re
@@ -56,6 +57,13 @@ from .orchestrator import Orchestrator
 from .product_preview import ProductPreviewError, ProductPreviewManager
 from .projects import Project, ProjectError, ProjectRegistry, canonical_project_repo
 from .orchestrator.run_registry import clamp_run_history_limit
+from .orchestrator.scheduler import (
+    MAX_DEPENDENCY_EDGES,
+    MAX_DEPENDENCY_NODES,
+    RequestGroupKey,
+    dependency_cycle_nodes,
+    group_by_request,
+)
 from .workflow import (
     SUPPORTED_AGENT_KINDS,
     SUPPORTED_CI_MODES,
@@ -246,6 +254,299 @@ def _issue_card(
     }
 
 
+_PUBLIC_SCHEDULE_REASONS = {
+    "not_evaluated": "scheduler evaluation is pending",
+    "ready": "eligible for dispatch",
+    "dispatched": "agent run started",
+    "running": "agent run is active",
+    "retry_scheduled": "owned by the retry timer",
+    "auto_triage": "ticket advanced by automatic triage",
+    "continuous_improvement": "continuous improvement owns the idle board",
+    "leased_elsewhere": "owned by another durable run lease",
+    "registry_unavailable": "durable authority registry is unavailable",
+    "historical_release_verifier": "historical release verifier is evidence-only",
+    "claimed": "another scheduler path owns the ticket",
+    "paused": "ticket is paused",
+    "budget_exhausted": "turn budget is exhausted",
+    "finalizing": "finalization owns the ticket",
+    "inactive": "ticket state is not active",
+    "incomplete_identity": "ticket identity is incomplete",
+    "unsupported_agent": "ticket requests an unsupported agent",
+    "waiting_dependency": "waiting for dependencies",
+    "waiting_global_capacity": "waiting for global capacity",
+    "waiting_state_capacity": "waiting for state capacity",
+    "refused_conflict": "final conflict check refused dispatch",
+    "refused_dispatch_authority": "final dispatch authority was not acquired",
+    "terminal_success": "dependency is complete",
+    "terminal_needs_action": "terminal state does not resolve dependencies",
+    "dangling_dependency": "blocker is not present on the board",
+    "snapshot_unavailable": "not present in the last scheduler evaluation",
+    "decision_stale": "ticket changed after scheduler evaluation",
+}
+
+
+def _public_schedule_reason(code: str) -> str:
+    return _PUBLIC_SCHEDULE_REASONS.get(
+        code, "scheduler decision is available by code"
+    )
+
+
+def _request_group_schedule_payload(
+    *,
+    key: RequestGroupKey,
+    members: list[Issue],
+    all_issues: list[Issue],
+    schedule: dict[str, Any],
+    orchestrator: Orchestrator,
+    cfg: ServiceConfig,
+) -> dict[str, Any]:
+    by_identifier = {issue.identifier: issue for issue in all_issues}
+    by_reference = dict(by_identifier)
+    by_reference.update({issue.id: issue for issue in all_issues})
+    decisions = {
+        row.get("identifier"): row
+        for row in schedule.get("entries", [])
+        if isinstance(row, dict) and isinstance(row.get("identifier"), str)
+    }
+    member_ids = {issue.identifier for issue in members}
+    node_issues: dict[str, Issue | None] = {
+        issue.identifier: issue for issue in members
+    }
+    edge_set: set[tuple[str, str]] = set()
+    pending = list(members)
+    traversed: set[str] = set()
+    while pending:
+        issue = pending.pop()
+        if issue.identifier in traversed:
+            continue
+        traversed.add(issue.identifier)
+        node_issues.setdefault(issue.identifier, issue)
+        for blocker in issue.blocked_by:
+            blocker_reference = blocker.identifier or blocker.id
+            if not blocker_reference:
+                continue
+            blocker_issue = by_reference.get(blocker_reference)
+            blocker_id = (
+                blocker_issue.identifier
+                if blocker_issue is not None
+                else (blocker.identifier or blocker.id)
+            )
+            if not blocker_id:
+                continue
+            edge_set.add((blocker_id, issue.identifier))
+            node_issues.setdefault(blocker_id, blocker_issue)
+            if blocker_issue is not None and blocker_issue.identifier not in traversed:
+                pending.append(blocker_issue)
+
+    downstream: dict[str, list[str]] = {identifier: [] for identifier in node_issues}
+    indegree = {identifier: 0 for identifier in node_issues}
+    for blocker_id, dependent_id in sorted(edge_set):
+        downstream.setdefault(blocker_id, []).append(dependent_id)
+        indegree.setdefault(dependent_id, 0)
+        indegree[dependent_id] += 1
+    ready = [identifier for identifier, degree in indegree.items() if degree == 0]
+    heapq.heapify(ready)
+    execution_order: list[str] = []
+    while ready:
+        identifier = heapq.heappop(ready)
+        execution_order.append(identifier)
+        for dependent in sorted(downstream.get(identifier, [])):
+            indegree[dependent] -= 1
+            if indegree[dependent] == 0:
+                heapq.heappush(ready, dependent)
+    warnings: list[str] = []
+    unordered = sorted(set(node_issues) - set(execution_order))
+    cycle_nodes = dependency_cycle_nodes(set(node_issues), edge_set)
+    if unordered:
+        execution_order.extend(unordered)
+    if cycle_nodes:
+        warnings.append("dependency_cycle")
+
+    terminal_states = {state.strip().lower() for state in cfg.tracker.terminal_states}
+    counts = {
+        "running": 0,
+        "ready": 0,
+        "waiting": 0,
+        "retrying": 0,
+        "successful": 0,
+        "needs_action": 0,
+    }
+    nodes: list[dict[str, Any]] = []
+    for identifier in execution_order:
+        issue = node_issues[identifier]
+        scope = "request" if identifier in member_ids else "external"
+        decision = decisions.get(identifier)
+        if decision is None and issue is not None:
+            decision = decisions.get(issue.identifier)
+        if decision is not None:
+            status = str(decision.get("status") or "waiting")
+            code = str(decision.get("code") or "not_evaluated")
+            reason = str(decision.get("reason") or "not evaluated")
+        elif issue is None:
+            status = "needs_action"
+            code = "dangling_dependency"
+            reason = "blocker is not present on the board"
+            warnings.append(f"dangling_dependency:{identifier}")
+        elif issue.state.strip().lower() in terminal_states:
+            if orchestrator.dependency_state_resolved(issue.state):
+                status = "successful"
+                code = "terminal_success"
+                reason = "dependency is complete"
+            else:
+                status = "needs_action"
+                code = "terminal_needs_action"
+                reason = f"terminal state does not resolve dependencies: {issue.state}"
+        else:
+            status = "waiting"
+            code = "snapshot_unavailable"
+            reason = "not present in the last scheduler evaluation"
+        evaluated_state = decision.get("evaluated_state") if decision else None
+        evaluated_updated_at = (
+            decision.get("evaluated_updated_at") if decision else None
+        )
+        current_updated_at = (
+            issue.updated_at.isoformat()
+            if issue is not None and issue.updated_at is not None
+            else None
+        )
+        current_blockers = (
+            [
+                {
+                    "id": blocker.id,
+                    "identifier": blocker.identifier,
+                    "state": blocker.state,
+                }
+                for blocker in issue.blocked_by
+            ]
+            if issue is not None
+            else []
+        )
+        decision_drifted = bool(
+            issue is not None
+            and (
+                (evaluated_state is not None and issue.state != evaluated_state)
+                or (
+                    evaluated_updated_at is not None
+                    and current_updated_at != evaluated_updated_at
+                )
+                or (
+                    decision is not None
+                    and "evaluated_priority" in decision
+                    and issue.priority != decision.get("evaluated_priority")
+                )
+                or (
+                    decision is not None
+                    and "evaluated_request" in decision
+                    and ((issue.request or "").strip() or None)
+                    != decision.get("evaluated_request")
+                )
+                or (
+                    decision is not None
+                    and "evaluated_blocked_by" in decision
+                    and current_blockers != decision.get("evaluated_blocked_by")
+                )
+                or (
+                    decision is None
+                    and bool(schedule.get("available"))
+                    and issue.state.strip().lower() not in terminal_states
+                )
+            )
+        )
+        if decision_drifted:
+            status = "needs_action"
+            code = "decision_stale"
+        reason = _public_schedule_reason(code)
+        if scope == "request":
+            counts[status if status in counts else "waiting"] += 1
+        blockers: list[dict[str, Any]] = []
+        for blocker, dependent in sorted(edge_set):
+            if dependent != identifier:
+                continue
+            blocker_issue = node_issues.get(blocker)
+            blockers.append(
+                {
+                    "identifier": blocker,
+                    "state": blocker_issue.state if blocker_issue is not None else None,
+                    "resolved": (
+                        orchestrator.dependency_state_resolved(blocker_issue.state)
+                        if blocker_issue is not None
+                        else False
+                    ),
+                }
+            )
+        node = {
+            "identifier": identifier,
+            "title": issue.title if issue is not None else identifier,
+            "exists": issue is not None,
+            "state": issue.state if issue is not None else None,
+            "priority": issue.priority if issue is not None else None,
+            "scope": scope,
+            "cycle": identifier in cycle_nodes,
+            "decision_drifted": decision_drifted,
+            "evaluated_state": evaluated_state,
+            "blocked_by": blockers,
+            "unlocks": sorted(downstream.get(identifier, [])),
+            "decision": {"status": status, "code": code, "reason": reason},
+            "queue_rank": decision.get("queue_rank") if decision else None,
+            "scan_position": decision.get("scan_position") if decision else None,
+            "wave": decision.get("wave") if decision else None,
+            "global_critical_path_length": (
+                decision.get("critical_path_length") if decision else None
+            ),
+            "starvation_promoted": bool(
+                decision.get("starvation_promoted") if decision else False
+            ),
+            "retry": decision.get("retry") if decision else None,
+        }
+        nodes.append(node)
+
+    longest_unresolved_nodes: int | None
+    if cycle_nodes:
+        longest_unresolved_nodes = None
+    else:
+        unresolved = {
+            node["identifier"]
+            for node in nodes
+            if node["decision"]["status"] != "successful"
+        }
+        chain_nodes: dict[str, int] = {}
+        for identifier in reversed(execution_order):
+            if identifier not in unresolved:
+                continue
+            chain_nodes[identifier] = 1 + max(
+                (
+                    chain_nodes.get(dependent, 0)
+                    for dependent in downstream.get(identifier, [])
+                    if dependent in unresolved
+                ),
+                default=0,
+            )
+        longest_unresolved_nodes = max(chain_nodes.values(), default=0)
+    has_decision_drift = any(node["decision_drifted"] for node in nodes)
+    return {
+        "schema_version": 1,
+        "available": bool(schedule.get("available")),
+        "request": {"kind": key.kind, "id": key.value},
+        "generated_at": schedule.get("generated_at"),
+        "stale": bool(schedule.get("stale")) or has_decision_drift,
+        "decision_drifted": has_decision_drift,
+        "execution_valid": not cycle_nodes,
+        "policy": schedule.get("policy", "fifo"),
+        "policy_order": schedule.get("policy_order", "starvation, registration"),
+        "slots": schedule.get("slots", {}),
+        "summary": {
+            "counts": counts,
+            "longest_unresolved_chain_nodes": longest_unresolved_nodes,
+        },
+        "nodes": nodes,
+        "edges": [
+            {"from": blocker, "to": dependent}
+            for blocker, dependent in sorted(edge_set)
+        ],
+        "warnings": sorted(set(warnings)),
+    }
+
+
 def _json_safe(value: Any) -> Any:
     if isinstance(value, datetime | date):
         return value.isoformat()
@@ -312,6 +613,7 @@ def _workflow_payload(cfg: ServiceConfig) -> dict[str, Any]:
             "max_concurrent_agents": cfg.agent.max_concurrent_agents,
             "max_turns": cfg.agent.max_turns,
             "max_attempts": cfg.agent.max_attempts,
+            "scheduling_policy": cfg.agent.scheduling_policy,
             "feature_base_branch": cfg.agent.feature_base_branch,
             "auto_merge_target_branch": cfg.agent.auto_merge_target_branch,
             "auto_merge_on_done": cfg.agent.auto_merge_on_done,
@@ -443,6 +745,15 @@ def _check_request(raw: Any) -> str:
     if request and not _IDENTIFIER_RE.match(request):
         raise WorkflowMutationError(f"request must match {_IDENTIFIER_RULE}")
     return request
+
+
+def _check_request_schedule_key(raw: Any) -> str:
+    if not isinstance(raw, str) or not raw.strip():
+        raise WorkflowMutationError("request schedule id is required")
+    value = raw.strip()
+    if len(value) > 512 or any(ord(char) < 32 or ord(char) == 127 for char in value):
+        raise WorkflowMutationError("request schedule id is invalid")
+    return value
 
 
 def _check_blocked_by(raw: Any) -> list[str]:
@@ -681,6 +992,190 @@ def _register_issue_routes(
             }
         )
 
+    async def _fetch_all_file_issues(cfg: ServiceConfig) -> list[Issue]:
+        tracker = FileBoardTracker(cfg.tracker)
+        all_states = list(_valid_states(cfg).values())
+        return await asyncio.to_thread(tracker.fetch_issues_by_states, all_states)
+
+    async def handle_requests(_request: web.Request) -> web.Response:
+        cfg = ctx.config()
+        schedule = orchestrator.schedule_snapshot()
+        if cfg.tracker.kind != "file":
+            return web.json_response(
+                {
+                    "available": False,
+                    "reason": "unsupported_tracker",
+                    "tracker_kind": cfg.tracker.kind,
+                    "requests": [],
+                },
+                headers={"Cache-Control": "no-store"},
+            )
+        issues = await _fetch_all_file_issues(cfg)
+        edge_count = sum(len(issue.blocked_by) for issue in issues)
+        if len(issues) > MAX_DEPENDENCY_NODES or edge_count > MAX_DEPENDENCY_EDGES:
+            return _json_error(
+                413,
+                "schedule_graph_too_large",
+                "request schedule graph exceeds the safe read limit",
+            )
+        groups = group_by_request(issues)
+        decisions = {
+            row.get("identifier"): row
+            for row in schedule.get("entries", [])
+            if isinstance(row, dict) and isinstance(row.get("identifier"), str)
+        }
+        terminal_states = {state.strip().lower() for state in cfg.tracker.terminal_states}
+        requests_payload: list[dict[str, Any]] = []
+        catalog_drifted = False
+        for key, members in groups.items():
+            counts = {
+                "running": 0,
+                "ready": 0,
+                "waiting": 0,
+                "retrying": 0,
+                "successful": 0,
+                "needs_action": 0,
+            }
+            for issue in members:
+                decision = decisions.get(issue.identifier)
+                current_updated_at = (
+                    issue.updated_at.isoformat() if issue.updated_at else None
+                )
+                member_drifted = bool(
+                    (
+                        decision is not None
+                        and (
+                            (
+                                decision.get("evaluated_state") is not None
+                                and decision.get("evaluated_state") != issue.state
+                            )
+                            or (
+                                decision.get("evaluated_updated_at") is not None
+                                and decision.get("evaluated_updated_at")
+                                != current_updated_at
+                            )
+                            or (
+                                "evaluated_request" in decision
+                                and decision.get("evaluated_request")
+                                != ((issue.request or "").strip() or None)
+                            )
+                        )
+                    )
+                    or (
+                        decision is None
+                        and bool(schedule.get("available"))
+                        and issue.state.strip().lower() not in terminal_states
+                    )
+                )
+                catalog_drifted = catalog_drifted or member_drifted
+                if (
+                    member_drifted
+                ):
+                    status = "needs_action"
+                elif decision is not None:
+                    status = str(decision.get("status") or "waiting")
+                elif issue.state.strip().lower() in terminal_states:
+                    status = (
+                        "successful"
+                        if orchestrator.dependency_state_resolved(issue.state)
+                        else "needs_action"
+                    )
+                else:
+                    status = "waiting"
+                counts[status if status in counts else "waiting"] += 1
+            requests_payload.append(
+                {
+                    "kind": key.kind,
+                    "id": key.value,
+                    "node_count": len(members),
+                    "counts": counts,
+                    # The complete prerequisite closure is built only by the
+                    # detail endpoint; do not substitute the global DAG rank.
+                    "longest_unresolved_chain_nodes": None,
+                }
+            )
+        requests_payload.sort(
+            key=lambda row: (
+                row["kind"] != "request",
+                -sum(
+                    int(row["counts"].get(status, 0))
+                    for status in (
+                        "running",
+                        "ready",
+                        "waiting",
+                        "retrying",
+                        "needs_action",
+                    )
+                ),
+                str(row["id"]).casefold(),
+                str(row["id"]),
+            )
+        )
+        return web.json_response(
+            {
+                "available": bool(schedule.get("available")),
+                "reason": schedule.get("reason"),
+                "tracker_kind": cfg.tracker.kind,
+                "generated_at": schedule.get("generated_at"),
+                "stale": bool(schedule.get("stale")) or catalog_drifted,
+                "decision_drifted": catalog_drifted,
+                "policy": schedule.get("policy", cfg.agent.scheduling_policy),
+                "requests": requests_payload,
+            },
+            headers={"Cache-Control": "no-store"},
+        )
+
+    async def handle_request_schedule(request: web.Request) -> web.Response:
+        cfg = ctx.config()
+        if cfg.tracker.kind != "file":
+            return web.json_response(
+                {
+                    "available": False,
+                    "reason": "unsupported_tracker",
+                    "tracker_kind": cfg.tracker.kind,
+                },
+                headers={"Cache-Control": "no-store"},
+            )
+        kind = request.query.get(
+            "kind", request.match_info.get("kind", "request")
+        ).strip().lower()
+        if kind not in {"request", "ticket"}:
+            return _json_error(400, "invalid_request_kind", "kind must be request or ticket")
+        raw_identifier = request.query.get("id", request.match_info.get("identifier"))
+        identifier = (
+            _check_request_schedule_key(raw_identifier)
+            if "id" in request.query
+            else _check_identifier(str(raw_identifier or ""))
+        )
+        issues = await _fetch_all_file_issues(cfg)
+        edge_count = sum(len(issue.blocked_by) for issue in issues)
+        if len(issues) > MAX_DEPENDENCY_NODES or edge_count > MAX_DEPENDENCY_EDGES:
+            return _json_error(
+                413,
+                "schedule_graph_too_large",
+                "request schedule graph exceeds the safe read limit",
+            )
+        groups = group_by_request(issues)
+        key = RequestGroupKey(
+            "request" if kind == "request" else "ticket", identifier
+        )
+        members = groups.get(key)
+        if members is None:
+            return _json_error(
+                404,
+                "request_not_found",
+                f"unknown {kind} schedule {identifier}",
+            )
+        payload = _request_group_schedule_payload(
+            key=key,
+            members=members,
+            all_issues=issues,
+            schedule=orchestrator.schedule_snapshot(),
+            orchestrator=orchestrator,
+            cfg=cfg,
+        )
+        return web.json_response(payload, headers={"Cache-Control": "no-store"})
+
     async def handle_issue_create(request: web.Request) -> web.Response:
         body = await _read_json(request)
         cfg = ctx.config()
@@ -905,6 +1400,19 @@ def _register_issue_routes(
         "/api/v1/runs/{run_id}/diagnostic", _wrap(handle_run_diagnostic)
     )
     app.router.add_get("/api/v1/board", _wrap(handle_board))
+    app.router.add_get("/api/v1/requests", _wrap(handle_requests))
+    app.router.add_get(
+        "/api/v1/requests/schedule",
+        _wrap(handle_request_schedule),
+    )
+    app.router.add_get(
+        "/api/v1/requests/{identifier}/schedule",
+        _wrap(handle_request_schedule),
+    )
+    app.router.add_get(
+        "/api/v1/requests/{kind}/{identifier}/schedule",
+        _wrap(handle_request_schedule),
+    )
     app.router.add_post("/api/v1/issues", _wrap(handle_issue_create))
     app.router.add_get("/api/v1/issues/{identifier}", _wrap(handle_issue_detail))
     app.router.add_patch("/api/v1/issues/{identifier}", _wrap(handle_issue_patch))
