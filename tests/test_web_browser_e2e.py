@@ -96,10 +96,64 @@ class _StubOrchestrator:
         return None
 
     def recent_runs(
-        self, issue_id: str | None = None, limit: int = 50
+        self,
+        issue_id: str | None = None,
+        limit: int = 50,
+        *,
+        query: str | None = None,
+        status: str | None = None,
+        agent: str | None = None,
     ) -> tuple[list[dict[str, Any]], str | None]:
-        del issue_id, limit
-        return [], None
+        del issue_id, limit, query, status, agent
+        return [self._run_summary()], None
+
+    @staticmethod
+    def _run_summary() -> dict[str, Any]:
+        return {
+            "run_id": "a" * 32,
+            "issue_id": "id-SEED-DONE",
+            "identifier": "SEED-DONE",
+            "title": "Seed done card",
+            "state": "Done",
+            "attempt": None,
+            "attempt_kind": "initial",
+            "agent_kind": "codex",
+            "status": "normal",
+            "started_at": "2026-07-02T00:00:00+00:00",
+            "updated_at": "2026-07-02T00:00:05+00:00",
+            "completed_at": "2026-07-02T00:00:05+00:00",
+            "workspace_path": "/tmp/SEED-DONE",
+            "branch_name": "symphony/SEED-DONE",
+            "commit_sha": "b" * 40,
+            "tokens": {"input": 10, "cache": 2, "output": 3, "total": 15},
+            "failure_class": None,
+            "failure_message": None,
+        }
+
+    def run_detail(self, run_id: str) -> tuple[dict[str, Any] | None, str | None]:
+        if run_id != "a" * 32:
+            return None, None
+        return {
+            "run": self._run_summary(),
+            "events": [
+                {
+                    "event_id": 1,
+                    "event_type": "run_acquired",
+                    "created_at": "2026-07-02T00:00:00+00:00",
+                    "payload": {"agent_kind": "codex", "state": "Done"},
+                },
+                {
+                    "event_id": 2,
+                    "event_type": "run_completed",
+                    "created_at": "2026-07-02T00:00:05+00:00",
+                    "payload": {"status": "normal", "total_tokens": 15},
+                },
+            ],
+        }, None
+
+    def run_diagnostic(self, run_id: str) -> tuple[dict[str, Any] | None, str | None]:
+        detail, error = self.run_detail(run_id)
+        return ({"schema_version": 1, **detail} if detail else None), error
 
     def request_refresh(self) -> bool:
         return False
@@ -761,6 +815,30 @@ async def test_web_git_and_chat_browser_e2e(
             await browser.close()
 
 
+async def _exercise_runs_page(page: Any, base_url: str) -> None:
+    await page.goto(f"{base_url}/#/runs")
+    await page.locator(".run-attempt-row").first.wait_for()
+    assert "SEED-DONE" in await page.locator(".run-attempt-row").first.inner_text()
+    await page.locator(".run-attempt-row").first.click()
+    await page.locator(".run-timeline-event").nth(1).wait_for()
+    assert await page.locator(".run-timeline-event").count() == 2
+    assert "Seed done card" in await page.locator(".run-attempt-detail h2").inner_text()
+    async with page.expect_request(
+        lambda request: request.url.endswith("query=missing-run")
+    ):
+        await page.locator("#runs-search").fill("missing-run")
+    await page.get_by_text("No recorded runs match these filters").wait_for()
+    await page.locator("#runs-search").fill("")
+    await page.locator(".run-attempt-row").first.wait_for()
+    async with page.expect_request(
+        lambda request: "status=normal" in request.url
+    ):
+        await page.locator("#runs-status-filter").select_option("normal")
+    await page.locator("#runs-status-filter").select_option("")
+    await page.goto(f"{base_url}/#/board")
+    await page.get_by_role("button", name="+ New Issue").wait_for()
+
+
 async def test_web_board_browser_e2e(web_base_url: str) -> None:
     assert async_playwright is not None
     async with async_playwright() as p:
@@ -777,6 +855,7 @@ async def test_web_board_browser_e2e(web_base_url: str) -> None:
         )
         try:
             await _exercise_column_scope(page, web_base_url)
+            await _exercise_runs_page(page, web_base_url)
             await _exercise_issue_crud(page)
             await _exercise_settings_layout(page, web_base_url)
             await _exercise_mobile_layout(page, web_base_url)
