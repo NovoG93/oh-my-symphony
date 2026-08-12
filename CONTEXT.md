@@ -20,6 +20,18 @@ Making an existing directory usable as a Project while preserving its contents. 
 
 A user-interface navigation from one independently running Project service to another. A switch can start the destination service, but it never retargets, redirects, or stops workers belonging to either Project.
 
+## Ticket artifact
+
+A host-owned deliverable file collected from a worker's workspace and shown on one ticket's card. A worker writes the file into the workspace artifact directory; the host copies it after each completed turn and keeps it after the workspace is removed. A Ticket artifact is operational data, not Git history, and it is never the same thing as the Git-tracked evidence under a ticket's evidence root.
+
+## Artifact store
+
+The per-Project directory that holds every Ticket artifact, one subdirectory per ticket, with a metadata index beside the files. The store is the only path the Board serves artifacts from. A file that is absent from the index is not served.
+
+## Artifact sweep
+
+The periodic removal of artifact subdirectories whose ticket left the Board or entered the archive state. A sweep removes a subdirectory only after the retention period passes with no change. A retention period of zero disables the sweep. A live ticket never loses its Ticket artifacts.
+
 ## Product Preview
 
 An operator-started, loopback-only process launched from one Project's trusted workflow recipe in a detached checkout of the exact target commit. Symphony asks the operating system for a currently free managed port. Each Project service owns only the preview process group it launched; it never stops an unrelated listener or another Project's preview. A rare bind race fails the launch rather than killing the process that acquired the port.

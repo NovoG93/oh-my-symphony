@@ -157,9 +157,7 @@ class TestCollect:
         assert ("big.bin", "file_too_large") in result.skipped
 
     def test_ticket_quota_cap(self, tmp_path: Path) -> None:
-        workspace = _make_workspace(
-            tmp_path, {"a.bin": b"x" * 40, "b.bin": b"y" * 40}
-        )
+        workspace = _make_workspace(tmp_path, {"a.bin": b"x" * 40, "b.bin": b"y" * 40})
         store = _store(tmp_path, max_ticket_bytes=50)
         result = store.collect_from_workspace(workspace, identifier="T-1")
         assert len(result.collected) == 1

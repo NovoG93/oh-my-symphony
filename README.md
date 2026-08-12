@@ -669,6 +669,35 @@ stage-specific prompt files configured by `WORKFLOW.md`.
 
 Every artefact a ticket produces lives under `docs/<TICKET-ID>/<stage>/`. See [`docs/PIPELINE.md`](docs/PIPELINE.md#per-ticket-artefact-root) for the layout, what to commit, and the `${LLM_WIKI_PATH:-./docs/llm-wiki}/` carve-out.
 
+### Board deliverables
+
+Those `docs/` artefacts are committed evidence. Files a reviewer just wants to
+*open* — screenshots, exported reports, PDFs — go somewhere else: an agent saves
+them to `.symphony-artifacts/` at its workspace root, and after each turn
+Symphony copies new files to `.symphony/artifacts/<TICKET-ID>/` on the host.
+They then show up in the ticket drawer on the web board (images preview inline)
+and as an `## Artifacts` list on the ticket itself, and they survive the
+workspace being removed at Done. The directory is kept out of Git, so
+deliverables never land in the merge.
+
+An optional `.symphony-artifacts/manifest.json` adds titles:
+
+```json
+{ "artifacts": [{ "file": "login.png", "title": "Login page", "summary": "After the fix" }] }
+```
+
+Defaults, all optional in `WORKFLOW.md`:
+
+```yaml
+artifacts:
+  enabled: true                 # false turns collection off entirely
+  dir: .symphony-artifacts      # workspace directory agents write into
+  max_file_mb: 25
+  max_ticket_mb: 200
+  ttl_days: 30                  # drop artifacts 30 days after a ticket is archived; 0 disables
+  require_for_done: false       # true blocks Done until a ticket has at least one artifact
+```
+
 ### Machine gate for application releases
 
 Production application delivery is opt-in. Add `app-release` to the Verify
