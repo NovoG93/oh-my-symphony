@@ -14,6 +14,9 @@ this blocks DNS-rebinding reads as well as writes. Mutating methods must
 additionally send a JSON content type, which forces a CORS preflight on
 cross-origin HTML/form attempts. Binding to a non-loopback interface is an
 explicit operator opt-in to network exposure and disables the Host check.
+Fronting the board with a reverse proxy or tunnel is the other opt-in: the
+public name goes in `SYMPHONY_TRUSTED_ORIGINS` so project mutations and the
+chat WebSocket accept it.
 """
 
 from __future__ import annotations
@@ -22,6 +25,7 @@ import asyncio
 import heapq
 import ipaddress
 import json
+import os
 import re
 from functools import partial
 from datetime import date, datetime
@@ -110,6 +114,13 @@ _MAX_BODY = 128_000
 _MAX_LABELS = 20
 _ALLOWED_HOSTS = {"localhost", "127.0.0.1", "[::1]"}
 _LOOPBACK_BINDS = {"", "localhost", "127.0.0.1", "::1", "[::1]"}
+# Operators who front the board with a reverse proxy or tunnel (cloudflared,
+# ngrok, ssh -L with a rewritten Host) reach it under a public name the
+# loopback allowlists cannot know. They declare it here, comma separated:
+#   SYMPHONY_TRUSTED_ORIGINS=https://symphony.example.com
+# Entries may be full origins (`https://host:port`), bare hostnames (any
+# scheme/port), or `*` to trust every origin.
+TRUSTED_ORIGINS_ENV = "SYMPHONY_TRUSTED_ORIGINS"
 _CI_EDITABLE_KEYS = {"enabled", "interval_ms", "max_turns", "agent_kind", "modes"}
 BIND_HOST_KEY: web.AppKey[str] = web.AppKey("symphony.bind_host", str)
 CHAT_MANAGER_KEY: web.AppKey[ChatManager] = web.AppKey("symphony.chat", ChatManager)
@@ -147,11 +158,85 @@ def _request_host(request: web.Request) -> str:
     return raw.rsplit(":", 1)[0]
 
 
+def _bare_host(host: str) -> str:
+    """Strip IPv6 brackets so Host and Origin hostnames compare equal."""
+    return host.strip().lower().removeprefix("[").removesuffix("]")
+
+
+def _host_is_loopback(host: str) -> bool:
+    bare = _bare_host(host)
+    if bare == "localhost":
+        return True
+    try:
+        return ipaddress.ip_address(bare).is_loopback
+    except ValueError:
+        return False
+
+
+def _trusted_origins() -> set[str]:
+    """Operator-declared origins from `SYMPHONY_TRUSTED_ORIGINS`."""
+    raw = os.environ.get(TRUSTED_ORIGINS_ENV, "")
+    return {
+        entry.strip().lower().rstrip("/")
+        for entry in raw.replace(";", ",").split(",")
+        if entry.strip()
+    }
+
+
+def _host_is_declared_trusted(host: str) -> bool:
+    """Does `SYMPHONY_TRUSTED_ORIGINS` name this Host header?"""
+    trusted = _trusted_origins()
+    if "*" in trusted:
+        return True
+    bare = _bare_host(host)
+    if not bare:
+        return False
+    return any(
+        bare == _bare_host(urlsplit(entry).hostname or entry) for entry in trusted
+    )
+
+
+def _origin_is_trusted(request: web.Request, origin: str) -> bool:
+    """Is this browser Origin allowed to mutate this board?
+
+    A missing Origin is fine — non-browser clients omit it, and browsers
+    always send one on the cross-origin requests we care about. Anything
+    else has to be loopback, the very host the browser addressed, or an
+    origin the operator declared.
+    """
+    if not origin:
+        return True
+    trusted = _trusted_origins()
+    if "*" in trusted:
+        return True
+    normalized = origin.strip().lower().rstrip("/")
+    if normalized in trusted:
+        return True
+    host = _bare_host(urlsplit(origin).hostname or "")
+    if not host:
+        # `Origin: null` — sandboxed iframe, file://, or a redirected form post.
+        return False
+    if host in trusted:
+        return True
+    if _host_is_loopback(host):
+        # Same machine. A TLS-terminating proxy or port forward in front of
+        # the board changes the scheme or port but not the trust boundary.
+        return True
+    return host == _bare_host(_request_host(request))
+
+
 @web.middleware
 async def _api_guard(request: web.Request, handler):
     if request.path.startswith("/api/"):
         bind = str(request.app.get(BIND_HOST_KEY) or "127.0.0.1").lower()
-        if bind in _LOOPBACK_BINDS and _request_host(request) not in _ALLOWED_HOSTS:
+        host = _request_host(request)
+        if (
+            bind in _LOOPBACK_BINDS
+            and host not in _ALLOWED_HOSTS
+            # A proxy that forwards the public Host verbatim is still the
+            # operator's own front door once they have declared it.
+            and not _host_is_declared_trusted(host)
+        ):
             return _json_error(
                 403, "forbidden_host", f"host {request.host!r} not allowed"
             )
@@ -2329,9 +2414,6 @@ def _register_git_routes(
 # ---------------------------------------------------------------------------
 
 
-_WS_ALLOWED_ORIGIN_HOSTS = {"localhost", "127.0.0.1", "::1", "[::1]"}
-
-
 def _register_chat_routes(
     app: web.Application, ctx: _Ctx, orchestrator: Orchestrator
 ) -> None:
@@ -2539,11 +2621,7 @@ def _register_chat_routes(
     def _origin_allowed(request: web.Request) -> bool:
         # Browsers do not apply CORS to WebSocket upgrades; without this an
         # arbitrary web page could stream the operator's transcript.
-        origin = request.headers.get("Origin")
-        if not origin:
-            return True
-        host = (urlsplit(origin).hostname or "").strip().lower()
-        return host in _WS_ALLOWED_ORIGIN_HOSTS
+        return _origin_is_trusted(request, request.headers.get("Origin") or "")
 
     async def _pump(
         queue: asyncio.Queue[dict[str, Any] | None], ws: web.WebSocketResponse
@@ -2859,17 +2937,14 @@ def _project_mutation_error(request: web.Request) -> web.Response | None:
             403, "project_mutation_forbidden", "project management is loopback-only"
         )
     origin = request.headers.get("Origin")
-    if origin:
-        parsed = urlsplit(origin)
-        if (
-            parsed.scheme.lower() != request.scheme.lower()
-            or parsed.netloc.lower() != request.host.lower()
-        ):
-            return _json_error(
-                403,
-                "forbidden_origin",
-                "project mutations require same-origin requests",
-            )
+    if not _origin_is_trusted(request, origin or ""):
+        return _json_error(
+            403,
+            "forbidden_origin",
+            f"origin {origin!r} may not manage projects; set "
+            f"{TRUSTED_ORIGINS_ENV}={origin} if you front this board with a "
+            "reverse proxy or tunnel",
+        )
     if request.content_length is not None and request.content_length > 16_384:
         return _json_error(413, "request_too_large", "project request is too large")
     return None
