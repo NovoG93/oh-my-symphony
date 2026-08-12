@@ -1,9 +1,12 @@
 """Persistent run-state helpers for `symphony service`."""
 
 from __future__ import annotations
+import json
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from threading import Thread
 
 import pytest
 
@@ -18,6 +21,7 @@ from symphony.service import (
     build_orchestrator_command,
     clear_record,
     is_process_running,
+    is_symphony_workflow_reachable,
     load_record,
     main as service_main,
     record_path_for,
@@ -45,7 +49,9 @@ def _issue(identifier: str = "SMA-1") -> Issue:
     )
 
 
-def _record(workflow_path: Path, *, pid: int | None = 1234, port: int = 9999) -> ServiceRecord:
+def _record(
+    workflow_path: Path, *, pid: int | None = 1234, port: int = 9999
+) -> ServiceRecord:
     workflow_dir = workflow_path.parent
     return ServiceRecord(
         workflow_path=workflow_path.resolve(),
@@ -114,14 +120,228 @@ def test_stale_pid_with_live_api_is_reported_running(tmp_path: Path) -> None:
     assert status.record.orchestrator_pid == 1234
 
 
-def test_service_status_uses_current_process_checker(tmp_path: Path, monkeypatch) -> None:
+def test_service_status_uses_current_process_checker(
+    tmp_path: Path, monkeypatch
+) -> None:
     workflow = _workflow(tmp_path)
     save_record(_record(workflow, pid=1234))
     monkeypatch.setattr(service_module, "is_process_running", lambda pid: pid == 1234)
+    monkeypatch.setattr(
+        service_module,
+        "is_symphony_workflow_reachable",
+        lambda *_args: pytest.fail("live PID must not perform an HTTP identity probe"),
+    )
 
     status = service_status(workflow, port=9999)
 
     assert status.state == "running"
+
+
+def test_exact_workflow_probe_uses_health_identity(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    workflow = _workflow(tmp_path).resolve()
+    seen: dict[str, object] = {}
+
+    class Response:
+        status = 200
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args: object) -> None:
+            return None
+
+        def read(self, limit: int) -> bytes:
+            seen["limit"] = limit
+            return json.dumps({"workflow_path": str(workflow)}).encode()
+
+    class Opener:
+        def open(self, request: object, timeout: float) -> Response:
+            seen["url"] = request.full_url  # type: ignore[attr-defined]
+            seen["timeout"] = timeout
+            return Response()
+
+    monkeypatch.setattr(
+        service_module.urllib.request,
+        "build_opener",
+        lambda *_handlers: Opener(),
+    )
+
+    assert is_symphony_workflow_reachable("0.0.0.0", 9999, workflow) is True
+    assert seen == {
+        "url": "http://127.0.0.1:9999/api/v1/health",
+        "timeout": 0.5,
+        "limit": 4096,
+    }
+
+
+def test_exact_workflow_probe_rejects_other_workflow(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    workflow = _workflow(tmp_path)
+
+    class Response:
+        status = 200
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args: object) -> None:
+            return None
+
+        def read(self, _limit: int) -> bytes:
+            return json.dumps(
+                {"workflow_path": str(tmp_path / "other" / "WORKFLOW.md")}
+            ).encode()
+
+    class Opener:
+        def open(self, *_args: object, **_kwargs: object) -> Response:
+            return Response()
+
+    monkeypatch.setattr(
+        service_module.urllib.request,
+        "build_opener",
+        lambda *_handlers: Opener(),
+    )
+
+    assert is_symphony_workflow_reachable("127.0.0.1", 9999, workflow) is False
+
+
+def test_stale_record_port_serving_other_workflow_is_stopped(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    workflow = _workflow(tmp_path)
+    save_record(_record(workflow, pid=1234))
+
+    class Response:
+        status = 200
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args: object) -> None:
+            return None
+
+        def read(self, _limit: int) -> bytes:
+            return json.dumps(
+                {"workflow_path": str(tmp_path / "other" / "WORKFLOW.md")}
+            ).encode()
+
+    class Opener:
+        def open(self, *_args: object, **_kwargs: object) -> Response:
+            return Response()
+
+    monkeypatch.setattr(
+        service_module.urllib.request,
+        "build_opener",
+        lambda *_handlers: Opener(),
+    )
+
+    status = service_status(workflow, is_running=lambda _pid: False)
+
+    assert status.state == "stopped"
+    assert status.api_reachable is False
+
+
+def test_exact_workflow_probe_rejects_redirects(tmp_path: Path) -> None:
+    workflow = _workflow(tmp_path).resolve()
+
+    class RedirectingHandler(BaseHTTPRequestHandler):
+        def do_GET(self) -> None:
+            if self.path == "/api/v1/health":
+                self.send_response(302)
+                self.send_header("Location", "/matching-workflow")
+                self.end_headers()
+                return
+            payload = json.dumps({"workflow_path": str(workflow)}).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(payload)))
+            self.end_headers()
+            self.wfile.write(payload)
+
+        def log_message(self, _format: str, *args: object) -> None:
+            del args
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), RedirectingHandler)
+    thread = Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        assert (
+            is_symphony_workflow_reachable("127.0.0.1", server.server_port, workflow)
+            is False
+        )
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join()
+
+
+def test_exact_workflow_probe_brackets_ipv6_loopback(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    workflow = _workflow(tmp_path).resolve()
+    seen_urls: list[str] = []
+
+    class Response:
+        status = 200
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args: object) -> None:
+            return None
+
+        def read(self, _limit: int) -> bytes:
+            return json.dumps({"workflow_path": str(workflow)}).encode()
+
+    class Opener:
+        def open(self, request: object, **_kwargs: object) -> Response:
+            seen_urls.append(request.full_url)  # type: ignore[attr-defined]
+            return Response()
+
+    monkeypatch.setattr(
+        service_module.urllib.request,
+        "build_opener",
+        lambda *_handlers: Opener(),
+    )
+
+    assert is_symphony_workflow_reachable("::1", 9999, workflow) is True
+    assert seen_urls == ["http://[::1]:9999/api/v1/health"]
+
+
+@pytest.mark.parametrize("served_workflow", ["", "relative/WORKFLOW.md", "/tmp/\x00"])
+def test_exact_workflow_probe_rejects_malformed_peer_paths(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    served_workflow: str,
+) -> None:
+    workflow = _workflow(tmp_path).resolve()
+
+    class Response:
+        status = 200
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args: object) -> None:
+            return None
+
+        def read(self, _limit: int) -> bytes:
+            return json.dumps({"workflow_path": served_workflow}).encode()
+
+    class Opener:
+        def open(self, *_args: object, **_kwargs: object) -> Response:
+            return Response()
+
+    monkeypatch.setattr(
+        service_module.urllib.request,
+        "build_opener",
+        lambda *_handlers: Opener(),
+    )
+
+    assert is_symphony_workflow_reachable("127.0.0.1", 9999, workflow) is False
 
 
 def test_process_running_returns_false_for_invalid_pids() -> None:
@@ -130,7 +350,9 @@ def test_process_running_returns_false_for_invalid_pids() -> None:
     assert is_process_running(-1) is False
 
 
-def test_live_record_is_running_even_when_requested_port_differs(tmp_path: Path) -> None:
+def test_live_record_is_running_even_when_requested_port_differs(
+    tmp_path: Path,
+) -> None:
     workflow = _workflow(tmp_path)
     save_record(_record(workflow, pid=1234, port=9999))
 
@@ -182,8 +404,15 @@ def test_service_status_cli_reports_live_api_with_stale_pid(
     monkeypatch.setattr(service_module, "is_process_running", lambda pid: False)
     monkeypatch.setattr(
         service_module,
-        "is_symphony_api_reachable",
-        lambda host, port: (host, port) == ("127.0.0.1", 9999),
+        "is_symphony_workflow_reachable",
+        lambda host, port, served_workflow: (
+            (
+                host,
+                port,
+                Path(served_workflow),
+            )
+            == ("127.0.0.1", 9999, workflow)
+        ),
     )
 
     rc = service_main(["status", str(workflow)])
@@ -378,8 +607,7 @@ def test_force_stop_terminates_processes_referencing_owned_workspace(
 
     class _Completed:
         stdout = (
-            f" 9010 node helper --working-dir {workspace}\n"
-            " 9020 unrelated process\n"
+            f" 9010 node helper --working-dir {workspace}\n 9020 unrelated process\n"
         )
 
     def _fake_run(*args, **kwargs):  # noqa: ANN001, ANN002
@@ -418,10 +646,12 @@ def test_start_clears_stale_record_before_doctor(
     )
     monkeypatch.setattr(
         service_module,
-        "is_symphony_api_reachable",
-        lambda host, port: False,
+        "is_symphony_workflow_reachable",
+        lambda host, port, served_workflow: False,
     )
-    monkeypatch.setattr(service_module, "_run_doctor_or_print", lambda *args, **kwargs: False)
+    monkeypatch.setattr(
+        service_module, "_run_doctor_or_print", lambda *args, **kwargs: False
+    )
 
     rc = service_main(["start", str(workflow)])
 
@@ -436,7 +666,9 @@ def test_start_cleans_spawned_process_if_record_save_fails(
 ) -> None:
     workflow = _workflow(tmp_path)
     stopped: list[int | None] = []
-    monkeypatch.setattr(service_module, "_run_doctor_or_print", lambda *args, **kwargs: True)
+    monkeypatch.setattr(
+        service_module, "_run_doctor_or_print", lambda *args, **kwargs: True
+    )
     monkeypatch.setattr(service_module, "_popen_detached", lambda *args, **kwargs: 1234)
     monkeypatch.setattr(service_module, "_wait_until", lambda *args, **kwargs: True)
     monkeypatch.setattr(

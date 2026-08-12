@@ -3202,7 +3202,7 @@
     // Several sessions can run at once; the page shows one at a time and
     // tells the socket which one so only its deltas are streamed.
     currentId: null, sessions: null, autoCreatePromise: null, projectSetupActions: {},
-    projectSetupExpiryTimers: {}, confirmationTokens: {},
+    projectSetupExpiryTimers: {}, confirmationTokens: {}, lifecycleBusy: false,
   };
 
   const CHAT_AGENT_LABELS = {
@@ -3418,6 +3418,7 @@
       if (result && result.action) {
         rememberChatProjectSetup(result.action);
         renderChatProjectSetupAction(view, result.action);
+        if (result.action.status === 'succeeded') await loadProjects();
       }
       return chatState.projectSetupActions[action.action_id] || action;
     } catch (err) {
@@ -3459,7 +3460,12 @@
         view.input.value = '';
       }
     } catch (err) {
-      if (chatState.currentId === sessionId) showToast(err.message, 'error');
+      if (chatState.currentId === sessionId) {
+        showToast(err.message, 'error');
+        if (err.code === 'chat_backend_unavailable' || err.code === 'chat_no_session') {
+          await refreshChatSessions(view);
+        }
+      }
     }
   }
 
@@ -3537,6 +3543,7 @@
     const tabs = el('div', { class: 'chat-tabs' }, live.map((meta) => el('button', {
       class: `chat-tab${meta.session_id === chatState.currentId ? ' active' : ''}`,
       'data-session-id': meta.session_id,
+      disabled: chatState.lifecycleBusy,
       title: t('chat.sessionMeta', { agent: meta.agent_kind, mode: meta.mode, time: formatShortDateTime(meta.created_at) }),
       onClick: () => selectChatSession(view, meta.session_id),
     }, [
@@ -3547,7 +3554,7 @@
     const atLimit = listing.max_sessions > 0 && live.length >= listing.max_sessions;
     view.sessionBar.appendChild(el('button', {
       class: 'btn btn-ghost chat-new-session',
-      disabled: atLimit,
+      disabled: atLimit || chatState.lifecycleBusy,
       title: atLimit ? t('chat.sessionLimit', { max: listing.max_sessions }) : t('chat.startAnother'),
       onClick: () => openNewChatSessionModal(view),
     }, t('chat.newSessionShort')));
@@ -3562,11 +3569,12 @@
       ...resumable.map((meta) => el('option', { value: meta.session_id },
         `${truncate(meta.title || meta.mode, 30)} · ${formatShortDateTime(meta.updated_at || meta.created_at)}`)),
     ]);
-    select.disabled = atLimit;
+    select.disabled = atLimit || chatState.lifecycleBusy;
     select.addEventListener('change', async () => {
       const sessionId = select.value;
       select.value = '';
-      if (!sessionId) return;
+      if (!sessionId || chatState.lifecycleBusy) return;
+      setChatLifecycleBusy(view, true);
       try {
         let confirmationToken = chatConfirmationToken(sessionId);
         if (!confirmationToken) {
@@ -3579,6 +3587,9 @@
         await selectChatSession(view, snapshot.session_id);
       } catch (err) {
         showToast(err.message, 'error');
+        if (err.code === 'chat_no_session') await refreshChatSessions(view);
+      } finally {
+        setChatLifecycleBusy(view, false);
       }
     });
     return select;
@@ -3623,9 +3634,16 @@
     });
   }
 
+  function setChatLifecycleBusy(view, busy) {
+    chatState.lifecycleBusy = busy;
+    renderChatSessionBar(view);
+    renderChatControls(view);
+    updateChatComposer(view);
+  }
+
   function updateChatComposer(view) {
     const snap = chatState.snapshot || { active: false };
-    const disabled = !snap.active || chatState.busy;
+    const disabled = !snap.active || chatState.busy || chatState.lifecycleBusy;
     view.input.disabled = disabled;
     view.sendBtn.disabled = disabled;
   }
@@ -3660,27 +3678,38 @@
     }
     const toggle = el('div', { class: 'chat-mode-toggle' }, ['qa', 'edit'].map((mode) => el('button', {
       class: `chat-mode-btn${snap.mode === mode ? ' active' : ''}`,
+      disabled: chatState.lifecycleBusy,
       onClick: async () => {
-        if (snap.mode === mode) return;
+        if (snap.mode === mode || chatState.lifecycleBusy) return;
+        setChatLifecycleBusy(view, true);
         try {
           const result = await api.patchChatSessionById(snap.session_id, { mode });
           if (!result.context_preserved) showToast(t('chat.modeResetContext'), 'info');
           await refreshChatControls(view);
         } catch (err) {
           showToast(err.message, 'error');
+          await refreshChatSessions(view);
+        } finally {
+          setChatLifecycleBusy(view, false);
         }
       },
     }, mode === 'qa' ? t('chat.qa') : t('common.edit'))));
     view.controls.appendChild(toggle);
     view.controls.appendChild(el('button', {
       class: 'btn btn-ghost',
+      disabled: chatState.lifecycleBusy,
       title: t('chat.stopHint'),
       onClick: async () => {
+        if (chatState.lifecycleBusy) return;
+        setChatLifecycleBusy(view, true);
         try {
           await api.deleteChatSessionById(snap.session_id);
           await refreshChatSessions(view);
         } catch (err) {
           showToast(err.message, 'error');
+          if (err.code === 'chat_no_session') await refreshChatSessions(view);
+        } finally {
+          setChatLifecycleBusy(view, false);
         }
       },
     }, t('chat.stop')));

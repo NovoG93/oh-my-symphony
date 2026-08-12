@@ -58,6 +58,7 @@ from .backends import (
 )
 from .errors import (
     ChatBusyError,
+    ChatBackendUnavailableError,
     ChatNoSessionError,
     ChatProjectActionError,
     ChatProjectAuthorizationError,
@@ -93,6 +94,20 @@ _TITLE_CHARS = 80
 MAX_INDEX_ENTRIES = 50
 _TOOL_PREVIEW_CHARS = 200
 _RAW_PREVIEW_CHARS = 400
+_CODEX_ACTIVITY_LABELS = {
+    ("commandExecution", "completed"): "command",
+    ("commandExecution", "failed"): "command failed",
+    ("commandExecution", "declined"): "command declined",
+    ("fileChange", "completed"): "files changed",
+    ("fileChange", "failed"): "file change failed",
+    ("fileChange", "declined"): "file change declined",
+    ("mcpToolCall", "completed"): "MCP tool",
+    ("mcpToolCall", "failed"): "MCP tool failed",
+    ("mcpToolCall", "declined"): "MCP tool declined",
+    ("dynamicToolCall", "completed"): "dynamic tool",
+    ("dynamicToolCall", "failed"): "dynamic tool failed",
+    ("dynamicToolCall", "declined"): "dynamic tool declined",
+}
 
 # Frame types that are streamed to live subscribers but never numbered,
 # kept in the transcript or written to the JSONL: hundreds arrive per turn
@@ -128,8 +143,8 @@ _PROJECT_SETUP_PREAMBLE = (
     "option to create or adopt one, do NOT run `symphony project`, create its "
     "files yourself, or claim it was registered. Instead include exactly one "
     "machine-readable proposal for that option, after the human explanation:\n"
-    "<symphony-project-setup>{\"choice\": 1, \"name\": \"Project name\", "
-    "\"path\": \"/absolute/project/path\"}</symphony-project-setup>\n"
+    '<symphony-project-setup>{"choice": 1, "name": "Project name", '
+    '"path": "/absolute/project/path"}</symphony-project-setup>\n'
     "Use a positive option number, a non-empty name, and an absolute path. "
     "The server shows the choice and creates/registers it only if the operator "
     "selects that number. It reports the authoritative result; do not auto-start "
@@ -187,7 +202,6 @@ _DEEP_ROUTING = (
 )
 
 
-
 # Prepended to the first message after a mode switch — with claude the
 # conversation is resumed, so the original preamble's rules stick unless
 # explicitly revoked.
@@ -222,6 +236,7 @@ def _board_preamble(cfg: ServiceConfig) -> str:
         states=", ".join(states),
         routing=routing,
     )
+
 
 _PERMISSION_MODE_RE = re.compile(r"\s--permission-mode(?:[ =]\S+)?")
 
@@ -300,9 +315,7 @@ def cfg_for_mode(
     if agent_kind != cfg.agent.kind:
         cfg = replace(cfg, agent=replace(cfg.agent, kind=agent_kind))
     if agent_kind == "claude":
-        command = _claude_command_for_mode(
-            cfg.claude.command, mode, resume_session_id
-        )
+        command = _claude_command_for_mode(cfg.claude.command, mode, resume_session_id)
         return replace(cfg, claude=replace(cfg.claude, command=command)), True
     if agent_kind == "codex":
         if mode == "qa":
@@ -444,9 +457,7 @@ def _project_setup_spec(text: str) -> tuple[str, ProjectSetupAction | None]:
     # A fresh, server-generated nonce lets an operator receive a new card for
     # an identical proposal after an earlier card expires or fails.
     action_id = "project-" + uuid.uuid4().hex
-    visible = (
-        text[:open_start] + text[end + len(_PROJECT_SETUP_CLOSE) :]
-    ).strip()
+    visible = (text[:open_start] + text[end + len(_PROJECT_SETUP_CLOSE) :]).strip()
     return visible, ProjectSetupAction(
         action_id=action_id,
         choice=choice,
@@ -490,6 +501,10 @@ class ChatSession:
     # sequence counter and the JSONL writer all belong to the session rather
     # than the manager.
     turn_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+    # Backend construction, replacement, and teardown must be atomic relative
+    # to each other. A mode rebuild can yield while starting a process; Stop
+    # waits for that rebuild and then tears down the backend it produced.
+    lifecycle_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     turn_task: asyncio.Task[None] | None = None
     turn_failure_broadcast: bool = False
     writer: "_TranscriptWriter | None" = None
@@ -694,8 +709,7 @@ class ChatManager:
         if kind not in SUPPORTED_AGENT_KINDS:
             raise SymphonyError(f"unsupported agent kind {kind!r}")
         session_id = (
-            datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S-")
-            + uuid.uuid4().hex[:6]
+            datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S-") + uuid.uuid4().hex[:6]
         )
         session = ChatSession(
             session_id=session_id,
@@ -712,11 +726,12 @@ class ChatManager:
         session.writer = _TranscriptWriter(self._transcript_path(session_id))
         self._sessions[session_id] = session
         self._active_id = session_id
-        try:
-            await self._build_backend(cfg, session)
-        except BaseException:
-            self._forget_live(session)
-            raise
+        async with session.lifecycle_lock:
+            try:
+                await self._build_backend(cfg, session)
+            except BaseException:
+                self._forget_live(session)
+                raise
         self._broadcast(
             session,
             "session_status",
@@ -746,6 +761,8 @@ class ChatManager:
                 f"chat session limit reached ({MAX_SESSIONS}); stop one first"
             )
         entry = await asyncio.to_thread(self._find_index_entry, session_id)
+        if self._closed:
+            raise ChatNoSessionError("chat manager is shut down")
         if entry is None:
             raise ChatNoSessionError(f"unknown chat session {session_id!r}")
         cfg = self._config_provider()
@@ -777,11 +794,12 @@ class ChatManager:
         session.writer = _TranscriptWriter(self._transcript_path(session_id))
         self._sessions[session_id] = session
         self._active_id = session_id
-        try:
-            await self._build_backend(cfg, session)
-        except BaseException:
-            self._forget_live(session)
-            raise
+        async with session.lifecycle_lock:
+            try:
+                await self._build_backend(cfg, session)
+            except BaseException:
+                self._forget_live(session)
+                raise
         self._broadcast(
             session,
             "session_status",
@@ -795,89 +813,110 @@ class ChatManager:
         self, session_id: str | None = None, forget: bool = False
     ) -> None:
         session = self._resolve(session_id)
-        task = session.turn_task
-        if task is not None and not task.done():
-            task.cancel()
-            try:
-                await task
-            except (asyncio.CancelledError, Exception):
-                pass
-        session.turn_task = None
-        # Project setup is a protected control-plane mutation. Do not close its
-        # transcript writer while its domain call can still commit; the task is
-        # intentionally shielded from request cancellation in confirmation.
-        for action in session.project_setup_actions.values():
-            if action.task is not None:
-                await asyncio.shield(action.task)
-        if session.backend is not None:
-            try:
-                await session.backend.stop()
-            except Exception as exc:
-                log.warning("chat_backend_stop_failed", error=str(exc))
-        self._broadcast(session, "session_status", "session stopped", meta={})
-        self._save_index()
-        if session.writer is not None:
-            await asyncio.to_thread(session.writer.flush)
-        self._forget_live(session)
-        if forget:
-            # Drops the index entry only — the JSONL transcript stays put as
-            # an audit trail of what the agent was asked to do.
-            self._drop_index_entry(session.session_id)
+        async with session.lifecycle_lock:
+            if self._sessions.get(session.session_id) is not session:
+                raise ChatNoSessionError(f"no live chat session {session.session_id!r}")
+            task = session.turn_task
+            if task is not None and not task.done():
+                task.cancel()
+                try:
+                    await task
+                except (asyncio.CancelledError, Exception):
+                    pass
+            session.turn_task = None
+            # Project setup is a protected control-plane mutation. Do not close its
+            # transcript writer while its domain call can still commit; the task is
+            # intentionally shielded from request cancellation in confirmation.
+            for action in session.project_setup_actions.values():
+                if action.task is not None:
+                    await asyncio.shield(action.task)
+            if session.backend is not None:
+                try:
+                    await session.backend.stop()
+                except Exception as exc:
+                    log.warning("chat_backend_stop_failed", error=str(exc))
+            self._broadcast(session, "session_status", "session stopped", meta={})
+            self._save_index()
+            if session.writer is not None:
+                await asyncio.to_thread(session.writer.flush)
+            self._forget_live(session)
+            if forget:
+                # Drops the index entry only — the JSONL transcript stays put as
+                # an audit trail of what the agent was asked to do.
+                self._drop_index_entry(session.session_id)
 
     async def set_mode(
         self, mode: str, session_id: str | None = None
     ) -> dict[str, Any]:
         session = self._resolve(session_id)
         mode = _check_mode(mode)
-        if session.turn_lock.locked():
-            raise ChatBusyError("a turn is running; wait before changing mode")
-        if mode == session.mode:
-            return {
-                "mode": mode,
-                "context_preserved": True,
-                "mode_enforced": session.mode_enforced,
-            }
-        cfg = self._config_provider()
-        resume_id: str | None = None
-        context_preserved = False
-        old_backend = session.backend
-        if session.agent_kind == "claude" and old_backend is not None:
-            sid = old_backend.session_id
-            if sid and sid != "pending":
-                resume_id = sid
-                context_preserved = True
-        if old_backend is not None:
-            try:
-                await old_backend.stop()
-            except Exception as exc:
-                log.warning("chat_backend_stop_failed", error=str(exc))
-        session.mode = mode
-        self._close_project_setup_choice_windows(session, reason="a mode change")
-        session.backend = None
-        session.backend_turns = 0
-        # A restarted backend has no memory of the original safety and board
-        # rules. Give it the full preamble instead of the terse mode notice.
-        session.pending_preamble = not context_preserved
-        session.pending_mode_notice = context_preserved
-        await self._build_backend(cfg, session, resume_session_id=resume_id)
-        self._broadcast(
-            session,
-            "session_status",
-            f"mode changed to {mode}"
-            + ("" if context_preserved else " — conversation context reset"),
-            meta={"mode": mode, "context_preserved": context_preserved},
-        )
-        self._save_index()
-        return {
-            "mode": mode,
-            "context_preserved": context_preserved,
-            "mode_enforced": session.mode_enforced,
-        }
+        async with session.lifecycle_lock:
+            if self._sessions.get(session.session_id) is not session:
+                raise ChatNoSessionError(f"no live chat session {session.session_id!r}")
+            turn = session.turn_task
+            if session.turn_lock.locked() or (turn is not None and not turn.done()):
+                raise ChatBusyError("a turn is running; wait before changing mode")
+            if mode == session.mode:
+                return {
+                    "mode": mode,
+                    "context_preserved": True,
+                    "mode_enforced": session.mode_enforced,
+                }
+            async with session.turn_lock:
+                cfg = self._config_provider()
+                resume_id: str | None = None
+                context_preserved = False
+                old_backend = session.backend
+                if session.agent_kind == "claude" and old_backend is not None:
+                    sid = old_backend.session_id
+                    if sid and sid != "pending":
+                        resume_id = sid
+                        context_preserved = True
+                if old_backend is not None:
+                    try:
+                        await old_backend.stop()
+                    except Exception as exc:
+                        log.warning("chat_backend_stop_failed", error=str(exc))
+                session.mode = mode
+                self._close_project_setup_choice_windows(
+                    session, reason="a mode change"
+                )
+                session.backend = None
+                session.backend_turns = 0
+                # A restarted backend has no memory of the original safety and board
+                # rules. Give it the full preamble instead of the terse mode notice.
+                session.pending_preamble = not context_preserved
+                session.pending_mode_notice = context_preserved
+                try:
+                    await self._build_backend(cfg, session, resume_session_id=resume_id)
+                except BaseException:
+                    # The stopped backend cannot serve this live entry. Preserve its
+                    # index/transcript so the explicit Resume flow can restore Q&A.
+                    self._save_index()
+                    self._forget_live(session)
+                    raise
+                self._broadcast(
+                    session,
+                    "session_status",
+                    f"mode changed to {mode}"
+                    + ("" if context_preserved else " — conversation context reset"),
+                    meta={"mode": mode, "context_preserved": context_preserved},
+                )
+                self._save_index()
+                return {
+                    "mode": mode,
+                    "context_preserved": context_preserved,
+                    "mode_enforced": session.mode_enforced,
+                }
 
     async def send_message(
         self, text: str, session_id: str | None = None
     ) -> dict[str, Any]:
         session = self._resolve(session_id)
+        if session.backend is None:
+            raise ChatBackendUnavailableError(
+                "chat backend is unavailable; resume the session before sending"
+            )
         if session.turn_lock.locked():
             raise ChatBusyError("a turn is already running")
         text = text.strip()
@@ -964,9 +1003,7 @@ class ChatManager:
             self._subscribers[queue] = session_id
 
     def snapshot(self, session_id: str | None = None) -> dict[str, Any]:
-        session = (
-            self._sessions.get(session_id) if session_id else self.active_session
-        )
+        session = self._sessions.get(session_id) if session_id else self.active_session
         if session is None:
             return {"active": False}
         self._prune_project_setup_actions(session)
@@ -1147,6 +1184,7 @@ class ChatManager:
         self, session: ChatSession, action: ProjectSetupAction
     ) -> None:
         try:
+
             def create_checked() -> Any:
                 expectation = action.target_expectation
                 if expectation is None:
@@ -1228,7 +1266,10 @@ class ChatManager:
         if session.mode == "edit":
             visible, proposal = _project_setup_spec(text)
         removed: list[str] = []
-        if proposal is not None and proposal.action_id not in session.project_setup_actions:
+        if (
+            proposal is not None
+            and proposal.action_id not in session.project_setup_actions
+        ):
             self._expire_project_setup_actions(session)
             duplicate_choice = any(
                 action.choice == proposal.choice
@@ -1312,9 +1353,16 @@ class ChatManager:
                 on_event=partial(self._on_backend_event, session),
             )
         )
-        await backend.start()
-        await backend.initialize()
-        await backend.start_session(initial_prompt="", issue_title=None)
+        try:
+            await backend.start()
+            await backend.initialize()
+            await backend.start_session(initial_prompt="", issue_title=None)
+        except BaseException:
+            try:
+                await backend.stop()
+            except Exception as exc:
+                log.warning("chat_backend_stop_failed", error=str(exc))
+            raise
         session.backend = backend
 
     async def _run_turn(self, session: ChatSession, prompt: str) -> None:
@@ -1328,9 +1376,7 @@ class ChatManager:
             is_first = session.backend_turns == 0
             session.turn_failure_broadcast = False
             try:
-                await backend.run_turn(
-                    prompt=prompt, is_continuation=not is_first
-                )
+                await backend.run_turn(prompt=prompt, is_continuation=not is_first)
             except asyncio.CancelledError:
                 raise
             except SymphonyError as exc:
@@ -1422,9 +1468,7 @@ class ChatManager:
             )
         elif event == EVENT_TURN_FAILED:
             session.turn_failure_broadcast = True
-            reason = str(
-                payload.get("reason") or payload.get("error") or "turn failed"
-            )
+            reason = str(payload.get("reason") or payload.get("error") or "turn failed")
             self._broadcast(session, "turn_failed", reason, meta={})
         elif event == EVENT_OTHER_MESSAGE:
             for type_, text, meta in _summarize_frame(session.agent_kind, payload):
@@ -1565,9 +1609,7 @@ class ChatManager:
         self._write_index(entries.values())
 
     def _drop_index_entry(self, session_id: str) -> None:
-        entries = [
-            row for row in self._read_index() if row["session_id"] != session_id
-        ]
+        entries = [row for row in self._read_index() if row["session_id"] != session_id]
         self._write_index(entries)
 
     def _write_index(self, entries: Any) -> None:
@@ -1741,7 +1783,7 @@ def _summarize_frame(
 
 
 def _summarize_claude_frame(
-    payload: dict[str, Any]
+    payload: dict[str, Any],
 ) -> list[tuple[str, str, dict[str, Any]]]:
     """stream-json `stream_event` / `assistant` / `user` frames -> messages."""
     out: list[tuple[str, str, dict[str, Any]]] = []
@@ -1781,7 +1823,7 @@ def _summarize_claude_frame(
 
 
 def _claude_text_delta(
-    payload: dict[str, Any]
+    payload: dict[str, Any],
 ) -> list[tuple[str, str, dict[str, Any]]]:
     """`--include-partial-messages` deltas -> ephemeral typing chunks.
 
@@ -1850,25 +1892,91 @@ def _tool_result_preview(block: dict[str, Any]) -> str:
     return ""
 
 
+def _codex_safe_detail(value: object) -> str:
+    """Return one redacted, byte-bounded activity detail from a safe field."""
+    if not isinstance(value, str) or not value.strip():
+        return ""
+    # Import lazily: importing the orchestrator package while chat itself is
+    # imported would cycle through orchestrator.core back into this module.
+    from .orchestrator.diagnostics import redact_text
+
+    return redact_text(value.strip(), maximum=_TOOL_PREVIEW_CHARS).strip()
+
+
+def _codex_file_change_detail(changes: object) -> str:
+    """Summarize only file paths; diffs and other change fields stay private."""
+    if not isinstance(changes, list):
+        return ""
+    paths: list[str] = []
+    truncated = False
+    for change in changes:
+        if not isinstance(change, dict):
+            continue
+        path = _codex_safe_detail(change.get("path"))
+        if not path:
+            continue
+        if len(paths) == 5:
+            truncated = True
+            break
+        paths.append(path)
+    detail = ", ".join(paths)
+    if truncated:
+        detail += ", …"
+    return _codex_safe_detail(detail)
+
+
+def _codex_tool_detail(item: dict[str, Any]) -> str:
+    """Allow only public tool names into MCP/dynamic activity details."""
+    tool = _codex_safe_detail(item.get("tool"))
+    if item.get("type") != "mcpToolCall":
+        return tool
+    server = _codex_safe_detail(item.get("server"))
+    if server and tool:
+        return _codex_safe_detail(f"{server}/{tool}")
+    return server or tool
+
+
 def _summarize_codex_frame(
-    payload: dict[str, Any]
+    payload: dict[str, Any],
 ) -> list[tuple[str, str, dict[str, Any]]]:
-    """Codex agent deltas and `item/completed` echoes -> chat messages."""
+    """Codex v2 envelopes -> visible text or explicitly allowlisted activity."""
     if payload.get("type") == "agent_delta":
         text = payload.get("text")
         if isinstance(text, str) and text:
-            return [("agent_delta", text, {"item_id": payload.get("item_id")})]
+            # The item id is an internal protocol handle and is not needed to
+            # append an ephemeral text delta in the browser.
+            return [("agent_delta", text, {})]
         return []
-    if payload.get("type") == "assistant" and isinstance(
-        payload.get("message"), str
-    ):
+    if payload.get("type") == "assistant" and isinstance(payload.get("message"), str):
         text = payload["message"].strip()
         return [("agent_message", text, {"partial": True})] if text else []
+
     item = payload.get("item")
-    if isinstance(item, dict):
-        itype = str(item.get("type") or "item")
-        detail = _preview(
-            json.dumps(item, ensure_ascii=False), _TOOL_PREVIEW_CHARS
-        )
-        return [("tool_activity", itype, {"detail": detail})]
-    return []
+    if not isinstance(item, dict):
+        return []
+    item_type = item.get("type")
+    status = item.get("status")
+    if not isinstance(item_type, str) or not isinstance(status, str):
+        return []
+    if (
+        item_type == "dynamicToolCall"
+        and status == "completed"
+        and item.get("success") is False
+    ):
+        status = "failed"
+    label = _CODEX_ACTIVITY_LABELS.get((item_type, status))
+    if label is None:
+        # Reasoning, user, in-progress, and future item types are private by
+        # default. New Codex shapes require an explicit safe projection here.
+        return []
+
+    if item_type == "commandExecution":
+        detail = _codex_safe_detail(item.get("command"))
+        if not detail:
+            return []
+    elif item_type == "fileChange":
+        detail = _codex_file_change_detail(item.get("changes"))
+    else:
+        detail = _codex_tool_detail(item)
+    meta = {"detail": detail} if detail else {}
+    return [("tool_activity", label, meta)]

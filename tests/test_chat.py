@@ -30,6 +30,7 @@ from symphony.chat import (
 )
 from symphony.errors import (
     ChatBusyError,
+    ChatBackendUnavailableError,
     ChatNoSessionError,
     ChatProjectActionError,
     ChatSessionExistsError,
@@ -79,11 +80,20 @@ class _FakeBackend:
         self.gate: asyncio.Event | None = None
         self.raise_on_turn: Exception | None = None
         self._session_id: str | None = None
+        self.initialize_entered: asyncio.Event | None = None
+        self.initialize_gate: asyncio.Event | None = None
+        self.initialize_error: Exception | None = None
 
     async def start(self) -> None:
         pass
 
     async def initialize(self) -> dict[str, Any]:
+        if self.initialize_entered is not None:
+            self.initialize_entered.set()
+        if self.initialize_gate is not None:
+            await self.initialize_gate.wait()
+        if self.initialize_error is not None:
+            raise self.initialize_error
         return {}
 
     async def start_session(
@@ -111,9 +121,7 @@ class _FakeBackend:
                 },
             },
         )
-        await self._emit(
-            EVENT_TURN_COMPLETED, {"message": f"answer {len(self.turns)}"}
-        )
+        await self._emit(EVENT_TURN_COMPLETED, {"message": f"answer {len(self.turns)}"})
         return TurnResult(
             status=EVENT_TURN_COMPLETED, turn_id="t", last_message="answer"
         )
@@ -280,6 +288,162 @@ async def test_send_while_busy_raises(
     await manager.stop_session()
 
 
+async def test_send_without_backend_rejects_before_mutating_transcript(
+    tmp_path: Path, fake_backends: list[_FakeBackend]
+) -> None:
+    cfg = _cfg(tmp_path)
+    manager = ChatManager(lambda: cfg)
+    await manager.start_session("qa")
+    session = manager.active_session
+    assert session is not None
+    await session.backend.stop()  # type: ignore[union-attr]
+    session.backend = None
+    before = [(row.type, row.text) for row in session.transcript]
+
+    with pytest.raises(ChatBackendUnavailableError, match="resume"):
+        await manager.send_message("must not be accepted")
+
+    assert session.turn_count == 0
+    assert [(row.type, row.text) for row in session.transcript] == before
+    assert session.turn_task is None
+    await manager.stop_session()
+
+
+async def test_mode_rebuild_blocks_send_until_backend_is_ready(
+    tmp_path: Path,
+    fake_backends: list[_FakeBackend],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    cfg = _cfg(tmp_path)
+    manager = ChatManager(lambda: cfg)
+    await manager.start_session("qa")
+    session = manager.active_session
+    assert session is not None
+    before = (
+        session.seq,
+        session.turn_count,
+        session.title,
+        session.pending_preamble,
+        session.pending_mode_notice,
+        [(row.type, row.text) for row in session.transcript],
+    )
+    entered = asyncio.Event()
+    release = asyncio.Event()
+
+    def build_replacement(init: BackendInit) -> _FakeBackend:
+        backend = _FakeBackend(init)
+        backend.initialize_entered = entered
+        backend.initialize_gate = release
+        fake_backends.append(backend)
+        return backend
+
+    monkeypatch.setattr(chat_module, "build_backend", build_replacement)
+    changing = asyncio.create_task(manager.set_mode("edit"))
+    await entered.wait()
+
+    with pytest.raises(ChatBackendUnavailableError):
+        await manager.send_message("keep this draft")
+
+    assert (
+        session.seq,
+        session.turn_count,
+        session.title,
+        session.pending_preamble,
+        session.pending_mode_notice,
+        [(row.type, row.text) for row in session.transcript],
+    ) == (
+        before[0],
+        before[1],
+        before[2],
+        True,
+        False,
+        before[5],
+    )
+    assert session.turn_task is None
+    release.set()
+    assert (await changing)["mode"] == "edit"
+
+    await manager.send_message("retry after rebuild")
+    await _wait_turn(manager)
+    assert fake_backends[-1].turns[-1][0].endswith("retry after rebuild")
+    await manager.stop_session()
+
+
+async def test_stop_waits_for_mode_rebuild_then_stops_replacement(
+    tmp_path: Path,
+    fake_backends: list[_FakeBackend],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    cfg = _cfg(tmp_path)
+    manager = ChatManager(lambda: cfg)
+    session_id = (await manager.start_session("qa"))["session_id"]
+    entered = asyncio.Event()
+    release = asyncio.Event()
+
+    def build_replacement(init: BackendInit) -> _FakeBackend:
+        backend = _FakeBackend(init)
+        backend.initialize_entered = entered
+        backend.initialize_gate = release
+        fake_backends.append(backend)
+        return backend
+
+    monkeypatch.setattr(chat_module, "build_backend", build_replacement)
+    changing = asyncio.create_task(manager.set_mode("edit", session_id))
+    await entered.wait()
+    stopping = asyncio.create_task(manager.stop_session(session_id))
+    await asyncio.sleep(0)
+    try:
+        assert stopping.done() is False
+    finally:
+        release.set()
+    assert (await changing)["mode"] == "edit"
+    await stopping
+
+    assert manager.session(session_id) is None
+    assert all(backend.stopped for backend in fake_backends)
+
+
+async def test_failed_mode_rebuild_moves_session_to_explicit_resume(
+    tmp_path: Path,
+    fake_backends: list[_FakeBackend],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    cfg = _cfg(tmp_path)
+    manager = ChatManager(lambda: cfg)
+    session_id = (await manager.start_session("qa"))["session_id"]
+    await manager.send_message("remember this")
+    await _wait_turn(manager)
+
+    def build_broken(init: BackendInit) -> _FakeBackend:
+        backend = _FakeBackend(init)
+        backend.initialize_error = RuntimeError("cannot initialize")
+        fake_backends.append(backend)
+        return backend
+
+    monkeypatch.setattr(chat_module, "build_backend", build_broken)
+    with pytest.raises(RuntimeError, match="cannot initialize"):
+        await manager.set_mode("edit", session_id)
+
+    assert manager.session(session_id) is None
+    assert [row["session_id"] for row in manager.list_sessions()["resumable"]] == [
+        session_id
+    ]
+
+    def build_ready(init: BackendInit) -> _FakeBackend:
+        backend = _FakeBackend(init)
+        fake_backends.append(backend)
+        return backend
+
+    monkeypatch.setattr(chat_module, "build_backend", build_ready)
+    resumed = await manager.reattach(session_id)
+    assert resumed["mode"] == "qa"
+    assert any(
+        row["type"] == "agent_message" and row["text"] == "answer 1"
+        for row in resumed["transcript_tail"]
+    )
+    await manager.stop_session()
+
+
 async def test_turn_failure_is_broadcast(
     tmp_path: Path, fake_backends: list[_FakeBackend]
 ) -> None:
@@ -357,17 +521,12 @@ async def test_transcript_jsonl_written(
     await manager.send_message("persist me")
     await _wait_turn(manager)
 
-    path = (
-        tmp_path / ".symphony" / "chat" / f"{snapshot['session_id']}.jsonl"
-    )
+    path = tmp_path / ".symphony" / "chat" / f"{snapshot['session_id']}.jsonl"
     for _ in range(50):
         if path.exists() and "persist me" in path.read_text(encoding="utf-8"):
             break
         await asyncio.sleep(0.05)
-    rows = [
-        json.loads(line)
-        for line in path.read_text(encoding="utf-8").splitlines()
-    ]
+    rows = [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
     assert any(r["type"] == "user_message" and r["text"] == "persist me" for r in rows)
     await manager.stop_session()
 
@@ -457,15 +616,217 @@ def test_summarize_claude_frame_extracts_text_deltas() -> None:
         ("agent_delta", "Hel", {"index": 0})
     ]
     # Reasoning and half-built tool arguments must not reach the bubble.
-    assert _summarize_claude_frame(_delta_frame("hm", delta_type="thinking_delta")) == []
+    assert (
+        _summarize_claude_frame(_delta_frame("hm", delta_type="thinking_delta")) == []
+    )
     assert _summarize_claude_frame({"type": "stream_event", "event": {}}) == []
     assert _summarize_claude_frame(_delta_frame("")) == []
 
 
-def test_summarize_codex_frame_extracts_normalized_deltas() -> None:
+def test_summarize_codex_frame_omits_nonterminal_and_private_frames() -> None:
     assert _summarize_codex_frame(
-        {"type": "agent_delta", "text": "Hel", "item_id": "i1"}
-    ) == [("agent_delta", "Hel", {"item_id": "i1"})]
+        {"type": "agent_delta", "text": "Hel", "item_id": "private-item-id"}
+    ) == [("agent_delta", "Hel", {})]
+    private_items = [
+        {
+            "id": "reason-1",
+            "type": "reasoning",
+            "summary": [{"text": "private summary"}],
+            "content": [{"text": "private reasoning"}],
+        },
+        {
+            "id": "user-1",
+            "type": "userMessage",
+            "content": [{"text": "private user text"}],
+        },
+        {
+            "id": "cmd-1",
+            "type": "commandExecution",
+            "command": "git status --short",
+            "cwd": "/repo",
+            "status": "inProgress",
+            "aggregatedOutput": "private output",
+        },
+        {
+            "id": "file-1",
+            "type": "fileChange",
+            "status": "inProgress",
+            "changes": [{"path": "src/app.py", "diff": "private diff"}],
+        },
+        {
+            "id": "mcp-1",
+            "type": "mcpToolCall",
+            "server": "filesystem",
+            "tool": "read_file",
+            "status": "inProgress",
+            "arguments": {"path": "/private"},
+        },
+        {
+            "id": "dynamic-1",
+            "type": "dynamicToolCall",
+            "tool": "lookup_ticket",
+            "status": "inProgress",
+            "arguments": {"id": "SECRET-1"},
+        },
+        {"id": "future-1", "type": "unknownFutureItem", "secret": "raw"},
+        {"type": ["commandExecution"], "status": "completed", "command": "raw"},
+    ]
+    assert all(_summarize_codex_frame({"item": item}) == [] for item in private_items)
+
+
+def test_summarize_codex_frame_normalizes_terminal_command_statuses_safely() -> None:
+    expected_labels = {
+        "completed": "command",
+        "failed": "command failed",
+        "declined": "command declined",
+    }
+    for status, label in expected_labels.items():
+        normalized = _summarize_codex_frame(
+            {
+                "item": {
+                    "id": f"cmd-{status}",
+                    "type": "commandExecution",
+                    "command": "deploy --api-key=sk-proj-1234567890abcdef",
+                    "cwd": "/private/repo",
+                    "status": status,
+                    "aggregatedOutput": "raw command output",
+                    "exitCode": 7,
+                }
+            }
+        )
+        assert normalized == [
+            (
+                "tool_activity",
+                label,
+                {"detail": "deploy --api-key=[REDACTED]"},
+            )
+        ]
+        rendered = json.dumps(normalized)
+        assert "cmd-" not in rendered
+        assert "/private/repo" not in rendered
+        assert "raw command output" not in rendered
+        assert "1234567890abcdef" not in rendered
+
+    long_detail = _summarize_codex_frame(
+        {
+            "item": {
+                "type": "commandExecution",
+                "status": "completed",
+                "command": "x" * 500,
+            }
+        }
+    )[0][2]["detail"]
+    assert len(long_detail.encode("utf-8")) <= 200
+    assert long_detail.endswith("…[truncated]")
+
+
+def test_summarize_codex_frame_normalizes_file_mcp_and_dynamic_activity() -> None:
+    frames = [
+        (
+            {
+                "item": {
+                    "id": "file-private-id",
+                    "type": "fileChange",
+                    "status": "completed",
+                    "changes": [
+                        {
+                            "path": "src/app.py",
+                            "kind": "update",
+                            "diff": "+ password=private-file-secret",
+                        },
+                        {"path": "tests/test_app.py", "kind": "add", "diff": "+ raw"},
+                    ],
+                }
+            },
+            [
+                (
+                    "tool_activity",
+                    "files changed",
+                    {"detail": "src/app.py, tests/test_app.py"},
+                )
+            ],
+        ),
+        (
+            {
+                "item": {
+                    "id": "mcp-private-id",
+                    "type": "mcpToolCall",
+                    "server": "filesystem",
+                    "tool": "read_file",
+                    "status": "failed",
+                    "arguments": {"path": "/private/input"},
+                    "result": {"content": "private MCP result"},
+                    "error": "private MCP error",
+                }
+            },
+            [
+                (
+                    "tool_activity",
+                    "MCP tool failed",
+                    {"detail": "filesystem/read_file"},
+                )
+            ],
+        ),
+        (
+            {
+                "item": {
+                    "id": "dynamic-private-id",
+                    "type": "dynamicToolCall",
+                    "tool": "lookup_ticket",
+                    "status": "completed",
+                    "arguments": {"id": "SECRET-123"},
+                    "contentItems": [
+                        {"type": "inputText", "text": "private dynamic result"}
+                    ],
+                    "success": True,
+                }
+            },
+            [
+                (
+                    "tool_activity",
+                    "dynamic tool",
+                    {"detail": "lookup_ticket"},
+                )
+            ],
+        ),
+    ]
+    normalized = []
+    for frame, expected in frames:
+        activity = _summarize_codex_frame(frame)
+        assert activity == expected
+        normalized.extend(activity)
+
+    rendered = json.dumps(normalized)
+    for private_value in (
+        "private-id",
+        "private-file-secret",
+        "/private/input",
+        "private MCP result",
+        "private MCP error",
+        "SECRET-123",
+        "private dynamic result",
+    ):
+        assert private_value not in rendered
+
+
+def test_summarize_codex_frame_preserves_final_markdown_without_raw_item() -> None:
+    markdown = "## Done\n\n- Updated `src/app.py`\n- Tests pass"
+    normalized = _summarize_codex_frame(
+        {
+            "type": "assistant",
+            "message": markdown,
+            "item": {
+                "id": "agent-private-id",
+                "type": "agentMessage",
+                "text": markdown,
+                "raw": {"reasoning": "private chain of thought"},
+            },
+        }
+    )
+    assert normalized == [("agent_message", markdown, {"partial": True})]
+    rendered = json.dumps(normalized)
+    assert "agent-private-id" not in rendered
+    assert "private chain of thought" not in rendered
 
 
 def test_summarize_pi_frame_streams_only_visible_assistant_text() -> None:
@@ -480,18 +841,24 @@ def test_summarize_pi_frame_streams_only_visible_assistant_text() -> None:
         },
     }
     assert _summarize_pi_frame(update) == [("agent_snapshot", "Hello", {})]
-    assert _summarize_pi_frame(
-        {
-            "type": "message_update",
-            "message": {
-                "role": "assistant",
-                "content": [{"type": "thinking", "thinking": "private"}],
-            },
-        }
-    ) == []
-    assert _summarize_pi_frame(
-        {"type": "message_start", "message": {"role": "assistant", "content": []}}
-    ) == []
+    assert (
+        _summarize_pi_frame(
+            {
+                "type": "message_update",
+                "message": {
+                    "role": "assistant",
+                    "content": [{"type": "thinking", "thinking": "private"}],
+                },
+            }
+        )
+        == []
+    )
+    assert (
+        _summarize_pi_frame(
+            {"type": "message_start", "message": {"role": "assistant", "content": []}}
+        )
+        == []
+    )
 
 
 def test_summarize_pi_frame_finishes_one_persisted_agent_message() -> None:
@@ -510,21 +877,24 @@ def test_summarize_pi_frame_finishes_one_persisted_agent_message() -> None:
 
 
 def test_terminal_agent_message_accepts_pi_agent_end_shape() -> None:
-    assert _terminal_agent_message(
-        {
-            "type": "agent_end",
-            "messages": [
-                {"role": "user", "content": [{"type": "text", "text": "question"}]},
-                {
-                    "role": "assistant",
-                    "content": [
-                        {"type": "thinking", "thinking": "private"},
-                        {"type": "text", "text": "answer"},
-                    ],
-                },
-            ],
-        }
-    ) == "answer"
+    assert (
+        _terminal_agent_message(
+            {
+                "type": "agent_end",
+                "messages": [
+                    {"role": "user", "content": [{"type": "text", "text": "question"}]},
+                    {
+                        "role": "assistant",
+                        "content": [
+                            {"type": "thinking", "thinking": "private"},
+                            {"type": "text", "text": "answer"},
+                        ],
+                    },
+                ],
+            }
+        )
+        == "answer"
+    )
 
 
 async def test_token_deltas_stream_without_touching_transcript(
@@ -574,7 +944,9 @@ async def test_sessions_run_independently(
     cfg = _cfg(tmp_path)
     manager = ChatManager(lambda: cfg)
     first = (await manager.start_session("qa"))["session_id"]
-    second = (await manager.start_session("edit", confirmation_token=CONFIRMATION_TOKEN))["session_id"]
+    second = (
+        await manager.start_session("edit", confirmation_token=CONFIRMATION_TOKEN)
+    )["session_id"]
     assert first != second
     fake_backends[0].gate = asyncio.Event()
 
@@ -596,7 +968,8 @@ async def test_sessions_run_independently(
     )
     # Transcripts do not bleed across sessions.
     assert not any(
-        m.text == "fast" for m in manager.session(first).transcript  # type: ignore[union-attr]
+        m.text == "fast"
+        for m in manager.session(first).transcript  # type: ignore[union-attr]
     )
 
     listing = manager.list_sessions()
@@ -678,9 +1051,7 @@ async def test_reattach_uses_configured_agent_not_untrusted_index_kind(
 ) -> None:
     cfg = _cfg(tmp_path)
     manager = ChatManager(lambda: cfg)
-    session_id = (await manager.start_session("qa", agent_kind="gemini"))[
-        "session_id"
-    ]
+    session_id = (await manager.start_session("qa", agent_kind="gemini"))["session_id"]
     await manager.send_message("first")
     await _wait_turn(manager)
     await manager.stop_session()
@@ -725,7 +1096,9 @@ def test_untrusted_chat_json_rejects_huge_and_unsafe_sequence_values(
 ) -> None:
     transcript = tmp_path / "chat.jsonl"
     transcript.write_text(
-        '{"seq":' + "9" * 5_000 + '}\n'
+        '{"seq":'
+        + "9" * 5_000
+        + "}\n"
         + '{"seq":9007199254740992}\n'
         + '{"seq":true}\n'
         + '{"seq":1,"type":"agent_message","text":"safe"}\n',
@@ -741,7 +1114,9 @@ def test_untrusted_chat_index_rejects_huge_json_integer(tmp_path: Path) -> None:
     cfg = _cfg(tmp_path)
     index = tmp_path / ".symphony" / "chat" / "index.json"
     index.parent.mkdir(parents=True)
-    index.write_text('{"sessions":[{"turn_count":' + "9" * 5_000 + "}]}", encoding="utf-8")
+    index.write_text(
+        '{"sessions":[{"turn_count":' + "9" * 5_000 + "}]}", encoding="utf-8"
+    )
 
     manager = ChatManager(lambda: cfg)
 
@@ -808,7 +1183,8 @@ async def test_budget_warns_once_and_never_blocks(
     assert session is not None
     assert session.budget_exceeded() is True
     warnings = [
-        m for m in session.transcript
+        m
+        for m in session.transcript
         if m.type == "session_status" and "chat budget reached" in m.text
     ]
     assert len(warnings) == 1
@@ -818,10 +1194,16 @@ async def test_budget_warns_once_and_never_blocks(
     await manager.send_message("second")
     await _wait_turn(manager)
     assert len(fake_backends[0].turns) == 2
-    assert len([
-        m for m in session.transcript
-        if m.type == "session_status" and "chat budget reached" in m.text
-    ]) == 1
+    assert (
+        len(
+            [
+                m
+                for m in session.transcript
+                if m.type == "session_status" and "chat budget reached" in m.text
+            ]
+        )
+        == 1
+    )
     assert manager.snapshot()["budget"]["exceeded"] is True
     await manager.stop_session()
 
@@ -909,7 +1291,9 @@ def test_project_setup_repeated_unclosed_markers_stay_plain_text() -> None:
     assert proposal is None
 
 
-def test_project_setup_marker_with_symlink_loop_stays_plain_text(tmp_path: Path) -> None:
+def test_project_setup_marker_with_symlink_loop_stays_plain_text(
+    tmp_path: Path,
+) -> None:
     loop = tmp_path / "loop"
     try:
         loop.symlink_to(loop)
@@ -958,9 +1342,7 @@ async def test_project_setup_choice_is_explicit_and_idempotent(
     cfg = _cfg(tmp_path)
     calls: list[tuple[str, Path]] = []
 
-    def create_project(
-        name: str, path: Path, *, expected_target: Any | None = None
-    ):
+    def create_project(name: str, path: Path, *, expected_target: Any | None = None):
         assert expected_target is not None and expected_target.repo == path
         calls.append((name, path))
         from symphony.projects import Project
@@ -996,8 +1378,12 @@ async def test_project_setup_choice_is_explicit_and_idempotent(
     assert manager.snapshot()["project_setup_actions"] == [action.as_dict()]
 
     first, second = await asyncio.gather(
-        manager.confirm_project_setup(action.action_id, confirmation_token=CONFIRMATION_TOKEN),
-        manager.confirm_project_setup(action.action_id, confirmation_token=CONFIRMATION_TOKEN),
+        manager.confirm_project_setup(
+            action.action_id, confirmation_token=CONFIRMATION_TOKEN
+        ),
+        manager.confirm_project_setup(
+            action.action_id, confirmation_token=CONFIRMATION_TOKEN
+        ),
     )
     assert first["status"] == second["status"] == "succeeded"
     assert first["project"] == {
@@ -1034,7 +1420,9 @@ async def test_default_project_setup_creates_registered_board(
     )
     action = manager.project_setup_for_choice("1")
     assert action is not None
-    result = await manager.confirm_project_setup(action.action_id, confirmation_token=CONFIRMATION_TOKEN)
+    result = await manager.confirm_project_setup(
+        action.action_id, confirmation_token=CONFIRMATION_TOKEN
+    )
     assert result["status"] == "succeeded"
     assert (target / ".git").exists()
     assert (target / "WORKFLOW.md").is_file()
@@ -1114,7 +1502,9 @@ async def test_project_setup_prunes_terminal_card_before_adding_new_proposal(
     )
 
     assert len(session.project_setup_actions) == 20
-    assert "project-00000000000000000000000000000001" not in session.project_setup_actions
+    assert (
+        "project-00000000000000000000000000000001" not in session.project_setup_actions
+    )
     assert manager.project_setup_for_choice("99") is not None
     await manager.stop_session()
 
@@ -1203,7 +1593,9 @@ async def test_project_setup_requires_edit_mode(
     tmp_path: Path, fake_backends: list[_FakeBackend]
 ) -> None:
     cfg = _cfg(tmp_path)
-    manager = ChatManager(lambda: cfg, project_creator=lambda _name, _path, **_kwargs: None)
+    manager = ChatManager(
+        lambda: cfg, project_creator=lambda _name, _path, **_kwargs: None
+    )
     await manager.start_session("qa")
     session = manager.active_session
     assert session is not None
@@ -1217,7 +1609,9 @@ async def test_project_setup_requires_edit_mode(
     )
     session.project_setup_actions[action.action_id] = action
     with pytest.raises(ChatProjectActionError, match="edit-mode"):
-        await manager.confirm_project_setup(action.action_id, confirmation_token=CONFIRMATION_TOKEN)
+        await manager.confirm_project_setup(
+            action.action_id, confirmation_token=CONFIRMATION_TOKEN
+        )
     await manager.stop_session()
 
 
@@ -1225,7 +1619,9 @@ async def test_project_setup_expiry_fails_closed(
     tmp_path: Path, fake_backends: list[_FakeBackend]
 ) -> None:
     cfg = _cfg(tmp_path)
-    manager = ChatManager(lambda: cfg, project_creator=lambda _name, _path, **_kwargs: None)
+    manager = ChatManager(
+        lambda: cfg, project_creator=lambda _name, _path, **_kwargs: None
+    )
     await manager.start_session("edit", confirmation_token=CONFIRMATION_TOKEN)
     session = manager.active_session
     assert session is not None
@@ -1239,7 +1635,9 @@ async def test_project_setup_expiry_fails_closed(
     session.project_setup_actions[action.action_id] = action
     assert manager.project_setup_for_choice("1") is None
     with pytest.raises(ChatProjectActionError, match="expired"):
-        await manager.confirm_project_setup(action.action_id, confirmation_token=CONFIRMATION_TOKEN)
+        await manager.confirm_project_setup(
+            action.action_id, confirmation_token=CONFIRMATION_TOKEN
+        )
     assert action.status == "expired"
     assert action.choice_active is False
     await manager.stop_session()

@@ -232,7 +232,9 @@ class _StubOrchestrator:
                 "status": "normal",
                 "tokens": {"input": 1, "cache": 2, "output": 3, "total": 6},
             },
-            "events": [{"event_type": "run_completed", "payload": {"status": "normal"}}],
+            "events": [
+                {"event_type": "run_completed", "payload": {"status": "normal"}}
+            ],
         }, None
 
     def run_diagnostic(self, run_id: str) -> tuple[dict[str, Any] | None, str | None]:
@@ -479,9 +481,7 @@ Build.
     assert "/Users/operator/secret" not in json.dumps(payload)
     assert payload["nodes"][2]["decision"]["code"] == "waiting_dependency"
 
-    standalone_resp = await client.get(
-        "/api/v1/requests/ticket/SEED-1/schedule"
-    )
+    standalone_resp = await client.get("/api/v1/requests/ticket/SEED-1/schedule")
     assert standalone_resp.status == 200
     standalone = await standalone_resp.json()
     assert standalone["request"] == {"kind": "ticket", "id": "SEED-1"}
@@ -1995,6 +1995,31 @@ async def test_open_project_starts_only_destination_and_returns_independent_url(
         await client.close()
 
 
+async def test_open_project_start_failure_returns_actionable_guidance(
+    board_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from symphony.projects import Project
+
+    destination = Project(
+        "other", "Other", "/tmp/other", "/tmp/other/WORKFLOW.md", "127.0.0.1", 10001
+    )
+    registry = _FakeProjectRegistry([destination])
+    registry.start = lambda _project_id: 1  # type: ignore[method-assign]
+    client = await _project_client(board_dir, monkeypatch, registry)
+    try:
+        response = await client.post("/api/v1/projects/other/open", json={})
+        payload = await response.json()
+    finally:
+        await client.close()
+
+    assert response.status == 409
+    assert payload["error"]["code"] == "project_open_failed"
+    assert (
+        "symphony service status /tmp/other/WORKFLOW.md" in payload["error"]["message"]
+    )
+    assert "service command exited" not in payload["error"]["message"]
+
+
 async def test_project_mutations_reject_cross_origin(
     board_dir: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -2024,7 +2049,9 @@ async def test_project_mutations_reject_cross_origin(
 
 @pytest.mark.asyncio
 async def test_runs_endpoint_supports_explorer_filters(client: TestClient) -> None:
-    resp = await client.get("/api/v1/runs?query=other&status=force_ejected_zombie&agent=codex")
+    resp = await client.get(
+        "/api/v1/runs?query=other&status=force_ejected_zombie&agent=codex"
+    )
     assert resp.status == 200
     payload = await resp.json()
     assert [row["identifier"] for row in payload["runs"]] == ["OTHER-1"]
@@ -2039,7 +2066,9 @@ async def test_runs_endpoint_supports_explorer_filters(client: TestClient) -> No
 
 
 @pytest.mark.asyncio
-async def test_run_detail_and_attachment_diagnostic_endpoints(client: TestClient) -> None:
+async def test_run_detail_and_attachment_diagnostic_endpoints(
+    client: TestClient,
+) -> None:
     run_id = "a" * 32
     detail_resp = await client.get(f"/api/v1/runs/{run_id}")
     assert detail_resp.status == 200
@@ -2061,7 +2090,9 @@ async def test_run_detail_and_attachment_diagnostic_endpoints(client: TestClient
 
 
 @pytest.mark.asyncio
-async def test_run_detail_validates_ids_and_returns_not_found(client: TestClient) -> None:
+async def test_run_detail_validates_ids_and_returns_not_found(
+    client: TestClient,
+) -> None:
     invalid = await client.get("/api/v1/runs/not-a-run")
     assert invalid.status == 400
     assert (await invalid.json())["error"]["code"] == "invalid_run_id"
@@ -2072,6 +2103,7 @@ async def test_run_detail_validates_ids_and_returns_not_found(client: TestClient
     assert missing.status == 404
     assert (await missing.json())["error"]["code"] == "run_not_found"
 
+
 def test_run_diagnostics_loopback_guard() -> None:
     assert _request_is_loopback(SimpleNamespace(remote="127.0.0.1", app={}))  # type: ignore[arg-type]
     assert not _request_is_loopback(SimpleNamespace(remote="10.0.0.8", app={}))  # type: ignore[arg-type]
@@ -2079,17 +2111,33 @@ def test_run_diagnostics_loopback_guard() -> None:
 
 def test_schedule_reason_taxonomy_covers_every_authoritative_code() -> None:
     required = {
-        "not_evaluated", "ready", "dispatched", "running",
-        "retry_scheduled", "auto_triage", "continuous_improvement",
-        "leased_elsewhere", "registry_unavailable",
-        "historical_release_verifier", "claimed", "paused",
-        "budget_exhausted", "finalizing", "inactive",
-        "incomplete_identity", "unsupported_agent",
-        "waiting_dependency", "waiting_global_capacity",
-        "waiting_state_capacity", "refused_conflict",
-        "refused_dispatch_authority", "terminal_success",
-        "terminal_needs_action", "dangling_dependency",
-        "snapshot_unavailable", "decision_stale",
+        "not_evaluated",
+        "ready",
+        "dispatched",
+        "running",
+        "retry_scheduled",
+        "auto_triage",
+        "continuous_improvement",
+        "leased_elsewhere",
+        "registry_unavailable",
+        "historical_release_verifier",
+        "claimed",
+        "paused",
+        "budget_exhausted",
+        "finalizing",
+        "inactive",
+        "incomplete_identity",
+        "unsupported_agent",
+        "waiting_dependency",
+        "waiting_global_capacity",
+        "waiting_state_capacity",
+        "refused_conflict",
+        "refused_dispatch_authority",
+        "terminal_success",
+        "terminal_needs_action",
+        "dangling_dependency",
+        "snapshot_unavailable",
+        "decision_stale",
     }
     assert required == set(_PUBLIC_SCHEDULE_REASONS)
     app = Path("src/symphony/web/static/app.js").read_text(encoding="utf-8")

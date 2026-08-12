@@ -233,6 +233,20 @@ async def test_open_starts_only_selected_stopped_project(
     assert registry.calls == [("start", "beta")]
 
 
+async def test_open_start_failure_returns_actionable_guidance(
+    client: TestClient, registry: _Registry
+) -> None:
+    registry.start = lambda _project_id: 1  # type: ignore[method-assign]
+
+    response = await client.post("/api/v1/projects/beta/open", json={})
+    payload = await response.json()
+
+    assert response.status == 409
+    assert payload["error"]["code"] == "project_open_failed"
+    assert "symphony service status" in payload["error"]["message"]
+    assert "service command exited" not in payload["error"]["message"]
+
+
 async def test_listing_degrades_status_and_board_diagnostics(
     client: TestClient, registry: _Registry
 ) -> None:

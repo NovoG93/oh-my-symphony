@@ -363,10 +363,18 @@ def build_hub_app(
             if not _status_running(status):
                 result = await _invoke(registry.start, project_id)
                 if isinstance(result, int) and result != 0:
-                    raise RuntimeError(f"service command exited with status {result}")
+                    raise RuntimeError(
+                        f"could not start {project.name!r}; run "
+                        f"`symphony service status {project.workflow}` and inspect "
+                        "the service log, then retry"
+                    )
                 status = await _invoke(registry.status, project_id)
             if not _status_running(status):
-                raise RuntimeError("service did not report running after start")
+                raise RuntimeError(
+                    f"{project.name!r} did not report running; run "
+                    f"`symphony service status {project.workflow}` and inspect "
+                    "the service log, then retry"
+                )
         except KeyError:
             return _json_error(
                 404, "project_not_found", f"unknown project {project_id}"

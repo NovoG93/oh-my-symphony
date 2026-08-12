@@ -194,7 +194,12 @@ class _StubOrchestrator:
             "stale": False,
             "policy": "dag",
             "policy_order": "starvation, priority, longest_dependency_chain, registration",
-            "slots": {"running": 0, "maximum": 2, "available_before": 2, "available_after": 2},
+            "slots": {
+                "running": 0,
+                "maximum": 2,
+                "available_before": 2,
+                "available_after": 2,
+            },
             "entries": [
                 {
                     **common,
@@ -277,7 +282,10 @@ def board_dir(tmp_path: Path) -> Path:
         ),
         encoding="utf-8",
     )
-    for identifier, blocker in (("E2E-CYCLE-A", "E2E-CYCLE-B"), ("E2E-CYCLE-B", "E2E-CYCLE-A")):
+    for identifier, blocker in (
+        ("E2E-CYCLE-A", "E2E-CYCLE-B"),
+        ("E2E-CYCLE-B", "E2E-CYCLE-A"),
+    ):
         (kanban / f"{identifier}.md").write_text(
             _ticket(identifier, "Cycle request", "Todo", 2).replace(
                 "labels:\n",
@@ -380,7 +388,10 @@ async def _exercise_issue_crud(page: Any) -> None:
     drawer = page.locator("#drawer-panel")
     await drawer.locator(".description-body .md-table").wait_for()
     assert await drawer.locator(".description-body .md-heading").count() == 1
-    assert await drawer.locator(".description-body thead th").all_text_contents() == ["Check", "Result"]
+    assert await drawer.locator(".description-body thead th").all_text_contents() == [
+        "Check",
+        "Result",
+    ]
     cells = await drawer.locator(".description-body tbody td").all_text_contents()
     assert cells[:2] == ["Markdown table", "PASS"]
     assert "<script>window.__xss=1</script>" in cells
@@ -391,9 +402,7 @@ async def _exercise_issue_crud(page: Any) -> None:
 
     await drawer.get_by_role("button", name="Delete issue").click()
     await page.locator(".modal-form").last.get_by_role("button", name="Delete").click()
-    await page.locator(".card", has_text=f"{title} updated").wait_for(
-        state="detached"
-    )
+    await page.locator(".card", has_text=f"{title} updated").wait_for(state="detached")
 
 
 async def _exercise_settings_layout(page: Any, web_base_url: str) -> None:
@@ -401,7 +410,9 @@ async def _exercise_settings_layout(page: Any, web_base_url: str) -> None:
         await page.set_viewport_size({"width": width, "height": 900})
         await page.goto(f"{web_base_url}/#/settings", wait_until="networkidle")
         await page.locator(".settings-card").first.wait_for()
-        assert await page.locator(".settings-body").get_by_role("heading", level=2).all_text_contents() == [
+        assert await page.locator(".settings-body").get_by_role(
+            "heading", level=2
+        ).all_text_contents() == [
             "Workspace & interface",
             "Workflow setup",
             "Automation",
@@ -471,11 +482,25 @@ class _FakeChatBackend:
         # When set, the turn pauses after the deltas so the test can observe
         # the half-typed bubble before the finished message replaces it.
         self.stream_gate: asyncio.Event | None = None
+        # Tests can gate or fail exactly the next replacement backend without
+        # changing the otherwise shared deterministic fixture.
+        self.next_initialize_entered: asyncio.Event | None = None
+        self.next_initialize_gate: asyncio.Event | None = None
+        self.next_initialize_error: Exception | None = None
+        self.initialize_entered: asyncio.Event | None = None
+        self.initialize_gate: asyncio.Event | None = None
+        self.initialize_error: Exception | None = None
 
     async def start(self) -> None:
         return None
 
     async def initialize(self) -> dict[str, Any]:
+        if self.initialize_entered is not None:
+            self.initialize_entered.set()
+        if self.initialize_gate is not None:
+            await self.initialize_gate.wait()
+        if self.initialize_error is not None:
+            raise self.initialize_error
         return {}
 
     async def start_session(
@@ -511,6 +536,83 @@ class _FakeChatBackend:
                         },
                     },
                 )
+        elif self.init.cfg.agent.kind == "codex":
+            answer = "## Done\n\n- Updated `src/app.py`\n- Tests pass"
+            items = [
+                {
+                    "id": "reason-private",
+                    "type": "reasoning",
+                    "summary": ["PRIVATE CHAIN OF THOUGHT"],
+                    "content": ["PRIVATE REASONING CONTENT"],
+                },
+                {
+                    "id": "command-internal",
+                    "type": "commandExecution",
+                    "command": "git status --short",
+                    "cwd": "PRIVATE COMMAND CWD",
+                    "status": "completed",
+                    "aggregatedOutput": "RAW COMMAND OUTPUT",
+                    "exitCode": 0,
+                },
+                {
+                    "id": "cmd-failed",
+                    "type": "commandExecution",
+                    "command": "deploy --api-key=sk-proj-1234567890abcdef",
+                    "cwd": "/private/repo",
+                    "status": "failed",
+                    "aggregatedOutput": "RAW FAILED OUTPUT",
+                    "exitCode": 7,
+                },
+                {
+                    "id": "cmd-declined",
+                    "type": "commandExecution",
+                    "command": "deploy --api-key=sk-proj-1234567890abcdef",
+                    "cwd": "/private/repo",
+                    "status": "declined",
+                    "aggregatedOutput": "RAW DECLINED OUTPUT",
+                    "exitCode": 7,
+                },
+                {
+                    "id": "file-private-id",
+                    "type": "fileChange",
+                    "status": "completed",
+                    "changes": [
+                        {
+                            "path": "src/app.py",
+                            "kind": "update",
+                            "diff": "+ password=PRIVATE_FILE_SECRET",
+                        },
+                        {
+                            "path": "tests/test_app.py",
+                            "kind": "add",
+                            "diff": "+ RAW DIFF",
+                        },
+                    ],
+                },
+                {
+                    "id": "mcp-private-id",
+                    "type": "mcpToolCall",
+                    "server": "filesystem",
+                    "tool": "read_file",
+                    "status": "failed",
+                    "arguments": {"path": "/private/input"},
+                    "result": {"content": "PRIVATE MCP RESULT"},
+                    "error": "PRIVATE MCP ERROR",
+                },
+                {
+                    "id": "dynamic-private-id",
+                    "type": "dynamicToolCall",
+                    "tool": "lookup_ticket",
+                    "status": "completed",
+                    "arguments": {"id": "SECRET-123"},
+                    "contentItems": [
+                        {"type": "inputText", "text": "PRIVATE DYNAMIC RESULT"}
+                    ],
+                    "success": True,
+                },
+            ]
+            for item in items:
+                await self._emit(EVENT_OTHER_MESSAGE, {"item": item})
         else:
             for chunk in _DELTAS:
                 await self._emit(
@@ -538,6 +640,21 @@ class _FakeChatBackend:
                 EVENT_TURN_COMPLETED,
                 {"type": "agent_end", "messages": [message]},
             )
+        elif self.init.cfg.agent.kind == "codex":
+            await self._emit(
+                EVENT_OTHER_MESSAGE,
+                {
+                    "type": "assistant",
+                    "message": answer,
+                    "item": {
+                        "id": "agent-private-id",
+                        "type": "agentMessage",
+                        "text": answer,
+                        "raw": {"reasoning": "PRIVATE CHAIN OF THOUGHT"},
+                    },
+                },
+            )
+            await self._emit(EVENT_TURN_COMPLETED, {"message": answer})
         else:
             await self._emit(
                 EVENT_OTHER_MESSAGE,
@@ -547,9 +664,7 @@ class _FakeChatBackend:
                 },
             )
             await self._emit(EVENT_TURN_COMPLETED, {"message": answer})
-        return TurnResult(
-            status=EVENT_TURN_COMPLETED, turn_id="t", last_message=answer
-        )
+        return TurnResult(status=EVENT_TURN_COMPLETED, turn_id="t", last_message=answer)
 
     async def stop(self) -> None:
         self.stopped = True
@@ -592,6 +707,14 @@ def chat_backends(monkeypatch: pytest.MonkeyPatch) -> list[_FakeChatBackend]:
 
     def _build(init: BackendInit) -> _FakeChatBackend:
         backend = _FakeChatBackend(init)
+        if built:
+            previous = built[-1]
+            backend.initialize_entered = previous.next_initialize_entered
+            backend.initialize_gate = previous.next_initialize_gate
+            backend.initialize_error = previous.next_initialize_error
+            previous.next_initialize_entered = None
+            previous.next_initialize_gate = None
+            previous.next_initialize_error = None
         built.append(backend)
         return backend
 
@@ -626,7 +749,9 @@ def git_board_dir(tmp_path: Path) -> Path:
     (kanban / "E2E-1.md").write_text(
         _ticket("E2E-1", "Seed task branch card", "Todo"), encoding="utf-8"
     )
-    (root / "calc.py").write_text("def add(a, b):\n    return a + b\n", encoding="utf-8")
+    (root / "calc.py").write_text(
+        "def add(a, b):\n    return a + b\n", encoding="utf-8"
+    )
     _git(root, "init", "-q", "-b", "main")
     _git(root, "add", "-A")
     _git(root, "commit", "-q", "-m", "init board")
@@ -647,6 +772,16 @@ async def git_web_base_url(
     monkeypatch: pytest.MonkeyPatch,
 ) -> AsyncIterator[str]:
     del chat_backends  # ordering only: patch the backend before the server runs
+    projects: list[Any] = []
+
+    class _Registry:
+        def list(self) -> list[Any]:
+            return list(projects)
+
+        def status(self, _project_id: str) -> str:
+            return "stopped"
+
+    registry = _Registry()
 
     def create_project(
         _registry: Any,
@@ -656,7 +791,7 @@ async def git_web_base_url(
         expected_target: Any | None = None,
     ) -> Any:
         assert expected_target is not None and expected_target.repo == path
-        return SimpleNamespace(
+        project = SimpleNamespace(
             id="chat-todo-app",
             name=name,
             git_repo=str(path),
@@ -664,11 +799,15 @@ async def git_web_base_url(
             host="127.0.0.1",
             port=10000,
         )
+        projects.append(project)
+        return project
 
     # This browser test proves the Chat UI/API handshake; the domain service's
     # real Git/registry behavior is covered separately without a global fixture.
-    monkeypatch.setattr(webapi_module, "ProjectRegistry", lambda: object())
-    monkeypatch.setattr(webapi_module, "_create_or_adopt_registered_project", create_project)
+    monkeypatch.setattr(webapi_module, "ProjectRegistry", lambda: registry)
+    monkeypatch.setattr(
+        webapi_module, "_create_or_adopt_registered_project", create_project
+    )
     state = WorkflowState(git_board_dir / "WORKFLOW.md")
     cfg, err = state.reload()
     assert err is None and cfg is not None
@@ -701,9 +840,11 @@ async def _exercise_git_actions(page: Any, base_url: str, board: Path) -> None:
 
     # An unmerged branch pre-checks Force; clearing it must be refused, and
     # the refusal stays inside the modal so the choice can be corrected.
-    await page.locator(".branch-row", has_text="symphony/E2E-1").get_by_role(
-        "button", name="Delete"
-    ).click()
+    await (
+        page.locator(".branch-row", has_text="symphony/E2E-1")
+        .get_by_role("button", name="Delete")
+        .click()
+    )
     modal = page.locator(".modal-form").last
     assert "is NOT merged" in await modal.inner_text()
     force = modal.locator("#git-delete-force")
@@ -785,6 +926,29 @@ async def _exercise_chat_session(
     await page.locator(".chat-status", has_text="chat budget reached").wait_for()
     assert not await page.locator(".chat-input").is_disabled()
     listing = await (await page.request.get(f"{base_url}/api/v1/chat/sessions")).json()
+    # A completed turn can rebuild Edit -> Q&A and immediately answer again.
+    await (
+        page.locator(".chat-mode-toggle")
+        .get_by_role("button", name="Edit", exact=True)
+        .click()
+    )
+    await page.locator(".chat-mode-btn.active", has_text="Edit").wait_for()
+    await (
+        page.locator(".chat-mode-toggle")
+        .get_by_role("button", name="Q&A", exact=True)
+        .click()
+    )
+    await page.locator(".chat-mode-btn.active", has_text="Q&A").wait_for()
+    await page.locator(".chat-input").fill("load the current Kanban issues")
+    await page.get_by_role("button", name="Send", exact=True).click()
+    await page.wait_for_function(
+        "() => document.querySelectorAll('.chat-agent .chat-bubble').length === 2"
+    )
+    assert (
+        await page.locator(".chat-error", has_text="no backend for session").count()
+        == 0
+    )
+    assert await page.locator(".chat-input").input_value() == ""
     return default_session_id, listing["active_id"]
 
 
@@ -823,6 +987,60 @@ async def _exercise_chat_prime_snapshots(
     return session_id
 
 
+async def _exercise_chat_codex_events(page: Any) -> None:
+    await page.get_by_role("button", name="Stop").click()
+    await page.wait_for_function(
+        "() => document.querySelectorAll('.chat-tab').length === 2"
+    )
+    await page.get_by_role("button", name="+ New").click()
+    modal = page.locator(".modal-form").last
+    await modal.get_by_label("Agent").select_option("codex")
+    await modal.get_by_role("button", name="Start session").click()
+    await page.locator(".chat-controls", has_text="codex").wait_for()
+
+    await page.locator(".chat-input").fill("inspect the repository")
+    await page.get_by_role("button", name="Send", exact=True).click()
+    await page.locator(".chat-agent .chat-bubble").wait_for()
+
+    assert await page.locator(".chat-tool-name").all_inner_texts() == [
+        "command",
+        "command failed",
+        "command declined",
+        "files changed",
+        "MCP tool failed",
+        "dynamic tool",
+    ]
+    details = await page.locator(".chat-tool-detail").all_inner_texts()
+    assert details[0] == "git status --short"
+    assert details[3:] == [
+        "src/app.py, tests/test_app.py",
+        "filesystem/read_file",
+        "lookup_ticket",
+    ]
+    transcript = await page.locator(".chat-transcript").inner_text()
+    for private_marker in (
+        "reason-private",
+        "command-internal",
+        "cmd-failed",
+        "cmd-declined",
+        "file-private-id",
+        "mcp-private-id",
+        "dynamic-private-id",
+        "agent-private-id",
+        "PRIVATE",
+        "RAW",
+        "SECRET-123",
+        "sk-proj-1234567890abcdef",
+        "/private/repo",
+        "/private/input",
+    ):
+        assert private_marker not in transcript
+    assert '"type"' not in transcript
+    bubble = page.locator(".chat-agent .chat-bubble")
+    assert await bubble.locator("h2", has_text="Done").count() == 1
+    assert await bubble.locator("code", has_text="src/app.py").count() == 1
+
+
 async def _exercise_chat_multi_session(
     page: Any, default_session_id: str, budget_session_id: str
 ) -> None:
@@ -851,12 +1069,16 @@ async def _exercise_chat_reattach(
     await page.wait_for_function(
         "() => document.querySelectorAll('.chat-resume-select option').length >= 2"
     )
-    value = await page.locator(".chat-resume-select option").nth(1).get_attribute("value")
+    value = (
+        await page.locator(".chat-resume-select option").nth(1).get_attribute("value")
+    )
     await page.locator(".chat-resume-select").select_option(value)
     await page.locator(".toast", has_text="Session reattached").wait_for()
     # The conversation comes back from the JSONL, not from memory.
     await page.locator(".chat-agent .chat-bubble").first.wait_for()
-    assert "calc.py" in await page.locator(".chat-agent .chat-bubble").first.inner_text()
+    assert (
+        "calc.py" in await page.locator(".chat-agent .chat-bubble").first.inner_text()
+    )
 
     # Retire the unused auto-created session only after validating reattach;
     # the fake backends share a runtime ID, so stopping it earlier would
@@ -883,9 +1105,11 @@ async def test_chat_project_setup_browser_e2e(
         try:
             await page.goto(f"{git_web_base_url}/#/chat", wait_until="networkidle")
             await page.locator(".chat-session-bar").wait_for()
-            await page.locator(".chat-mode-toggle").get_by_role(
-                "button", name="Edit", exact=True
-            ).click()
+            await (
+                page.locator(".chat-mode-toggle")
+                .get_by_role("button", name="Edit", exact=True)
+                .click()
+            )
             await page.locator(".chat-mode-btn.active", has_text="Edit").wait_for()
             await page.locator(".chat-input").fill("offer a separate project")
             await page.get_by_role("button", name="Send", exact=True).click()
@@ -894,13 +1118,17 @@ async def test_chat_project_setup_browser_e2e(
             await card.wait_for()
             assert "Todo App" in await card.inner_text()
             assert "New directory" in await card.inner_text()
-            assert "symphony-project-setup" not in await page.locator(
-                ".chat-transcript"
-            ).inner_text()
+            assert (
+                "symphony-project-setup"
+                not in await page.locator(".chat-transcript").inner_text()
+            )
             await card.get_by_role("button", name="Select option 1").click()
             await card.locator(
                 ".chat-project-setup-status", has_text="Registered"
             ).wait_for()
+            await page.locator(
+                'select[aria-label="Select project"] option[value="chat-todo-app"]'
+            ).wait_for(state="attached")
             listing = await (
                 await page.request.get(f"{git_web_base_url}/api/v1/chat/sessions")
             ).json()
@@ -915,9 +1143,9 @@ async def test_chat_project_setup_browser_e2e(
             assert action["project"]["id"] == "chat-todo-app"
             assert chat_backends[-1].turns[-1].endswith("offer a separate project")
             # The registration action is distinct from filing a current-board ticket.
-            assert sorted(path.name for path in (git_board_dir / "kanban").iterdir()) == [
-                "E2E-1.md"
-            ]
+            assert sorted(
+                path.name for path in (git_board_dir / "kanban").iterdir()
+            ) == ["E2E-1.md"]
             assert page_errors == []
         finally:
             await browser.close()
@@ -937,9 +1165,11 @@ async def test_chat_pending_project_setup_card_disappears_after_stop(
         page.on("pageerror", lambda exc: page_errors.append(str(exc)))
         try:
             await page.goto(f"{git_web_base_url}/#/chat", wait_until="networkidle")
-            await page.locator(".chat-mode-toggle").get_by_role(
-                "button", name="Edit", exact=True
-            ).click()
+            await (
+                page.locator(".chat-mode-toggle")
+                .get_by_role("button", name="Edit", exact=True)
+                .click()
+            )
             await page.locator(".chat-mode-btn.active", has_text="Edit").wait_for()
             await page.locator(".chat-input").fill("offer a separate project")
             await page.get_by_role("button", name="Send", exact=True).click()
@@ -956,6 +1186,67 @@ async def test_chat_pending_project_setup_card_disappears_after_stop(
                 for backend in chat_backends
             )
         finally:
+            await browser.close()
+
+
+async def test_chat_failed_mode_rebuild_exposes_resume_and_preserves_draft(
+    git_web_base_url: str, chat_backends: list[_FakeChatBackend]
+) -> None:
+    assert async_playwright is not None
+    async with async_playwright() as p:
+        try:
+            browser = await p.chromium.launch()
+        except Exception as exc:
+            pytest.skip(f"Playwright Chromium unavailable: {exc}")
+        page = await browser.new_page(viewport={"width": 1440, "height": 960})
+        page_errors: list[str] = []
+        page.on("pageerror", lambda exc: page_errors.append(str(exc)))
+        release = asyncio.Event()
+        try:
+            await page.goto(f"{git_web_base_url}/#/chat", wait_until="networkidle")
+            await page.wait_for_function(
+                "() => document.querySelectorAll('.chat-tab').length === 1"
+            )
+            listing = await (
+                await page.request.get(f"{git_web_base_url}/api/v1/chat/sessions")
+            ).json()
+            session_id = listing["active_id"]
+            entered = asyncio.Event()
+            current = chat_backends[-1]
+            current.next_initialize_entered = entered
+            current.next_initialize_gate = release
+            current.next_initialize_error = RuntimeError("cannot rebuild chat backend")
+
+            draft = "keep this unsent draft"
+            await page.locator(".chat-input").fill(draft)
+            await (
+                page.locator(".chat-mode-toggle")
+                .get_by_role("button", name="Edit", exact=True)
+                .click()
+            )
+            await entered.wait()
+            try:
+                assert await page.locator(".chat-mode-btn").evaluate_all(
+                    "(buttons) => buttons.every((button) => button.disabled)"
+                )
+                assert await page.get_by_role("button", name="Stop").is_disabled()
+                assert await page.get_by_role("button", name="+ New").is_disabled()
+                assert await page.locator(".chat-input").is_disabled()
+            finally:
+                release.set()
+
+            await page.locator(".toast-error").wait_for()
+            await page.locator(
+                f'.chat-resume-select option[value="{session_id}"]'
+            ).wait_for(state="attached")
+            assert await page.locator(".chat-resume-select").is_visible()
+            assert await page.locator(".chat-input").input_value() == draft
+            assert not await page.locator(".chat-input").is_disabled()
+            assert current.stopped is True
+            assert chat_backends[1].stopped is True
+            assert page_errors == []
+        finally:
+            release.set()
             await browser.close()
 
 
@@ -976,9 +1267,9 @@ async def test_web_git_and_chat_browser_e2e(
         page.on("pageerror", lambda exc: page_errors.append(str(exc)))
         page.on(
             "console",
-            lambda msg: console_errors.append(msg.text)
-            if msg.type == "error"
-            else None,
+            lambda msg: (
+                console_errors.append(msg.text) if msg.type == "error" else None
+            ),
         )
         try:
             await _exercise_git_actions(page, git_web_base_url, git_board_dir)
@@ -988,12 +1279,9 @@ async def test_web_git_and_chat_browser_e2e(
             await _exercise_chat_multi_session(
                 page, default_session_id, budget_session_id
             )
-            await _exercise_chat_reattach(
-                page, budget_session_id, default_session_id
-            )
-            await _exercise_chat_prime_snapshots(
-                page, git_web_base_url, chat_backends
-            )
+            await _exercise_chat_reattach(page, budget_session_id, default_session_id)
+            await _exercise_chat_prime_snapshots(page, git_web_base_url, chat_backends)
+            await _exercise_chat_codex_events(page)
             # Unlike the board flow, this one deliberately drives rejected
             # requests (unmerged delete, mistyped push confirmation, snapshot
             # of a just-stopped session). The browser logs each as a resource
@@ -1022,9 +1310,7 @@ async def _exercise_runs_page(page: Any, base_url: str) -> None:
     await page.get_by_text("No recorded runs match these filters").wait_for()
     await page.locator("#runs-search").fill("")
     await page.locator(".run-attempt-row").first.wait_for()
-    async with page.expect_request(
-        lambda request: "status=normal" in request.url
-    ):
+    async with page.expect_request(lambda request: "status=normal" in request.url):
         await page.locator("#runs-status-filter").select_option("normal")
     await page.locator("#runs-status-filter").select_option("")
     await page.goto(f"{base_url}/#/board")
@@ -1039,7 +1325,9 @@ async def _exercise_request_schedule(
     await page.get_by_role("heading", name="Request schedule").wait_for()
     picker = page.locator(".request-picker")
     await picker.wait_for()
-    option = await picker.locator("option").filter(has_text="E2E-REQ").get_attribute("value")
+    option = (
+        await picker.locator("option").filter(has_text="E2E-REQ").get_attribute("value")
+    )
     assert option is not None
     await picker.select_option(option)
     await page.locator(".request-node-id", has_text="E2E-PLAN").wait_for()
@@ -1049,7 +1337,11 @@ async def _exercise_request_schedule(
     await page.locator(".request-node-details summary").first.click()
     await page.get_by_text("Decision code", exact=True).first.wait_for()
 
-    cycle_option = await picker.locator("option").filter(has_text="E2E-CYCLE").get_attribute("value")
+    cycle_option = (
+        await picker.locator("option")
+        .filter(has_text="E2E-CYCLE")
+        .get_attribute("value")
+    )
     assert cycle_option is not None
     await picker.select_option(cycle_option)
     await page.get_by_text("Dependency cycle detected", exact=False).wait_for()

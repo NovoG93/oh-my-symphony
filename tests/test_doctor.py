@@ -101,9 +101,7 @@ def test_after_create_warns_on_masked_install_output(tmp_path: Path) -> None:
     assert "WORKFLOW.md:" in result.message
 
 
-def test_after_create_warning_does_not_fail_by_default(
-    tmp_path: Path, capsys
-) -> None:
+def test_after_create_warning_does_not_fail_by_default(tmp_path: Path, capsys) -> None:
     board = tmp_path / "kanban"
     board.mkdir()
     workflow = _write_workflow(
@@ -382,8 +380,15 @@ def test_port_fail_names_stale_record_when_api_still_responds(
         )
         monkeypatch.setattr(
             service_module,
-            "is_symphony_api_reachable",
-            lambda host, port: (host, port) == ("127.0.0.1", bound_port),
+            "is_symphony_workflow_reachable",
+            lambda host, port, workflow: (
+                (
+                    host,
+                    port,
+                    Path(workflow),
+                )
+                == ("127.0.0.1", bound_port, cfg.workflow_path.resolve())
+            ),
         )
 
         result = check_port(cfg, is_running=lambda pid: False)
@@ -616,7 +621,9 @@ def _isolate_home(monkeypatch, home: Path) -> None:
     monkeypatch.setenv("HOME", str(home))
     monkeypatch.setenv("USERPROFILE", str(home))
     monkeypatch.setenv("HOMEDRIVE", home.drive or "")
-    monkeypatch.setenv("HOMEPATH", str(home)[len(home.drive):] if home.drive else str(home))
+    monkeypatch.setenv(
+        "HOMEPATH", str(home)[len(home.drive) :] if home.drive else str(home)
+    )
 
 
 def test_pi_auth_warns_when_missing(tmp_path: Path, monkeypatch) -> None:
@@ -688,9 +695,7 @@ def test_prime_agent_auth_passes_when_present(tmp_path: Path, monkeypatch) -> No
     assert "auth.json" in result.message
 
 
-def test_prime_agent_auth_uses_config_dir_override(
-    tmp_path: Path, monkeypatch
-) -> None:
+def test_prime_agent_auth_uses_config_dir_override(tmp_path: Path, monkeypatch) -> None:
     _isolate_home(monkeypatch, tmp_path)
     auth_dir = tmp_path / "prime-config"
     monkeypatch.setenv("PRIME_AGENT_CODING_AGENT_DIR", str(auth_dir))
@@ -751,9 +756,7 @@ def test_gemini_auth_accepts_api_key_env(tmp_path: Path, monkeypatch) -> None:
     assert "GEMINI_API_KEY" in result.message
 
 
-def test_gemini_auth_accepts_oauth_selected_type(
-    tmp_path: Path, monkeypatch
-) -> None:
+def test_gemini_auth_accepts_oauth_selected_type(tmp_path: Path, monkeypatch) -> None:
     _isolate_home(monkeypatch, tmp_path)
     monkeypatch.delenv("GEMINI_API_KEY", raising=False)
     settings = tmp_path / ".gemini" / "settings.json"
@@ -884,7 +887,9 @@ def test_agy_state_dir_fails_when_state_is_not_writable(
     assert "operation not permitted" in result.message
 
 
-def test_stage_turn_budget_fails_for_multi_stage_one_turn_workflow(tmp_path: Path) -> None:
+def test_stage_turn_budget_fails_for_multi_stage_one_turn_workflow(
+    tmp_path: Path,
+) -> None:
     cfg = _build_cfg(
         tmp_path,
         """
@@ -1208,9 +1213,7 @@ def test_symphony_cli_check_warns_when_not_on_login_path(
         returncode = 1
         stdout = ""
 
-    monkeypatch.setattr(
-        doctor_module.subprocess, "run", lambda *a, **k: _Missing()
-    )
+    monkeypatch.setattr(doctor_module.subprocess, "run", lambda *a, **k: _Missing())
     monkeypatch.setattr(
         "symphony.orchestrator.helpers.resolve_symphony_cli",
         lambda: "/opt/venv/bin/symphony",

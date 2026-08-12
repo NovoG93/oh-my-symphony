@@ -33,6 +33,7 @@ from aiohttp import WSCloseCode, WSMsgType, web
 
 from .chat import ChatManager
 from .errors import (
+    ChatBackendUnavailableError,
     ChatBusyError,
     ChatNoSessionError,
     ChatProjectActionError,
@@ -296,9 +297,7 @@ _PUBLIC_SCHEDULE_REASONS = {
 
 
 def _public_schedule_reason(code: str) -> str:
-    return _PUBLIC_SCHEDULE_REASONS.get(
-        code, "scheduler decision is available by code"
-    )
+    return _PUBLIC_SCHEDULE_REASONS.get(code, "scheduler decision is available by code")
 
 
 def _request_group_schedule_payload(
@@ -955,7 +954,9 @@ def _register_issue_routes(
             )
         run_id = request.match_info["run_id"].strip()
         if not _RUN_ID_RE.fullmatch(run_id):
-            return _json_error(400, "invalid_run_id", "run_id must be 32 lowercase hex characters")
+            return _json_error(
+                400, "invalid_run_id", "run_id must be 32 lowercase hex characters"
+            )
         detail, registry_error = orchestrator.run_detail(run_id)
         if registry_error:
             return _json_error(503, "run_registry_unavailable", registry_error)
@@ -972,7 +973,9 @@ def _register_issue_routes(
             )
         run_id = request.match_info["run_id"].strip()
         if not _RUN_ID_RE.fullmatch(run_id):
-            return _json_error(400, "invalid_run_id", "run_id must be 32 lowercase hex characters")
+            return _json_error(
+                400, "invalid_run_id", "run_id must be 32 lowercase hex characters"
+            )
         diagnostic, registry_error = orchestrator.run_diagnostic(run_id)
         if registry_error:
             return _json_error(503, "run_registry_unavailable", registry_error)
@@ -1049,7 +1052,9 @@ def _register_issue_routes(
             for row in schedule.get("entries", [])
             if isinstance(row, dict) and isinstance(row.get("identifier"), str)
         }
-        terminal_states = {state.strip().lower() for state in cfg.tracker.terminal_states}
+        terminal_states = {
+            state.strip().lower() for state in cfg.tracker.terminal_states
+        }
         requests_payload: list[dict[str, Any]] = []
         catalog_drifted = False
         for key, members in groups.items():
@@ -1093,9 +1098,7 @@ def _register_issue_routes(
                     )
                 )
                 catalog_drifted = catalog_drifted or member_drifted
-                if (
-                    member_drifted
-                ):
+                if member_drifted:
                     status = "needs_action"
                 elif decision is not None:
                     status = str(decision.get("status") or "waiting")
@@ -1161,11 +1164,15 @@ def _register_issue_routes(
                 },
                 headers={"Cache-Control": "no-store"},
             )
-        kind = request.query.get(
-            "kind", request.match_info.get("kind", "request")
-        ).strip().lower()
+        kind = (
+            request.query.get("kind", request.match_info.get("kind", "request"))
+            .strip()
+            .lower()
+        )
         if kind not in {"request", "ticket"}:
-            return _json_error(400, "invalid_request_kind", "kind must be request or ticket")
+            return _json_error(
+                400, "invalid_request_kind", "kind must be request or ticket"
+            )
         raw_identifier = request.query.get("id", request.match_info.get("identifier"))
         identifier = (
             _check_request_schedule_key(raw_identifier)
@@ -1181,9 +1188,7 @@ def _register_issue_routes(
                 "request schedule graph exceeds the safe read limit",
             )
         groups = group_by_request(issues)
-        key = RequestGroupKey(
-            "request" if kind == "request" else "ticket", identifier
-        )
+        key = RequestGroupKey("request" if kind == "request" else "ticket", identifier)
         members = groups.get(key)
         if members is None:
             return _json_error(
@@ -1421,9 +1426,7 @@ def _register_issue_routes(
 
     app.router.add_get("/api/v1/runs", _wrap(handle_runs))
     app.router.add_get("/api/v1/runs/{run_id}", _wrap(handle_run_detail))
-    app.router.add_get(
-        "/api/v1/runs/{run_id}/diagnostic", _wrap(handle_run_diagnostic)
-    )
+    app.router.add_get("/api/v1/runs/{run_id}/diagnostic", _wrap(handle_run_diagnostic))
     app.router.add_get("/api/v1/board", _wrap(handle_board))
     app.router.add_get("/api/v1/requests", _wrap(handle_requests))
     app.router.add_get(
@@ -2211,8 +2214,10 @@ def _register_chat_routes(
     manager = ChatManager(
         ctx.config,
         request_refresh=orchestrator.request_refresh,
-        project_creator=lambda name, path, *, expected_target: _create_or_adopt_registered_project(
-            project_registry, name=name, path=path, expected_target=expected_target
+        project_creator=lambda name, path, *, expected_target: (
+            _create_or_adopt_registered_project(
+                project_registry, name=name, path=path, expected_target=expected_target
+            )
         ),
     )
     app[CHAT_MANAGER_KEY] = manager
@@ -2284,16 +2289,16 @@ def _register_chat_routes(
         except ChatProjectAuthorizationError as exc:
             return _json_error(403, exc.code, exc.message)
         except ChatProjectActionError as exc:
-            status = 404 if exc.message.startswith("unknown project setup action") else 409
+            status = (
+                404 if exc.message.startswith("unknown project setup action") else 409
+            )
             return _json_error(status, exc.code, exc.message)
         if action["status"] == "failed":
             return web.json_response(
                 {
                     "error": {
                         "code": "project_setup_failed",
-                        "message": str(
-                            action.get("error") or "project setup failed"
-                        ),
+                        "message": str(action.get("error") or "project setup failed"),
                     },
                     "action": action,
                 },
@@ -2323,6 +2328,8 @@ def _register_chat_routes(
             snapshot = await manager.send_message(text, session_id)
         except ChatNoSessionError as exc:
             return _json_error(404, exc.code, exc.message)
+        except ChatBackendUnavailableError as exc:
+            return _json_error(409, exc.code, exc.message)
         except ChatBusyError as exc:
             return _json_error(409, exc.code, exc.message)
         return web.json_response(snapshot, status=202)
@@ -2383,7 +2390,9 @@ def _register_chat_routes(
         action_id = _check_project_setup_action_id(request.match_info["action_id"])
         body = await _read_json(request)
         if body:
-            return _json_error(400, "invalid_body", "project setup selection takes no fields")
+            return _json_error(
+                400, "invalid_body", "project setup selection takes no fields"
+            )
         return await _confirm_project_setup(request, session_id, action_id)
 
     async def handle_chat_session_reattach(request: web.Request) -> web.Response:
@@ -2839,10 +2848,18 @@ def _register_project_routes(app: web.Application, ctx: _Ctx) -> None:
             if not _status_is_running(status):
                 result = await asyncio.to_thread(registry.start, project_id)
                 if isinstance(result, int) and result != 0:
-                    raise ProjectError(f"service command exited with status {result}")
+                    raise ProjectError(
+                        f"could not start {project.name!r}; run "
+                        f"`symphony service status {project.workflow}` and inspect "
+                        "the service log, then retry"
+                    )
                 status = await asyncio.to_thread(registry.status, project_id)
             if not _status_is_running(status):
-                raise ProjectError(f"project {project_id!r} did not start")
+                raise ProjectError(
+                    f"{project.name!r} did not report running; run "
+                    f"`symphony service status {project.workflow}` and inspect "
+                    "the service log, then retry"
+                )
         except ProjectError as exc:
             missing = str(exc).startswith("unknown project ")
             return _json_error(
