@@ -10,6 +10,27 @@ Versioning: [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.20.1] - 2026-08-13 - Proxied and tunnelled boards can manage projects
+
+### Fixed
+
+- **Project management behind a proxy or tunnel.** The project mutation
+  guard and the chat WebSocket compared the browser `Origin` byte-for-byte
+  against the `Host` header, so a board reached through cloudflared, ngrok,
+  or a TLS-terminating proxy rejected its own UI with
+  `project mutations require same-origin requests`. Loopback origins are now
+  accepted whatever their scheme or port, the host the browser actually
+  addressed is accepted, and the 403 names the environment variable to set.
+
+### Added
+
+- **`SYMPHONY_TRUSTED_ORIGINS`.** Comma-separated public front doors for a
+  proxied board — full origins (`https://board.example.com`), bare
+  hostnames (any scheme/port), or `*`. Declared hosts also satisfy the
+  `/api/` Host allowlist, so proxies that forward the public `Host`
+  verbatim work too. Opaque (`null`) and undeclared foreign origins are
+  still rejected.
+
 ## [0.20.0] - 2026-08-13 - Ticket artifacts, runs explorer, and DAG scheduling
 
 ### Added
@@ -1457,7 +1478,8 @@ First public release of the multi-agent fork.
 - Per-state concurrency caps, `$VAR`/`~` expansion, dynamic WORKFLOW
   reload, structured stderr logging, `symphony doctor`.
 
-[Unreleased]: https://github.com/cskwork/oh-my-symphony/compare/v0.20.0...HEAD
+[Unreleased]: https://github.com/cskwork/oh-my-symphony/compare/v0.20.1...HEAD
+[0.20.1]: https://github.com/cskwork/oh-my-symphony/compare/v0.20.0...v0.20.1
 [0.20.0]: https://github.com/cskwork/oh-my-symphony/compare/v0.19.1...v0.20.0
 [0.19.1]: https://github.com/cskwork/oh-my-symphony/compare/v0.19.0...v0.19.1
 [0.19.0]: https://github.com/cskwork/oh-my-symphony/compare/v0.18.2...v0.19.0
