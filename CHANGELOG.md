@@ -10,8 +10,18 @@ Versioning: [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.20.0] - 2026-08-13 - Ticket artifacts, runs explorer, and DAG scheduling
+
 ### Added
 
+- Add host-owned ticket artifacts. Agents save deliverables (screenshots,
+  reports, exports) to `.symphony-artifacts/` at their workspace root; after
+  every turn Symphony copies new files to `.symphony/artifacts/<TICKET-ID>/`,
+  lists them in the web board's ticket drawer with inline image previews, and
+  writes an `## Artifacts` section on the ticket. Deliverables outlive the
+  workspace, stay out of Git, and never reach the merge. Configured under
+  `artifacts:` in `WORKFLOW.md`; `require_for_done: true` blocks Done until a
+  ticket has one, and `ttl_days` drops artifacts for archived tickets.
 - Add an attempt-centric Runs explorer with search/filter controls, polling,
   per-run lifecycle timelines, bounded/redacted failure diagnostics, token and
   Git/workspace references, and downloadable diagnostic JSON.
@@ -1447,7 +1457,8 @@ First public release of the multi-agent fork.
 - Per-state concurrency caps, `$VAR`/`~` expansion, dynamic WORKFLOW
   reload, structured stderr logging, `symphony doctor`.
 
-[Unreleased]: https://github.com/cskwork/oh-my-symphony/compare/v0.19.1...HEAD
+[Unreleased]: https://github.com/cskwork/oh-my-symphony/compare/v0.20.0...HEAD
+[0.20.0]: https://github.com/cskwork/oh-my-symphony/compare/v0.19.1...v0.20.0
 [0.19.1]: https://github.com/cskwork/oh-my-symphony/compare/v0.19.0...v0.19.1
 [0.19.0]: https://github.com/cskwork/oh-my-symphony/compare/v0.18.2...v0.19.0
 [0.18.2]: https://github.com/cskwork/oh-my-symphony/compare/v0.18.1...v0.18.2
