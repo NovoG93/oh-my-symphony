@@ -1944,6 +1944,7 @@
     }
     if (detail.live) container.appendChild(buildLiveSection(detail));
     container.appendChild(buildRunHistorySection(detail));
+    container.appendChild(buildArtifactsSection(detail));
     container.appendChild(buildDescriptionSection(detail));
     container.appendChild(el('div', { class: 'drawer-meta' }, [
       el('div', null, t('issue.createdAgo', { ago: timeAgo(detail.created_at) })),
@@ -2006,6 +2007,75 @@
       el('span', { class: 'run-history-status' }, status),
       el('span', { class: 'run-history-time' }, `${start} -> ${end}`),
     ]);
+  }
+
+  function formatArtifactBytes(size) {
+    const bytes = Number(size) || 0;
+    if (bytes < 1024) return `${bytes} B`;
+    let value = bytes;
+    for (const unit of ['KB', 'MB', 'GB']) {
+      value /= 1024;
+      if (value < 1024 || unit === 'GB') {
+        return `${value.toFixed(1).replace(/\.0$/, '')} ${unit}`;
+      }
+    }
+    return `${bytes} B`;
+  }
+
+  // Worker deliverables collected off the workspace. Images preview inline;
+  // everything else is a download link — the server already forces
+  // `Content-Disposition: attachment` for types a browser could execute.
+  function buildArtifactsSection(detail) {
+    const artifacts = Array.isArray(detail.artifacts) ? detail.artifacts : [];
+    const section = el('div', { class: 'drawer-artifacts' });
+    section.appendChild(el('div', { class: 'section-heading' }, [
+      el('span', null, `${t('artifacts.heading')} (${artifacts.length})`),
+    ]));
+    if (!artifacts.length) {
+      section.appendChild(el('div', { class: 'form-hint' }, t('artifacts.empty')));
+      section.appendChild(el('div', { class: 'form-hint' }, t('artifacts.hint')));
+      return section;
+    }
+    const list = el('div', { class: 'artifact-list' });
+    artifacts.forEach((artifact) => {
+      const isImage = artifact.inline && String(artifact.content_type || '').startsWith('image/');
+      const meta = [formatArtifactBytes(artifact.byte_size)];
+      if (artifact.turn) meta.push(t('artifacts.turn', { turn: artifact.turn }));
+      const link = el('a', {
+        class: 'artifact-name',
+        href: artifact.url,
+        target: '_blank',
+        rel: 'noopener noreferrer',
+        download: artifact.inline ? null : artifact.name,
+      }, artifact.title || artifact.name);
+      const item = el('div', { class: 'artifact-item' }, [
+        el('div', { class: 'artifact-row' }, [
+          link,
+          el('span', { class: 'artifact-meta' }, meta.join(' · ')),
+        ]),
+      ]);
+      if (artifact.summary) {
+        item.appendChild(el('div', { class: 'artifact-summary' }, artifact.summary));
+      }
+      if (isImage) {
+        const thumb = el('img', {
+          class: 'artifact-thumb',
+          src: artifact.url,
+          alt: artifact.title || artifact.name,
+          loading: 'lazy',
+        });
+        const preview = el('a', {
+          href: artifact.url,
+          target: '_blank',
+          rel: 'noopener noreferrer',
+          class: 'artifact-thumb-link',
+        }, [thumb]);
+        item.appendChild(preview);
+      }
+      list.appendChild(item);
+    });
+    section.appendChild(list);
+    return section;
   }
 
   function buildDescriptionSection(detail) {
