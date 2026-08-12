@@ -167,7 +167,11 @@ class ArtifactStore:
         max_file_bytes: int = 25 * 1024 * 1024,
         max_ticket_bytes: int = 200 * 1024 * 1024,
     ) -> None:
-        self._root = root
+        # Absolute from here on: `workflow_path` may be relative while
+        # `tracker.board_root` is always resolved, and the two are mixed in
+        # an `os.path.relpath` to build the ticket's Markdown links. A
+        # relative root would silently resolve against the process cwd.
+        self._root = Path(os.path.abspath(root))
         self._max_file_bytes = max_file_bytes
         self._max_ticket_bytes = max_ticket_bytes
         self._lock = threading.Lock()
