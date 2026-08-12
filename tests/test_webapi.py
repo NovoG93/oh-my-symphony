@@ -22,7 +22,11 @@ from symphony.orchestrator import Orchestrator
 from symphony.server import build_app
 from symphony.utils.auto_merge import AutoMergeResult
 from symphony.utils.git_ops import GitOpResult
-from symphony.webapi import _PUBLIC_SCHEDULE_REASONS, _request_is_loopback
+from symphony.webapi import (
+    _PUBLIC_SCHEDULE_REASONS,
+    _request_is_loopback,
+    TRUSTED_ORIGINS_ENV,
+)
 from symphony.workflow import WorkflowState
 
 WORKFLOW_TEXT = """---
@@ -2032,17 +2036,74 @@ async def test_project_mutations_reject_cross_origin(
         )
         assert response.status == 403
         assert (await response.json())["error"]["code"] == "forbidden_origin"
-        wrong_scheme = await client.post(
+        opaque = await client.post(
             "/api/v1/projects",
             json={"name": "Demo", "path": "/tmp/demo"},
-            headers={
-                "Origin": str(client.make_url("/"))
-                .replace("http:", "https:", 1)
-                .rstrip("/")
-            },
+            headers={"Origin": "null"},
         )
-        assert wrong_scheme.status == 403
-        assert (await wrong_scheme.json())["error"]["code"] == "forbidden_origin"
+        assert opaque.status == 403
+        assert (await opaque.json())["error"]["code"] == "forbidden_origin"
+    finally:
+        await client.close()
+
+
+async def test_project_mutations_accept_local_and_declared_origins(
+    board_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A TLS-terminating proxy or tunnel must not look like an attacker.
+
+    The empty payload stops each request at field validation, so a 400
+    proves the origin guard let it through without touching the registry.
+    """
+    client = await _project_client(board_dir, monkeypatch, _FakeProjectRegistry([]))
+    try:
+        # Same machine, different scheme and port than the browser used.
+        for origin in ("https://127.0.0.1:9999", "http://localhost:1234"):
+            allowed = await client.post(
+                "/api/v1/projects", json={"name": "", "path": ""},
+                headers={"Origin": origin},
+            )
+            assert allowed.status == 400, origin
+            assert (await allowed.json())["error"]["code"] == "invalid_project_name"
+
+        tunnel = "https://symphony.example.com"
+        blocked = await client.post(
+            "/api/v1/projects",
+            json={"name": "", "path": ""},
+            headers={"Origin": tunnel},
+        )
+        assert blocked.status == 403
+        assert TRUSTED_ORIGINS_ENV in (await blocked.json())["error"]["message"]
+
+        monkeypatch.setenv(TRUSTED_ORIGINS_ENV, f"{tunnel} , https://other.example")
+        declared = await client.post(
+            "/api/v1/projects",
+            json={"name": "", "path": ""},
+            headers={"Origin": tunnel},
+        )
+        assert declared.status == 400
+        assert (await declared.json())["error"]["code"] == "invalid_project_name"
+    finally:
+        await client.close()
+
+
+async def test_declared_origin_host_passes_the_api_host_guard(
+    board_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Proxies that forward the public Host verbatim reach the API too."""
+    client = await _project_client(board_dir, monkeypatch, _FakeProjectRegistry([]))
+    try:
+        rejected = await client.get(
+            "/api/v1/projects", headers={"Host": "symphony.example.com"}
+        )
+        assert rejected.status == 403
+        assert (await rejected.json())["error"]["code"] == "forbidden_host"
+
+        monkeypatch.setenv(TRUSTED_ORIGINS_ENV, "https://symphony.example.com")
+        accepted = await client.get(
+            "/api/v1/projects", headers={"Host": "symphony.example.com"}
+        )
+        assert accepted.status == 200
     finally:
         await client.close()
 
