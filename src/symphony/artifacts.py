@@ -36,9 +36,12 @@ import re
 import shutil
 import tempfile
 import threading
+import unicodedata
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from typing import Any
+
 from .logging import get_logger
 
 log = get_logger()
@@ -51,8 +54,27 @@ FILES_DIR = "files"
 # Ticket identifiers as the file tracker mints them (TASK-001, SMA-32…).
 # No leading dot, no path separators — safe as a single path component.
 _SAFE_IDENTIFIER = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
-_UNSAFE_NAME_CHARS = re.compile(r"[^A-Za-z0-9._ -]+")
+# Word characters (Unicode-aware, so `로그인.png` survives), dot, dash, space.
+# Traversal safety comes from the path-part filter in `sanitize_artifact_name`,
+# not from this class — separators are simply not word characters.
+_UNSAFE_NAME_CHARS = re.compile(r"[^\w.\- ]+", re.UNICODE)
 _MAX_NAME_LEN = 120
+
+# Worker-authored manifest text is interpolated into the ticket Markdown,
+# which carries HTML-comment section markers. A title that contained one
+# would split the orchestrator-owned block; newlines would break out of the
+# list and could forge a `## Heading` that stage contracts read as evidence.
+_MANIFEST_TEXT_STRIP = re.compile(r"<!--|-->")
+_WHITESPACE_RUN = re.compile(r"\s+")
+_MAX_MANIFEST_TEXT_LEN = 300
+
+
+def _clean_manifest_text(raw: Any) -> str:
+    """Flatten worker-supplied title/summary to one safe single-line string."""
+    if not isinstance(raw, str):
+        return ""
+    collapsed = _WHITESPACE_RUN.sub(" ", _MANIFEST_TEXT_STRIP.sub("", raw)).strip()
+    return collapsed[:_MAX_MANIFEST_TEXT_LEN]
 
 
 def _utcnow_str(now: datetime | None = None) -> str:
@@ -72,6 +94,9 @@ def sanitize_artifact_name(raw: str) -> str:
     """
     parts = [p for p in Path(raw).parts if p not in ("", ".", "..", "/")]
     flat = "__".join(parts) if parts else ""
+    # NFC so the name written to disk, stored in the index, and asked for over
+    # HTTP compare equal on byte-exact filesystems (macOS hands back NFD).
+    flat = unicodedata.normalize("NFC", flat)
     flat = _UNSAFE_NAME_CHARS.sub("_", flat).strip().lstrip(". -")
     if not flat:
         flat = "artifact"
@@ -144,11 +169,9 @@ def _parse_manifest(magic_dir: Path) -> dict[str, dict[str, str]]:
         file_name = entry.get("file")
         if not isinstance(file_name, str) or not file_name.strip():
             continue
-        title = entry.get("title")
-        summary = entry.get("summary")
         result[file_name.strip()] = {
-            "title": title.strip() if isinstance(title, str) else "",
-            "summary": summary.strip() if isinstance(summary, str) else "",
+            "title": _clean_manifest_text(entry.get("title")),
+            "summary": _clean_manifest_text(entry.get("summary")),
         }
     return result
 

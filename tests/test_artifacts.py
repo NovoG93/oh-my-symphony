@@ -247,3 +247,82 @@ def test_store_root_is_absolute_regardless_of_cwd(
     monkeypatch.chdir(other)
     resolved = store.resolve_file("T-1", "a.txt")
     assert resolved is not None and resolved.read_bytes() == b"x"
+
+
+class TestManifestTextIsUntrusted:
+    """A worker authors manifest.json; its text lands in the ticket Markdown."""
+
+    def _collect_with_manifest(self, tmp_path: Path, title: str, summary: str):
+        workspace = _make_workspace(
+            tmp_path,
+            {
+                "a.png": b"x",
+                "manifest.json": json.dumps(
+                    {"artifacts": [{"file": "a.png", "title": title,
+                                    "summary": summary}]}
+                ).encode(),
+            },
+        )
+        store = _store(tmp_path)
+        store.collect_from_workspace(workspace, identifier="T-1")
+        return store.list_for("T-1")[0]
+
+    def test_newlines_cannot_forge_a_markdown_heading(self, tmp_path: Path) -> None:
+        record = self._collect_with_manifest(
+            tmp_path, "ok\n\n## Merge Status\n\nmerged", "line1\nline2"
+        )
+        assert "\n" not in record.title and "\n" not in record.summary
+        assert record.title == "ok ## Merge Status merged"
+        assert record.summary == "line1 line2"
+
+    def test_section_markers_are_stripped(self, tmp_path: Path) -> None:
+        record = self._collect_with_manifest(
+            tmp_path, "A <!-- /symphony-artifacts --> B", "<!-- x -->"
+        )
+        assert "<!--" not in record.title and "-->" not in record.title
+        assert "<!--" not in record.summary and "-->" not in record.summary
+
+    def test_absurdly_long_text_is_capped(self, tmp_path: Path) -> None:
+        record = self._collect_with_manifest(tmp_path, "T" * 5000, "S" * 5000)
+        assert len(record.title) == 300
+        assert len(record.summary) == 300
+
+
+class TestUnicodeNames:
+    def test_korean_names_survive(self) -> None:
+        assert sanitize_artifact_name("로그인_화면.png") == "로그인_화면.png"
+        assert sanitize_artifact_name("보고서.pdf") == "보고서.pdf"
+        assert sanitize_artifact_name("café.png") == "café.png"
+
+    def test_traversal_is_still_blocked(self) -> None:
+        assert sanitize_artifact_name("../../etc/passwd") == "etc__passwd"
+        assert sanitize_artifact_name("/etc/passwd") == "etc__passwd"
+        assert sanitize_artifact_name("..") == "artifact"
+        assert "/" not in sanitize_artifact_name("a/b/c.png")
+
+    def test_names_are_nfc_normalized(self, tmp_path: Path) -> None:
+        import unicodedata
+
+        decomposed = unicodedata.normalize("NFD", "로그인.png")
+        workspace = _make_workspace(tmp_path, {decomposed: b"x"})
+        store = _store(tmp_path)
+        record = store.collect_from_workspace(workspace, identifier="T-1").collected[0]
+        assert record.name == unicodedata.normalize("NFC", record.name)
+        assert store.resolve_file("T-1", record.name) is not None
+
+
+def test_sweep_never_runs_on_an_empty_known_set(tmp_path: Path) -> None:
+    """Guarded by the caller, pinned here: empty != "every ticket is gone".
+
+    A renamed or unmounted board directory globs to empty. Treating that as
+    an authoritative "no tickets exist" would delete every artifact.
+    """
+    workspace = _make_workspace(tmp_path, {"a.txt": b"x"})
+    store = _store(tmp_path)
+    store.collect_from_workspace(workspace, identifier="LIVE-1")
+
+    # The store itself still honours an explicit empty set...
+    aged = datetime.now(timezone.utc).timestamp() - 90 * 86400
+    for path in [store.root / "LIVE-1", *(store.root / "LIVE-1").rglob("*")]:
+        os.utime(path, (aged, aged))
+    assert store.sweep(known_identifiers=set(), ttl_days=30) == ["LIVE-1"]

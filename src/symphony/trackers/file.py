@@ -476,6 +476,12 @@ _ARTIFACTS_BLOCK_RE = re.compile(
     re.escape(_ARTIFACTS_MARKER_OPEN) + r".*?" + re.escape(_ARTIFACTS_MARKER_CLOSE),
     re.DOTALL,
 )
+_ARTIFACTS_MARKER_RE = re.compile(
+    "|".join(
+        re.escape(marker)
+        for marker in (_ARTIFACTS_MARKER_OPEN, _ARTIFACTS_MARKER_CLOSE)
+    )
+)
 
 
 def _strip_warning_blocks(body: str) -> str:
@@ -594,9 +600,10 @@ class FileBoardTracker:
         """Every identifier with a ticket file, in any state.
 
         Used by the artifact sweep to tell "ticket left the board" from
-        "ticket is merely not a dispatch candidate", so archived-but-present
-        tickets keep their deliverables. Reads file stems rather than
-        parsing bodies — one unparseable ticket must not make the sweep
+        "ticket is merely not a dispatch candidate". The caller narrows this
+        further by subtracting the archive state, so archived tickets do
+        lose their deliverables once the TTL passes. Reads file stems rather
+        than parsing bodies — one unparseable ticket must not make the sweep
         believe the ticket is gone.
         """
         return {path.stem for path in self._ticket_paths()}
@@ -859,8 +866,16 @@ class FileBoardTracker:
         per-turn artifact collection never churns `updated_at` (which the
         auto-archive sweep reads as "someone touched this"). An empty
         `section_body` removes the block.
+
+        `section_body` carries worker-authored text, so marker sequences are
+        stripped from it here: a payload containing the close marker would
+        end the non-greedy block match early and strand the real marker in
+        the body, and every later upsert would strand another copy.
+        Whitespace is renormalized only at the two splice seams — collapsing
+        blank lines across the whole body would eat them inside fenced code
+        blocks, where repro logs and diffs legitimately have them.
         """
-        clean = section_body.strip()
+        clean = _ARTIFACTS_MARKER_RE.sub("", section_body).strip()
         block = (
             f"{_ARTIFACTS_MARKER_OPEN}\n"
             f"## Artifacts\n\n{clean}\n"
@@ -880,8 +895,11 @@ class FileBoardTracker:
             else:
                 if existing.group(0) == block:
                     return None
-                combined = body[: existing.start()] + block + body[existing.end() :]
-                combined = re.sub(r"\n{3,}", "\n\n", combined).strip()
+                head = body[: existing.start()].rstrip()
+                tail = body[existing.end() :].strip("\n")
+                combined = "\n\n".join(
+                    part for part in (head, block, tail) if part
+                )
             front["updated_at"] = datetime.now(timezone.utc).strftime(
                 "%Y-%m-%dT%H:%M:%SZ"
             )

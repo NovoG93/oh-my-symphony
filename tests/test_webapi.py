@@ -2273,3 +2273,25 @@ async def test_artifact_file_rejects_unlisted_and_traversal_names(
     assert escape.status in (400, 404)
     if escape.status == 200:  # pragma: no cover - guard against silent regress
         assert b"classified" not in await escape.read()
+
+
+def test_executable_content_types_are_never_inline() -> None:
+    """Pin the allowlist: these render script on the board's own origin.
+
+    Adding `image/svg+xml` here to "preview diagrams" would flip both the
+    server (Content-Disposition: inline) and the client (top-level
+    same-origin link) in one edit, turning a worker-authored file into
+    stored XSS. Keep this list a constraint, not a comment.
+    """
+    from symphony.webapi import _INLINE_ARTIFACT_TYPES
+
+    for content_type in (
+        "text/html",
+        "image/svg+xml",
+        "application/xhtml+xml",
+        "text/xml",
+        "application/xml",
+        "application/javascript",
+        "text/javascript",
+    ):
+        assert content_type not in _INLINE_ARTIFACT_TYPES

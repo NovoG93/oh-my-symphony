@@ -240,8 +240,11 @@ class _Ctx:
     def artifacts(self) -> ArtifactStore | None:
         """Read-side view of the ticket artifact store, or None when off.
 
-        The web app never writes artifacts — collection is the
-        orchestrator's job — so the size caps are irrelevant here.
+        Collection is the orchestrator's job, so the size caps do not apply
+        here. Not strictly read-only: a corrupt index is rebuilt (and
+        rewritten) on read. That write is `os.replace`, so a reader never
+        sees a torn index even though this instance's lock is not the
+        orchestrator's.
         """
         cfg = self.config()
         if not cfg.artifacts.enabled:
@@ -1377,8 +1380,14 @@ def _register_issue_routes(
         store = ctx.artifacts()
         if store is None:
             return _json_error(404, "artifacts_disabled", "artifacts are disabled")
-        path = await asyncio.to_thread(store.resolve_file, identifier, name)
+        # One index read for both the record and the path: with a corrupt
+        # index each read re-hashes the whole ticket directory.
         record = await asyncio.to_thread(store.record_for, identifier, name)
+        path = (
+            await asyncio.to_thread(store.resolve_file, identifier, name)
+            if record is not None
+            else None
+        )
         if path is None or record is None:
             return _json_error(
                 404, "artifact_not_found", f"unknown artifact {name} on {identifier}"
