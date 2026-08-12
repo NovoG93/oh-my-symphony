@@ -675,6 +675,69 @@ merged
     assert result.passed is True
 
 
+def test_done_contract_requires_artifact_store_when_root_is_passed(
+    tmp_path: Path,
+) -> None:
+    docs_root = tmp_path / "docs"
+    (docs_root / "SMA-1" / "qa").mkdir(parents=True)
+    (docs_root / "SMA-1" / "qa" / "evidence.log").write_text("ok")
+    (docs_root / "SMA-1" / "work").mkdir(parents=True)
+    (docs_root / "SMA-1" / "work" / "feature.md").write_text("ok")
+    store_root = tmp_path / "artifacts"
+
+    body = """
+## As-Is -> To-Be Report
+### As-Is
+- old
+### To-Be
+- new
+
+## Merge Status
+merged
+"""
+
+    empty = evaluate_contract(
+        producing_state="Done",
+        ticket_body=body,
+        identifier="SMA-1",
+        docs_root=docs_root,
+        artifact_store_root=store_root,
+    )
+    assert empty.passed is False
+    assert any("no collected artifacts" in item for item in empty.missing)
+
+    (store_root / "SMA-1" / "files").mkdir(parents=True)
+    (store_root / "SMA-1" / "files" / "shot.png").write_bytes(b"png")
+    populated = evaluate_contract(
+        producing_state="Done",
+        ticket_body=body,
+        identifier="SMA-1",
+        docs_root=docs_root,
+        artifact_store_root=store_root,
+    )
+    assert populated.passed is True
+
+
+def test_done_contract_ignores_artifact_store_when_root_is_omitted(
+    tmp_path: Path,
+) -> None:
+    docs_root = tmp_path / "docs"
+    (docs_root / "SMA-1" / "qa").mkdir(parents=True)
+    (docs_root / "SMA-1" / "qa" / "evidence.log").write_text("ok")
+    (docs_root / "SMA-1" / "work").mkdir(parents=True)
+    (docs_root / "SMA-1" / "work" / "feature.md").write_text("ok")
+
+    result = evaluate_contract(
+        producing_state="Done",
+        ticket_body=(
+            "## As-Is -> To-Be Report\n### As-Is\n- old\n\n## Merge Status\nmerged\n"
+        ),
+        identifier="SMA-1",
+        docs_root=docs_root,
+    )
+    assert result.passed is True
+
+
 def test_done_contract_fails_without_merge_status(tmp_path: Path) -> None:
     docs_root = tmp_path / "docs"
     (docs_root / "SMA-1" / "qa").mkdir(parents=True)

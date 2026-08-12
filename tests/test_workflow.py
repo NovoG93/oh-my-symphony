@@ -1975,3 +1975,53 @@ def test_preview_config_requires_managed_loopback_host(tmp_path):
     )
     with pytest.raises(ConfigValidationError, match=r"include \$\{HOST\}"):
         build_service_config(load_workflow(path))
+
+
+def test_artifacts_config_defaults(tmp_path):
+    cfg = build_service_config(load_workflow(_write(tmp_path, "Body")))
+    assert cfg.artifacts.enabled is True
+    assert cfg.artifacts.dir == ".symphony-artifacts"
+    assert cfg.artifacts.max_file_mb == 25
+    assert cfg.artifacts.max_ticket_mb == 200
+    assert cfg.artifacts.ttl_days == 30
+    assert cfg.artifacts.require_for_done is False
+
+
+def test_artifacts_config_parses_overrides(tmp_path):
+    path = _write(
+        tmp_path,
+        textwrap.dedent(
+            """\
+            ---
+            artifacts:
+              enabled: false
+              dir: deliverables
+              max_file_mb: 5
+              max_ticket_mb: 50
+              ttl_days: 0
+              require_for_done: true
+            ---
+            Body
+            """
+        ),
+    )
+    cfg = build_service_config(load_workflow(path))
+    assert cfg.artifacts.enabled is False
+    assert cfg.artifacts.dir == "deliverables"
+    assert cfg.artifacts.max_file_mb == 5
+    assert cfg.artifacts.max_ticket_mb == 50
+    assert cfg.artifacts.ttl_days == 0
+    assert cfg.artifacts.require_for_done is True
+
+
+@pytest.mark.parametrize("bad_dir", ["../outside", "/tmp/abs", "a/b", "."])
+def test_artifacts_config_rejects_unsafe_dir(tmp_path, bad_dir):
+    path = _write(tmp_path, f"---\nartifacts:\n  dir: {bad_dir}\n---\nBody")
+    with pytest.raises(ConfigValidationError, match="artifacts.dir"):
+        build_service_config(load_workflow(path))
+
+
+def test_artifacts_config_rejects_negative_ttl(tmp_path):
+    path = _write(tmp_path, "---\nartifacts:\n  ttl_days: -1\n---\nBody")
+    with pytest.raises(ConfigValidationError, match="artifacts.ttl_days"):
+        build_service_config(load_workflow(path))
