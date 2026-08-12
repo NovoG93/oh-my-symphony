@@ -586,6 +586,34 @@ symphony board mv TASK-1 Blocked         # forces a state transition
 무엇을 커밋할지, 그리고 `${LLM_WIKI_PATH:-./docs/llm-wiki}/` 예외에 대해서는
 [`docs/PIPELINE.md`](docs/PIPELINE.md#per-ticket-artefact-root)를 참고한다.
 
+### Board deliverables
+
+위의 `docs/` 산출물은 커밋되는 증거다. 리뷰어가 그냥 *열어보기만* 하면 되는
+파일 — 스크린샷, 리포트, PDF — 은 다른 곳에 둔다. 에이전트가 워크스페이스
+루트의 `.symphony-artifacts/`에 저장하면, Symphony가 매 턴이 끝날 때 새 파일을
+호스트의 `.symphony/artifacts/<TICKET-ID>/`로 복사한다. 그러면 웹 보드의 티켓
+서랍에 나타나고(이미지는 인라인 미리보기), 티켓 본문에도 `## Artifacts` 목록이
+생기며, Done에서 워크스페이스가 지워져도 남는다. 이 디렉터리는 Git에서 제외되므로
+산출물이 머지에 섞이지 않는다.
+
+`.symphony-artifacts/manifest.json`은 선택 사항이며 제목을 붙인다:
+
+```json
+{ "artifacts": [{ "file": "login.png", "title": "로그인 화면", "summary": "수정 후" }] }
+```
+
+`WORKFLOW.md`에서 모두 선택 사항인 기본값:
+
+```yaml
+artifacts:
+  enabled: true                 # false면 수집을 완전히 끈다
+  dir: .symphony-artifacts      # 에이전트가 쓰는 워크스페이스 디렉터리
+  max_file_mb: 25
+  max_ticket_mb: 200
+  ttl_days: 30                  # 티켓이 아카이브된 뒤 30일이 지나면 정리, 0이면 끔
+  require_for_done: false       # true면 산출물이 하나도 없을 때 Done을 막는다
+```
+
 ## Custom prompts
 
 `WORKFLOW.md`는 Quickstart에 나온 `prompts.base` + `prompts.stages` 맵으로

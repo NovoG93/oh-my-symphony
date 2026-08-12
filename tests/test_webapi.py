@@ -2180,9 +2180,7 @@ def _seed_artifact(
             "turn": 2,
         }
     )
-    index.write_text(
-        json.dumps({"version": 1, "entries": entries}), encoding="utf-8"
-    )
+    index.write_text(json.dumps({"version": 1, "entries": entries}), encoding="utf-8")
 
 
 async def test_issue_artifacts_lists_collected_files(
