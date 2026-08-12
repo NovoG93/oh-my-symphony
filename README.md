@@ -1076,6 +1076,22 @@ JSON API endpoints:
 | POST   | `/api/v1/{id}/pause` `/resume`    | Hold / release a running worker              |
 | POST   | `/api/v1/issues/{id}/skip-document` | Move idle Document ticket to Human Review (deprecated alias: `/skip-learn`) |
 
+#### Behind a reverse proxy or tunnel
+
+The board trusts loopback. If you front it with cloudflared, ngrok, nginx,
+or any other proxy, the browser arrives under a public name that loopback
+allowlists cannot know, and project creation fails with `forbidden_origin`
+(or `forbidden_host`). Declare the public front door:
+
+```bash
+SYMPHONY_TRUSTED_ORIGINS=https://symphony.example.com symphony ./WORKFLOW.md --port 9999
+```
+
+Comma-separate several entries; a bare hostname matches any scheme and
+port, and `*` trusts every origin. Everything the tunnel exposes is
+reachable by whoever can reach the tunnel, so put authentication (for
+example Cloudflare Access) in front of it.
+
 ### CLI Kanban TUI (primary UI)
 
 ```bash
