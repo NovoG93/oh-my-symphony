@@ -4086,7 +4086,7 @@ class Orchestrator:
         identifier: str,
         workspace_path: Path,
         run_id: str,
-        turn: int,
+        turn: int | None,
     ) -> None:
         """Copy new workspace deliverables into the host-owned store.
 
@@ -4143,7 +4143,10 @@ class Orchestrator:
 
         File-board tickets get a relative link that resolves in any local
         Markdown viewer; remote trackers (Jira, Linear) have no ticket file
-        to be relative to, so they get the file name only.
+        to be relative to, so they get the file name only. Today only the
+        file board implements `upsert_artifacts_section`, so the remote
+        rendering is written but not yet reachable — see
+        `_tracker_call_upsert_artifacts_section`.
         """
         store = self._artifact_store
         if store is None:
@@ -4200,7 +4203,12 @@ class Orchestrator:
         except Exception as exc:
             log.warning("artifact_sweep_fetch_failed", error=str(exc))
             return
-        if known is None:
+        if not known:
+            # None = tracker cannot enumerate; empty = it enumerated nothing.
+            # A board directory that was renamed, unmounted, or lost to an I/O
+            # error also globs to empty, and treating that as "every ticket is
+            # gone" would delete artifacts nobody can regenerate. A genuinely
+            # empty board has no artifacts to sweep either way.
             return
         try:
             await asyncio.to_thread(
@@ -4245,9 +4253,21 @@ class Orchestrator:
         """
         common_dir = git_inspect.git_common_dir(cfg.workflow_path.parent)
         if common_dir is None:
+            # Custom `after_create` hooks may build worktrees in a different
+            # repository (the shipped monorepo template does). Say so: without
+            # the ignore rule `commit_workspace_on_done` stages deliverables
+            # into the feature branch and the Done merge carries them.
+            log.warning(
+                "artifact_dir_git_exclude_skipped",
+                reason="workflow dir is not inside a git repository",
+                workflow_dir=str(cfg.workflow_path.parent),
+            )
             return
         exclude_path = common_dir / "info" / "exclude"
-        pattern = f"{cfg.artifacts.dir}/"
+        # Leading slash anchors to each working tree's root, where the magic
+        # directory actually lives. An unanchored `output/` would match at any
+        # depth and silently untrack an unrelated `web/output/` for good.
+        pattern = f"/{cfg.artifacts.dir}/"
         try:
             existing = (
                 exclude_path.read_text(encoding="utf-8")
@@ -7442,6 +7462,21 @@ class Orchestrator:
                         self._sync_backend_agent_pid(running_issue_id, None)
                 if after_run_pending:
                     await self._workspace_manager.after_run_best_effort(workspace.path)
+                # Salvage deliverables written before an abnormal exit (turn
+                # timeout, TurnFailed, stall eviction). The per-turn call runs
+                # only on the success path, and the workspace is torn down at
+                # Done, so without this the file is gone for good — worst
+                # under `artifacts.require_for_done`, where the deliverable
+                # turn is the long, timeout-prone one. Unshielded and
+                # best-effort, exactly like the `after_run` hook above.
+                entry_for_run = self._running.get(running_issue_id)
+                await self._collect_ticket_artifacts(
+                    cfg,
+                    identifier=issue.identifier,
+                    workspace_path=workspace.path,
+                    run_id=entry_for_run.run_id if entry_for_run else "",
+                    turn=None,  # salvage pass: the turn it came from is unknown
+                )
         except asyncio.CancelledError:
             outcome = "shutdown_interrupted" if self._stopping else "cancelled"
             error = None

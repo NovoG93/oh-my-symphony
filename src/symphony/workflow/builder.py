@@ -671,6 +671,16 @@ def build_service_config(workflow: WorkflowDefinition) -> ServiceConfig:
             "artifacts.dir must be a single relative directory name",
             value=artifacts_dir,
         )
+    # The name is written verbatim into `.git/info/exclude`. Gitignore
+    # metacharacters would change what the line means -- `#drop` is a
+    # comment, `!keep` a negation -- and the rule would silently stop
+    # protecting the branch from collected deliverables.
+    if not re.fullmatch(r"[A-Za-z0-9._-]+", artifacts_dir):
+        raise ConfigValidationError(
+            "artifacts.dir may contain only letters, digits, dot, dash and "
+            "underscore (it is written into .git/info/exclude verbatim)",
+            value=artifacts_dir,
+        )
     artifacts_ttl_raw = artifacts_raw.get("ttl_days")
     if artifacts_ttl_raw is None:
         artifacts_ttl_days = artifacts_defaults.ttl_days

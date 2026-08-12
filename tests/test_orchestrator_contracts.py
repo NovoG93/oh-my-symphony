@@ -815,3 +815,40 @@ def test_board_uses_default_contracts_rejects_deep_and_custom_lanes() -> None:
     )
     assert not board_uses_default_contracts(deep)
     assert not board_uses_default_contracts(("Todo", "In Progress", "Staging"))
+
+
+def test_done_artifact_gate_ignores_temp_files_and_symlinks(tmp_path: Path) -> None:
+    """An interrupted copy or a planted symlink must not satisfy the gate.
+
+    `_copy_into_store` writes `.tmp-artifact-*` then renames; a crash in
+    that window leaves the temp file behind. The gate must agree with what
+    the board's Artifacts list shows, which is the index, not the directory.
+    """
+    docs_root = tmp_path / "docs"
+    (docs_root / "SMA-1" / "qa").mkdir(parents=True)
+    (docs_root / "SMA-1" / "qa" / "evidence.log").write_text("ok")
+    (docs_root / "SMA-1" / "work").mkdir(parents=True)
+    (docs_root / "SMA-1" / "work" / "feature.md").write_text("ok")
+    body = "## As-Is -> To-Be Report\n### As-Is\n- old\n\n## Merge Status\nmerged\n"
+    files = tmp_path / "artifacts" / "SMA-1" / "files"
+    files.mkdir(parents=True)
+
+    def verdict() -> bool:
+        return evaluate_contract(
+            producing_state="Done",
+            ticket_body=body,
+            identifier="SMA-1",
+            docs_root=docs_root,
+            artifact_store_root=tmp_path / "artifacts",
+        ).passed
+
+    (files / ".tmp-artifact-abc123").write_bytes(b"partial")
+    assert verdict() is False, "leftover temp file must not pass the gate"
+
+    outside = tmp_path / "outside.txt"
+    outside.write_text("secret")
+    (files / "planted.txt").symlink_to(outside)
+    assert verdict() is False, "a symlink must not pass the gate"
+
+    (files / "real.png").write_bytes(b"png")
+    assert verdict() is True

@@ -287,7 +287,7 @@ def _evaluate_done_contract(
         # `files/` mirrors ArtifactStore layout; checked directly so the
         # contract stays a pure filesystem predicate like the docs checks.
         store_files = artifact_store_root / identifier / "files"
-        if not _directory_has_files(store_files):
+        if not _has_collected_artifact(store_files):
             missing.append(
                 "no collected artifacts (`artifacts.require_for_done` is "
                 "enabled) — save at least one deliverable file into the "
@@ -322,6 +322,26 @@ def _section_present_nonempty(body: str, heading: str) -> bool:
     next_heading = re.search(r"^##\s+\S", after, re.MULTILINE)
     section_body = after if next_heading is None else after[: next_heading.start()]
     return bool(section_body.strip())
+
+
+def _has_collected_artifact(path: Path) -> bool:
+    """True when the ticket's artifact directory holds a real deliverable.
+
+    Stricter than `_directory_has_files`: an interrupted copy leaves a
+    `.tmp-artifact-*` file behind, and a worker can plant a symlink. Either
+    would satisfy a plain "directory is non-empty" check and pass the Done
+    gate for a ticket whose board Artifacts list renders empty.
+    """
+    if not path.is_dir():
+        return False
+    try:
+        entries = list(path.iterdir())
+    except OSError:
+        return False
+    return any(
+        entry.is_file() and not entry.is_symlink() and not entry.name.startswith(".")
+        for entry in entries
+    )
 
 
 def _directory_has_files(path: Path) -> bool:

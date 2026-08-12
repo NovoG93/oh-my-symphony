@@ -1466,3 +1466,33 @@ def test_list_all_identifiers_includes_every_state(tmp_path):
     _write(board, ".tmp-junk.md", "not a ticket")
 
     assert tracker.list_all_identifiers() == {"A-1", "A-2"}
+
+
+def test_upsert_artifacts_section_preserves_blank_lines_in_code_fences(tmp_path):
+    """The replace path must not collapse blank lines outside its own block.
+
+    Repro logs, diffs and pytest output routinely carry double blank lines.
+    """
+    tracker = _artifact_tracker(tmp_path)
+    fenced = "## Repro log\n\n```text\nstep one\n\n\nstep three\n```"
+    tracker.update_fields("ART-1", description=fenced)
+
+    tracker.upsert_artifacts_section("ART-1", "- first")
+    tracker.upsert_artifacts_section("ART-1", "- first\n- second")
+
+    _, body = parse_ticket_file(tmp_path / "kanban" / "ART-1.md")
+    assert "step one\n\n\nstep three" in body
+
+
+def test_upsert_artifacts_section_strips_markers_from_the_payload(tmp_path):
+    """Worker text carrying the close marker must not split the block."""
+    tracker = _artifact_tracker(tmp_path)
+    evil = "- [A <!-- /symphony-artifacts --> B](<y>)"
+
+    tracker.upsert_artifacts_section("ART-1", evil)
+    tracker.upsert_artifacts_section("ART-1", evil + "\n- [C](<z>)")
+
+    _, body = parse_ticket_file(tmp_path / "kanban" / "ART-1.md")
+    assert body.count("<!-- symphony-artifacts -->") == 1
+    assert body.count("<!-- /symphony-artifacts -->") == 1
+    assert body.count("## Artifacts") == 1

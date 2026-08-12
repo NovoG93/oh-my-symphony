@@ -2025,3 +2025,15 @@ def test_artifacts_config_rejects_negative_ttl(tmp_path):
     path = _write(tmp_path, "---\nartifacts:\n  ttl_days: -1\n---\nBody")
     with pytest.raises(ConfigValidationError, match="artifacts.ttl_days"):
         build_service_config(load_workflow(path))
+
+
+@pytest.mark.parametrize("bad_dir", ["#drop", "!keep", "a*b", "a?b", "a[b]"])
+def test_artifacts_config_rejects_gitignore_metacharacters(tmp_path, bad_dir):
+    """`dir` is written verbatim into .git/info/exclude.
+
+    `#drop` would become a comment and `!keep` a negation, silently
+    disabling the rule that keeps deliverables out of the merge.
+    """
+    path = _write(tmp_path, f'---\nartifacts:\n  dir: "{bad_dir}"\n---\nBody')
+    with pytest.raises(ConfigValidationError, match="artifacts.dir"):
+        build_service_config(load_workflow(path))
