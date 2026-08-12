@@ -16,17 +16,24 @@ from symphony.projects import (
     create_or_adopt_project,
     project_target_expectation,
 )
+from symphony.service import ServiceStatus
 
 
 def git(cwd: Path, *args: str) -> str:
-    result = subprocess.run(["git", "-C", str(cwd), *args], check=True, capture_output=True, text=True)
+    result = subprocess.run(
+        ["git", "-C", str(cwd), *args], check=True, capture_output=True, text=True
+    )
     return result.stdout.strip()
 
 
 def init_repo(path: Path) -> Path:
     path.mkdir()
-    subprocess.run(["git", "init", "-b", "main", str(path)], check=True, capture_output=True)
-    (path / "WORKFLOW.md").write_text("---\ntracker: {kind: file}\n---\n", encoding="utf-8")
+    subprocess.run(
+        ["git", "init", "-b", "main", str(path)], check=True, capture_output=True
+    )
+    (path / "WORKFLOW.md").write_text(
+        "---\ntracker: {kind: file}\n---\n", encoding="utf-8"
+    )
     return path
 
 
@@ -36,7 +43,9 @@ def source_bundle(path: Path) -> Path:
         (path / name).write_text(name + "\n", encoding="utf-8")
     (path / "WORKFLOW.file.example.md").write_text("workflow\n", encoding="utf-8")
     (path / "scripts").mkdir()
-    (path / "scripts/symphony-setup-worktree.sh").write_text("#!/bin/sh\n", encoding="utf-8")
+    (path / "scripts/symphony-setup-worktree.sh").write_text(
+        "#!/bin/sh\n", encoding="utf-8"
+    )
     (path / "docs/symphony-prompts").mkdir(parents=True)
     (path / "docs/symphony-prompts/base.md").write_text("prompt\n", encoding="utf-8")
     (path / "skills/demo").mkdir(parents=True)
@@ -45,7 +54,9 @@ def source_bundle(path: Path) -> Path:
 
 
 def project(repo: Path, *, id: str = "one", port: int = 9999) -> Project:
-    return Project(id, id.title(), str(repo), str(repo / "WORKFLOW.md"), "127.0.0.1", port)
+    return Project(
+        id, id.title(), str(repo), str(repo / "WORKFLOW.md"), "127.0.0.1", port
+    )
 
 
 def create_project_in_process(payload: tuple[str, str, str, str]) -> Project:
@@ -59,7 +70,9 @@ def create_project_in_process(payload: tuple[str, str, str, str]) -> Project:
     )
 
 
-def test_registry_json_v1_uses_environment_override(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_registry_json_v1_uses_environment_override(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     path = tmp_path / "state" / "projects.json"
     monkeypatch.setenv("SYMPHONY_PROJECTS_FILE", str(path))
     repo = init_repo(tmp_path / "repo")
@@ -67,14 +80,92 @@ def test_registry_json_v1_uses_environment_override(tmp_path: Path, monkeypatch:
     registry.add(project(repo))
 
     assert registry.load() == [project(repo)]
-    assert json.loads(path.read_text()) == {"version": 1, "projects": [{
-        "id": "one", "name": "One", "git_repo": str(repo),
-        "workflow": str(repo / "WORKFLOW.md"), "host": "127.0.0.1", "port": 9999,
-    }]}
+    assert json.loads(path.read_text()) == {
+        "version": 1,
+        "projects": [
+            {
+                "id": "one",
+                "name": "One",
+                "git_repo": str(repo),
+                "workflow": str(repo / "WORKFLOW.md"),
+                "host": "127.0.0.1",
+                "port": 9999,
+            }
+        ],
+    }
+
+
+def test_registry_recognizes_exact_workflow_already_serving_registered_port(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from symphony import service
+
+    repo = init_repo(tmp_path / "repo")
+    registry = ProjectRegistry(tmp_path / "projects.json")
+    registry.add(project(repo))
+    monkeypatch.setattr(
+        service,
+        "service_status",
+        lambda *_args, **_kwargs: ServiceStatus(state="stopped", record=None),
+    )
+    probes: list[tuple[str, int, Path]] = []
+
+    def exact_probe(host: str, port: int, workflow: str | Path) -> bool:
+        probes.append((host, port, Path(workflow)))
+        return True
+
+    monkeypatch.setattr(service, "is_symphony_workflow_reachable", exact_probe)
+
+    status = registry.status("one")
+
+    assert status.state == "running"
+    assert status.api_reachable is True
+    assert status.record is None
+    assert probes == [("127.0.0.1", 9999, repo / "WORKFLOW.md")]
+
+
+def test_registry_stopped_status_performs_one_exact_identity_probe(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from symphony import service
+
+    repo = init_repo(tmp_path / "repo")
+    registered = project(repo)
+    registry = ProjectRegistry(tmp_path / "projects.json")
+    registry.add(registered)
+    service.save_record(
+        service.ServiceRecord(
+            workflow_path=Path(registered.workflow).resolve(),
+            workflow_dir=repo.resolve(),
+            host=registered.host,
+            port=registered.port,
+            orchestrator_pid=1234,
+            log_path=repo / "log" / "symphony.log",
+            started_at="2026-05-16T00:00:00Z",
+            orchestrator_command=[],
+        )
+    )
+    monkeypatch.setattr(service, "is_process_running", lambda _pid: False)
+    probes: list[tuple[str, int, Path]] = []
+
+    def exact_probe(host: str, port: int, workflow: str | Path) -> bool:
+        probes.append((host, port, Path(workflow)))
+        return False
+
+    monkeypatch.setattr(service, "is_symphony_workflow_reachable", exact_probe)
+
+    status = registry.status("one")
+
+    assert status.state == "stopped"
+    assert probes == [
+        (registered.host, registered.port, Path(registered.workflow).resolve())
+    ]
 
 
 @pytest.mark.parametrize("collision", ["id", "repo", "port"])
-def test_registry_rejects_duplicate_identity_repo_or_port(tmp_path: Path, collision: str) -> None:
+def test_registry_rejects_duplicate_identity_repo_or_port(
+    tmp_path: Path, collision: str
+) -> None:
     first_repo = init_repo(tmp_path / "one")
     second_repo = init_repo(tmp_path / "two")
     registry = ProjectRegistry(tmp_path / "projects.json")
@@ -118,7 +209,9 @@ def test_create_bootstraps_sibling_repo_and_initial_commit(
     monkeypatch.setenv("SYMPHONY_PROJECTS_FILE", str(registry_path))
     monkeypatch.setattr(project_cli, "source_checkout", lambda: source)
 
-    assert project_cli.main(["create", "Demo App", "--id", "demo", "--port", "10010"]) == 0
+    assert (
+        project_cli.main(["create", "Demo App", "--id", "demo", "--port", "10010"]) == 0
+    )
     target = tmp_path / "demo"
     record = ProjectRegistry().get("demo")
     assert Path(record.git_repo) == target
@@ -141,13 +234,23 @@ def test_lifecycle_commands_delegate_to_service_main(
     monkeypatch.setenv("SYMPHONY_PROJECTS_FILE", str(registry_path))
     ProjectRegistry().add(project(repo, id="app", port=10001))
     calls: list[list[str]] = []
-    monkeypatch.setattr(project_cli.service, "main", lambda argv: calls.append(argv) or 0)
+    monkeypatch.setattr(
+        project_cli.service, "main", lambda argv: calls.append(argv) or 0
+    )
 
     assert project_cli.main(["start", "app", "--replace"]) == 0
     assert project_cli.main(["stop", "app", "--force"]) == 0
     assert project_cli.main(["status", "app"]) == 0
     assert calls == [
-        ["start", str(repo / "WORKFLOW.md"), "--host", "127.0.0.1", "--port", "10001", "--replace"],
+        [
+            "start",
+            str(repo / "WORKFLOW.md"),
+            "--host",
+            "127.0.0.1",
+            "--port",
+            "10001",
+            "--replace",
+        ],
         ["stop", str(repo / "WORKFLOW.md"), "--timeout", "10.0", "--force"],
         ["status", str(repo / "WORKFLOW.md"), "--port", "10001"],
     ]
@@ -162,9 +265,12 @@ def test_create_rejects_absolute_workflow_without_overwriting(
     monkeypatch.setenv("SYMPHONY_PROJECTS_FILE", str(tmp_path / "projects.json"))
     monkeypatch.setattr(project_cli, "source_checkout", lambda: source)
 
-    assert project_cli.main([
-        "create", "Unsafe", "--id", "unsafe", "--workflow", str(sentinel)
-    ]) == 1
+    assert (
+        project_cli.main(
+            ["create", "Unsafe", "--id", "unsafe", "--workflow", str(sentinel)]
+        )
+        == 1
+    )
     assert sentinel.read_text(encoding="utf-8") == "keep me\n"
     assert not (tmp_path / "unsafe").exists()
 
@@ -178,9 +284,12 @@ def test_add_rejects_workflow_from_another_repository(
     monkeypatch.setenv("SYMPHONY_PROJECTS_FILE", str(tmp_path / "projects.json"))
     monkeypatch.setattr(project_cli, "source_checkout", lambda: source)
 
-    assert project_cli.main([
-        "add", str(first), "--id", "first", "--workflow", "../second/WORKFLOW.md"
-    ]) == 1
+    assert (
+        project_cli.main(
+            ["add", str(first), "--id", "first", "--workflow", "../second/WORKFLOW.md"]
+        )
+        == 1
+    )
     assert ProjectRegistry().load() == []
 
 
@@ -200,7 +309,10 @@ def test_adopt_non_git_directory_preserves_contents_and_commits_only_created_fil
 
     assert Path(record.git_repo) == target.resolve()
     assert unrelated.read_text(encoding="utf-8") == "keep me\n"
-    assert "notes.txt" not in git(target, "show", "--format=", "--name-only", "HEAD").splitlines()
+    assert (
+        "notes.txt"
+        not in git(target, "show", "--format=", "--name-only", "HEAD").splitlines()
+    )
     assert git(target, "status", "--porcelain", "--", "notes.txt") == "?? notes.txt"
     assert (target / ".git").is_dir()
 
@@ -288,8 +400,14 @@ def test_adopt_git_repo_never_stages_unrelated_changes_or_overwrites_bundle(
     (target / "tracked.txt").write_text("original\n", encoding="utf-8")
     git(target, "add", "WORKFLOW.md", "tracked.txt")
     git(
-        target, "-c", "user.name=Test", "-c", "user.email=test@example.com",
-        "commit", "-m", "initial",
+        target,
+        "-c",
+        "user.name=Test",
+        "-c",
+        "user.email=test@example.com",
+        "commit",
+        "-m",
+        "initial",
     )
     (target / "tracked.txt").write_text("modified\n", encoding="utf-8")
     (target / "untracked.txt").write_text("untracked\n", encoding="utf-8")
@@ -307,11 +425,15 @@ def test_adopt_git_repo_never_stages_unrelated_changes_or_overwrites_bundle(
     assert "tracked.txt" not in committed
     assert "untracked.txt" not in committed
     assert "tracked.txt" in git(target, "diff", "--name-only").splitlines()
-    assert "tracked.txt" not in git(target, "diff", "--cached", "--name-only").splitlines()
+    assert (
+        "tracked.txt" not in git(target, "diff", "--cached", "--name-only").splitlines()
+    )
     assert "?? untracked.txt" in git(target, "status", "--porcelain")
 
 
-def test_create_or_adopt_is_idempotent_for_registered_repository(tmp_path: Path) -> None:
+def test_create_or_adopt_is_idempotent_for_registered_repository(
+    tmp_path: Path,
+) -> None:
     source = source_bundle(tmp_path / "source")
     target = tmp_path / "target"
     registry = ProjectRegistry(tmp_path / "projects.json")
@@ -319,7 +441,11 @@ def test_create_or_adopt_is_idempotent_for_registered_repository(tmp_path: Path)
         target, source=source, name="First", project_id="first", registry=registry
     )
     second = create_or_adopt_project(
-        target, source=source, name="Ignored", project_id="other", port=10042,
+        target,
+        source=source,
+        name="Ignored",
+        project_id="other",
+        port=10042,
         registry=registry,
     )
 
@@ -327,37 +453,55 @@ def test_create_or_adopt_is_idempotent_for_registered_repository(tmp_path: Path)
     assert registry.list() == [first]
 
 
-def test_conflict_and_workflow_escape_leave_existing_directory_untouched(tmp_path: Path) -> None:
+def test_conflict_and_workflow_escape_leave_existing_directory_untouched(
+    tmp_path: Path,
+) -> None:
     source = source_bundle(tmp_path / "source")
     target = tmp_path / "existing"
     target.mkdir()
     (target / "docs").write_text("not a directory\n", encoding="utf-8")
-    before = {path.relative_to(target): path.read_bytes() for path in target.rglob("*") if path.is_file()}
+    before = {
+        path.relative_to(target): path.read_bytes()
+        for path in target.rglob("*")
+        if path.is_file()
+    }
 
     with pytest.raises(ProjectError, match="requires a directory"):
         create_or_adopt_project(
-            target, source=source, project_id="conflict",
+            target,
+            source=source,
+            project_id="conflict",
             registry=ProjectRegistry(tmp_path / "projects.json"),
         )
     assert target.is_dir()
     assert not (target / ".git").exists()
     assert before == {
-        path.relative_to(target): path.read_bytes() for path in target.rglob("*") if path.is_file()
+        path.relative_to(target): path.read_bytes()
+        for path in target.rglob("*")
+        if path.is_file()
     }
 
     with pytest.raises(ProjectError, match="escapes"):
         create_or_adopt_project(
-            target, source=source, project_id="escape", workflow="../WORKFLOW.md",
+            target,
+            source=source,
+            project_id="escape",
+            workflow="../WORKFLOW.md",
             registry=ProjectRegistry(tmp_path / "other-projects.json"),
         )
     with pytest.raises(ProjectError, match="must be relative"):
         create_or_adopt_project(
-            target, source=source, project_id="absolute", workflow=str(tmp_path / "WORKFLOW.md"),
+            target,
+            source=source,
+            project_id="absolute",
+            workflow=str(tmp_path / "WORKFLOW.md"),
             registry=ProjectRegistry(tmp_path / "other-projects.json"),
         )
 
 
-def test_missing_workflow_gets_project_scoped_workspace_and_contained_board(tmp_path: Path) -> None:
+def test_missing_workflow_gets_project_scoped_workspace_and_contained_board(
+    tmp_path: Path,
+) -> None:
     source = source_bundle(tmp_path / "source")
     (source / "WORKFLOW.file.example.md").write_text(
         "---\ntracker:\n  kind: file\n  board_root: ./kanban\n"
@@ -367,7 +511,10 @@ def test_missing_workflow_gets_project_scoped_workspace_and_contained_board(tmp_
     target = tmp_path / "new-project"
 
     create_or_adopt_project(
-        target, source=source, name="New", project_id="new",
+        target,
+        source=source,
+        name="New",
+        project_id="new",
         registry=ProjectRegistry(tmp_path / "projects.json"),
     )
 
@@ -385,9 +532,13 @@ def test_existing_git_without_workflow_is_bootstrapped_without_replacing_history
     git(target, "add", "product.txt")
     git(
         target,
-        "-c", "user.name=Test",
-        "-c", "user.email=test@example.com",
-        "commit", "-m", "product baseline",
+        "-c",
+        "user.name=Test",
+        "-c",
+        "user.email=test@example.com",
+        "commit",
+        "-m",
+        "product baseline",
     )
     baseline = git(target, "rev-parse", "HEAD")
 
@@ -420,9 +571,13 @@ def test_existing_git_can_adopt_symphony_files_ignored_by_repository(
     git(target, "add", "-f", ".gitignore")
     git(
         target,
-        "-c", "user.name=Test",
-        "-c", "user.email=test@example.com",
-        "commit", "-m", "ignore policy",
+        "-c",
+        "user.name=Test",
+        "-c",
+        "user.email=test@example.com",
+        "commit",
+        "-m",
+        "ignore policy",
     )
 
     project_record = create_or_adopt_project(
@@ -451,7 +606,9 @@ def scoped_source_bundle(path: Path) -> Path:
     return source
 
 
-def test_concurrent_distinct_projects_keep_all_records_and_unique_ports(tmp_path: Path) -> None:
+def test_concurrent_distinct_projects_keep_all_records_and_unique_ports(
+    tmp_path: Path,
+) -> None:
     source = scoped_source_bundle(tmp_path / "source")
     registry_path = tmp_path / "projects.json"
 
@@ -472,11 +629,18 @@ def test_concurrent_distinct_projects_keep_all_records_and_unique_ports(tmp_path
     assert len({item.port for item in stored}) == 6
 
 
-def test_concurrent_processes_serialize_registry_and_port_allocation(tmp_path: Path) -> None:
+def test_concurrent_processes_serialize_registry_and_port_allocation(
+    tmp_path: Path,
+) -> None:
     source = scoped_source_bundle(tmp_path / "source")
     registry_path = tmp_path / "projects.json"
     payloads = [
-        (str(tmp_path / f"process-{index}"), str(source), f"process-{index}", str(registry_path))
+        (
+            str(tmp_path / f"process-{index}"),
+            str(source),
+            f"process-{index}",
+            str(registry_path),
+        )
         for index in range(2)
     ]
 
@@ -509,7 +673,9 @@ def test_concurrent_processes_serialize_registry_and_port_allocation(tmp_path: P
     assert len({item.port for item in stored}) == 2
 
 
-def test_concurrent_same_target_returns_one_record_without_cleanup_race(tmp_path: Path) -> None:
+def test_concurrent_same_target_returns_one_record_without_cleanup_race(
+    tmp_path: Path,
+) -> None:
     source = scoped_source_bundle(tmp_path / "source")
     registry_path = tmp_path / "projects.json"
     target = tmp_path / "shared"
@@ -532,7 +698,9 @@ def test_concurrent_same_target_returns_one_record_without_cleanup_race(tmp_path
     assert git(target, "rev-list", "--count", "HEAD") == "1"
 
 
-def test_env_backed_board_escape_is_rejected(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_env_backed_board_escape_is_rejected(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     source = source_bundle(tmp_path / "source")
     target = init_repo(tmp_path / "target")
     (target / "WORKFLOW.md").write_text(
@@ -567,9 +735,7 @@ def test_duplicate_resolved_workspace_root_is_rejected(tmp_path: Path) -> None:
 
     first = existing_repo("first")
     second = existing_repo("second")
-    create_or_adopt_project(
-        first, source=source, project_id="first", registry=registry
-    )
+    create_or_adopt_project(first, source=source, project_id="first", registry=registry)
     with pytest.raises(ProjectError, match="workspace root already owned"):
         create_or_adopt_project(
             second, source=source, project_id="second", registry=registry

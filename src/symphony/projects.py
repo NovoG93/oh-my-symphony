@@ -125,7 +125,11 @@ class Project:
 
 def projects_file() -> Path:
     override = os.environ.get("SYMPHONY_PROJECTS_FILE")
-    return Path(override).expanduser() if override else Path.home() / ".symphony" / "projects.json"
+    return (
+        Path(override).expanduser()
+        if override
+        else Path.home() / ".symphony" / "projects.json"
+    )
 
 
 def validate_id(project_id: str) -> None:
@@ -192,14 +196,18 @@ class ProjectRegistry:
         except FileNotFoundError:
             return []
         except (OSError, json.JSONDecodeError) as exc:
-            raise ProjectError(f"cannot read project registry {self.path}: {exc}") from exc
+            raise ProjectError(
+                f"cannot read project registry {self.path}: {exc}"
+            ) from exc
         if not isinstance(raw, dict) or raw.get("version") != REGISTRY_VERSION:
             raise ProjectError(
                 f"unsupported project registry format in {self.path}; expected version {REGISTRY_VERSION}"
             )
         values = raw.get("projects")
         if not isinstance(values, list):
-            raise ProjectError(f"invalid project registry {self.path}: projects must be a list")
+            raise ProjectError(
+                f"invalid project registry {self.path}: projects must be a list"
+            )
         projects = [Project.from_json(value) for value in values]
         validate_unique(projects)
         return projects
@@ -214,10 +222,15 @@ class ProjectRegistry:
     def _save_unlocked(self, projects: list[Project]) -> None:
         validate_unique(projects)
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        payload = {"version": REGISTRY_VERSION, "projects": [asdict(p) for p in projects]}
+        payload = {
+            "version": REGISTRY_VERSION,
+            "projects": [asdict(p) for p in projects],
+        }
         tmp = self.path.with_name(f".{self.path.name}.{os.getpid()}.tmp")
         try:
-            tmp.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+            tmp.write_text(
+                json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+            )
             tmp.replace(self.path)
         finally:
             try:
@@ -232,7 +245,9 @@ class ProjectRegistry:
     def get(self, project_id: str) -> Project:
         project = next((item for item in self.load() if item.id == project_id), None)
         if project is None:
-            raise ProjectError(f"unknown project {project_id!r}; run `symphony project list`")
+            raise ProjectError(
+                f"unknown project {project_id!r}; run `symphony project list`"
+            )
         return project
 
     def add(self, project: Project) -> None:
@@ -246,27 +261,56 @@ class ProjectRegistry:
             projects = self._load_unlocked()
             project = next((item for item in projects if item.id == project_id), None)
             if project is None:
-                raise ProjectError(f"unknown project {project_id!r}; run `symphony project list`")
+                raise ProjectError(
+                    f"unknown project {project_id!r}; run `symphony project list`"
+                )
             self._save_unlocked([item for item in projects if item.id != project_id])
             return project
 
     def status(self, project_id: str):
-        """Return managed-service status for hub-compatible registry consumers."""
+        """Return service status, recognizing an exact live workflow without a record."""
         from . import service
 
         project = self.get(project_id)
-        return service.service_status(project.workflow, port=project.port)
+        status = service.service_status(project.workflow, port=project.port)
+        if (
+            status.state == "running"
+            or status.record is not None
+            or not service.is_symphony_workflow_reachable(
+                project.host, project.port, project.workflow
+            )
+        ):
+            return status
+        return service.ServiceStatus(
+            state="running",
+            record=status.record,
+            requested_port=status.requested_port,
+            recorded_port=status.recorded_port,
+            pid_running=status.pid_running,
+            api_reachable=True,
+        )
 
     def start(self, project_id: str) -> int:
         from . import service
 
         project = self.get(project_id)
         result = service.main(
-            ["start", project.workflow, "--host", project.host, "--port", str(project.port)]
+            [
+                "start",
+                project.workflow,
+                "--host",
+                project.host,
+                "--port",
+                str(project.port),
+            ]
         )
         if result != 0:
             return result
-        host = "127.0.0.1" if project.host in {"", "0.0.0.0", "::", "[::]"} else project.host
+        host = (
+            "127.0.0.1"
+            if project.host in {"", "0.0.0.0", "::", "[::]"}
+            else project.host
+        )
         deadline = time.monotonic() + 10.0
         while time.monotonic() < deadline:
             try:
@@ -439,7 +483,9 @@ def _inside(path: Path, directory: Path) -> bool:
 def _workflow_path(repo: Path, value: str) -> Path:
     raw = Path(value).expanduser()
     if raw.is_absolute():
-        raise ProjectError(f"workflow path must be relative to project repository: {value}")
+        raise ProjectError(
+            f"workflow path must be relative to project repository: {value}"
+        )
     workflow = (repo / raw).resolve()
     if not _inside(workflow, repo) or workflow == repo:
         raise ProjectError(f"workflow path escapes project repository: {value}")
@@ -462,7 +508,9 @@ def _validate_source_bundle(source: Path) -> None:
         elif not path.is_dir() or path.is_symlink():
             conflicts.append(f"{source_name} is not a directory")
     if missing:
-        raise ProjectError(f"source checkout is missing bootstrap files: {', '.join(missing)}")
+        raise ProjectError(
+            f"source checkout is missing bootstrap files: {', '.join(missing)}"
+        )
     if conflicts:
         raise ProjectError(f"invalid source bootstrap bundle: {', '.join(conflicts)}")
 
@@ -509,20 +557,26 @@ def _merge_missing_tree(
 ) -> None:
     if destination.exists() or destination.is_symlink():
         if destination.is_symlink() or not destination.is_dir():
-            raise ProjectError(f"project bundle path requires a directory: {destination}")
+            raise ProjectError(
+                f"project bundle path requires a directory: {destination}"
+            )
     else:
         _ensure_directory(destination, created_dirs)
     for child in source.iterdir():
-        if (
-            child.name in {".DS_Store", "__pycache__"}
-            or child.suffix in {".pyc", ".pyo"}
-        ):
+        if child.name in {".DS_Store", "__pycache__"} or child.suffix in {
+            ".pyc",
+            ".pyo",
+        }:
             continue
         target = destination / child.name
         if child.is_dir() and not child.is_symlink():
-            _merge_missing_tree(child, target, created_files, created_dirs, tracked_paths)
+            _merge_missing_tree(
+                child, target, created_files, created_dirs, tracked_paths
+            )
         elif child.is_file():
-            _copy_missing_file(child, target, created_files, created_dirs, tracked_paths)
+            _copy_missing_file(
+                child, target, created_files, created_dirs, tracked_paths
+            )
         else:
             raise ProjectError(f"unsupported source bundle entry: {child}")
 
@@ -540,23 +594,31 @@ def _validate_target_conflicts(repo: Path, workflow_path: Path) -> None:
         while parent != repo:
             if parent.exists() or parent.is_symlink():
                 if parent.is_symlink() or not parent.is_dir():
-                    raise ProjectError(f"project bundle path requires a directory: {parent}")
+                    raise ProjectError(
+                        f"project bundle path requires a directory: {parent}"
+                    )
                 break
             parent = parent.parent
     for target_name in _BUNDLE_DIRS.values():
         target = repo / target_name
         if target.exists() or target.is_symlink():
             if target.is_symlink() or not target.is_dir():
-                raise ProjectError(f"project bundle path requires a directory: {target}")
+                raise ProjectError(
+                    f"project bundle path requires a directory: {target}"
+                )
     # These operator-owned additions have fixed shapes as well.
     for target in (repo / "kanban", repo / ".claude", repo / ".claude/skills"):
         if target.exists() or target.is_symlink():
             if target.is_symlink() or not target.is_dir():
-                raise ProjectError(f"project bundle path requires a directory: {target}")
+                raise ProjectError(
+                    f"project bundle path requires a directory: {target}"
+                )
     skill_link = repo / ".claude/skills/symphony-skill"
     if skill_link.exists() or skill_link.is_symlink():
         if not skill_link.is_symlink() and not skill_link.is_dir():
-            raise ProjectError(f"project bundle path requires a directory: {skill_link}")
+            raise ProjectError(
+                f"project bundle path requires a directory: {skill_link}"
+            )
         # Existing symlinks and real skill directories are never overwritten.
 
 
@@ -574,7 +636,11 @@ def _bootstrap_missing(
     for source_name, target_name in mappings.items():
         destination = repo / target_name
         _copy_missing_file(
-            source / source_name, destination, created_files, created_dirs, tracked_paths
+            source / source_name,
+            destination,
+            created_files,
+            created_dirs,
+            tracked_paths,
         )
         if destination == workflow_path and destination in created_files:
             content = destination.read_text(encoding="utf-8")
@@ -585,10 +651,15 @@ def _bootstrap_missing(
                 count=1,
             )
             destination.write_text(content, encoding="utf-8")
-        if os.name != "nt" and target_name in {
-            "tui-open.sh",
-            "scripts/symphony-setup-worktree.sh",
-        } and destination in created_files:
+        if (
+            os.name != "nt"
+            and target_name
+            in {
+                "tui-open.sh",
+                "scripts/symphony-setup-worktree.sh",
+            }
+            and destination in created_files
+        ):
             destination.chmod(destination.stat().st_mode | 0o111)
     for source_name, target_name in _BUNDLE_DIRS.items():
         _merge_missing_tree(
@@ -629,7 +700,10 @@ def _workflow_resources(
             raise ProjectError(f"cannot resolve workflow resources: {exc}") from exc
         return None, None
     board = config.tracker.board_root if config.tracker.kind == "file" else None
-    return board.resolve() if board is not None else None, config.workspace_root.resolve()
+    return (
+        board.resolve() if board is not None else None,
+        config.workspace_root.resolve(),
+    )
 
 
 def _validate_resource_ownership(
@@ -637,7 +711,9 @@ def _validate_resource_ownership(
 ) -> None:
     board, workspace = _workflow_resources(workflow_path, strict=True)
     if board is not None and not _inside(board, repo):
-        raise ProjectError(f"file tracker board root escapes project repository: {board}")
+        raise ProjectError(
+            f"file tracker board root escapes project repository: {board}"
+        )
     for existing in projects:
         other_board, other_workspace = _workflow_resources(
             Path(existing.workflow), strict=False
@@ -676,7 +752,9 @@ def _cleanup_created(created_files: list[Path], created_dirs: list[Path]) -> Non
 
 def _registered_repo(projects: list[Project], repo: Path) -> Project | None:
     key = _repo_key(str(repo))
-    return next((project for project in projects if _repo_key(project.git_repo) == key), None)
+    return next(
+        (project for project in projects if _repo_key(project.git_repo) == key), None
+    )
 
 
 def _create_or_adopt_project_locked(
@@ -710,8 +788,11 @@ def _create_or_adopt_project_locked(
     candidate_existed = candidate.exists()
     existing_toplevel = _git_toplevel(candidate) if candidate_existed else None
     repo = existing_toplevel or candidate
+
     def target_changed() -> ProjectError:
-        return ProjectError("project target changed; request a new project setup proposal")
+        return ProjectError(
+            "project target changed; request a new project setup proposal"
+        )
 
     if expected_repo is not None:
         # ``expected_repo`` is the already-canonical string shown to the
@@ -771,7 +852,9 @@ def _create_or_adopt_project_locked(
             and _git_common_dir(ancestor_repo) == _git_common_dir(source_repo)
         )
     if protected:
-        raise ProjectError(f"refusing to register protected Symphony source checkout: {source_repo}")
+        raise ProjectError(
+            f"refusing to register protected Symphony source checkout: {source_repo}"
+        )
 
     workflow_path = _workflow_path(repo, workflow)
     projects = registry.load()
@@ -828,16 +911,31 @@ def _create_or_adopt_project_locked(
             # modified files are never included in ``relative_files``.
             _run_git(repo, "add", "-f", "--", *relative_files)
             staged = subprocess.run(
-                ["git", "-C", str(repo), "diff", "--cached", "--quiet", "--", *relative_files],
+                [
+                    "git",
+                    "-C",
+                    str(repo),
+                    "diff",
+                    "--cached",
+                    "--quiet",
+                    "--",
+                    *relative_files,
+                ],
                 check=False,
             )
             if staged.returncode == 1:
                 _run_git(
                     repo,
-                    "-c", "user.name=Symphony",
-                    "-c", "user.email=symphony@local",
-                    "commit", "--only", "-m", "chore: initialize Symphony project",
-                    "--", *relative_files,
+                    "-c",
+                    "user.name=Symphony",
+                    "-c",
+                    "user.email=symphony@local",
+                    "commit",
+                    "--only",
+                    "-m",
+                    "chore: initialize Symphony project",
+                    "--",
+                    *relative_files,
                 )
                 committed = True
             elif staged.returncode != 0:
@@ -858,7 +956,9 @@ def _create_or_adopt_project_locked(
         # A later registry write failure must never erase that durable work.
         if not committed:
             if not created_git and created_files:
-                relative_created = [str(path.relative_to(repo)) for path in created_files]
+                relative_created = [
+                    str(path.relative_to(repo)) for path in created_files
+                ]
                 try:
                     _run_git(repo, "reset", "--", *relative_created)
                 except ProjectError:

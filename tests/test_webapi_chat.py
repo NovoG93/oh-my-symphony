@@ -77,11 +77,19 @@ class _FakeBackend:
         self.gate: asyncio.Event | None = None
         self.other_frames: list[dict[str, Any]] | None = None
         self.terminal_payload: dict[str, Any] | None = None
+        self.next_initialize_entered: asyncio.Event | None = None
+        self.next_initialize_gate: asyncio.Event | None = None
+        self.initialize_entered: asyncio.Event | None = None
+        self.initialize_gate: asyncio.Event | None = None
 
     async def start(self) -> None:
         pass
 
     async def initialize(self) -> dict[str, Any]:
+        if self.initialize_entered is not None:
+            self.initialize_entered.set()
+        if self.initialize_gate is not None:
+            await self.initialize_gate.wait()
         return {}
 
     async def start_session(
@@ -153,6 +161,12 @@ def fake_backends(monkeypatch: pytest.MonkeyPatch) -> list[_FakeBackend]:
 
     def _build(init: BackendInit) -> _FakeBackend:
         backend = _FakeBackend(init)
+        if built:
+            previous = built[-1]
+            backend.initialize_entered = previous.next_initialize_entered
+            backend.initialize_gate = previous.next_initialize_gate
+            previous.next_initialize_entered = None
+            previous.next_initialize_gate = None
         built.append(backend)
         return backend
 
@@ -183,9 +197,7 @@ async def client(
         await cli.close()
 
 
-async def _receive_types_until(
-    ws: Any, terminal: str, limit: int = 20
-) -> list[str]:
+async def _receive_types_until(ws: Any, terminal: str, limit: int = 20) -> list[str]:
     types: list[str] = []
     for _ in range(limit):
         frame = await asyncio.wait_for(ws.receive_json(), timeout=5)
@@ -260,6 +272,32 @@ async def test_chat_message_validation_and_busy(
     assert resp.status == 415
 
 
+async def test_chat_message_without_backend_returns_conflict_without_user_row(
+    client: TestClient,
+) -> None:
+    from symphony import webapi
+
+    created = await client.post("/api/v1/chat/session", json={"mode": "qa"})
+    session_id = (await created.json())["session_id"]
+    manager = client.server.app[webapi.CHAT_MANAGER_KEY]
+    session = manager.session(session_id)
+    assert session is not None
+    assert session.backend is not None
+    await session.backend.stop()
+    session.backend = None
+    before = [row.as_dict() for row in session.transcript]
+
+    response = await client.post(
+        f"/api/v1/chat/sessions/{session_id}/message",
+        json={"text": "preserve this draft"},
+    )
+
+    assert response.status == 409
+    assert (await response.json())["error"]["code"] == "chat_backend_unavailable"
+    assert [row.as_dict() for row in session.transcript] == before
+    assert session.turn_count == 0
+
+
 async def test_chat_numeric_project_choice_uses_server_owned_registration(
     board_dir: Path,
     fake_backends: list[_FakeBackend],
@@ -331,9 +369,7 @@ async def test_chat_numeric_project_choice_uses_server_owned_registration(
         session = manager.session(session_id)
         assert session is not None and session.turn_task is not None
         await session.turn_task
-        snapshot = await (
-            await cli.get(f"/api/v1/chat/sessions/{session_id}")
-        ).json()
+        snapshot = await (await cli.get(f"/api/v1/chat/sessions/{session_id}")).json()
         [action] = snapshot["project_setup_actions"]
         assert action["choice"] == 1
         assert action["operation"] == "create"
@@ -400,7 +436,9 @@ async def test_chat_numeric_project_choice_uses_server_owned_registration(
         assert response.status == 202
         assert session.turn_task is not None
         await session.turn_task
-        actions = (await (await cli.get(f"/api/v1/chat/sessions/{session_id}")).json())["project_setup_actions"]
+        actions = (await (await cli.get(f"/api/v1/chat/sessions/{session_id}")).json())[
+            "project_setup_actions"
+        ]
         broken = next(action for action in actions if action["choice"] == 2)
         failed = await cli.post(
             f"/api/v1/chat/sessions/{session_id}/project-setup/{broken['action_id']}/select",
@@ -500,14 +538,12 @@ async def test_chat_ws_streams_prime_agent_snapshots_and_final_message(
     snapshots = [frame for frame in frames if frame["type"] == "agent_snapshot"]
     assert [frame["text"] for frame in snapshots] == ["Hel", "Hello"]
     assert all(frame["seq"] is None for frame in snapshots)
-    assert [
-        frame["text"] for frame in frames if frame["type"] == "agent_message"
-    ] == ["Hello"]
+    assert [frame["text"] for frame in frames if frame["type"] == "agent_message"] == [
+        "Hello"
+    ]
     assert "private reasoning" not in json.dumps(frames)
 
-    snapshot = await (
-        await client.get(f"/api/v1/chat/sessions/{session_id}")
-    ).json()
+    snapshot = await (await client.get(f"/api/v1/chat/sessions/{session_id}")).json()
     transcript = snapshot["transcript_tail"]
     assert "agent_snapshot" not in [row["type"] for row in transcript]
     assert [row["text"] for row in transcript if row["type"] == "agent_message"] == [
@@ -551,9 +587,7 @@ async def test_chat_sessions_plural_crud_and_singular_alias(
         f"/api/v1/chat/sessions/{first}/message", json={"text": "hello"}
     )
     assert resp.status == 202
-    resp = await client.patch(
-        f"/api/v1/chat/sessions/{first}", json={"mode": "edit"}
-    )
+    resp = await client.patch(f"/api/v1/chat/sessions/{first}", json={"mode": "edit"})
     assert resp.status == 200
     assert (await resp.json())["mode"] == "edit"
 
@@ -567,6 +601,40 @@ async def test_chat_sessions_plural_crud_and_singular_alias(
     assert resp.status == 404
     listing = await (await client.get("/api/v1/chat/sessions")).json()
     assert [e["session_id"] for e in listing["resumable"]] == [first]
+
+
+async def test_chat_stop_waits_for_gated_mode_rebuild(
+    client: TestClient, fake_backends: list[_FakeBackend]
+) -> None:
+    created = await client.post("/api/v1/chat/sessions", json={"mode": "qa"})
+    session_id = (await created.json())["session_id"]
+    entered = asyncio.Event()
+    release = asyncio.Event()
+    fake_backends[0].next_initialize_entered = entered
+    fake_backends[0].next_initialize_gate = release
+
+    changing = asyncio.create_task(
+        client.patch(
+            f"/api/v1/chat/sessions/{session_id}",
+            json={"mode": "edit"},
+        )
+    )
+    await entered.wait()
+    stopping = asyncio.create_task(client.delete(f"/api/v1/chat/sessions/{session_id}"))
+    await asyncio.sleep(0)
+    try:
+        assert stopping.done() is False
+    finally:
+        release.set()
+
+    changed = await changing
+    stopped = await stopping
+    assert changed.status == 200
+    assert stopped.status == 200
+    listing = await (await client.get("/api/v1/chat/sessions")).json()
+    assert listing["sessions"] == []
+    assert [row["session_id"] for row in listing["resumable"]] == [session_id]
+    assert all(backend.stopped for backend in fake_backends)
 
 
 async def test_chat_session_id_is_validated(client: TestClient) -> None:

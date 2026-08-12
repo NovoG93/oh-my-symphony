@@ -165,6 +165,10 @@ class ChatBusyError(SymphonyError):
     code = "chat_busy"
 
 
+class ChatBackendUnavailableError(SymphonyError):
+    code = "chat_backend_unavailable"
+
+
 class ChatSessionExistsError(SymphonyError):
     code = "chat_session_exists"
 

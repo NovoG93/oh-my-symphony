@@ -210,6 +210,7 @@ def test_web_chat_project_setup_action_contract() -> None:
     assert "function scheduleChatProjectSetupExpiry(view, action)" in js
     assert "projectSetupExpiryTimers" in js
     assert "if (chatState.currentId !== sessionId) return" in js
+    assert "if (result.action.status === 'succeeded') await loadProjects();" in js
     assert "'chat.projectSetupSelect': 'Select option {choice}'" in js
     assert "'chat.projectSetupSelect': '선택지 {choice} 선택'" in js
     assert ".chat-project-setup" in css
@@ -250,6 +251,13 @@ def test_web_chat_multi_session_contract() -> None:
     assert "Keep the successfully fetched resumable-session listing visible" in js
     assert "showToast(err.message, 'error')" in js
     assert "async function selectChatSession(view, sessionId)" in js
+    assert "function setChatLifecycleBusy(view, busy)" in js
+    assert "chatState.busy || chatState.lifecycleBusy" in js
+    assert (
+        "err.code === 'chat_backend_unavailable' || err.code === 'chat_no_session'"
+        in js
+    )
+    assert "disabled: chatState.lifecycleBusy" in js
     assert "function renderChatSessionBar(view)" in js
     assert "function buildChatResumeControl(view, resumable, atLimit)" in js
     assert "function openNewChatSessionModal(view)" in js
@@ -310,9 +318,13 @@ def test_web_settings_visual_hierarchy_contract() -> None:
     assert "el('h2', { class: 'settings-section-kicker' }, title)" in js
     assert "function bindBranchPolicyAutosave(select, key)" in js
     assert "else select.value = savedValue" in js
-    settings_render = js[js.index("async function renderSettingsPage"):]
-    assert settings_render.index("settings.workspace") < settings_render.index("settings.workflowSetup")
-    assert settings_render.index("settings.workflowSetup") < settings_render.index("settings.automation")
+    settings_render = js[js.index("async function renderSettingsPage") :]
+    assert settings_render.index("settings.workspace") < settings_render.index(
+        "settings.workflowSetup"
+    )
+    assert settings_render.index("settings.workflowSetup") < settings_render.index(
+        "settings.automation"
+    )
     assert "field(t('common.enabled'), el('span', { class: 'switch' }" in js
     assert ".settings-section-heading" in css
     assert ".settings-card-header" in css
