@@ -88,6 +88,24 @@ def _lines(proc: subprocess.CompletedProcess[str] | None) -> list[str]:
     return [line for line in proc.stdout.splitlines() if line.strip()]
 
 
+def git_common_dir(workflow_dir: Path) -> Path | None:
+    """Absolute path of the repo's shared git dir, or None outside a repo.
+
+    Linked worktrees share this common dir, so an ignore rule written to
+    `<common>/info/exclude` covers the host checkout and every worktree.
+    """
+    proc = _run_git(workflow_dir, "rev-parse", "--git-common-dir")
+    if proc is None or proc.returncode != 0:
+        return None
+    line = proc.stdout.strip()
+    if not line:
+        return None
+    path = Path(line)
+    if not path.is_absolute():
+        path = (workflow_dir / path).resolve()
+    return path
+
+
 def is_git_repo(workflow_dir: Path) -> bool:
     proc = _run_git(workflow_dir, "rev-parse", "--git-dir")
     return proc is not None and proc.returncode == 0

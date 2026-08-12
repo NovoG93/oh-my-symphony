@@ -85,6 +85,19 @@ def sanitize_artifact_name(raw: str) -> str:
     return flat
 
 
+def format_bytes(size: int) -> str:
+    """Short human-readable size for board notes (`12 KB`, `3.4 MB`)."""
+    if size < 1024:
+        return f"{size} B"
+    value = float(size)
+    for unit in ("KB", "MB", "GB"):
+        value /= 1024
+        if value < 1024 or unit == "GB":
+            rendered = f"{value:.1f}".rstrip("0").rstrip(".")
+            return f"{rendered} {unit}"
+    return f"{size} B"
+
+
 def _sha256_file(path: Path) -> str:
     digest = hashlib.sha256()
     with path.open("rb") as handle:
