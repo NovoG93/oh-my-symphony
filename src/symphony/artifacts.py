@@ -328,7 +328,17 @@ class ArtifactStore:
                     turn=turn,
                 )
                 try:
-                    self._copy_into_store(identifier, path, name)
+                    # Re-measure what actually landed: the worker may have
+                    # grown the file between the stat above and the copy,
+                    # which would put both caps and the running total below
+                    # reality. `copied` is the number we record and bill.
+                    byte_size = self._copy_into_store(identifier, path, name)
+                    if byte_size > self._max_file_bytes or (
+                        total_bytes + byte_size > self._max_ticket_bytes
+                    ):
+                        self._discard_from_store(identifier, name)
+                        result.skipped.append((relative, "grew_past_cap"))
+                        continue
                 except OSError as exc:
                     log.warning(
                         "artifact_copy_failed",
@@ -379,7 +389,13 @@ class ArtifactStore:
             except (FileNotFoundError, OSError):
                 return []
             for child in children:
-                if not child.is_dir() or child.name in known_identifiers:
+                # `is_dir()` follows symlinks, so a worker-planted link into
+                # a home directory would look sweepable. `rmtree` refuses a
+                # symlink itself, but relying on that makes the safety
+                # accidental; skip links explicitly instead.
+                if child.is_symlink() or not child.is_dir():
+                    continue
+                if child.name in known_identifiers:
                     continue
                 if not valid_identifier(child.name):
                     continue
@@ -421,20 +437,29 @@ class ArtifactStore:
                 return candidate
         raise OSError(f"could not find a free artifact name for {name!r}")
 
-    def _copy_into_store(self, identifier: str, source: Path, name: str) -> None:
+    def _copy_into_store(self, identifier: str, source: Path, name: str) -> int:
+        """Copy `source` into the ticket store; return the bytes written."""
         files_dir = self._files_dir(identifier)
         files_dir.mkdir(parents=True, exist_ok=True)
         fd, tmp = tempfile.mkstemp(prefix=".tmp-artifact-", dir=files_dir)
         os.close(fd)
         try:
             shutil.copyfile(source, tmp)
+            written = os.stat(tmp).st_size
             os.replace(tmp, files_dir / name)
+            return written
         except Exception:
             try:
                 os.unlink(tmp)
             except OSError:
                 pass
             raise
+
+    def _discard_from_store(self, identifier: str, name: str) -> None:
+        try:
+            (self._files_dir(identifier) / name).unlink()
+        except OSError:
+            pass
 
     def _load_index(self, identifier: str) -> list[ArtifactRecord]:
         index_path = self._index_path(identifier)
