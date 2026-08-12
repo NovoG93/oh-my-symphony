@@ -4068,6 +4068,17 @@ class Orchestrator:
             normal, cfg.agent.scheduling_policy, analysis=analysis
         )
 
+    def _prompt_artifacts_dir(self, cfg: ServiceConfig) -> str:
+        """`artifacts.dir` for templates, or "" when collection is off.
+
+        The empty string is what lets `{% if artifacts_dir %}` drop the
+        instruction entirely — a disabled board must not tell workers to
+        write into a directory nothing will ever read.
+        """
+        if not cfg.artifacts.enabled or self._artifact_store is None:
+            return ""
+        return cfg.artifacts.dir
+
     async def _collect_ticket_artifacts(
         self,
         cfg: ServiceConfig,
@@ -6629,6 +6640,7 @@ class Orchestrator:
                     rewind_scope=None,
                     compact_issue_context=cfg.agent.compact_issue_context,
                     full_ticket_path=self._ticket_prompt_path(cfg, issue),
+                    artifacts_dir=self._prompt_artifacts_dir(cfg),
                     extra_context=skill_context,
                 )
                 resumed_checkpoint = False
@@ -7586,6 +7598,7 @@ class Orchestrator:
                 ),
                 compact_issue_context=cfg.agent.compact_issue_context,
                 full_ticket_path=self._ticket_prompt_path(cfg, issue),
+                artifacts_dir=self._prompt_artifacts_dir(cfg),
                 extra_context=skill_context,
             )
             await new_client.start_session(

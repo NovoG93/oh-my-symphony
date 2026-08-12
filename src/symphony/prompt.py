@@ -444,6 +444,7 @@ def build_prompt_env(
     rewind_scope: list[dict[str, Any]] | None = None,
     compact_issue_context: bool = False,
     full_ticket_path: str | None = None,
+    artifacts_dir: str = "",
 ) -> dict[str, Any]:
     """§12.1 — input variables for prompt rendering.
 
@@ -472,6 +473,10 @@ def build_prompt_env(
     list when no rewind / parsing failed. Available to templates as
     `{{ rewind_scope }}` (typically iterated with `{% for row in
     rewind_scope %}…{% endfor %}`).
+
+    `artifacts_dir` is the workspace directory workers drop board
+    deliverables into (`artifacts.dir`), or "" when artifact collection is
+    disabled — so templates can guard with `{% if artifacts_dir %}`.
     """
     if hasattr(issue_obj, "to_template_dict"):
         issue_dict = issue_obj.to_template_dict()
@@ -501,6 +506,7 @@ def build_prompt_env(
         "token_ema": int(token_ema or 0),
         "token_budget": int(token_budget or 0),
         "rewind_scope": list(rewind_scope) if rewind_scope else [],
+        "artifacts_dir": artifacts_dir or "",
     }
 
 
@@ -520,6 +526,7 @@ def build_first_turn_prompt(
     rewind_scope: list[dict[str, Any]] | None = None,
     compact_issue_context: bool = False,
     full_ticket_path: str | None = None,
+    artifacts_dir: str = "",
     extra_context: str = "",
 ) -> tuple[str, dict[str, Any]]:
     """Construct the first-turn prompt sent to a worker.
@@ -560,6 +567,7 @@ def build_first_turn_prompt(
         rewind_scope=rewind_scope,
         compact_issue_context=compact_issue_context,
         full_ticket_path=full_ticket_path,
+        artifacts_dir=artifacts_dir,
     )
     env["turn_number"] = turn_number
     env["max_turns"] = max_turns
