@@ -44,6 +44,7 @@ from .config import (
     OpenCodeConfig,
     PiConfig,
     PrimeAgentConfig,
+    ArtifactsConfig,
     PreviewConfig,
     ProgressConfig,
     PromptConfig,
@@ -652,6 +653,61 @@ def build_service_config(workflow: WorkflowDefinition) -> ServiceConfig:
         acceptance=tuple(item.strip() for item in acceptance_raw),
     )
 
+    artifacts_raw = cfg.get("artifacts") or {}
+    if not isinstance(artifacts_raw, dict):
+        raise ConfigValidationError("artifacts must be a mapping", value=artifacts_raw)
+    artifacts_defaults = ArtifactsConfig()
+    artifacts_dir = (
+        _as_str(artifacts_raw.get("dir"), artifacts_defaults.dir).strip()
+        or artifacts_defaults.dir
+    )
+    dir_path = Path(artifacts_dir)
+    if (
+        dir_path.is_absolute()
+        or len(dir_path.parts) != 1
+        or artifacts_dir in (".", "..")
+    ):
+        raise ConfigValidationError(
+            "artifacts.dir must be a single relative directory name",
+            value=artifacts_dir,
+        )
+    artifacts_ttl_raw = artifacts_raw.get("ttl_days")
+    if artifacts_ttl_raw is None:
+        artifacts_ttl_days = artifacts_defaults.ttl_days
+    elif (
+        isinstance(artifacts_ttl_raw, bool)
+        or not isinstance(artifacts_ttl_raw, int)
+        or artifacts_ttl_raw < 0
+    ):
+        raise ConfigValidationError(
+            "artifacts.ttl_days must be an integer >= 0 (0 disables the sweep)",
+            value=artifacts_ttl_raw,
+        )
+    else:
+        artifacts_ttl_days = artifacts_ttl_raw
+    artifacts = ArtifactsConfig(
+        enabled=_validated_bool(
+            artifacts_raw.get("enabled"), True, name="artifacts.enabled"
+        ),
+        dir=artifacts_dir,
+        max_file_mb=_validated_positive_or_default(
+            artifacts_raw.get("max_file_mb"),
+            artifacts_defaults.max_file_mb,
+            name="artifacts.max_file_mb",
+        ),
+        max_ticket_mb=_validated_positive_or_default(
+            artifacts_raw.get("max_ticket_mb"),
+            artifacts_defaults.max_ticket_mb,
+            name="artifacts.max_ticket_mb",
+        ),
+        ttl_days=artifacts_ttl_days,
+        require_for_done=_validated_bool(
+            artifacts_raw.get("require_for_done"),
+            False,
+            name="artifacts.require_for_done",
+        ),
+    )
+
     tui_raw = cfg.get("tui") or {}
     if not isinstance(tui_raw, dict):
         tui_raw = {}
@@ -793,6 +849,7 @@ def build_service_config(workflow: WorkflowDefinition) -> ServiceConfig:
         prompt_template=prompt_template,
         workspace_reuse_policy=workspace_reuse_policy,
         preview=preview,
+        artifacts=artifacts,
     )
 
 

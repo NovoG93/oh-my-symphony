@@ -175,12 +175,17 @@ def evaluate_contract(
     identifier: str,
     *,
     docs_root: Path | None = None,
+    artifact_store_root: Path | None = None,
 ) -> ContractResult:
     """Evaluate the producing stage's contract against the ticket body.
 
     Stages outside the 4-stage enforcement set pass through. The
     orchestrator wires a failing result into a rewind by appending
     `result.note` and moving state back to the producing stage.
+
+    `artifact_store_root` is passed only when `artifacts.require_for_done`
+    is enabled; the Done contract then also requires at least one collected
+    file in the ticket's host-owned artifact store.
     """
     state = (producing_state or "").strip().lower()
     body = ticket_body or ""
@@ -199,7 +204,13 @@ def evaluate_contract(
         return _evaluate_document_contract(producing_state, body)
 
     if state == "done":
-        return _evaluate_done_contract(producing_state, body, identifier, docs_root)
+        return _evaluate_done_contract(
+            producing_state,
+            body,
+            identifier,
+            docs_root,
+            artifact_store_root=artifact_store_root,
+        )
 
     return ContractResult(passed=True)
 
@@ -263,6 +274,8 @@ def _evaluate_done_contract(
     body: str,
     identifier: str,
     docs_root: Path | None,
+    *,
+    artifact_store_root: Path | None = None,
 ) -> ContractResult:
     missing = _missing_sections(body, _DONE_REQUIRED)
     if docs_root is not None and identifier:
@@ -270,6 +283,16 @@ def _evaluate_done_contract(
             target = docs_root / identifier / required_dir
             if not _directory_has_files(target):
                 missing.append(f"artefact directory `{target}` missing or empty")
+    if artifact_store_root is not None and identifier:
+        # `files/` mirrors ArtifactStore layout; checked directly so the
+        # contract stays a pure filesystem predicate like the docs checks.
+        store_files = artifact_store_root / identifier / "files"
+        if not _directory_has_files(store_files):
+            missing.append(
+                "no collected artifacts (`artifacts.require_for_done` is "
+                "enabled) — save at least one deliverable file into the "
+                "workspace `.symphony-artifacts/` directory"
+            )
     return _build_result(producing_state, missing)
 
 

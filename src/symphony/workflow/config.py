@@ -442,6 +442,27 @@ class PreviewConfig:
 
 
 @dataclass(frozen=True)
+class ArtifactsConfig:
+    """Ticket artifact collection configured in WORKFLOW.md.
+
+    Workers drop deliverable files into `dir` inside their workspace; the
+    orchestrator copies new files into the host-owned store under
+    `.symphony/artifacts/<TICKET-ID>/` after each completed turn. On by
+    default because collection is a no-op until a worker creates the
+    directory. `ttl_days: 0` disables the off-board sweep entirely.
+    `require_for_done` extends the Done stage contract: tickets cannot land
+    in Done without at least one collected artifact.
+    """
+
+    enabled: bool = True
+    dir: str = ".symphony-artifacts"  # keep in sync with artifacts.DEFAULT_MAGIC_DIR
+    max_file_mb: int = 25
+    max_ticket_mb: int = 200
+    ttl_days: int = 30
+    require_for_done: bool = False
+
+
+@dataclass(frozen=True)
 class TuiConfig:
     """Display-time TUI tweaks. Affects rendering only; orchestrator ignores."""
 
@@ -611,6 +632,9 @@ class ServiceConfig:
     # §13.8 Product Preview — off by default, keyword-only so existing
     # positional ServiceConfig callers are unaffected.
     preview: PreviewConfig = field(default_factory=PreviewConfig)
+    # Ticket artifact collection — appended after the original fields so
+    # positional ServiceConfig callers keep receiving the same values.
+    artifacts: ArtifactsConfig = field(default_factory=ArtifactsConfig)
 
     def prompt_template_for_state(self, state: str) -> str:
         """Return the runtime prompt template for one tracker state."""
