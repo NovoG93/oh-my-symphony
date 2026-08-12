@@ -1359,3 +1359,110 @@ def test_stage_routed_board_records_the_audit_stamp_not_the_pin(tmp_path):
     from symphony.orchestrator.helpers import _requested_agent_kind
 
     assert _requested_agent_kind(issue) is None
+
+
+def _artifact_tracker(tmp_path: Path) -> FileBoardTracker:
+    board = tmp_path / "kanban"
+    board.mkdir()
+    tracker = FileBoardTracker(_tracker(board))
+    tracker.create(identifier="ART-1", title="Ticket")
+    return tracker
+
+
+def test_upsert_artifacts_section_appends_marked_block(tmp_path):
+    tracker = _artifact_tracker(tmp_path)
+
+    tracker.upsert_artifacts_section("ART-1", "- [Shot](<a.png>)")
+
+    _, body = parse_ticket_file(tmp_path / "kanban" / "ART-1.md")
+    assert "<!-- symphony-artifacts -->" in body
+    assert "## Artifacts" in body
+    assert "- [Shot](<a.png>)" in body
+    assert "<!-- /symphony-artifacts -->" in body
+
+
+def test_upsert_artifacts_section_replaces_instead_of_appending(tmp_path):
+    tracker = _artifact_tracker(tmp_path)
+
+    tracker.upsert_artifacts_section("ART-1", "- first")
+    tracker.upsert_artifacts_section("ART-1", "- first\n- second")
+
+    _, body = parse_ticket_file(tmp_path / "kanban" / "ART-1.md")
+    assert body.count("## Artifacts") == 1
+    assert body.count("<!-- symphony-artifacts -->") == 1
+    assert "- second" in body
+
+
+def test_upsert_artifacts_section_is_a_noop_when_unchanged(tmp_path):
+    tracker = _artifact_tracker(tmp_path)
+    tracker.upsert_artifacts_section("ART-1", "- first")
+    front_before, _ = parse_ticket_file(tmp_path / "kanban" / "ART-1.md")
+
+    time.sleep(0.01)
+    tracker.upsert_artifacts_section("ART-1", "- first")
+
+    front_after, _ = parse_ticket_file(tmp_path / "kanban" / "ART-1.md")
+    assert front_after["updated_at"] == front_before["updated_at"]
+
+
+def test_upsert_artifacts_section_empty_body_removes_block(tmp_path):
+    tracker = _artifact_tracker(tmp_path)
+    tracker.upsert_artifacts_section("ART-1", "- first")
+
+    tracker.upsert_artifacts_section("ART-1", "")
+
+    _, body = parse_ticket_file(tmp_path / "kanban" / "ART-1.md")
+    assert "symphony-artifacts" not in body
+    assert "## Artifacts" not in body
+
+
+def test_upsert_artifacts_section_preserves_operator_body(tmp_path):
+    tracker = _artifact_tracker(tmp_path)
+    tracker.update_fields("ART-1", description="## Notes\n\noperator text")
+
+    tracker.upsert_artifacts_section("ART-1", "- first")
+
+    _, body = parse_ticket_file(tmp_path / "kanban" / "ART-1.md")
+    assert "## Notes" in body
+    assert "operator text" in body
+    assert "## Artifacts" in body
+
+
+def test_warning_strip_does_not_orphan_the_artifacts_block(tmp_path):
+    """G5 strip must stop at the artifacts marker, not swallow it."""
+    tracker = _artifact_tracker(tmp_path)
+    tracker.upsert_artifacts_section("ART-1", "- first")
+    # Put the warning directly above the artifacts block — the position
+    # where a naive strip would run past the marker into `## Artifacts`.
+    path = tmp_path / "kanban" / "ART-1.md"
+    front, body = parse_ticket_file(path)
+    artifacts_start = body.index("<!-- symphony-artifacts -->")
+    reordered = (
+        f"{body[:artifacts_start]}## Conflict\n\nmerge conflict\n\n"
+        f"{body[artifacts_start:]}"
+    )
+    write_ticket_atomic(path, front, reordered)
+
+    issue = tracker.fetch_issue_full_by_id("ART-1")
+    tracker.update_state(issue, "Todo")  # active state -> strips warnings
+
+    _, after = parse_ticket_file(path)
+    assert "## Conflict" not in after
+    assert after.count("<!-- symphony-artifacts -->") == 1
+    assert after.count("<!-- /symphony-artifacts -->") == 1
+
+    tracker.upsert_artifacts_section("ART-1", "- second")
+    _, final = parse_ticket_file(path)
+    assert final.count("## Artifacts") == 1
+
+
+def test_list_all_identifiers_includes_every_state(tmp_path):
+    board = tmp_path / "kanban"
+    board.mkdir()
+    tracker = FileBoardTracker(_tracker(board))
+    tracker.create(identifier="A-1", title="todo")
+    tracker.create(identifier="A-2", title="done")
+    tracker.transition("A-2", "Done")
+    _write(board, ".tmp-junk.md", "not a ticket")
+
+    assert tracker.list_all_identifiers() == {"A-1", "A-2"}

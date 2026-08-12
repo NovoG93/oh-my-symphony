@@ -463,7 +463,18 @@ _WARNING_HEADING_RE = re.compile(
 # above a run summary would swallow the summary's opening marker and orphan
 # the section, which would make the next upsert append a duplicate.
 _WARNING_SECTION_END_RE = re.compile(
-    r"^(?:##\s+\S|<!--\s*symphony-run:)", re.MULTILINE
+    r"^(?:##\s+\S|<!--\s*symphony-run:|<!--\s*symphony-artifacts\s*-->)",
+    re.MULTILINE,
+)
+
+# Orchestrator-owned `## Artifacts` block. Marker-delimited so an upsert
+# replaces its own previous block instead of appending a duplicate, and so
+# an operator-authored `## Artifacts` heading elsewhere is never touched.
+_ARTIFACTS_MARKER_OPEN = "<!-- symphony-artifacts -->"
+_ARTIFACTS_MARKER_CLOSE = "<!-- /symphony-artifacts -->"
+_ARTIFACTS_BLOCK_RE = re.compile(
+    re.escape(_ARTIFACTS_MARKER_OPEN) + r".*?" + re.escape(_ARTIFACTS_MARKER_CLOSE),
+    re.DOTALL,
 )
 
 
@@ -578,6 +589,17 @@ class FileBoardTracker:
             for path in self._root.glob("*.md")
             if not path.name.startswith(".tmp-")
         )
+
+    def list_all_identifiers(self) -> set[str]:
+        """Every identifier with a ticket file, in any state.
+
+        Used by the artifact sweep to tell "ticket left the board" from
+        "ticket is merely not a dispatch candidate", so archived-but-present
+        tickets keep their deliverables. Reads file stems rather than
+        parsing bodies — one unparseable ticket must not make the sweep
+        believe the ticket is gone.
+        """
+        return {path.stem for path in self._ticket_paths()}
 
     def close(self) -> None:
         return None
@@ -827,6 +849,45 @@ class FileBoardTracker:
             return front, combined
 
         self._mutate_ticket(issue.identifier, mutate)
+
+    def upsert_artifacts_section(
+        self, identifier: str, section_body: str
+    ) -> Path | None:
+        """Replace the orchestrator-owned `## Artifacts` block in a ticket.
+
+        Idempotent: an unchanged block returns without a write, so the
+        per-turn artifact collection never churns `updated_at` (which the
+        auto-archive sweep reads as "someone touched this"). An empty
+        `section_body` removes the block.
+        """
+        clean = section_body.strip()
+        block = (
+            f"{_ARTIFACTS_MARKER_OPEN}\n"
+            f"## Artifacts\n\n{clean}\n"
+            f"{_ARTIFACTS_MARKER_CLOSE}"
+            if clean
+            else ""
+        )
+
+        def mutate(
+            front: dict[str, Any], body: str
+        ) -> tuple[dict[str, Any], str] | None:
+            existing = _ARTIFACTS_BLOCK_RE.search(body)
+            if existing is None:
+                if not block:
+                    return None
+                combined = "\n\n".join(part for part in (body.strip(), block) if part)
+            else:
+                if existing.group(0) == block:
+                    return None
+                combined = body[: existing.start()] + block + body[existing.end() :]
+                combined = re.sub(r"\n{3,}", "\n\n", combined).strip()
+            front["updated_at"] = datetime.now(timezone.utc).strftime(
+                "%Y-%m-%dT%H:%M:%SZ"
+            )
+            return front, combined
+
+        return self._mutate_ticket(identifier, mutate, missing_ok=True)
 
     def record_agent_kind(self, identifier: str, agent_kind: str) -> Path | None:
         """Write ``agent_kind`` to ticket frontmatter when missing.

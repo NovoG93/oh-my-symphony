@@ -35,6 +35,7 @@ from typing import Any, Awaitable, Callable, Coroutine, cast
 
 from .. import __version__
 from .._shell import kill_process_group, process_group_exists, process_identity
+from ..artifacts import ArtifactRecord, ArtifactStore, format_bytes
 from ..backends import (
     EVENT_AGENT_RETRY,
     EVENT_APPROVAL_DENIED,
@@ -830,6 +831,10 @@ class Orchestrator:
         # once the workflow dir is known; every record call is failure-
         # tolerant inside StatsStore, so hooks never guard beyond None.
         self._stats: StatsStore | None = None
+        # Ticket artifact store (`.symphony/artifacts/`). Bound in start()
+        # alongside `self._stats`; stays None when `artifacts.enabled: false`.
+        self._artifact_store: ArtifactStore | None = None
+        self._last_artifact_sweep_monotonic: float | None = None
         self._run_registry: RunRegistry | None = None
         self._run_registry_initialized = False
         # R1/A1 — supervision + health counters. One bad tick must degrade
@@ -2688,6 +2693,13 @@ class Orchestrator:
         self._stats = stats_store_for(
             cfg.workflow_path.parent / ".symphony" / "stats.jsonl"
         )
+        if cfg.artifacts.enabled:
+            self._artifact_store = ArtifactStore(
+                cfg.workflow_path.parent / ".symphony" / "artifacts",
+                max_file_bytes=cfg.artifacts.max_file_mb * 1024 * 1024,
+                max_ticket_bytes=cfg.artifacts.max_ticket_mb * 1024 * 1024,
+            )
+            self._ensure_artifact_dir_git_excluded(cfg)
         self._ensure_run_registry(cfg)
         await self._startup_terminal_cleanup(cfg)
         self._spawn_tick_loop()
@@ -3755,6 +3767,13 @@ class Orchestrator:
             ):
                 self._last_archive_sweep_monotonic = now_monotonic
                 await self._archive_sweep(cfg)
+            if (
+                self._last_artifact_sweep_monotonic is None
+                or now_monotonic - self._last_artifact_sweep_monotonic
+                >= ARCHIVE_SWEEP_INTERVAL_SEC
+            ):
+                self._last_artifact_sweep_monotonic = now_monotonic
+                await self._artifact_sweep(cfg)
             self._maybe_schedule_continuous_improvement(cfg)
             await self._notify_observers()
             return
@@ -4048,6 +4067,196 @@ class Orchestrator:
         return bumped + sort_candidates(
             normal, cfg.agent.scheduling_policy, analysis=analysis
         )
+
+    async def _collect_ticket_artifacts(
+        self,
+        cfg: ServiceConfig,
+        *,
+        identifier: str,
+        workspace_path: Path,
+        run_id: str,
+        turn: int,
+    ) -> None:
+        """Copy new workspace deliverables into the host-owned store.
+
+        Runs after every completed turn so a deliverable outlives the
+        workspace (removed at Done) and is visible on the board while the
+        run is still going. Idempotent by content hash, so re-scanning an
+        unchanged directory writes nothing. Best-effort throughout: a
+        failed collection must never fail the turn.
+        """
+        store = self._artifact_store
+        if store is None:
+            return
+        try:
+            result = await asyncio.to_thread(
+                store.collect_from_workspace,
+                workspace_path,
+                identifier=identifier,
+                magic_dir_name=cfg.artifacts.dir,
+                run_id=run_id or None,
+                turn=turn,
+            )
+        except Exception as exc:
+            log.warning(
+                "artifact_collect_failed", identifier=identifier, error=str(exc)
+            )
+            return
+        for name, reason in result.skipped:
+            if reason in ("duplicate", "hidden"):
+                continue
+            log.warning(
+                "artifact_skipped", identifier=identifier, name=name, reason=reason
+            )
+        if not result.collected:
+            return
+        try:
+            records = await asyncio.to_thread(store.list_for, identifier)
+            await asyncio.to_thread(
+                self._tracker_call_upsert_artifacts_section,
+                cfg,
+                identifier,
+                self._artifact_section_body(cfg, identifier, records),
+            )
+        except Exception as exc:
+            log.warning(
+                "artifact_section_write_failed",
+                identifier=identifier,
+                error=str(exc),
+            )
+
+    def _artifact_section_body(
+        self, cfg: ServiceConfig, identifier: str, records: list[ArtifactRecord]
+    ) -> str:
+        """Render the ticket's `## Artifacts` list.
+
+        File-board tickets get a relative link that resolves in any local
+        Markdown viewer; remote trackers (Jira, Linear) have no ticket file
+        to be relative to, so they get the file name only.
+        """
+        store = self._artifact_store
+        if store is None:
+            return ""
+        is_file_board = (cfg.tracker.kind or "").strip().lower() == "file"
+        board_root = cfg.tracker.board_root if is_file_board else None
+        lines: list[str] = []
+        for record in records:
+            title = record.title or record.name
+            size = format_bytes(record.byte_size)
+            link: str | None = None
+            if board_root is not None:
+                try:
+                    link = os.path.relpath(
+                        store.root / identifier / "files" / record.name, board_root
+                    )
+                except (OSError, ValueError):
+                    link = None
+            # Angle brackets keep names with spaces a valid CommonMark link.
+            head = (
+                f"- [{title}](<{link}>) — `{record.name}` ({size})"
+                if link
+                else f"- {title} — `{record.name}` ({size})"
+            )
+            lines.append(head)
+            if record.summary:
+                lines.append(f"  - {record.summary}")
+        return "\n".join(lines)
+
+    @staticmethod
+    def _tracker_call_upsert_artifacts_section(
+        cfg: ServiceConfig, identifier: str, section_body: str
+    ) -> None:
+        client = build_tracker_client(cfg)
+        try:
+            upsert = getattr(client, "upsert_artifacts_section", None)
+            if upsert is not None:
+                upsert(identifier, section_body)
+        finally:
+            client.close()
+
+    async def _artifact_sweep(self, cfg: ServiceConfig) -> None:
+        """Drop artifact directories for tickets that left the board.
+
+        Disabled when `artifacts.ttl_days <= 0`. Only directories whose
+        ticket is no longer visible to the tracker AND untouched for the
+        TTL are removed, so a live ticket never loses its deliverables.
+        """
+        store = self._artifact_store
+        if store is None or cfg.artifacts.ttl_days <= 0:
+            return
+        try:
+            known = await asyncio.to_thread(self._tracker_call_retained_identifiers, cfg)
+        except Exception as exc:
+            log.warning("artifact_sweep_fetch_failed", error=str(exc))
+            return
+        if known is None:
+            return
+        try:
+            await asyncio.to_thread(
+                store.sweep,
+                known_identifiers=known,
+                ttl_days=cfg.artifacts.ttl_days,
+            )
+        except Exception as exc:
+            log.warning("artifact_sweep_failed", error=str(exc))
+
+    @staticmethod
+    def _tracker_call_retained_identifiers(cfg: ServiceConfig) -> set[str] | None:
+        """Tickets whose artifacts the sweep must keep: present, not archived.
+
+        Returns None when the tracker cannot enumerate the whole board —
+        the sweep then does nothing rather than risk deleting artifacts for
+        tickets it simply could not see.
+        """
+        client = build_tracker_client(cfg)
+        try:
+            list_all = getattr(client, "list_all_identifiers", None)
+            if list_all is None:
+                return None
+            known = {str(item) for item in list_all()}
+            archive_state = (cfg.tracker.archive_state or "").strip()
+            if archive_state:
+                archived = client.fetch_issues_by_states([archive_state])
+                known -= {issue.identifier for issue in archived}
+            return known
+        finally:
+            client.close()
+
+    def _ensure_artifact_dir_git_excluded(self, cfg: ServiceConfig) -> None:
+        """Best-effort: keep the workspace artifact magic dir out of git.
+
+        `commit_workspace_on_done` stages the whole worktree, so without an
+        ignore rule every collected deliverable would land in the feature
+        branch and merge into the target branch. `.git/info/exclude` lives
+        in the shared common dir — one line covers the host checkout and
+        every linked worktree — and stays local, unlike editing the user's
+        checked-in .gitignore.
+        """
+        common_dir = git_inspect.git_common_dir(cfg.workflow_path.parent)
+        if common_dir is None:
+            return
+        exclude_path = common_dir / "info" / "exclude"
+        pattern = f"{cfg.artifacts.dir}/"
+        try:
+            existing = (
+                exclude_path.read_text(encoding="utf-8")
+                if exclude_path.exists()
+                else ""
+            )
+            if pattern in existing.splitlines():
+                return
+            exclude_path.parent.mkdir(parents=True, exist_ok=True)
+            with exclude_path.open("a", encoding="utf-8") as handle:
+                if existing and not existing.endswith("\n"):
+                    handle.write("\n")
+                handle.write(f"{pattern}\n")
+            log.info(
+                "artifact_dir_git_excluded",
+                exclude=str(exclude_path),
+                pattern=pattern,
+            )
+        except OSError as exc:
+            log.warning("artifact_dir_git_exclude_failed", error=str(exc))
 
     async def _archive_sweep(self, cfg: ServiceConfig) -> None:
         """Auto-archive terminal-state issues older than `archive_after_days`.
@@ -6597,6 +6806,14 @@ class Orchestrator:
                                     ticket_body=issue.description or "",
                                     identifier=issue.identifier,
                                     docs_root=workspace.path / "docs",
+                                    artifact_store_root=(
+                                        self._artifact_store.root
+                                        if (
+                                            cfg.artifacts.require_for_done
+                                            and self._artifact_store is not None
+                                        )
+                                        else None
+                                    ),
                                 )
                                 if not contract.passed:
                                     log.warning(
@@ -6942,6 +7159,19 @@ class Orchestrator:
 
                     await self._workspace_manager.after_run_best_effort(workspace.path)
                     after_run_pending = False
+                    # Collect before the next loop iteration evaluates the
+                    # stage contract, so `artifacts.require_for_done` sees
+                    # this turn's deliverables, and before Done removes the
+                    # workspace they live in.
+                    await self._collect_ticket_artifacts(
+                        cfg,
+                        identifier=issue.identifier,
+                        workspace_path=workspace.path,
+                        run_id=(
+                            running_entry.run_id if running_entry is not None else ""
+                        ),
+                        turn=turn_number,
+                    )
                     # The hook may commit or amend the turn's changes. Resolve
                     # HEAD only after it finishes so the explorer never reports
                     # the base/prior-turn commit as this turn's result.
