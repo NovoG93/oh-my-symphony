@@ -527,3 +527,29 @@ Symphony rewound the ticket so the producing stage can complete the contract.
     assert "old vague failure" not in compact_description
     assert "stale historical log" not in compact_description
     assert "large implementation history" not in compact_description
+
+
+@pytest.mark.parametrize("workflow", WORKFLOW_FILES)
+def test_base_prompt_directs_deliverables_to_the_artifacts_dir(workflow: str) -> None:
+    cfg = _load(workflow)
+    rendered = render(
+        cfg.prompt_template_for_state("Verify"),
+        build_prompt_env(
+            _issue("Verify"), attempt=None, artifacts_dir=".symphony-artifacts"
+        ),
+    )
+    assert "`.symphony-artifacts/` at the workspace root" in rendered
+    assert "manifest.json" in rendered
+    # The docs/ evidence root stays authoritative for proof.
+    assert "Every ticket artefact lives under `docs/DEMO-1/`." in rendered
+
+
+@pytest.mark.parametrize("workflow", WORKFLOW_FILES)
+def test_base_prompt_omits_artifacts_directive_when_disabled(workflow: str) -> None:
+    cfg = _load(workflow)
+    rendered = render(
+        cfg.prompt_template_for_state("Verify"),
+        build_prompt_env(_issue("Verify"), attempt=None),
+    )
+    assert "Board deliverables" not in rendered
+    assert "manifest.json" not in rendered
