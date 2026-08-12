@@ -2143,3 +2143,135 @@ def test_schedule_reason_taxonomy_covers_every_authoritative_code() -> None:
     app = Path("src/symphony/web/static/app.js").read_text(encoding="utf-8")
     for code in required:
         assert f"      {code}: t('schedule." in app
+
+
+# ---------------------------------------------------------------------------
+# ticket artifacts
+# ---------------------------------------------------------------------------
+
+
+def _seed_artifact(
+    board_dir: Path,
+    identifier: str = "SEED-1",
+    name: str = "shot.png",
+    content: bytes = b"png-bytes",
+    *,
+    content_type: str = "image/png",
+    title: str = "Login page",
+    summary: str = "After the fix",
+) -> None:
+    store = board_dir / ".symphony" / "artifacts" / identifier
+    (store / "files").mkdir(parents=True, exist_ok=True)
+    (store / "files" / name).write_bytes(content)
+    index = store / "index.json"
+    entries = []
+    if index.exists():
+        entries = json.loads(index.read_text(encoding="utf-8"))["entries"]
+    entries.append(
+        {
+            "name": name,
+            "title": title,
+            "summary": summary,
+            "content_type": content_type,
+            "byte_size": len(content),
+            "sha256": "0" * 64,
+            "collected_at": "2026-08-12T00:00:00Z",
+            "run_id": "run-1",
+            "turn": 2,
+        }
+    )
+    index.write_text(
+        json.dumps({"version": 1, "entries": entries}), encoding="utf-8"
+    )
+
+
+async def test_issue_artifacts_lists_collected_files(
+    client: TestClient, board_dir: Path
+) -> None:
+    _seed_artifact(board_dir)
+
+    resp = await client.get("/api/v1/issues/SEED-1/artifacts")
+
+    assert resp.status == 200
+    payload = await resp.json()
+    assert payload["enabled"] is True
+    assert len(payload["artifacts"]) == 1
+    entry = payload["artifacts"][0]
+    assert entry["name"] == "shot.png"
+    assert entry["title"] == "Login page"
+    assert entry["summary"] == "After the fix"
+    assert entry["byte_size"] == 9
+    assert entry["inline"] is True
+    assert entry["url"] == "/api/v1/issues/SEED-1/artifacts/shot.png"
+
+
+async def test_issue_artifacts_empty_for_unknown_ticket(client: TestClient) -> None:
+    resp = await client.get("/api/v1/issues/NOPE-9/artifacts")
+    assert resp.status == 200
+    assert (await resp.json())["artifacts"] == []
+
+
+async def test_issue_detail_carries_artifacts(
+    client: TestClient, board_dir: Path
+) -> None:
+    _seed_artifact(board_dir)
+
+    resp = await client.get("/api/v1/issues/SEED-1")
+
+    assert resp.status == 200
+    payload = await resp.json()
+    assert [a["name"] for a in payload["artifacts"]] == ["shot.png"]
+
+
+async def test_artifact_file_serves_image_inline(
+    client: TestClient, board_dir: Path
+) -> None:
+    _seed_artifact(board_dir)
+
+    resp = await client.get("/api/v1/issues/SEED-1/artifacts/shot.png")
+
+    assert resp.status == 200
+    assert await resp.read() == b"png-bytes"
+    assert resp.headers["Content-Type"] == "image/png"
+    assert resp.headers["Content-Disposition"].startswith("inline")
+    assert resp.headers["X-Content-Type-Options"] == "nosniff"
+
+
+async def test_artifact_file_forces_download_for_executable_types(
+    client: TestClient, board_dir: Path
+) -> None:
+    """Worker-authored HTML/SVG must never render on the board's origin."""
+    _seed_artifact(
+        board_dir,
+        name="evil.html",
+        content=b"<script>alert(1)</script>",
+        content_type="text/html",
+        title="Report",
+    )
+
+    resp = await client.get("/api/v1/issues/SEED-1/artifacts/evil.html")
+
+    assert resp.status == 200
+    assert resp.headers["Content-Disposition"].startswith("attachment")
+    assert resp.headers["X-Content-Type-Options"] == "nosniff"
+
+
+async def test_artifact_file_rejects_unlisted_and_traversal_names(
+    client: TestClient, board_dir: Path
+) -> None:
+    _seed_artifact(board_dir)
+    (board_dir / "secret.txt").write_text("classified", encoding="utf-8")
+
+    missing = await client.get("/api/v1/issues/SEED-1/artifacts/other.png")
+    assert missing.status == 404
+
+    # index.json sits beside files/ and is never a listed artifact.
+    index = await client.get("/api/v1/issues/SEED-1/artifacts/index.json")
+    assert index.status == 404
+
+    escape = await client.get(
+        "/api/v1/issues/SEED-1/artifacts/..%2F..%2F..%2Fsecret.txt"
+    )
+    assert escape.status in (400, 404)
+    if escape.status == 200:  # pragma: no cover - guard against silent regress
+        assert b"classified" not in await escape.read()

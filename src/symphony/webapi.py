@@ -27,7 +27,7 @@ from functools import partial
 from datetime import date, datetime
 from pathlib import Path
 from typing import Any, Awaitable, Callable
-from urllib.parse import urlsplit
+from urllib.parse import quote, urlsplit
 
 from aiohttp import WSCloseCode, WSMsgType, web
 
@@ -45,6 +45,7 @@ from .errors import (
 from .issue import Issue, registration_order_key
 from .logging import get_logger
 from .skills import normalize_skill_names
+from .artifacts import ArtifactRecord, ArtifactStore
 from .stats import StatsStore, stats_store_for
 from .trackers import context_manager as tracker_context_manager
 from .trackers.file import FileBoardTracker, parse_ticket_file
@@ -183,8 +184,11 @@ async def _read_json(request: web.Request) -> dict[str, Any]:
     return body
 
 
-def _wrap(handler: Callable[[web.Request], Awaitable[web.Response]]):
-    async def wrapped(request: web.Request) -> web.Response:
+def _wrap(handler: Callable[[web.Request], Awaitable[web.StreamResponse]]):
+    # StreamResponse (not Response) so file-serving routes can hand back a
+    # web.FileResponse; the error paths below still return plain Responses,
+    # which are StreamResponses.
+    async def wrapped(request: web.Request) -> web.StreamResponse:
         try:
             return await handler(request)
         except web.HTTPException:
@@ -232,6 +236,17 @@ class _Ctx:
 
     def stats(self) -> StatsStore:
         return stats_store_for(self.workflow_dir() / ".symphony" / "stats.jsonl")
+
+    def artifacts(self) -> ArtifactStore | None:
+        """Read-side view of the ticket artifact store, or None when off.
+
+        The web app never writes artifacts — collection is the
+        orchestrator's job — so the size caps are irrelevant here.
+        """
+        cfg = self.config()
+        if not cfg.artifacts.enabled:
+            return None
+        return ArtifactStore(self.workflow_dir() / ".symphony" / "artifacts")
 
 
 # ---------------------------------------------------------------------------
@@ -673,6 +688,43 @@ def _valid_states(cfg: ServiceConfig) -> dict[str, str]:
     """lowercase -> canonical casing for every configured state."""
     return {
         s.lower(): s for s in (*cfg.tracker.active_states, *cfg.tracker.terminal_states)
+    }
+
+
+# Content types the board may render in-document. Deliberately excludes
+# text/html and image/svg+xml — both can execute script against the board's
+# own origin, and workers author these bytes.
+_INLINE_ARTIFACT_TYPES = frozenset(
+    {
+        "image/png",
+        "image/jpeg",
+        "image/gif",
+        "image/webp",
+        "image/bmp",
+        "application/pdf",
+        "text/plain",
+    }
+)
+
+
+def _ascii_filename(name: str) -> str:
+    """Header-safe filename: no quotes, no control chars, ASCII only."""
+    cleaned = "".join(ch for ch in name if ch.isprintable() and ch not in '"\\')
+    return cleaned.encode("ascii", "replace").decode("ascii") or "artifact"
+
+
+def _artifact_json(identifier: str, record: ArtifactRecord) -> dict[str, Any]:
+    return {
+        "name": record.name,
+        "title": record.title,
+        "summary": record.summary,
+        "content_type": record.content_type,
+        "byte_size": record.byte_size,
+        "collected_at": record.collected_at,
+        "run_id": record.run_id,
+        "turn": record.turn,
+        "inline": record.content_type in _INLINE_ARTIFACT_TYPES,
+        "url": f"/api/v1/issues/{identifier}/artifacts/{quote(record.name)}",
     }
 
 
@@ -1287,13 +1339,66 @@ def _register_issue_routes(
             else {"identifier": identifier}
         )
         live = _live_by_identifier(orchestrator).get(identifier)
+        store = ctx.artifacts()
+        artifacts = (
+            [
+                _artifact_json(identifier, record)
+                for record in await asyncio.to_thread(store.list_for, identifier)
+            ]
+            if store is not None
+            else []
+        )
         return web.json_response(
             {
                 **card,
                 "description": body_text,
                 "frontmatter": _json_safe(front),
                 "live": live,
+                "artifacts": artifacts,
             }
+        )
+
+    async def handle_issue_artifacts(request: web.Request) -> web.Response:
+        identifier = _check_identifier(request.match_info["identifier"])
+        store = ctx.artifacts()
+        if store is None:
+            return web.json_response({"artifacts": [], "enabled": False})
+        records = await asyncio.to_thread(store.list_for, identifier)
+        return web.json_response(
+            {
+                "artifacts": [_artifact_json(identifier, r) for r in records],
+                "enabled": True,
+            }
+        )
+
+    async def handle_issue_artifact_file(request: web.Request) -> web.StreamResponse:
+        identifier = _check_identifier(request.match_info["identifier"])
+        name = request.match_info["name"]
+        store = ctx.artifacts()
+        if store is None:
+            return _json_error(404, "artifacts_disabled", "artifacts are disabled")
+        path = await asyncio.to_thread(store.resolve_file, identifier, name)
+        record = await asyncio.to_thread(store.record_for, identifier, name)
+        if path is None or record is None:
+            return _json_error(
+                404, "artifact_not_found", f"unknown artifact {name} on {identifier}"
+            )
+        # Worker-authored bytes served from the board's own origin: anything
+        # the browser could execute in this document's context (HTML, SVG,
+        # scripts) must download instead of render, and nosniff stops a
+        # text/plain payload being re-typed as HTML.
+        inline = record.content_type in _INLINE_ARTIFACT_TYPES
+        disposition = "inline" if inline else "attachment"
+        return web.FileResponse(
+            path,
+            headers={
+                "Content-Type": record.content_type,
+                "Content-Disposition": (
+                    f'{disposition}; filename="{_ascii_filename(name)}"'
+                ),
+                "X-Content-Type-Options": "nosniff",
+                "Cache-Control": "no-store",
+            },
         )
 
     async def handle_issue_patch(request: web.Request) -> web.Response:
@@ -1444,6 +1549,13 @@ def _register_issue_routes(
     app.router.add_post("/api/v1/issues", _wrap(handle_issue_create))
     app.router.add_get("/api/v1/issues/{identifier}", _wrap(handle_issue_detail))
     app.router.add_patch("/api/v1/issues/{identifier}", _wrap(handle_issue_patch))
+    app.router.add_get(
+        "/api/v1/issues/{identifier}/artifacts", _wrap(handle_issue_artifacts)
+    )
+    app.router.add_get(
+        "/api/v1/issues/{identifier}/artifacts/{name}",
+        _wrap(handle_issue_artifact_file),
+    )
     app.router.add_post(
         "/api/v1/issues/{identifier}/recover-blocked",
         _wrap(handle_issue_recover_blocked),
