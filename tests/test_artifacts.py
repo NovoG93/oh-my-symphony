@@ -225,3 +225,25 @@ class TestSweep:
         assert store.has_any("KEEP-1")
         assert store.has_any("FRESH-1")
         assert not store.has_any("OLD-1")
+
+
+def test_store_root_is_absolute_regardless_of_cwd(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Ticket Markdown links relpath the store against an absolute board root.
+
+    `workflow_path` may be relative, so a store built from it must not
+    resolve against whatever cwd the service happened to start in.
+    """
+    monkeypatch.chdir(tmp_path)
+    store = ArtifactStore(Path(".symphony/artifacts"))
+    assert store.root.is_absolute()
+    assert store.root == tmp_path.resolve() / ".symphony" / "artifacts"
+
+    workspace = _make_workspace(tmp_path, {"a.txt": b"x"})
+    store.collect_from_workspace(workspace, identifier="T-1")
+    other = tmp_path / "elsewhere"
+    other.mkdir()
+    monkeypatch.chdir(other)
+    resolved = store.resolve_file("T-1", "a.txt")
+    assert resolved is not None and resolved.read_bytes() == b"x"
