@@ -2039,7 +2039,10 @@
     const list = el('div', { class: 'artifact-list' });
     artifacts.forEach((artifact) => {
       const isImage = artifact.inline && String(artifact.content_type || '').startsWith('image/');
-      const meta = [formatArtifactBytes(artifact.byte_size)];
+      // Always show the real file name next to the worker-chosen title: the
+      // title is arbitrary text, so "Coverage report" could otherwise save
+      // an installer without the reader ever seeing the extension.
+      const meta = [artifact.name, formatArtifactBytes(artifact.byte_size)];
       if (artifact.turn) meta.push(t('artifacts.turn', { turn: artifact.turn }));
       const link = el('a', {
         class: 'artifact-name',

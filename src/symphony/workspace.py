@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import shlex
 import shutil
 import subprocess
 import sys
@@ -1018,6 +1019,7 @@ async def commit_workspace_on_done(
     exit_reason: str | None = None,
     state: str | None = None,
     timeout_s: float = 60.0,
+    extra_excludes: tuple[str, ...] = (),
 ) -> CommitOutcome:
     """Snapshot the per-ticket workspace into one git commit on worker exit.
 
@@ -1097,7 +1099,17 @@ async def commit_workspace_on_done(
         '  fi\n'
         'fi\n'
         'ADD_PATHS=(.)\n'
-        'while IFS= read -r exclude_path; do\n'
+        # Caller-supplied exclusions (the ticket artifact directory) are
+        # applied in *this* worktree's repo, whichever that is. The
+        # `.git/info/exclude` rule written at startup only covers the
+        # workflow repo, and a custom `after_create` hook may build the
+        # worktree in a different one — the shipped monorepo template does.
+        + "".join(
+            "ADD_PATHS+=(%s)\n" % shlex.quote(f":(exclude){item}")
+            for item in extra_excludes
+            if item
+        )
+        + 'while IFS= read -r exclude_path; do\n'
         '  [ -n "$exclude_path" ] && ADD_PATHS+=(":(exclude)$exclude_path")\n'
         'done < <(git config --get-all symphony.autocommitExclude 2>/dev/null || true)\n'
         'git add -A -- "${ADD_PATHS[@]}" || exit 42\n'

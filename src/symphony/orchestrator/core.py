@@ -3994,6 +3994,13 @@ class Orchestrator:
         ):
             self._last_archive_sweep_monotonic = now_monotonic
             await self._archive_sweep(cfg)
+        if (
+            self._last_artifact_sweep_monotonic is None
+            or now_monotonic - self._last_artifact_sweep_monotonic
+            >= ARCHIVE_SWEEP_INTERVAL_SEC
+        ):
+            self._last_artifact_sweep_monotonic = now_monotonic
+            await self._artifact_sweep(cfg)
 
         # Continuous-improvement heartbeat (plan §4). Cheap, non-blocking:
         # evaluates due-math + guards and, at most, fires one background task.
@@ -4067,6 +4074,20 @@ class Orchestrator:
         return bumped + sort_candidates(
             normal, cfg.agent.scheduling_policy, analysis=analysis
         )
+
+    @staticmethod
+    def _artifact_commit_excludes(cfg: "ServiceConfig | None") -> tuple[str, ...]:
+        """Pathspecs keeping collected deliverables out of the Done commit.
+
+        Belt to `_ensure_artifact_dir_git_excluded`'s braces: that writes
+        `.git/info/exclude` in the *workflow* repo, but a custom
+        `after_create` hook can build the worktree in a different repo (the
+        shipped monorepo template does), where the rule would not apply.
+        This exclusion travels with the commit call, so it holds either way.
+        """
+        if cfg is None or not cfg.artifacts.enabled:
+            return ()
+        return (cfg.artifacts.dir,)
 
     def _prompt_artifacts_dir(self, cfg: ServiceConfig) -> str:
         """`artifacts.dir` for templates, or "" when collection is off.
@@ -9141,6 +9162,7 @@ class Orchestrator:
                         title=entry.issue.title,
                         exit_reason=reason,
                         state=entry.issue.state,
+                        extra_excludes=self._artifact_commit_excludes(cfg),
                     )
                 if (
                     cfg is not None
@@ -9353,6 +9375,7 @@ class Orchestrator:
                     title=entry.issue.title,
                     exit_reason=reason,
                     state=entry.issue.state,
+                    extra_excludes=self._artifact_commit_excludes(cfg),
                 )
             elif (
                 cfg is not None
@@ -9387,6 +9410,7 @@ class Orchestrator:
                     title=entry.issue.title,
                     exit_reason=reason,
                     state=entry.issue.state,
+                    extra_excludes=self._artifact_commit_excludes(cfg),
                 )
             # When the worker ran the ticket all the way to Done, the
             # reconcile path that normally fires after_done/auto_merge/remove
@@ -10375,6 +10399,7 @@ class Orchestrator:
                             title=entry.issue.title,
                             exit_reason="reconcile_terminate_terminal",
                             state=issue.state,
+                            extra_excludes=self._artifact_commit_excludes(cfg),
                         )
                     if release_evidence_only:
                         if entry.known_app_release_finalizer:
@@ -10502,6 +10527,7 @@ class Orchestrator:
                             title=entry.issue.title,
                             exit_reason="reconcile_terminate_inactive",
                             state=issue.state,
+                            extra_excludes=self._artifact_commit_excludes(cfg),
                         )
                     await self._workspace_manager.remove(entry.workspace_path)
                 finally:

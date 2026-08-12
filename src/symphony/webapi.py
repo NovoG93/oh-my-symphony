@@ -1407,6 +1407,12 @@ def _register_issue_routes(
                 ),
                 "X-Content-Type-Options": "nosniff",
                 "Cache-Control": "no-store",
+                # Backstop for the allowlist above: even if a renderable
+                # type is ever added by mistake, these bytes are worker
+                # -authored and must not run script, load subresources, or
+                # frame anything on the board's origin.
+                "Content-Security-Policy": "default-src 'none'; sandbox allow-downloads",
+                "X-Frame-Options": "DENY",
             },
         )
 

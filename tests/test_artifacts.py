@@ -4,11 +4,14 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
+from unittest import mock
 from datetime import datetime, timezone
 from pathlib import Path
 
 import pytest
 
+import symphony.artifacts as artifacts_module
 from symphony.artifacts import (
     DEFAULT_MAGIC_DIR,
     ArtifactStore,
@@ -326,3 +329,42 @@ def test_sweep_never_runs_on_an_empty_known_set(tmp_path: Path) -> None:
     for path in [store.root / "LIVE-1", *(store.root / "LIVE-1").rglob("*")]:
         os.utime(path, (aged, aged))
     assert store.sweep(known_identifiers=set(), ttl_days=30) == ["LIVE-1"]
+
+
+def test_file_growing_during_copy_is_billed_and_capped(tmp_path: Path) -> None:
+    """The size that lands is the size that counts, not the pre-copy stat."""
+    workspace = _make_workspace(tmp_path, {"grow.bin": b"x" * 5})
+    store = _store(tmp_path, max_file_bytes=10)
+    source = workspace / DEFAULT_MAGIC_DIR / "grow.bin"
+    real_copyfile = shutil.copyfile
+
+    def grow_then_copy(src, dst, **kwargs):
+        source.write_bytes(b"x" * 500)  # worker grows it mid-collect
+        return real_copyfile(source, dst, **kwargs)
+
+    with mock.patch.object(artifacts_module.shutil, "copyfile", grow_then_copy):
+        result = store.collect_from_workspace(workspace, identifier="T-1")
+
+    assert result.collected == []
+    assert ("grow.bin", "grew_past_cap") in result.skipped
+    assert store.list_for("T-1") == []
+    # The oversized copy must not be left behind in the store.
+    assert not (store.root / "T-1" / "files" / "grow.bin").exists()
+
+
+def test_sweep_skips_symlinked_ticket_directories(tmp_path: Path) -> None:
+    """A planted link must not be followed — explicitly, not by rmtree luck."""
+    store = _store(tmp_path)
+    store.root.mkdir(parents=True)
+    precious = tmp_path / "precious"
+    precious.mkdir()
+    (precious / "keepme.txt").write_text("do not delete")
+    (store.root / "EVIL-1").symlink_to(precious, target_is_directory=True)
+    aged = datetime.now(timezone.utc).timestamp() - 90 * 86400
+    os.utime(precious, (aged, aged))
+    os.utime(precious / "keepme.txt", (aged, aged))
+
+    removed = store.sweep(known_identifiers={"OTHER"}, ttl_days=30)
+
+    assert removed == []
+    assert (precious / "keepme.txt").read_text() == "do not delete"

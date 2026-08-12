@@ -2295,3 +2295,18 @@ def test_executable_content_types_are_never_inline() -> None:
         "text/javascript",
     ):
         assert content_type not in _INLINE_ARTIFACT_TYPES
+
+
+async def test_artifact_file_carries_a_sandbox_csp(
+    client: TestClient, board_dir: Path
+) -> None:
+    """Backstop if a renderable type ever reaches the inline allowlist."""
+    _seed_artifact(board_dir)
+
+    resp = await client.get("/api/v1/issues/SEED-1/artifacts/shot.png")
+
+    csp = resp.headers["Content-Security-Policy"]
+    assert "default-src 'none'" in csp
+    assert "sandbox" in csp
+    assert "allow-downloads" in csp  # attachment responses must still save
+    assert resp.headers["X-Frame-Options"] == "DENY"

@@ -2154,3 +2154,53 @@ def test_default_workflows_restore_host_board_tracking_before_remove() -> None:
         workflow = (root / name).read_text(encoding="utf-8")
         assert "update-index --no-skip-worktree" in workflow
         assert '"$dir/$ISSUE_ID.md"' in workflow
+
+
+@pytest.mark.skipif(not _HAS_GIT, reason="git CLI required")
+@pytest.mark.asyncio
+async def test_commit_workspace_on_done_honours_extra_excludes(
+    tmp_path, monkeypatch
+):
+    """Collected deliverables must not ride into the Done commit.
+
+    `.git/info/exclude` is written in the *workflow* repo, but a custom
+    `after_create` hook can build the worktree in a different one (the
+    shipped monorepo template does), where that rule never applies. The
+    pathspec travels with the commit call instead, so it holds either way.
+    """
+    _git_id_env(monkeypatch, tmp_path)
+    ws = tmp_path / "ws"
+    (ws / ".symphony-artifacts").mkdir(parents=True)
+    (ws / "src.py").write_text("print('real work')")
+    (ws / ".symphony-artifacts" / "screenshot.png").write_bytes(b"\x89PNG")
+
+    await commit_workspace_on_done(
+        ws,
+        identifier="ART-1",
+        title="ship it",
+        extra_excludes=(".symphony-artifacts",),
+    )
+
+    committed = _git(ws, "show", "--pretty=", "--name-only", "HEAD").stdout
+    assert "src.py" in committed
+    assert ".symphony-artifacts" not in committed
+    # The file itself stays on disk for the collector to pick up.
+    assert (ws / ".symphony-artifacts" / "screenshot.png").exists()
+
+
+@pytest.mark.skipif(not _HAS_GIT, reason="git CLI required")
+@pytest.mark.asyncio
+async def test_commit_workspace_on_done_commits_artifacts_without_excludes(
+    tmp_path, monkeypatch
+):
+    """Control for the test above: without the pathspec they do land."""
+    _git_id_env(monkeypatch, tmp_path)
+    ws = tmp_path / "ws"
+    (ws / ".symphony-artifacts").mkdir(parents=True)
+    (ws / "src.py").write_text("print('real work')")
+    (ws / ".symphony-artifacts" / "screenshot.png").write_bytes(b"\x89PNG")
+
+    await commit_workspace_on_done(ws, identifier="ART-2", title="ship it")
+
+    committed = _git(ws, "show", "--pretty=", "--name-only", "HEAD").stdout
+    assert ".symphony-artifacts/screenshot.png" in committed

@@ -17,6 +17,11 @@ excludes; keep those guardrails when customizing the hook.
 # Symphony runtime logs + pid — keep local, never commit.
 log/
 
+# Symphony host state: run registry, stats, and collected ticket
+# artifacts. Operational data, not history — the artifact store alone
+# can hold up to `artifacts.max_ticket_mb` of binaries per ticket.
+.symphony/
+
 # Symphony agent-generated docs: keep markdown reports only.
 # Binary artefacts (per-ticket node_modules, e2e traces/videos,
 # screenshots, zips) stay local — too heavy for git history.
@@ -45,6 +50,8 @@ docs/**/coverage/
 | `docs/<ID>/qa/report/data/`           | ❌     | binary HTML report blobs                         |
 | `docs/<ID>/evidence/*.webm,*.png`     | ❌     | by default; pin specific ones with `!path` rules |
 | `log/*` (runtime logs + pid)          | ❌     | noise; the orchestrator regenerates these        |
+| `.symphony/artifacts/<ID>/`           | ❌     | board deliverables; served by the web board      |
+| `.symphony/state.db`, `stats.jsonl`   | ❌     | host run registry + token stats, machine-local   |
 
 ## Legacy host-linked docs
 
