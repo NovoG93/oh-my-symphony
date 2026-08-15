@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from ..workflow import KiroConfig
 from . import BackendInit
 from .per_turn import _has_shell_flag
 from .plain_cli import PlainCliBackend
@@ -11,7 +12,11 @@ class KiroBackend(PlainCliBackend):
     """Drive `kiro-cli chat --no-interactive` once per Symphony worker turn."""
 
     def __init__(self, init: BackendInit) -> None:
-        cfg = init.cfg.kiro
+        cfg = (
+            init.resolved_backend_config
+            if isinstance(init.resolved_backend_config, KiroConfig)
+            else init.cfg.kiro
+        )
         super().__init__(
             init,
             agent_name="kiro",

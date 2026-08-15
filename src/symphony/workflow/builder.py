@@ -481,6 +481,7 @@ def build_service_config(workflow: WorkflowDefinition) -> ServiceConfig:
             claude_raw.get("stall_timeout_ms"), DEFAULT_BACKEND_STALL_TIMEOUT_MS, name="claude.stall_timeout_ms"
         ),
         resume_across_turns=bool(claude_raw.get("resume_across_turns", True)),
+        model=_as_str(claude_raw.get("model"), "") or "",
     )
 
     gemini_raw = cfg.get("gemini") or {}

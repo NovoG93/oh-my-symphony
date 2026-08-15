@@ -88,6 +88,7 @@ from .coercion import (
 from .config import (
     AgentConfig,
     AgentProfileConfig,
+    AgentSelection,
     AgyConfig,
     ClaudeConfig,
     CodexConfig,
@@ -108,6 +109,11 @@ from .config import (
     TuiConfig,
     WikiConfig,
 )
+from .profiles import (
+    ResolvedAgentConfig,
+    resolve_agent_config,
+    selection_for_state,
+)
 from .builder import build_service_config, validated_ci_modes
 from .preflight import validate_for_dispatch
 from .state import WorkflowState
@@ -126,6 +132,10 @@ __all__ = [
     "HooksConfig",
     "AgentConfig",
     "AgentProfileConfig",
+    "AgentSelection",
+    "ResolvedAgentConfig",
+    "resolve_agent_config",
+    "selection_for_state",
     "AgyConfig",
     "CodexConfig",
     "ClaudeConfig",

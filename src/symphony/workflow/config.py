@@ -120,6 +120,14 @@ class AgentProfileConfig:
 
 
 @dataclass(frozen=True)
+class AgentSelection:
+    """Resolved agent selection: backend kind and optional named profile."""
+
+    kind: str
+    profile: str | None = None
+
+
+@dataclass(frozen=True)
 class AgentConfig:
     kind: str
     max_concurrent_agents: int
@@ -299,6 +307,97 @@ class AgentConfig:
             return stage
         return self.kind
 
+    def selection_for_state(
+        self,
+        state: str | None,
+        *,
+        ticket_profile: str | None = None,
+        ticket_kind: str | None = None,
+        dispatch_profile: str | None = None,
+        dispatch_kind: str | None = None,
+        agent_profiles: dict[str, AgentProfileConfig] | None = None,
+    ) -> AgentSelection:
+        """Resolve the agent selection (kind + profile) for a dispatch in `state`.
+
+        Precedence (PLAN §3):
+        1. explicit dispatch profile
+        2. explicit dispatch kind
+        3. ticket agent_profile
+        4. ticket agent_kind
+        5. agent.stage_profiles[state]
+        6. agent.stage_kinds[state]
+        7. agent.default_profile
+        8. agent.kind
+
+        Rejects ambiguous tickets that specify both ticket_kind and ticket_profile.
+        """
+        t_prof = (ticket_profile or "").strip()
+        t_kind = (ticket_kind or "").strip().lower()
+        if t_prof and t_kind:
+            raise ConfigValidationError(
+                f"ambiguous agent override: both ticket agent_kind ({t_kind!r}) and agent_profile ({t_prof!r}) are set",
+                ticket_kind=t_kind,
+                ticket_profile=t_prof,
+            )
+
+        profiles = agent_profiles or {}
+
+        # 1. explicit dispatch profile
+        d_prof = (dispatch_profile or "").strip()
+        if d_prof:
+            prof_cfg = profiles.get(d_prof)
+            if prof_cfg is not None:
+                return AgentSelection(kind=prof_cfg.kind, profile=d_prof)
+            if profiles:
+                raise ConfigValidationError(f"unknown agent profile {d_prof!r}", profile=d_prof)
+            return AgentSelection(kind=self.kind, profile=d_prof)
+
+        # 2. explicit dispatch kind
+        d_kind = (dispatch_kind or "").strip().lower()
+        if d_kind:
+            return AgentSelection(kind=d_kind, profile=None)
+
+        # 3. ticket agent_profile
+        if t_prof:
+            prof_cfg = profiles.get(t_prof)
+            if prof_cfg is not None:
+                return AgentSelection(kind=prof_cfg.kind, profile=t_prof)
+            if profiles:
+                raise ConfigValidationError(f"unknown agent profile {t_prof!r}", profile=t_prof)
+            return AgentSelection(kind=self.kind, profile=t_prof)
+
+        # 4. ticket agent_kind
+        if t_kind:
+            return AgentSelection(kind=t_kind, profile=None)
+
+        # 5. agent.stage_profiles[state]
+        normalized_state = _normalize_state_key(state or "")
+        stage_prof = self.stage_profiles.get(normalized_state)
+        if stage_prof:
+            prof_cfg = profiles.get(stage_prof)
+            if prof_cfg is not None:
+                return AgentSelection(kind=prof_cfg.kind, profile=stage_prof)
+            if profiles:
+                raise ConfigValidationError(f"unknown agent profile {stage_prof!r}", profile=stage_prof)
+            return AgentSelection(kind=self.kind, profile=stage_prof)
+
+        # 6. agent.stage_kinds[state]
+        stage_kind = self.stage_kinds.get(normalized_state)
+        if stage_kind:
+            return AgentSelection(kind=stage_kind, profile=None)
+
+        # 7. agent.default_profile
+        if self.default_profile:
+            prof_cfg = profiles.get(self.default_profile)
+            if prof_cfg is not None:
+                return AgentSelection(kind=prof_cfg.kind, profile=self.default_profile)
+            if profiles:
+                raise ConfigValidationError(f"unknown agent profile {self.default_profile!r}", profile=self.default_profile)
+            return AgentSelection(kind=self.kind, profile=self.default_profile)
+
+        # 8. agent.kind
+        return AgentSelection(kind=self.kind, profile=None)
+
 
 @dataclass(frozen=True)
 class CodexConfig:
@@ -327,6 +426,7 @@ class ClaudeConfig:
     # supported — each retry attempt builds a new backend instance, so the
     # captured session id is discarded with the prior worker.
     resume_across_turns: bool
+    model: str = ""
 
 
 @dataclass(frozen=True)
@@ -728,3 +828,23 @@ class ServiceConfig:
             "agent.kind must be one of agy, codex, claude, gemini, kiro, opencode, pi, prime-agent",
             value=kind,
         )
+
+    def selection_for_state(
+        self,
+        state: str | None,
+        *,
+        ticket_profile: str | None = None,
+        ticket_kind: str | None = None,
+        dispatch_profile: str | None = None,
+        dispatch_kind: str | None = None,
+    ) -> AgentSelection:
+        """Resolve the agent selection for `state` against this workflow configuration."""
+        return self.agent.selection_for_state(
+            state,
+            ticket_profile=ticket_profile,
+            ticket_kind=ticket_kind,
+            dispatch_profile=dispatch_profile,
+            dispatch_kind=dispatch_kind,
+            agent_profiles=self.agent_profiles,
+        )
+

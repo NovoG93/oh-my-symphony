@@ -79,10 +79,13 @@ from ..trackers import build_tracker_client
 from ..utils.wiki_sweep import sweep as _wiki_sweep_run
 from ..workflow import (
     DEFAULT_TERMINAL_STATES,
+    AgentSelection,
+    ResolvedAgentConfig,
     ServiceConfig,
     SUPPORTED_AGENT_KINDS,
     SYMPHONY_BRANCH_PREFIX,
     WorkflowState,
+    resolve_agent_config,
     validate_for_dispatch,
 )
 from ..utils.auto_merge import AutoMergeResult, auto_merge_on_done_best_effort
@@ -149,6 +152,7 @@ from .helpers import (
     _rewind_budget_target_state,
     _notify_state_transition,
     _requested_agent_kind,
+    _requested_agent_profile,
     _sort_for_dispatch_fifo,
     _task_debug,
     _to_iso,
@@ -6622,6 +6626,13 @@ class Orchestrator:
             if cfg.tracker.kind == "linear" and cfg.agent.kind == "codex":
                 tools.append(linear_graphql_tool())
 
+            selection = cfg.selection_for_state(
+                issue.state,
+                ticket_profile=_requested_agent_profile(issue),
+                ticket_kind=_requested_agent_kind(issue),
+            )
+            resolved_cfg = resolve_agent_config(cfg, selection)
+
             client = self._build_agent_backend(
                 BackendInit(
                     cfg=cfg,
@@ -6634,6 +6645,8 @@ class Orchestrator:
                         self._sync_backend_agent_pid(issue_id, pid)
                     ),
                     client_tools=tools,
+                    selection=selection,
+                    resolved_backend_config=resolved_cfg.active_config,
                 )
             )
             # Expose the live backend to `_on_codex_event` so the stall-progress
@@ -7605,6 +7618,14 @@ class Orchestrator:
         tools: list[Any] = []
         if cfg.tracker.kind == "linear" and cfg.agent.kind == "codex":
             tools.append(linear_graphql_tool())
+
+        selection = cfg.selection_for_state(
+            issue.state,
+            ticket_profile=_requested_agent_profile(issue),
+            ticket_kind=_requested_agent_kind(issue),
+        )
+        resolved_cfg = resolve_agent_config(cfg, selection)
+
         new_client = self._build_agent_backend(
             BackendInit(
                 cfg=cfg,
@@ -7617,6 +7638,8 @@ class Orchestrator:
                     self._sync_backend_agent_pid(issue_id, pid)
                 ),
                 client_tools=tools,
+                selection=selection,
+                resolved_backend_config=resolved_cfg.active_config,
             )
         )
         # Reset per-dispatch env BEFORE the new backend's subprocess spawns.

@@ -12,6 +12,7 @@ from __future__ import annotations
 import json
 from typing import Any
 
+from ..workflow import GeminiConfig
 from . import (
     EVENT_SESSION_STARTED,
     EVENT_TURN_COMPLETED,
@@ -25,7 +26,11 @@ class GeminiBackend(PerTurnCliBackend):
     """One subprocess per turn; parses plain text or best-effort JSON output."""
 
     def __init__(self, init: BackendInit) -> None:
-        cfg = init.cfg.gemini
+        cfg = (
+            init.resolved_backend_config
+            if isinstance(init.resolved_backend_config, GeminiConfig)
+            else init.cfg.gemini
+        )
         super().__init__(
             init, agent_name="gemini", turn_timeout_ms=cfg.turn_timeout_ms
         )

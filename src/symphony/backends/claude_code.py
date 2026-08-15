@@ -37,6 +37,7 @@ from ..errors import (
 )
 from ..logging import get_logger
 from ..utils.git_sandbox import GIT_ROOTS_ENV_VAR, git_roots_outside
+from ..workflow import ClaudeConfig
 from ..workspace import validate_agent_cwd
 from . import (
     EVENT_MALFORMED,
@@ -95,7 +96,11 @@ class ClaudeCodeBackend(BaseAgentBackend):
 
     def __init__(self, init: BackendInit) -> None:
         validate_agent_cwd(init.cwd, init.workspace_root)
-        self._claude = init.cfg.claude
+        self._claude = (
+            init.resolved_backend_config
+            if isinstance(init.resolved_backend_config, ClaudeConfig)
+            else init.cfg.claude
+        )
         self._cwd = init.cwd
         # Resolved once: the worktree layout cannot change mid-run, and
         # run_turn spawns a fresh subprocess every turn.

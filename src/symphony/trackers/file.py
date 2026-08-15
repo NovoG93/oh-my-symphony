@@ -86,6 +86,7 @@ _CANONICAL_FRONT_MATTER_KEYS = {
     "request",
     "agent",
     "agent_kind",
+    "agent_profile",
     "last_agent_kind",
     "skills",
     "created_at",
@@ -344,6 +345,7 @@ def issue_from_file(path: Path) -> Issue | None:
         updated_at=parse_iso_timestamp(front.get("updated_at"))
         or parse_iso_timestamp(_file_mtime_iso(path)),
         agent_kind=_parse_agent_kind(front),
+        agent_profile=_parse_agent_profile(front),
         last_agent_kind=str(front.get("last_agent_kind") or "").strip().lower()
         or None,
         skills=normalize_skill_names(front.get("skills")),
@@ -361,6 +363,18 @@ def _parse_agent_kind(front: dict[str, Any]) -> str | None:
         return None
     kind = raw.strip().lower()
     return kind or None
+
+
+def _parse_agent_profile(front: dict[str, Any]) -> str | None:
+    raw = front.get("agent_profile")
+    if raw is None:
+        agent = front.get("agent")
+        if isinstance(agent, dict):
+            raw = agent.get("profile")
+    if not isinstance(raw, str):
+        return None
+    profile = raw.strip()
+    return profile or None
 
 
 def _parse_blockers(value: Any) -> list[BlockerRef]:

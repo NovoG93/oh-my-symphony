@@ -15,6 +15,7 @@ from collections import Counter
 from typing import Any, Iterable
 
 from ..errors import TurnFailed
+from ..workflow import OpenCodeConfig
 from . import (
     EVENT_OTHER_MESSAGE,
     EVENT_SESSION_STARTED,
@@ -58,7 +59,11 @@ class OpenCodeBackend(PerTurnCliBackend):
     """One subprocess per turn; parses OpenCode raw JSON events."""
 
     def __init__(self, init: BackendInit) -> None:
-        cfg = init.cfg.opencode
+        cfg = (
+            init.resolved_backend_config
+            if isinstance(init.resolved_backend_config, OpenCodeConfig)
+            else init.cfg.opencode
+        )
         super().__init__(
             init, agent_name="opencode", turn_timeout_ms=cfg.turn_timeout_ms
         )
