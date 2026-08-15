@@ -19,6 +19,7 @@ dependencies = [
     "aiohttp>=3.9",
     "rich>=13.7",
     "textual>=0.85",
+    "mcp>=1.9,<2.0",
 ]
 
 [project.optional-dependencies]
@@ -36,6 +37,7 @@ browser = [
 [project.scripts]
 symphony = "symphony.cli:main"
 symphony-pyright = "symphony.pyright:main"
+symphony-mcp = "symphony.mcp.server:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
