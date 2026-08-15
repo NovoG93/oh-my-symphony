@@ -18,10 +18,10 @@ from typing import Any
 
 import pytest
 
-from symphony.backends import BackendInit, build_backend
+from symphony.backends import BackendInit
 from symphony.errors import ConfigValidationError
 from symphony.issue import Issue
-from symphony.orchestrator.helpers import _config_for_issue_agent, _requested_agent_kind, _requested_agent_profile
+from symphony.orchestrator.helpers import _config_for_issue_agent
 from symphony.trackers.file import issue_from_file
 from symphony.workflow import (
     AgentConfig,
@@ -33,9 +33,7 @@ from symphony.workflow import (
     ResolvedAgentConfig,
     ServiceConfig,
     TrackerConfig,
-    build_service_config,
     resolve_agent_config,
-    selection_for_state,
 )
 
 
@@ -53,22 +51,9 @@ def _make_service_config(
     claude_model: str = "",
 ) -> ServiceConfig:
     from symphony.workflow.config import (
-        AgyConfig,
-        ArtifactsConfig,
-        ContinuousImprovementConfig,
         HooksConfig,
-        KiroConfig,
-        NotificationsConfig,
-        OpenCodeConfig,
         PiConfig,
-        PreviewConfig,
-        PrimeAgentConfig,
-        ProgressConfig,
-        PromptConfig,
         ServerConfig,
-        SystemConfig,
-        TuiConfig,
-        WikiConfig,
     )
 
     agent_cfg = AgentConfig(

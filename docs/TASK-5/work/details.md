@@ -25,3 +25,7 @@ Implement runtime resolution for named agent profiles:
    `selection` and `resolved_backend_config` default to `None` in `BackendInit`'s signature, and `__post_init__` defaults them from `cfg` and `resolve_agent_config`, ensuring all existing tests and callers continue working without modification.
 4. **Lifecycle Re-Resolution**:
    `_rebuild_backend_for_phase` re-evaluates `selection_for_state` against `base_cfg` for the new phase's target state, ensuring stage transitions pick up stage profile changes.
+
+## Rewind Resolution (2026-08-15)
+- Removed tracked `graphify-out` symlink from the git index (`git rm graphify-out`) to eliminate orphan-scope machine-specific tracking and adhere to repository conventions.
+- Ran full test suite verifying 2335 tests passing (9 skipped) and clean merge preflight against main.

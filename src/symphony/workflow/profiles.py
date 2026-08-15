@@ -8,7 +8,7 @@ using immutable dataclass replacement.
 from __future__ import annotations
 
 from dataclasses import dataclass, replace
-from typing import Any, cast
+from typing import Any
 
 from ..errors import ConfigValidationError
 from .config import (

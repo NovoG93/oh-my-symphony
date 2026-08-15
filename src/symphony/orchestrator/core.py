@@ -79,8 +79,6 @@ from ..trackers import build_tracker_client
 from ..utils.wiki_sweep import sweep as _wiki_sweep_run
 from ..workflow import (
     DEFAULT_TERMINAL_STATES,
-    AgentSelection,
-    ResolvedAgentConfig,
     ServiceConfig,
     SUPPORTED_AGENT_KINDS,
     SYMPHONY_BRANCH_PREFIX,
