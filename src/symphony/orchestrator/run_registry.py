@@ -82,6 +82,9 @@ class RunRecord:
     attempt: int | None = None
     attempt_kind: str = ""
     agent_kind: str = ""
+    agent_profile: str = ""
+    model: str = ""
+    reasoning_effort: str = ""
     started_at: datetime | None = None
     updated_at: datetime | None = None
     completed_at: datetime | None = None
@@ -237,6 +240,9 @@ class RunRegistry:
         attempt: int | None,
         attempt_kind: str,
         agent_kind: str,
+        agent_profile: str = "",
+        model: str = "",
+        reasoning_effort: str = "",
         now: datetime | None = None,
     ) -> str | None:
         now = _utc(now)
@@ -253,10 +259,11 @@ class RunRegistry:
                 """
                 INSERT INTO runs (
                     run_id, issue_id, identifier, title, state, attempt,
-                    attempt_kind, agent_kind, workspace_path, status, started_at,
+                    attempt_kind, agent_kind, agent_profile, model, reasoning_effort,
+                    workspace_path, status, started_at,
                     updated_at, lease_expires_at, last_progress_at, completed_at,
                     owner_pid, owner_boot_id, branch_name
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'active', ?, ?, ?, ?, NULL, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'active', ?, ?, ?, ?, NULL, ?, ?, ?)
                 """,
                 (
                     run_id,
@@ -267,6 +274,9 @@ class RunRegistry:
                     attempt,
                     attempt_kind,
                     agent_kind,
+                    agent_profile,
+                    model,
+                    reasoning_effort,
                     str(workspace_path),
                     _iso(now),
                     _iso(now),
@@ -277,19 +287,27 @@ class RunRegistry:
                     f"symphony/{issue.identifier}",
                 ),
             )
+            payload: dict[str, Any] = {
+                "attempt": attempt,
+                "attempt_kind": attempt_kind,
+                "agent_kind": agent_kind,
+                "state": issue.state,
+            }
+            if agent_profile:
+                payload["agent_profile"] = agent_profile
+            if model:
+                payload["model"] = model
+            if reasoning_effort:
+                payload["reasoning_effort"] = reasoning_effort
             self._append_attempt_event_best_effort_locked(
                 run_id=run_id,
                 event_type="run_acquired",
-                payload={
-                    "attempt": attempt,
-                    "attempt_kind": attempt_kind,
-                    "agent_kind": agent_kind,
-                    "state": issue.state,
-                },
+                payload=payload,
                 now=now,
             )
             conn.execute("COMMIT")
             return run_id
+
         except Exception:
             conn.execute("ROLLBACK")
             raise
@@ -372,6 +390,9 @@ class RunRegistry:
         attempt: int | None,
         attempt_kind: str,
         agent_kind: str,
+        agent_profile: str = "",
+        model: str = "",
+        reasoning_effort: str = "",
         now: datetime | None = None,
     ) -> ContinuationAcquisition | None:
         """Atomically consume one safe checkpoint into a new active run.
@@ -457,14 +478,15 @@ class RunRegistry:
                     """
                     INSERT INTO runs (
                         run_id, issue_id, identifier, title, state, attempt,
-                        attempt_kind, agent_kind, workspace_path, status,
+                        attempt_kind, agent_kind, agent_profile, model, reasoning_effort,
+                        workspace_path, status,
                         started_at, updated_at, lease_expires_at,
                         last_progress_at, completed_at, owner_pid,
                         owner_boot_id, branch_name, resume_session_id,
                         checkpoint_state, checkpoint_turn, checkpointed_at,
                         continued_from_run_id
                     ) VALUES (
-                        ?, ?, ?, ?, ?, ?, ?, ?, ?, 'active', ?, ?, ?, ?, NULL,
+                        ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'active', ?, ?, ?, ?, NULL,
                         ?, ?, ?, ?, ?, ?, ?, ?
                     )
                     """,
@@ -477,6 +499,9 @@ class RunRegistry:
                         attempt,
                         attempt_kind,
                         agent_kind,
+                        agent_profile,
+                        model,
+                        reasoning_effort,
                         str(workspace_path),
                         _iso(now),
                         _iso(now),
@@ -501,15 +526,22 @@ class RunRegistry:
                     raise
                 conn.execute("ROLLBACK")
                 return None
+            payload: dict[str, Any] = {
+                "attempt": attempt,
+                "attempt_kind": attempt_kind,
+                "agent_kind": agent_kind,
+                "state": issue.state,
+            }
+            if agent_profile:
+                payload["agent_profile"] = agent_profile
+            if model:
+                payload["model"] = model
+            if reasoning_effort:
+                payload["reasoning_effort"] = reasoning_effort
             self._append_attempt_event_best_effort_locked(
                 run_id=run_id,
                 event_type="run_acquired",
-                payload={
-                    "attempt": attempt,
-                    "attempt_kind": attempt_kind,
-                    "agent_kind": agent_kind,
-                    "state": issue.state,
-                },
+                payload=payload,
                 now=now,
             )
             conn.execute("COMMIT")
@@ -518,6 +550,7 @@ class RunRegistry:
                 continued_from_run_id=continued_from_run_id,
                 checkpoint=checkpoint,
             )
+
         except Exception:
             if conn.in_transaction:
                 conn.execute("ROLLBACK")
@@ -2006,15 +2039,16 @@ class RunRegistry:
             clauses.append(
                 "(issue_id LIKE ? ESCAPE '\\' OR identifier LIKE ? ESCAPE '\\' "
                 "OR title LIKE ? ESCAPE '\\' OR agent_kind LIKE ? ESCAPE '\\' "
+                "OR agent_profile LIKE ? ESCAPE '\\' OR model LIKE ? ESCAPE '\\' "
                 "OR status LIKE ? ESCAPE '\\')"
             )
-            params.extend((escaped, escaped, escaped, escaped, escaped))
+            params.extend((escaped, escaped, escaped, escaped, escaped, escaped, escaped))
         if status:
             clauses.append("status = ?")
             params.append(status)
         if agent:
-            clauses.append("agent_kind = ?")
-            params.append(agent)
+            clauses.append("(agent_kind = ? OR agent_profile = ?)")
+            params.extend((agent, agent))
         where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
         params.append(limit)
         rows = self._connect().execute(
@@ -2022,6 +2056,9 @@ class RunRegistry:
             params,
         ).fetchall()
         return [_record(row) for row in rows]
+
+    query_runs = recent_runs
+
 
     def run_events(self, run_id: str) -> list[dict[str, Any]]:
         rows = self._connect().execute(
@@ -2335,6 +2372,9 @@ def _run_summary(record: RunRecord) -> dict[str, Any]:
         "attempt": record.attempt,
         "attempt_kind": record.attempt_kind,
         "agent_kind": record.agent_kind,
+        "agent_profile": record.agent_profile,
+        "model": record.model,
+        "reasoning_effort": record.reasoning_effort,
         "status": record.status,
         "started_at": _iso(record.started_at),
         "updated_at": _iso(record.updated_at),
@@ -2396,6 +2436,7 @@ def _parse(value: str | None) -> datetime | None:
 def _record(row: sqlite3.Row) -> RunRecord:
     owner_pid = row["owner_pid"]
     backend_agent_pid = row["backend_agent_pid"]
+    keys = row.keys()
     return RunRecord(
         run_id=str(row["run_id"]),
         issue_id=str(row["issue_id"]),
@@ -2409,9 +2450,13 @@ def _record(row: sqlite3.Row) -> RunRecord:
         attempt=int(row["attempt"]) if row["attempt"] is not None else None,
         attempt_kind=str(row["attempt_kind"]),
         agent_kind=str(row["agent_kind"]),
+        agent_profile=str(row["agent_profile"] or "") if "agent_profile" in keys else "",
+        model=str(row["model"] or "") if "model" in keys else "",
+        reasoning_effort=str(row["reasoning_effort"] or "") if "reasoning_effort" in keys else "",
         started_at=_parse(row["started_at"]),
         updated_at=_parse(row["updated_at"]),
         completed_at=_parse(row["completed_at"]),
+
         owner_pid=int(owner_pid) if owner_pid is not None else None,
         owner_boot_id=row["owner_boot_id"],
         backend_agent_pid=(

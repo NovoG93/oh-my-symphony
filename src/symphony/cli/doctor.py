@@ -51,6 +51,7 @@ from ..trackers.file import FileBoardTracker
 from ..utils.git_sandbox import resolve_git_common_dir, writable_git_roots
 from ..service import ProcessRunningPredicate, port_owner_hint
 from ..workflow import (
+    SUPPORTED_AGENT_KINDS,
     ServiceConfig,
     build_service_config,
     load_workflow,
@@ -165,6 +166,124 @@ def check_agent_cli(cfg: ServiceConfig) -> CheckResult:
     if located is None:
         return CheckResult(name, "fail", f"{binary!r} not on $PATH (configured: {command!r})")
     return CheckResult(name, "pass", f"{binary} → {located}")
+
+
+def check_agent_profiles(cfg: ServiceConfig) -> list[CheckResult]:
+    results: list[CheckResult] = []
+
+    for name, prof in cfg.agent_profiles.items():
+        res_name = f"agent.profile.{name}"
+        kind = prof.kind
+        if kind not in SUPPORTED_AGENT_KINDS:
+            results.append(
+                CheckResult(res_name, "fail", f"unsupported agent kind {kind!r}")
+            )
+            continue
+
+        if prof.model:
+            if any(c in prof.model for c in " \t\r\n"):
+                results.append(
+                    CheckResult(
+                        res_name,
+                        "fail",
+                        f"invalid model syntax {prof.model!r}: contains whitespace or newlines",
+                    )
+                )
+                continue
+
+        is_override = bool(prof.command)
+        if is_override:
+            command = prof.command or ""
+        else:
+            base_cfg = getattr(cfg, kind.replace("-", "_"), None)
+            command = getattr(base_cfg, "command", "") if base_cfg is not None else ""
+
+        try:
+            argv = shlex.split(command)
+        except ValueError as exc:
+            results.append(CheckResult(res_name, "fail", f"command not parseable: {exc}"))
+            continue
+
+        if not argv:
+            results.append(
+                CheckResult(res_name, "fail", f"command is empty for profile {name!r}")
+            )
+            continue
+
+        binary = argv[0]
+        located = shutil.which(binary)
+        if located is None and binary == "python":
+            located = sys.executable
+
+        if located is None:
+            results.append(
+                CheckResult(
+                    res_name,
+                    "fail",
+                    f"{binary!r} not on $PATH (configured: {command!r})",
+                )
+            )
+            continue
+
+        if is_override:
+            results.append(
+                CheckResult(
+                    res_name,
+                    "warn",
+                    f"{kind} profile {name!r} overrides backend command ({command!r}) → {located}",
+                )
+            )
+        else:
+            model_info = f", model={prof.model}" if prof.model else ""
+            results.append(
+                CheckResult(
+                    res_name,
+                    "pass",
+                    f"{kind} profile {name!r}{model_info} → {located}",
+                )
+            )
+
+    for stage, prof_name in cfg.agent.stage_profiles.items():
+        res_name = f"agent.stage_profiles.{stage}"
+        if prof_name not in cfg.agent_profiles:
+            results.append(
+                CheckResult(
+                    res_name,
+                    "fail",
+                    f'unknown profile "{prof_name}" (not found in agent_profiles)',
+                )
+            )
+        else:
+            results.append(
+                CheckResult(
+                    res_name,
+                    "pass",
+                    f'resolves to profile "{prof_name}" ({cfg.agent_profiles[prof_name].kind})',
+                )
+            )
+
+    if cfg.agent.default_profile:
+        res_name = "agent.default_profile"
+        prof_name = cfg.agent.default_profile
+        if prof_name not in cfg.agent_profiles:
+            results.append(
+                CheckResult(
+                    res_name,
+                    "fail",
+                    f'unknown profile "{prof_name}" (not found in agent_profiles)',
+                )
+            )
+        else:
+            results.append(
+                CheckResult(
+                    res_name,
+                    "pass",
+                    f'resolves to profile "{prof_name}" ({cfg.agent_profiles[prof_name].kind})',
+                )
+            )
+
+    return results
+
 
 
 _PLACEHOLDER_TOKENS = ("my-org/my-repo", "my-org:my-repo")
@@ -1026,6 +1145,7 @@ def run_checks(cfg: ServiceConfig, host: str = "127.0.0.1") -> list[CheckResult]
         check_shell(),
         check_stage_turn_budget(cfg),
         check_agent_cli(cfg),
+        *check_agent_profiles(cfg),
         check_pi_auth(cfg),
         check_prime_agent_auth(cfg),
         check_gemini_auth(cfg),

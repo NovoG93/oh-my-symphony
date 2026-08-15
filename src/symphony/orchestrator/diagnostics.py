@@ -97,7 +97,15 @@ _SECRET_PATTERNS: tuple[tuple[re.Pattern[str], str], ...] = (
 )
 
 _ALLOWED_FIELDS: dict[str, tuple[str, ...]] = {
-    "run_acquired": ("attempt", "attempt_kind", "agent_kind", "state"),
+    "run_acquired": (
+        "attempt",
+        "attempt_kind",
+        "agent_kind",
+        "agent_profile",
+        "model",
+        "reasoning_effort",
+        "state",
+    ),
     "run_started": ("state",),
     "session_started": (),
     "turn_started": ("turn", "state", "continuation"),

@@ -25,9 +25,10 @@ def test_v8_continuation_migration_is_additive_and_link_is_unique(
                   'initial', 'codex', '/tmp/ws', 'normal', '2026-01-01', '2026-01-01')
         """
     )
-    monkeypatch.setattr(migration_mod, "MIGRATIONS", original)
+    monkeypatch.setattr(migration_mod, "MIGRATIONS", original[:8])
 
     assert migration_mod.apply_migrations(conn, path) == [8]
+
     columns = {
         str(row[1]) for row in conn.execute("PRAGMA table_info(runs)").fetchall()
     }

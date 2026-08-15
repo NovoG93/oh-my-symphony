@@ -209,11 +209,28 @@ in `WORKFLOW.md`.
 When creating file-board tickets from the CLI, use
 `symphony board new TASK-2 "title" --agent-kind codex`.
 
+Named agent profiles (`agent_profiles:` in `WORKFLOW.md`) pin a ticket the
+same way:
+
+```yaml
+agent:
+  profile: sol
+```
+
+The flat alias `agent_profile: sol` is also accepted for hand-edited cards.
+A ticket must not set both `agent_kind` and `agent_profile` — creation and
+update reject the combination as ambiguous. From the CLI, use
+`symphony board new TASK-2 "title" --agent-profile sol` or
+`symphony board update TASK-2 --agent-profile sol`; an unknown profile name
+is rejected with the available list whenever `WORKFLOW.md` defines profiles.
+
 Between the ticket pin and the global default sits optional per-state routing:
 `agent.stage_kinds` maps board states to agent kinds so cheap/fast agents can
 own light lanes (e.g. `Todo: gemini`, `Document: gemini`) while a strong default
-handles Plan/Build/Review. Resolution per dispatch: ticket `agent_kind` pin >
-`agent.stage_kinds[state]` > `agent.kind`. The backend is re-resolved at every
+handles Plan/Build/Review. Resolution per dispatch: ticket `agent_profile`
+pin > ticket `agent_kind` pin > `agent.stage_profiles[state]` >
+`agent.stage_kinds[state]` > `agent.default_profile` > `agent.kind`. The
+backend is re-resolved at every
 stage change, including the in-run lane transitions a single dispatch walks, so
 a ticket that goes In Progress → Verify → Document inside one dispatch gets each
 lane's configured backend.
@@ -371,7 +388,10 @@ PASS  tracker.board_root            ./kanban (3 tickets)
 Exit code is `0` when all checks pass, `1` if any FAIL, `2` if `WORKFLOW.md`
 itself can't be loaded. The doctor catches the most common first-run
 failures in one pass: port collision, missing CLI on `$PATH`, the shipped
-placeholder clone URL, unwritable workspace, missing board directory.
+placeholder clone URL, unwritable workspace, missing board directory. When
+`agent_profiles:` is configured, each profile also gets its own
+PASS/FAIL/WARN line — supported kind, model syntax, executable on `$PATH`,
+and `stage_profiles` / `default_profile` references.
 
 ## Prove It Works
 
