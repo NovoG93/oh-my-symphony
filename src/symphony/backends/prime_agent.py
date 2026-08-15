@@ -19,6 +19,7 @@ from typing import Any
 
 from ..issue import normalize_state, workspace_key
 from ..trackers.file import issue_from_file
+from ..workflow import PrimeAgentConfig
 from . import BackendInit
 from .pi import PiBackend
 
@@ -35,7 +36,11 @@ class PrimeAgentBackend(PiBackend):
         # inherited method (run_turn, _consume_stream, …) uses our command
         # and timeout values.
         super().__init__(init)
-        self._pi = init.cfg.prime_agent
+        self._pi = (
+            init.resolved_backend_config
+            if isinstance(init.resolved_backend_config, PrimeAgentConfig)
+            else init.cfg.prime_agent
+        )
         self._pi_tracker = init.cfg.tracker
 
     async def initialize(self) -> dict[str, Any]:

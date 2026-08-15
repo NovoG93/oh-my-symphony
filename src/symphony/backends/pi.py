@@ -50,6 +50,7 @@ from ..errors import (
 )
 from ..logging import get_logger
 from ..utils.git_sandbox import git_roots_env
+from ..workflow import PiConfig
 from ..workspace import validate_agent_cwd
 from . import (
     EVENT_AGENT_RETRY,
@@ -106,7 +107,11 @@ class PiBackend(BaseAgentBackend):
 
     def __init__(self, init: BackendInit) -> None:
         validate_agent_cwd(init.cwd, init.workspace_root)
-        self._pi = init.cfg.pi
+        self._pi = (
+            init.resolved_backend_config
+            if isinstance(init.resolved_backend_config, PiConfig)
+            else init.cfg.pi
+        )
         self._cwd = init.cwd
         self._on_event = init.on_event
         self._on_process_started = init.on_process_started

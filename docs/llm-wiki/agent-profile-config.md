@@ -42,7 +42,10 @@ selection consumes these fields yet — that is Phase 2/3 work.
 **Phase boundary check:** grep that only `workflow/config.py`,
 `workflow/builder.py`, `workflow/constants.py`, `workflow/__init__.py`
 read `agent_profiles|stage_profiles|default_profile` — any dispatch or
-backend consumer means Phase 2/3 leaked into this phase.
+backend consumer means Phase 2/3 leaked into this phase. **Update
+(2026-08-15, TASK-5):** Phase 2 runtime consumers now exist by design —
+see [[agent-profile-resolution]] for the resolver, overlay, and lifecycle
+wiring.
 
 **Evidence:** 16 unit tests in `tests/test_workflow_agent_profiles.py`;
 TASK-4 QA artefacts under `docs/TASK-4/qa/` (ac-scorecard, qa-evidence,

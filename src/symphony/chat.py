@@ -441,8 +441,10 @@ def _project_setup_spec(text: str) -> tuple[str, ProjectSetupAction | None]:
         return text, None
     try:
         candidate = Path(raw_path).expanduser()
-        if not candidate.is_absolute() or (
-            candidate.exists() and not candidate.is_dir()
+        if (
+            not candidate.is_absolute()
+            or (candidate.exists() and not candidate.is_dir())
+            or (candidate.is_symlink() and not candidate.exists())
         ):
             return text, None
         # A nested directory in an existing Git checkout is not a distinct

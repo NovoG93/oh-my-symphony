@@ -30,6 +30,7 @@ class Issue:
     created_at: datetime | None = None
     updated_at: datetime | None = None
     agent_kind: str | None = None
+    agent_profile: str | None = None
     skills: tuple[str, ...] = field(default_factory=tuple)
     request: str | None = None
     # Audit-only record of the backend that last ran this ticket. NEVER read
@@ -57,6 +58,7 @@ class Issue:
             "created_at": self.created_at.isoformat() if self.created_at else None,
             "updated_at": self.updated_at.isoformat() if self.updated_at else None,
             "agent_kind": self.agent_kind or "",
+            "agent_profile": self.agent_profile or "",
             "last_agent_kind": self.last_agent_kind or "",
             "skills": list(self.skills),
             "request": self.request or "",

@@ -37,6 +37,7 @@ from ..errors import (
 )
 from ..logging import get_logger
 from ..utils.git_sandbox import git_roots_env, git_roots_outside
+from ..workflow import CodexConfig
 from ..workspace import validate_agent_cwd
 from . import (
     EVENT_APPROVAL_AUTO_APPROVED,
@@ -263,7 +264,11 @@ class CodexAppServerBackend(BaseAgentBackend):
 
     def __init__(self, init: BackendInit) -> None:
         validate_agent_cwd(init.cwd, init.workspace_root)
-        codex = init.cfg.codex
+        codex = (
+            init.resolved_backend_config
+            if isinstance(init.resolved_backend_config, CodexConfig)
+            else init.cfg.codex
+        )
         self._codex = codex
         self._cwd = init.cwd
         self._workspace_root = init.workspace_root
