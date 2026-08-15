@@ -178,10 +178,20 @@ agent:
   kind: codex          # codex | claude | gemini | agy | kiro | opencode | pi | prime-agent
   # Optional per-state backend routing: cheap/fast agents on light lanes,
   # the default `kind` everywhere else. Precedence per dispatch:
-  # per-ticket `agent_kind` frontmatter pin > stage_kinds > kind.
+  # dispatch profile > dispatch kind > per-ticket `agent_profile` pin >
+  # per-ticket `agent_kind` pin > stage_profiles > stage_kinds >
+  # default_profile > kind. A ticket setting both `agent_kind` and
+  # `agent_profile` is refused.
   # stage_kinds:
   #   Todo: gemini
   #   Document: gemini
+  # Optional per-state named-profile routing (see top-level
+  # `agent_profiles:`). Sessions are scoped per ticket + backend kind +
+  # profile, so routing a state to a different profile starts a fresh
+  # session instead of resuming the other profile's session.
+  # stage_profiles:
+  #   Document: luna
+  # default_profile: sol
   max_concurrent_agents: 1
   # This is the per-attempt execution cap. In prompt templates,
   # {{ turn_number }}/{{ max_turns }} reports the ticket lifetime position/cap.
@@ -371,6 +381,23 @@ prime_agent:
   turn_timeout_ms: 3600000
   read_timeout_ms: 20000
   stall_timeout_ms: 300000
+
+# Optional named agent profiles: per-profile overrides layered on the
+# global backend config; unset fields inherit (None = inherit). Route
+# states via agent.stage_profiles / agent.default_profile (see `agent:`).
+# Codex profile fields: model, reasoning_effort, command, and the three
+# timeouts. Claude profile fields: model, command, resume_across_turns,
+# and the three timeouts — a non-empty `model` injects `--model <model>`
+# right after the `claude` token at runtime; wrapper-script commands
+# (no leading `claude` token) are left unchanged.
+# agent_profiles:
+#   sol:                    # codex profile example
+#     kind: codex
+#     model: gpt-5.6-sol
+#     reasoning_effort: medium
+#   luna:                   # claude profile example (a profile `command:`
+#     kind: claude          # override must keep the edit/scope flags the
+#     model: sonnet         # global claude command carries)
 
 server:
   port: 9999            # optional JSON API; the primary UI is `symphony tui`

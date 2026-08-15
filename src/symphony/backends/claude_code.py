@@ -72,6 +72,24 @@ def _utc_iso() -> str:
     return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
 
 
+def _inject_model(command: str, model: str) -> str:
+    """Inject ``--model <model>`` right after a literal ``claude`` token.
+
+    Injecting after the token rather than appending keeps pipelines and
+    redirections in operator-authored commands intact. Non-``claude``
+    commands (wrapper scripts) are returned unchanged.
+    """
+    if not model:
+        return command
+    stripped = command.lstrip()
+    if not (stripped == "claude" or stripped.startswith(("claude ", "claude\t"))):
+        return command
+    leading_ws = command[: len(command) - len(stripped)]
+    rest = stripped[len("claude") :]
+    flag = f"--model {shlex.quote(model)}"
+    return f"{leading_ws}claude {flag}{rest}"
+
+
 def _inject_add_dirs(command: str, dirs: Sequence[str]) -> str:
     """Inject ``--add-dir <path>`` right after a literal ``claude`` token.
 
@@ -202,7 +220,8 @@ class ClaudeCodeBackend(BaseAgentBackend):
         if self._closed:
             raise ResponseError("backend is closed")
 
-        cmd = _inject_add_dirs(self._claude.command, self._git_roots)
+        cmd = _inject_model(self._claude.command, self._claude.model)
+        cmd = _inject_add_dirs(cmd, self._git_roots)
         if self._session_id and self._session_id != PENDING_SESSION_ID and (
             self._resume_on_next_turn
             or (is_continuation and self._claude.resume_across_turns)
