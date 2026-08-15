@@ -6,13 +6,18 @@ import pytest
 
 from symphony.errors import ConfigValidationError
 from symphony.workflow.builder import build_service_config
-from symphony.workflow.config import AgentConfig, AgentProfileConfig, ServiceConfig
+from symphony.workflow.config import AgentProfileConfig, ServiceConfig
 from symphony.workflow.constants import PROFILE_FIELDS_BY_KIND, SUPPORTED_AGENT_KINDS
 from symphony.workflow.parser import parse_workflow_text
 
 
 def _parse(workflow_text: str) -> ServiceConfig:
-    definition = parse_workflow_text(workflow_text, source_path=Path("/tmp/WORKFLOW.md"))
+    stripped = workflow_text.strip()
+    if not stripped.startswith("---"):
+        workflow_text = f"---\n{stripped}\n---\n"
+    definition = parse_workflow_text(
+        workflow_text, source_path=Path("/tmp/WORKFLOW.md")
+    )
     return build_service_config(definition)
 
 
@@ -241,7 +246,9 @@ agent_profiles:
     kind: claude
     reasoning_effort: high
 """
-    with pytest.raises(ConfigValidationError, match="not supported for backend 'claude'"):
+    with pytest.raises(
+        ConfigValidationError, match="not supported for backend 'claude'"
+    ):
         _parse(text_claude_reasoning)
 
     # resume_across_turns on codex
@@ -253,7 +260,9 @@ agent_profiles:
     kind: codex
     resume_across_turns: true
 """
-    with pytest.raises(ConfigValidationError, match="not supported for backend 'codex'"):
+    with pytest.raises(
+        ConfigValidationError, match="not supported for backend 'codex'"
+    ):
         _parse(text_codex_resume)
 
     # arbitrary unknown field
@@ -265,7 +274,9 @@ agent_profiles:
     kind: codex
     foo_bar_setting: 123
 """
-    with pytest.raises(ConfigValidationError, match="unsupported field 'foo_bar_setting'"):
+    with pytest.raises(
+        ConfigValidationError, match="unsupported field 'foo_bar_setting'"
+    ):
         _parse(text_unknown)
 
 
@@ -292,7 +303,9 @@ agent_profiles:
     kind: codex
     {timeout_field}: 0
 """
-        with pytest.raises(ConfigValidationError, match=f"{timeout_field} must be a positive integer"):
+        with pytest.raises(
+            ConfigValidationError, match=f"{timeout_field} must be a positive integer"
+        ):
             _parse(text_zero)
 
         text_neg = f"""
@@ -303,7 +316,9 @@ agent_profiles:
     kind: codex
     {timeout_field}: -100
 """
-        with pytest.raises(ConfigValidationError, match=f"{timeout_field} must be a positive integer"):
+        with pytest.raises(
+            ConfigValidationError, match=f"{timeout_field} must be a positive integer"
+        ):
             _parse(text_neg)
 
 
@@ -316,7 +331,9 @@ agent_profiles:
     kind: claude
     resume_across_turns: "yes"
 """
-    with pytest.raises(ConfigValidationError, match="resume_across_turns must be a boolean"):
+    with pytest.raises(
+        ConfigValidationError, match="resume_across_turns must be a boolean"
+    ):
         _parse(text)
 
 
@@ -338,7 +355,9 @@ tracker:
 agent_profiles:
   item: "string value"
 """
-    with pytest.raises(ConfigValidationError, match="agent_profiles\\['item'\\] must be a mapping"):
+    with pytest.raises(
+        ConfigValidationError, match="agent_profiles\\['item'\\] must be a mapping"
+    ):
         _parse(text_item_not_map)
 
 
@@ -351,3 +370,18 @@ tracker:
     assert cfg.agent_profiles == {}
     assert cfg.agent.stage_profiles == {}
     assert cfg.agent.default_profile is None
+
+
+def test_validation_rejects_duplicate_profile_names() -> None:
+    # Keys normalizing to the same trimmed name
+    text_ws_duplicate = """
+tracker:
+  kind: file
+agent_profiles:
+  "qa":
+    kind: agy
+  " qa":
+    kind: codex
+"""
+    with pytest.raises(ConfigValidationError, match="duplicate profile name 'qa'"):
+        _parse(text_ws_duplicate)

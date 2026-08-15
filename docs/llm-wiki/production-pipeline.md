@@ -86,5 +86,6 @@ cannot detect (states are just opaque strings to the Python core).
   drive-by scope creep.
 - 2026-05-09 | (this ticket) | Absorbed evidence-first ideas from cskwork/backend-dev-skills (MIT): bug-label reproduce sub-block in Triage, durable HTTP/e2e proofs in Review/QA, per-ticket docs/<id>/<stage>/ artefact root, LLM_WIKI_PATH env override.
 - 2026-08-15 | SMOKE-003 | Marked page historical: all three WORKFLOW files declare the 4-state `active_states` list. Kept the 8-stage body as history; rewrite deferred to a dedicated ticket to avoid drive-by scope creep.
+- 2026-08-15 | TASK-4 | The gate's contract check matches exact section headers: the Verify-stage prompt's literal title `## Merge Status: preflight clean, orchestrator will merge at Done` (docs/symphony-prompts/{file,linear}/stages/verify.md) failed the `## Merge Status` match and rewound the ticket. Stage outputs must use bare canonical headers with qualifiers in the body.
 
-**Last updated:** 2026-05-17 by Todo auto-triage.
+**Last updated:** 2026-08-15 by TASK-4 Document.

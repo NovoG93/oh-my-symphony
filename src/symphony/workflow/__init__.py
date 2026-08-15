@@ -64,6 +64,7 @@ from .constants import (
     JIRA_EMAIL_ENV,
     LINEAR_API_KEY_ENV,
     LINEAR_DEFAULT_ENDPOINT,
+    PROFILE_FIELDS_BY_KIND,
     SUPPORTED_AGENT_KINDS,
     SUPPORTED_CI_MODES,
     SUPPORTED_TRACKER_KINDS,
@@ -86,6 +87,7 @@ from .coercion import (
 )
 from .config import (
     AgentConfig,
+    AgentProfileConfig,
     AgyConfig,
     ClaudeConfig,
     CodexConfig,
@@ -123,6 +125,7 @@ __all__ = [
     "TrackerConfig",
     "HooksConfig",
     "AgentConfig",
+    "AgentProfileConfig",
     "AgyConfig",
     "CodexConfig",
     "ClaudeConfig",
@@ -148,6 +151,7 @@ __all__ = [
     # state
     "WorkflowState",
     # constants used by callers / tests
+    "PROFILE_FIELDS_BY_KIND",
     "SUPPORTED_AGENT_KINDS",
     "SUPPORTED_CI_MODES",
     "CI_AGENT_MODES",

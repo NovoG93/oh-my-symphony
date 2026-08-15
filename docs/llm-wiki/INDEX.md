@@ -16,3 +16,4 @@ before any new ticket; Learn writes back to them after QA passes.
 | session-persistence | Per-workspace `.symphony-session.json` + load on dispatch + save on session_started + per-backend honor-points + codex `thread/resume` fallback | 2026-05-10 (SMA-20) |
 | tui-rendering | Textual `KanbanApp` widget tree + diff-mount card refresh + heartbeat / observer / tracker poll cadence + invariants the helpers preserve | 2026-05-10 (Textual migration) |
 | byte-exact-static-deliverables | printf-over-echo deterministic write + cmp/od/wc/sha256sum proof chain + workspace-fixture pattern when /tmp writes are blocked | 2026-08-15 (SMOKE-003) |
+| agent-profile-config | Phase-1 named-profile model: AgentProfileConfig fields, PROFILE_FIELDS_BY_KIND allowlist, validation-at-build time, YAML duplicate-key boundary, no runtime consumers until Phase 2/3 | 2026-08-15 (TASK-4) |
