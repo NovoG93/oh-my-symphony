@@ -71,3 +71,92 @@ async def test_post_is_not_retried():
     with pytest.raises(UpstreamError):
         await c.create_issue(title="t", description=None, priority=None)
     assert calls["n"] == 1
+
+
+async def test_list_requests_path():
+    def handler(req):
+        assert req.url.path == "/api/v1/requests"
+        return httpx.Response(200, json={"available": True, "requests": []})
+
+    c = _client(handler)
+    data = await c.list_requests()
+    assert data["available"] is True
+
+
+async def test_list_runs_passes_filters():
+    captured = {}
+
+    def handler(req):
+        captured["params"] = dict(req.url.params)
+        return httpx.Response(200, json={"runs": [], "count": 0})
+
+    c = _client(handler)
+    await c.list_runs(issue_id="TASK-1", limit=10, status="failed", agent="claude")
+    assert captured["params"] == {
+        "limit": "10",
+        "issue": "TASK-1",
+        "status": "failed",
+        "agent": "claude",
+    }
+
+
+async def test_patch_issue_sends_fields():
+    captured = {}
+
+    def handler(req):
+        assert req.method == "PATCH"
+        assert req.url.path == "/api/v1/issues/TASK-1"
+        captured["body"] = req.content
+        return httpx.Response(200, json={"identifier": "TASK-1", "updated": ["state"]})
+
+    c = _client(handler)
+    r = await c.patch_issue("TASK-1", fields={"state": "Cancelled"})
+    assert r["identifier"] == "TASK-1"
+    assert b'"state":"Cancelled"' in captured["body"]
+
+
+async def test_recover_blocked_body():
+    captured = {}
+
+    def handler(req):
+        assert req.url.path == "/api/v1/issues/TASK-1/recover-blocked"
+        captured["body"] = req.content
+        return httpx.Response(200, json={"identifier": "TASK-1", "fix_created": True})
+
+    c = _client(handler)
+    await c.recover_blocked("TASK-1", fix_state="Todo", agent_kind="agy")
+    assert b'"fix_state":"Todo"' in captured["body"]
+    assert b'"agent_kind":"agy"' in captured["body"]
+
+
+async def test_skip_document_sends_json_object():
+    captured = {}
+
+    def handler(req):
+        captured["content_type"] = req.headers.get("content-type", "")
+        captured["body"] = req.content
+        return httpx.Response(200, json={"identifier": "TASK-1", "skipped": True})
+
+    c = _client(handler)
+    await c.skip_document("TASK-1")
+    assert "application/json" in captured["content_type"]
+
+
+async def test_get_artifact_file_returns_bytes():
+    def handler(req):
+        return httpx.Response(200, content=b"hello", headers={"content-type": "text/plain"})
+
+    c = _client(handler)
+    data = await c.get_artifact_file("TASK-1", "qa.md")
+    assert data["content"] == b"hello"
+    assert data["content_type"] == "text/plain"
+
+
+async def test_get_run_diagnostic_path():
+    def handler(req):
+        assert req.url.path == "/api/v1/runs/r1/diagnostic"
+        return httpx.Response(200, json={"trace": "x"})
+
+    c = _client(handler)
+    data = await c.get_run_diagnostic("r1")
+    assert data == {"trace": "x"}

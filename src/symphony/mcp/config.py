@@ -15,6 +15,7 @@ class Settings:
     timeout_seconds: float = 30.0
     token: str | None = None
     allowed_projects: frozenset[str] = field(default_factory=frozenset)
+    allow_control: bool = False
     audit_log: Path = field(
         default_factory=lambda: Path("~/.local/state/symphony-mcp/audit.jsonl").expanduser()
     )
@@ -36,6 +37,13 @@ def _read_token() -> str | None:
     return None
 
 
+def _env_bool(name: str, default: bool = False) -> bool:
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() in ("1", "true", "yes", "on")
+
+
 def load() -> Settings:
     allowed = frozenset(
         p.strip()
@@ -49,4 +57,5 @@ def load() -> Settings:
         timeout_seconds=float(os.environ.get("SYMPHONY_MCP_TIMEOUT", "30")),
         token=_read_token(),
         allowed_projects=allowed,
+        allow_control=_env_bool("SYMPHONY_MCP_ALLOW_CONTROL", default=False),
     )

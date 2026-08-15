@@ -52,6 +52,7 @@ class RunInfo:
     started_at: str | None = None
     finished_at: str | None = None
     error: str | None = None
+    title: str | None = None
 
 
 def to_project(data: dict) -> Project:
@@ -148,17 +149,152 @@ def to_request_status(
 
 
 def to_run_info(data: dict) -> RunInfo:
-    # GET /api/v1/runs/{id} nests the record under "run".
+    # GET /api/v1/runs/{id} nests the record under "run"; GET /api/v1/runs
+    # returns flat records. Both populate `status` (run outcome) and `state`
+    # (board state); prefer `status` as the run's own outcome.
     raw_run = data.get("run")
     run: dict = raw_run if isinstance(raw_run, dict) else data
     return RunInfo(
         run_id=str(run.get("run_id") or run.get("id") or ""),
         task_id=run.get("issue_id") or run.get("identifier") or run.get("task_id"),
         agent=run.get("agent_kind") or run.get("agent"),
-        status=run.get("state") or run.get("status"),
+        status=run.get("status") or run.get("state"),
         started_at=run.get("started_at"),
         finished_at=run.get("completed_at")
         or run.get("finished_at")
         or run.get("ended_at"),
         error=run.get("failure_message") or run.get("error") or run.get("error_message"),
+        title=run.get("title"),
+    )
+
+
+@dataclass(frozen=True)
+class RequestSummary:
+    kind: str = ""
+    id: str = ""
+    node_count: int = 0
+    counts: dict[str, int] = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
+class BoardColumn:
+    name: str = ""
+    terminal: bool = False
+    description: str = ""
+
+
+@dataclass(frozen=True)
+class BoardIssue:
+    identifier: str = ""
+    title: str = ""
+    state: str = ""
+    priority: int | None = None
+
+
+@dataclass(frozen=True)
+class BoardSummary:
+    name: str = ""
+    tracker_kind: str = ""
+    read_only: bool = False
+    default_agent_kind: str = ""
+    agent_kinds: list[str] = field(default_factory=list)
+    columns: list[BoardColumn] = field(default_factory=list)
+    issues: list[BoardIssue] = field(default_factory=list)
+    live: dict[str, dict] = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
+class ArtifactInfo:
+    name: str = ""
+    title: str = ""
+    summary: str = ""
+    content_type: str = ""
+    byte_size: int = 0
+    collected_at: str | None = None
+    run_id: str | None = None
+    turn: int | None = None
+    inline: bool = False
+
+
+@dataclass(frozen=True)
+class WorkflowInfo:
+    workflow_path: str = ""
+    default_agent_kind: str = ""
+    agent_kinds: list[str] = field(default_factory=list)
+    columns: list[BoardColumn] = field(default_factory=list)
+    agent: dict = field(default_factory=dict)
+    continuous_improvement: dict = field(default_factory=dict)
+    preview: dict = field(default_factory=dict)
+    polling_interval_ms: int = 0
+
+
+def to_request_summary(data: dict) -> RequestSummary:
+    return RequestSummary(
+        kind=str(data.get("kind") or ""),
+        id=str(data.get("id") or ""),
+        node_count=int(data.get("node_count") or 0),
+        counts=dict(data.get("counts") or {}),
+    )
+
+
+def to_board_column(data: dict) -> BoardColumn:
+    return BoardColumn(
+        name=str(data.get("name") or ""),
+        terminal=bool(data.get("terminal")),
+        description=str(data.get("description") or ""),
+    )
+
+
+def to_board_issue(data: dict) -> BoardIssue:
+    return BoardIssue(
+        identifier=str(data.get("identifier") or data.get("id") or ""),
+        title=str(data.get("title") or ""),
+        state=str(data.get("state") or ""),
+        priority=data.get("priority") if isinstance(data.get("priority"), int) else None,
+    )
+
+
+def to_board(data: dict) -> BoardSummary:
+    board = data.get("board") or {}
+    board = board if isinstance(board, dict) else {}
+    live = data.get("live") or {}
+    live = live if isinstance(live, dict) else {}
+    return BoardSummary(
+        name=str(board.get("name") or ""),
+        tracker_kind=str(board.get("tracker_kind") or ""),
+        read_only=bool(board.get("read_only")),
+        default_agent_kind=str(board.get("default_agent_kind") or ""),
+        agent_kinds=list(board.get("agent_kinds") or []),
+        columns=[to_board_column(c) for c in (data.get("columns") or []) if isinstance(c, dict)],
+        issues=[to_board_issue(i) for i in (data.get("issues") or []) if isinstance(i, dict)],
+        live={str(k): dict(v) for k, v in live.items() if isinstance(v, dict)},
+    )
+
+
+def to_artifact(data: dict) -> ArtifactInfo:
+    return ArtifactInfo(
+        name=str(data.get("name") or ""),
+        title=str(data.get("title") or ""),
+        summary=str(data.get("summary") or ""),
+        content_type=str(data.get("content_type") or ""),
+        byte_size=int(data.get("byte_size") or 0),
+        collected_at=data.get("collected_at"),
+        run_id=data.get("run_id"),
+        turn=data.get("turn"),
+        inline=bool(data.get("inline")),
+    )
+
+
+def to_workflow(data: dict) -> WorkflowInfo:
+    agent = data.get("agent") or {}
+    agent = agent if isinstance(agent, dict) else {}
+    return WorkflowInfo(
+        workflow_path=str(data.get("workflow_path") or ""),
+        default_agent_kind=str(agent.get("kind") or ""),
+        agent_kinds=list(data.get("agent_kinds") or []),
+        columns=[to_board_column(c) for c in (data.get("columns") or []) if isinstance(c, dict)],
+        agent=dict(agent),
+        continuous_improvement=dict(data.get("continuous_improvement") or {}),
+        preview=dict(data.get("preview") or {}),
+        polling_interval_ms=int(data.get("polling_interval_ms") or 0),
     )

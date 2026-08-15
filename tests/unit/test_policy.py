@@ -24,3 +24,14 @@ def test_permissions_v1():
     for action in ("delete", "pause", "shell", "configure"):
         with pytest.raises(PermissionDenied):
             p.assert_permission(action)
+
+
+def test_control_gate_default_denied():
+    p = Policy(frozenset())
+    with pytest.raises(PermissionDenied):
+        p.assert_control_allowed()
+
+
+def test_control_gate_enabled():
+    p = Policy(frozenset(), allow_control=True)
+    p.assert_control_allowed()

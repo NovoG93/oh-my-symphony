@@ -28,3 +28,13 @@ def test_load_token_from_file(monkeypatch, tmp_path):
     f.write_text("filetoken\n")
     monkeypatch.setenv("SYMPHONY_MCP_TOKEN_FILE", str(f))
     assert load().token == "filetoken"
+
+
+def test_load_allow_control_default_off(monkeypatch):
+    monkeypatch.delenv("SYMPHONY_MCP_ALLOW_CONTROL", raising=False)
+    assert load().allow_control is False
+
+
+def test_load_allow_control_enabled(monkeypatch):
+    monkeypatch.setenv("SYMPHONY_MCP_ALLOW_CONTROL", "1")
+    assert load().allow_control is True

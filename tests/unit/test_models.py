@@ -1,9 +1,13 @@
 from symphony.mcp.models import (
     schedule_items,
+    to_artifact,
+    to_board,
     to_project,
     to_request_status,
+    to_request_summary,
     to_run_info,
     to_task_summary,
+    to_workflow,
 )
 
 
@@ -84,3 +88,70 @@ def test_task_summary_prefers_identifier_and_decision_status():
     assert t.id == "X"
     assert t.stage == "Build"
     assert t.status == "successful"
+
+
+def test_to_run_info_prefers_status_and_maps_title():
+    r = to_run_info(
+        {
+            "run_id": "r1",
+            "issue_id": "TASK-2",
+            "agent_kind": "claude",
+            "state": "Done",
+            "status": "success",
+            "title": "Fix /health",
+        }
+    )
+    assert r.status == "success"  # run outcome wins over board state
+    assert r.title == "Fix /health"
+
+
+def test_to_request_summary():
+    r = to_request_summary(
+        {"kind": "request", "id": "REQ-1", "node_count": 3, "counts": {"running": 1}}
+    )
+    assert r.kind == "request"
+    assert r.id == "REQ-1"
+    assert r.node_count == 3
+    assert r.counts == {"running": 1}
+
+
+def test_to_board():
+    b = to_board(
+        {
+            "board": {"name": "oms", "tracker_kind": "file", "default_agent_kind": "agy"},
+            "columns": [{"name": "Todo", "terminal": False}, {"name": "Done", "terminal": True}],
+            "issues": [{"identifier": "TASK-1", "title": "t", "state": "Todo", "priority": 2}],
+            "live": {"TASK-2": {"status": "running"}},
+        }
+    )
+    assert b.name == "oms"
+    assert b.default_agent_kind == "agy"
+    assert len(b.columns) == 2
+    assert b.columns[1].terminal is True
+    assert b.issues[0].identifier == "TASK-1"
+    assert b.issues[0].priority == 2
+    assert b.live == {"TASK-2": {"status": "running"}}
+
+
+def test_to_artifact():
+    a = to_artifact(
+        {"name": "qa.md", "title": "QA report", "content_type": "text/plain", "byte_size": 42}
+    )
+    assert a.name == "qa.md"
+    assert a.title == "QA report"
+    assert a.byte_size == 42
+
+
+def test_to_workflow():
+    w = to_workflow(
+        {
+            "workflow_path": "/x/WORKFLOW.md",
+            "agent": {"kind": "agy"},
+            "agent_kinds": ["agy", "claude", "codex"],
+            "columns": [{"name": "Todo", "terminal": False}],
+        }
+    )
+    assert w.workflow_path == "/x/WORKFLOW.md"
+    assert w.default_agent_kind == "agy"
+    assert w.agent_kinds == ["agy", "claude", "codex"]
+    assert len(w.columns) == 1
