@@ -37,6 +37,17 @@ Honour the gate matching `{{ issue.state }}`. One stage = one transition; never 
 - Token budget: keep this turn under {{ token_budget }} completion tokens (stage EMA: {{ token_ema }}). Cut narration, never evidence.
 {% endif %}
 
+## Repo orientation (graphify)
+
+A code-only knowledge graph is pre-built at `graphify-out/graph.json` in this workspace. Before broad repo exploration (blind `Search`/`ReadFile` sweeps), query it to locate the exact modules, functions, and call paths this ticket touches:
+
+- `graphify query "<question>"` — broad context (BFS); add `--budget 1500` for a fuller answer.
+- `graphify query "<question>" --dfs` — trace one specific path.
+- `graphify path "<symbol A>" "<symbol B>"` — shortest path between two concepts.
+- `graphify explain "<symbol>"` — plain-language summary of a node.
+
+Treat "where is X defined / what calls Y / how does Z flow" as a graphify query first; then verify by reading only the files the graph points to. The graph is already built — do not re-run extraction.
+
 ## Board card mental model
 
 Each lane answers one human question. Todo: is this ready to work? In Progress: what are we changing and how will we prove it? Verify: did it really work and is it safe to merge? Document: what should the next ticket remember? Done: what changed from As-Is to To-Be?
