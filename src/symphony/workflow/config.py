@@ -101,6 +101,25 @@ class HooksConfig:
 
 
 @dataclass(frozen=True)
+class AgentProfileConfig:
+    """Named agent configuration profile.
+
+    Inherits from the global backend config and overrides only explicitly
+    configured fields (None = inherit).
+    """
+
+    name: str
+    kind: str
+    model: str | None = None
+    reasoning_effort: str | None = None
+    command: str | None = None
+    turn_timeout_ms: int | None = None
+    read_timeout_ms: int | None = None
+    stall_timeout_ms: int | None = None
+    resume_across_turns: bool | None = None
+
+
+@dataclass(frozen=True)
 class AgentConfig:
     kind: str
     max_concurrent_agents: int
@@ -238,6 +257,13 @@ class AgentConfig:
     # to raise the *backend's* stall_timeout_ms for every lane at once.
     # Falls back to the resolved backend's `stall_timeout_ms`.
     stall_timeout_ms_by_state: dict[str, int] = field(default_factory=dict)
+    # Optional per-state profile routing. Keys are tracker state names
+    # lowercased by the parser, values are profile names defined in
+    # `agent_profiles`.
+    stage_profiles: dict[str, str] = field(default_factory=dict)
+    # Optional default profile name from `agent_profiles`. When set,
+    # stages without an explicit stage_profiles mapping use this profile.
+    default_profile: str | None = None
 
     def stage_contracts_enabled(self, active_states: "tuple[str, ...]") -> bool:
         """Resolve `agent.stage_contracts` against the board's lanes."""
@@ -635,6 +661,8 @@ class ServiceConfig:
     # Ticket artifact collection — appended after the original fields so
     # positional ServiceConfig callers keep receiving the same values.
     artifacts: ArtifactsConfig = field(default_factory=ArtifactsConfig)
+    # Named agent profiles map (profile_name -> AgentProfileConfig)
+    agent_profiles: dict[str, AgentProfileConfig] = field(default_factory=dict)
 
     def prompt_template_for_state(self, state: str) -> str:
         """Return the runtime prompt template for one tracker state."""
