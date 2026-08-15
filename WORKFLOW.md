@@ -329,11 +329,11 @@ agy:
   # `agy models`; the 3.7 generation is "flash"-only, "pro" is still 3.1).
   # Symphony appends `--dangerously-skip-permissions` (and `--continue` on
   # continuation turns when resume_across_turns is true).
-  command: 'agy --model gemini-3.7-flash-high --print "$(cat)"'
+  command: 'agy --model gemini-3.7-flash-high --print-timeout 30m --print "$(cat)"'
   resume_across_turns: true
   turn_timeout_ms: 3600000
   read_timeout_ms: 20000
-  stall_timeout_ms: 300000
+  stall_timeout_ms: 900000
 
 prime_agent:
   command: 'prime-agent -p --mode json'
