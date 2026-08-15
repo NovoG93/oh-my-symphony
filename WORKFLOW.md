@@ -238,7 +238,15 @@ hooks:
   #            See docs/${ISSUE_ID}/ for evidence." 2>/dev/null || true
 
 agent:
-  kind: claude
+  kind: agy
+  # Per-state backend routing — precedence per dispatch:
+  #   per-ticket `agent_kind` pin > stage_kinds > kind.
+  # codex plans (Todo), agy implements (In Progress = default kind),
+  # claude reviews (Verify) and documents (Document).
+  stage_kinds:
+    Todo: codex
+    Verify: claude
+    Document: claude
   max_concurrent_agents: 1
   max_turns: 100
   max_retry_backoff_ms: 300000
@@ -259,7 +267,7 @@ agent:
   # File-board optimization: obvious Todo tickets with Acceptance Criteria
   # are routed to In Progress by Symphony itself, saving a model turn. Bug
   # tickets, blocked tickets, and underspecified tickets still run Todo.
-  auto_triage_actionable_todo: true
+  auto_triage_actionable_todo: false  # force codex to plan in Todo (no fast-track)
   # Blocked integration/merge/review episodes are software work: Symphony
   # opens one deduplicated FIX ticket, dispatches it, verifies the repair,
   # and reopens the source ticket without waiting for an operator.
@@ -286,14 +294,14 @@ agent:
   auto_merge_on_done: true
   # Publish and verify the target upstream after the local --no-ff merge.
   # Set false for a local-only run; no git push or git ls-remote is attempted.
-  auto_merge_push_target: true
+  auto_merge_push_target: false
   # Branch/ref used as the start point for new `symphony/<ID>` feature
   # branches. Empty string = current host branch. The board viewer can
   # update this from its real git branch dropdown.
-  feature_base_branch: "dev"
+  feature_base_branch: "main"
   # Branch to merge into after Document. Pinning this avoids integration drift
   # when an operator checks out another host branch while Symphony is running.
-  auto_merge_target_branch: "dev"
+  auto_merge_target_branch: "main"
   auto_merge_exclude_paths:
     - kanban
 
@@ -315,6 +323,18 @@ claude:
   read_timeout_ms: 20000
   stall_timeout_ms: 300000
 
+agy:
+  # Antigravity CLI (agy) print mode — the default `kind` (implementer).
+  # Model pinned via `--model` to `gemini-3.7-flash-high` (verified via
+  # `agy models`; the 3.7 generation is "flash"-only, "pro" is still 3.1).
+  # Symphony appends `--dangerously-skip-permissions` (and `--continue` on
+  # continuation turns when resume_across_turns is true).
+  command: 'agy --model gemini-3.7-flash-high --print "$(cat)"'
+  resume_across_turns: true
+  turn_timeout_ms: 3600000
+  read_timeout_ms: 20000
+  stall_timeout_ms: 300000
+
 prime_agent:
   command: 'prime-agent -p --mode json'
   resume_across_turns: true
@@ -323,14 +343,12 @@ prime_agent:
   stall_timeout_ms: 300000
 
 codex:
-  # `-c model=...` forces a valid model at thread/start time. The user
-  # ~/.codex/config.toml here pins `gpt-5.5` which is not a valid model
-  # name in codex 0.130; without the override, `thread/start` hangs
-  # silently (no JSON-RPC error response) and Symphony eventually surfaces
-  # this as `port_exit: subprocess stdout closed` after the subprocess
-  # times out. Override keeps the codex backend usable while leaving the
-  # user-level config untouched.
-  command: codex app-server -c model=gpt-5-codex
+  # Model pinned via `-c model=...`. The ChatGPT (OAuth) account exposes a
+  # restricted model set: `gpt-5.6-sol` (codex default) works; `gpt-5.6-sol-high`
+  # and `gpt-5-codex` are REJECTED ("not supported with a ChatGPT account").
+  # "gpt 5.6 sol high" = model `gpt-5.6-sol` + reasoning_effort high (default).
+  command: codex app-server -c model=gpt-5.6-sol
+  reasoning_effort: high
   approval_policy: never
   # The release workflow requires workers to run Playwright/Chromium gates.
   # Codex's macOS workspace-write sandbox can block Chromium's Mach bootstrap
