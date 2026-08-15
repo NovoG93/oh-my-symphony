@@ -1,5 +1,12 @@
 # Production pipeline
 
+> **Status note (2026-08-15, SMOKE-003): historical.** The live pipeline in
+> `WORKFLOW.md`, `WORKFLOW.example.md`, and `WORKFLOW.file.example.md` is the
+> 4-active-state `Todo -> In Progress -> Verify -> Document -> Done` shape —
+> all three declare `active_states: [Todo, "In Progress", Verify, Document]`.
+> The 8-stage invariants below describe the earlier layout and no longer
+> match the repo. Full rewrite: dedicated follow-up ticket.
+
 **Summary:** Symphony drives every ticket through an eight-stage gated
 pipeline (Todo -> Explore -> Plan -> In Progress -> Review -> QA ->
 Learn -> Done) implemented in the prompt, not the Python core. Three artefacts
@@ -78,5 +85,6 @@ cannot detect (states are just opaque strings to the Python core).
   example. Leaving its full conversion to a separate ticket avoids
   drive-by scope creep.
 - 2026-05-09 | (this ticket) | Absorbed evidence-first ideas from cskwork/backend-dev-skills (MIT): bug-label reproduce sub-block in Triage, durable HTTP/e2e proofs in Review/QA, per-ticket docs/<id>/<stage>/ artefact root, LLM_WIKI_PATH env override.
+- 2026-08-15 | SMOKE-003 | Marked page historical: all three WORKFLOW files declare the 4-state `active_states` list. Kept the 8-stage body as history; rewrite deferred to a dedicated ticket to avoid drive-by scope creep.
 
 **Last updated:** 2026-05-17 by Todo auto-triage.

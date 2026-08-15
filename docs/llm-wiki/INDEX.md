@@ -15,3 +15,4 @@ before any new ticket; Learn writes back to them after QA passes.
 | board-viewer-theming | CSS variable token surface + `:root[data-theme="..."]` override pattern + UI Zoom micro-pattern mirrored for theme persistence. **Historical:** `tools/board-viewer/` was removed; the built-in web app is the only board | 2026-05-17 (SMA-23) |
 | session-persistence | Per-workspace `.symphony-session.json` + load on dispatch + save on session_started + per-backend honor-points + codex `thread/resume` fallback | 2026-05-10 (SMA-20) |
 | tui-rendering | Textual `KanbanApp` widget tree + diff-mount card refresh + heartbeat / observer / tracker poll cadence + invariants the helpers preserve | 2026-05-10 (Textual migration) |
+| byte-exact-static-deliverables | printf-over-echo deterministic write + cmp/od/wc/sha256sum proof chain + workspace-fixture pattern when /tmp writes are blocked | 2026-08-15 (SMOKE-003) |
