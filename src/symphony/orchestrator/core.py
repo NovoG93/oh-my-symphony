@@ -54,6 +54,7 @@ from ..utils import git_inspect
 from ..utils.archive import select_archivable
 from ..backends.codex import linear_graphql_tool
 from ..errors import (
+    ConfigValidationError,
     SymphonyError,
     TurnFailed,
     TurnInputRequired,
@@ -6174,7 +6175,21 @@ class Orchestrator:
         resolved_attempt_kind = attempt_kind or (
             "retry" if attempt is not None else "initial"
         )
-        agent_kind = cfg.agent.kind_for_state(issue.state, _requested_agent_kind(issue))
+        try:
+            dispatch_selection = cfg.selection_for_state(
+                issue.state,
+                ticket_profile=_requested_agent_profile(issue),
+                ticket_kind=_requested_agent_kind(issue),
+            )
+        except ConfigValidationError as exc:
+            log.error(
+                "dispatch_selection_refused",
+                issue_id=issue.id,
+                identifier=issue.identifier,
+                error=str(exc),
+            )
+            return False
+        agent_kind = dispatch_selection.kind
         acquisition = self._try_acquire_run_lease(
             cfg=cfg,
             issue=issue,

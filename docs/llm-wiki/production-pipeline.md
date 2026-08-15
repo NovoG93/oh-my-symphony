@@ -87,5 +87,6 @@ cannot detect (states are just opaque strings to the Python core).
 - 2026-05-09 | (this ticket) | Absorbed evidence-first ideas from cskwork/backend-dev-skills (MIT): bug-label reproduce sub-block in Triage, durable HTTP/e2e proofs in Review/QA, per-ticket docs/<id>/<stage>/ artefact root, LLM_WIKI_PATH env override.
 - 2026-08-15 | SMOKE-003 | Marked page historical: all three WORKFLOW files declare the 4-state `active_states` list. Kept the 8-stage body as history; rewrite deferred to a dedicated ticket to avoid drive-by scope creep.
 - 2026-08-15 | TASK-4 | The gate's contract check matches exact section headers: the Verify-stage prompt's literal title `## Merge Status: preflight clean, orchestrator will merge at Done` (docs/symphony-prompts/{file,linear}/stages/verify.md) failed the `## Merge Status` match and rewound the ticket. Stage outputs must use bare canonical headers with qualifiers in the body.
+- 2026-08-15 | TASK-6 | Third recurrence of that exact-header rewind (TASK-1, TASK-4, TASK-6): the Verify-prompt title in docs/symphony-prompts/{file,linear}/stages/verify.md is still the trap. Until the prompt template itself is fixed, Verify must emit bare `## Merge Status`. Also: a contract rewind rewrites commit topology (the Verify-pass tip is orphaned; HEAD holds the identical tree) — re-check `git merge-base`/delta before quoting tips.
 
-**Last updated:** 2026-08-15 by TASK-4 Document.
+**Last updated:** 2026-08-15 by TASK-6 Document.
