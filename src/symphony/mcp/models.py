@@ -150,15 +150,17 @@ def to_request_status(
 
 def to_run_info(data: dict) -> RunInfo:
     # GET /api/v1/runs/{id} nests the record under "run"; GET /api/v1/runs
-    # returns flat records. Both populate `status` (run outcome) and `state`
-    # (board state); prefer `status` as the run's own outcome.
+    # returns flat records. Prefer `state` (the ticket's board state) as the
+    # human-meaningful status; the raw `status` field is the run registry's
+    # internal lifecycle enum (active/normal/orphaned/...), less useful here.
+    # Failure is surfaced separately via `error` (failure_message).
     raw_run = data.get("run")
     run: dict = raw_run if isinstance(raw_run, dict) else data
     return RunInfo(
         run_id=str(run.get("run_id") or run.get("id") or ""),
         task_id=run.get("issue_id") or run.get("identifier") or run.get("task_id"),
         agent=run.get("agent_kind") or run.get("agent"),
-        status=run.get("status") or run.get("state"),
+        status=run.get("state") or run.get("status"),
         started_at=run.get("started_at"),
         finished_at=run.get("completed_at")
         or run.get("finished_at")

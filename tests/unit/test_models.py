@@ -90,18 +90,18 @@ def test_task_summary_prefers_identifier_and_decision_status():
     assert t.status == "successful"
 
 
-def test_to_run_info_prefers_status_and_maps_title():
+def test_to_run_info_prefers_state_and_maps_title():
     r = to_run_info(
         {
             "run_id": "r1",
             "issue_id": "TASK-2",
             "agent_kind": "claude",
             "state": "Done",
-            "status": "success",
+            "status": "normal",
             "title": "Fix /health",
         }
     )
-    assert r.status == "success"  # run outcome wins over board state
+    assert r.status == "Done"  # board state wins over the registry lifecycle enum
     assert r.title == "Fix /health"
 
 
