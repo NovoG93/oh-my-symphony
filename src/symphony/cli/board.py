@@ -38,11 +38,13 @@ from ..trackers.validate import (
 from ..workflow import (
     DEFAULT_BOARD_ROOT_NAME,
     SUPPORTED_AGENT_KINDS,
+    ServiceConfig,
     TrackerConfig,
     build_service_config,
     load_workflow,
     resolve_workflow_path,
 )
+
 
 
 def _operator_message(exc: BaseException) -> str:
@@ -60,6 +62,17 @@ def _operator_message(exc: BaseException) -> str:
             return f"{message} ({details})"
         return message
     return str(exc)
+
+
+def _resolve_service_config(args: argparse.Namespace) -> ServiceConfig | None:
+    """Return ServiceConfig from WORKFLOW.md or None if not found/loadable."""
+    workflow_path = resolve_workflow_path(args.workflow)
+    if workflow_path.exists():
+        try:
+            return build_service_config(load_workflow(workflow_path))
+        except SymphonyError:
+            return None
+    return None
 
 
 def _resolve_tracker(args: argparse.Namespace) -> TrackerConfig | None:
@@ -193,6 +206,28 @@ def cmd_new(args: argparse.Namespace) -> int:
         )
         return 1
     blocked_by = list(dict.fromkeys(args.blocked_by or []))
+
+    agent_kind = getattr(args, "agent_kind", None)
+    agent_profile = getattr(args, "agent_profile", None)
+    if agent_profile is not None and agent_kind is not None:
+        print("error: cannot set both --agent-kind and --agent-profile", file=sys.stderr)
+        return 1
+    if agent_profile is not None:
+        cleaned_prof = agent_profile.strip()
+        if not cleaned_prof:
+            print("error: agent profile name cannot be empty", file=sys.stderr)
+            return 1
+        svc_cfg = _resolve_service_config(args)
+        if svc_cfg is not None and svc_cfg.agent_profiles:
+            if cleaned_prof not in svc_cfg.agent_profiles:
+                print(
+                    f"error: unknown agent profile {cleaned_prof!r}; "
+                    f"available: {sorted(svc_cfg.agent_profiles.keys())}",
+                    file=sys.stderr,
+                )
+                return 1
+        agent_profile = cleaned_prof
+
     try:
         description = _read_description(args)
 
@@ -214,7 +249,8 @@ def cmd_new(args: argparse.Namespace) -> int:
             priority=args.priority,
             labels=_collect_labels(args),
             description=description,
-            agent_kind=args.agent_kind,
+            agent_kind=agent_kind,
+            agent_profile=agent_profile,
             blocked_by=blocked_by or None,
             request=args.request,
         )
@@ -223,6 +259,7 @@ def cmd_new(args: argparse.Namespace) -> int:
         return 1
     print(f"created {path}")
     return 0
+
 
 
 def cmd_mv(args: argparse.Namespace) -> int:
@@ -268,6 +305,30 @@ def cmd_update(args: argparse.Namespace) -> int:
             )
             return 1
 
+    agent_kind = getattr(args, "agent_kind", None)
+    agent_profile = getattr(args, "agent_profile", None)
+    if (
+        agent_profile is not None
+        and agent_kind is not None
+        and agent_profile.strip()
+        and agent_kind.strip()
+    ):
+        print("error: cannot set both --agent-kind and --agent-profile", file=sys.stderr)
+        return 1
+
+    if agent_profile is not None:
+        cleaned_prof = agent_profile.strip()
+        if cleaned_prof:
+            svc_cfg = _resolve_service_config(args)
+            if svc_cfg is not None and svc_cfg.agent_profiles:
+                if cleaned_prof not in svc_cfg.agent_profiles:
+                    print(
+                        f"error: unknown agent profile {cleaned_prof!r}; "
+                        f"available: {sorted(svc_cfg.agent_profiles.keys())}",
+                        file=sys.stderr,
+                    )
+                    return 1
+
     try:
         issues = fbt.scan_all()
         current = next((i for i in issues if i.identifier == identifier), None)
@@ -295,6 +356,8 @@ def cmd_update(args: argparse.Namespace) -> int:
             state=state,
             blocked_by=blocked_by,
             request=args.request,
+            agent_kind=agent_kind,
+            agent_profile=agent_profile,
         )
     except (OSError, SymphonyError) as exc:
         print(f"error: {_operator_message(exc)}", file=sys.stderr)
@@ -307,6 +370,10 @@ def cmd_update(args: argparse.Namespace) -> int:
         changes.append(f"blocked_by={','.join(blocked_by) or '(cleared)'}")
     if args.request is not None:
         changes.append(f"request={args.request or '(cleared)'}")
+    if agent_kind is not None:
+        changes.append(f"agent_kind={agent_kind or '(cleared)'}")
+    if agent_profile is not None:
+        changes.append(f"agent_profile={agent_profile or '(cleared)'}")
     print(f"updated {identifier} ({', '.join(changes) or 'no changes'}) -> {path}")
     return 0
 
@@ -328,14 +395,19 @@ def cmd_show(args: argparse.Namespace) -> int:
     if front.get("request"):
         print(f"request: {front['request']}")
     agent = front.get("agent")
-    if isinstance(agent, dict) and agent.get("kind"):
+    if isinstance(agent, dict) and agent.get("profile"):
+        print(f"agent: profile={agent['profile']}")
+    elif isinstance(agent, dict) and agent.get("kind"):
         print(f"agent: {agent['kind']}")
+    elif front.get("agent_profile"):
+        print(f"agent: profile={front['agent_profile']}")
     elif front.get("agent_kind"):
         print(f"agent: {front['agent_kind']}")
     if body:
         print()
         print(body)
     return 0
+
 
 
 def cmd_graph(args: argparse.Namespace) -> int:
@@ -451,6 +523,12 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="override backend for this ticket (default: WORKFLOW.md agent.kind)",
     )
+    p_new.add_argument(
+        "--agent-profile",
+        dest="agent_profile",
+        default=None,
+        help="override agent profile for this ticket",
+    )
     p_new.set_defaults(func=cmd_new)
 
     p_mv = sub.add_parser("mv", help="change a ticket state")
@@ -483,7 +561,22 @@ def build_parser() -> argparse.ArgumentParser:
         metavar="REQ",
         help="request grouping id ('' clears it)",
     )
+    p_update.add_argument(
+        "--agent-kind",
+        "--agent",
+        dest="agent_kind",
+        choices=sorted(SUPPORTED_AGENT_KINDS),
+        default=None,
+        help="override backend for this ticket ('' clears it)",
+    )
+    p_update.add_argument(
+        "--agent-profile",
+        dest="agent_profile",
+        default=None,
+        help="override agent profile for this ticket ('' clears it)",
+    )
     p_update.set_defaults(func=cmd_update)
+
 
     p_show = sub.add_parser("show", help="print a ticket's contents")
     add_workflow_args(p_show)

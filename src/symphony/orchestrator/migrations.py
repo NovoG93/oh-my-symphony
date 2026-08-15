@@ -40,6 +40,7 @@ RELEASE_PROVENANCE_VERSION = 5
 RELEASE_CYCLE_AUTHORITY_VERSION = 6
 RUN_EXPLORER_VERSION = 7
 DURABLE_CONTINUATION_VERSION = 8
+RUN_AGENT_PROFILE_VERSION = 9
 
 
 @dataclass(frozen=True)
@@ -578,6 +579,18 @@ def _migrate_008_durable_continuation(conn: sqlite3.Connection) -> None:
     )
 
 
+def _migrate_009_agent_profile_columns(conn: sqlite3.Connection) -> None:
+    """Add agent_profile, model, and reasoning_effort columns to runs table."""
+    if not _table_columns(conn, "runs"):
+        _migrate_001_baseline(conn)
+    for column, declaration in (
+        ("agent_profile", "TEXT"),
+        ("model", "TEXT"),
+        ("reasoning_effort", "TEXT"),
+    ):
+        _add_column_if_missing(conn, "runs", column, declaration)
+
+
 MIGRATIONS: tuple[Migration, ...] = (
     Migration(1, "baseline_runs_and_issue_flags", _migrate_001_baseline),
     # The recorded name stays "governed_workflow_ledger" so existing
@@ -609,7 +622,13 @@ MIGRATIONS: tuple[Migration, ...] = (
         "durable_crash_continuation",
         _migrate_008_durable_continuation,
     ),
+    Migration(
+        RUN_AGENT_PROFILE_VERSION,
+        "run_agent_profile_provenance",
+        _migrate_009_agent_profile_columns,
+    ),
 )
+
 
 LATEST_SCHEMA_VERSION = MIGRATIONS[-1].version
 

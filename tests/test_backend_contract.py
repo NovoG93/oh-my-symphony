@@ -501,7 +501,9 @@ async def test_no_backend_grants_extra_roots_for_a_plain_repo_workspace(
     """A workspace that owns its `.git` needs nothing extra — stay quiet."""
     if shutil.which("git") is None:
         pytest.skip("git CLI required")
+    monkeypatch.delenv(GIT_ROOTS_ENV_VAR, raising=False)
     workspace_root = tmp_path / "workspaces"
+
     cwd = workspace_root / "ws"
     cwd.mkdir(parents=True)
     subprocess.run(

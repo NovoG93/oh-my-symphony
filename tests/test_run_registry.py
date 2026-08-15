@@ -987,7 +987,8 @@ def test_v4_release_gate_migration_backfills_generation_and_evidence_identity(
 
     registry = RunRegistry(path)
 
-    assert registry.applied_migrations == (5, 6, 7, 8)
+    assert registry.applied_migrations == (5, 6, 7, 8, 9)
+
     assert len(list(tmp_path.glob("state.db.backup-*"))) == 1
     for finalizer, verifier in (
         ("PENDING-FINAL", "PENDING-VERIFY"),
@@ -1110,7 +1111,7 @@ def test_v5_release_completion_without_ticket_token_is_invalidated(
     gate = registry.get_release_gate("APP-FINAL")
     evidence = registry.get_release_evidence_identity("VERIFY-1")
 
-    assert registry.applied_migrations == (6, 7, 8)
+    assert registry.applied_migrations == (6, 7, 8, 9)
     assert gate is not None and evidence is not None
     assert gate.status == "pending"
     assert gate.generation and gate.generation != "old-generation"
@@ -1229,7 +1230,7 @@ def test_concurrent_v4_to_v6_migration_backfills_once_after_same_version_read(
     assert not any(starter.is_alive() for starter in starters)
     assert errors == []
     assert len(results) == 2
-    assert sorted(applied for applied, _generation in results) == [(), (5, 6, 7, 8)]
+    assert sorted(applied for applied, _generation in results) == [(), (5, 6, 7, 8, 9)]
     generations = {generation for _applied, generation in results}
     assert len(generations) == 1
     assert next(iter(generations))
@@ -1406,7 +1407,8 @@ def test_run_explorer_v7_summary_events_and_diagnostic_are_bounded(tmp_path: Pat
         now=datetime(2026, 9, 1, tzinfo=timezone.utc),
     )
     assert run_id is not None
-    assert registry.schema_version() == 8
+    assert registry.schema_version() == 9
+
 
     registry.append_attempt_event(
         run_id=run_id,
