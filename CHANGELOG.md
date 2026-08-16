@@ -10,6 +10,17 @@ Versioning: [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.21.0] - 2026-08-16 - Named agent profiles and MCP gateway
+
+### Added
+
+- **Named agent profiles.** Per-stage agent specialization through
+  `AgentProfileConfig`, a precedence-based resolver (`selection_for_state`),
+  and `resolve_agent_config` overlaying profile fields onto the backend config.
+- **Streamable HTTP MCP gateway.** A deny-by-default, bearer-authed MCP server
+  (17 tools) fronting the orchestrator REST API, with control tools gated
+  behind `SYMPHONY_MCP_ALLOW_CONTROL`.
+
 ## [0.20.1] - 2026-08-13 - Proxied and tunnelled boards can manage projects
 
 ### Fixed
