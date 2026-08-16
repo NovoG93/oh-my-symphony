@@ -5,8 +5,9 @@ profiles: a frozen `AgentSelection` value type, the 8-tier
 `selection_for_state` resolver, the `resolve_agent_config` overlay that
 produces a concrete backend config per dispatch, `BackendInit` plumbing so
 every backend driver receives the resolved config, and per-stage-transition
-re-resolution in the orchestrator. CLI flag injection (Phase 3) and UI
-(Phase 5) remain out of scope.
+re-resolution in the orchestrator. CLI flag injection (Phase 3, TASK-6)
+and web UI profile editing (deferred post-feature, plan §16) were out of
+scope for this phase.
 
 **Resolution model (`src/symphony/workflow/config.py`):**
 - `AgentSelection(kind, profile)` — `@dataclass(frozen=True)`; `profile`
@@ -88,4 +89,8 @@ pytest-cache-evidence, security-review, merge-preflight, runtime-blocked).
   `lastfailed={}` + nodeids-count vs the worker-recorded run totals (see
   `docs/TASK-5/qa/pytest-cache-evidence.md`).
 
-**Last updated:** 2026-08-15 by TASK-5 Document.
+- 2026-08-16 | TASK-8 | Scope note corrected: Phase 5 was documentation +
+  E2E validation, not UI; web UI profile editing is deferred post-feature
+  (plan §16) — see [[agent-profiles-validation-and-docs]].
+
+**Last updated:** 2026-08-16 by TASK-8 Document.

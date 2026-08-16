@@ -44,7 +44,7 @@ When resolving the agent for a given tracker state and dispatch:
 |---|---|
 | `codex` | `model`, `reasoning_effort`, `command`, `turn_timeout_ms`, `read_timeout_ms`, `stall_timeout_ms` |
 | `claude` | `model`, `command`, `resume_across_turns`, `turn_timeout_ms`, `read_timeout_ms`, `stall_timeout_ms` |
-| `gemini`, `agy`, `kiro`, `opencode`, `pi`, `prime_agent` | `command`, `resume_across_turns` (except gemini), `turn_timeout_ms`, `read_timeout_ms`, `stall_timeout_ms` |
+| `gemini`, `agy`, `kiro`, `opencode`, `pi`, `prime_agent` | `command`, `resume_across_turns` (accepted for all; inert on gemini — the gemini backend has no resume support), `turn_timeout_ms`, `read_timeout_ms`, `stall_timeout_ms` |
 
 ### 1.6 Session Identity & Isolation
 - Session identity is scoped by `(ticket_id, backend_kind, profile_name)`.

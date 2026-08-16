@@ -48,6 +48,9 @@ Phase 3's branch delta beyond main is `claude_code.py` (+21), `core.py`
   `lastfailed` empty (indirect; live rerun denied in the worktree) —
   `docs/TASK-6/qa/test-run-evidence.md`.
 
-**Remaining phases:** Phase 4 (run-record/CLI/doctor), Phase 5 (UI).
+- 2026-08-16 | TASK-8 | Phase 4 landed in TASK-7
+  ([[agent-profile-observability-tooling]]); Phase 5 (docs + E2E
+  validation) landed in TASK-8 ([[agent-profiles-validation-and-docs]]).
+  Web UI profile editing is deferred post-feature (plan §16).
 User-facing key docs: `WORKFLOW.example.md` gained a commented
 `agent_profiles:` block in TASK-6's Document pass.

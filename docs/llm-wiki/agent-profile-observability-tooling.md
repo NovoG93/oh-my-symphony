@@ -21,7 +21,8 @@ checks. 18 new tests; recorded full-suite session 2,371 collected,
   supplies it at acquisition; `diagnostics.py` allowlists the three keys on
   the `run_acquired` event.
 - `symphony runs` output is unchanged (still prints `agent_kind`) — the new
-  columns are persisted provenance; UI surfacing is Phase 5.
+  columns are persisted provenance; UI surfacing is deferred post-feature
+  (plan §16).
 
 **Ticket override (`src/symphony/trackers/file.py`):**
 - `create`/`update_fields` write `agent: {profile: <name>}` frontmatter;
@@ -80,6 +81,8 @@ show/rejections, 7 doctor checks). QA artefacts under `docs/TASK-7/qa/`
   ticket frontmatter via the tracker, and `selection_for_state`'s
   `dispatch_profile`/`dispatch_kind` still have no callers.
 
-**Remaining:** Phase 5 — web UI surfacing of profiles and run-record fields.
+- 2026-08-16 | TASK-8 | Phase 5 was documentation + E2E validation, not
+  web UI — see [[agent-profiles-validation-and-docs]]. Web UI surfacing of
+  profiles and run-record fields remains deferred post-feature (plan §16).
 
-**Last updated:** 2026-08-15 by TASK-7 Document.
+**Last updated:** 2026-08-16 by TASK-8 Document.
