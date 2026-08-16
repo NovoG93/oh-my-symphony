@@ -15,7 +15,7 @@ def _settings(tmp_path, allow_control=False):
 
 
 @pytest.mark.asyncio
-async def test_registers_16_tools(tmp_path):
+async def test_registers_17_tools(tmp_path):
     mcp = build_mcp(_settings(tmp_path))
     tools = await mcp.list_tools()
     names = {t.name for t in tools}
