@@ -199,13 +199,77 @@ agent:
 CLI에서 파일 보드 티켓을 만들 때는
 `symphony board new TASK-2 "title" --agent-kind codex`를 쓴다.
 
-티켓 고정값과 전역 기본값 사이에는 선택적 상태별 라우팅이 있다:
-`agent.stage_kinds`는 보드 상태를 에이전트 kind에 매핑해서, 가벼운 레인은
-저렴하고 빠른 에이전트가(예: `Todo: gemini`, `Document: gemini`), Plan/Build/Review는
-강한 기본 에이전트가 맡게 한다. 디스패치별 우선순위: 티켓 `agent_kind` 고정 >
-`agent.stage_kinds[state]` > `agent.kind`. 백엔드는 상태가 바뀔 때마다 다시
-결정된다 — 한 번의 디스패치 안에서 일어나는 레인 전환도 포함이라, In Progress →
-Verify → Document를 한 디스패치로 걷는 티켓도 레인마다 설정된 백엔드를 받는다.
+### 명명된 에이전트 프로필 (Named Agent Profiles)
+
+명명된 에이전트 프로필(`agent_profiles:`)을 사용하면 백엔드 종류뿐만 아니라 개별 단계나 티켓마다 특정 모델, 추론 강도(reasoning effort), 실행 설정을 세밀하게 지정할 수 있다. 상세 내용은 [docs/features/agent-profiles.md](docs/features/agent-profiles.md)를 참조한다.
+
+#### 프로필 상속 및 지원 필드
+프로필은 전역 백엔드 설정 블록(`codex:`, `claude:` 등)의 설정을 상속하며, 명시적으로 설정된 필드만 오버레이한다:
+- **`codex`**: `model`, `reasoning_effort`, `command`, `turn_timeout_ms`, `read_timeout_ms`, `stall_timeout_ms`
+- **`claude`**: `model` (`--model <name>` 자동 주입), `command`, `resume_across_turns`, `turn_timeout_ms`, `read_timeout_ms`, `stall_timeout_ms`
+- **`gemini`, `agy`, `kiro`, `opencode`, `pi`, `prime_agent`**: `command`, `resume_across_turns`, 타임아웃. 지원되지 않는 필드는 설정 빌드 시 검증 실패한다. gemini 백엔드는 `resume_across_turns`를 허용하지만 재개(resume)를 지원하지 않아 무시된다.
+
+#### 8단계 결정 우선순위
+1. `dispatch_profile` (명시적 CLI / 런타임 디스패치 프로필)
+2. `dispatch_kind` (명시적 CLI / 런타임 디스패치 kind)
+3. 티켓 `agent.profile` / `agent_profile:` (티켓 frontmatter 고정)
+4. 티켓 `agent.kind` / `agent_kind:` (티켓 frontmatter 고정)
+5. `agent.stage_profiles[state]` (워크플로 단계별 프로필 매핑)
+6. `agent.stage_kinds[state]` (워크플로 단계별 kind 매핑)
+7. `agent.default_profile` (워크플로 기본 프로필)
+8. `agent.kind` (워크플로 전역 기본 kind)
+
+프로필은 **단계가 바뀔 때마다(In Progress → Verify → Document)** 다시 계산된다. 세션은 `(ticket, backend kind, profile)` 단위로 격리되므로 프로필이 달라지면 독립된 새 세션이 시작된다.
+
+#### 티켓 레벨 프로필 재정의
+티켓 frontmatter에 프로필을 지정할 수 있다:
+
+```yaml
+agent:
+  profile: sol
+```
+
+플랫 별칭 `agent_profile: sol`도 지원된다. 하나의 티켓에 `agent_kind`와 `agent_profile`을 동시에 지정하면 모호성으로 거부된다.
+
+#### 예시: 다중 모델 및 혼합 백엔드 워크플로
+
+```yaml
+agent:
+  kind: claude
+  stage_profiles:
+    Research: fable-planner
+    Plan: sol-planner
+    Build: sonnet-builder
+    Review: sol-reviewer
+    QA: luna-qa
+
+agent_profiles:
+  fable-planner:
+    kind: claude
+    model: fable
+  sol-planner:
+    kind: codex
+    model: sol
+    reasoning_effort: high
+  sonnet-builder:
+    kind: claude
+    model: sonnet
+  sol-reviewer:
+    kind: codex
+    model: sol
+    reasoning_effort: high
+  luna-qa:
+    kind: codex
+    model: luna
+    reasoning_effort: medium
+```
+
+#### 하위 호환성 및 마이그레이션 안내
+기존 `agent.kind` 및 `agent.stage_kinds` 설정은 수정 없이 그대로 작동한다. 프로필을 도입하려면:
+1. `agent_profiles:` 아래에 재사용 가능한 프로필을 정의한다.
+2. `agent.stage_kinds`를 `agent.stage_profiles`로 전환한다.
+3. 필요 시 `agent.default_profile`을 설정하여 매핑되지 않은 단계의 기본 프로필을 지정한다.
+
 
 파일 보드 워크플로에서 `agent.auto_triage_actionable_todo`는 기본값이
 `true`다: 본문과 `Acceptance Criteria` 섹션이 있는 Todo 티켓은 모델 턴을 쓰지 않고

@@ -30,6 +30,9 @@ class RunningEntry:
     workspace_path: Path
     attempt_kind: str = "initial"
     agent_kind: str = ""
+    agent_profile: str = ""
+    model: str = ""
+    reasoning_effort: str = ""
     run_id: str = ""
     # A recovered attempt always owns a new run id. The predecessor link is
     # public history; the private checkpoint is consumed only by the backend

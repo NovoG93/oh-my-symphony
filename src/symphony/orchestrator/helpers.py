@@ -171,6 +171,14 @@ def _requested_agent_kind(issue: Issue) -> str | None:
     return kind or None
 
 
+def _requested_agent_profile(issue: Issue) -> str | None:
+    profile_val = getattr(issue, "agent_profile", None)
+    if not profile_val:
+        return None
+    profile = str(profile_val).strip()
+    return profile or None
+
+
 def _is_auto_triage_todo_candidate(issue: Issue, cfg: ServiceConfig) -> bool:
     if not cfg.agent.auto_triage_actionable_todo:
         return False
@@ -197,20 +205,33 @@ def _is_auto_triage_todo_candidate(issue: Issue, cfg: ServiceConfig) -> bool:
 def _config_for_issue_agent(cfg: ServiceConfig, issue: Issue) -> ServiceConfig:
     """Return a per-worker config with the ticket's backend override applied.
 
-    Precedence: per-ticket `agent_kind` pin > `agent.stage_kinds` entry for
-    the ticket's current state > workflow-level `agent.kind`.
+    Precedence: per-ticket `agent_profile` / `agent_kind` > `agent.stage_profiles` /
+    `agent.stage_kinds` entry for the ticket's current state > `agent.default_profile`
+    > workflow-level `agent.kind`.
     """
     pin = _requested_agent_kind(issue)
+    ticket_profile = _requested_agent_profile(issue)
+    if pin is not None and ticket_profile is not None:
+        raise ConfigValidationError(
+            f"ambiguous agent override: both ticket agent_kind ({pin!r}) and agent_profile ({ticket_profile!r}) are set",
+            ticket_kind=pin,
+            ticket_profile=ticket_profile,
+            issue=issue.identifier,
+        )
     if pin is not None and pin not in SUPPORTED_AGENT_KINDS:
         raise ConfigValidationError(
             f"ticket agent.kind must be one of {sorted(SUPPORTED_AGENT_KINDS)}",
             value=pin,
             issue=issue.identifier,
         )
-    kind = cfg.agent.kind_for_state(issue.state, pin)
-    if kind == cfg.agent.kind:
+    selection = cfg.selection_for_state(
+        issue.state,
+        ticket_profile=ticket_profile,
+        ticket_kind=pin,
+    )
+    if selection.kind == cfg.agent.kind:
         return cfg
-    return replace(cfg, agent=replace(cfg.agent, kind=kind))
+    return replace(cfg, agent=replace(cfg.agent, kind=selection.kind))
 
 
 def _utc_iso_z() -> str:

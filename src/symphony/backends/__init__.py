@@ -28,7 +28,7 @@ from pathlib import Path
 from typing import Any, Awaitable, Callable, Protocol, cast, runtime_checkable
 
 from ..errors import ConfigValidationError
-from ..workflow import ServiceConfig
+from ..workflow import AgentSelection, ServiceConfig
 
 
 # Normalized event vocabulary — every backend emits these strings only.
@@ -123,6 +123,19 @@ class BackendInit:
     on_event: EventCallback
     on_process_started: Callable[[int], None] | None = None
     client_tools: list[ToolDescriptor] = field(default_factory=list)
+    selection: AgentSelection | None = None
+    resolved_backend_config: Any | None = None
+
+    def __post_init__(self) -> None:
+        if self.selection is None:
+            self.selection = AgentSelection(kind=self.cfg.agent.kind)
+        if self.resolved_backend_config is None:
+            from ..workflow.profiles import resolve_agent_config
+
+            self.resolved_backend_config = resolve_agent_config(
+                self.cfg, self.selection
+            ).active_config
+
 
 
 @runtime_checkable
@@ -223,7 +236,7 @@ def build_backend(init: BackendInit) -> AgentBackend:
     duck-typing through `isinstance(..., AgentBackend)` still works
     thanks to `@runtime_checkable`.
     """
-    kind = init.cfg.agent.kind
+    kind = init.selection.kind if init.selection is not None else init.cfg.agent.kind
     if kind == "codex":
         from .codex import CodexAppServerBackend
 

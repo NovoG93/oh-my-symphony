@@ -227,6 +227,14 @@ for dir in ${SYMPHONY_BOARD_ROOT_NAME:-kanban}; do
   grep -qxF "$dir" "$exclude_file" 2>/dev/null || echo "$dir" >> "$exclude_file"
   _symphony_link_dir "$dir" "$HOST_REPO/$dir"
 done
+# graphify-out/: codebase knowledge graph built in the host repo (graphify).
+# Symlink it into the worktree so agents can `graphify query` instead of
+# grepping raw files. Skipped when the host repo has no graph yet. The
+# directory is git-ignored in the host repo, so the symlink is the sharing
+# mechanism (always resolves to the host's single current graph).
+if [ -e "$HOST_REPO/graphify-out" ]; then
+  _symphony_link_dir "graphify-out" "$HOST_REPO/graphify-out"
+fi
 _symphony_release_worktree_lock
 # Pick the first available Python interpreter that satisfies pyproject first.
 # The package currently requires >=3.12; keep 3.11 only as a last fallback so

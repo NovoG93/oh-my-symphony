@@ -86,6 +86,7 @@ _CANONICAL_FRONT_MATTER_KEYS = {
     "request",
     "agent",
     "agent_kind",
+    "agent_profile",
     "last_agent_kind",
     "skills",
     "created_at",
@@ -344,6 +345,7 @@ def issue_from_file(path: Path) -> Issue | None:
         updated_at=parse_iso_timestamp(front.get("updated_at"))
         or parse_iso_timestamp(_file_mtime_iso(path)),
         agent_kind=_parse_agent_kind(front),
+        agent_profile=_parse_agent_profile(front),
         last_agent_kind=str(front.get("last_agent_kind") or "").strip().lower()
         or None,
         skills=normalize_skill_names(front.get("skills")),
@@ -361,6 +363,18 @@ def _parse_agent_kind(front: dict[str, Any]) -> str | None:
         return None
     kind = raw.strip().lower()
     return kind or None
+
+
+def _parse_agent_profile(front: dict[str, Any]) -> str | None:
+    raw = front.get("agent_profile")
+    if raw is None:
+        agent = front.get("agent")
+        if isinstance(agent, dict):
+            raw = agent.get("profile")
+    if not isinstance(raw, str):
+        return None
+    profile = raw.strip()
+    return profile or None
 
 
 def _parse_blockers(value: Any) -> list[BlockerRef]:
@@ -921,9 +935,10 @@ class FileBoardTracker:
         def mutate(
             front: dict[str, Any], body: str
         ) -> tuple[dict[str, Any], str] | None:
-            if _parse_agent_kind(front) or not normalized:
+            if _parse_agent_kind(front) or _parse_agent_profile(front) or not normalized:
                 return None
             front["agent"] = {"kind": normalized}
+
             front["updated_at"] = datetime.now(timezone.utc).strftime(
                 "%Y-%m-%dT%H:%M:%SZ"
             )
@@ -982,6 +997,7 @@ class FileBoardTracker:
         labels: list[str] | None = None,
         description: str = "",
         agent_kind: str | None = None,
+        agent_profile: str | None = None,
         skills: list[str] | None = None,
         blocked_by: list[str] | None = None,
         request: str | None = None,
@@ -1020,6 +1036,7 @@ class FileBoardTracker:
                         labels=labels,
                         description=description,
                         agent_kind=agent_kind,
+                        agent_profile=agent_profile,
                         skills=skills,
                         blocked_by=blocked_by,
                         request=request,
@@ -1042,6 +1059,7 @@ class FileBoardTracker:
         labels: list[str] | None = None,
         description: str = "",
         agent_kind: str | None = None,
+        agent_profile: str | None = None,
         skills: list[str] | None = None,
         blocked_by: list[str] | None = None,
         request: str | None = None,
@@ -1059,6 +1077,7 @@ class FileBoardTracker:
                         labels=labels,
                         description=description,
                         agent_kind=agent_kind,
+                        agent_profile=agent_profile,
                         skills=skills,
                         blocked_by=blocked_by,
                         request=request,
@@ -1079,6 +1098,7 @@ class FileBoardTracker:
         labels: list[str] | None = None,
         description: str = "",
         agent_kind: str | None = None,
+        agent_profile: str | None = None,
         skills: list[str] | None = None,
         blocked_by: list[str] | None = None,
         request: str | None = None,
@@ -1095,6 +1115,7 @@ class FileBoardTracker:
                 priority=priority,
                 labels=labels,
                 agent_kind=agent_kind,
+                agent_profile=agent_profile,
                 skills=skills,
                 blocked_by=blocked_by,
                 request=request,
@@ -1111,10 +1132,19 @@ class FileBoardTracker:
         priority: int | None,
         labels: list[str] | None,
         agent_kind: str | None,
+        agent_profile: str | None = None,
         skills: list[str] | None,
         blocked_by: list[str] | None = None,
         request: str | None = None,
     ) -> dict[str, Any]:
+        has_kind = isinstance(agent_kind, str) and bool(agent_kind.strip())
+        has_profile = isinstance(agent_profile, str) and bool(agent_profile.strip())
+        if has_kind and has_profile:
+            raise SymphonyError(
+                f"ambiguous agent override: both agent_kind ({agent_kind!r}) and agent_profile ({agent_profile!r}) are set",
+                agent_kind=agent_kind,
+                agent_profile=agent_profile,
+            )
         now = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
         front: dict[str, Any] = {
             "id": identifier,
@@ -1130,8 +1160,11 @@ class FileBoardTracker:
             front["blocked_by"] = [str(item) for item in blocked_by]
         if isinstance(request, str) and request.strip():
             front["request"] = request.strip()
-        if isinstance(agent_kind, str) and agent_kind.strip():
+        if isinstance(agent_profile, str) and agent_profile.strip():
+            front["agent"] = {"profile": agent_profile.strip()}
+        elif isinstance(agent_kind, str) and agent_kind.strip():
             front["agent"] = {"kind": agent_kind.strip().lower()}
+
         normalized_skills = normalize_skill_names(list(skills or []))
         if normalized_skills:
             front["skills"] = list(normalized_skills)
@@ -1149,6 +1182,7 @@ class FileBoardTracker:
         labels: list[str] | None = None,
         skills: list[str] | None = None,
         agent_kind: str | None = None,
+        agent_profile: str | None = None,
         blocked_by: list[str] | None = None,
         request: str | None = None,
     ) -> Path:
@@ -1178,13 +1212,44 @@ class FileBoardTracker:
                     front["skills"] = list(normalized)
                 else:
                     front.pop("skills", None)
+            if agent_profile is not None and agent_kind is not None and agent_profile.strip() and agent_kind.strip():
+                raise SymphonyError(
+                    f"ambiguous agent override: both agent_kind ({agent_kind!r}) and agent_profile ({agent_profile!r}) are set",
+                    agent_kind=agent_kind,
+                    agent_profile=agent_profile,
+                )
             if agent_kind is not None:
                 cleaned = agent_kind.strip().lower()
                 front.pop("agent_kind", None)
                 if cleaned:
-                    front["agent"] = {"kind": cleaned}
+                    if isinstance(front.get("agent"), dict):
+                        front["agent"].pop("profile", None)
+                        front["agent"]["kind"] = cleaned
+                    else:
+                        front["agent"] = {"kind": cleaned}
                 else:
-                    front.pop("agent", None)
+                    if isinstance(front.get("agent"), dict):
+                        front["agent"].pop("kind", None)
+                        if not front["agent"]:
+                            front.pop("agent", None)
+                    else:
+                        front.pop("agent", None)
+            if agent_profile is not None:
+                cleaned_prof = agent_profile.strip()
+                front.pop("agent_profile", None)
+                if cleaned_prof:
+                    if isinstance(front.get("agent"), dict):
+                        front["agent"].pop("kind", None)
+                        front["agent"]["profile"] = cleaned_prof
+                    else:
+                        front["agent"] = {"profile": cleaned_prof}
+                else:
+                    if isinstance(front.get("agent"), dict):
+                        front["agent"].pop("profile", None)
+                        if not front["agent"]:
+                            front.pop("agent", None)
+                    else:
+                        front.pop("agent", None)
             if blocked_by is not None:
                 if blocked_by:
                     front["blocked_by"] = [str(item) for item in blocked_by]
@@ -1200,6 +1265,7 @@ class FileBoardTracker:
                 "%Y-%m-%dT%H:%M:%SZ"
             )
             return front, body if description is None else description
+
 
         path = self._mutate_ticket(identifier, mutate)
         assert path is not None

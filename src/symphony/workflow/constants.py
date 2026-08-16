@@ -94,6 +94,67 @@ DEFAULT_CI_MAX_IMPROVEMENT_TICKETS_PER_RUN = 3
 
 SUPPORTED_AGENT_KINDS = {"agy", "codex", "claude", "gemini", "kiro", "opencode", "pi", "prime-agent"}
 DEFAULT_AGENT_KIND = "codex"
+
+PROFILE_FIELDS_BY_KIND: dict[str, set[str]] = {
+    "codex": {
+        "model",
+        "reasoning_effort",
+        "command",
+        "turn_timeout_ms",
+        "read_timeout_ms",
+        "stall_timeout_ms",
+    },
+    "claude": {
+        "model",
+        "command",
+        "resume_across_turns",
+        "turn_timeout_ms",
+        "read_timeout_ms",
+        "stall_timeout_ms",
+    },
+    "gemini": {
+        "command",
+        "resume_across_turns",
+        "turn_timeout_ms",
+        "read_timeout_ms",
+        "stall_timeout_ms",
+    },
+    "agy": {
+        "command",
+        "resume_across_turns",
+        "turn_timeout_ms",
+        "read_timeout_ms",
+        "stall_timeout_ms",
+    },
+    "kiro": {
+        "command",
+        "resume_across_turns",
+        "turn_timeout_ms",
+        "read_timeout_ms",
+        "stall_timeout_ms",
+    },
+    "opencode": {
+        "command",
+        "resume_across_turns",
+        "turn_timeout_ms",
+        "read_timeout_ms",
+        "stall_timeout_ms",
+    },
+    "pi": {
+        "command",
+        "resume_across_turns",
+        "turn_timeout_ms",
+        "read_timeout_ms",
+        "stall_timeout_ms",
+    },
+    "prime-agent": {
+        "command",
+        "resume_across_turns",
+        "turn_timeout_ms",
+        "read_timeout_ms",
+        "stall_timeout_ms",
+    },
+}
 DEFAULT_CLAUDE_COMMAND = (
     "claude -p --output-format stream-json --include-partial-messages --verbose"
 )

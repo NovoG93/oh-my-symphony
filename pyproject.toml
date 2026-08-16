@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "oh-my-symphony"
-version = "0.20.1"
+version = "0.21.0"
 description = "Multi-agent fork of OpenAI Symphony — supports Codex CLI, Claude Code CLI, Gemini CLI, AGY/Antigravity CLI, Kiro CLI, OpenCode CLI, Pi CLI, and Prime Agent CLI behind one local Kanban orchestrator with TUI and web board."
 readme = "README.md"
 requires-python = ">=3.12"
@@ -19,6 +19,7 @@ dependencies = [
     "aiohttp>=3.9",
     "rich>=13.7",
     "textual>=0.85",
+    "mcp>=1.9,<2.0",
 ]
 
 [project.optional-dependencies]
@@ -36,6 +37,7 @@ browser = [
 [project.scripts]
 symphony = "symphony.cli:main"
 symphony-pyright = "symphony.pyright:main"
+symphony-mcp = "symphony.mcp.server:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]

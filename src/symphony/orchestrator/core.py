@@ -54,6 +54,7 @@ from ..utils import git_inspect
 from ..utils.archive import select_archivable
 from ..backends.codex import linear_graphql_tool
 from ..errors import (
+    ConfigValidationError,
     SymphonyError,
     TurnFailed,
     TurnInputRequired,
@@ -83,6 +84,7 @@ from ..workflow import (
     SUPPORTED_AGENT_KINDS,
     SYMPHONY_BRANCH_PREFIX,
     WorkflowState,
+    resolve_agent_config,
     validate_for_dispatch,
 )
 from ..utils.auto_merge import AutoMergeResult, auto_merge_on_done_best_effort
@@ -149,6 +151,7 @@ from .helpers import (
     _rewind_budget_target_state,
     _notify_state_transition,
     _requested_agent_kind,
+    _requested_agent_profile,
     _sort_for_dispatch_fifo,
     _task_debug,
     _to_iso,
@@ -388,6 +391,9 @@ def _run_record_payload(record: RunRecord) -> dict[str, Any]:
         "attempt": record.attempt,
         "attempt_kind": record.attempt_kind,
         "agent_kind": record.agent_kind,
+        "agent_profile": record.agent_profile,
+        "model": record.model,
+        "reasoning_effort": record.reasoning_effort,
         "status": record.status,
         "started_at": record.started_at.isoformat() if record.started_at else None,
         "updated_at": record.updated_at.isoformat() if record.updated_at else None,
@@ -2557,6 +2563,9 @@ class Orchestrator:
         attempt: int | None,
         attempt_kind: str,
         agent_kind: str,
+        agent_profile: str = "",
+        model: str = "",
+        reasoning_effort: str = "",
         release_required: bool = False,
     ) -> _RunLeaseAcquisition | None:
         if release_required:
@@ -2570,6 +2579,9 @@ class Orchestrator:
                         attempt=attempt,
                         attempt_kind=attempt_kind,
                         agent_kind=agent_kind,
+                        agent_profile=agent_profile,
+                        model=model,
+                        reasoning_effort=reasoning_effort,
                     ),
                 )
             except SymphonyError:
@@ -2604,6 +2616,9 @@ class Orchestrator:
                         attempt=attempt,
                         attempt_kind="recovery",
                         agent_kind=agent_kind,
+                        agent_profile=agent_profile,
+                        model=model,
+                        reasoning_effort=reasoning_effort,
                     )
                     if recovered is None:
                         # Discovery raced or the source became ineligible. Do
@@ -2637,9 +2652,13 @@ class Orchestrator:
                 attempt=attempt,
                 attempt_kind=attempt_kind,
                 agent_kind=agent_kind,
+                agent_profile=agent_profile,
+                model=model,
+                reasoning_effort=reasoning_effort,
             ),
             "",
         )
+
         if run_id == "":
             if cfg.agent.crash_continuation:
                 # Recovery authority cannot degrade into a leaseless writer.
@@ -3129,6 +3148,9 @@ class Orchestrator:
             "issue_identifier": entry.issue.identifier,
             "state": entry.issue.state,
             "agent_kind": self._entry_agent_kind(entry),
+            "agent_profile": entry.agent_profile,
+            "model": entry.model,
+            "reasoning_effort": entry.reasoning_effort,
             "turn_count": total_turn_count,
             "total_turn_count": total_turn_count,
             "attempt_turn_count": entry.turn_count,
@@ -6172,7 +6194,25 @@ class Orchestrator:
         resolved_attempt_kind = attempt_kind or (
             "retry" if attempt is not None else "initial"
         )
-        agent_kind = cfg.agent.kind_for_state(issue.state, _requested_agent_kind(issue))
+        try:
+            dispatch_selection = cfg.selection_for_state(
+                issue.state,
+                ticket_profile=_requested_agent_profile(issue),
+                ticket_kind=_requested_agent_kind(issue),
+            )
+        except ConfigValidationError as exc:
+            log.error(
+                "dispatch_selection_refused",
+                issue_id=issue.id,
+                identifier=issue.identifier,
+                error=str(exc),
+            )
+            return False
+        agent_kind = dispatch_selection.kind
+        agent_profile = dispatch_selection.profile or ""
+        resolved_agent = resolve_agent_config(cfg, dispatch_selection)
+        model = getattr(resolved_agent.active_config, "model", "") or ""
+        reasoning_effort = getattr(resolved_agent.active_config, "reasoning_effort", "") or ""
         acquisition = self._try_acquire_run_lease(
             cfg=cfg,
             issue=issue,
@@ -6180,12 +6220,16 @@ class Orchestrator:
             attempt=attempt,
             attempt_kind=resolved_attempt_kind,
             agent_kind=agent_kind,
+            agent_profile=agent_profile,
+            model=model,
+            reasoning_effort=reasoning_effort,
             release_required=(
                 release_authority.gate is not None
                 or release_authority.app_release
                 or release_authority.finalizer
             ),
         )
+
         if acquisition is None:
             return False
         run_id = acquisition.run_id
@@ -6313,6 +6357,9 @@ class Orchestrator:
             workspace_path=workspace_path,
             attempt_kind=resolved_attempt_kind,
             agent_kind=agent_kind,
+            agent_profile=agent_profile,
+            model=model,
+            reasoning_effort=reasoning_effort,
             run_id=run_id,
             continued_from_run_id=acquisition.continued_from_run_id,
             continuation_checkpoint=acquisition.checkpoint,
@@ -6392,16 +6439,17 @@ class Orchestrator:
         # consumers (board UIs, audits, Done-state history) can see who
         # ran which ticket without inferring from logs. Idempotent —
         # adapter preserves any existing override. Skipped when
-        # `agent.stage_kinds` routing is active: the stamp is read back as
+        # `agent.stage_kinds` / `agent.stage_profiles` routing is active: the stamp is read back as
         # a per-ticket pin on later dispatches, which would freeze the
         # first stage's backend and defeat per-state routing.
         try:
-            if cfg.agent.stage_kinds:
+            if cfg.agent.stage_kinds or cfg.agent.stage_profiles:
                 # Routed board: the pin must stay empty, but the audit value
                 # still belongs on the ticket (F-20).
                 self._tracker_call_record_last_agent_kind(
                     cfg, issue.identifier, entry.agent_kind
                 )
+
             else:
                 self._tracker_call_record_agent_kind(
                     cfg, issue.identifier, entry.agent_kind
@@ -6622,6 +6670,13 @@ class Orchestrator:
             if cfg.tracker.kind == "linear" and cfg.agent.kind == "codex":
                 tools.append(linear_graphql_tool())
 
+            selection = cfg.selection_for_state(
+                issue.state,
+                ticket_profile=_requested_agent_profile(issue),
+                ticket_kind=_requested_agent_kind(issue),
+            )
+            resolved_cfg = resolve_agent_config(cfg, selection)
+
             client = self._build_agent_backend(
                 BackendInit(
                     cfg=cfg,
@@ -6634,6 +6689,8 @@ class Orchestrator:
                         self._sync_backend_agent_pid(issue_id, pid)
                     ),
                     client_tools=tools,
+                    selection=selection,
+                    resolved_backend_config=resolved_cfg.active_config,
                 )
             )
             # Expose the live backend to `_on_codex_event` so the stall-progress
@@ -7605,6 +7662,14 @@ class Orchestrator:
         tools: list[Any] = []
         if cfg.tracker.kind == "linear" and cfg.agent.kind == "codex":
             tools.append(linear_graphql_tool())
+
+        selection = cfg.selection_for_state(
+            issue.state,
+            ticket_profile=_requested_agent_profile(issue),
+            ticket_kind=_requested_agent_kind(issue),
+        )
+        resolved_cfg = resolve_agent_config(cfg, selection)
+
         new_client = self._build_agent_backend(
             BackendInit(
                 cfg=cfg,
@@ -7617,6 +7682,8 @@ class Orchestrator:
                     self._sync_backend_agent_pid(issue_id, pid)
                 ),
                 client_tools=tools,
+                selection=selection,
+                resolved_backend_config=resolved_cfg.active_config,
             )
         )
         # Reset per-dispatch env BEFORE the new backend's subprocess spawns.

@@ -209,14 +209,111 @@ in `WORKFLOW.md`.
 When creating file-board tickets from the CLI, use
 `symphony board new TASK-2 "title" --agent-kind codex`.
 
-Between the ticket pin and the global default sits optional per-state routing:
-`agent.stage_kinds` maps board states to agent kinds so cheap/fast agents can
-own light lanes (e.g. `Todo: gemini`, `Document: gemini`) while a strong default
-handles Plan/Build/Review. Resolution per dispatch: ticket `agent_kind` pin >
-`agent.stage_kinds[state]` > `agent.kind`. The backend is re-resolved at every
-stage change, including the in-run lane transitions a single dispatch walks, so
-a ticket that goes In Progress → Verify → Document inside one dispatch gets each
-lane's configured backend.
+### Named Agent Profiles
+
+Named agent profiles (`agent_profiles:` in `WORKFLOW.md`) extend stage routing beyond backend kinds so individual workflow stages or tickets can select specific models, reasoning effort levels, and execution settings. Full reference is documented in [docs/features/agent-profiles.md](docs/features/agent-profiles.md).
+
+#### Backend Kinds vs. Profiles
+- **Backend Kind** (`codex`, `claude`, `gemini`, `agy`, `kiro`, `opencode`, `pi`, `prime-agent`): Specifies the binary adapter, protocol, and subprocess lifecycle.
+- **Named Profile**: An overlay configuration specifying a `kind` and optional overrides (model, reasoning effort, command, timeouts). Unset fields inherit from the matching global backend block (`codex:`, `claude:`, etc.).
+
+#### Profile Inheritance & Supported Fields
+Profiles inherit all unset settings from their corresponding global backend block. Only allowlisted, non-null fields override base settings:
+- **`codex`**: `model`, `reasoning_effort`, `command`, `turn_timeout_ms`, `read_timeout_ms`, `stall_timeout_ms`
+- **`claude`**: `model` (injects `--model <name>`), `command`, `resume_across_turns`, `turn_timeout_ms`, `read_timeout_ms`, `stall_timeout_ms`
+- **`gemini`, `agy`, `kiro`, `opencode`, `pi`, `prime_agent`**: `command`, `resume_across_turns`, and timeouts. Unsupported fields (e.g. `reasoning_effort` on `claude` or `agy`) are rejected at config validation. The gemini backend accepts `resume_across_turns` but ignores it (no resume support).
+
+#### Resolution Precedence (8 Tiers)
+Symphony resolves the effective agent per dispatch using 8 deterministic tiers:
+1. `dispatch_profile` (explicit CLI / runtime dispatch profile)
+2. `dispatch_kind` (explicit CLI / runtime dispatch kind)
+3. Ticket `agent.profile` / `agent_profile:` (ticket frontmatter pin)
+4. Ticket `agent.kind` / `agent_kind:` (ticket frontmatter pin)
+5. `agent.stage_profiles[state]` in `WORKFLOW.md`
+6. `agent.stage_kinds[state]` in `WORKFLOW.md`
+7. `agent.default_profile` in `WORKFLOW.md`
+8. `agent.kind` in `WORKFLOW.md`
+
+The profile is re-resolved dynamically on **every stage transition** (e.g. In Progress → Verify → Document). Sessions are scoped by `(ticket, backend kind, profile)`, so moving between stages with different profiles starts a fresh, isolated session.
+
+#### Ticket-Level Overrides
+A ticket can pin a profile via frontmatter:
+
+```yaml
+agent:
+  profile: sol
+```
+
+The flat alias `agent_profile: sol` is also accepted for hand-edited cards. A ticket must not set both `agent_kind` and `agent_profile` — creation and update reject the combination as ambiguous. From the CLI, use `symphony board new TASK-2 "title" --agent-profile sol` or `symphony board update TASK-2 --agent-profile sol`.
+
+#### Example 1: Multi-Model Single-Backend Workflow
+Route different stages to different models of the same backend (e.g. fast model for triage/docs, strong model with high reasoning for implementation):
+
+```yaml
+agent:
+  kind: codex
+  default_profile: sol-standard
+  stage_profiles:
+    Todo: luna-fast
+    "In Progress": sol-high
+    Verify: sol-high
+    Document: luna-fast
+
+agent_profiles:
+  luna-fast:
+    kind: codex
+    model: luna
+    reasoning_effort: low
+  sol-standard:
+    kind: codex
+    model: sol
+    reasoning_effort: medium
+  sol-high:
+    kind: codex
+    model: sol
+    reasoning_effort: high
+```
+
+#### Example 2: Mixed-Backend Multi-Agent Workflow
+Combine Claude and Codex profiles across specialized workflow stages:
+
+```yaml
+agent:
+  kind: claude
+  stage_profiles:
+    Research: fable-planner
+    Plan: sol-planner
+    Build: sonnet-builder
+    Review: sol-reviewer
+    QA: luna-qa
+
+agent_profiles:
+  fable-planner:
+    kind: claude
+    model: fable
+  sol-planner:
+    kind: codex
+    model: sol
+    reasoning_effort: high
+  sonnet-builder:
+    kind: claude
+    model: sonnet
+  sol-reviewer:
+    kind: codex
+    model: sol
+    reasoning_effort: high
+  luna-qa:
+    kind: codex
+    model: luna
+    reasoning_effort: medium
+```
+
+#### Backward Compatibility & Migration Guidance
+Existing workflows using only `agent.kind` and `agent.stage_kinds` continue to work unchanged. To migrate:
+1. Define reusable profiles under `agent_profiles:` in `WORKFLOW.md`.
+2. Replace `agent.stage_kinds` with `agent.stage_profiles` pointing to your profile names.
+3. Optionally configure `agent.default_profile` to establish a default profile fallback for unmapped stages.
+
 
 ### Heavy stages
 
@@ -371,7 +468,10 @@ PASS  tracker.board_root            ./kanban (3 tickets)
 Exit code is `0` when all checks pass, `1` if any FAIL, `2` if `WORKFLOW.md`
 itself can't be loaded. The doctor catches the most common first-run
 failures in one pass: port collision, missing CLI on `$PATH`, the shipped
-placeholder clone URL, unwritable workspace, missing board directory.
+placeholder clone URL, unwritable workspace, missing board directory. When
+`agent_profiles:` is configured, each profile also gets its own
+PASS/FAIL/WARN line — supported kind, model syntax, executable on `$PATH`,
+and `stage_profiles` / `default_profile` references.
 
 ## Prove It Works
 

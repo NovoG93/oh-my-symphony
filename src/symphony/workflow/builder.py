@@ -34,6 +34,7 @@ from .coercion import (
 )
 from .config import (
     AgentConfig,
+    AgentProfileConfig,
     AgyConfig,
     ClaudeConfig,
     CodexConfig,
@@ -100,6 +101,7 @@ from .constants import (
     JIRA_EMAIL_ENV,
     LINEAR_API_KEY_ENV,
     LINEAR_DEFAULT_ENDPOINT,
+    PROFILE_FIELDS_BY_KIND,
     SUPPORTED_AGENT_KINDS,
     SUPPORTED_CI_MODES,
     SUPPORTED_WORKSPACE_REUSE_POLICIES,
@@ -295,6 +297,8 @@ def build_service_config(workflow: WorkflowDefinition) -> ServiceConfig:
         ),
     )
 
+    agent_profiles = _validated_agent_profiles(cfg.get("agent_profiles"))
+
     agent_raw = cfg.get("agent") or {}
     if not isinstance(agent_raw, dict):
         agent_raw = {}
@@ -427,6 +431,16 @@ def build_service_config(workflow: WorkflowDefinition) -> ServiceConfig:
             active_states=tracker.active_states,
             terminal_states=tracker.terminal_states,
         ),
+        stage_profiles=_validated_stage_profiles(
+            agent_raw.get("stage_profiles"),
+            agent_profiles=agent_profiles,
+            active_states=tracker.active_states,
+            terminal_states=tracker.terminal_states,
+        ),
+        default_profile=_validated_default_profile(
+            agent_raw.get("default_profile"),
+            agent_profiles=agent_profiles,
+        ),
     )
 
     codex_raw = cfg.get("codex") or {}
@@ -467,6 +481,7 @@ def build_service_config(workflow: WorkflowDefinition) -> ServiceConfig:
             claude_raw.get("stall_timeout_ms"), DEFAULT_BACKEND_STALL_TIMEOUT_MS, name="claude.stall_timeout_ms"
         ),
         resume_across_turns=bool(claude_raw.get("resume_across_turns", True)),
+        model=_as_str(claude_raw.get("model"), "") or "",
     )
 
     gemini_raw = cfg.get("gemini") or {}
@@ -860,6 +875,7 @@ def build_service_config(workflow: WorkflowDefinition) -> ServiceConfig:
         workspace_reuse_policy=workspace_reuse_policy,
         preview=preview,
         artifacts=artifacts,
+        agent_profiles=agent_profiles,
     )
 
 
@@ -958,6 +974,214 @@ def _validated_stage_kinds(
             )
         out[normalized_key] = kind
     return out
+
+
+_ALL_PROFILE_FIELDS = {
+    "model",
+    "reasoning_effort",
+    "command",
+    "turn_timeout_ms",
+    "read_timeout_ms",
+    "stall_timeout_ms",
+    "resume_across_turns",
+}
+
+
+def _validated_agent_profiles(raw: Any) -> dict[str, AgentProfileConfig]:
+    """Parse and validate top-level `agent_profiles:` mapping.
+
+    Enforces non-empty profile names, supported backend kinds (canonicalizing
+    'antigravity' to 'agy'), allowlist checking against PROFILE_FIELDS_BY_KIND,
+    and type checking of individual fields.
+    """
+    if raw is None:
+        return {}
+    if not isinstance(raw, dict):
+        raise ConfigValidationError(
+            "agent_profiles must be a mapping",
+            value=raw,
+        )
+    out: dict[str, AgentProfileConfig] = {}
+    for profile_name, profile_data in raw.items():
+        if not isinstance(profile_name, str) or not profile_name.strip():
+            raise ConfigValidationError(
+                "agent_profiles profile name must be a non-empty string",
+                value=profile_name,
+            )
+        name = profile_name.strip()
+        if name in out:
+            raise ConfigValidationError(
+                f"agent_profiles has duplicate profile name {name!r}",
+                value=name,
+            )
+        if not isinstance(profile_data, dict):
+            raise ConfigValidationError(
+                f"agent_profiles[{name!r}] must be a mapping",
+                value=profile_data,
+            )
+        kind_raw = profile_data.get("kind")
+        if kind_raw is None:
+            raise ConfigValidationError(
+                f"agent_profiles[{name!r}].kind is required",
+                value=profile_data,
+            )
+        if not isinstance(kind_raw, str):
+            raise ConfigValidationError(
+                f"agent_profiles[{name!r}].kind must be a string",
+                value=kind_raw,
+            )
+        kind = _canonical_agent_kind(kind_raw.strip().lower())
+        if kind not in SUPPORTED_AGENT_KINDS:
+            raise ConfigValidationError(
+                f"agent_profiles[{name!r}].kind must be one of {sorted(SUPPORTED_AGENT_KINDS)}",
+                value=kind_raw,
+            )
+
+        allowed_fields = PROFILE_FIELDS_BY_KIND.get(kind, set())
+        for key, val in profile_data.items():
+            if key == "kind":
+                continue
+            if key not in allowed_fields:
+                if key in _ALL_PROFILE_FIELDS:
+                    raise ConfigValidationError(
+                        f"agent_profiles[{name!r}].{key} is not supported for backend '{kind}'",
+                        value=val,
+                    )
+                raise ConfigValidationError(
+                    f"agent_profiles[{name!r}] has unsupported field '{key}'",
+                    value=key,
+                )
+
+        model = profile_data.get("model")
+        if model is not None and not isinstance(model, str):
+            raise ConfigValidationError(
+                f"agent_profiles[{name!r}].model must be a string",
+                value=model,
+            )
+
+        reasoning_effort = profile_data.get("reasoning_effort")
+        if reasoning_effort is not None and not isinstance(reasoning_effort, str):
+            raise ConfigValidationError(
+                f"agent_profiles[{name!r}].reasoning_effort must be a string",
+                value=reasoning_effort,
+            )
+
+        command = profile_data.get("command")
+        if command is not None and not isinstance(command, str):
+            raise ConfigValidationError(
+                f"agent_profiles[{name!r}].command must be a string",
+                value=command,
+            )
+
+        turn_timeout_ms = profile_data.get("turn_timeout_ms")
+        if turn_timeout_ms is not None:
+            if isinstance(turn_timeout_ms, bool) or not isinstance(turn_timeout_ms, int) or turn_timeout_ms <= 0:
+                raise ConfigValidationError(
+                    f"agent_profiles[{name!r}].turn_timeout_ms must be a positive integer",
+                    value=turn_timeout_ms,
+                )
+
+        read_timeout_ms = profile_data.get("read_timeout_ms")
+        if read_timeout_ms is not None:
+            if isinstance(read_timeout_ms, bool) or not isinstance(read_timeout_ms, int) or read_timeout_ms <= 0:
+                raise ConfigValidationError(
+                    f"agent_profiles[{name!r}].read_timeout_ms must be a positive integer",
+                    value=read_timeout_ms,
+                )
+
+        stall_timeout_ms = profile_data.get("stall_timeout_ms")
+        if stall_timeout_ms is not None:
+            if isinstance(stall_timeout_ms, bool) or not isinstance(stall_timeout_ms, int) or stall_timeout_ms <= 0:
+                raise ConfigValidationError(
+                    f"agent_profiles[{name!r}].stall_timeout_ms must be a positive integer",
+                    value=stall_timeout_ms,
+                )
+
+        resume_across_turns = profile_data.get("resume_across_turns")
+        if resume_across_turns is not None and not isinstance(resume_across_turns, bool):
+            raise ConfigValidationError(
+                f"agent_profiles[{name!r}].resume_across_turns must be a boolean",
+                value=resume_across_turns,
+            )
+
+        out[name] = AgentProfileConfig(
+            name=name,
+            kind=kind,
+            model=model,
+            reasoning_effort=reasoning_effort,
+            command=command,
+            turn_timeout_ms=turn_timeout_ms,
+            read_timeout_ms=read_timeout_ms,
+            stall_timeout_ms=stall_timeout_ms,
+            resume_across_turns=resume_across_turns,
+        )
+    return out
+
+
+def _validated_stage_profiles(
+    value: Any,
+    *,
+    agent_profiles: dict[str, AgentProfileConfig],
+    active_states: tuple[str, ...],
+    terminal_states: tuple[str, ...],
+) -> dict[str, str]:
+    """agent.stage_profiles — per-state profile routing, keys lowercased."""
+    if value is None:
+        return {}
+    if not isinstance(value, dict):
+        raise ConfigValidationError(
+            "agent.stage_profiles must be a map of state name to profile name",
+            value=value,
+        )
+    known = {state.strip().lower() for state in (*active_states, *terminal_states)}
+    out: dict[str, str] = {}
+    for key, raw in value.items():
+        if not isinstance(key, str):
+            continue
+        normalized_key = key.strip().lower()
+        if not normalized_key:
+            continue
+        if not isinstance(raw, str) or not raw.strip():
+            raise ConfigValidationError(
+                f"agent.stage_profiles[{key!r}] must be a non-empty string profile name",
+                value=raw,
+            )
+        profile_name = raw.strip()
+        if profile_name not in agent_profiles:
+            raise ConfigValidationError(
+                f"agent.stage_profiles[{key!r}] references unknown profile '{profile_name}'",
+                value=raw,
+            )
+        if normalized_key not in known:
+            get_logger().warning(
+                "agent_stage_profiles_unknown_state",
+                state=key,
+                known_states=sorted(known),
+            )
+        out[normalized_key] = profile_name
+    return out
+
+
+def _validated_default_profile(
+    value: Any,
+    *,
+    agent_profiles: dict[str, AgentProfileConfig],
+) -> str | None:
+    """agent.default_profile — default profile name from agent_profiles."""
+    if value is None:
+        return None
+    if not isinstance(value, str) or not value.strip():
+        raise ConfigValidationError(
+            "agent.default_profile must be a non-empty string",
+            value=value,
+        )
+    profile_name = value.strip()
+    if profile_name not in agent_profiles:
+        raise ConfigValidationError(
+            f"agent.default_profile references unknown profile '{profile_name}'",
+            value=value,
+        )
+    return profile_name
 
 
 def _log_stage_contracts_decision(agent: AgentConfig, tracker: TrackerConfig) -> None:
