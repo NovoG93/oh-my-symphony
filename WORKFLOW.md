@@ -298,10 +298,10 @@ agent:
   # Branch/ref used as the start point for new `symphony/<ID>` feature
   # branches. Empty string = current host branch. The board viewer can
   # update this from its real git branch dropdown.
-  feature_base_branch: "main"
+  feature_base_branch: "develop"
   # Branch to merge into after Document. Pinning this avoids integration drift
   # when an operator checks out another host branch while Symphony is running.
-  auto_merge_target_branch: "main"
+  auto_merge_target_branch: "develop"
   auto_merge_exclude_paths:
     - kanban
 
