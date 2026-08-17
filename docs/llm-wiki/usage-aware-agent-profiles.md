@@ -1,4 +1,4 @@
-# Usage-aware agent profiles — Stage 1 usage-pool model + Stage 3 enforcement
+# Usage-aware agent profiles — Stages 1, 2.1, 3, 4 (model, probe, enforcement, exhaustion)
 
 **Summary:** TASK-12 delivered Stage 1 of the Usage-Aware Agent Profiles
 feature: a shared usage-pool configuration model, load-time validation, and
@@ -81,12 +81,80 @@ evaluate per-pool usage snapshots.
 **Stage boundary (as of Stage 3):** no provider probes registered yet —
 `USAGE_PROBES` is still empty, so real quota telemetry arrives with Stages
 4/5 backend probes. Until then evaluate() always fails open (no snapshot).
+*(Superseded by TASK-14 — Stage 2.1 registered the Codex probe, see below.)*
 
 **Evidence (TASK-13):** 68 usage-limit tests (27 scheduler +
 41 manager/phase-1) — `tests/test_orchestrator_usage_limits.py`,
 `tests/test_usage_limits.py`; QA artefacts under `docs/TASK-13/qa/` incl.
 `repro-after.md` (permission-denied closure with pytest-cache evidence) and
 `runtime-blocked.md` (fresh green run not proven in the ticket worktree).
+
+## Stage 2.1 + Stage 4 — authoritative Codex probe + runtime provider exhaustion (TASK-14)
+
+**Summary:** TASK-14 delivered the authoritative Codex usage probe (Stage
+2.1) and runtime provider-exhaustion classification (Stage 4). Real quota
+telemetry now flows into the shared `ProviderUsageManager`, and genuine
+plan/credit exhaustion is a capacity wait — it never burns the retry
+budget.
+
+**Probe & normalization (`src/symphony/backends/codex.py`):**
+- `normalize_codex_rate_limits` (`codex.py:278`): windows keyed by
+  `windowDurationMins` — 300 -> `five_hour`, 10080 -> `weekly`, any other
+  N -> `<N>_minutes`; the primary/secondary position fields are ignored.
+  `resetsAt` parsed from epoch seconds/ms or ISO strings
+  (`_parse_resets_at`); hard limit via `rateLimitReachedType` /
+  `hardLimitReached` / `rateLimitReached`.
+- Auth mode: `authMode`/`accountType` == apiKey marks the snapshot
+  `authoritative=False` — ChatGPT subscription caps only bind
+  subscription-authenticated Codex; API-key dispatch is never blocked by
+  caps (telemetry still recorded).
+- `CodexUsageProbe` (`codex.py:431`): `fetch_usage()` calls
+  `account/rateLimits/read` (plus `account/read` for the auth mode) via
+  the JSON-RPC client, the backend, or a standalone `codex app-server`
+  subprocess; any error fails open (returns `None`).
+- Registration: `USAGE_PROBES["codex"] = CodexUsageProbe` at codex.py
+  import AND lazy import inside `get_usage_probe` (`usage.py`) — both
+  idempotent; the registry is no longer empty.
+
+**Notification → cache (immediate):** `account/rateLimits/updated`
+notifications normalize the payload and call
+`usage_manager.set_snapshot(pool_id, snapshot)` right away
+(`codex.py:1113-1157`); the orchestrator also normalizes rate-limits
+payloads inside `_on_codex_event` (belt and braces). Notification payloads
+carry no authMode, so their snapshots default `authoritative=True`
+(telemetry-accurate; cap-authoritative only after a probe refresh).
+
+**Exhaustion classification (Stage 4):**
+- `_is_genuine_provider_exhaustion` (`codex.py:398`): RPM/TPM/requests-per-
+  minute errors -> False (normal retry path); plan-limit / quota / credit
+  keywords -> True.
+- `_raise_for_terminal_status` (`codex.py:927`): on a genuine-exhaustion
+  turn failure, emits `EVENT_PROVIDER_USAGE_EXHAUSTED` with `pool_id` /
+  `resets_at` and raises `ProviderCapacityError` (backends/__init__.py:58;
+  event constant at :50). Generic 429/RPM/network errors keep the existing
+  `EVENT_TURN_FAILED`/`TurnFailed` handling.
+
+**Orchestrator wiring (`src/symphony/orchestrator/core.py`):**
+- `_on_codex_event` (`core.py:8961`): the exhaustion event writes a
+  `hard_limit_reached=True` snapshot to `_usage_manager`, sets the
+  `RunningEntry` flags (`hit_provider_usage_exhausted`, pool id,
+  resets_at), and cancels the worker task.
+- `_run_agent_attempt` (`core.py:7392`): catches `ProviderCapacityError`,
+  updates the shared pool snapshot, and returns with outcome
+  `provider_usage_exhausted` — no generic error escalation.
+- `_on_worker_exit_impl` (`core.py:9874`): the exhaustion branch pops
+  retry trackers and the claim WITHOUT consuming an attempt count and
+  without setting pause flags; the next scheduler tick derives
+  `waiting_provider_usage` eligibility from the hard-limit snapshot and
+  auto-clears it when the window `resets_at` passes.
+
+**Evidence (TASK-14):** 15 tests in `tests/test_codex_usage.py` (normal-
+ization by duration, duration-not-position, multiple limit ids, updated
+notification, unknown window, hard limit, api-key no-cap, probe read,
+fails open, registry, event+dataclass, genuine vs RPM, no-retry-consumed,
+generic 429 normal retry). Pytest cache of the implementation run (20:37
+UTC): 2514 collected, `lastfailed = {}`; a fresh re-run was not proven in
+the ticket worktree (execution denied — `docs/TASK-14/qa/runtime-blocked.md`).
 
 **Decision log:**
 - 2026-08-17 | TASK-12 | Usage modeled per shared pool, not per profile:
@@ -98,5 +166,15 @@ evaluate per-pool usage snapshots.
   tick (auto-clear), never the operator pause mechanism; running workers
   short-circuit eligibility. Deviation from the ticket description:
   `_latest_rate_limits` retained as telemetry-only (no AC required removal).
+- 2026-08-17 | TASK-14 | Authoritative probe + exhaustion classification:
+  windows normalized by `windowDurationMins` (300 -> `five_hour`, 10080 ->
+  `weekly`, other -> `<N>_minutes`), never by primary/secondary position;
+  apiKey auth marks snapshots `authoritative=False` so ChatGPT subscription
+  caps bind only subscription-auth; genuine plan/credit exhaustion emits
+  `EVENT_PROVIDER_USAGE_EXHAUSTED` + raises `ProviderCapacityError` and
+  bypasses the retry budget (ticket returns to `waiting_provider_usage` on
+  the next scheduler tick). Probe registration is dual: module-level
+  `USAGE_PROBES["codex"]` in codex.py plus lazy import in
+  `get_usage_probe` (idempotent).
 
-**Last updated:** 2026-08-17 by TASK-13 Document.
+**Last updated:** 2026-08-17 by TASK-14 Document.

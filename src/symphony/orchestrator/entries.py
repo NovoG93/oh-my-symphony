@@ -169,11 +169,16 @@ class RunningEntry:
     # tracker; a real stage transition clears it, an unchanged state escalates.
     consecutive_empty_turns: int = 0
     hit_empty_response_loop: bool = False
+    # Set when provider capacity/quota is exhausted during an attempt.
+    hit_provider_usage_exhausted: bool = False
+    provider_usage_exhausted_pool_id: str = ""
+    provider_usage_exhausted_resets_at: datetime | None = None
     # Per-turn preview accumulator. Updated alongside `last_codex_message` for
     # any payload that yields preview text; cleared back to "" on every
     # `EVENT_TURN_COMPLETED` after the empty-loop check. `last_codex_message`
     # is sticky for UI continuity; this buffer is what the guard reads.
     current_turn_message: str = ""
+
 
 
 @dataclass

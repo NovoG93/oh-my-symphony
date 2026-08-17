@@ -130,8 +130,17 @@ usage -> contention`) and holds over-cap dispatches as derived
 `waiting_provider_usage` wait state that clears automatically when
 capacity returns; caps never cancel an already-running worker. Fail open:
 missing, stale, or non-authoritative usage telemetry never blocks
-dispatch. Provider quota probes (which populate real usage snapshots) land
-in later stages.
+dispatch. **Provider probes (since Stage 2.1):** an authoritative
+`CodexUsageProbe` polls the Codex App Server (`account/rateLimits/read`),
+and every `account/rateLimits/updated` notification refreshes the shared
+pool snapshot immediately. Codex windows are normalized by duration
+(`windowDurationMins`: 300 -> `five_hour`, 10080 -> `weekly`, other ->
+`<N>_minutes`), never by position, and API-key-authenticated usage is
+non-authoritative so ChatGPT subscription caps never block API-key
+dispatch. **Capacity exhaustion (Stage 4):** genuine subscription/plan
+quota exhaustion terminates the running attempt without consuming the
+retry budget — the ticket waits as `waiting_provider_usage` until the pool
+resets; transient 429/RPM/TPM errors keep normal retry behaviour.
 
 ### 6. Session Scoping & Isolation
 
