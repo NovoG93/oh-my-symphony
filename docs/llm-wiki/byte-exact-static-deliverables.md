@@ -35,6 +35,8 @@ path in re-run commands. The fixture then rides the merge with the evidence.
 | 2026-08-15 (SMOKE-003) | Fixture at `qa/expected-ok.txt` instead of `/tmp/expected` | harness blocks `/tmp` writes; fixture must ride the merge too |
 | 2026-08-15 (SMOKE-003) | No test code for a static text deliverable | shell AC checks are the proof |
 | 2026-08-15 (SMOKE-003) | `git ls-files` in the proof chain | proves the deliverable is tracked and survives the merge |
+| 2026-08-17 (TASK-9) | Re-applied the pattern unchanged for `profile-smoke.txt` | second end-to-end confirmation; same bytes (`4f 4b 0a`) and same sha256 `a12b7cb4…` for `OK\n` |
+| 2026-08-17 (TASK-9) | Fixture at `work/expected-ok.txt` instead of `qa/expected-ok.txt` | both live inside the ticket evidence root and ride the merge; only the `docs/<id>/` location matters |
 
 ## Not covered
 
