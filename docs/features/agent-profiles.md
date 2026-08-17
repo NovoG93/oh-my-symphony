@@ -95,7 +95,7 @@ To prevent configuration errors, profiles strictly validate allowed fields at co
 
 Any unsupported field (e.g., specifying `reasoning_effort` on a `claude` or `agy` profile) is rejected during configuration loading.
 
-#### Usage Pools (usage-aware profiles — Stage 1)
+#### Usage Pools (usage-aware profiles)
 
 `usage_pool` references a shared usage pool declared under the top-level
 `usage_pools:` mapping in `WORKFLOW.md`. Usage is modeled per shared
@@ -124,9 +124,14 @@ Pools are validated at load: `source` is required (non-empty string), and
 `caps` is a required mapping of window name to a percentage with
 `0 < v <= 100`. Window names are arbitrary (e.g. `five_hour`, `weekly`,
 `daily`, `monthly`). Referencing an unknown pool from a profile is
-rejected. **Stage 1 scope:** this is the configuration model — pool
-resolution, probe invocation, and quota enforcement land in the later
-usage-aware scheduling stages.
+rejected. **Enforcement (since Stage 3):** the scheduler evaluates the
+pool's usage snapshot in its eligibility chain (`ownership -> contract ->
+usage -> contention`) and holds over-cap dispatches as derived
+`waiting_provider_usage` wait state that clears automatically when
+capacity returns; caps never cancel an already-running worker. Fail open:
+missing, stale, or non-authoritative usage telemetry never blocks
+dispatch. Provider quota probes (which populate real usage snapshots) land
+in later stages.
 
 ### 6. Session Scoping & Isolation
 
