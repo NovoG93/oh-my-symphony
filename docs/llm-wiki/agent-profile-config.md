@@ -11,8 +11,8 @@ selection consumes these fields yet — that is Phase 2/3 work.
 - `AgentProfileConfig` (`src/symphony/workflow/config.py`): `name` and
   `kind` required; `model`, `reasoning_effort`, `command`,
   `turn_timeout_ms`, `read_timeout_ms`, `stall_timeout_ms`,
-  `resume_across_turns` optional — `None` means inherit from the global
-  backend config.
+  `resume_across_turns`, `usage_pool` optional — `None` means inherit from
+  the global backend config (`usage_pool: None` = default to `profile.kind`).
 - `PROFILE_FIELDS_BY_KIND` (`src/symphony/workflow/constants.py`) is the
   per-kind field allowlist: `codex` allows `model` + `reasoning_effort`;
   `claude` allows `model` but NOT `reasoning_effort`; `agy`, `gemini`,
@@ -59,5 +59,8 @@ security-audit, merge-preflight).
 - 2026-08-15 | TASK-4 | Duplicate profile names rejected at builder level
   after strip; PyYAML exact-duplicate collapse documented as a parser
   boundary, not a builder bug.
+- 2026-08-17 | TASK-12 | Profile model extended with optional `usage_pool`
+  reference (allowlisted for all kinds); shared pools live under top-level
+  `usage_pools:` — see [[usage-aware-agent-profiles]].
 
-**Last updated:** 2026-08-15 by TASK-4 Document.
+**Last updated:** 2026-08-17 by TASK-12 Document.

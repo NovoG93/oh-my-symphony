@@ -103,6 +103,7 @@ PROFILE_FIELDS_BY_KIND: dict[str, set[str]] = {
         "turn_timeout_ms",
         "read_timeout_ms",
         "stall_timeout_ms",
+        "usage_pool",
     },
     "claude": {
         "model",
@@ -111,6 +112,7 @@ PROFILE_FIELDS_BY_KIND: dict[str, set[str]] = {
         "turn_timeout_ms",
         "read_timeout_ms",
         "stall_timeout_ms",
+        "usage_pool",
     },
     "gemini": {
         "command",
@@ -118,6 +120,7 @@ PROFILE_FIELDS_BY_KIND: dict[str, set[str]] = {
         "turn_timeout_ms",
         "read_timeout_ms",
         "stall_timeout_ms",
+        "usage_pool",
     },
     "agy": {
         "command",
@@ -125,6 +128,7 @@ PROFILE_FIELDS_BY_KIND: dict[str, set[str]] = {
         "turn_timeout_ms",
         "read_timeout_ms",
         "stall_timeout_ms",
+        "usage_pool",
     },
     "kiro": {
         "command",
@@ -132,6 +136,7 @@ PROFILE_FIELDS_BY_KIND: dict[str, set[str]] = {
         "turn_timeout_ms",
         "read_timeout_ms",
         "stall_timeout_ms",
+        "usage_pool",
     },
     "opencode": {
         "command",
@@ -139,6 +144,7 @@ PROFILE_FIELDS_BY_KIND: dict[str, set[str]] = {
         "turn_timeout_ms",
         "read_timeout_ms",
         "stall_timeout_ms",
+        "usage_pool",
     },
     "pi": {
         "command",
@@ -146,6 +152,7 @@ PROFILE_FIELDS_BY_KIND: dict[str, set[str]] = {
         "turn_timeout_ms",
         "read_timeout_ms",
         "stall_timeout_ms",
+        "usage_pool",
     },
     "prime-agent": {
         "command",
@@ -153,6 +160,7 @@ PROFILE_FIELDS_BY_KIND: dict[str, set[str]] = {
         "turn_timeout_ms",
         "read_timeout_ms",
         "stall_timeout_ms",
+        "usage_pool",
     },
 }
 DEFAULT_CLAUDE_COMMAND = (

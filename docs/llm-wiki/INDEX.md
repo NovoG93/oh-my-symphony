@@ -21,4 +21,5 @@ before any new ticket; Learn writes back to them after QA passes.
 | agent-profile-backend-execution | Phase-3 backend execution: Claude `--model` injection after the `claude` token, dispatch `selection_for_state` + per-ticket ConfigValidationError refusal, profile-scoped session identity, 9 backend tests | 2026-08-15 (TASK-6) |
 | agent-profile-observability-tooling | Phase-4 observability+tooling: run-record provenance (v9), ticket `agent.profile` override, `--agent-profile` CLI, doctor profile checks; per-stage dispatch/reroute logs + stage-transition run-record updates (TASK-10) | 2026-08-17 (TASK-10) |
 | agent-profiles-validation-and-docs | Phase-5 documentation & E2E validation: §20 acceptance config resolution, backward-compatibility regression, migration guidance, deferred UI boundary | 2026-08-17 (TASK-9 live routing smoke) |
+| usage-aware-agent-profiles | Usage-aware profiles Stage 1: UsagePoolConfig + `usage_pools` map + `AgentProfileConfig.usage_pool` reference, load-time validation (caps `0 < v <= 100`, unknown refs rejected), normalized usage types + fail-open USAGE_PROBES; no runtime consumers yet | 2026-08-17 (TASK-12) |
 
