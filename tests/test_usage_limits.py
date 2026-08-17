@@ -1,15 +1,19 @@
 from __future__ import annotations
 
 from dataclasses import FrozenInstanceError
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 import textwrap
 import pytest
 
 from symphony.errors import ConfigValidationError
+from symphony.orchestrator.usage import (
+    ProviderUsageManager,
+    UsageDecision,
+    format_wait_reason,
+)
 from symphony.workflow.builder import build_service_config
 from symphony.workflow.config import (
-    AgentProfileConfig,
     ServiceConfig,
     UsagePoolConfig,
 )
@@ -27,9 +31,7 @@ def _parse(workflow_text: str) -> ServiceConfig:
     dedented = textwrap.dedent(workflow_text).strip()
     if not dedented.startswith("---"):
         dedented = f"---\n{dedented}\n---\n"
-    definition = parse_workflow_text(
-        dedented, source_path=Path("/tmp/WORKFLOW.md")
-    )
+    definition = parse_workflow_text(dedented, source_path=Path("/tmp/WORKFLOW.md"))
     return build_service_config(definition)
 
 
@@ -247,7 +249,9 @@ def test_usage_pools_validation_rejects_non_mapping_pool_entry() -> None:
     usage_pools:
       codex: "invalid-string"
     """
-    with pytest.raises(ConfigValidationError, match="usage_pools\\['codex'\\] must be a mapping"):
+    with pytest.raises(
+        ConfigValidationError, match="usage_pools\\['codex'\\] must be a mapping"
+    ):
         _parse(text)
 
 
@@ -268,7 +272,9 @@ def test_usage_pools_validation_rejects_missing_or_empty_source() -> None:
         caps:
           weekly: 80
     """
-    with pytest.raises(ConfigValidationError, match="source must be a non-empty string"):
+    with pytest.raises(
+        ConfigValidationError, match="source must be a non-empty string"
+    ):
         _parse(text_empty)
 
 
@@ -368,3 +374,246 @@ def test_usage_probe_protocol_and_registry_fail_open() -> None:
             return None
 
     assert isinstance(DummyProbe(), UsageProbe)
+
+
+# --- ProviderUsageManager Unit Tests ---
+
+
+def test_provider_usage_manager_evaluate_returns_ready_when_snapshot_is_none() -> None:
+    manager = ProviderUsageManager()
+    pool = UsagePoolConfig(source="codex", caps={"weekly": 70.0})
+    assert manager.evaluate("codex", pool) == UsageDecision.READY
+
+
+def test_provider_usage_manager_evaluate_returns_ready_when_snapshot_is_stale() -> None:
+    manager = ProviderUsageManager()
+    pool = UsagePoolConfig(source="codex", caps={"weekly": 70.0})
+    manager.set_snapshot(
+        "codex",
+        ProviderUsageSnapshot(
+            pool_id="codex",
+            source="codex",
+            windows={
+                "weekly": UsageWindow(
+                    key="weekly", used_percent=99.0, remaining_percent=1.0
+                )
+            },
+            stale=True,
+            authoritative=True,
+        ),
+    )
+    assert manager.evaluate("codex", pool) == UsageDecision.READY
+
+
+def test_provider_usage_manager_evaluate_returns_ready_when_non_authoritative() -> None:
+    manager = ProviderUsageManager()
+    pool = UsagePoolConfig(source="codex", caps={"weekly": 70.0})
+    manager.set_snapshot(
+        "codex",
+        ProviderUsageSnapshot(
+            pool_id="codex",
+            source="codex",
+            windows={
+                "weekly": UsageWindow(
+                    key="weekly", used_percent=99.0, remaining_percent=1.0
+                )
+            },
+            authoritative=False,
+        ),
+    )
+    assert manager.evaluate("codex", pool) == UsageDecision.READY
+
+
+def test_provider_usage_manager_evaluate_returns_wait_when_hard_limit_reached() -> None:
+    manager = ProviderUsageManager()
+    pool = UsagePoolConfig(source="codex", caps={"weekly": 70.0})
+    manager.set_snapshot(
+        "codex",
+        ProviderUsageSnapshot(
+            pool_id="codex",
+            source="codex",
+            windows={
+                "weekly": UsageWindow(
+                    key="weekly", used_percent=10.0, remaining_percent=90.0
+                )
+            },
+            hard_limit_reached=True,
+            authoritative=True,
+        ),
+    )
+    assert manager.evaluate("codex", pool) == UsageDecision.WAIT_PROVIDER_USAGE
+
+
+def test_provider_usage_manager_evaluate_returns_wait_when_window_exceeds_cap() -> None:
+    manager = ProviderUsageManager()
+    pool = UsagePoolConfig(source="codex", caps={"five_hour": 80.0, "weekly": 70.0})
+    manager.set_snapshot(
+        "codex",
+        ProviderUsageSnapshot(
+            pool_id="codex",
+            source="codex",
+            windows={
+                "five_hour": UsageWindow(
+                    key="five_hour", used_percent=50.0, remaining_percent=50.0
+                ),
+                "weekly": UsageWindow(
+                    key="weekly", used_percent=75.0, remaining_percent=25.0
+                ),
+            },
+            authoritative=True,
+        ),
+    )
+    assert manager.evaluate("codex", pool) == UsageDecision.WAIT_PROVIDER_USAGE
+
+
+def test_provider_usage_manager_evaluate_returns_ready_when_under_cap() -> None:
+    manager = ProviderUsageManager()
+    pool = UsagePoolConfig(source="codex", caps={"five_hour": 80.0, "weekly": 70.0})
+    manager.set_snapshot(
+        "codex",
+        ProviderUsageSnapshot(
+            pool_id="codex",
+            source="codex",
+            windows={
+                "five_hour": UsageWindow(
+                    key="five_hour", used_percent=79.9, remaining_percent=20.1
+                ),
+                "weekly": UsageWindow(
+                    key="weekly", used_percent=69.9, remaining_percent=30.1
+                ),
+            },
+            authoritative=True,
+        ),
+    )
+    assert manager.evaluate("codex", pool) == UsageDecision.READY
+
+
+def test_provider_usage_manager_evaluate_fails_open_when_window_resets_at_has_passed() -> (
+    None
+):
+    now = datetime(2026, 8, 17, 12, 0, 0, tzinfo=timezone.utc)
+    manager = ProviderUsageManager(clock=lambda: now)
+    pool = UsagePoolConfig(source="codex", caps={"weekly": 70.0})
+    past = now - timedelta(minutes=5)
+    manager.set_snapshot(
+        "codex",
+        ProviderUsageSnapshot(
+            pool_id="codex",
+            source="codex",
+            windows={
+                "weekly": UsageWindow(
+                    key="weekly",
+                    used_percent=90.0,
+                    remaining_percent=10.0,
+                    resets_at=past,
+                )
+            },
+            authoritative=True,
+        ),
+    )
+    # Passed reset_at -> fails open
+    assert manager.evaluate("codex", pool) == UsageDecision.READY
+
+
+@pytest.mark.asyncio
+async def test_provider_usage_manager_refresh_success_caches_snapshot() -> None:
+    snapshot = ProviderUsageSnapshot(
+        pool_id="codex",
+        source="codex",
+        windows={
+            "weekly": UsageWindow(
+                key="weekly", used_percent=55.0, remaining_percent=45.0
+            )
+        },
+        authoritative=True,
+    )
+
+    class MockProbe:
+        async def fetch_usage(self) -> ProviderUsageSnapshot:
+            return snapshot
+
+    manager = ProviderUsageManager(probes={"codex": MockProbe()})
+    res = await manager.refresh("codex")
+    assert res == snapshot
+    assert manager.snapshot("codex") == snapshot
+
+
+@pytest.mark.asyncio
+async def test_provider_usage_manager_refresh_failure_marks_existing_stale() -> None:
+    initial = ProviderUsageSnapshot(
+        pool_id="codex",
+        source="codex",
+        windows={
+            "weekly": UsageWindow(
+                key="weekly", used_percent=55.0, remaining_percent=45.0
+            )
+        },
+        authoritative=True,
+    )
+
+    class FailingProbe:
+        async def fetch_usage(self) -> ProviderUsageSnapshot:
+            raise RuntimeError("API connection timeout")
+
+    manager = ProviderUsageManager(probes={"codex": FailingProbe()})
+    manager.set_snapshot("codex", initial)
+    res = await manager.refresh("codex")
+    assert res is not None
+    assert res.stale is True
+    assert manager.snapshot("codex").stale is True
+
+
+@pytest.mark.asyncio
+async def test_provider_usage_manager_refresh_if_needed_respects_cache_ttl() -> None:
+    call_count = 0
+
+    class CountingProbe:
+        async def fetch_usage(self) -> ProviderUsageSnapshot:
+            nonlocal call_count
+            call_count += 1
+            return ProviderUsageSnapshot(
+                pool_id="codex",
+                source="codex",
+                windows={
+                    "weekly": UsageWindow(
+                        key="weekly", used_percent=20.0, remaining_percent=80.0
+                    )
+                },
+            )
+
+    manager = ProviderUsageManager(cache_ttl_s=60.0, probes={"codex": CountingProbe()})
+    await manager.refresh_if_needed("codex", "codex")
+    assert call_count == 1
+
+    # Within TTL -> no second probe
+    await manager.refresh_if_needed("codex", "codex")
+    assert call_count == 1
+
+    # Force refresh -> re-probes
+    await manager.refresh_if_needed("codex", "codex", force=True)
+    assert call_count == 2
+
+
+def test_provider_usage_manager_format_wait_reason() -> None:
+    now = datetime(2026, 8, 17, 14, 0, 0, tzinfo=timezone.utc)
+    pool = UsagePoolConfig(source="codex", caps={"weekly": 70.0})
+    snap = ProviderUsageSnapshot(
+        pool_id="codex",
+        source="codex",
+        windows={
+            "weekly": UsageWindow(
+                key="weekly", used_percent=75.0, remaining_percent=25.0, resets_at=now
+            )
+        },
+    )
+    reason = format_wait_reason("codex", pool, snap)
+    assert "codex weekly usage cap reached (75.0% >= 70.0%)" in reason
+    assert "2026-08-17T14:00:00+00:00" in reason
+
+    hard_snap = ProviderUsageSnapshot(
+        pool_id="codex",
+        source="codex",
+        hard_limit_reached=True,
+    )
+    hard_reason = format_wait_reason("codex", pool, hard_snap)
+    assert "codex provider hard usage limit reached" in hard_reason

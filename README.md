@@ -223,7 +223,7 @@ Profiles inherit all unset settings from their corresponding global backend bloc
 - **`claude`**: `model` (injects `--model <name>`), `command`, `resume_across_turns`, `turn_timeout_ms`, `read_timeout_ms`, `stall_timeout_ms`, `usage_pool`
 - **`gemini`, `agy`, `kiro`, `opencode`, `pi`, `prime_agent`**: `command`, `resume_across_turns`, timeouts, and `usage_pool`. Unsupported fields (e.g. `reasoning_effort` on `claude` or `agy`) are rejected at config validation. The gemini backend accepts `resume_across_turns` but ignores it (no resume support).
 
-Every kind also accepts `usage_pool`, the name of a shared usage pool declared under top-level `usage_pools:` in `WORKFLOW.md` (usage-aware profiles, Stage 1: validated at load; pool resolution and quota enforcement land with the usage-aware scheduling stages). Full reference: [docs/features/agent-profiles.md](docs/features/agent-profiles.md).
+Every kind also accepts `usage_pool`, the name of a shared usage pool declared under top-level `usage_pools:` in `WORKFLOW.md` (usage-aware profiles: validated at load; since Stage 3 the scheduler enforces pool caps at dispatch eligibility — quotas are checked per pool with fail-open semantics when usage telemetry is missing or stale, and caps never cancel a running worker). Full reference: [docs/features/agent-profiles.md](docs/features/agent-profiles.md).
 
 #### Resolution Precedence (8 Tiers)
 Symphony resolves the effective agent per dispatch using 8 deterministic tiers:

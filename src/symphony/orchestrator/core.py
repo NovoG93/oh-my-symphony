@@ -173,6 +173,11 @@ from .run_registry import (
     RunRegistry,
     registry_path_for_workflow,
 )
+from .usage import (
+    ProviderUsageManager,
+    UsageDecision,
+    format_wait_reason,
+)
 
 
 # Initiative D — the former ``_pkg.<name>`` parent-package indirection is
@@ -397,9 +402,12 @@ def _run_record_payload(record: RunRecord) -> dict[str, Any]:
         "status": record.status,
         "started_at": record.started_at.isoformat() if record.started_at else None,
         "updated_at": record.updated_at.isoformat() if record.updated_at else None,
-        "completed_at": record.completed_at.isoformat() if record.completed_at else None,
+        "completed_at": record.completed_at.isoformat()
+        if record.completed_at
+        else None,
         "workspace_path": str(record.workspace_path) if record.workspace_path else None,
-        "branch_name": record.branch_name or f"{SYMPHONY_BRANCH_PREFIX}{record.identifier}",
+        "branch_name": record.branch_name
+        or f"{SYMPHONY_BRANCH_PREFIX}{record.identifier}",
         "commit_sha": record.commit_sha,
         "continued_from_run_id": record.continued_from_run_id,
         "checkpoint": (
@@ -743,6 +751,7 @@ class Orchestrator:
         build_backend: Callable[[BackendInit], AgentBackend] | None = None,
         improvement_runner: ImprovementRunner | None = None,
         improvement_lease: Lease | None = None,
+        usage_manager: ProviderUsageManager | None = None,
     ) -> None:
         self._workflow_state = workflow_state
         # Initiative D — backend factory via constructor injection. None
@@ -755,6 +764,10 @@ class Orchestrator:
         # read-only properties below keep the many legacy read sites (and
         # tests) working; mutations should go through its methods.
         self._dispatch_state = DispatchState()
+        # Shared provider usage manager for evaluating quota caps across profiles
+        self._usage_manager: ProviderUsageManager = (
+            usage_manager or ProviderUsageManager()
+        )
         # C5 — `Done`-transition counter for the periodic wiki sweep. Lives
         # in-process; restart resets it (acceptable — the sweep is a
         # housekeeping nudge, not a correctness gate). Wraparound at
@@ -811,6 +824,7 @@ class Orchestrator:
         self._stopping = False
         self._refresh_pending = False
         self._observers: list[Callable[[], Awaitable[None]]] = []
+
         # Operator-driven pause is split into two pieces:
         #   * `_paused_issue_ids` — the authoritative "this ticket is held"
         #     flag. Set on pause_worker, cleared only on resume_worker (or
@@ -910,6 +924,10 @@ class Orchestrator:
     @property
     def _turn_budget_exhausted(self) -> set[str]:
         return self._dispatch_state.turn_budget_exhausted
+
+    @property
+    def usage_manager(self) -> ProviderUsageManager:
+        return self._usage_manager
 
     def _build_agent_backend(self, init: BackendInit) -> AgentBackend:
         """Resolve the backend factory: injected > module global (patchable)."""
@@ -2052,7 +2070,6 @@ class Orchestrator:
                 False,
             )
         )
-
 
     def recent_runs(
         self,
@@ -3711,6 +3728,20 @@ class Orchestrator:
             await self._notify_observers()
             return
 
+        # Refresh usage pool snapshots if needed.
+        if cfg.usage_pools:
+            for pool_id, pool_cfg in cfg.usage_pools.items():
+                try:
+                    await self._usage_manager.refresh_if_needed(
+                        pool_id, pool_cfg.source
+                    )
+                except Exception as exc:
+                    log.warning(
+                        "usage_pool_refresh_failed",
+                        pool_id=pool_id,
+                        error=str(exc),
+                    )
+
         # Fetch candidates.
         try:
             candidates = await self._fetch_candidates(cfg)
@@ -3760,10 +3791,7 @@ class Orchestrator:
                 }
                 await self._notify_observers()
                 return
-        if (
-            not dependency_graph_within_bounds
-            and cfg.agent.scheduling_policy == "fifo"
-        ):
+        if not dependency_graph_within_bounds and cfg.agent.scheduling_policy == "fifo":
             slots_before = self._available_slots(cfg)
             await self._dispatch_fifo_without_schedule_projection(candidates, cfg)
             self._schedule_snapshot = {
@@ -3806,10 +3834,7 @@ class Orchestrator:
         dependency_analysis = (
             await asyncio.to_thread(analyze_dependencies, candidates)
             if dependency_graph_within_bounds
-            and (
-                cfg.agent.scheduling_policy == "dag"
-                or cfg.tracker.kind == "file"
-            )
+            and (cfg.agent.scheduling_policy == "dag" or cfg.tracker.kind == "file")
             else DependencyAnalysis({}, {})
         )
         ordered_candidates = self._sort_with_wait_age_bump(
@@ -4060,9 +4085,7 @@ class Orchestrator:
                 issue,
                 cfg,
                 attempt=persisted_attempt,
-                attempt_kind=(
-                    "retry" if persisted_attempt is not None else None
-                ),
+                attempt_kind=("retry" if persisted_attempt is not None else None),
             )
 
     def _sort_with_wait_age_bump(
@@ -4245,7 +4268,9 @@ class Orchestrator:
         if store is None or cfg.artifacts.ttl_days <= 0:
             return
         try:
-            known = await asyncio.to_thread(self._tracker_call_retained_identifiers, cfg)
+            known = await asyncio.to_thread(
+                self._tracker_call_retained_identifiers, cfg
+            )
         except Exception as exc:
             log.warning("artifact_sweep_fetch_failed", error=str(exc))
             return
@@ -5500,6 +5525,40 @@ class Orchestrator:
             )
         return None
 
+    def _eligibility_usage_decision(
+        self, issue: Issue, cfg: ServiceConfig
+    ) -> _EligibilityDecision | None:
+        try:
+            selection = cfg.selection_for_state(
+                issue.state,
+                ticket_profile=_requested_agent_profile(issue),
+                ticket_kind=_requested_agent_kind(issue),
+            )
+        except ConfigValidationError:
+            return None
+
+        profile_cfg = (
+            cfg.agent_profiles.get(selection.profile) if selection.profile else None
+        )
+        pool_id = (
+            profile_cfg.usage_pool if profile_cfg and profile_cfg.usage_pool else None
+        ) or selection.kind
+
+        pool = cfg.usage_pools.get(pool_id)
+        if pool is None:
+            return None
+
+        decision = self._usage_manager.evaluate(pool_id, pool)
+        if decision is UsageDecision.WAIT_PROVIDER_USAGE:
+            snapshot = self._usage_manager.snapshot(pool_id)
+            reason = format_wait_reason(pool_id, pool, snapshot)
+            return _EligibilityDecision(
+                _EligibilityDisposition.WAIT_NON_SLOT,
+                "waiting_provider_usage",
+                reason,
+            )
+        return None
+
     def _eligibility_decision(
         self,
         issue: Issue,
@@ -5513,6 +5572,8 @@ class Orchestrator:
         )
         if decision is None:
             decision = self._eligibility_contract_decision(issue, cfg)
+        if decision is None:
+            decision = self._eligibility_usage_decision(issue, cfg)
         if decision is None:
             decision = self._eligibility_contention_decision(
                 issue, cfg, include_global_slots=include_global_slots
@@ -6215,7 +6276,9 @@ class Orchestrator:
         agent_profile = dispatch_selection.profile or ""
         resolved_agent = resolve_agent_config(cfg, dispatch_selection)
         model = getattr(resolved_agent.active_config, "model", "") or ""
-        reasoning_effort = getattr(resolved_agent.active_config, "reasoning_effort", "") or ""
+        reasoning_effort = (
+            getattr(resolved_agent.active_config, "reasoning_effort", "") or ""
+        )
         acquisition = self._try_acquire_run_lease(
             cfg=cfg,
             issue=issue,
@@ -7044,19 +7107,27 @@ class Orchestrator:
                                 ticket_profile=_requested_agent_profile(issue),
                                 ticket_kind=_requested_agent_kind(issue),
                             )
-                            phase_resolved_agent = resolve_agent_config(phase_cfg, phase_selection)
+                            phase_resolved_agent = resolve_agent_config(
+                                phase_cfg, phase_selection
+                            )
                             to_kind = phase_selection.kind
                             to_profile = phase_selection.profile or ""
                             to_model = (
-                                getattr(phase_resolved_agent.active_config, "model", "") or ""
+                                getattr(phase_resolved_agent.active_config, "model", "")
+                                or ""
                             )
                             to_reasoning_effort = (
-                                getattr(phase_resolved_agent.active_config, "reasoning_effort", "")
+                                getattr(
+                                    phase_resolved_agent.active_config,
+                                    "reasoning_effort",
+                                    "",
+                                )
                                 or ""
                             )
                             from_kind = (
                                 running_entry.agent_kind
-                                if running_entry is not None and running_entry.agent_kind
+                                if running_entry is not None
+                                and running_entry.agent_kind
                                 else cfg.agent.kind
                             )
                             from_profile = (
@@ -7065,9 +7136,7 @@ class Orchestrator:
                                 else ""
                             )
                             from_model = (
-                                running_entry.model
-                                if running_entry is not None
-                                else ""
+                                running_entry.model if running_entry is not None else ""
                             )
                             from_reasoning_effort = (
                                 running_entry.reasoning_effort
@@ -7100,19 +7169,26 @@ class Orchestrator:
                                 running_entry.agent_profile = to_profile
                                 running_entry.model = to_model
                                 running_entry.reasoning_effort = to_reasoning_effort
-                                if running_entry.run_id and self._run_registry is not None:
-                                    stage_registry = cast(RunRegistry, self._run_registry)
+                                if (
+                                    running_entry.run_id
+                                    and self._run_registry is not None
+                                ):
+                                    stage_registry = cast(
+                                        RunRegistry, self._run_registry
+                                    )
                                     stage_run_id = running_entry.run_id
                                     self._registry_guard(
                                         "update_stage_agent_profile",
-                                        lambda: stage_registry.update_stage_agent_profile(
-                                            issue_id=running_issue_id,
-                                            run_id=stage_run_id,
-                                            state=current_state,
-                                            agent_kind=to_kind,
-                                            agent_profile=to_profile,
-                                            model=to_model,
-                                            reasoning_effort=to_reasoning_effort,
+                                        lambda: (
+                                            stage_registry.update_stage_agent_profile(
+                                                issue_id=running_issue_id,
+                                                run_id=stage_run_id,
+                                                state=current_state,
+                                                agent_kind=to_kind,
+                                                agent_profile=to_profile,
+                                                model=to_model,
+                                                reasoning_effort=to_reasoning_effort,
+                                            )
                                         ),
                                         False,
                                     )
@@ -7213,9 +7289,8 @@ class Orchestrator:
                         break
 
                     is_continuation = (
-                        (running.recovery_session_resumed and turn_number == 1)
-                        or (turn_number > 1 and not is_phase_transition)
-                    )
+                        running.recovery_session_resumed and turn_number == 1
+                    ) or (turn_number > 1 and not is_phase_transition)
                     if is_continuation:
                         debug = self._issue_debug.setdefault(
                             running_issue_id, _IssueDebug()
@@ -7632,12 +7707,16 @@ class Orchestrator:
         except SymphonyError as exc:
             outcome = "error"
             running = self._running.get(running_issue_id)
-            private_session_id = running.resume_session_id if running is not None else None
+            private_session_id = (
+                running.resume_session_id if running is not None else None
+            )
             error = str(redact_session_id(str(exc), private_session_id))
         except Exception as exc:
             outcome = "error"
             running = self._running.get(running_issue_id)
-            private_session_id = running.resume_session_id if running is not None else None
+            private_session_id = (
+                running.resume_session_id if running is not None else None
+            )
             error = str(redact_session_id(str(exc), private_session_id))
             log.error(
                 "worker_unhandled_error",
@@ -8724,9 +8803,7 @@ class Orchestrator:
                     debug.last_error = f"approval denied: {reason} ({command})"
                 else:
                     debug.last_error = f"approval denied: {reason}"
-                self._append_run_event(
-                    entry, "approval_denied", {"reason": reason}
-                )
+                self._append_run_event(entry, "approval_denied", {"reason": reason})
                 log.warning(
                     "approval_denied",
                     issue_id=issue_id,
@@ -8976,7 +9053,9 @@ class Orchestrator:
             )
         if ev_name == EVENT_AGENT_RETRY:
             phase = payload.get("phase") if isinstance(payload, dict) else None
-            retry_attempt = payload.get("attempt") if isinstance(payload, dict) else None
+            retry_attempt = (
+                payload.get("attempt") if isinstance(payload, dict) else None
+            )
             retry_error = (
                 payload.get("error") or payload.get("final_error")
                 if isinstance(payload, dict)
