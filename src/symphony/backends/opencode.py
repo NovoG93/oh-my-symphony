@@ -12,6 +12,7 @@ import asyncio
 import json
 import shlex
 from collections import Counter
+from datetime import datetime, timezone
 from typing import Any, Iterable
 
 from ..errors import TurnFailed
@@ -26,6 +27,13 @@ from . import (
     _is_valid_session_id,
 )
 from .per_turn import PerTurnCliBackend
+from .usage import (
+    ProviderUsageSnapshot,
+    UsageProbe,
+    UsageWindow,
+    USAGE_PROBES,
+)
+
 
 
 HEARTBEAT_INTERVAL_S = 30.0
@@ -78,7 +86,13 @@ class OpenCodeBackend(PerTurnCliBackend):
     # per-turn hooks
     # ------------------------------------------------------------------
 
+    def _check_provider_exhaustion(
+        self, text: str
+    ) -> tuple[bool, datetime | None]:
+        return _is_genuine_opencode_exhaustion(text), None
+
     def is_progress_event(self, event: dict[str, Any]) -> bool:
+
         return event.get("type") in {"opencode_heartbeat", "opencode_usage"}
 
     @property
@@ -384,3 +398,85 @@ def _sum_int_values(data: dict[str, Any], *keys: str) -> int:
         if ivalue > 0:
             total += ivalue
     return total
+
+
+def _is_genuine_opencode_exhaustion(text: str) -> bool:
+    """Return True if error text signals provider quota exhaustion rather than RPM."""
+    lowered = text.lower()
+    if (
+        "requests per minute" in lowered
+        or "tokens per minute" in lowered
+        or "rpm" in lowered
+        or "tpm" in lowered
+    ):
+        return False
+    exhaustion_keywords = (
+        "quota exceeded",
+        "quota_exceeded",
+        "usage limit reached",
+        "usage_limit",
+        "insufficient credits",
+        "rate limit reached",
+        "out of credits",
+        "provider_usage_exhausted",
+        "provider usage exhausted",
+    )
+    return any(kw in lowered for kw in exhaustion_keywords)
+
+
+def normalize_opencode_local_usage(
+    raw: dict[str, Any],
+    *,
+    pool_id: str = "opencode-go",
+) -> ProviderUsageSnapshot:
+    """Normalize local OpenCode usage estimates (always authoritative=False)."""
+    windows: dict[str, UsageWindow] = {}
+    used_pct = None
+    if "used_percent" in raw:
+        try:
+            used_pct = float(raw["used_percent"])
+        except (ValueError, TypeError):
+            pass
+    elif "usedPercent" in raw:
+        try:
+            used_pct = float(raw["usedPercent"])
+        except (ValueError, TypeError):
+            pass
+
+    if used_pct is not None:
+        windows["local"] = UsageWindow(
+            key="local",
+            used_percent=used_pct,
+            remaining_percent=max(0.0, 100.0 - used_pct),
+        )
+
+    return ProviderUsageSnapshot(
+        pool_id=pool_id,
+        source=pool_id,
+        windows=windows,
+        hard_limit_reached=bool(raw.get("hard_limit_reached")),
+        authoritative=False,  # Local estimates MUST NEVER block scheduling
+        observed_at=datetime.now(timezone.utc),
+    )
+
+
+class OpenCodeGoUsageProbe(UsageProbe):
+    """Usage probe for OpenCode / OpenCode Go (non-authoritative estimate or fail open)."""
+
+    def __init__(
+        self,
+        *,
+        pool_id: str = "opencode-go",
+        cached_snapshot: ProviderUsageSnapshot | None = None,
+    ) -> None:
+        self.pool_id = pool_id
+        self.cached_snapshot = cached_snapshot
+
+    async def fetch_usage(self) -> ProviderUsageSnapshot | None:
+        """Return non-authoritative snapshot or None (fails open)."""
+        return self.cached_snapshot
+
+
+USAGE_PROBES["opencode-go"] = OpenCodeGoUsageProbe
+USAGE_PROBES["opencode"] = OpenCodeGoUsageProbe
+

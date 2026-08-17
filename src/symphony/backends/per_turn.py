@@ -32,14 +32,17 @@ from ..logging import get_logger
 from ..utils.git_sandbox import git_roots_env
 from ..workspace import validate_agent_cwd
 from . import (
+    EVENT_PROVIDER_USAGE_EXHAUSTED,
     EVENT_SESSION_STARTED,
     EVENT_TURN_FAILED,
     EVENT_TURN_STARTED,
     BackendInit,
     BaseAgentBackend,
+    ProviderCapacityError,
     TurnResult,
     redact_session_id,
 )
+
 
 
 log = get_logger()
@@ -87,6 +90,11 @@ class PerTurnCliBackend(BaseAgentBackend):
         self._cwd = init.cwd
         self._on_event = init.on_event
         self._on_process_started = init.on_process_started
+        self._usage_manager = getattr(init, "usage_manager", None)
+        self._usage_pool = getattr(init, "usage_pool", None) or (
+            init.selection.kind if init.selection is not None else agent_name
+        )
+
         self._session_id: str | None = None
         self._closed = False
         self._active_proc: asyncio.subprocess.Process | None = None
@@ -100,6 +108,13 @@ class PerTurnCliBackend(BaseAgentBackend):
     # ------------------------------------------------------------------
     # subclass hooks
     # ------------------------------------------------------------------
+
+    def _check_provider_exhaustion(
+        self, text: str
+    ) -> tuple[bool, Any | None]:
+        del text
+        return False, None
+
 
     def _command_for_turn(self, *, prompt: str, is_continuation: bool) -> str:
         raise NotImplementedError
@@ -285,6 +300,20 @@ class PerTurnCliBackend(BaseAgentBackend):
 
     async def _fail_turn(self, rc: int) -> None:
         err_msg = self._stderr_blob()
+        is_exhausted, resets_at = self._check_provider_exhaustion(err_msg)
+        if is_exhausted:
+            pool_id = self._usage_pool or self._agent_name
+            await self._emit(
+                EVENT_PROVIDER_USAGE_EXHAUSTED,
+                {
+                    "pool_id": pool_id,
+                    "reason": err_msg,
+                    "resets_at": resets_at.isoformat() if resets_at else None,
+                },
+            )
+            raise ProviderCapacityError(
+                pool_id=pool_id, resets_at=resets_at, message=err_msg
+            )
         payload = {
             "reason": f"{self._agent_name} exit {rc}"
             + (f"; stderr: {err_msg}" if err_msg else ""),
@@ -293,6 +322,7 @@ class PerTurnCliBackend(BaseAgentBackend):
         }
         await self._emit(EVENT_TURN_FAILED, payload)
         raise TurnFailed(err_msg or f"{self._agent_name} failed with exit {rc}")
+
 
     def _capture_stderr(self, stderr: bytes) -> None:
         text = stderr.decode("utf-8", errors="replace")

@@ -47,5 +47,30 @@ def get_usage_probe(source: str) -> type[UsageProbe] | None:
         from .codex import CodexUsageProbe
 
         USAGE_PROBES["codex"] = CodexUsageProbe
-    return USAGE_PROBES.get(source)
+    elif source == "claude" and "claude" not in USAGE_PROBES:
+        from .claude_code import ClaudeUsageProbe
 
+        USAGE_PROBES["claude"] = ClaudeUsageProbe
+    elif source == "agy" and "agy" not in USAGE_PROBES:
+        from .agy import AgyUsageProbe
+
+        USAGE_PROBES["agy"] = AgyUsageProbe
+    elif source == "gemini" and "gemini" not in USAGE_PROBES:
+        from .gemini import GeminiUsageProbe
+
+        USAGE_PROBES["gemini"] = GeminiUsageProbe
+    elif source == "kiro" and "kiro" not in USAGE_PROBES:
+        from .kiro import KiroUsageProbe
+
+        USAGE_PROBES["kiro"] = KiroUsageProbe
+    elif (source in ("opencode", "opencode-go")) and ("opencode-go" not in USAGE_PROBES):
+        from .opencode import OpenCodeGoUsageProbe
+
+        USAGE_PROBES["opencode-go"] = OpenCodeGoUsageProbe
+        USAGE_PROBES["opencode"] = OpenCodeGoUsageProbe
+    elif source == "github-copilot" and "github-copilot" not in USAGE_PROBES:
+        from .pi import GithubCopilotUsageProbe
+
+        USAGE_PROBES["github-copilot"] = GithubCopilotUsageProbe
+
+    return USAGE_PROBES.get(source)
