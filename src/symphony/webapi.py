@@ -389,6 +389,7 @@ _PUBLIC_SCHEDULE_REASONS = {
     "waiting_dependency": "waiting for dependencies",
     "waiting_global_capacity": "waiting for global capacity",
     "waiting_state_capacity": "waiting for state capacity",
+    "waiting_provider_usage": "waiting for provider capacity",
     "refused_conflict": "final conflict check refused dispatch",
     "refused_dispatch_authority": "final dispatch authority was not acquired",
     "terminal_success": "dependency is complete",
@@ -397,6 +398,7 @@ _PUBLIC_SCHEDULE_REASONS = {
     "snapshot_unavailable": "not present in the last scheduler evaluation",
     "decision_stale": "ticket changed after scheduler evaluation",
 }
+
 
 
 def _public_schedule_reason(code: str) -> str:
@@ -743,8 +745,16 @@ def _workflow_payload(cfg: ServiceConfig) -> dict[str, Any]:
             ),
         },
         "agent_kinds": sorted(SUPPORTED_AGENT_KINDS),
+        "usage_pools": {
+            name: {
+                "source": pool.source,
+                "caps": dict(pool.caps),
+            }
+            for name, pool in cfg.usage_pools.items()
+        },
         "continuous_improvement": _continuous_improvement_payload(cfg),
         "preview": {
+
             "enabled": cfg.preview.enabled,
             "cwd": cfg.preview.cwd,
             "health_path": cfg.preview.health_path,
@@ -1157,8 +1167,10 @@ def _register_issue_routes(
                 "columns": _columns_payload(cfg),
                 "issues": issues,
                 "live": _live_by_identifier(orchestrator),
+                "provider_usage": orchestrator.snapshot().get("provider_usage", {}),
             }
         )
+
 
     async def _fetch_all_file_issues(cfg: ServiceConfig) -> list[Issue]:
         tracker = FileBoardTracker(cfg.tracker)

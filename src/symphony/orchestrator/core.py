@@ -2880,12 +2880,101 @@ class Orchestrator:
                 ),
             },
             "rate_limits": self._latest_rate_limits,
+            "provider_usage": self._provider_usage_projection(),
             "workflow": {
                 "default_agent_kind": cfg.agent.kind if cfg is not None else "",
                 "branch_policy": self._branch_policy_snapshot(cfg),
             },
             "health": self._health_summary(),
         }
+
+    def _provider_usage_projection(self) -> dict[str, Any]:
+        """Project usage-pool-aware runtime data for all configured and known pools."""
+        cfg = self._workflow_state.current()
+        pool_ids: set[str] = set()
+        if cfg is not None and cfg.usage_pools:
+            pool_ids.update(cfg.usage_pools.keys())
+        if self._usage_manager is not None:
+            pool_ids.update(self._usage_manager.snapshots.keys())
+
+        result: dict[str, Any] = {}
+        for pool_id in sorted(pool_ids):
+            pool_cfg = (
+                cfg.usage_pools.get(pool_id)
+                if (cfg is not None and cfg.usage_pools)
+                else None
+            )
+            snap = (
+                self._usage_manager.snapshot(pool_id)
+                if self._usage_manager is not None
+                else None
+            )
+
+            source = (
+                snap.source
+                if snap is not None
+                else (pool_cfg.source if pool_cfg is not None else pool_id)
+            )
+            stale = snap.stale if snap is not None else False
+            authoritative = snap.authoritative if snap is not None else True
+
+            windows_proj: dict[str, Any] = {}
+            if snap is not None and snap.windows:
+                for w_key, w in snap.windows.items():
+                    used = w.used_percent
+                    remaining = w.remaining_percent
+                    if remaining is None and used is not None:
+                        remaining = (
+                            round(100.0 - float(used), 2)
+                            if isinstance(used, float)
+                            else 100 - used
+                        )
+                    resets = (
+                        w.resets_at.isoformat()
+                        if isinstance(w.resets_at, datetime)
+                        else w.resets_at
+                    )
+                    windows_proj[w_key] = {
+                        "used_percent": used,
+                        "remaining_percent": remaining,
+                        "resets_at": resets,
+                    }
+            elif pool_cfg is not None and pool_cfg.caps:
+                for w_key in pool_cfg.caps:
+                    windows_proj[w_key] = {
+                        "used_percent": None,
+                        "remaining_percent": None,
+                        "resets_at": None,
+                    }
+
+            if snap is None:
+                status = "unavailable"
+            elif snap.hard_limit_reached:
+                status = "capacity_paused"
+            elif (
+                pool_cfg is not None
+                and self._usage_manager is not None
+                and self._usage_manager.evaluate(pool_id, pool_cfg)
+                == UsageDecision.WAIT_PROVIDER_USAGE
+            ):
+                status = "capacity_paused"
+            else:
+                status = "available"
+
+            result[pool_id] = {
+                "source": source,
+                "windows": windows_proj,
+                "status": status,
+                "stale": stale,
+                "authoritative": authoritative,
+            }
+
+        return result
+
+    def provider_usage_snapshot(self) -> dict[str, Any]:
+        """Project usage-pool-aware runtime metrics across all pools."""
+        return self._provider_usage_projection()
+
 
     def schedule_snapshot(self) -> dict[str, Any]:
         """Immutable projection authored by the last completed scheduler pass."""

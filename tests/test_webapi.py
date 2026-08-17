@@ -140,7 +140,9 @@ class _StubOrchestrator:
                 "seconds_running": 0,
             },
             "rate_limits": None,
+            "provider_usage": {},
         }
+
 
     def issue_snapshot(self, _identifier: str) -> dict[str, Any] | None:
         return None
@@ -1994,8 +1996,9 @@ async def test_open_project_starts_only_destination_and_returns_independent_url(
             "url": "http://127.0.0.1:10001/",
         }
         assert registry.started == ["other"]
-        assert client.server.app is not None
+        assert getattr(client.server, "app", None) is not None
     finally:
+
         await client.close()
 
 
@@ -2192,7 +2195,9 @@ def test_schedule_reason_taxonomy_covers_every_authoritative_code() -> None:
         "waiting_dependency",
         "waiting_global_capacity",
         "waiting_state_capacity",
+        "waiting_provider_usage",
         "refused_conflict",
+
         "refused_dispatch_authority",
         "terminal_success",
         "terminal_needs_action",
@@ -2371,3 +2376,164 @@ async def test_artifact_file_carries_a_sandbox_csp(
     assert "sandbox" in csp
     assert "allow-downloads" in csp  # attachment responses must still save
     assert resp.headers["X-Frame-Options"] == "DENY"
+
+
+# ---------------------------------------------------------------------------
+# Stage 6.12: Usage pools & provider usage API contract
+# ---------------------------------------------------------------------------
+
+
+async def test_workflow_api_exposes_usage_pools(
+    client: TestClient, tmp_path: Path
+) -> None:
+    """Stage 5: /api/v1/workflow includes configured usage_pools."""
+    resp = await client.get("/api/v1/workflow")
+    assert resp.status == 200
+    payload = await resp.json()
+    assert "usage_pools" in payload
+    assert isinstance(payload["usage_pools"], dict)
+
+
+async def test_workflow_api_exposes_configured_usage_pools_content(
+    board_dir: Path,
+) -> None:
+    """Stage 5: /api/v1/workflow includes source and caps for configured pools."""
+    wf_text = """---
+tracker:
+  kind: file
+  board_root: ./kanban
+  active_states: [Todo, Doing]
+  terminal_states: [Done, Archive]
+
+usage_pools:
+  codex:
+    source: codex
+    caps:
+      five_hour: 80
+      weekly: 70
+
+agent:
+  kind: codex
+---
+"""
+    (board_dir / "WORKFLOW.md").write_text(wf_text, encoding="utf-8")
+    wf_state = WorkflowState(board_dir / "WORKFLOW.md")
+    wf_state.reload()
+    orch = _StubOrchestrator(wf_state)
+    app = build_app(cast(Orchestrator, orch))
+    srv = TestServer(app)
+    cl = TestClient(srv)
+    await cl.start_server()
+    try:
+        resp = await cl.get("/api/v1/workflow")
+        assert resp.status == 200
+        payload = await resp.json()
+        assert "usage_pools" in payload
+        assert payload["usage_pools"]["codex"]["source"] == "codex"
+        assert payload["usage_pools"]["codex"]["caps"] == {
+            "five_hour": 80.0,
+            "weekly": 70.0,
+        }
+    finally:
+        await cl.close()
+
+
+def test_snapshot_exposes_provider_usage(tmp_path: Path) -> None:
+    """Stage 5: orchestrator.snapshot() includes provider_usage mapping."""
+    from datetime import datetime, timezone
+    from symphony.backends.usage import ProviderUsageSnapshot, UsageWindow
+    from symphony.orchestrator.core import Orchestrator
+    from symphony.orchestrator.usage import ProviderUsageManager
+    from symphony.workflow import WorkflowState
+
+    wf_file = tmp_path / "WORKFLOW.md"
+    wf_file.write_text(
+        """---
+tracker: { kind: memory }
+usage_pools:
+  codex:
+    source: codex
+    caps: { five_hour: 80, weekly: 70 }
+agent: { kind: codex }
+---
+""",
+        encoding="utf-8",
+    )
+    wf_state = WorkflowState(wf_file)
+    wf_state.reload()
+    mgr = ProviderUsageManager()
+    snap = ProviderUsageSnapshot(
+        pool_id="codex",
+        source="codex",
+        windows={
+            "five_hour": UsageWindow(
+                key="five_hour",
+                used_percent=63.0,
+                remaining_percent=37.0,
+                resets_at=datetime(2026, 8, 17, 23, 0, tzinfo=timezone.utc),
+            ),
+            "weekly": UsageWindow(
+                key="weekly",
+                used_percent=51.0,
+                remaining_percent=49.0,
+                resets_at=datetime(2026, 8, 20, 14, 0, tzinfo=timezone.utc),
+            ),
+        },
+        hard_limit_reached=False,
+        authoritative=True,
+    )
+    mgr.set_snapshot("codex", snap)
+    orch = Orchestrator(wf_state, usage_manager=mgr)
+    snapshot = orch.snapshot()
+    assert "provider_usage" in snapshot
+    pu = snapshot["provider_usage"]
+    assert "codex" in pu
+    assert pu["codex"]["source"] == "codex"
+    assert pu["codex"]["status"] == "available"
+    assert pu["codex"]["stale"] is False
+    assert pu["codex"]["authoritative"] is True
+    assert pu["codex"]["windows"]["five_hour"]["used_percent"] == 63.0
+    assert pu["codex"]["windows"]["five_hour"]["remaining_percent"] == 37.0
+    assert pu["codex"]["windows"]["five_hour"]["resets_at"] == "2026-08-17T23:00:00+00:00"
+
+
+def test_remaining_percent_is_100_minus_used_percent(tmp_path: Path) -> None:
+    """Stage 5: remaining_percent is automatically 100 - used_percent when omitted."""
+    from symphony.backends.usage import ProviderUsageSnapshot, UsageWindow
+    from symphony.orchestrator.core import Orchestrator
+    from symphony.orchestrator.usage import ProviderUsageManager
+    from symphony.workflow import WorkflowState
+
+    wf_file = tmp_path / "WORKFLOW.md"
+    wf_file.write_text(
+        """---
+tracker: { kind: memory }
+usage_pools:
+  claude:
+    source: claude
+    caps: { five_hour: 80 }
+agent: { kind: claude }
+---
+""",
+        encoding="utf-8",
+    )
+    wf_state = WorkflowState(wf_file)
+    wf_state.reload()
+    mgr = ProviderUsageManager()
+    snap = ProviderUsageSnapshot(
+        pool_id="claude",
+        source="claude",
+        windows={
+            "five_hour": UsageWindow(
+                key="five_hour",
+                used_percent=42.0,
+                remaining_percent=None,  # omitted -> calculated
+            ),
+        },
+    )
+    mgr.set_snapshot("claude", snap)
+    orch = Orchestrator(wf_state, usage_manager=mgr)
+    pu = orch.snapshot()["provider_usage"]
+    assert pu["claude"]["windows"]["five_hour"]["remaining_percent"] == 58.0
+
+

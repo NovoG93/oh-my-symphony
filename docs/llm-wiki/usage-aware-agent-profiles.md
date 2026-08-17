@@ -1,4 +1,4 @@
-# Usage-aware agent profiles — Stages 1, 2.1, 2.2-2.8, 3, 4 (model, probes, enforcement, exhaustion)
+# Usage-aware agent profiles — Stages 1, 2.1, 2.2-2.8, 3, 4, 5 (model, probes, enforcement, exhaustion, projection/UI)
 
 **Summary:** TASK-12 delivered Stage 1 of the Usage-Aware Agent Profiles
 feature: a shared usage-pool configuration model, load-time validation, and
@@ -223,9 +223,55 @@ UTC): 2549 collected, `lastfailed = {}` — all 36 + 83 other usage tests +
 4 pyright-gate tests unfailed; a fresh re-run was not proven in the ticket
 worktree (execution denied — `docs/TASK-15/qa/runtime-blocked.md`).
 
+## Stage 5 — per-pool API projection + Provider Usage UI card (TASK-16)
+
+**Summary:** TASK-16 projected the usage pools through the API and the web
+UI. Runtime quota telemetry is now visible per pool on the board: the
+orchestrator snapshot carries `provider_usage` and the workflow payload
+carries the configured `usage_pools`; the web app renders a Provider Usage
+card next to Agent Policy.
+
+**Projection (`src/symphony/orchestrator/core.py:2883`):**
+- `_provider_usage_projection()` (`core.py:2891-2969`) emits per-pool
+  `source`, `windows` (`used_percent`, `remaining_percent`, `resets_at`
+  ISO-8601), `status` (`available` | `capacity_paused` | `unavailable`),
+  `stale`, `authoritative`. Pool ids = union of `cfg.usage_pools` keys and
+  manager snapshot keys; no per-request network I/O (TTL-cached snapshots).
+- `remaining_percent` defaults to `100 - used_percent`; `authoritative`
+  defaults True when no snapshot exists (fail-open invariant: unknown usage
+  never blocks the UI or scheduler). `rate_limits` is retained as legacy
+  telemetry alongside `provider_usage`.
+
+**API payloads (`src/symphony/webapi.py:748`):**
+- `_workflow_payload` serializes `usage_pools` as `{pool: {source, caps}}`.
+- `_PUBLIC_SCHEDULE_REASONS` gains `waiting_provider_usage` ("waiting for
+  provider capacity"); `handle_board` exposes `provider_usage` in the board
+  payload (`.get("provider_usage", {})` — stub-orchestrator safe).
+
+**UI card (`src/symphony/web/static/app.js:2814`):**
+- `buildProviderUsageCard(usagePools, providerUsage)` renders per-pool
+  header + status badge (`Available` / `Capacity paused` / `Usage
+  unavailable`), stale/estimated chips, progress bar with `--paused` /
+  `--estimated` modifier classes, and meta rows (used %, remaining %,
+  configured cap, resets-at / available-after). Mounted after
+  `buildAgentPolicyCard` in the workflow editor (app.js:2699) and on the
+  Settings page (app.js:4881).
+- `scheduleReasonLabel` maps `waiting_provider_usage` -> localized reason
+  (app.js:1336). EN/KO i18n blocks: 21 keys each (i18n.js:537-560 /
+  1114-1137), parity verified; `scripts/check_i18n.py` green.
+- CSS: `.provider-usage-card` + bar/badge/chip rules at style.css:2217-2245
+  (no new page).
+
+**Evidence (TASK-16):** 8 Stage 6.12 contract tests in
+`tests/test_webapi.py` + `tests/test_web_static_contract.py` (usage_pools
+shape + content, snapshot provider_usage, remaining=100-used, card exists,
+waiting_provider_usage translation, unknown renders, estimated visually
+distinguished). Recorded implementation run (21:34 UTC): 2557 collected,
+`lastfailed = {}`; a fresh re-run was not proven in the ticket worktree
+(execution denied — `docs/TASK-16/qa/runtime-blocked.md`).
+
 **Decision log:**
-- 2026-08-17 | TASK-12 | Usage modeled per shared pool, not per profile:
-  `UsagePoolConfig` + `usage_pools` map; `usage_pool` is a reference only.
+- 2026-08-17 | TASK-12 | Usage modeled per shared pool, not per profile:  `UsagePoolConfig` + `usage_pools` map; `usage_pool` is a reference only.
   Stricter-than-spec: unsupported pool-entry fields rejected at load
   (matches the `agent_profiles` allowlist pattern).
 - 2026-08-17 | TASK-13 | Enforcement delivered as derived scheduler state:
@@ -251,5 +297,12 @@ worktree (execution denied — `docs/TASK-15/qa/runtime-blocked.md`).
   binding only, local estimates hardcoded `authoritative=False`; Gemini and
   Kiro detect hard limits from runtime errors only with reset extraction,
   no pseudo-TTY / interactive scraping.
+- 2026-08-17 | TASK-16 | Stage 5 projected per-pool: orchestrator snapshot
+  gains `provider_usage` (source/windows/status/stale/authoritative;
+  `remaining_percent = 100 - used_percent` fallback; `authoritative` fails
+  open to True) alongside legacy `rate_limits`; workflow payload exposes
+  configured `usage_pools` (source + caps); Provider Usage card + paused
+  "Capacity paused"/"Available after" state + `waiting_provider_usage`
+  schedule reason localized EN/KO; 8 Stage 6.12 contract tests.
 
-**Last updated:** 2026-08-17 by TASK-15 Document.
+**Last updated:** 2026-08-17 by TASK-16 Document.

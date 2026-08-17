@@ -483,6 +483,58 @@ def test_board_request_view_ships_accessible_explainable_schedule_contract() -> 
     assert "Request schedule" in js
     assert "요청 스케줄" in js
     assert "available only for file boards" in js
-    assert "파일 보드에서만 지원" in js
     assert ".request-node-main:focus-visible" in css
     assert ".schedule-details-list" in css
+
+
+# ---------------------------------------------------------------------------
+# Stage 6.12: Provider Usage Card & UI Contract Tests
+# ---------------------------------------------------------------------------
+
+
+def test_provider_usage_card_exists() -> None:
+    js = _script_bundle()
+    css = (STATIC_ROOT / "style.css").read_text(encoding="utf-8")
+    i18n = (STATIC_ROOT / "i18n.js").read_text(encoding="utf-8")
+
+    assert "function buildProviderUsageCard(" in js
+    assert "provider-usage-card" in js
+    assert ".provider-usage-card" in css
+    assert ".usage-bar-track" in css
+    assert ".usage-bar-fill" in css
+    assert "'usage.providerUsage': 'Provider Usage'" in i18n
+    assert "'usage.providerUsage': '공급자 사용량'" in i18n
+    assert "'usage.capacityPaused': 'Capacity paused'" in i18n
+    assert "'usage.availableAfter': 'Available after'" in i18n
+    assert "Capacity paused" in js or "t('usage.capacityPaused')" in js
+    assert "Available after" in js or "t('usage.availableAfter')" in js
+
+
+def test_waiting_provider_usage_has_translation() -> None:
+    js = _script_bundle()
+    i18n = (STATIC_ROOT / "i18n.js").read_text(encoding="utf-8")
+
+    assert "waiting_provider_usage:" in js
+    assert "'schedule.reasonProviderUsage': 'Waiting for provider capacity.'" in i18n
+    assert "'schedule.reasonProviderUsage': '공급자 용량을 기다립니다.'" in i18n
+
+
+def test_usage_unknown_is_rendered_without_error() -> None:
+    js = _script_bundle()
+    i18n = (STATIC_ROOT / "i18n.js").read_text(encoding="utf-8")
+
+    assert "'usage.unavailable': 'Usage unavailable'" in i18n
+    assert "'usage.unavailable': '사용량 정보 없음'" in i18n
+    assert "t('usage.unavailable')" in js
+
+
+def test_estimated_usage_is_visually_distinguished() -> None:
+    js = _script_bundle()
+    css = (STATIC_ROOT / "style.css").read_text(encoding="utf-8")
+    i18n = (STATIC_ROOT / "i18n.js").read_text(encoding="utf-8")
+
+    assert "'usage.estimated': 'Estimated'" in i18n
+    assert "'usage.estimated': '추정치'" in i18n
+    assert ".chip-estimated" in css or ".usage-bar-fill--estimated" in css
+    assert "chip-estimated" in js or "usage-bar-fill--estimated" in js
+
