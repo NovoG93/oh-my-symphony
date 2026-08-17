@@ -38,6 +38,7 @@ dir was writable, the object database was not.
 | 2026-08-06 | Move the Final History Gate from the agent to the orchestrator | The agent is the least privileged actor in the system; making it prove delivery meant a permission limit could park a finished ticket in `Blocked`. |
 | 2026-08-06 | Host re-checks a `Blocked` ticket's history before opening an RCA | An RCA worker inherits the same sandbox and blocks identically, and an RCA ticket cannot open a further RCA — so the board dead-ended. |
 | 2026-08-17 (FIX-TASK-10-1) | Resolve `dirty_overlap` merge collisions by restoring host uncommitted files | Host uncommitted modifications on files touched by the branch trigger the merge safety gate (`_RC_SKIP_DIRTY` / exit code 41); restoring uncommitted host changes restores clean merge preflight. |
+| 2026-08-17 (FIX-TASK-11-1) | Confirm transient dirty overlap resolution on static artifact removal | Preflight verification confirms clean host working tree unblocks dependent branches and passes merge safety gate without branch rewrites. |
 
 ## What to reuse
 
