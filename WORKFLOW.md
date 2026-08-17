@@ -239,14 +239,17 @@ hooks:
 
 agent:
   kind: agy
-  # Per-state backend routing — precedence per dispatch:
-  #   per-ticket `agent_kind` pin > stage_kinds > kind.
-  # codex plans (Todo), agy implements (In Progress = default kind),
-  # claude reviews (Verify) and documents (Document).
-  stage_kinds:
-    Todo: codex
-    Verify: claude
-    Document: claude
+  # Per-state backend routing via NAMED PROFILES. Precedence per dispatch:
+  #   dispatch profile > dispatch kind > ticket profile > ticket kind >
+  #   stage_profiles > stage_kinds > default_profile > kind.
+  # codex plans (Todo), agy implements (In Progress), claude reviews
+  # (Verify) and documents (Document).
+  default_profile: builder
+  stage_profiles:
+    Todo: planner
+    "In Progress": builder
+    Verify: reviewer
+    Document: documenter
   max_concurrent_agents: 1
   max_turns: 100
   max_retry_backoff_ms: 300000
@@ -304,6 +307,23 @@ agent:
   auto_merge_target_branch: "develop"
   auto_merge_exclude_paths:
     - kanban
+
+agent_profiles:
+  planner:
+    kind: codex
+    model: gpt-5.6-sol
+    reasoning_effort: high
+
+  builder:
+    kind: agy
+
+  reviewer:
+    kind: claude
+    model: deepseek-v4-pro[1m]
+
+  documenter:
+    kind: claude
+    model: deepseek-v4-flash
 
 claude:
   # `--add-dir "$SYMPHONY_WORKFLOW_DIR"` extends Claude Code's scope
