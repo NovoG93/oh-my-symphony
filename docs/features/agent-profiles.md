@@ -137,7 +137,19 @@ pool snapshot immediately. Codex windows are normalized by duration
 (`windowDurationMins`: 300 -> `five_hour`, 10080 -> `weekly`, other ->
 `<N>_minutes`), never by position, and API-key-authenticated usage is
 non-authoritative so ChatGPT subscription caps never block API-key
-dispatch. **Capacity exhaustion (Stage 4):** genuine subscription/plan
+dispatch. **Remaining backend probes (Stage 2.2-2.8):** every other
+backend kind now has a registered probe, all honoring the fail-open
+invariant — AGY (`agy -p /quota --output-format json`, read-only, keeps
+provider/model-specific quota buckets verbatim), Claude (passive/cached
+telemetry; `five_hour` and `weekly` windows; no undocumented endpoints),
+Gemini and Kiro (hard-limit detection and reset extraction from runtime
+errors only — no TTY scraping; Kiro normalizes credits to a `monthly`
+window), and GitHub Copilot (hard-limit detection only). **Delegation:**
+a profile's `kind` never implies a usage pool — OpenCode, Pi, and
+Prime Agent profiles bind an explicit `usage_pool` (e.g. `pi-codex ->
+codex`, `pi-copilot -> github-copilot`); local usage estimates are
+non-authoritative and can never block scheduling.
+**Capacity exhaustion (Stage 4):** genuine subscription/plan
 quota exhaustion terminates the running attempt without consuming the
 retry budget — the ticket waits as `waiting_provider_usage` until the pool
 resets; transient 429/RPM/TPM errors keep normal retry behaviour.

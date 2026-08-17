@@ -1,4 +1,4 @@
-# Usage-aware agent profiles — Stages 1, 2.1, 3, 4 (model, probe, enforcement, exhaustion)
+# Usage-aware agent profiles — Stages 1, 2.1, 2.2-2.8, 3, 4 (model, probes, enforcement, exhaustion)
 
 **Summary:** TASK-12 delivered Stage 1 of the Usage-Aware Agent Profiles
 feature: a shared usage-pool configuration model, load-time validation, and
@@ -156,6 +156,73 @@ generic 429 normal retry). Pytest cache of the implementation run (20:37
 UTC): 2514 collected, `lastfailed = {}`; a fresh re-run was not proven in
 the ticket worktree (execution denied — `docs/TASK-14/qa/runtime-blocked.md`).
 
+## Stage 2.2-2.8 — remaining backend usage probes + explicit-pool delegation (TASK-15)
+
+**Summary:** TASK-15 completed the probe lineup for the eight backend
+kinds: AGY (authoritative read-only `/quota`), Claude (passive/cached
+subscription telemetry), OpenCode / Pi / Prime Agent (delegation to an
+explicitly bound `usage_pool`; local estimates never block), Gemini and
+Kiro (hard-limit detection only). Every probe honors the fail-open
+invariant: no authoritative telemetry -> never block scheduling.
+
+**Probes & normalizers:**
+- AGY (`src/symphony/backends/agy.py`): `AgyUsageProbe` executes the
+  read-only `agy -p /quota --output-format json` subprocess; non-zero exit,
+  non-dict JSON, or exception -> `None` (fail open). `normalize_agy_usage`
+  keeps provider/model-specific bucket keys verbatim as window keys — no
+  fabricated `five_hour`/`weekly` structure; hard limit via
+  `rateLimitReached*` flags.
+- Claude (`src/symphony/backends/claude_code.py`): `ClaudeUsageProbe` is a
+  passive cached adapter — returns the cached telemetry snapshot or `None`
+  on cold start; `normalize_claude_usage` maps `five_hour` variants ->
+  `five_hour`, `seven_day`/`7d`/`weekly` variants -> `weekly`;
+  `_is_genuine_claude_exhaustion` excludes rpm/tpm/429 and flags
+  usage-limit keywords; zero new HTTP (no undocumented Anthropic
+  endpoints).
+- OpenCode (`src/symphony/backends/opencode.py`):
+  `normalize_opencode_local_usage` hardcodes `authoritative=False` — local
+  estimates can never block scheduling (`evaluate()` -> READY,
+  `orchestrator/usage.py:164`); `OpenCodeGoUsageProbe` registered for both
+  `opencode` and `opencode-go`, returns non-authoritative snapshot or
+  `None`; `_is_genuine_opencode_exhaustion` for runtime errors.
+- Pi / Prime Agent (`src/symphony/backends/pi.py`):
+  `GithubCopilotUsageProbe` (percentage unknown — hard-limit detection
+  only, fails open); `_is_genuine_pi_exhaustion` plus exhaustion hooks in
+  terminal-stop checks and exit hooks. Runtime pool fallback is the
+  agent's own kind (`per_turn.py:94-96`) — an omitted `usage_pool` never
+  implies another backend's pool.
+- Gemini (`src/symphony/backends/gemini.py`): `GeminiUsageProbe` returns
+  cached/`None` — no pseudo-TTY scraping of `/stats`;
+  `_parse_gemini_exhaustion` extracts reset times from ISO
+  "resets at ...", "retry after Ns", or "resets in Nm"; generic 429 is
+  classified as not-exhaustion (normal retry).
+- Kiro (`src/symphony/backends/kiro.py`): `normalize_kiro_usage` computes
+  `used/total*100` into a `monthly` window; `KiroUsageProbe` fails open
+  (no programmatic quota endpoint, no interactive TTY scraping);
+  `_is_genuine_kiro_exhaustion` flags credit/monthly keywords, excludes
+  rpm/tpm.
+
+**Delegation invariant (AC3):** backend `kind` never implies `usage_pool`.
+Profiles bind it explicitly (`pi-codex -> codex`, `pi-copilot ->
+github-copilot`, `opencode-codex -> codex`); omitted `usage_pool` falls
+back to the agent's own kind, never another backend's pool. Runtime
+exhaustion hooks use `self._usage_pool or self._agent_name` so
+`ProviderCapacityError`/`EVENT_PROVIDER_USAGE_EXHAUSTED` target the bound
+pool.
+
+**Registry:** `get_usage_probe` (`src/symphony/backends/usage.py`) lazily
+resolves `codex`, `claude`, `agy`, `gemini`, `kiro`, `opencode(-go)`,
+`github-copilot`; all probes are also eager-registered at module import
+(dual registration, idempotent). Missing/unsupported sources return `None`
+(fail open).
+
+**Evidence (TASK-15):** 36 tests in `tests/test_backend_usage_probes.py`
+(28 named + 8 parametrized `test_usage_probe_failure_never_prevents_
+dispatch[...]` across all 8 kinds). Recorded implementation run (21:04
+UTC): 2549 collected, `lastfailed = {}` — all 36 + 83 other usage tests +
+4 pyright-gate tests unfailed; a fresh re-run was not proven in the ticket
+worktree (execution denied — `docs/TASK-15/qa/runtime-blocked.md`).
+
 **Decision log:**
 - 2026-08-17 | TASK-12 | Usage modeled per shared pool, not per profile:
   `UsagePoolConfig` + `usage_pools` map; `usage_pool` is a reference only.
@@ -176,5 +243,13 @@ the ticket worktree (execution denied — `docs/TASK-14/qa/runtime-blocked.md`).
   the next scheduler tick). Probe registration is dual: module-level
   `USAGE_PROBES["codex"]` in codex.py plus lazy import in
   `get_usage_probe` (idempotent).
+- 2026-08-17 | TASK-15 | Remaining probes delivered fail-open: AGY executes
+  the read-only `agy -p /quota --output-format json` and preserves
+  provider/model bucket keys verbatim (no fabricated 5h/weekly structure);
+  Claude is a passive cached adapter (five_hour/weekly normalization, no
+  new HTTP); OpenCode/Pi/Prime never imply a pool — explicit `usage_pool`
+  binding only, local estimates hardcoded `authoritative=False`; Gemini and
+  Kiro detect hard limits from runtime errors only with reset extraction,
+  no pseudo-TTY / interactive scraping.
 
-**Last updated:** 2026-08-17 by TASK-14 Document.
+**Last updated:** 2026-08-17 by TASK-15 Document.
