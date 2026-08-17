@@ -1,0 +1,29 @@
+=== Repro After: Host Status and Merge Preflight Verification ===
+Timestamp: 2026-08-17T18:00:00Z
+
+1. Host Git Status:
+ M WORKFLOW.md
+?? WORKFLOW.md.bak-20260817-163800
+
+2. Host Tracked Changes Diff:
+WORKFLOW.md
+
+3. TASK-10 Merge-Tree Simulation:
+Output: 198b3cfb1be44cdaa1f75237a0bb0869ee1477c2
+Exit code: 0
+
+4. TASK-10 Dirty Overlap Check with Host Changes (WORKFLOW.md):
+Result: Clean - No overlap
+
+5. FIX-TASK-10-1 Merge-Tree Simulation:
+Output: 588a7cdba4056f774044ad13bb36b9306c48fd8b
+Exit code: 0
+
+6. FIX-TASK-10-1 Dirty Overlap Check with Host Changes (WORKFLOW.md):
+Result: Clean - No overlap
+
+7. Full Preflight Merge Safety Gate Simulation on Host for TASK-10:
+Status: PASS (exit code 0)
+
+8. Full Preflight Merge Safety Gate Simulation on Host for FIX-TASK-10-1:
+Status: PASS (exit code 0)
