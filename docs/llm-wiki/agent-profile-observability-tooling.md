@@ -83,8 +83,10 @@ checks. 18 new tests; recorded full-suite session 2,371 collected,
 - ~~Lease-reacquire path passes only `agent_kind` — reacquired run row drops
   profile/model/reasoning_effort (LOW-2)~~ — **resolved 2026-08-17 by
   TASK-10** (reacquire `acquire_run` call, `core.py:2434-2440`).
-- `graphify-out` symlink committed on the branch (LOW-1); recommend
-  excluding it at merge.
+- ~~`graphify-out` symlink committed on the branch (LOW-1)~~ — resolved
+  2026-08-17 by develop commit `94a532b` (untracked before the TASK-10
+  merge; `.gitignore` entry broadened to match symlinks, trailing slash
+  only matched directories).
 - Stall-reconciler timeout lookup still ignores profile-overlaid timeouts
   (TASK-5 carry-over, see [[agent-profile-resolution]]).
 
@@ -124,5 +126,10 @@ show/rejections, 7 doctor checks). QA artefacts under `docs/TASK-7/qa/`
   values, so the expanded reroute condition reduces to the old kind-change
   check — no new log lines or DB writes for `agent.kind`/`stage_kinds`
   workflows.
+- 2026-08-17 | TASK-10 | LOW-1 (`graphify-out` symlink) was resolved
+  upstream by `94a532b` before the TASK-10 merge, so the merge delivers a
+  tree without the symlink; future "known gaps" entries should record
+  upstream resolution commits as soon as they appear, not wait for the
+  merge.
 
 **Last updated:** 2026-08-17 by TASK-10 Document.
