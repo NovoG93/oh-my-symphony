@@ -54,6 +54,7 @@ from .config import (
     SystemConfig,
     TrackerConfig,
     TuiConfig,
+    UsagePoolConfig,
     WikiConfig,
 )
 from .constants import (
@@ -297,7 +298,10 @@ def build_service_config(workflow: WorkflowDefinition) -> ServiceConfig:
         ),
     )
 
-    agent_profiles = _validated_agent_profiles(cfg.get("agent_profiles"))
+    usage_pools = _validated_usage_pools(cfg.get("usage_pools"))
+    agent_profiles = _validated_agent_profiles(
+        cfg.get("agent_profiles"), usage_pools=usage_pools
+    )
 
     agent_raw = cfg.get("agent") or {}
     if not isinstance(agent_raw, dict):
@@ -876,6 +880,7 @@ def build_service_config(workflow: WorkflowDefinition) -> ServiceConfig:
         preview=preview,
         artifacts=artifacts,
         agent_profiles=agent_profiles,
+        usage_pools=usage_pools,
     )
 
 
@@ -984,15 +989,106 @@ _ALL_PROFILE_FIELDS = {
     "read_timeout_ms",
     "stall_timeout_ms",
     "resume_across_turns",
+    "usage_pool",
 }
 
 
-def _validated_agent_profiles(raw: Any) -> dict[str, AgentProfileConfig]:
+def _validated_usage_pools(raw: Any) -> dict[str, UsagePoolConfig]:
+    """Parse and validate top-level `usage_pools:` mapping.
+
+    Enforces non-empty pool names, unique pool names, required string source,
+    and valid caps mapping with numeric values in range (0, 100].
+    """
+    if raw is None:
+        return {}
+    if not isinstance(raw, dict):
+        raise ConfigValidationError(
+            "usage_pools must be a mapping",
+            value=raw,
+        )
+    out: dict[str, UsagePoolConfig] = {}
+    for pool_name, pool_data in raw.items():
+        if not isinstance(pool_name, str) or not pool_name.strip():
+            raise ConfigValidationError(
+                "usage_pools pool name must be a non-empty string",
+                value=pool_name,
+            )
+        name = pool_name.strip()
+        if name in out:
+            raise ConfigValidationError(
+                f"usage_pools has duplicate pool name {name!r}",
+                value=name,
+            )
+        if not isinstance(pool_data, dict):
+            raise ConfigValidationError(
+                f"usage_pools[{name!r}] must be a mapping",
+                value=pool_data,
+            )
+        allowed_keys = {"source", "caps"}
+        for k in pool_data:
+            if k not in allowed_keys:
+                raise ConfigValidationError(
+                    f"usage_pools[{name!r}] has unsupported field '{k}'",
+                    value=k,
+                )
+
+        source_raw = pool_data.get("source")
+        if source_raw is None:
+            raise ConfigValidationError(
+                f"usage_pools[{name!r}].source is required",
+                value=pool_data,
+            )
+        if not isinstance(source_raw, str) or not source_raw.strip():
+            raise ConfigValidationError(
+                f"usage_pools[{name!r}].source must be a non-empty string",
+                value=source_raw,
+            )
+        source = source_raw.strip()
+
+        caps_raw = pool_data.get("caps")
+        if caps_raw is None:
+            raise ConfigValidationError(
+                f"usage_pools[{name!r}].caps is required",
+                value=pool_data,
+            )
+        if not isinstance(caps_raw, dict):
+            raise ConfigValidationError(
+                f"usage_pools[{name!r}].caps must be a mapping",
+                value=caps_raw,
+            )
+        caps: dict[str, float] = {}
+        for window_raw, val_raw in caps_raw.items():
+            if not isinstance(window_raw, str) or not window_raw.strip():
+                raise ConfigValidationError(
+                    f"usage_pools[{name!r}].caps window name must be a non-empty string",
+                    value=window_raw,
+                )
+            window = window_raw.strip()
+            if isinstance(val_raw, bool) or not isinstance(val_raw, (int, float)):
+                raise ConfigValidationError(
+                    f"usage_pools[{name!r}].caps.{window} must be a number between 0 and 100 (exclusive 0, inclusive 100)",
+                    value=val_raw,
+                )
+            num_val = float(val_raw)
+            if not (0.0 < num_val <= 100.0):
+                raise ConfigValidationError(
+                    f"usage_pools[{name!r}].caps.{window} must be between 0 and 100 (exclusive 0, inclusive 100)",
+                    value=val_raw,
+                )
+            caps[window] = num_val
+
+        out[name] = UsagePoolConfig(source=source, caps=caps)
+    return out
+
+
+def _validated_agent_profiles(
+    raw: Any, *, usage_pools: dict[str, UsagePoolConfig] | None = None
+) -> dict[str, AgentProfileConfig]:
     """Parse and validate top-level `agent_profiles:` mapping.
 
     Enforces non-empty profile names, supported backend kinds (canonicalizing
     'antigravity' to 'agy'), allowlist checking against PROFILE_FIELDS_BY_KIND,
-    and type checking of individual fields.
+    and type checking of individual fields including usage_pool references.
     """
     if raw is None:
         return {}
@@ -1104,6 +1200,23 @@ def _validated_agent_profiles(raw: Any) -> dict[str, AgentProfileConfig]:
                 value=resume_across_turns,
             )
 
+        usage_pool_raw = profile_data.get("usage_pool")
+        if usage_pool_raw is not None:
+            if not isinstance(usage_pool_raw, str) or not usage_pool_raw.strip():
+                raise ConfigValidationError(
+                    f"agent_profiles[{name!r}].usage_pool must be a non-empty string",
+                    value=usage_pool_raw,
+                )
+            usage_pool_name = usage_pool_raw.strip()
+            if usage_pools is not None and usage_pool_name not in usage_pools:
+                raise ConfigValidationError(
+                    f"agent_profiles[{name!r}].usage_pool references unknown usage pool {usage_pool_name!r}",
+                    value=usage_pool_name,
+                )
+            usage_pool = usage_pool_name
+        else:
+            usage_pool = None
+
         out[name] = AgentProfileConfig(
             name=name,
             kind=kind,
@@ -1114,6 +1227,7 @@ def _validated_agent_profiles(raw: Any) -> dict[str, AgentProfileConfig]:
             read_timeout_ms=read_timeout_ms,
             stall_timeout_ms=stall_timeout_ms,
             resume_across_turns=resume_across_turns,
+            usage_pool=usage_pool,
         )
     return out
 

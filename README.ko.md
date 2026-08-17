@@ -205,9 +205,11 @@ CLI에서 파일 보드 티켓을 만들 때는
 
 #### 프로필 상속 및 지원 필드
 프로필은 전역 백엔드 설정 블록(`codex:`, `claude:` 등)의 설정을 상속하며, 명시적으로 설정된 필드만 오버레이한다:
-- **`codex`**: `model`, `reasoning_effort`, `command`, `turn_timeout_ms`, `read_timeout_ms`, `stall_timeout_ms`
-- **`claude`**: `model` (`--model <name>` 자동 주입), `command`, `resume_across_turns`, `turn_timeout_ms`, `read_timeout_ms`, `stall_timeout_ms`
-- **`gemini`, `agy`, `kiro`, `opencode`, `pi`, `prime_agent`**: `command`, `resume_across_turns`, 타임아웃. 지원되지 않는 필드는 설정 빌드 시 검증 실패한다. gemini 백엔드는 `resume_across_turns`를 허용하지만 재개(resume)를 지원하지 않아 무시된다.
+- **`codex`**: `model`, `reasoning_effort`, `command`, `turn_timeout_ms`, `read_timeout_ms`, `stall_timeout_ms`, `usage_pool`
+- **`claude`**: `model` (`--model <name>` 자동 주입), `command`, `resume_across_turns`, `turn_timeout_ms`, `read_timeout_ms`, `stall_timeout_ms`, `usage_pool`
+- **`gemini`, `agy`, `kiro`, `opencode`, `pi`, `prime_agent`**: `command`, `resume_across_turns`, 타임아웃, `usage_pool`. 지원되지 않는 필드는 설정 빌드 시 검증 실패한다. gemini 백엔드는 `resume_across_turns`를 허용하지만 재개(resume)를 지원하지 않아 무시된다.
+
+모든 종류가 `usage_pool`도 허용한다. 이는 `WORKFLOW.md`의 최상위 `usage_pools:`에 선언된 공유 사용 풀의 이름이며, 로드 시 검증된다(풀 해석과 할당량 적용은 usage-aware 프로필의 후속 단계에서 제공). 상세 내용은 [docs/features/agent-profiles.md](docs/features/agent-profiles.md)를 참조한다.
 
 #### 8단계 결정 우선순위
 1. `dispatch_profile` (명시적 CLI / 런타임 디스패치 프로필)

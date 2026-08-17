@@ -84,16 +84,49 @@ To prevent configuration errors, profiles strictly validate allowed fields at co
 
 | Backend Kind | Allowed Profile Fields | Description / Notes |
 |---|---|---|
-| `codex` | `model`, `reasoning_effort`, `command`, `turn_timeout_ms`, `read_timeout_ms`, `stall_timeout_ms` | `model` and `reasoning_effort` are sent directly in turn parameters. |
-| `claude` | `model`, `command`, `resume_across_turns`, `turn_timeout_ms`, `read_timeout_ms`, `stall_timeout_ms` | A non-empty `model` injects `--model <name>` immediately following the `claude` command token. |
-| `gemini` | `command`, `resume_across_turns`, `turn_timeout_ms`, `read_timeout_ms`, `stall_timeout_ms` | `resume_across_turns` is accepted but inert — the gemini backend has no resume support. |
-| `agy` | `command`, `resume_across_turns`, `turn_timeout_ms`, `read_timeout_ms`, `stall_timeout_ms` | |
-| `kiro` | `command`, `resume_across_turns`, `turn_timeout_ms`, `read_timeout_ms`, `stall_timeout_ms` | |
-| `opencode` | `command`, `resume_across_turns`, `turn_timeout_ms`, `read_timeout_ms`, `stall_timeout_ms` | |
-| `pi` | `command`, `resume_across_turns`, `turn_timeout_ms`, `read_timeout_ms`, `stall_timeout_ms` | |
-| `prime_agent` | `command`, `resume_across_turns`, `turn_timeout_ms`, `read_timeout_ms`, `stall_timeout_ms` | |
+| `codex` | `model`, `reasoning_effort`, `command`, `turn_timeout_ms`, `read_timeout_ms`, `stall_timeout_ms`, `usage_pool` | `model` and `reasoning_effort` are sent directly in turn parameters. |
+| `claude` | `model`, `command`, `resume_across_turns`, `turn_timeout_ms`, `read_timeout_ms`, `stall_timeout_ms`, `usage_pool` | A non-empty `model` injects `--model <name>` immediately following the `claude` command token. |
+| `gemini` | `command`, `resume_across_turns`, `turn_timeout_ms`, `read_timeout_ms`, `stall_timeout_ms`, `usage_pool` | `resume_across_turns` is accepted but inert — the gemini backend has no resume support. |
+| `agy` | `command`, `resume_across_turns`, `turn_timeout_ms`, `read_timeout_ms`, `stall_timeout_ms`, `usage_pool` | |
+| `kiro` | `command`, `resume_across_turns`, `turn_timeout_ms`, `read_timeout_ms`, `stall_timeout_ms`, `usage_pool` | |
+| `opencode` | `command`, `resume_across_turns`, `turn_timeout_ms`, `read_timeout_ms`, `stall_timeout_ms`, `usage_pool` | |
+| `pi` | `command`, `resume_across_turns`, `turn_timeout_ms`, `read_timeout_ms`, `stall_timeout_ms`, `usage_pool` | |
+| `prime_agent` | `command`, `resume_across_turns`, `turn_timeout_ms`, `read_timeout_ms`, `stall_timeout_ms`, `usage_pool` | |
 
 Any unsupported field (e.g., specifying `reasoning_effort` on a `claude` or `agy` profile) is rejected during configuration loading.
+
+#### Usage Pools (usage-aware profiles — Stage 1)
+
+`usage_pool` references a shared usage pool declared under the top-level
+`usage_pools:` mapping in `WORKFLOW.md`. Usage is modeled per shared
+pool/provider quota, not per named profile: a profile binds to a pool by
+name and never carries cap values itself. When omitted, the pool defaults
+to the profile's `kind`.
+
+```yaml
+usage_pools:
+  codex:
+    source: codex
+    caps:
+      five_hour: 80
+      weekly: 70
+
+agent_profiles:
+  builder:
+    kind: codex
+    usage_pool: codex   # explicit; omitted -> defaults to profile kind
+  pi-builder:
+    kind: pi
+    usage_pool: codex   # multiplexing backend sharing the codex pool
+```
+
+Pools are validated at load: `source` is required (non-empty string), and
+`caps` is a required mapping of window name to a percentage with
+`0 < v <= 100`. Window names are arbitrary (e.g. `five_hour`, `weekly`,
+`daily`, `monthly`). Referencing an unknown pool from a profile is
+rejected. **Stage 1 scope:** this is the configuration model — pool
+resolution, probe invocation, and quota enforcement land in the later
+usage-aware scheduling stages.
 
 ### 6. Session Scoping & Isolation
 

@@ -107,6 +107,7 @@ from .config import (
     SystemConfig,
     TrackerConfig,
     TuiConfig,
+    UsagePoolConfig,
     WikiConfig,
 )
 from .profiles import (
@@ -149,6 +150,7 @@ __all__ = [
     "TuiConfig",
     "ProgressConfig",
     "SystemConfig",
+    "UsagePoolConfig",
     "WikiConfig",
     "PromptConfig",
     "ServiceConfig",

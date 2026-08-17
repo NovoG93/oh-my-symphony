@@ -117,6 +117,15 @@ class AgentProfileConfig:
     read_timeout_ms: int | None = None
     stall_timeout_ms: int | None = None
     resume_across_turns: bool | None = None
+    usage_pool: str | None = None
+
+
+@dataclass(frozen=True)
+class UsagePoolConfig:
+    """Shared usage pool configuration defining quota source and capacity caps."""
+
+    source: str
+    caps: dict[str, float]
 
 
 @dataclass(frozen=True)
@@ -763,6 +772,8 @@ class ServiceConfig:
     artifacts: ArtifactsConfig = field(default_factory=ArtifactsConfig)
     # Named agent profiles map (profile_name -> AgentProfileConfig)
     agent_profiles: dict[str, AgentProfileConfig] = field(default_factory=dict)
+    # Shared usage pools map (pool_id -> UsagePoolConfig)
+    usage_pools: dict[str, UsagePoolConfig] = field(default_factory=dict)
 
     def prompt_template_for_state(self, state: str) -> str:
         """Return the runtime prompt template for one tracker state."""

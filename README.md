@@ -219,9 +219,11 @@ Named agent profiles (`agent_profiles:` in `WORKFLOW.md`) extend stage routing b
 
 #### Profile Inheritance & Supported Fields
 Profiles inherit all unset settings from their corresponding global backend block. Only allowlisted, non-null fields override base settings:
-- **`codex`**: `model`, `reasoning_effort`, `command`, `turn_timeout_ms`, `read_timeout_ms`, `stall_timeout_ms`
-- **`claude`**: `model` (injects `--model <name>`), `command`, `resume_across_turns`, `turn_timeout_ms`, `read_timeout_ms`, `stall_timeout_ms`
-- **`gemini`, `agy`, `kiro`, `opencode`, `pi`, `prime_agent`**: `command`, `resume_across_turns`, and timeouts. Unsupported fields (e.g. `reasoning_effort` on `claude` or `agy`) are rejected at config validation. The gemini backend accepts `resume_across_turns` but ignores it (no resume support).
+- **`codex`**: `model`, `reasoning_effort`, `command`, `turn_timeout_ms`, `read_timeout_ms`, `stall_timeout_ms`, `usage_pool`
+- **`claude`**: `model` (injects `--model <name>`), `command`, `resume_across_turns`, `turn_timeout_ms`, `read_timeout_ms`, `stall_timeout_ms`, `usage_pool`
+- **`gemini`, `agy`, `kiro`, `opencode`, `pi`, `prime_agent`**: `command`, `resume_across_turns`, timeouts, and `usage_pool`. Unsupported fields (e.g. `reasoning_effort` on `claude` or `agy`) are rejected at config validation. The gemini backend accepts `resume_across_turns` but ignores it (no resume support).
+
+Every kind also accepts `usage_pool`, the name of a shared usage pool declared under top-level `usage_pools:` in `WORKFLOW.md` (usage-aware profiles, Stage 1: validated at load; pool resolution and quota enforcement land with the usage-aware scheduling stages). Full reference: [docs/features/agent-profiles.md](docs/features/agent-profiles.md).
 
 #### Resolution Precedence (8 Tiers)
 Symphony resolves the effective agent per dispatch using 8 deterministic tiers:
