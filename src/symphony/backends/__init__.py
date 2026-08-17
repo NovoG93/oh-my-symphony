@@ -24,6 +24,7 @@ backend-specific protocol details.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Awaitable, Callable, Protocol, cast, runtime_checkable
 
@@ -46,10 +47,27 @@ EVENT_UNSUPPORTED_TOOL_CALL = "unsupported_tool_call"
 EVENT_NOTIFICATION = "notification"
 EVENT_OTHER_MESSAGE = "other_message"
 EVENT_MALFORMED = "malformed"
+EVENT_PROVIDER_USAGE_EXHAUSTED = "provider_usage_exhausted"
 # Pi-flavoured signals — backend may translate native events to these so the
 # orchestrator can log/observe them with cross-backend semantics.
 EVENT_COMPACTION = "compaction"           # context compaction started/ended
 EVENT_AGENT_RETRY = "agent_retry"         # backend-internal auto-retry
+
+
+@dataclass
+class ProviderCapacityError(Exception):
+    """Raised when a provider's plan, credit, or subscription quota is exhausted."""
+
+    pool_id: str
+    resets_at: datetime | None = None
+    message: str = "provider usage exhausted"
+
+    def __str__(self) -> str:
+        resets_str = (
+            f" (resets at {self.resets_at.isoformat()})" if self.resets_at else ""
+        )
+        return f"{self.pool_id}: {self.message}{resets_str}"
+
 
 # R7 — stream robustness knobs shared by the line-streaming backends.
 # A stream that is nothing but garbage should fail with a parse error, not
@@ -125,6 +143,8 @@ class BackendInit:
     client_tools: list[ToolDescriptor] = field(default_factory=list)
     selection: AgentSelection | None = None
     resolved_backend_config: Any | None = None
+    usage_manager: Any | None = None
+    usage_pool: str | None = None
 
     def __post_init__(self) -> None:
         if self.selection is None:

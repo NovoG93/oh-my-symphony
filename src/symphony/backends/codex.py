@@ -22,6 +22,7 @@ import json
 import os
 import shlex
 import time
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Sequence
 
@@ -45,6 +46,7 @@ from . import (
     EVENT_MALFORMED,
     EVENT_NOTIFICATION,
     EVENT_OTHER_MESSAGE,
+    EVENT_PROVIDER_USAGE_EXHAUSTED,
     EVENT_SESSION_STARTED,
     EVENT_TURN_CANCELLED,
     EVENT_TURN_COMPLETED,
@@ -54,11 +56,18 @@ from . import (
     MALFORMED_LINE_LIMIT,
     BackendInit,
     BaseAgentBackend,
+    ProviderCapacityError,
     ToolDescriptor,
     TurnResult,
     _is_valid_session_id,
 )
 from .approval_policy import dangerous_command_reason
+from .usage import (
+    ProviderUsageSnapshot,
+    UsageProbe,
+    UsageWindow,
+    USAGE_PROBES,
+)
 
 
 log = get_logger()
@@ -73,9 +82,12 @@ METHOD_THREAD_START = "thread/start"
 METHOD_THREAD_RESUME = "thread/resume"
 METHOD_TURN_START = "turn/start"
 METHOD_THREAD_ARCHIVE = "thread/archive"
+METHOD_ACCOUNT_READ = "account/read"
+METHOD_ACCOUNT_RATE_LIMITS_READ = "account/rateLimits/read"
 # `thread/approveGuardianDeniedAction` is the rough equivalent of the legacy
 # respondToApproval; symphony auto-approves so this is rarely used.
 METHOD_APPROVAL_RESPOND = "thread/approveGuardianDeniedAction"
+
 
 # Notifications we react to.
 NOTIF_TURN_COMPLETED = "turn/completed"
@@ -234,6 +246,333 @@ def _inject_writable_roots(command: str, writable_roots: Sequence[str]) -> str:
     )
 
 
+def _parse_resets_at(val: Any) -> datetime | None:
+    if val is None:
+        return None
+    if isinstance(val, datetime):
+        return val if val.tzinfo is not None else val.replace(tzinfo=timezone.utc)
+    if isinstance(val, (int, float)):
+        ts = val / 1000.0 if val > 1e11 else float(val)
+        try:
+            return datetime.fromtimestamp(ts, tz=timezone.utc)
+        except (ValueError, OSError, OverflowError):
+            return None
+    if isinstance(val, str):
+        val = val.strip()
+        if not val:
+            return None
+        try:
+            num = float(val)
+            ts = num / 1000.0 if num > 1e11 else num
+            return datetime.fromtimestamp(ts, tz=timezone.utc)
+        except ValueError:
+            pass
+        try:
+            dt = datetime.fromisoformat(val.replace("Z", "+00:00"))
+            return dt if dt.tzinfo is not None else dt.replace(tzinfo=timezone.utc)
+        except ValueError:
+            return None
+    return None
+
+
+def normalize_codex_rate_limits(
+    raw: dict[str, Any],
+    *,
+    pool_id: str = "codex",
+    auth_mode: str | None = None,
+) -> ProviderUsageSnapshot:
+    """Normalize raw Codex App Server rate limit responses into ProviderUsageSnapshot."""
+    effective_auth = auth_mode
+    if effective_auth is None and isinstance(raw, dict):
+        effective_auth = (
+            raw.get("authMode")
+            or raw.get("accountType")
+            or raw.get("auth_mode")
+        )
+
+    # API-key auth does not get ChatGPT subscription caps (non-authoritative for caps)
+    authoritative = True
+    if effective_auth is not None and str(effective_auth).lower() in ("apikey", "api_key"):
+        authoritative = False
+
+    # Check hard limit
+    hard_limit_reached = False
+    if isinstance(raw, dict):
+        rl_type = raw.get("rateLimitReachedType") or raw.get("rate_limit_reached_type")
+        if rl_type is not None and str(rl_type).lower() not in ("none", "false", "soft", ""):
+            hard_limit_reached = True
+        elif (
+            raw.get("hardLimitReached") is True
+            or raw.get("hard_limit_reached") is True
+            or raw.get("rateLimitReached") is True
+        ):
+            hard_limit_reached = True
+
+    limits_dict: dict[str, Any] = {}
+    if isinstance(raw, dict):
+        if "rateLimits" in raw and isinstance(raw["rateLimits"], dict):
+            limits_dict = raw["rateLimits"]
+        else:
+            limits_dict = raw
+
+    windows: dict[str, UsageWindow] = {}
+    non_window_keys = {
+        "rateLimits",
+        "rateLimitReachedType",
+        "rate_limit_reached_type",
+        "authMode",
+        "accountType",
+        "auth_mode",
+        "hardLimitReached",
+        "hard_limit_reached",
+        "rateLimitReached",
+    }
+
+    for key, val in limits_dict.items():
+        if key in non_window_keys or not isinstance(val, dict):
+            continue
+
+        used_raw = val.get("usedPercent") if "usedPercent" in val else val.get("used_percent")
+        used_pct: float | None = None
+        if used_raw is not None:
+            try:
+                used_pct = float(used_raw)
+            except (ValueError, TypeError):
+                used_pct = None
+
+        rem_raw = (
+            val.get("remainingPercent")
+            if "remainingPercent" in val
+            else val.get("remaining_percent")
+        )
+        rem_pct: float | None = None
+        if rem_raw is not None:
+            try:
+                rem_pct = float(rem_raw)
+            except (ValueError, TypeError):
+                rem_pct = None
+        elif used_pct is not None:
+            rem_pct = max(0.0, 100.0 - used_pct)
+
+        resets_at = _parse_resets_at(
+            val.get("resetsAt") if "resetsAt" in val else val.get("resets_at")
+        )
+
+        dur = (
+            val.get("windowDurationMins")
+            if "windowDurationMins" in val
+            else (val.get("window_duration_mins") or val.get("durationMins") or val.get("duration_mins"))
+        )
+
+        if dur is not None:
+            try:
+                dur_mins = int(dur)
+                if dur_mins == 300:
+                    window_key = "five_hour"
+                elif dur_mins == 10080:
+                    window_key = "weekly"
+                else:
+                    window_key = f"{dur_mins}_minutes"
+            except (ValueError, TypeError):
+                window_key = str(key)
+        else:
+            window_key = str(key)
+
+        windows[window_key] = UsageWindow(
+            key=window_key,
+            used_percent=used_pct,
+            remaining_percent=rem_pct,
+            resets_at=resets_at,
+        )
+
+    return ProviderUsageSnapshot(
+        pool_id=pool_id,
+        source="codex",
+        windows=windows,
+        hard_limit_reached=hard_limit_reached,
+        authoritative=authoritative,
+        observed_at=datetime.now(timezone.utc),
+    )
+
+
+def _is_genuine_provider_exhaustion(
+    msg: str, err_type: str = "", err_code: str = ""
+) -> bool:
+    """Return True if an error signals subscription/plan quota exhaustion rather than RPM/429."""
+    text = f"{msg} {err_type} {err_code}".lower()
+    if (
+        "requests per minute" in text
+        or "tokens per minute" in text
+        or "rpm" in text
+        or "tpm" in text
+    ):
+        return False
+
+    exhaustion_keywords = (
+        "usage limit",
+        "usage_limit",
+        "quota exceeded",
+        "quota_exceeded",
+        "insufficient_quota",
+        "rate_limit_reached",
+        "plan limit",
+        "plan_limit",
+        "capacity exceeded",
+        "hit your limit",
+        "reached your limit",
+        "monthly credit",
+        "credits exhausted",
+        "provider_usage_exhausted",
+        "provider usage exhausted",
+    )
+    return any(kw in text for kw in exhaustion_keywords)
+
+
+class CodexUsageProbe(UsageProbe):
+    """Authoritative Codex rate limits probe against Codex App Server."""
+
+    def __init__(
+        self,
+        *,
+        command: str = "codex app-server",
+        cwd: Path | None = None,
+        client: Any | None = None,
+        backend: Any | None = None,
+        pool_id: str = "codex",
+    ) -> None:
+        self.command = command
+        self.cwd = cwd
+        self.client = client
+        self.backend = backend
+        self.pool_id = pool_id
+
+    async def fetch_usage(self) -> ProviderUsageSnapshot | None:
+        """Query account/rateLimits/read and return normalized snapshot."""
+        try:
+            if self.client is not None and hasattr(self.client, "request"):
+                raw = await self.client.request(METHOD_ACCOUNT_RATE_LIMITS_READ, {})
+                auth_resp = {}
+                try:
+                    auth_resp = await self.client.request(METHOD_ACCOUNT_READ, {})
+                except Exception:
+                    pass
+                auth_mode = (
+                    auth_resp.get("authMode")
+                    or auth_resp.get("auth_mode")
+                    or (
+                        auth_resp.get("account", {}).get("type")
+                        if isinstance(auth_resp.get("account"), dict)
+                        else None
+                    )
+                )
+                return normalize_codex_rate_limits(
+                    raw, pool_id=self.pool_id, auth_mode=auth_mode
+                )
+
+            if self.backend is not None and hasattr(self.backend, "_request"):
+                raw = await self.backend._request(METHOD_ACCOUNT_RATE_LIMITS_READ, {})
+                return normalize_codex_rate_limits(raw, pool_id=self.pool_id)
+
+            return await self._probe_standalone()
+        except Exception as exc:
+            log.warning("codex_usage_probe_failed", pool_id=self.pool_id, error=str(exc))
+            return None
+
+    async def _probe_standalone(self) -> ProviderUsageSnapshot | None:
+        cmd = self.command
+        cwd = str(self.cwd) if self.cwd else None
+        proc = None
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                resolve_bash(),
+                "-lc",
+                cmd,
+                cwd=cwd,
+                stdin=asyncio.subprocess.PIPE,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+                limit=MAX_LINE_BYTES,
+                start_new_session=os.name == "posix",
+            )
+            if proc.stdin is None or proc.stdout is None:
+                return None
+
+            # 1. initialize
+            proc.stdin.write(
+                (
+                    json.dumps({
+                        "jsonrpc": "2.0",
+                        "id": 1,
+                        "method": METHOD_INITIALIZE,
+                        "params": {"clientInfo": {"name": "symphony", "version": "0.2.0"}},
+                    })
+                    + "\n"
+                ).encode("utf-8")
+            )
+            # 2. account/read (best effort)
+            proc.stdin.write(
+                (
+                    json.dumps({
+                        "jsonrpc": "2.0",
+                        "id": 2,
+                        "method": METHOD_ACCOUNT_READ,
+                        "params": {},
+                    })
+                    + "\n"
+                ).encode("utf-8")
+            )
+            # 3. account/rateLimits/read
+            proc.stdin.write(
+                (
+                    json.dumps({
+                        "jsonrpc": "2.0",
+                        "id": 3,
+                        "method": METHOD_ACCOUNT_RATE_LIMITS_READ,
+                        "params": {},
+                    })
+                    + "\n"
+                ).encode("utf-8")
+            )
+            await proc.stdin.drain()
+
+            auth_mode = None
+            rate_limits_result = None
+
+            for _ in range(30):
+                line = await asyncio.wait_for(proc.stdout.readline(), timeout=5.0)
+                if not line:
+                    break
+                text = line.decode("utf-8", errors="replace").strip()
+                if not text:
+                    continue
+                try:
+                    msg = json.loads(text)
+                except Exception:
+                    continue
+                if isinstance(msg, dict):
+                    if msg.get("id") == 2:
+                        res = msg.get("result") or {}
+                        auth_mode = res.get("authMode") or res.get("auth_mode")
+                    elif msg.get("id") == 3:
+                        rate_limits_result = msg.get("result") or {}
+                        break
+
+            if rate_limits_result is not None:
+                return normalize_codex_rate_limits(
+                    rate_limits_result, pool_id=self.pool_id, auth_mode=auth_mode
+                )
+            return None
+        finally:
+            if proc is not None:
+                try:
+                    await terminate_process_tree(proc)
+                except Exception:
+                    pass
+
+
+USAGE_PROBES["codex"] = CodexUsageProbe
+
+
 def _coerce_turn(result: Any) -> dict[str, Any]:
     """Extract the ``turn`` sub-object from a v2 result/notification payload.
 
@@ -247,6 +586,7 @@ def _coerce_turn(result: Any) -> dict[str, Any]:
 
 
 class CodexAppServerBackend(BaseAgentBackend):
+
     """One subprocess instance per worker run; speaks Codex JSON-RPC."""
 
     def is_progress_event(self, event: dict[str, Any]) -> bool:
@@ -298,6 +638,9 @@ class CodexAppServerBackend(BaseAgentBackend):
             "total_tokens": 0,
         }
         self._latest_rate_limits: dict[str, Any] | None = None
+        self._usage_manager = init.usage_manager
+        self._usage_pool = init.usage_pool
+
 
     # ------------------------------------------------------------------
     # AgentBackend lifecycle
@@ -592,15 +935,46 @@ class CodexAppServerBackend(BaseAgentBackend):
             raise TurnCancelled("turn interrupted")
         if status == "failed":
             err = turn.get("error") or {}
-            await self._emit(EVENT_TURN_FAILED, turn)
             if isinstance(err, dict):
                 msg = err.get("message") or err.get("type") or "turn failed"
+                err_type = str(err.get("type") or "")
+                err_code = str(err.get("code") or "")
             else:
                 msg = str(err)
+                err_type = ""
+                err_code = ""
+
+            if _is_genuine_provider_exhaustion(msg, err_type, err_code):
+                resets_at = None
+                rl = turn.get("rateLimits") or turn.get("rate_limits")
+                if isinstance(rl, dict):
+                    snap = normalize_codex_rate_limits(
+                        rl, pool_id=self._usage_pool or "codex"
+                    )
+                    for w in snap.windows.values():
+                        if w.resets_at:
+                            resets_at = w.resets_at
+                            break
+                await self._emit(
+                    EVENT_PROVIDER_USAGE_EXHAUSTED,
+                    {
+                        "reason": msg,
+                        "pool_id": self._usage_pool or "codex",
+                        "resets_at": resets_at.isoformat() if resets_at else None,
+                    },
+                )
+                raise ProviderCapacityError(
+                    pool_id=self._usage_pool or "codex",
+                    resets_at=resets_at,
+                    message=msg,
+                )
+
+            await self._emit(EVENT_TURN_FAILED, turn)
             raise TurnFailed(msg)
         # Unknown status — don't silently coerce to success.
         await self._emit(EVENT_TURN_FAILED, turn)
         raise TurnFailed(f"unexpected turn status {status!r}")
+
 
     # ------------------------------------------------------------------
     # JSON-RPC line protocol over stdio
@@ -773,7 +1147,24 @@ class CodexAppServerBackend(BaseAgentBackend):
                 self._latest_rate_limits = rl
             elif isinstance(params, dict) and "rateLimits" not in params:
                 self._latest_rate_limits = params
+            if self._latest_rate_limits is not None:
+                pool_id = self._usage_pool or "codex"
+                snapshot = normalize_codex_rate_limits(
+                    self._latest_rate_limits,
+                    pool_id=pool_id,
+                )
+                if self._usage_manager is not None:
+                    self._usage_manager.set_snapshot(pool_id, snapshot)
+            await self._emit(
+                EVENT_NOTIFICATION,
+                {
+                    "method": method,
+                    "params": params,
+                    "rate_limits": self._latest_rate_limits,
+                },
+            )
             return
+
         # ----- turn lifecycle -----
         if method == NOTIF_TURN_COMPLETED:
             waiter = self._turn_completion_waiter

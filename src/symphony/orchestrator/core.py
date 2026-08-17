@@ -41,13 +41,16 @@ from ..backends import (
     EVENT_APPROVAL_DENIED,
     EVENT_COMPACTION,
     EVENT_OTHER_MESSAGE,
+    EVENT_PROVIDER_USAGE_EXHAUSTED,
     EVENT_TURN_FAILED,
     EVENT_SESSION_STARTED,
     EVENT_TURN_COMPLETED,
     AgentBackend,
     BackendInit,
+    ProviderCapacityError,
     redact_session_id,
 )
+
 from ..backends import build_backend
 from ..chat import cfg_for_mode
 from ..utils import git_inspect
@@ -6746,6 +6749,13 @@ class Orchestrator:
             )
             resolved_cfg = resolve_agent_config(cfg, selection)
 
+            pool_id = "codex"
+            if selection.profile and selection.profile in cfg.agent_profiles:
+                prof = cfg.agent_profiles[selection.profile]
+                pool_id = prof.usage_pool or prof.kind or cfg.agent.kind
+            else:
+                pool_id = selection.kind or cfg.agent.kind
+
             client = self._build_agent_backend(
                 BackendInit(
                     cfg=cfg,
@@ -6760,8 +6770,11 @@ class Orchestrator:
                     client_tools=tools,
                     selection=selection,
                     resolved_backend_config=resolved_cfg.active_config,
+                    usage_manager=self._usage_manager,
+                    usage_pool=pool_id,
                 )
             )
+
             # Expose the live backend to `_on_codex_event` so the stall-progress
             # predicate routes through `client.is_progress_event(...)`.
             running.client = client
@@ -7376,6 +7389,29 @@ class Orchestrator:
                         await client.run_turn(
                             prompt=prompt, is_continuation=is_continuation
                         )
+                    except ProviderCapacityError as exc:
+                        outcome = "provider_usage_exhausted"
+                        error = str(exc)
+                        from ..backends.usage import ProviderUsageSnapshot, UsageWindow
+
+                        windows = {}
+                        if exc.resets_at:
+                            windows["default"] = UsageWindow(
+                                key="default",
+                                used_percent=100.0,
+                                remaining_percent=0.0,
+                                resets_at=exc.resets_at,
+                            )
+                        snap = ProviderUsageSnapshot(
+                            pool_id=exc.pool_id,
+                            source=exc.pool_id,
+                            windows=windows,
+                            hard_limit_reached=True,
+                            authoritative=True,
+                            observed_at=datetime.now(timezone.utc),
+                        )
+                        self._usage_manager.set_snapshot(exc.pool_id, snap)
+                        return
                     except (
                         TurnTimeout,
                         TurnFailed,
@@ -7387,6 +7423,7 @@ class Orchestrator:
                             redact_session_id(str(exc), running.resume_session_id)
                         )
                         return
+
                     finally:
                         self._sync_backend_agent_pid(
                             running_issue_id, _backend_agent_pid(client)
@@ -7818,6 +7855,13 @@ class Orchestrator:
             ticket_kind=_requested_agent_kind(issue),
         )
         resolved_cfg = resolve_agent_config(cfg, selection)
+        pool_id = "codex"
+        if selection.profile and selection.profile in cfg.agent_profiles:
+            prof = cfg.agent_profiles[selection.profile]
+            pool_id = prof.usage_pool or prof.kind or cfg.agent.kind
+        else:
+            pool_id = selection.kind or cfg.agent.kind
+
 
         new_client = self._build_agent_backend(
             BackendInit(
@@ -7833,8 +7877,11 @@ class Orchestrator:
                 client_tools=tools,
                 selection=selection,
                 resolved_backend_config=resolved_cfg.active_config,
+                usage_manager=self._usage_manager,
+                usage_pool=pool_id,
             )
         )
+
         # Reset per-dispatch env BEFORE the new backend's subprocess spawns.
         # Forward phase transitions unset SYMPHONY_REWIND_SCOPE; rewinds
         # set it to the JSON of the latest finding rows.
@@ -8898,7 +8945,56 @@ class Orchestrator:
         rl = event.get("rate_limits")
         if isinstance(rl, dict):
             self._latest_rate_limits = rl
+            from ..backends.codex import normalize_codex_rate_limits
+
+            pool_id = "codex"
+            if entry is not None and entry.agent_profile:
+                prof = cfg.agent_profiles.get(entry.agent_profile) if cfg else None
+                if prof and prof.usage_pool:
+                    pool_id = prof.usage_pool
+            elif entry is not None and entry.agent_kind:
+                pool_id = entry.agent_kind
+            snap = normalize_codex_rate_limits(rl, pool_id=pool_id)
+            self._usage_manager.set_snapshot(pool_id, snap)
+
+        # Provider quota / capacity exhaustion event.
+        if ev_name == EVENT_PROVIDER_USAGE_EXHAUSTED:
+            pool_id = str(payload.get("pool_id") or "codex")
+            resets_at_str = payload.get("resets_at")
+            resets_at = None
+            if resets_at_str:
+                from ..backends.codex import _parse_resets_at
+
+                resets_at = _parse_resets_at(resets_at_str)
+            from ..backends.usage import ProviderUsageSnapshot, UsageWindow
+
+            windows = {}
+            if resets_at:
+                windows["default"] = UsageWindow(
+                    key="default",
+                    used_percent=100.0,
+                    remaining_percent=0.0,
+                    resets_at=resets_at,
+                )
+            snap = ProviderUsageSnapshot(
+                pool_id=pool_id,
+                source=pool_id,
+                windows=windows,
+                hard_limit_reached=True,
+                authoritative=True,
+                observed_at=datetime.now(timezone.utc),
+            )
+            self._usage_manager.set_snapshot(pool_id, snap)
+            if entry is not None:
+                entry.hit_provider_usage_exhausted = True
+                entry.provider_usage_exhausted_pool_id = pool_id
+                entry.provider_usage_exhausted_resets_at = resets_at
+                if entry.worker_task is not None and not entry.worker_task.done():
+                    entry.worker_task.cancel()
+                entry.cancelled_at = datetime.now(timezone.utc)
+
         # Update session id when known. The backend reports a single session
+
         # identifier; this orchestrator stores it as `thread_id` for legacy
         # snapshot-shape stability and mirrors it as `session_id`. Codex
         # additionally exposes per-turn ids; when present they suffix the
@@ -9775,7 +9871,25 @@ class Orchestrator:
                 issue_id=issue_id,
                 issue_identifier=entry.issue.identifier,
             )
+        elif (
+            reason == "provider_usage_exhausted"
+            or (entry is not None and entry.hit_provider_usage_exhausted)
+        ):
+            # Provider capacity / quota exhaustion: do NOT consume retry budget.
+            # Ticket returns to waiting_provider_usage on next scheduler tick.
+            self._persisted_retry_attempts.pop(issue_id, None)
+            self._clear_issue_flags(issue_id, retry_attempt=True)
+            self._claimed.discard(issue_id)
+            debug.last_error = error or "provider usage exhausted"
+            log.info(
+                "worker_provider_usage_exhausted",
+                issue_id=issue_id,
+                issue_identifier=entry.issue.identifier,
+                reason=reason,
+                error=error,
+            )
         else:
+
             failure_reason = f"{reason}: {error}" if error else reason
             cleaned_failure = _clean_board_error_message(failure_reason)
             if _is_retryable_worker_error(self._entry_agent_kind(entry), reason, error):

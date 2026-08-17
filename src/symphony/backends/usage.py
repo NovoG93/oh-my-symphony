@@ -43,4 +43,9 @@ USAGE_PROBES: dict[str, type[UsageProbe]] = {}
 
 def get_usage_probe(source: str) -> type[UsageProbe] | None:
     """Retrieve the probe class for a given usage pool source, or None if unsupported (fail open)."""
+    if source == "codex" and "codex" not in USAGE_PROBES:
+        from .codex import CodexUsageProbe
+
+        USAGE_PROBES["codex"] = CodexUsageProbe
     return USAGE_PROBES.get(source)
+
