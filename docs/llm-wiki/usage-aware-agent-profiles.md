@@ -1,4 +1,4 @@
-# Usage-aware agent profiles — Stages 1, 2.1, 2.2-2.8, 3, 4, 5 (model, probes, enforcement, exhaustion, projection/UI)
+# Usage-aware agent profiles — Stages 1-6 (model, probes, enforcement, exhaustion, projection/UI, test suite & docs)
 
 **Summary:** TASK-12 delivered Stage 1 of the Usage-Aware Agent Profiles
 feature: a shared usage-pool configuration model, load-time validation, and
@@ -270,7 +270,71 @@ distinguished). Recorded implementation run (21:34 UTC): 2557 collected,
 `lastfailed = {}`; a fresh re-run was not proven in the ticket worktree
 (execution denied — `docs/TASK-16/qa/runtime-blocked.md`).
 
+## Stage 6 — comprehensive test suite + final documentation (TASK-17)
+
+**Summary:** TASK-17 closed the feature: the consolidated Stage 6 test suite
+(13 areas, 6.1-6.13) and user documentation. The 8-file usage selection
+counts 286 nodeids (green in the recorded run, zero `lastfailed`); the
+global fail-open invariant is now a permanent parameterized regression test
+across all 8 backend kinds; the profile-vs-pool boundary is documented for
+users.
+
+**Test suite (Stages 6.1-6.13):**
+- 6.1 configuration (`tests/test_usage_limits.py`,
+  `tests/test_workflow_agent_profiles.py`): `UsagePoolConfig` fields, shared
+  pools per kind, wrapper binding (`pi`/`opencode`/`prime-agent`),
+  invalid-cap-percent rejection, unknown-pool rejection, backward
+  compatibility when `usage_pools` is omitted, generic windows.
+- 6.2 generic pools (`tests/test_usage_limits.py` — added in TASK-17):
+  same-pool profiles share one cap; independent pools never cross-block;
+  any configured window can block (`five_hour`/`weekly`/`daily`/`monthly`,
+  parametrized); non-authoritative estimates never block.
+- 6.3-6.9 backend probes (`tests/test_codex_usage.py`,
+  `tests/test_backend_usage_probes.py`): per-backend normalization,
+  fail-open on probe error, genuine-vs-transient exhaustion (Stages
+  2.1/2.2-2.8, sections above).
+- 6.10-6.11 scheduler eligibility + running-worker semantics
+  (`tests/test_orchestrator_usage_limits.py`): at-cap blocks, below-cap
+  allows, reset auto-clear, stale-refresh fail-open, caps never cancel
+  running workers, exhaustion never burns the retry budget.
+- 6.12 API/UI contract (`tests/test_webapi.py`,
+  `tests/test_web_static_contract.py`, `tests/test_i18n.py`): `usage_pools`
+  in the workflow payload, `provider_usage` in the orchestrator snapshot,
+  `remaining_percent = 100 - used_percent`, Provider Usage card, EN/KO
+  `waiting_provider_usage` translation.
+- 6.13 fail-open invariant:
+  `test_usage_probe_failure_never_prevents_dispatch` parameterized over all
+  8 kinds (`codex`, `claude`, `agy`, `gemini`, `kiro`, `opencode`, `pi`,
+  `prime-agent`) in both `test_backend_usage_probes.py` and
+  `test_orchestrator_usage_limits.py` (16 nodeids): a raising probe + no
+  snapshot makes `_eligibility_usage_decision` return `None` (not
+  usage-blocked) for every kind.
+
+**Docs:** README.md "Usage Pools & Quota Management" states the core
+boundary — profiles define HOW an agent runs (model, reasoning effort,
+command, timeouts), pools define WHETHER the provider may start new work
+(quotas, caps, reset times); both WORKFLOW examples document the
+`usage_pools:` block and the `usage_pool:` profile reference (including a
+`pi-codex` multiplexing example); `docs/features/agent-profiles.md` records
+the Stage 6 suite and the permanent fail-open invariant.
+
+**Evidence (TASK-17):** 8 new Stage 6.2 tests in `tests/test_usage_limits.py`
+(5 defs + 1 parametrized x4); recorded full-suite run (2026-08-17 21:54
+UTC): 2564 collected, `lastfailed` absent = zero failures; the 8-file usage
+selection counts exactly 286 nodeids. Fresh re-run not proven in the ticket
+worktree (execution denied — `docs/TASK-17/qa/runtime-blocked.md`,
+`docs/TASK-17/qa/test-cache-evidence.md`); merge preflight clean
+(`docs/TASK-17/qa/merge-preflight.md`). Wiki Stage 6 write-back, CHANGELOG
+entry, and README.ko.md drift fix delivered by the TASK-17 Document lane.
+
 **Decision log:**
+- 2026-08-17 | TASK-17 | Stage 6 consolidated the safety net and docs: 8 new
+  generic-pool tests (shared caps, no cross-blocking, any-window blocking,
+  estimates never block); the 8-kind fail-open invariant is a permanent
+  parameterized regression test (16 nodeids across 2 modules) proving a
+  probe failure can never prevent dispatch; 286 usage nodeids green in the
+  recorded run; README + both WORKFLOW examples + feature doc state the
+  HOW/WHETHER boundary; CHANGELOG Unreleased entry added at Document.
 - 2026-08-17 | TASK-12 | Usage modeled per shared pool, not per profile:  `UsagePoolConfig` + `usage_pools` map; `usage_pool` is a reference only.
   Stricter-than-spec: unsupported pool-entry fields rejected at load
   (matches the `agent_profiles` allowlist pattern).
@@ -305,4 +369,4 @@ distinguished). Recorded implementation run (21:34 UTC): 2557 collected,
   "Capacity paused"/"Available after" state + `waiting_provider_usage`
   schedule reason localized EN/KO; 8 Stage 6.12 contract tests.
 
-**Last updated:** 2026-08-17 by TASK-16 Document.
+**Last updated:** 2026-08-17 by TASK-17 Document.

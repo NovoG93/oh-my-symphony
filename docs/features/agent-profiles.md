@@ -165,6 +165,13 @@ a "Capacity paused" / "Available after" notice, and the derived
 `waiting_provider_usage` schedule reason is localized in English and Korean.
 Missing or stale telemetry renders as "Usage unavailable" and never blocks
 the UI.
+**Comprehensive Test Suite & Global Fail-Open Invariant (Stage 6):** the
+feature is covered across 13 test suites (configuration validation, generic
+pool logic, every backend probe, scheduler eligibility, running-worker
+semantics, and web API/UI contracts). A permanent parameterized regression test
+proves the global fail-open invariant across all 8 backend kinds (`codex`,
+`claude`, `agy`, `gemini`, `kiro`, `opencode`, `pi`, `prime-agent`): a
+usage-probe failure or exception can NEVER prevent dispatch.
 
 ### 6. Session Scoping & Isolation
 
