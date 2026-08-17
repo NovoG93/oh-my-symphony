@@ -209,7 +209,7 @@ CLI에서 파일 보드 티켓을 만들 때는
 - **`claude`**: `model` (`--model <name>` 자동 주입), `command`, `resume_across_turns`, `turn_timeout_ms`, `read_timeout_ms`, `stall_timeout_ms`, `usage_pool`
 - **`gemini`, `agy`, `kiro`, `opencode`, `pi`, `prime_agent`**: `command`, `resume_across_turns`, 타임아웃, `usage_pool`. 지원되지 않는 필드는 설정 빌드 시 검증 실패한다. gemini 백엔드는 `resume_across_turns`를 허용하지만 재개(resume)를 지원하지 않아 무시된다.
 
-모든 종류가 `usage_pool`도 허용한다. 이는 `WORKFLOW.md`의 최상위 `usage_pools:`에 선언된 공유 사용 풀의 이름이며, 로드 시 검증된다(풀 해석과 할당량 적용은 usage-aware 프로필의 후속 단계에서 제공). 상세 내용은 [docs/features/agent-profiles.md](docs/features/agent-profiles.md)를 참조한다.
+모든 종류가 `usage_pool`도 허용한다. 이는 `WORKFLOW.md`의 최상위 `usage_pools:`에 선언된 공유 사용 풀의 이름이며 로드 시 검증된다. 사용량은 이름 붙은 프로필이 아니라 공유 풀/공급자 할당량 단위로 모델링된다 — **에이전트 프로필은 에이전트가 HOW 실행되는지(모델, reasoning effort, 명령, 타임아웃)를 정의하고, 사용 풀은 공급자가 새 작업을 시작할 수 있는지(WHETHER)를 정의한다.** 전용 백엔드(`codex`, `claude`, `gemini`, `agy`, `kiro`)는 풀을 생략하면 자신의 백엔드 종류로 기본 설정되고, 멀티플렉싱 백엔드(`opencode`, `pi`, `prime-agent`)는 `usage_pool:`로 다른 공급자의 풀을 명시적으로 공유할 수 있다(예: `usage_pool: codex`). 풀 캡은 디스패치 자격 검사에서만 적용되며, 원격 측정이 없거나 오래되었거나 비신뢰(non-authoritative)여도 어떤 백엔드에서도 디스패치를 막지 않는다(전역 fail-open 불변식, 8개 백엔드 모두). 캡은 실행 중인 워커를 취소하지 않으며, 공급자가 런타임에 할당량을 소진하면(`EVENT_PROVIDER_USAGE_EXHAUSTED`) 재시도 예산을 소모하지 않고 `waiting_provider_usage`로 용량이 돌아올 때까지 대기한다. 상세 내용은 [docs/features/agent-profiles.md](docs/features/agent-profiles.md)를 참조한다.
 
 #### 8단계 결정 우선순위
 1. `dispatch_profile` (명시적 CLI / 런타임 디스패치 프로필)

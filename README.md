@@ -223,7 +223,22 @@ Profiles inherit all unset settings from their corresponding global backend bloc
 - **`claude`**: `model` (injects `--model <name>`), `command`, `resume_across_turns`, `turn_timeout_ms`, `read_timeout_ms`, `stall_timeout_ms`, `usage_pool`
 - **`gemini`, `agy`, `kiro`, `opencode`, `pi`, `prime_agent`**: `command`, `resume_across_turns`, timeouts, and `usage_pool`. Unsupported fields (e.g. `reasoning_effort` on `claude` or `agy`) are rejected at config validation. The gemini backend accepts `resume_across_turns` but ignores it (no resume support).
 
-Every kind also accepts `usage_pool`, the name of a shared usage pool declared under top-level `usage_pools:` in `WORKFLOW.md` (usage-aware profiles: validated at load; since Stage 3 the scheduler enforces pool caps at dispatch eligibility — quotas are checked per pool with fail-open semantics when usage telemetry is missing or stale, and caps never cancel a running worker). Full reference: [docs/features/agent-profiles.md](docs/features/agent-profiles.md).
+Every kind also accepts `usage_pool`, the name of a shared usage pool declared under top-level `usage_pools:` in `WORKFLOW.md`. Full reference: [docs/features/agent-profiles.md](docs/features/agent-profiles.md).
+
+#### Usage Pools & Quota Management (`usage_pools`)
+
+Usage is modeled **per shared usage pool/provider quota** (`usage_pools:`), never per named profile.
+
+> **Core Architectural Boundary:**
+> **Agent profiles define HOW an agent runs** (model, reasoning effort, command, timeouts).
+> **Usage pools define WHETHER the provider/account may start new work** (quotas, caps, reset times).
+
+- **Shared Quota:** Multiple profiles (e.g. `codex-builder`, `codex-reviewer`, `pi-codex`) sharing the same subscription bind to one pool and respect a single shared cap.
+- **Defaulting & Delegation:** Dedicated backends (`codex`, `claude`, `gemini`, `agy`, `kiro`) default their pool to their backend kind if omitted. Multiplexing backends (`opencode`, `pi`, `prime-agent`) can explicitly set `usage_pool` (e.g., `usage_pool: codex`) to share another provider's pool.
+- **Global Fail-Open Invariant:** Missing, stale, or non-authoritative telemetry never blocks dispatch across any of the 8 backend kinds (`codex`, `claude`, `agy`, `gemini`, `kiro`, `opencode`, `pi`, `prime-agent`).
+- **Worker Non-Interruption:** Configured caps only prevent *new* dispatches; running workers are never cancelled when a cap is crossed.
+- **Capacity Exhaustion:** If a provider signals hard quota exhaustion at runtime (`EVENT_PROVIDER_USAGE_EXHAUSTED`), the attempt halts without burning the retry budget, returning the ticket to `waiting_provider_usage` until capacity returns.
+- **Provider Usage UI Card:** Runtime quota telemetry (used %, remaining %, reset countdown, capacity paused state) is displayed in the built-in web UI next to Agent Policy.
 
 #### Resolution Precedence (8 Tiers)
 Symphony resolves the effective agent per dispatch using 8 deterministic tiers:

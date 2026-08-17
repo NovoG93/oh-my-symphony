@@ -382,12 +382,30 @@ prime_agent:
   read_timeout_ms: 20000
   stall_timeout_ms: 300000
 
+# Optional shared usage pools (usage-aware profiles): usage is modeled
+# per shared pool/provider quota (usage_pools:), never per named profile.
+# A profile only references a pool (usage_pool:); it never carries cap
+# values. When omitted, usage_pool defaults to the profile's backend kind.
+# Quotas are checked at dispatch eligibility (fail-open if telemetry is
+# missing/stale; caps never interrupt running workers).
+# usage_pools:
+#   codex:
+#     source: codex
+#     caps:
+#       five_hour: 80
+#       weekly: 70
+#   claude:
+#     source: claude
+#     caps:
+#       five_hour: 80
+#       weekly: 70
+
 # Optional named agent profiles: per-profile overrides layered on the
 # global backend config; unset fields inherit (None = inherit). Route
 # states via agent.stage_profiles / agent.default_profile (see `agent:`).
-# Codex profile fields: model, reasoning_effort, command, and the three
-# timeouts. Claude profile fields: model, command, resume_across_turns,
-# and the three timeouts — a non-empty `model` injects `--model <model>`
+# Codex profile fields: model, reasoning_effort, command, usage_pool, and
+# the three timeouts. Claude profile fields: model, command, resume_across_turns,
+# usage_pool, and the three timeouts — a non-empty `model` injects `--model <model>`
 # right after the `claude` token at runtime; wrapper-script commands
 # (no leading `claude` token) are left unchanged.
 # agent_profiles:
@@ -398,6 +416,9 @@ prime_agent:
 #   luna:                   # claude profile example (a profile `command:`
 #     kind: claude          # override must keep the edit/scope flags the
 #     model: sonnet         # global claude command carries)
+#   pi-codex:               # multiplexing backend sharing a pool
+#     kind: pi
+#     usage_pool: codex
 
 server:
   port: 9999            # optional JSON API; the primary UI is `symphony tui`

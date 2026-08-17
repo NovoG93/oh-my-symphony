@@ -302,6 +302,111 @@ def test_usage_pools_validation_rejects_unsupported_field() -> None:
         _parse(text)
 
 
+# --- Stage 6.2 Generic Usage-Pool Tests ---
+
+
+def test_profiles_with_same_usage_pool_share_limit() -> None:
+    manager = ProviderUsageManager()
+    pool = UsagePoolConfig(source="codex", caps={"weekly": 70.0})
+    manager.set_snapshot(
+        "codex",
+        ProviderUsageSnapshot(
+            pool_id="codex",
+            source="codex",
+            windows={
+                "weekly": UsageWindow(
+                    key="weekly",
+                    used_percent=80.0,
+                    remaining_percent=20.0,
+                )
+            },
+            authoritative=True,
+        ),
+    )
+    # Both builder and reviewer resolving to the "codex" pool are blocked
+    assert manager.evaluate("codex", pool) == UsageDecision.WAIT_PROVIDER_USAGE
+
+
+def test_pi_copilot_is_not_blocked_by_codex_limit() -> None:
+    manager = ProviderUsageManager()
+    codex_pool = UsagePoolConfig(source="codex", caps={"weekly": 70.0})
+    copilot_pool = UsagePoolConfig(source="github-copilot", caps={"weekly": 70.0})
+
+    manager.set_snapshot(
+        "codex",
+        ProviderUsageSnapshot(
+            pool_id="codex",
+            source="codex",
+            windows={
+                "weekly": UsageWindow(
+                    key="weekly",
+                    used_percent=100.0,
+                    remaining_percent=0.0,
+                )
+            },
+            authoritative=True,
+        ),
+    )
+    # Codex pool is blocked
+    assert manager.evaluate("codex", codex_pool) == UsageDecision.WAIT_PROVIDER_USAGE
+    # Independent copilot pool is not blocked (no snapshot / under cap -> fail open)
+    assert manager.evaluate("copilot", copilot_pool) == UsageDecision.READY
+
+
+@pytest.mark.parametrize(
+    ("window", "used", "cap"),
+    [
+        ("five_hour", 80.0, 80.0),
+        ("weekly", 70.0, 70.0),
+        ("daily", 90.0, 80.0),
+        ("monthly", 95.0, 90.0),
+    ],
+)
+def test_any_configured_window_can_block(
+    window: str, used: float, cap: float
+) -> None:
+    manager = ProviderUsageManager()
+    pool = UsagePoolConfig(source="test-provider", caps={window: cap})
+    manager.set_snapshot(
+        "test-pool",
+        ProviderUsageSnapshot(
+            pool_id="test-pool",
+            source="test-provider",
+            windows={
+                window: UsageWindow(
+                    key=window,
+                    used_percent=used,
+                    remaining_percent=100.0 - used,
+                )
+            },
+            authoritative=True,
+        ),
+    )
+    assert manager.evaluate("test-pool", pool) == UsageDecision.WAIT_PROVIDER_USAGE
+
+
+def test_estimated_usage_never_blocks_scheduler() -> None:
+    manager = ProviderUsageManager()
+    pool = UsagePoolConfig(source="opencode-go", caps={"weekly": 70.0})
+    manager.set_snapshot(
+        "opencode-go",
+        ProviderUsageSnapshot(
+            pool_id="opencode-go",
+            source="local-estimate",
+            authoritative=False,
+            windows={
+                "weekly": UsageWindow(
+                    key="weekly",
+                    used_percent=99.0,
+                    remaining_percent=1.0,
+                    resets_at=None,
+                )
+            },
+        ),
+    )
+    assert manager.evaluate("opencode-go", pool) == UsageDecision.READY
+
+
 # --- Normalized backend usage types & probe protocol tests ---
 
 
