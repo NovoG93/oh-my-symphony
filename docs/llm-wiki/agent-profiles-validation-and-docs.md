@@ -58,4 +58,13 @@ explicitly deferred.
   tests/test_workflow_agent_profiles_e2e.py -v`; `.venv/bin/pytest -q`;
   `symphony doctor WORKFLOW.md`.
 
-**Last updated:** 2026-08-16 by TASK-8 Document.
+**Live routing smoke (TASK-9, 2026-08-17):** kanban ticket TASK-9 ran the
+named-profile routing on a real pipeline: Todo -> codex (planner/gpt-5.6-sol),
+In Progress -> agy (builder), Verify -> claude (reviewer/deepseek-v4-pro[1m]),
+Document -> claude (documenter/deepseek-v4-flash). Every stage transition
+resolved to its configured profile and produced the stage's expected artefact
+set (`docs/TASK-9/{work,qa}/`); the byte-exact deliverable (`4f 4b 0a`, sha256
+`a12b7cb4…`) shipped unchanged. Confirms the Phase-1..5 config /
+resolution / execution chain in production shape.
+
+**Last updated:** 2026-08-17 by TASK-9 Document.
