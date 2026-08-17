@@ -19,6 +19,6 @@ before any new ticket; Learn writes back to them after QA passes.
 | agent-profile-config | Phase-1 named-profile model: AgentProfileConfig fields, PROFILE_FIELDS_BY_KIND allowlist, validation-at-build time, YAML duplicate-key boundary, no runtime consumers until Phase 2/3 | 2026-08-15 (TASK-4) |
 | agent-profile-resolution | Phase-2 runtime resolution: AgentSelection + 8-tier precedence + resolve_agent_config non-null overlay + BackendInit selection/resolved_backend_config + per-transition F-01 re-resolution + ambiguity guard; stall-reconciler gap follow-up | 2026-08-15 (TASK-5) |
 | agent-profile-backend-execution | Phase-3 backend execution: Claude `--model` injection after the `claude` token, dispatch `selection_for_state` + per-ticket ConfigValidationError refusal, profile-scoped session identity, 9 backend tests | 2026-08-15 (TASK-6) |
-| agent-profile-observability-tooling | Phase-4 observability+tooling: run-record provenance (v9), ticket `agent.profile` override, `--agent-profile` CLI, doctor profile checks | 2026-08-15 (TASK-7) |
+| agent-profile-observability-tooling | Phase-4 observability+tooling: run-record provenance (v9), ticket `agent.profile` override, `--agent-profile` CLI, doctor profile checks; per-stage dispatch/reroute logs + stage-transition run-record updates (TASK-10) | 2026-08-17 (TASK-10) |
 | agent-profiles-validation-and-docs | Phase-5 documentation & E2E validation: §20 acceptance config resolution, backward-compatibility regression, migration guidance, deferred UI boundary | 2026-08-17 (TASK-9 live routing smoke) |
 

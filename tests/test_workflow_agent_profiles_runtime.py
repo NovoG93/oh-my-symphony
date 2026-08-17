@@ -654,3 +654,262 @@ def test_orchestrator_stage_transition_re_resolves_profile(
     assert isinstance(created_backends[1].init.resolved_backend_config, ClaudeConfig)
     assert created_backends[1].init.resolved_backend_config.model == "sonnet"
 
+
+def test_dispatch_logs_profile_model_reasoning_effort(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import asyncio
+    from datetime import datetime, timezone
+    import symphony.orchestrator.core as core_mod
+    from symphony.orchestrator import Orchestrator
+    from symphony.workflow.state import WorkflowState
+
+    profiles = {
+        "sol-planner": AgentProfileConfig(
+            name="sol-planner", kind="codex", model="gpt-5.6-sol", reasoning_effort="high"
+        ),
+    }
+    cfg = _make_service_config(
+        kind="codex",
+        stage_profiles={"plan": "sol-planner"},
+        agent_profiles=profiles,
+    )
+    issue = Issue(
+        id="iss-dispatch-log",
+        identifier="T-LOG-1",
+        title="dispatch log test",
+        description="",
+        priority=1,
+        state="Plan",
+    )
+    orch = Orchestrator(WorkflowState(Path("/tmp/no.md")))
+    orch._workspace_manager = _FakeWorkspaceManager(tmp_path)  # type: ignore[assignment]
+
+    logged_events: list[tuple[str, dict[str, Any]]] = []
+
+    def _fake_log_info(event: str, **kwargs: Any) -> None:
+        logged_events.append((event, kwargs))
+
+    monkeypatch.setattr(core_mod.log, "info", _fake_log_info)
+    monkeypatch.setattr(core_mod, "build_backend", lambda init: _RecordingBackend(init=init))
+
+    async def _test() -> None:
+        # Mock dispatch worker start so it doesn't run full background loop
+        def _fake_run_attempt(iss: Issue, attempt: int | None, c: ServiceConfig) -> None:
+            pass
+
+        monkeypatch.setattr(orch, "_run_agent_attempt", _fake_run_attempt)
+
+        dispatched = orch._dispatch(issue, cfg, attempt=1)
+        assert dispatched is True
+
+    asyncio.run(_test())
+
+    dispatch_logs = [kwargs for event, kwargs in logged_events if event == "dispatch"]
+    assert len(dispatch_logs) == 1
+    dlog = dispatch_logs[0]
+    assert dlog["issue_id"] == "iss-dispatch-log"
+    assert dlog["issue_identifier"] == "T-LOG-1"
+    assert dlog["attempt"] == 1
+    assert dlog["agent_kind"] == "codex"
+    assert dlog["agent_profile"] == "sol-planner"
+    assert dlog["model"] == "gpt-5.6-sol"
+    assert dlog["reasoning_effort"] == "high"
+
+
+def test_stage_backend_rerouted_logs_same_kind_different_profile(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import asyncio
+    from datetime import datetime, timezone
+    import symphony.orchestrator.core as core_mod
+    from symphony.orchestrator import Orchestrator, RunningEntry
+    from symphony.workflow.state import WorkflowState
+
+    profiles = {
+        "claude-reviewer": AgentProfileConfig(
+            name="claude-reviewer", kind="claude", model="deepseek-v4-pro[1m]"
+        ),
+        "claude-documenter": AgentProfileConfig(
+            name="claude-documenter", kind="claude", model="deepseek-v4-flash"
+        ),
+    }
+    cfg = _make_service_config(
+        kind="claude",
+        stage_profiles={"plan": "claude-reviewer", "build": "claude-documenter"},
+        agent_profiles=profiles,
+    )
+    issue = Issue(
+        id="iss-reroute-same-kind",
+        identifier="T-REROUTE-1",
+        title="reroute log test",
+        description="## Plan\n- ok\n\n## Acceptance Tests\n- ok\n\n## Done Signals\n- ok\n\n## Implementation\n- ok\n\n## Self-Critique\n- ok\n\n## Security Audit\n| check | verdict | evidence |\n| --- | --- | --- |\n| sec | pass | na |\n\n## Review\nok\n\n## QA Evidence\n- ok\n\n## AC Scorecard\n| s | src | res | ev |\n| - | - | - | - |\n| a | b | pass | c |\n\n## Merge Status\nmerged\n\n## Wiki Updates\n- doc\n\n## Human Review\nready\n",
+        priority=1,
+        state="Plan",
+    )
+    orch = Orchestrator(WorkflowState(Path("/tmp/no.md")))
+    orch._workspace_manager = _FakeWorkspaceManager(tmp_path)  # type: ignore[assignment]
+    (tmp_path / "docs" / issue.identifier / "work").mkdir(parents=True, exist_ok=True)
+    (tmp_path / "docs" / issue.identifier / "work" / "notes.md").write_text("ok")
+    (tmp_path / "docs" / issue.identifier / "qa").mkdir(parents=True, exist_ok=True)
+    (tmp_path / "docs" / issue.identifier / "qa" / "version.log").write_text("ok")
+
+    orch._running[issue.id] = RunningEntry(
+        issue=issue,
+        started_at=datetime.now(timezone.utc),
+        retry_attempt=None,
+        worker_task=None,  # type: ignore[arg-type]
+        workspace_path=tmp_path,
+        agent_kind="claude",
+        agent_profile="claude-reviewer",
+        model="deepseek-v4-pro[1m]",
+        reasoning_effort="",
+        release_authority_resolved=True,
+    )
+
+    created_backends: list[_RecordingBackend] = []
+
+    def _fake_build_backend(init: BackendInit) -> _RecordingBackend:
+        b = _RecordingBackend(init=init)
+        created_backends.append(b)
+        return b
+
+    monkeypatch.setattr(core_mod, "build_backend", _fake_build_backend)
+
+    logged_events: list[tuple[str, dict[str, Any]]] = []
+
+    def _fake_log_info(event: str, **kwargs: Any) -> None:
+        logged_events.append((event, kwargs))
+
+    monkeypatch.setattr(core_mod.log, "info", _fake_log_info)
+
+    sequence = ["Build", "Done"]
+    idx = 0
+
+    async def _fake_refresh(c: ServiceConfig, running_id: str) -> Issue:
+        nonlocal idx
+        st = sequence[idx]
+        idx = min(idx + 1, len(sequence) - 1)
+        cur_issue = orch._running[running_id].issue
+        return replace(cur_issue, state=st)
+
+    monkeypatch.setattr(orch, "_refresh_issue_state", _fake_refresh)
+
+    asyncio.run(orch._run_agent_attempt(issue, attempt=None, cfg=cfg))
+
+    reroute_logs = [kwargs for event, kwargs in logged_events if event == "stage_backend_rerouted"]
+    assert len(reroute_logs) == 1
+    rlog = reroute_logs[0]
+    assert rlog["issue_id"] == "iss-reroute-same-kind"
+    assert rlog["identifier"] == "T-REROUTE-1"
+    assert rlog["from_state"] == "plan"
+    assert rlog["to_state"] == "build"
+    assert rlog["from_kind"] == "claude"
+    assert rlog["to_kind"] == "claude"
+    assert rlog["from_profile"] == "claude-reviewer"
+    assert rlog["to_profile"] == "claude-documenter"
+    assert rlog["from_model"] == "deepseek-v4-pro[1m]"
+    assert rlog["to_model"] == "deepseek-v4-flash"
+    assert rlog["to_reasoning_effort"] == ""
+
+
+def test_orchestrator_stage_transition_persists_profile_to_run_record(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import asyncio
+    from datetime import datetime, timezone
+    import symphony.orchestrator.core as core_mod
+    from symphony.orchestrator import Orchestrator, RunningEntry
+    from symphony.orchestrator.run_registry import RunRegistry
+    from symphony.workflow.state import WorkflowState
+
+    registry = RunRegistry(tmp_path / ".symphony" / "state.db")
+
+    profiles = {
+        "sol-planner": AgentProfileConfig(
+            name="sol-planner", kind="codex", model="sol", reasoning_effort="high"
+        ),
+        "sonnet-builder": AgentProfileConfig(
+            name="sonnet-builder", kind="claude", model="sonnet"
+        ),
+    }
+    cfg = _make_service_config(
+        kind="claude",
+        stage_profiles={"plan": "sol-planner", "build": "sonnet-builder"},
+        agent_profiles=profiles,
+    )
+    issue = Issue(
+        id="iss-persist-test",
+        identifier="T-PERSIST-1",
+        title="orchestrator persistence test",
+        description="## Plan\n- ok\n\n## Acceptance Tests\n- ok\n\n## Done Signals\n- ok\n\n## Implementation\n- ok\n\n## Self-Critique\n- ok\n\n## Security Audit\n| check | verdict | evidence |\n| --- | --- | --- |\n| sec | pass | na |\n\n## Review\nok\n\n## QA Evidence\n- ok\n\n## AC Scorecard\n| s | src | res | ev |\n| - | - | - | - |\n| a | b | pass | c |\n\n## Merge Status\nmerged\n\n## Wiki Updates\n- doc\n\n## Human Review\nready\n",
+        priority=1,
+        state="Plan",
+    )
+    run_id = registry.acquire_run(
+        issue,
+        workspace_path=tmp_path / issue.identifier,
+        attempt=None,
+        attempt_kind="initial",
+        agent_kind="codex",
+        agent_profile="sol-planner",
+        model="sol",
+        reasoning_effort="high",
+    )
+    assert run_id
+
+    orch = Orchestrator(WorkflowState(Path("/tmp/no.md")))
+    orch._run_registry = registry
+    orch._run_registry_initialized = True
+    orch._workspace_manager = _FakeWorkspaceManager(tmp_path)  # type: ignore[assignment]
+    (tmp_path / "docs" / issue.identifier / "work").mkdir(parents=True, exist_ok=True)
+    (tmp_path / "docs" / issue.identifier / "work" / "notes.md").write_text("ok")
+    (tmp_path / "docs" / issue.identifier / "qa").mkdir(parents=True, exist_ok=True)
+    (tmp_path / "docs" / issue.identifier / "qa" / "version.log").write_text("ok")
+
+    orch._running[issue.id] = RunningEntry(
+        issue=issue,
+        started_at=datetime.now(timezone.utc),
+        retry_attempt=None,
+        worker_task=None,  # type: ignore[arg-type]
+        workspace_path=tmp_path,
+        agent_kind="codex",
+        agent_profile="sol-planner",
+        model="sol",
+        reasoning_effort="high",
+        run_id=run_id,
+        release_authority_resolved=True,
+    )
+
+    created_backends: list[_RecordingBackend] = []
+
+    def _fake_build_backend(init: BackendInit) -> _RecordingBackend:
+        b = _RecordingBackend(init=init)
+        created_backends.append(b)
+        return b
+
+    monkeypatch.setattr(core_mod, "build_backend", _fake_build_backend)
+
+    sequence = ["Build", "Done"]
+    idx = 0
+
+    async def _fake_refresh(c: ServiceConfig, running_id: str) -> Issue:
+        nonlocal idx
+        st = sequence[idx]
+        idx = min(idx + 1, len(sequence) - 1)
+        cur_issue = orch._running[running_id].issue
+        return replace(cur_issue, state=st)
+
+    monkeypatch.setattr(orch, "_refresh_issue_state", _fake_refresh)
+
+    asyncio.run(orch._run_agent_attempt(issue, attempt=None, cfg=cfg))
+
+    rec = registry.get_run(run_id)
+    assert rec.state == "Done"
+    assert rec.agent_kind == "claude"
+    assert rec.agent_profile == "sonnet-builder"
+    assert rec.model == "sonnet"
+    assert rec.reasoning_effort == ""
+
+
+
