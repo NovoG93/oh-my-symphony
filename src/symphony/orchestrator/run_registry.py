@@ -602,6 +602,47 @@ class RunRegistry:
         )
         return cur.rowcount == 1
 
+    def update_stage_agent_profile(
+        self,
+        *,
+        issue_id: str,
+        run_id: str,
+        state: str,
+        agent_kind: str,
+        agent_profile: str = "",
+        model: str = "",
+        reasoning_effort: str = "",
+        now: datetime | None = None,
+    ) -> bool:
+        """Update active run record to reflect current stage profile/model/agent."""
+        now = _utc(now)
+        conn = self._connect()
+        cur = conn.execute(
+            """
+            UPDATE runs
+            SET state = ?, agent_kind = ?, agent_profile = ?, model = ?,
+                reasoning_effort = ?, updated_at = ?
+            WHERE issue_id = ?
+              AND run_id = ?
+              AND status = 'active'
+              AND owner_pid = ?
+              AND owner_boot_id = ?
+            """,
+            (
+                state,
+                agent_kind,
+                agent_profile,
+                model,
+                reasoning_effort,
+                _iso(now),
+                issue_id,
+                run_id,
+                self._owner_pid,
+                self._boot_id,
+            ),
+        )
+        return cur.rowcount == 1
+
     def heartbeat(
         self,
         *,

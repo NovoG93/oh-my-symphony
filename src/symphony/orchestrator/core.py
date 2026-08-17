@@ -2434,6 +2434,9 @@ class Orchestrator:
                 attempt=entry.retry_attempt,
                 attempt_kind="reacquired",
                 agent_kind=entry.agent_kind,
+                agent_profile=entry.agent_profile,
+                model=entry.model,
+                reasoning_effort=entry.reasoning_effort,
             ),
             "",
         )
@@ -6434,6 +6437,9 @@ class Orchestrator:
             issue_identifier=issue.identifier,
             attempt=attempt,
             agent_kind=entry.agent_kind,
+            agent_profile=entry.agent_profile,
+            model=entry.model,
+            reasoning_effort=entry.reasoning_effort,
         )
         # Persist the resolved backend onto the ticket so downstream
         # consumers (board UIs, audits, Done-state history) can see who
@@ -7033,19 +7039,83 @@ class Orchestrator:
                             # kind must be re-resolved from the unrouted config
                             # here — not reused from the lane we started in.
                             phase_cfg = _config_for_issue_agent(base_cfg, issue)
-                            if phase_cfg.agent.kind != cfg.agent.kind:
+                            phase_selection = phase_cfg.selection_for_state(
+                                issue.state,
+                                ticket_profile=_requested_agent_profile(issue),
+                                ticket_kind=_requested_agent_kind(issue),
+                            )
+                            phase_resolved_agent = resolve_agent_config(phase_cfg, phase_selection)
+                            to_kind = phase_selection.kind
+                            to_profile = phase_selection.profile or ""
+                            to_model = (
+                                getattr(phase_resolved_agent.active_config, "model", "") or ""
+                            )
+                            to_reasoning_effort = (
+                                getattr(phase_resolved_agent.active_config, "reasoning_effort", "")
+                                or ""
+                            )
+                            from_kind = (
+                                running_entry.agent_kind
+                                if running_entry is not None and running_entry.agent_kind
+                                else cfg.agent.kind
+                            )
+                            from_profile = (
+                                running_entry.agent_profile
+                                if running_entry is not None
+                                else ""
+                            )
+                            from_model = (
+                                running_entry.model
+                                if running_entry is not None
+                                else ""
+                            )
+                            from_reasoning_effort = (
+                                running_entry.reasoning_effort
+                                if running_entry is not None
+                                else ""
+                            )
+                            if (
+                                from_kind != to_kind
+                                or from_profile != to_profile
+                                or from_model != to_model
+                                or from_reasoning_effort != to_reasoning_effort
+                            ):
                                 log.info(
                                     "stage_backend_rerouted",
                                     issue_id=issue.id,
                                     identifier=issue.identifier,
                                     from_state=prev_phase_state,
                                     to_state=current_state,
-                                    from_kind=cfg.agent.kind,
-                                    to_kind=phase_cfg.agent.kind,
+                                    from_kind=from_kind,
+                                    to_kind=to_kind,
+                                    from_profile=from_profile,
+                                    to_profile=to_profile,
+                                    from_model=from_model,
+                                    to_model=to_model,
+                                    to_reasoning_effort=to_reasoning_effort,
                                 )
                             cfg = phase_cfg
                             if running_entry is not None:
-                                running_entry.agent_kind = cfg.agent.kind
+                                running_entry.agent_kind = to_kind
+                                running_entry.agent_profile = to_profile
+                                running_entry.model = to_model
+                                running_entry.reasoning_effort = to_reasoning_effort
+                                if running_entry.run_id and self._run_registry is not None:
+                                    stage_registry = cast(RunRegistry, self._run_registry)
+                                    stage_run_id = running_entry.run_id
+                                    self._registry_guard(
+                                        "update_stage_agent_profile",
+                                        lambda: stage_registry.update_stage_agent_profile(
+                                            issue_id=running_issue_id,
+                                            run_id=stage_run_id,
+                                            state=current_state,
+                                            agent_kind=to_kind,
+                                            agent_profile=to_profile,
+                                            model=to_model,
+                                            reasoning_effort=to_reasoning_effort,
+                                        ),
+                                        False,
+                                    )
                             (
                                 client,
                                 first_prompt,

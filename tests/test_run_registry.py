@@ -2222,3 +2222,49 @@ def test_continuation_acquisition_race_has_exactly_one_successor(tmp_path: Path)
             "SELECT COUNT(*) FROM runs WHERE continued_from_run_id = ?",
             (predecessor,),
         ).fetchone() == (1,)
+
+
+def test_run_registry_update_stage_agent_profile(tmp_path: Path) -> None:
+    registry = RunRegistry(tmp_path / "state.db", lease_ttl=timedelta(seconds=60))
+    now = datetime(2026, 7, 2, 1, 0, tzinfo=timezone.utc)
+    issue = _issue()
+
+    run_id = registry.acquire_run(
+        issue,
+        workspace_path=tmp_path / "ws" / issue.identifier,
+        attempt=None,
+        attempt_kind="initial",
+        agent_kind="codex",
+        agent_profile="sol-planner",
+        model="sol",
+        reasoning_effort="high",
+        now=now,
+    )
+    assert run_id
+
+    initial_rec = registry.get_run(run_id)
+    assert initial_rec.state == "In Progress"
+    assert initial_rec.agent_kind == "codex"
+    assert initial_rec.agent_profile == "sol-planner"
+    assert initial_rec.model == "sol"
+    assert initial_rec.reasoning_effort == "high"
+
+    updated = registry.update_stage_agent_profile(
+        issue_id=issue.id,
+        run_id=run_id,
+        state="Verify",
+        agent_kind="claude",
+        agent_profile="claude-reviewer",
+        model="claude-3-7-sonnet",
+        reasoning_effort="medium",
+        now=now + timedelta(seconds=10),
+    )
+    assert updated is True
+
+    updated_rec = registry.get_run(run_id)
+    assert updated_rec.state == "Verify"
+    assert updated_rec.agent_kind == "claude"
+    assert updated_rec.agent_profile == "claude-reviewer"
+    assert updated_rec.model == "claude-3-7-sonnet"
+    assert updated_rec.reasoning_effort == "medium"
+
