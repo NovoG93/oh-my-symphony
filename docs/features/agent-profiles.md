@@ -153,6 +153,18 @@ non-authoritative and can never block scheduling.
 quota exhaustion terminates the running attempt without consuming the
 retry budget — the ticket waits as `waiting_provider_usage` until the pool
 resets; transient 429/RPM/TPM errors keep normal retry behaviour.
+**API + UI projection (Stage 5):** the orchestrator snapshot exposes
+per-pool `provider_usage` — `source`, per-window `used_percent` /
+`remaining_percent` / `resets_at`, `status`
+(`available` | `capacity_paused` | `unavailable`), `stale`, and
+`authoritative` (`remaining_percent` defaults to `100 - used_percent`), and
+the workflow payload exposes the configured `usage_pools` (source + caps).
+The web board renders a Provider Usage card next to Agent Policy with usage
+bars, configured caps, remaining %, and reset times; an over-cap pool shows
+a "Capacity paused" / "Available after" notice, and the derived
+`waiting_provider_usage` schedule reason is localized in English and Korean.
+Missing or stale telemetry renders as "Usage unavailable" and never blocks
+the UI.
 
 ### 6. Session Scoping & Isolation
 

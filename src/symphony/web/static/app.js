@@ -57,8 +57,10 @@
   }
 
   const api = {
+    getState: () => apiRequest('/state'),
     getBoard: () => apiRequest('/board'),
     getRequests: () => apiRequest('/requests'),
+
     getRequestSchedule: (kind, id) => {
       const params = new URLSearchParams({ kind, id });
       return apiRequest(`/requests/schedule?${params.toString()}`);
@@ -1331,7 +1333,9 @@
       waiting_dependency: t('schedule.reasonDependency'),
       waiting_global_capacity: t('schedule.reasonCapacity'),
       waiting_state_capacity: t('schedule.reasonStateCapacity'),
+      waiting_provider_usage: t('schedule.reasonProviderUsage'),
       refused_conflict: t('schedule.reasonConflict'),
+
       refused_dispatch_authority: t('schedule.reasonAuthority'),
       terminal_success: t('schedule.reasonComplete'),
       terminal_needs_action: t('schedule.reasonTerminal'),
@@ -2691,8 +2695,11 @@
     ]);
     wrap.appendChild(saveBar);
     wrap.appendChild(buildAgentPolicyCard(state.workflow.agent));
+    const providerUsage = (state.board && state.board.provider_usage) || (state.status && state.status.provider_usage);
+    wrap.appendChild(buildProviderUsageCard(state.workflow.usage_pools, providerUsage));
 
     state.wfRerender = () => {
+
       clearNode(list);
       state.workflowDraft.forEach((row) => list.appendChild(buildWfRow(row)));
       updateSaveBarVisibility();
@@ -2792,6 +2799,157 @@
       ]),
     ]);
   }
+
+  function formatIsoTime(isoStr) {
+    if (!isoStr) return '';
+    try {
+      const dt = new Date(isoStr);
+      if (isNaN(dt.getTime())) return String(isoStr);
+      return dt.toLocaleDateString([], { weekday: 'short', hour: '2-digit', minute: '2-digit' });
+    } catch (_e) {
+      return String(isoStr);
+    }
+  }
+
+  function buildProviderUsageCard(usagePools, providerUsage) {
+    const card = el('div', { class: 'card-panel provider-usage-card', id: 'provider-usage-card' });
+    card.appendChild(el('h3', null, t('usage.providerUsage')));
+
+    const poolMap = {};
+    if (usagePools) {
+      for (const [k, v] of Object.entries(usagePools)) {
+        poolMap[k] = { cfg: v, data: null };
+      }
+    }
+    if (providerUsage) {
+      for (const [k, v] of Object.entries(providerUsage)) {
+        if (!poolMap[k]) poolMap[k] = { cfg: null, data: v };
+        else poolMap[k].data = v;
+      }
+    }
+
+    const poolIds = Object.keys(poolMap).sort();
+    if (poolIds.length === 0) {
+      card.appendChild(el('div', { class: 'history-muted usage-empty' }, t('usage.unavailable')));
+      return card;
+    }
+
+    const list = el('div', { class: 'provider-usage-list' });
+    for (const poolId of poolIds) {
+      const { cfg: poolCfg, data: poolData } = poolMap[poolId];
+      const poolSec = el('div', { class: 'provider-usage-pool', 'data-pool-id': poolId });
+
+      const displayName = poolId.charAt(0).toUpperCase() + poolId.slice(1);
+      const status = (poolData && poolData.status) || 'available';
+      const isPaused = status === 'capacity_paused';
+      const isStale = Boolean(poolData && poolData.stale);
+      const isAuthoritative = !poolData || poolData.authoritative !== false;
+      const poolSource = (poolData && poolData.source) || (poolCfg && poolCfg.source) || poolId;
+
+      const header = el('div', { class: 'usage-pool-header' }, [
+        el('div', { class: 'usage-pool-title-group' }, [
+          el('h4', { class: 'usage-pool-name' }, displayName),
+          el('span', { class: 'usage-pool-source' }, `${t('usage.pool')}: ${poolSource}`),
+        ]),
+        el('div', { class: 'usage-pool-badges' }, [
+          isPaused
+            ? el('span', { class: 'chip-status chip-status--paused badge badge-paused' }, t('usage.capacityPaused'))
+            : (!poolData || (!poolData.windows && (!poolCfg || !poolCfg.caps)))
+            ? el('span', { class: 'chip-status badge badge-muted' }, t('usage.unavailable'))
+            : el('span', { class: 'chip-status badge badge-success' }, t('usage.available')),
+          isStale ? el('span', { class: 'chip-status chip-stale badge badge-stale' }, t('usage.stale')) : null,
+          !isAuthoritative
+            ? el('span', { class: 'chip-status chip-estimated badge badge-estimated' }, t('usage.estimated'))
+            : el('span', { class: 'chip-status chip-authoritative badge badge-authoritative' }, t('usage.authoritative')),
+        ].filter(Boolean)),
+      ]);
+      poolSec.appendChild(header);
+
+      if (isPaused) {
+        poolSec.appendChild(
+          el('div', { class: 'usage-paused-notice' }, [
+            el('p', { class: 'usage-paused-text' }, `${t('usage.tasksPaused', { pool: displayName })} — ${t('usage.waitingForCapacity')}`),
+          ])
+        );
+      }
+
+      // Collect all window keys
+      const windowKeys = new Set();
+      if (poolCfg && poolCfg.caps) {
+        for (const k of Object.keys(poolCfg.caps)) windowKeys.add(k);
+      }
+      if (poolData && poolData.windows) {
+        for (const k of Object.keys(poolData.windows)) windowKeys.add(k);
+      }
+
+      if (windowKeys.size === 0) {
+        poolSec.appendChild(el('div', { class: 'history-muted usage-empty-pool' }, t('usage.unavailable')));
+      } else {
+        const winLabels = {
+          five_hour: t('usage.fiveHour'),
+          weekly: t('usage.weekly'),
+          daily: t('usage.daily'),
+          monthly: t('usage.monthly'),
+        };
+        const windowsList = el('div', { class: 'usage-windows-list' });
+        for (const winKey of Array.from(windowKeys).sort()) {
+          const winData = (poolData && poolData.windows && poolData.windows[winKey]) || {};
+          const cap = poolCfg && poolCfg.caps ? poolCfg.caps[winKey] : null;
+          const used = winData.used_percent;
+          let remaining = winData.remaining_percent;
+          if (remaining == null && used != null) {
+            remaining = Math.round((100 - used) * 100) / 100;
+          }
+          const resetsAt = winData.resets_at;
+          const winTitle = winLabels[winKey] || winKey.replace(/_/g, ' ');
+
+          const row = el('div', { class: 'usage-window-row' });
+          const winHeader = el('div', { class: 'usage-window-header' }, [
+            el('span', { class: 'usage-window-title' }, winTitle),
+            el('span', { class: 'usage-window-used-label' }, used != null ? t('usage.usedPercent', { n: used }) : t('usage.unavailable')),
+          ]);
+          row.appendChild(winHeader);
+
+          // Progress bar
+          const pct = used != null ? Math.min(100, Math.max(0, used)) : 0;
+          const isOverCap = cap != null && used != null && used >= cap;
+          let fillClass = 'usage-bar-fill';
+          if (isPaused || isOverCap) fillClass += ' usage-bar-fill--paused';
+          if (!isAuthoritative) fillClass += ' usage-bar-fill--estimated';
+
+          const barTrack = el('div', { class: 'usage-bar-track' }, [
+            el('div', { class: fillClass, style: `width: ${pct}%` }),
+          ]);
+          row.appendChild(barTrack);
+
+          // Meta row: remaining, cap, reset time
+          const metaItems = [];
+          if (remaining != null) {
+            metaItems.push(el('span', { class: 'usage-meta-item usage-meta-remaining' }, `${t('usage.remaining')}: ${t('usage.remainingPercent', { n: remaining })}`));
+          }
+          if (cap != null) {
+            metaItems.push(el('span', { class: 'usage-meta-item usage-meta-cap' }, `${t('usage.configuredCap')}: ${t('usage.capPercent', { n: cap })}`));
+          }
+          if (resetsAt) {
+            const resetPrefix = isPaused ? t('usage.availableAfter') : t('usage.resetsAt');
+            metaItems.push(el('span', { class: 'usage-meta-item usage-meta-reset' }, `${resetPrefix}: ${formatIsoTime(resetsAt)}`));
+          }
+          if (metaItems.length > 0) {
+            row.appendChild(el('div', { class: 'usage-window-meta' }, metaItems));
+          }
+
+          windowsList.appendChild(row);
+        }
+        poolSec.appendChild(windowsList);
+      }
+
+
+      list.appendChild(poolSec);
+    }
+    card.appendChild(list);
+    return card;
+  }
+
 
   // ------------------------------------------------------------------
   // Page: Git
@@ -4718,7 +4876,12 @@
       body.appendChild(settingsSectionHeading(t('settings.workflowSetup'), t('settings.workflowSetupDescription')));
       body.appendChild(buildLanePresetCard(lanePresets, wf));
       body.appendChild(buildBranchPolicyCard(wf));
+      const providerUsage = (board && board.provider_usage) || (state.board && state.board.provider_usage);
+      if (wf.usage_pools || providerUsage) {
+        body.appendChild(buildProviderUsageCard(wf.usage_pools, providerUsage));
+      }
       body.appendChild(settingsSectionHeading(t('settings.automation'), t('settings.automationDescription')));
+
       body.appendChild(buildContinuousImprovementCard(wf, ciStatus));
     } catch (err) {
       clearNode(body);
