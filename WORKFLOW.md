@@ -325,6 +325,29 @@ agent_profiles:
     kind: claude
     model: deepseek-v4-flash
 
+usage_pools:
+  # A cap is only enforced when the matching provider probe returns
+  # authoritative telemetry;
+  # otherwise the scheduler fails open (normal scheduling). Pools match the
+  # backends currently in use via the named profiles (profile.usage_pool
+  # defaults to profile.kind).
+  codex:        # planner
+    source: codex
+    caps:
+      five_hour: 80
+      weekly: 70
+
+  claude:       # reviewer + documenter
+    source: claude
+    caps:
+      five_hour: 80
+      weekly: 70
+
+  agy:          # builder
+    source: agy
+    caps:
+      daily: 80
+
 claude:
   # `--add-dir "$SYMPHONY_WORKFLOW_DIR"` extends Claude Code's scope
   # from the per-ticket worktree cwd up to the host project root so the
