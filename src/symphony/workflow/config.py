@@ -37,6 +37,7 @@ from .constants import (
     DEFAULT_CI_TICKET_PREFIX,
     DEFAULT_CODEX_MODEL,
     DEFAULT_CODEX_REASONING_EFFORT,
+    DEFAULT_COPILOT_COMMAND,
     DEFAULT_KIRO_COMMAND,
     DEFAULT_MAX_ATTEMPTS,
     DEFAULT_MAX_RETRIES,
@@ -556,6 +557,31 @@ def _default_prime_agent_config() -> PrimeAgentConfig:
 
 
 @dataclass(frozen=True)
+class CopilotConfig:
+    """`agent.kind: copilot` — driving the GitHub Copilot CLI."""
+
+    command: str = DEFAULT_COPILOT_COMMAND
+    turn_timeout_ms: int = DEFAULT_BACKEND_TURN_TIMEOUT_MS
+    read_timeout_ms: int = DEFAULT_BACKEND_READ_TIMEOUT_MS
+    stall_timeout_ms: int = DEFAULT_BACKEND_STALL_TIMEOUT_MS
+    resume_across_turns: bool = True
+    model: str = ""
+    reasoning_effort: str = ""
+
+
+def _default_copilot_config() -> CopilotConfig:
+    return CopilotConfig(
+        command=DEFAULT_COPILOT_COMMAND,
+        turn_timeout_ms=DEFAULT_BACKEND_TURN_TIMEOUT_MS,
+        read_timeout_ms=DEFAULT_BACKEND_READ_TIMEOUT_MS,
+        stall_timeout_ms=DEFAULT_BACKEND_STALL_TIMEOUT_MS,
+        resume_across_turns=True,
+        model="",
+        reasoning_effort="",
+    )
+
+
+@dataclass(frozen=True)
 class ServerConfig:
     """§13.7 optional HTTP extension."""
 
@@ -774,6 +800,8 @@ class ServiceConfig:
     agent_profiles: dict[str, AgentProfileConfig] = field(default_factory=dict)
     # Shared usage pools map (pool_id -> UsagePoolConfig)
     usage_pools: dict[str, UsagePoolConfig] = field(default_factory=dict)
+    # GitHub Copilot CLI backend config — optional/defaulted
+    copilot: CopilotConfig | None = None
 
     def prompt_template_for_state(self, state: str) -> str:
         """Return the runtime prompt template for one tracker state."""
@@ -811,6 +839,13 @@ class ServiceConfig:
                 self.prime_agent.read_timeout_ms,
                 self.prime_agent.stall_timeout_ms,
             )
+        if kind == "copilot":
+            cfg = self.copilot or _default_copilot_config()
+            return (
+                cfg.turn_timeout_ms,
+                cfg.read_timeout_ms,
+                cfg.stall_timeout_ms,
+            )
         if kind == "gemini":
             return (
                 self.gemini.turn_timeout_ms,
@@ -836,7 +871,7 @@ class ServiceConfig:
                 self.opencode.stall_timeout_ms,
             )
         raise ConfigValidationError(
-            "agent.kind must be one of agy, codex, claude, gemini, kiro, opencode, pi, prime-agent",
+            "agent.kind must be one of agy, codex, claude, copilot, gemini, kiro, opencode, pi, prime-agent",
             value=kind,
         )
 

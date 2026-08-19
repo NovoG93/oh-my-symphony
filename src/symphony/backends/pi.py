@@ -41,8 +41,6 @@ import time
 from collections import deque
 from typing import Any
 
-from datetime import datetime, timezone
-
 from .._shell import resolve_bash, safe_proc_wait, terminate_process_tree
 from ..errors import (
     PortExit,
@@ -72,12 +70,6 @@ from . import (
     TurnResult,
     _is_valid_session_id,
     redact_session_id,
-)
-from .usage import (
-    ProviderUsageSnapshot,
-    UsageProbe,
-    UsageWindow,
-    USAGE_PROBES,
 )
 
 
@@ -753,24 +745,4 @@ def _is_genuine_pi_exhaustion(text: str) -> bool:
         "provider usage exhausted",
     )
     return any(kw in lowered for kw in exhaustion_keywords)
-
-
-class GithubCopilotUsageProbe(UsageProbe):
-    """Usage probe for GitHub Copilot (fails open, percentage unknown, hard limit detection only)."""
-
-    def __init__(
-        self,
-        *,
-        pool_id: str = "github-copilot",
-        cached_snapshot: ProviderUsageSnapshot | None = None,
-    ) -> None:
-        self.pool_id = pool_id
-        self.cached_snapshot = cached_snapshot
-
-    async def fetch_usage(self) -> ProviderUsageSnapshot | None:
-        """Return None (fails open)."""
-        return self.cached_snapshot
-
-
-USAGE_PROBES["github-copilot"] = GithubCopilotUsageProbe
 

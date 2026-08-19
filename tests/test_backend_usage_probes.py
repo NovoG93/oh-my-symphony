@@ -50,8 +50,12 @@ from symphony.backends.opencode import (
     normalize_opencode_local_usage,
     _is_genuine_opencode_exhaustion,
 )
+from symphony.backends.copilot import (
+    CopilotBackend,
+    CopilotUsageProbe,
+    _is_genuine_copilot_exhaustion,
+)
 from symphony.backends.pi import (
-    GithubCopilotUsageProbe,
     PiBackend,
     _is_genuine_pi_exhaustion,
 )
@@ -518,10 +522,16 @@ def test_prime_claude_does_not_implicitly_use_claude_code_pool() -> None:
 
 
 @pytest.mark.asyncio
-async def test_github_copilot_usage_probe_fails_open() -> None:
-    probe = GithubCopilotUsageProbe(pool_id="github-copilot")
+async def test_copilot_usage_probe_fails_open() -> None:
+    probe = CopilotUsageProbe(pool_id="copilot")
     res = await probe.fetch_usage()
     assert res is None
+
+
+def test_copilot_exhaustion_detection() -> None:
+    assert _is_genuine_copilot_exhaustion("insufficient credits on model provider") is True
+    assert _is_genuine_copilot_exhaustion("quota exceeded: rate limit reached") is True
+    assert _is_genuine_copilot_exhaustion("requests per minute exceeded") is False
 
 
 def test_pi_exhaustion_detection() -> None:
@@ -541,6 +551,7 @@ def test_pi_exhaustion_detection() -> None:
         "codex",
         "claude",
         "agy",
+        "copilot",
         "gemini",
         "kiro",
         "opencode",
@@ -590,7 +601,8 @@ def test_usage_probes_registry_all_backends_registered() -> None:
         ("gemini", "GeminiUsageProbe"),
         ("kiro", "KiroUsageProbe"),
         ("opencode-go", "OpenCodeGoUsageProbe"),
-        ("github-copilot", "GithubCopilotUsageProbe"),
+        ("copilot", "CopilotUsageProbe"),
+        ("github-copilot", "CopilotUsageProbe"),
     ]
     for source, expected_cls_name in sources:
         probe_cls = get_usage_probe(source)

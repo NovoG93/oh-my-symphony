@@ -39,6 +39,7 @@ from .config import (
     ClaudeConfig,
     CodexConfig,
     ContinuousImprovementConfig,
+    CopilotConfig,
     GeminiConfig,
     HooksConfig,
     KiroConfig,
@@ -81,6 +82,7 @@ from .constants import (
     DEFAULT_CODEX_REASONING_EFFORT,
     DEFAULT_CODEX_STALL_TIMEOUT_MS,
     DEFAULT_CODEX_TURN_TIMEOUT_MS,
+    DEFAULT_COPILOT_COMMAND,
     DEFAULT_GEMINI_COMMAND,
     DEFAULT_HOOK_TIMEOUT_MS,
     DEFAULT_KIRO_COMMAND,
@@ -603,6 +605,32 @@ def build_service_config(workflow: WorkflowDefinition) -> ServiceConfig:
         resume_across_turns=bool(pa_raw.get("resume_across_turns", True)),
     )
 
+    copilot_raw = cfg.get("copilot")
+    copilot: CopilotConfig | None = None
+    if isinstance(copilot_raw, dict):
+        copilot = CopilotConfig(
+            command=_as_str(copilot_raw.get("command"), DEFAULT_COPILOT_COMMAND)
+            or DEFAULT_COPILOT_COMMAND,
+            turn_timeout_ms=_validated_positive_or_default(
+                copilot_raw.get("turn_timeout_ms"),
+                DEFAULT_BACKEND_TURN_TIMEOUT_MS,
+                name="copilot.turn_timeout_ms",
+            ),
+            read_timeout_ms=_validated_positive_or_default(
+                copilot_raw.get("read_timeout_ms"),
+                DEFAULT_BACKEND_READ_TIMEOUT_MS,
+                name="copilot.read_timeout_ms",
+            ),
+            stall_timeout_ms=_validated_positive_or_default(
+                copilot_raw.get("stall_timeout_ms"),
+                DEFAULT_BACKEND_STALL_TIMEOUT_MS,
+                name="copilot.stall_timeout_ms",
+            ),
+            resume_across_turns=bool(copilot_raw.get("resume_across_turns", True)),
+            model=_as_str(copilot_raw.get("model"), "") or "",
+            reasoning_effort=_as_str(copilot_raw.get("reasoning_effort"), "") or "",
+        )
+
     server_raw = cfg.get("server") or {}
     if not isinstance(server_raw, dict):
         server_raw = {}
@@ -881,6 +909,7 @@ def build_service_config(workflow: WorkflowDefinition) -> ServiceConfig:
         artifacts=artifacts,
         agent_profiles=agent_profiles,
         usage_pools=usage_pools,
+        copilot=copilot,
     )
 
 

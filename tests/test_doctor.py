@@ -19,6 +19,7 @@ from symphony.cli.doctor import (
     check_app_release_contract,
     check_agy_state_dir,
     check_agent_cli,
+    check_copilot_auth,
     check_gemini_auth,
     check_kiro_auth,
     check_pi_auth,
@@ -529,11 +530,11 @@ def test_run_checks_returns_one_result_per_check(tmp_path: Path) -> None:
     )
     results = run_checks(cfg)
     # protected repository + port + shell + max_turns + agent + pi_auth
-    # + prime_agent_auth + gemini_auth + agy_state + kiro_auth + prompts
+    # + prime_agent_auth + copilot_auth + gemini_auth + agy_state + kiro_auth + prompts
     # + after_create + workspace + git_history + agent_git_grant + tracker
     # + board.reachable + deep_merge_contract + stage_contracts + board.cli
-    # + board.dependencies + app.release-contract + state.db = 23
-    assert len(results) == 23
+    # + board.dependencies + app.release-contract + state.db = 24
+    assert len(results) == 24
     assert {r.name.split("=")[0].split(".")[0] for r in results} >= {
         "agent",
         "hooks",
@@ -568,6 +569,53 @@ def test_prime_agent_auth_skipped_for_non_prime_agent(tmp_path: Path) -> None:
     result = check_prime_agent_auth(cfg)
     assert result.status == "pass"
     assert "skipped" in result.message
+
+
+def test_copilot_auth_skipped_for_non_copilot(tmp_path: Path) -> None:
+    cfg = _build_cfg(
+        tmp_path,
+        """
+        tracker: { kind: file, board_root: ./kanban }
+        agent: { kind: codex }
+        codex: { command: codex app-server }
+        """,
+    )
+    result = check_copilot_auth(cfg)
+    assert result.status == "pass"
+    assert "skipped" in result.message
+
+
+def test_copilot_auth_passes_on_env_var(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("GITHUB_TOKEN", "ghp_test12345")
+    cfg = _build_cfg(
+        tmp_path,
+        """
+        tracker: { kind: file, board_root: ./kanban }
+        agent: { kind: copilot }
+        """,
+    )
+    result = check_copilot_auth(cfg)
+    assert result.status == "pass"
+    assert "GITHUB_TOKEN present" in result.message
+
+
+def test_copilot_auth_warns_when_no_token_detected(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.delenv("COPILOT_GITHUB_TOKEN", raising=False)
+    monkeypatch.delenv("GH_TOKEN", raising=False)
+    monkeypatch.delenv("GITHUB_TOKEN", raising=False)
+    monkeypatch.setenv("HOME", str(tmp_path))
+    cfg = _build_cfg(
+        tmp_path,
+        """
+        tracker: { kind: file, board_root: ./kanban }
+        agent: { kind: copilot }
+        """,
+    )
+    result = check_copilot_auth(cfg)
+    assert result.status == "warn"
+    assert "No GitHub Copilot auth token detected" in result.message
 
 
 def test_gemini_auth_skipped_for_non_gemini(tmp_path: Path) -> None:

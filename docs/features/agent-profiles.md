@@ -147,7 +147,8 @@ errors only — no TTY scraping; Kiro normalizes credits to a `monthly`
 window), and GitHub Copilot (hard-limit detection only). **Delegation:**
 a profile's `kind` never implies a usage pool — OpenCode, Pi, and
 Prime Agent profiles bind an explicit `usage_pool` (e.g. `pi-codex ->
-codex`, `pi-copilot -> github-copilot`); local usage estimates are
+codex`, `pi-copilot -> copilot` — legacy `github-copilot` still resolves
+via `USAGE_SOURCE_ALIASES`); local usage estimates are
 non-authoritative and can never block scheduling.
 **Capacity exhaustion (Stage 4):** genuine subscription/plan
 quota exhaustion terminates the running attempt without consuming the

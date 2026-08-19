@@ -186,11 +186,15 @@ invariant: no authoritative telemetry -> never block scheduling.
   `opencode` and `opencode-go`, returns non-authoritative snapshot or
   `None`; `_is_genuine_opencode_exhaustion` for runtime errors.
 - Pi / Prime Agent (`src/symphony/backends/pi.py`):
-  `GithubCopilotUsageProbe` (percentage unknown — hard-limit detection
-  only, fails open); `_is_genuine_pi_exhaustion` plus exhaustion hooks in
-  terminal-stop checks and exit hooks. Runtime pool fallback is the
-  agent's own kind (`per_turn.py:94-96`) — an omitted `usage_pool` never
-  implies another backend's pool.
+  `_is_genuine_pi_exhaustion` plus exhaustion hooks in terminal-stop
+  checks and exit hooks. Runtime pool fallback is the agent's own kind
+  (`per_turn.py:94-96`) — an omitted `usage_pool` never implies another
+  backend's pool. (TASK-18 moved the Copilot probe out of this module.)
+- Copilot (`src/symphony/backends/copilot.py`): `CopilotUsageProbe`
+  (percentage unknown — hard-limit detection only, fails open);
+  `_is_genuine_copilot_exhaustion` excludes rpm/tpm, flags quota/credit
+  keywords. Canonical source `copilot`; legacy `github-copilot` resolves
+  via `USAGE_SOURCE_ALIASES`. See [[copilot-backend]].
 - Gemini (`src/symphony/backends/gemini.py`): `GeminiUsageProbe` returns
   cached/`None` — no pseudo-TTY scraping of `/stats`;
   `_parse_gemini_exhaustion` extracts reset times from ISO
@@ -204,7 +208,8 @@ invariant: no authoritative telemetry -> never block scheduling.
 
 **Delegation invariant (AC3):** backend `kind` never implies `usage_pool`.
 Profiles bind it explicitly (`pi-codex -> codex`, `pi-copilot ->
-github-copilot`, `opencode-codex -> codex`); omitted `usage_pool` falls
+copilot`, `opencode-codex -> codex`; legacy `github-copilot` still
+resolves via `USAGE_SOURCE_ALIASES`); omitted `usage_pool` falls
 back to the agent's own kind, never another backend's pool. Runtime
 exhaustion hooks use `self._usage_pool or self._agent_name` so
 `ProviderCapacityError`/`EVENT_PROVIDER_USAGE_EXHAUSTED` target the bound
@@ -212,7 +217,9 @@ pool.
 
 **Registry:** `get_usage_probe` (`src/symphony/backends/usage.py`) lazily
 resolves `codex`, `claude`, `agy`, `gemini`, `kiro`, `opencode(-go)`,
-`github-copilot`; all probes are also eager-registered at module import
+`copilot` (`USAGE_SOURCE_ALIASES` normalizes legacy `github-copilot` ->
+`copilot` first, usage.py:41/51); all probes are also eager-registered at
+module import
 (dual registration, idempotent). Missing/unsupported sources return `None`
 (fail open).
 
