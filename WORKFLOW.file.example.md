@@ -191,7 +191,7 @@ hooks:
     git -C "$HOST_REPO" worktree remove --force "$WORKTREE_PATH" 2>/dev/null || true
 
 agent:
-  kind: codex          # codex | claude | gemini | agy | kiro | opencode | pi | prime-agent
+  kind: codex          # codex | claude | copilot | gemini | agy | kiro | opencode | pi | prime-agent
   # Optional per-state backend routing: cheap/fast agents on light lanes,
   # the default `kind` everywhere else. Precedence per dispatch:
   # dispatch profile > dispatch kind > per-ticket `agent_profile` pin >
@@ -300,6 +300,14 @@ claude:
   # the agent unable to run the tool its prompt mandates.
   command: 'claude -p --output-format stream-json --verbose --permission-mode acceptEdits --add-dir "$SYMPHONY_WORKFLOW_DIR/kanban"'
 
+copilot:
+  # GitHub Copilot CLI runs in non-interactive JSON mode. Symphony automatically
+  # appends `--session-id <uuid>`, `--model`, `--reasoning-effort`, and `--add-dir`
+  # for host directories as needed.
+  command: copilot
+  resume_across_turns: true
+  turn_timeout_ms: 3600000
+
 gemini:
   # `gemini -p` (no argument) prints help in Gemini CLI 0.39+; pass `""`
   # so the prompt comes from stdin. Symphony appends `--yolo` for unattended
@@ -366,7 +374,8 @@ prime_agent:
 # the three timeouts. Claude profile fields: model, command, resume_across_turns,
 # usage_pool, and the three timeouts — a non-empty `model` injects `--model <model>`
 # right after the `claude` token at runtime; wrapper-script commands
-# (no leading `claude` token) are left unchanged.
+# (no leading `claude` token) are left unchanged. Copilot profile fields: model,
+# reasoning_effort, command, resume_across_turns, usage_pool, and timeouts.
 # agent_profiles:
 #   sol:                    # codex profile example
 #     kind: codex

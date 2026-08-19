@@ -32,7 +32,7 @@ hooks:
     echo "run finished at $(date)"
 
 agent:
-  kind: claude          # codex | claude | gemini | opencode | pi | prime-agent
+  kind: claude          # codex | claude | copilot | gemini | agy | kiro | opencode | pi | prime-agent
   max_concurrent_agents: 1
   max_turns: 20
   crash_continuation: true

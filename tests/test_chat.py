@@ -24,6 +24,8 @@ from symphony.chat import (
     _claude_command_for_mode,
     _summarize_claude_frame,
     _summarize_codex_frame,
+    _summarize_copilot_frame,
+    _summarize_frame,
     _summarize_pi_frame,
     _terminal_agent_message,
     cfg_for_mode,
@@ -1785,3 +1787,49 @@ def test_board_preamble_deep_board_files_one_intake_ticket(tmp_path: Path) -> No
     assert "Intake, Research, Plan" in preamble
     # On a deep board the pipeline decomposes; chat does not build the DAG.
     assert "adversarial plan-review" not in preamble
+
+
+def test_summarize_copilot_frame() -> None:
+    msg_frame = {
+        "type": "assistant.message",
+        "data": {"content": "Resolved the bug."},
+    }
+    assert _summarize_copilot_frame(msg_frame) == [
+        ("agent_message", "Resolved the bug.", {})
+    ]
+
+    delta_frame = {
+        "type": "assistant.message_delta",
+        "data": {"deltaContent": "Editing file..."},
+    }
+    assert _summarize_copilot_frame(delta_frame) == [
+        ("agent_delta", "Editing file...", {})
+    ]
+
+    tool_frame = {
+        "type": "tool.call",
+        "data": {"tool": "edit_file", "args": {"path": "src/main.py"}},
+    }
+    tool_summarized = _summarize_copilot_frame(tool_frame)
+    assert len(tool_summarized) == 1
+    assert tool_summarized[0][0] == "tool_activity"
+    assert tool_summarized[0][1] == "edit_file"
+    assert "src/main.py" in tool_summarized[0][2]["detail"]
+
+    error_frame = {
+        "type": "session.error",
+        "data": {"message": "Process failed"},
+    }
+    assert _summarize_copilot_frame(error_frame) == [
+        ("tool_activity", "error", {"detail": "Process failed"})
+    ]
+
+    # Ephemeral/unknown frames ignored
+    assert _summarize_copilot_frame({"type": "session.mcp_servers_loaded"}) == []
+    assert _summarize_copilot_frame({"type": "assistant.turn_start"}) == []
+
+    # _summarize_frame dispatcher
+    assert _summarize_frame("copilot", msg_frame) == [
+        ("agent_message", "Resolved the bug.", {})
+    ]
+

@@ -1,4 +1,4 @@
-"""Comprehensive test suite for GitHub Copilot backend (Phase 1, 2 & 3 / TASK-18, TASK-19 & TASK-20)."""
+"""Comprehensive test suite for GitHub Copilot backend (Phases 1–4 / TASK-18–21)."""
 
 from __future__ import annotations
 
@@ -35,6 +35,8 @@ from symphony.backends.usage import (
     UsageWindow,
     get_usage_probe,
 )
+from symphony.chat import _summarize_copilot_frame, _summarize_frame
+from symphony.cli.doctor import check_agent_cli, check_copilot_auth, check_pi_auth
 from symphony.errors import ConfigValidationError, TurnFailed
 from symphony.issue import Issue
 from symphony.orchestrator.core import Orchestrator, _EligibilityDisposition
@@ -951,3 +953,129 @@ async def test_copilot_run_turn_end_to_end(
     completed_events = [e for e in events if e["event"] == EVENT_TURN_COMPLETED]
     assert len(completed_events) == 1
     assert completed_events[0]["payload"]["message"] == "Plan created successfully"
+
+
+# ==============================================================================
+# §29 Doctor, API, UI & Chat Summarization Tests (Phase 4 / TASK-21)
+# ==============================================================================
+
+
+def test_doctor_detects_copilot_binary(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    cfg = _parse_config("""
+    tracker: { kind: file }
+    agent: { kind: copilot }
+    copilot:
+      command: python
+    """)
+    cli_result = check_agent_cli(cfg)
+    assert cli_result.status == "pass"
+
+    monkeypatch.setenv("COPILOT_GITHUB_TOKEN", "ghp_secret_token_123")
+    result = check_copilot_auth(cfg)
+    assert result.status == "pass"
+    assert "COPILOT_GITHUB_TOKEN present" in result.message
+    # Auth credentials must not be printed in doctor output
+    assert "ghp_secret_token_123" not in result.message
+
+
+def test_doctor_handles_copilot_auth_independently_from_pi(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    copilot_cfg = _parse_config("""
+    tracker: { kind: file }
+    agent: { kind: copilot }
+    """)
+    pi_cfg = _parse_config("""
+    tracker: { kind: file }
+    agent: { kind: pi }
+    """)
+
+    # When kind is copilot, check_pi_auth skips
+    pi_result = check_pi_auth(copilot_cfg)
+    assert pi_result.status == "pass"
+    assert "not pi" in pi_result.message
+
+    # When kind is pi, check_copilot_auth skips
+    copilot_result = check_copilot_auth(pi_cfg)
+    assert copilot_result.status == "pass"
+    assert "not copilot" in copilot_result.message
+
+
+def test_workflow_api_exposes_copilot_supported_kind() -> None:
+    assert "copilot" in SUPPORTED_AGENT_KINDS
+    assert "copilot" in PROFILE_FIELDS_BY_KIND
+
+
+def test_chat_agent_selector_contains_copilot() -> None:
+    app_js_path = Path(__file__).parent.parent / "src" / "symphony" / "web" / "static" / "app.js"
+    content = app_js_path.read_text(encoding="utf-8")
+    assert "copilot: 'GitHub Copilot'" in content or 'copilot: "GitHub Copilot"' in content
+
+
+def test_summarize_copilot_frame_assistant_message() -> None:
+    payload = {
+        "type": "assistant.message",
+        "data": {
+            "content": "Work complete and tests pass.",
+            "outputTokens": 88,
+        },
+    }
+    frames = _summarize_copilot_frame(payload)
+    assert frames == [("agent_message", "Work complete and tests pass.", {})]
+
+
+def test_summarize_copilot_frame_assistant_delta() -> None:
+    payload = {
+        "type": "assistant.message_delta",
+        "data": {
+            "deltaContent": "Refactoring ",
+        },
+    }
+    frames = _summarize_copilot_frame(payload)
+    assert frames == [("agent_delta", "Refactoring ", {})]
+
+
+def test_summarize_copilot_frame_tool_activity() -> None:
+    payload = {
+        "type": "tool.call",
+        "data": {
+            "name": "bash",
+            "args": {"command": "pytest"},
+        },
+    }
+    frames = _summarize_copilot_frame(payload)
+    assert len(frames) == 1
+    assert frames[0][0] == "tool_activity"
+    assert frames[0][1] == "bash"
+    assert "pytest" in frames[0][2]["detail"]
+
+
+def test_summarize_copilot_frame_session_error() -> None:
+    payload = {
+        "type": "session.error",
+        "data": {
+            "message": "Connection to model timed out",
+        },
+    }
+    frames = _summarize_copilot_frame(payload)
+    assert frames == [("tool_activity", "error", {"detail": "Connection to model timed out"})]
+
+
+def test_summarize_copilot_frame_ephemeral_and_unknown_ignored() -> None:
+    assert _summarize_copilot_frame({"type": "assistant.turn_start"}) == []
+    assert _summarize_copilot_frame({"type": "assistant.turn_end"}) == []
+    assert _summarize_copilot_frame({"type": "model.call_start"}) == []
+    assert _summarize_copilot_frame({"type": "session.mcp_servers_loaded"}) == []
+    assert _summarize_copilot_frame({"type": "assistant.idle"}) == []
+    assert _summarize_copilot_frame({"type": "unrecognized_event_type"}) == []
+    assert _summarize_copilot_frame({}) == []
+
+
+def test_summarize_frame_dispatches_copilot() -> None:
+    payload = {
+        "type": "assistant.message",
+        "data": {"content": "Hello from Copilot"},
+    }
+    frames = _summarize_frame("copilot", payload)
+    assert frames == [("agent_message", "Hello from Copilot", {})]
+

@@ -1778,6 +1778,8 @@ def _summarize_frame(
         return _summarize_claude_frame(payload)
     if agent_kind == "codex":
         return _summarize_codex_frame(payload)
+    if agent_kind == "copilot":
+        return _summarize_copilot_frame(payload)
     if agent_kind in {"pi", "prime-agent"}:
         return _summarize_pi_frame(payload)
     raw = _preview(json.dumps(payload, ensure_ascii=False), _RAW_PREVIEW_CHARS)
@@ -1877,6 +1879,70 @@ def _summarize_pi_frame(
         name = str(payload.get("toolName") or payload.get("tool") or "tool")
         detail = _preview(str(payload.get("result") or ""), _TOOL_PREVIEW_CHARS)
         return [("tool_activity", f"{name} result", {"detail": detail})]
+    return []
+
+
+def _summarize_copilot_frame(
+    payload: dict[str, Any],
+) -> list[tuple[str, str, dict[str, Any]]]:
+    """Copilot JSONL event frames -> safe chat frames.
+
+    `assistant.message` (authoritative final response), `assistant.message_delta`
+    (ephemeral text chunk), `tool.*` (tool execution / arguments / results), and
+    `session.error` (backend failure). Ephemeral setup, turn lifecycle, and
+    unknown events return [] so internal details do not leak into the chat
+    transcript.
+    """
+    kind = payload.get("type")
+    if not isinstance(kind, str):
+        return []
+
+    if kind == "assistant.message":
+        data_msg = payload.get("data")
+        if isinstance(data_msg, dict):
+            text = str(data_msg.get("content") or "").strip()
+            if text:
+                return [("agent_message", text, {})]
+        return []
+
+    if kind == "assistant.message_delta":
+        data_delta = payload.get("data")
+        if isinstance(data_delta, dict):
+            text = data_delta.get("deltaContent") or data_delta.get("content")
+            if isinstance(text, str) and text:
+                return [("agent_delta", text, {})]
+        return []
+
+    if kind.startswith("tool.") or kind.startswith("tool_") or kind == "tool":
+        data_raw = payload.get("data")
+        tool_data = data_raw if isinstance(data_raw, dict) else payload
+        name = str(tool_data.get("name") or tool_data.get("tool") or tool_data.get("toolName") or kind)
+        detail_val = (
+            tool_data.get("args")
+            or tool_data.get("input")
+            or tool_data.get("arguments")
+            or tool_data.get("detail")
+            or tool_data.get("result")
+            or ""
+        )
+        if isinstance(detail_val, (dict, list)):
+            detail = _preview(json.dumps(detail_val, ensure_ascii=False), _TOOL_PREVIEW_CHARS)
+        elif detail_val:
+            detail = _preview(str(detail_val), _TOOL_PREVIEW_CHARS)
+        else:
+            detail = ""
+        meta = {"detail": detail} if detail else {}
+        return [("tool_activity", name, meta)]
+
+    if kind == "session.error":
+        data_err = payload.get("data")
+        if isinstance(data_err, dict):
+            err_msg = str(data_err.get("message") or data_err.get("error") or "error")
+        else:
+            err_msg = str(data_err or payload.get("message") or "error")
+        detail = _preview(err_msg, _TOOL_PREVIEW_CHARS)
+        return [("tool_activity", "error", {"detail": detail} if detail else {})]
+
     return []
 
 
