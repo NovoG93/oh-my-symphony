@@ -160,3 +160,20 @@ the suite uses `_FakeSubprocess` doubles.
   binary); `GithubCopilotUsageProbe` references gone (0 hits tests/ src/).
   Full suite: 2636 collected = 2627 passed, 9 skipped (`.pytest_cache`
   evidence; live run gated).
+
+## First copilot-routed Verify — smoke outcome (TASK-22, 2026-08-19)
+
+- TASK-22 (root `copilot-smoke.txt` = `OK\n`) was the first Verify routed to
+  the GitHub Copilot backend (claude-sonnet-5, reasoning_effort high),
+  exercising command construction (`/usr/local/bin/copilot`), JSONL parsing,
+  review output extraction, and the merge gate end-to-end.
+- Outcome: the review executed and committed evidence artifacts
+  (`docs/TASK-22/qa/*`), but the ticket-body contract sections (`## QA
+  Evidence`, `## AC Scorecard`, `## Merge Status`, `## Security Audit`,
+  `## Review`) were missing at gate time -> `## Contract Failure` rewind ->
+  sections completed on the retry turn.
+- Lesson: the Verify contract gate reads the kanban ticket body, not the
+  evidence vault — qa/ artifacts alone do not satisfy it. Copilot-routed
+  reviews must emit the five section headers verbatim in the ticket, or the
+  host rewinds regardless of backend quality.
+- Evidence: `kanban/TASK-22.md` sections + `docs/TASK-22/qa/{acceptance-checks,merge-tree,security-audit,runtime-blocked}.md`.

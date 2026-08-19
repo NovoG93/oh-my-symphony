@@ -60,6 +60,7 @@ The TASK-9 artifact `profile-smoke.txt` was removed without rewriting history:
 | 2026-08-17 (TASK-11) | Removed `profile-smoke.txt` with plain `git rm`, no revert/reset | smoke artifact must not ship on develop; history stays intact — proof chain is `test ! -e`, empty `git ls-files`, deletion commit stat, `62a5734` ancestor check |
 | 2026-08-17 (TASK-11) | `git ls-files <path>` pathspec instead of `git ls-files | grep` | workspace pipe policy denies `|`; the pathspec form is equivalent and single-command |
 | 2026-08-17 (TASK-11) | Step-4 topology proof qualified: merge-base == target tip only when the branch is a direct descendant; otherwise per-path disjoint analysis | develop advanced past the merge base after pass 1; the simple topology claim no longer applied, and the fallback proved conflict-free |
+| 2026-08-19 (TASK-22) | Re-applied the pattern unchanged for `copilot-smoke.txt` | third end-to-end confirmation; same bytes (`4f 4b 0a`) and sha256 `a12b7cb4…` for `OK\n`; fixture at `work/expected-ok.txt`; committed content re-proven via `git show HEAD:<path>` when re-run commands are gated |
 
 ## Not covered
 
