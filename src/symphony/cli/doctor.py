@@ -51,6 +51,7 @@ from ..trackers.file import FileBoardTracker
 from ..utils.git_sandbox import resolve_git_common_dir, writable_git_roots
 from ..service import ProcessRunningPredicate, port_owner_hint
 from ..workflow import (
+    DEFAULT_COPILOT_COMMAND,
     SUPPORTED_AGENT_KINDS,
     ServiceConfig,
     build_service_config,
@@ -147,6 +148,8 @@ def check_agent_cli(cfg: ServiceConfig) -> CheckResult:
         command = cfg.pi.command
     elif kind == "prime-agent":
         command = cfg.prime_agent.command
+    elif kind == "copilot":
+        command = cfg.copilot.command if cfg.copilot is not None else DEFAULT_COPILOT_COMMAND
     else:
         return CheckResult(f"agent.kind={kind}", "fail", f"unsupported agent kind {kind!r}")
 
@@ -402,6 +405,32 @@ def check_prime_agent_auth(cfg: ServiceConfig) -> CheckResult:
 # Keep the shorter name available for callers that refer to the backend as
 # ``prime`` rather than by its configured ``prime-agent`` kind.
 check_prime_auth = check_prime_agent_auth
+
+
+def check_copilot_auth(cfg: ServiceConfig) -> CheckResult:
+    """When agent.kind=copilot, verify authentication environment or cached token."""
+    name = "agent.kind=copilot.auth"
+    if cfg.agent.kind != "copilot":
+        return CheckResult(name, "pass", "not copilot (skipped)")
+
+    for env_var in ("COPILOT_GITHUB_TOKEN", "GH_TOKEN", "GITHUB_TOKEN"):
+        if os.environ.get(env_var):
+            return CheckResult(name, "pass", f"{env_var} present")
+
+    copilot_hosts = Path.home() / ".config" / "github-copilot" / "hosts.json"
+    gh_hosts = Path.home() / ".config" / "gh" / "hosts.yml"
+    if copilot_hosts.exists():
+        return CheckResult(name, "pass", f"{copilot_hosts} present")
+    if gh_hosts.exists():
+        return CheckResult(name, "pass", f"{gh_hosts} present")
+
+    return CheckResult(
+        name,
+        "warn",
+        "No GitHub Copilot auth token detected (checked COPILOT_GITHUB_TOKEN, "
+        "GH_TOKEN, GITHUB_TOKEN, and config files) — run `copilot auth` / `gh auth login` "
+        "or export a token before dispatch.",
+    )
 
 
 def check_gemini_auth(cfg: ServiceConfig) -> CheckResult:
@@ -877,6 +906,7 @@ def _agent_commands(cfg: ServiceConfig) -> dict[str, str]:
         "opencode": cfg.opencode.command,
         "pi": cfg.pi.command,
         "prime-agent": cfg.prime_agent.command,
+        "copilot": cfg.copilot.command if cfg.copilot is not None else DEFAULT_COPILOT_COMMAND,
     }
 
 # CLIs Symphony can widen on the command line. Every other kind gets the grant
@@ -1148,6 +1178,7 @@ def run_checks(cfg: ServiceConfig, host: str = "127.0.0.1") -> list[CheckResult]
         *check_agent_profiles(cfg),
         check_pi_auth(cfg),
         check_prime_agent_auth(cfg),
+        check_copilot_auth(cfg),
         check_gemini_auth(cfg),
         check_agy_state_dir(cfg),
         check_kiro_auth(cfg),

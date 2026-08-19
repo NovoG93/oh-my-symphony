@@ -57,6 +57,7 @@ from symphony.backends.codex import (
     _scan_workspace_symlinks,
 )
 from symphony.backends.agy import AgyBackend
+from symphony.backends.copilot import CopilotBackend, CopilotUsageProbe
 from symphony.backends.gemini import GeminiBackend
 from symphony.backends.kiro import KiroBackend
 from symphony.backends.opencode import OpenCodeBackend
@@ -72,6 +73,7 @@ from symphony.workflow import (
     AgyConfig,
     ClaudeConfig,
     CodexConfig,
+    CopilotConfig,
     GeminiConfig,
     HooksConfig,
     KiroConfig,
@@ -158,6 +160,13 @@ def _make_cfg(kind: str, *, workspace_root: Path) -> ServiceConfig:
         ),
         prime_agent=PrimeAgentConfig(
             command='prime-agent -p --mode json',
+            turn_timeout_ms=60_000,
+            read_timeout_ms=5_000,
+            stall_timeout_ms=30_000,
+            resume_across_turns=True,
+        ),
+        copilot=CopilotConfig(
+            command="copilot",
             turn_timeout_ms=60_000,
             read_timeout_ms=5_000,
             stall_timeout_ms=30_000,

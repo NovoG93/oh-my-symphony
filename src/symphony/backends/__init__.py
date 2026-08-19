@@ -289,8 +289,12 @@ def build_backend(init: BackendInit) -> AgentBackend:
         from .prime_agent import PrimeAgentBackend
 
         return cast(AgentBackend, PrimeAgentBackend(init))
+    if kind == "copilot":
+        from .copilot import CopilotBackend
+
+        return cast(AgentBackend, CopilotBackend(init))
     raise ConfigValidationError(
         "unknown agent.kind "
-        f"{kind!r}; expected agy, codex, claude, gemini, kiro, opencode, "
-        f"pi, or prime-agent"
+        f"{kind!r}; expected agy, codex, claude, copilot, gemini, kiro, "
+        f"opencode, pi, or prime-agent"
     )

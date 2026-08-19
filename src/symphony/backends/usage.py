@@ -8,7 +8,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from datetime import datetime
-from typing import Any, Protocol, runtime_checkable
+from typing import Protocol, runtime_checkable
 
 
 @dataclass(frozen=True)
@@ -36,6 +36,11 @@ class UsageProbe(Protocol):
     async def fetch_usage(self) -> ProviderUsageSnapshot | None: ...
 
 
+# Source name aliases mapped to their canonical probe source.
+USAGE_SOURCE_ALIASES = {
+    "github-copilot": "copilot",
+}
+
 # Registry mapping source name -> UsageProbe class/factory.
 # Missing or unsupported probes return None (fail open).
 USAGE_PROBES: dict[str, type[UsageProbe]] = {}
@@ -43,6 +48,8 @@ USAGE_PROBES: dict[str, type[UsageProbe]] = {}
 
 def get_usage_probe(source: str) -> type[UsageProbe] | None:
     """Retrieve the probe class for a given usage pool source, or None if unsupported (fail open)."""
+    source = USAGE_SOURCE_ALIASES.get(source, source)
+
     if source == "codex" and "codex" not in USAGE_PROBES:
         from .codex import CodexUsageProbe
 
@@ -68,9 +75,9 @@ def get_usage_probe(source: str) -> type[UsageProbe] | None:
 
         USAGE_PROBES["opencode-go"] = OpenCodeGoUsageProbe
         USAGE_PROBES["opencode"] = OpenCodeGoUsageProbe
-    elif source == "github-copilot" and "github-copilot" not in USAGE_PROBES:
-        from .pi import GithubCopilotUsageProbe
+    elif source == "copilot" and "copilot" not in USAGE_PROBES:
+        from .copilot import CopilotUsageProbe
 
-        USAGE_PROBES["github-copilot"] = GithubCopilotUsageProbe
+        USAGE_PROBES["copilot"] = CopilotUsageProbe
 
     return USAGE_PROBES.get(source)

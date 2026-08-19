@@ -18,12 +18,14 @@ from .config import (
     AgyConfig,
     ClaudeConfig,
     CodexConfig,
+    CopilotConfig,
     GeminiConfig,
     KiroConfig,
     OpenCodeConfig,
     PiConfig,
     PrimeAgentConfig,
     ServiceConfig,
+    _default_copilot_config,
 )
 from .constants import PROFILE_FIELDS_BY_KIND, SUPPORTED_AGENT_KINDS
 
@@ -43,6 +45,7 @@ class ResolvedAgentConfig:
     opencode: OpenCodeConfig | None = None
     pi: PiConfig | None = None
     prime_agent: PrimeAgentConfig | None = None
+    copilot: CopilotConfig | None = None
 
     @property
     def active_config(self) -> Any:
@@ -67,6 +70,8 @@ def _get_backend_config(cfg: ServiceConfig, kind: str) -> Any:
         return cfg.pi
     if kind == "prime-agent":
         return cfg.prime_agent
+    if kind == "copilot":
+        return cfg.copilot or _default_copilot_config()
     raise ConfigValidationError(
         f"unsupported backend kind {kind!r}; supported: {sorted(SUPPORTED_AGENT_KINDS)}",
         kind=kind,
