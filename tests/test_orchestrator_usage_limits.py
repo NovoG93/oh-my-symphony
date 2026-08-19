@@ -712,6 +712,7 @@ async def test_configured_cap_does_not_cancel_running_worker() -> None:
         "opencode",
         "pi",
         "prime-agent",
+        "copilot",
     ],
 )
 def test_usage_probe_failure_never_prevents_dispatch(kind: str) -> None:
