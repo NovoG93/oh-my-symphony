@@ -318,8 +318,9 @@ agent_profiles:
     kind: agy
 
   reviewer:
-    kind: claude
-    model: deepseek-v4-pro[1m]
+    kind: copilot
+    model: claude-sonnet-5
+    reasoning_effort: high
 
   documenter:
     kind: claude
@@ -347,6 +348,11 @@ usage_pools:
     source: agy
     caps:
       daily: 80
+
+  copilot:      # reviewer (Verify) — GitHub Copilot CLI
+    source: copilot
+    caps:
+      monthly: 80
 
 claude:
   # `--add-dir "$SYMPHONY_WORKFLOW_DIR"` extends Claude Code's scope
@@ -417,6 +423,25 @@ opencode:
 pi:
   command: 'pi --mode json -p ""'
   resume_across_turns: true
+
+copilot:
+  # GitHub Copilot CLI (native subscription, NOT brokered through Agent
+  # Vault). Model catalog verified on the host: claude-sonnet-5 (default),
+  # claude-sonnet-4.5/4.6, claude-opus-4.8/5, gpt-5.4, gpt-5.1-codex,
+  # gemini-3.7-flash. Quota = premium_interactions 1500/mo (~95% remaining).
+  # CopilotBackend appends --output-format=json --no-ask-user
+  # --allow-all-tools (plus --model/--reasoning-effort/--session-id/--add-dir
+  # as configured); writable roots become --add-dir. Buffered stdout, so a
+  # generous stall budget (matches agy).
+  # Absolute path required: /etc/profile.d/agent-vault.sh defines
+  # `copilot(){ av copilot "$@"; }`, and agents spawn via `bash -lc` (login
+  # shell). The absolute path bypasses that broker wrapper so the direct
+  # GitHub OAuth login is used, NOT the Agent Vault proxy.
+  command: /usr/local/bin/copilot
+  resume_across_turns: true
+  turn_timeout_ms: 3600000
+  read_timeout_ms: 20000
+  stall_timeout_ms: 2700000
 
 qa:
   # Boot recipe for As-Is/To-Be HTTP runs. The Verify prompt prefers these
