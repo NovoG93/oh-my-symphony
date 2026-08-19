@@ -191,10 +191,14 @@ invariant: no authoritative telemetry -> never block scheduling.
   (`per_turn.py:94-96`) — an omitted `usage_pool` never implies another
   backend's pool. (TASK-18 moved the Copilot probe out of this module.)
 - Copilot (`src/symphony/backends/copilot.py`): `CopilotUsageProbe`
-  (percentage unknown — hard-limit detection only, fails open);
-  `_is_genuine_copilot_exhaustion` excludes rpm/tpm, flags quota/credit
-  keywords. Canonical source `copilot`; legacy `github-copilot` resolves
-  via `USAGE_SOURCE_ALIASES`. See [[copilot-backend]].
+  (TASK-20: authoritative — spawns `copilot --server --stdio`, calls
+  `account.getQuota` over LSP framing, normalizes
+  `premium_interactions.remainingPercentage` to a `monthly` window,
+  `used = 100 - remaining`, `resetDate` → `resets_at`, fails open);
+  `_is_genuine_copilot_exhaustion` excludes rpm/tpm and generic 429,
+  flags quota/credit keywords. Canonical source `copilot`; legacy
+  `github-copilot` resolves via `USAGE_SOURCE_ALIASES`. See
+  [[copilot-backend]].
 - Gemini (`src/symphony/backends/gemini.py`): `GeminiUsageProbe` returns
   cached/`None` — no pseudo-TTY scraping of `/stats`;
   `_parse_gemini_exhaustion` extracts reset times from ISO

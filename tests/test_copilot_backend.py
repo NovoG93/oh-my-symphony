@@ -1,7 +1,10 @@
-"""Comprehensive test suite for GitHub Copilot backend (Phase 1 & 2 / TASK-18 & TASK-19)."""
+"""Comprehensive test suite for GitHub Copilot backend (Phase 1, 2 & 3 / TASK-18, TASK-19 & TASK-20)."""
 
 from __future__ import annotations
 
+import asyncio
+from datetime import datetime, timezone
+import json
 from pathlib import Path
 import textwrap
 from typing import Any
@@ -16,12 +19,26 @@ from symphony.backends import (
     ProviderCapacityError,
     build_backend,
 )
-import symphony.backends.per_turn as per_turn_module
+import symphony.backends.copilot as copilot_module
 from symphony.backends.copilot import (
     CopilotBackend,
+    CopilotUsageProbe,
     _is_genuine_copilot_exhaustion,
+    _parse_resets_at,
+    next_month_first_day_utc,
+    normalize_copilot_quota,
+)
+import symphony.backends.per_turn as per_turn_module
+from symphony.backends.usage import (
+    USAGE_PROBES,
+    ProviderUsageSnapshot,
+    UsageWindow,
+    get_usage_probe,
 )
 from symphony.errors import ConfigValidationError, TurnFailed
+from symphony.issue import Issue
+from symphony.orchestrator.core import Orchestrator, _EligibilityDisposition
+from symphony.orchestrator.entries import RunningEntry
 from symphony.workflow.builder import build_service_config
 from symphony.workflow.config import ServiceConfig
 from symphony.workflow.constants import (
@@ -30,6 +47,7 @@ from symphony.workflow.constants import (
 )
 from symphony.workflow.parser import parse_workflow_text
 from symphony.workflow.profiles import resolve_agent_config
+from symphony.workflow.state import WorkflowState
 from tests.test_backends import _FakeSubprocess, _install_subprocess_double
 
 
@@ -66,6 +84,31 @@ def _make_backend(
             on_event=on_event,
         )
     )  # type: ignore[return-value]
+
+
+def _issue(
+    identifier: str,
+    *,
+    state: str = "In Progress",
+    agent_kind: str | None = None,
+    agent_profile: str | None = None,
+) -> Issue:
+    return Issue(
+        id=identifier,
+        identifier=identifier,
+        title=identifier,
+        description="",
+        state=state,
+        priority=1,
+        agent_kind=agent_kind,
+        agent_profile=agent_profile,
+    )
+
+
+def _orch(cfg: ServiceConfig) -> Orchestrator:
+    state = WorkflowState(Path("/tmp/WORKFLOW.md"))
+    state._config = cfg  # type: ignore[attr-defined]
+    return Orchestrator(state)
 
 
 # ==============================================================================
@@ -419,6 +462,215 @@ def test_copilot_is_progress_event(tmp_path: Path) -> None:
 
 
 # ==============================================================================
+# §26 Usage Probe & Quota Probing Tests
+# ==============================================================================
+
+
+def test_copilot_usage_probe_lives_in_copilot_module() -> None:
+    assert hasattr(copilot_module, "CopilotUsageProbe")
+    assert USAGE_PROBES.get("copilot") is CopilotUsageProbe
+
+
+def test_source_copilot_resolves_copilot_usage_probe() -> None:
+    probe_cls = get_usage_probe("copilot")
+    assert probe_cls is CopilotUsageProbe
+
+
+def test_legacy_github_copilot_alias_resolves_if_supported() -> None:
+    probe_cls = get_usage_probe("github-copilot")
+    assert probe_cls is CopilotUsageProbe
+
+
+@pytest.mark.asyncio
+async def test_copilot_quota_probe_failure_fails_open() -> None:
+    probe = CopilotUsageProbe(command="nonexistent-copilot-bin-12345")
+    snapshot = await probe.fetch_usage()
+    assert snapshot is None
+
+
+def test_remaining_percentage_converts_to_used_percentage() -> None:
+    raw = {
+        "jsonrpc": "2.0",
+        "id": 1,
+        "result": {
+            "quotaSnapshots": {
+                "chat": {
+                    "isUnlimitedEntitlement": True,
+                    "entitlementRequests": 0,
+                    "usedRequests": 0,
+                    "remainingPercentage": 100,
+                    "resetDate": "2026-09-01T00:00:00Z",
+                    "hasQuota": True,
+                    "tokenBasedBilling": True,
+                },
+                "completions": {
+                    "isUnlimitedEntitlement": True,
+                    "entitlementRequests": 0,
+                    "usedRequests": 0,
+                    "remainingPercentage": 100,
+                    "resetDate": "2026-09-01T00:00:00Z",
+                    "hasQuota": True,
+                    "tokenBasedBilling": True,
+                },
+                "premium_interactions": {
+                    "isUnlimitedEntitlement": False,
+                    "entitlementRequests": 1500,
+                    "usedRequests": 74,
+                    "remainingPercentage": 95.1,
+                    "resetDate": "2026-09-01T00:00:00Z",
+                    "hasQuota": True,
+                    "tokenBasedBilling": True,
+                },
+            }
+        },
+    }
+    snapshot = normalize_copilot_quota(raw, pool_id="copilot-pool")
+    assert snapshot.pool_id == "copilot-pool"
+    assert snapshot.source == "copilot"
+    assert snapshot.authoritative is True
+    assert snapshot.hard_limit_reached is False
+    assert "monthly" in snapshot.windows
+
+    window = snapshot.windows["monthly"]
+    assert window.key == "monthly"
+    assert window.remaining_percent == 95.1
+    assert window.used_percent == 4.9
+    assert window.resets_at == datetime(2026, 9, 1, 0, 0, 0, tzinfo=timezone.utc)
+
+    # Test edge case: 0% remaining -> 100% used and hard_limit_reached = True
+    raw_exhausted = {
+        "result": {
+            "quotaSnapshots": {
+                "premium_interactions": {
+                    "remainingPercentage": 0.0,
+                    "hasQuota": False,
+                }
+            }
+        }
+    }
+    exhausted_snapshot = normalize_copilot_quota(raw_exhausted)
+    assert exhausted_snapshot.hard_limit_reached is True
+    assert exhausted_snapshot.windows["monthly"].used_percent == 100.0
+    assert exhausted_snapshot.windows["monthly"].remaining_percent == 0.0
+
+
+def test_monthly_reset_is_calculated_correctly() -> None:
+    # Explicit ISO resetDate
+    raw = {
+        "result": {
+            "quotaSnapshots": {
+                "premium_interactions": {
+                    "remainingPercentage": 50.0,
+                    "resetDate": "2026-10-15T12:00:00Z",
+                }
+            }
+        }
+    }
+    snapshot = normalize_copilot_quota(raw)
+    assert snapshot.windows["monthly"].resets_at == datetime(
+        2026, 10, 15, 12, 0, 0, tzinfo=timezone.utc
+    )
+
+    # Fallback when resetDate is missing
+    raw_no_reset = {
+        "result": {
+            "quotaSnapshots": {
+                "premium_interactions": {
+                    "remainingPercentage": 50.0,
+                }
+            }
+        }
+    }
+    snapshot_no_reset = normalize_copilot_quota(raw_no_reset)
+    assert snapshot_no_reset.windows["monthly"].resets_at is not None
+
+    # Test next_month_first_day_utc calculation
+    dt_aug = datetime(2026, 8, 19, 12, 0, 0, tzinfo=timezone.utc)
+    assert next_month_first_day_utc(dt_aug) == datetime(2026, 9, 1, 0, 0, 0, tzinfo=timezone.utc)
+
+    dt_dec = datetime(2026, 12, 31, 23, 59, 59, tzinfo=timezone.utc)
+    assert next_month_first_day_utc(dt_dec) == datetime(2027, 1, 1, 0, 0, 0, tzinfo=timezone.utc)
+
+    # Test _parse_resets_at helper directly
+    assert _parse_resets_at(None) is None
+    assert _parse_resets_at("invalid-date") is None
+    assert _parse_resets_at({"invalid": "type"}) is None
+    assert _parse_resets_at(1788220800) == datetime(2026, 9, 1, 0, 0, 0, tzinfo=timezone.utc)
+    assert _parse_resets_at(1788220800000) == datetime(2026, 9, 1, 0, 0, 0, tzinfo=timezone.utc)
+    assert _parse_resets_at("2026-09-01T00:00:00Z") == datetime(2026, 9, 1, 0, 0, 0, tzinfo=timezone.utc)
+
+
+class _FakeLspStream:
+    def __init__(self, data: bytes) -> None:
+        self._reader = asyncio.StreamReader()
+        self._reader.feed_data(data)
+        self._reader.feed_eof()
+
+    async def readline(self) -> bytes:
+        return await self._reader.readline()
+
+    async def readexactly(self, n: int) -> bytes:
+        return await self._reader.readexactly(n)
+
+    async def read(self, n: int = -1) -> bytes:
+        return await self._reader.read(n)
+
+
+@pytest.mark.asyncio
+async def test_copilot_usage_probe_standalone_lsp_rpc(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    response_body = json.dumps({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "result": {
+            "quotaSnapshots": {
+                "premium_interactions": {
+                    "isUnlimitedEntitlement": False,
+                    "remainingPercentage": 80.0,
+                    "resetDate": "2026-09-01T00:00:00Z",
+                    "hasQuota": True,
+                }
+            }
+        },
+    }).encode("utf-8")
+    lsp_frame = f"Content-Length: {len(response_body)}\r\n\r\n".encode("utf-8") + response_body
+
+    fake_proc = _FakeSubprocess()
+    fake_proc.stdout = _FakeLspStream(lsp_frame)  # type: ignore[assignment]
+    _install_subprocess_double(monkeypatch, copilot_module, [fake_proc])
+
+    probe = CopilotUsageProbe(pool_id="copilot-test")
+    snapshot = await probe.fetch_usage()
+    assert snapshot is not None
+    assert snapshot.pool_id == "copilot-test"
+    assert snapshot.source == "copilot"
+    assert snapshot.authoritative is True
+    assert snapshot.hard_limit_reached is False
+    assert "monthly" in snapshot.windows
+    assert snapshot.windows["monthly"].used_percent == 20.0
+    assert snapshot.windows["monthly"].remaining_percent == 80.0
+    assert snapshot.windows["monthly"].resets_at == datetime(2026, 9, 1, 0, 0, 0, tzinfo=timezone.utc)
+
+    # Verify LSP request was sent to stdin
+    assert b"account.getQuota" in fake_proc.stdin.data
+    assert b"Content-Length:" in fake_proc.stdin.data
+
+
+@pytest.mark.asyncio
+async def test_copilot_usage_probe_standalone_malformed_lsp_fails_open(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fake_proc = _FakeSubprocess()
+    fake_proc.stdout = _FakeLspStream(b"not an lsp frame\r\n\r\n")  # type: ignore[assignment]
+    _install_subprocess_double(monkeypatch, copilot_module, [fake_proc])
+
+    probe = CopilotUsageProbe()
+    snapshot = await probe.fetch_usage()
+    assert snapshot is None
+
+
+# ==============================================================================
 # §27 Capacity & Exhaustion Tests
 # ==============================================================================
 
@@ -445,9 +697,152 @@ def test_generic_rate_limit_does_not_mark_plan_exhausted() -> None:
     assert _is_genuine_copilot_exhaustion("Too many requests: 60 requests per minute limit reached") is False
     assert _is_genuine_copilot_exhaustion("RPM limit exceeded") is False
     assert _is_genuine_copilot_exhaustion("Tokens per minute exceeded") is False
+    assert _is_genuine_copilot_exhaustion("429 Too Many Requests") is False
+    assert _is_genuine_copilot_exhaustion("rate limit exceeded") is False
     assert _is_genuine_copilot_exhaustion("AI credits exhausted") is True
     assert _is_genuine_copilot_exhaustion("Quota exceeded") is True
     assert _is_genuine_copilot_exhaustion("insufficient credits") is True
+    assert _is_genuine_copilot_exhaustion("premium requests exhausted") is True
+    assert _is_genuine_copilot_exhaustion("usage limit reached") is True
+
+
+def test_exhausted_copilot_pool_blocks_all_copilot_profiles() -> None:
+    cfg = _parse_config("""
+    tracker: { kind: file }
+    agent:
+      kind: copilot
+      max_concurrent_agents: 5
+    usage_pools:
+      copilot:
+        source: copilot
+        caps:
+          monthly: 80
+    agent_profiles:
+      copilot-builder:
+        kind: copilot
+      copilot-reviewer:
+        kind: copilot
+    """)
+    orch = _orch(cfg)
+    orch._usage_manager.set_snapshot(
+        "copilot",
+        ProviderUsageSnapshot(
+            pool_id="copilot",
+            source="copilot",
+            windows={
+                "monthly": UsageWindow(
+                    key="monthly",
+                    used_percent=10.0,
+                    remaining_percent=90.0,
+                )
+            },
+            hard_limit_reached=True,
+            authoritative=True,
+        ),
+    )
+    builder_issue = _issue("TASK-1", agent_profile="copilot-builder")
+    reviewer_issue = _issue("TASK-2", agent_profile="copilot-reviewer")
+
+    b_decision = orch._eligibility_decision(builder_issue, cfg, owning_retry=False)
+    r_decision = orch._eligibility_decision(reviewer_issue, cfg, owning_retry=False)
+
+    assert b_decision.disposition is _EligibilityDisposition.WAIT_NON_SLOT
+    assert b_decision.code == "waiting_provider_usage"
+    assert r_decision.disposition is _EligibilityDisposition.WAIT_NON_SLOT
+    assert r_decision.code == "waiting_provider_usage"
+
+
+def test_configured_copilot_cap_blocks_new_dispatch() -> None:
+    cfg = _parse_config("""
+    tracker: { kind: file }
+    agent:
+      kind: copilot
+    usage_pools:
+      copilot:
+        source: copilot
+        caps:
+          monthly: 80
+    """)
+    orch = _orch(cfg)
+    orch._usage_manager.set_snapshot(
+        "copilot",
+        ProviderUsageSnapshot(
+            pool_id="copilot",
+            source="copilot",
+            windows={
+                "monthly": UsageWindow(
+                    key="monthly",
+                    used_percent=85.0,
+                    remaining_percent=15.0,
+                )
+            },
+            authoritative=True,
+        ),
+    )
+    issue = _issue("TASK-1")
+    decision = orch._eligibility_decision(issue, cfg, owning_retry=False)
+    assert decision.disposition is _EligibilityDisposition.WAIT_NON_SLOT
+    assert decision.code == "waiting_provider_usage"
+    assert "monthly" in decision.reason
+
+
+@pytest.mark.asyncio
+async def test_running_copilot_worker_is_not_cancelled_when_cap_crossed() -> None:
+    cfg = _parse_config("""
+    tracker: { kind: file }
+    agent:
+      kind: copilot
+      max_concurrent_agents: 5
+    usage_pools:
+      copilot:
+        source: copilot
+        caps:
+          monthly: 80
+    """)
+    orch = _orch(cfg)
+    running_issue = _issue("TASK-1")
+    worker_task = asyncio.create_task(asyncio.sleep(10))
+
+    orch._running[running_issue.id] = RunningEntry(
+        issue=running_issue,
+        started_at=datetime.now(timezone.utc),
+        retry_attempt=None,
+        worker_task=worker_task,
+        workspace_path=Path("/tmp/ws-task-1"),
+    )
+
+    # Usage crosses configured monthly cap while worker is running
+    orch._usage_manager.set_snapshot(
+        "copilot",
+        ProviderUsageSnapshot(
+            pool_id="copilot",
+            source="copilot",
+            windows={
+                "monthly": UsageWindow(
+                    key="monthly",
+                    used_percent=85.0,
+                    remaining_percent=15.0,
+                )
+            },
+            authoritative=True,
+        ),
+    )
+
+    # Running worker must not be cancelled
+    assert not worker_task.done()
+    assert not worker_task.cancelled()
+
+    # New issue is blocked
+    new_issue = _issue("TASK-2")
+    decision = orch._eligibility_decision(new_issue, cfg, owning_retry=False)
+    assert decision.disposition is _EligibilityDisposition.WAIT_NON_SLOT
+    assert decision.code == "waiting_provider_usage"
+
+    worker_task.cancel()
+    try:
+        await worker_task
+    except asyncio.CancelledError:
+        pass
 
 
 # ==============================================================================

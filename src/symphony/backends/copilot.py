@@ -5,13 +5,18 @@ Drives `copilot --output-format=json --no-ask-user --allow-all-tools -p ""` once
 
 from __future__ import annotations
 
-from datetime import datetime
+import asyncio
+from datetime import datetime, timezone
 import json
+import os
+from pathlib import Path
 import shlex
 import uuid
 from typing import Any
 
+from .._shell import resolve_bash, terminate_process_tree
 from ..errors import TurnFailed
+from ..logging import get_logger
 from ..utils.git_sandbox import git_roots_outside
 from ..workflow import CopilotConfig
 from ..workflow.config import _default_copilot_config
@@ -25,12 +30,15 @@ from . import (
     TurnResult,
     _is_valid_session_id,
 )
-from .per_turn import PerTurnCliBackend
+from .per_turn import MAX_LINE_BYTES, PerTurnCliBackend
 from .usage import (
     ProviderUsageSnapshot,
     UsageProbe,
+    UsageWindow,
     USAGE_PROBES,
 )
+
+log = get_logger()
 
 
 class CopilotBackend(PerTurnCliBackend):
@@ -237,7 +245,7 @@ class CopilotBackend(PerTurnCliBackend):
 
 
 def _is_genuine_copilot_exhaustion(text: str) -> bool:
-    """Return True if error text signals provider quota/plan exhaustion rather than RPM."""
+    """Return True if error text signals provider quota/plan exhaustion rather than generic RPM/429."""
     lowered = text.lower()
     if (
         "requests per minute" in lowered
@@ -250,34 +258,299 @@ def _is_genuine_copilot_exhaustion(text: str) -> bool:
         "quota exceeded",
         "quota_exceeded",
         "usage limit reached",
+        "usage limit exceeded",
         "usage_limit",
         "insufficient credits",
-        "rate limit reached",
-        "rate_limit_reached",
         "out of credits",
         "ai credits exhausted",
+        "credits exhausted",
         "premium requests exhausted",
         "provider_usage_exhausted",
         "provider usage exhausted",
+        "plan limit reached",
+        "plan limit exceeded",
     )
     return any(kw in lowered for kw in exhaustion_keywords)
 
 
+def _parse_resets_at(val: Any) -> datetime | None:
+    if val is None:
+        return None
+    if isinstance(val, (int, float)):
+        try:
+            ts = float(val)
+            if ts > 1e11:  # milliseconds
+                ts /= 1000.0
+            return datetime.fromtimestamp(ts, tz=timezone.utc)
+        except (ValueError, OSError):
+            return None
+    if isinstance(val, str):
+        try:
+            dt = datetime.fromisoformat(val.replace("Z", "+00:00"))
+            return dt if dt.tzinfo is not None else dt.replace(tzinfo=timezone.utc)
+        except ValueError:
+            return None
+    return None
+
+
+def next_month_first_day_utc(now: datetime | None = None) -> datetime:
+    """Return the first day of the next month at 00:00:00 UTC."""
+    if now is None:
+        now = datetime.now(timezone.utc)
+    elif now.tzinfo is None:
+        now = now.replace(tzinfo=timezone.utc)
+    if now.month == 12:
+        return datetime(now.year + 1, 1, 1, tzinfo=timezone.utc)
+    return datetime(now.year, now.month + 1, 1, tzinfo=timezone.utc)
+
+
+def normalize_copilot_quota(
+    raw: dict[str, Any],
+    *,
+    pool_id: str = "copilot",
+) -> ProviderUsageSnapshot:
+    """Normalize Copilot JSON-RPC account.getQuota response into a ProviderUsageSnapshot."""
+    res = raw.get("result") if isinstance(raw, dict) and "result" in raw else raw
+    if not isinstance(res, dict):
+        res = {}
+
+    snapshots = (
+        res.get("quotaSnapshots")
+        or res.get("quota_snapshots")
+        or res.get("quotas")
+        or res
+    )
+    if not isinstance(snapshots, dict):
+        snapshots = {}
+
+    premium = (
+        snapshots.get("premium_interactions")
+        or snapshots.get("premiumInteractions")
+        or snapshots.get("premium_requests")
+        or snapshots.get("premiumRequests")
+        or snapshots.get("monthly")
+        or snapshots
+    )
+
+    hard_limit_reached = False
+    if isinstance(raw, dict):
+        if (
+            raw.get("hard_limit_reached") is True
+            or raw.get("hardLimitReached") is True
+            or raw.get("rateLimitReached") is True
+        ):
+            hard_limit_reached = True
+
+    used_pct: float | None = None
+    rem_pct: float | None = None
+    resets_at: datetime | None = None
+
+    if isinstance(premium, dict):
+        if premium.get("hasQuota") is False or premium.get("has_quota") is False:
+            hard_limit_reached = True
+
+        rem_raw = (
+            premium.get("remainingPercentage")
+            if "remainingPercentage" in premium
+            else premium.get("remaining_percentage")
+            if "remaining_percentage" in premium
+            else premium.get("remainingPercent")
+            if "remainingPercent" in premium
+            else premium.get("remaining_percent")
+        )
+        if rem_raw is not None:
+            try:
+                rem_pct = float(rem_raw)
+                used_pct = max(0.0, min(100.0, round(100.0 - rem_pct, 4)))
+            except (ValueError, TypeError):
+                rem_pct = None
+                used_pct = None
+        else:
+            used_raw = (
+                premium.get("usedPercent")
+                if "usedPercent" in premium
+                else premium.get("used_percent")
+            )
+            if used_raw is not None:
+                try:
+                    used_pct = float(used_raw)
+                    rem_pct = max(0.0, min(100.0, round(100.0 - used_pct, 4)))
+                except (ValueError, TypeError):
+                    used_pct = None
+                    rem_pct = None
+            elif "usedRequests" in premium and "entitlementRequests" in premium:
+                try:
+                    ent = float(premium["entitlementRequests"])
+                    used_req = float(premium["usedRequests"])
+                    if ent > 0:
+                        used_pct = max(0.0, min(100.0, round((used_req / ent) * 100.0, 4)))
+                        rem_pct = max(0.0, min(100.0, round(100.0 - used_pct, 4)))
+                except (ValueError, TypeError, ZeroDivisionError):
+                    pass
+
+        if rem_pct is not None and rem_pct <= 0.0:
+            hard_limit_reached = True
+
+        reset_val = (
+            premium.get("resetDate")
+            or premium.get("reset_date")
+            or premium.get("resetsAt")
+            or premium.get("resets_at")
+        )
+        resets_at = _parse_resets_at(reset_val)
+        if resets_at is None:
+            resets_at = next_month_first_day_utc()
+
+    windows: dict[str, UsageWindow] = {}
+    if used_pct is not None or rem_pct is not None or resets_at is not None:
+        windows["monthly"] = UsageWindow(
+            key="monthly",
+            used_percent=used_pct,
+            remaining_percent=rem_pct,
+            resets_at=resets_at,
+        )
+
+    return ProviderUsageSnapshot(
+        pool_id=pool_id,
+        source="copilot",
+        windows=windows,
+        hard_limit_reached=hard_limit_reached,
+        authoritative=True,
+        observed_at=datetime.now(timezone.utc),
+    )
+
+
 class CopilotUsageProbe(UsageProbe):
-    """Usage probe for GitHub Copilot."""
+    """Authoritative quota probe using Copilot CLI's internal JSON-RPC server mode."""
 
     def __init__(
         self,
         *,
+        command: str = "copilot --server --stdio --no-auto-update --log-level error",
+        cwd: Path | None = None,
         pool_id: str = "copilot",
         cached_snapshot: ProviderUsageSnapshot | None = None,
     ) -> None:
+        self.command = command
+        self.cwd = cwd
         self.pool_id = pool_id
         self.cached_snapshot = cached_snapshot
 
     async def fetch_usage(self) -> ProviderUsageSnapshot | None:
-        """Return cached snapshot or None (fails open)."""
-        return self.cached_snapshot
+        """Query account.getQuota via LSP-framed JSON-RPC server and return normalized snapshot."""
+        if self.cached_snapshot is not None:
+            return self.cached_snapshot
+        try:
+            return await self._probe_standalone()
+        except Exception as exc:
+            log.warning("copilot_usage_probe_failed", pool_id=self.pool_id, error=str(exc))
+            return None
+
+    async def _probe_standalone(self) -> ProviderUsageSnapshot | None:
+        cmd = self.command
+        parts = shlex.split(cmd)
+        if "--server" not in parts:
+            cmd = f"{cmd} --server --stdio --no-auto-update --log-level error"
+
+        proc = None
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                resolve_bash(),
+                "-lc",
+                cmd,
+                cwd=str(self.cwd) if self.cwd else None,
+                stdin=asyncio.subprocess.PIPE,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+                limit=MAX_LINE_BYTES,
+                start_new_session=os.name == "posix",
+            )
+            if proc.stdin is None or proc.stdout is None:
+                return None
+
+            req = {
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "account.getQuota",
+                "params": {},
+            }
+            body = json.dumps(req).encode("utf-8")
+            header = f"Content-Length: {len(body)}\r\n\r\n".encode("utf-8")
+            proc.stdin.write(header + body)
+            await proc.stdin.drain()
+
+            quota_result = None
+            for _ in range(10):
+                msg = await self._read_lsp_message(proc.stdout, timeout=5.0)
+                if msg is None:
+                    break
+                if msg.get("id") == 1 or "result" in msg:
+                    quota_result = msg
+                    break
+
+            if quota_result is not None:
+                return normalize_copilot_quota(quota_result, pool_id=self.pool_id)
+            return None
+        except Exception as exc:
+            log.warning(
+                "copilot_usage_probe_standalone_failed",
+                pool_id=self.pool_id,
+                error=str(exc),
+            )
+            return None
+        finally:
+            if proc is not None:
+                try:
+                    if proc.stdin and not proc.stdin.is_closing():
+                        proc.stdin.close()
+                except Exception:
+                    pass
+                try:
+                    await terminate_process_tree(proc)
+                except Exception:
+                    pass
+
+    @staticmethod
+    async def _read_lsp_message(
+        stdout: asyncio.StreamReader, timeout: float = 5.0
+    ) -> dict[str, Any] | None:
+        content_length: int | None = None
+        # Read header lines
+        while True:
+            line_bytes = await asyncio.wait_for(stdout.readline(), timeout=timeout)
+            if not line_bytes:
+                return None
+            line_str = line_bytes.decode("utf-8", errors="replace").strip()
+            if not line_str:
+                if content_length is not None:
+                    break
+                continue
+            lower = line_str.lower()
+            if lower.startswith("content-length:"):
+                try:
+                    content_length = int(line_str.split(":", 1)[1].strip())
+                except ValueError:
+                    return None
+
+        if content_length is None or content_length <= 0:
+            return None
+
+        if hasattr(stdout, "readexactly"):
+            body_bytes = await asyncio.wait_for(
+                stdout.readexactly(content_length), timeout=timeout
+            )
+        else:
+            body_bytes = await asyncio.wait_for(
+                stdout.read(content_length), timeout=timeout
+            )
+        body_str = body_bytes.decode("utf-8", errors="replace")
+        try:
+            parsed = json.loads(body_str)
+            if isinstance(parsed, dict):
+                return parsed
+        except Exception:
+            return None
+        return None
 
 
 USAGE_PROBES["copilot"] = CopilotUsageProbe
