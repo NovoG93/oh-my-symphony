@@ -3440,6 +3440,7 @@
     agy: 'AGY',
     claude: 'Claude Code',
     codex: 'Codex',
+    copilot: 'GitHub Copilot',
     gemini: 'Gemini CLI',
     kiro: 'Kiro',
     opencode: 'OpenCode',

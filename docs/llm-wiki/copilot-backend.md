@@ -132,3 +132,31 @@ JSON-RPC and runtime exhaustion classification
 
 Not proven (Done Signal): live Copilot CLI execution with a real token —
 the suite uses `_FakeSubprocess` doubles.
+
+## Phase 4 — UI/chat/docs/tests exposure (TASK-21)
+
+- Chat summarizer: `_summarize_copilot_frame` (chat.py:1885), dispatched from
+  `_summarize_frame` on `agent_kind == "copilot"` (chat.py:1781).
+  `assistant.message.data.content` -> authoritative `agent_message`;
+  `assistant.message.data.deltaContent` -> `agent_delta`; `tool.*`/`tool_`/`tool`
+  -> `tool_activity` (payload previewed); `session.error` -> `tool_activity`
+  error; lifecycle/setup frames -> `[]`. Every access type-guarded
+  (`isinstance(kind, str)` / `isinstance(data, dict)`).
+- Chat agent selector: `copilot: 'GitHub Copilot'` in `CHAT_AGENT_LABELS`
+  (web/static/app.js:3443); the web UI renders options from
+  `listing.supported_agent_kinds` + `CHAT_AGENT_LABELS` (app.js:3832-3834), so
+  the single `SUPPORTED_AGENT_KINDS` (constants.py:95) drives every surface
+  (webapi.py:747, tui/app.py:697,772, builder/profiles/mutate, cli/board,
+  chat.py:711/772/1036) — no per-site lists to patch.
+- Docs: hardcoded backend counts removed repo-wide — README.md/README.ko.md,
+  pyproject.toml, docs/index.html, docs/features/agent-profiles.md,
+  WORKFLOW.example.md/WORKFLOW.file.example.md,
+  skills/symphony-skill/reference/workflow-config.md, `src/symphony/__init__.py`
+  docstring — now "multiple coding-agent backends".
+- Tests: §29 Doctor/API/UI suite + 6 `test_summarize_copilot_frame*` +
+  dispatcher test + `test_chat_agent_selector_contains_copilot` +
+  `test_workflow_api_exposes_copilot_supported_kind`; fail-open probe test
+  pinned to `command="nonexistent-copilot-bin"` (never invokes the host
+  binary); `GithubCopilotUsageProbe` references gone (0 hits tests/ src/).
+  Full suite: 2636 collected = 2627 passed, 9 skipped (`.pytest_cache`
+  evidence; live run gated).

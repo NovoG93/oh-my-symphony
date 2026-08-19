@@ -12,7 +12,7 @@ Prior to named profiles, Symphony supported stage routing across backend kinds v
 
 ### 1. Backend Kinds vs. Named Profiles
 
-- **Backend Kind** (`codex`, `claude`, `gemini`, `agy`, `kiro`, `opencode`, `pi`, `prime-agent`): Defines the underlying agent CLI adapter, subprocess protocol, tool surface, and process execution lifecycle.
+- **Backend Kind** (`codex`, `claude`, `copilot`, `gemini`, `agy`, `kiro`, `opencode`, `pi`, `prime-agent`): Defines the underlying agent CLI adapter, subprocess protocol, tool surface, and process execution lifecycle.
 - **Named Profile** (`fable-planner`, `sol-reviewer`, `sonnet-builder`, etc.): An overlay configuration applied to a backend kind. A profile specifies a target backend `kind` along with specific settings (e.g., `model`, `reasoning_effort`, `command`, `turn_timeout_ms`).
 
 ### 2. Profile Inheritance & Overlay Model
@@ -86,6 +86,7 @@ To prevent configuration errors, profiles strictly validate allowed fields at co
 |---|---|---|
 | `codex` | `model`, `reasoning_effort`, `command`, `turn_timeout_ms`, `read_timeout_ms`, `stall_timeout_ms`, `usage_pool` | `model` and `reasoning_effort` are sent directly in turn parameters. |
 | `claude` | `model`, `command`, `resume_across_turns`, `turn_timeout_ms`, `read_timeout_ms`, `stall_timeout_ms`, `usage_pool` | A non-empty `model` injects `--model <name>` immediately following the `claude` command token. |
+| `copilot` | `model`, `reasoning_effort`, `command`, `resume_across_turns`, `turn_timeout_ms`, `read_timeout_ms`, `stall_timeout_ms`, `usage_pool` | `model` and `reasoning_effort` are forwarded via CLI flags `--model` and `--reasoning-effort`. |
 | `gemini` | `command`, `resume_across_turns`, `turn_timeout_ms`, `read_timeout_ms`, `stall_timeout_ms`, `usage_pool` | `resume_across_turns` is accepted but inert — the gemini backend has no resume support. |
 | `agy` | `command`, `resume_across_turns`, `turn_timeout_ms`, `read_timeout_ms`, `stall_timeout_ms`, `usage_pool` | |
 | `kiro` | `command`, `resume_across_turns`, `turn_timeout_ms`, `read_timeout_ms`, `stall_timeout_ms`, `usage_pool` | |
@@ -170,8 +171,8 @@ the UI.
 feature is covered across 13 test suites (configuration validation, generic
 pool logic, every backend probe, scheduler eligibility, running-worker
 semantics, and web API/UI contracts). A permanent parameterized regression test
-proves the global fail-open invariant across all 8 backend kinds (`codex`,
-`claude`, `agy`, `gemini`, `kiro`, `opencode`, `pi`, `prime-agent`): a
+proves the global fail-open invariant across all supported backend kinds (`codex`,
+`claude`, `agy`, `copilot`, `gemini`, `kiro`, `opencode`, `pi`, `prime-agent`): a
 usage-probe failure or exception can NEVER prevent dispatch.
 
 ### 6. Session Scoping & Isolation

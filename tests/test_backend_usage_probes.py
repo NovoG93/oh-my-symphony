@@ -13,79 +13,52 @@ Tests cover:
 
 from __future__ import annotations
 
-import asyncio
-from datetime import datetime, timedelta, timezone
 from pathlib import Path
 import textwrap
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, patch
 import pytest
 
-from symphony.backends import (
-    EVENT_PROVIDER_USAGE_EXHAUSTED,
-    BackendInit,
-    ProviderCapacityError,
-)
-from symphony.backends.agy import AgyBackend, AgyUsageProbe, normalize_agy_usage
+from symphony.backends.agy import AgyUsageProbe, normalize_agy_usage
 from symphony.backends.claude_code import (
-    ClaudeCodeBackend,
     ClaudeUsageProbe,
     normalize_claude_usage,
     _is_genuine_claude_exhaustion,
 )
 from symphony.backends.gemini import (
-    GeminiBackend,
     GeminiUsageProbe,
     normalize_gemini_usage,
     _parse_gemini_exhaustion,
 )
 from symphony.backends.kiro import (
-    KiroBackend,
     KiroUsageProbe,
     normalize_kiro_usage,
     _is_genuine_kiro_exhaustion,
 )
 from symphony.backends.opencode import (
-    OpenCodeBackend,
-    OpenCodeGoUsageProbe,
     normalize_opencode_local_usage,
     _is_genuine_opencode_exhaustion,
 )
 from symphony.backends.copilot import (
-    CopilotBackend,
     CopilotUsageProbe,
     _is_genuine_copilot_exhaustion,
 )
 from symphony.backends.pi import (
-    PiBackend,
     _is_genuine_pi_exhaustion,
 )
-from symphony.backends.prime_agent import PrimeAgentBackend
 from symphony.backends.usage import (
     ProviderUsageSnapshot,
-    UsageProbe,
     UsageWindow,
-    USAGE_PROBES,
     get_usage_probe,
 )
-from symphony.errors import TurnFailed
 from symphony.issue import Issue
-from symphony.orchestrator.core import Orchestrator, _EligibilityDisposition
+from symphony.orchestrator.core import Orchestrator
 from symphony.orchestrator.usage import ProviderUsageManager, UsageDecision
 from symphony.workflow.builder import build_service_config
 from symphony.workflow.config import (
-    AgentProfileConfig,
-    AgyConfig,
-    ClaudeConfig,
-    GeminiConfig,
-    KiroConfig,
-    OpenCodeConfig,
-    PiConfig,
-    PrimeAgentConfig,
     ServiceConfig,
     UsagePoolConfig,
 )
 from symphony.workflow.parser import parse_workflow_text
-from symphony.workflow.profiles import AgentSelection
 from symphony.workflow.state import WorkflowState
 
 
@@ -523,7 +496,7 @@ def test_prime_claude_does_not_implicitly_use_claude_code_pool() -> None:
 
 @pytest.mark.asyncio
 async def test_copilot_usage_probe_fails_open() -> None:
-    probe = CopilotUsageProbe(pool_id="copilot")
+    probe = CopilotUsageProbe(command="nonexistent-copilot-bin", pool_id="copilot")
     res = await probe.fetch_usage()
     assert res is None
 

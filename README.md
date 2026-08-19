@@ -7,9 +7,9 @@
 [![Tests](https://github.com/cskwork/oh-my-symphony/actions/workflows/tests.yml/badge.svg)](https://github.com/cskwork/oh-my-symphony/actions/workflows/tests.yml)
 [![GitHub stars](https://img.shields.io/github/stars/cskwork/oh-my-symphony?style=social)](https://github.com/cskwork/oh-my-symphony/stargazers)
 
-> One control plane. One terminal. Multiple project boards. Eight AI coding agents
-> (**Codex**, **Claude Code**, **Gemini**, **AGY/Antigravity**, **Kiro**,
-> **OpenCode**, **Pi**, **Prime Agent**) — pick per ticket, run in parallel,
+> One control plane. One terminal. Multiple project boards. Multiple AI coding agents
+> (**Codex**, **Claude Code**, **GitHub Copilot**, **Gemini**, **AGY/Antigravity**,
+> **Kiro**, **OpenCode**, **Pi**, **Prime Agent**) — pick per ticket, run in parallel,
 > review Git changes, preview builds, and watch live.
 
 ![Symphony 9999 admin UI screenshot](docs/admin-ui-screenshot.png)
@@ -48,7 +48,7 @@ terminal for.
 
 ## Why Symphony?
 
-- **No vendor lock-in.** Swap Codex ↔ Claude Code ↔ Gemini ↔ AGY ↔ Kiro ↔ OpenCode ↔ Pi ↔ Prime Agent with one
+- **No vendor lock-in.** Swap Codex ↔ Claude Code ↔ GitHub Copilot ↔ Gemini ↔ AGY ↔ Kiro ↔ OpenCode ↔ Pi ↔ Prime Agent with one
   YAML line, or mix backends per ticket. New agents (Ollama, local models,
   anything with a CLI) drop in behind a thin `AgentBackend` Protocol without
   changing the orchestrator.
@@ -66,9 +66,9 @@ terminal for.
   external trackers; you don't need either one to try Symphony.
 - **Battle-tested base, hardened for local operations.** Forked from
   [OpenAI's official Symphony reference implementation](https://github.com/openai/symphony).
-  This fork keeps the file-first orchestration model, then adds eight agent
-  backends, the TUI/web operator surfaces, SQLite run leases, restart-safe
-  issue flags, and locked Markdown ticket writes.
+  This fork keeps the file-first orchestration model, then adds multiple
+  coding-agent backends, the TUI/web operator surfaces, SQLite run leases,
+  restart-safe issue flags, and locked Markdown ticket writes.
 - **A real web app, not just a viewer.** The orchestrator port serves a
   multi-project control plane: issue CRUD, drag-and-drop columns, per-column
   stage prompts, branch policy, pause / resume, lane presets, operator chat,
@@ -87,9 +87,9 @@ terminal for.
   tickets while they sleep.
 - **Teams** parallelizing bug fixes, doc updates, or migration tickets across
   multiple coding agents simultaneously.
-- **Researchers and reviewers** comparing how Codex, Claude Code, Gemini,
-  AGY/Antigravity, Kiro, OpenCode, Pi, and Prime Agent tackle the same task side by side,
-  with identical prompts and workspaces.
+- **Researchers and reviewers** comparing how Codex, Claude Code, GitHub Copilot,
+  Gemini, AGY/Antigravity, Kiro, OpenCode, Pi, and Prime Agent tackle the same task
+  side by side, with identical prompts and workspaces.
 - **Anyone** who hit the "one chat window per agent" ceiling and wants a
   real orchestrator with a Kanban they can read at a glance.
 
@@ -126,10 +126,13 @@ Upstream polls a tracker (Linear or a local Markdown Kanban) and runs a Codex
 session inside a per-issue workspace. This fork keeps that orchestrator and
 adds:
 
-1. A pluggable **AgentBackend** layer with eight concrete adapters:
+1. A pluggable **AgentBackend** layer with multiple concrete adapters:
    - **Codex** — `codex app-server` (JSON-RPC stdio, multi-turn) — original
    - **Claude Code** — `claude -p --output-format stream-json --verbose`
      (NDJSON events, per-turn subprocess with `--resume`)
+   - **GitHub Copilot** — `copilot --output-format=json --no-ask-user --allow-all-tools`
+     (JSONL events, per-turn subprocess with `--session-id` UUID continuity,
+     custom `--model` and `--reasoning-effort`, plus writable roots via `--add-dir`)
    - **Gemini** — `gemini -p ""` (one-shot per turn, stdin prompt → stdout result)
    - **AGY / Antigravity** — `agy --print "$(cat)"` (one-shot per turn, stdin prompt
      -> stdout result; `agent.kind: antigravity` aliases to `agy`)
@@ -170,10 +173,15 @@ Set `agent.kind` in your `WORKFLOW.md`:
 
 ```yaml
 agent:
-  kind: claude          # codex | claude | gemini | agy | kiro | opencode | pi | prime-agent
+  kind: claude          # codex | claude | copilot | gemini | agy | kiro | opencode | pi | prime-agent
 
 claude:
   command: claude -p --output-format stream-json --verbose
+  resume_across_turns: true
+  turn_timeout_ms: 3600000
+
+copilot:
+  command: copilot
   resume_across_turns: true
   turn_timeout_ms: 3600000
 
@@ -188,10 +196,10 @@ prime_agent:
   turn_timeout_ms: 3600000
 ```
 
-Each backend reads its own block (`codex`, `claude`, `gemini`, `agy`, `kiro`,
-`opencode`, `pi`, `prime_agent`); only the one matching `agent.kind` is used at runtime. The
-Codex `linear_graphql`
-client tool is only advertised when `agent.kind=codex`.
+Each backend reads its own block (`codex`, `claude`, `copilot`, `gemini`, `agy`,
+`kiro`, `opencode`, `pi`, `prime_agent`); only the one matching `agent.kind` is
+used at runtime. The Codex `linear_graphql` client tool is only advertised when
+`agent.kind=codex`.
 
 `agent.kind` is the global default. A file-board ticket can opt into a
 different backend by adding ticket frontmatter:
@@ -203,9 +211,8 @@ agent:
 
 The flat alias `agent_kind: codex` is also accepted for hand-edited cards.
 All backend command and timeout settings still come from the matching global
-`codex:`, `claude:`, `gemini:`, `agy:`, `kiro:`, `opencode:`, `pi:`, or
-`prime_agent:` block
-in `WORKFLOW.md`.
+`codex:`, `claude:`, `copilot:`, `gemini:`, `agy:`, `kiro:`, `opencode:`, `pi:`,
+or `prime_agent:` block in `WORKFLOW.md`.
 When creating file-board tickets from the CLI, use
 `symphony board new TASK-2 "title" --agent-kind codex`.
 
@@ -214,13 +221,14 @@ When creating file-board tickets from the CLI, use
 Named agent profiles (`agent_profiles:` in `WORKFLOW.md`) extend stage routing beyond backend kinds so individual workflow stages or tickets can select specific models, reasoning effort levels, and execution settings. Full reference is documented in [docs/features/agent-profiles.md](docs/features/agent-profiles.md).
 
 #### Backend Kinds vs. Profiles
-- **Backend Kind** (`codex`, `claude`, `gemini`, `agy`, `kiro`, `opencode`, `pi`, `prime-agent`): Specifies the binary adapter, protocol, and subprocess lifecycle.
+- **Backend Kind** (`codex`, `claude`, `copilot`, `gemini`, `agy`, `kiro`, `opencode`, `pi`, `prime-agent`): Specifies the binary adapter, protocol, and subprocess lifecycle.
 - **Named Profile**: An overlay configuration specifying a `kind` and optional overrides (model, reasoning effort, command, timeouts). Unset fields inherit from the matching global backend block (`codex:`, `claude:`, etc.).
 
 #### Profile Inheritance & Supported Fields
 Profiles inherit all unset settings from their corresponding global backend block. Only allowlisted, non-null fields override base settings:
 - **`codex`**: `model`, `reasoning_effort`, `command`, `turn_timeout_ms`, `read_timeout_ms`, `stall_timeout_ms`, `usage_pool`
 - **`claude`**: `model` (injects `--model <name>`), `command`, `resume_across_turns`, `turn_timeout_ms`, `read_timeout_ms`, `stall_timeout_ms`, `usage_pool`
+- **`copilot`**: `model`, `reasoning_effort`, `command`, `resume_across_turns`, `turn_timeout_ms`, `read_timeout_ms`, `stall_timeout_ms`, `usage_pool`
 - **`gemini`, `agy`, `kiro`, `opencode`, `pi`, `prime_agent`**: `command`, `resume_across_turns`, timeouts, and `usage_pool`. Unsupported fields (e.g. `reasoning_effort` on `claude` or `agy`) are rejected at config validation. The gemini backend accepts `resume_across_turns` but ignores it (no resume support).
 
 Every kind also accepts `usage_pool`, the name of a shared usage pool declared under top-level `usage_pools:` in `WORKFLOW.md`. Full reference: [docs/features/agent-profiles.md](docs/features/agent-profiles.md).
@@ -234,8 +242,8 @@ Usage is modeled **per shared usage pool/provider quota** (`usage_pools:`), neve
 > **Usage pools define WHETHER the provider/account may start new work** (quotas, caps, reset times).
 
 - **Shared Quota:** Multiple profiles (e.g. `codex-builder`, `codex-reviewer`, `pi-codex`) sharing the same subscription bind to one pool and respect a single shared cap.
-- **Defaulting & Delegation:** Dedicated backends (`codex`, `claude`, `gemini`, `agy`, `kiro`) default their pool to their backend kind if omitted. Multiplexing backends (`opencode`, `pi`, `prime-agent`) can explicitly set `usage_pool` (e.g., `usage_pool: codex`) to share another provider's pool.
-- **Global Fail-Open Invariant:** Missing, stale, or non-authoritative telemetry never blocks dispatch across any of the 8 backend kinds (`codex`, `claude`, `agy`, `gemini`, `kiro`, `opencode`, `pi`, `prime-agent`).
+- **Defaulting & Delegation:** Dedicated backends (`codex`, `claude`, `copilot`, `gemini`, `agy`, `kiro`) default their pool to their backend kind if omitted. Multiplexing backends (`opencode`, `pi`, `prime-agent`) can explicitly set `usage_pool` (e.g., `usage_pool: codex`) to share another provider's pool.
+- **Global Fail-Open Invariant:** Missing, stale, or non-authoritative telemetry never blocks dispatch across any of the supported backend kinds (`codex`, `claude`, `agy`, `copilot`, `gemini`, `kiro`, `opencode`, `pi`, `prime-agent`).
 - **Worker Non-Interruption:** Configured caps only prevent *new* dispatches; running workers are never cancelled when a cap is crossed.
 - **Capacity Exhaustion:** If a provider signals hard quota exhaustion at runtime (`EVENT_PROVIDER_USAGE_EXHAUSTED`), the attempt halts without burning the retry budget, returning the ticket to `waiting_provider_usage` until capacity returns.
 - **Provider Usage UI Card:** Runtime quota telemetry (used %, remaining %, reset countdown, capacity paused state) is displayed in the built-in web UI next to Agent Policy.
@@ -370,6 +378,7 @@ Make the relevant CLI available on `$PATH`:
 |--------------|------------------------|
 | `codex`      | `codex` (with `app-server` subcommand) |
 | `claude`     | `claude` (Claude Code) |
+| `copilot`    | `copilot` (GitHub Copilot CLI — install with `npm install -g @github/copilot` or GitHub CLI extension; sign in via `gh auth login` / `copilot auth` or export `COPILOT_GITHUB_TOKEN` / `GH_TOKEN` / `GITHUB_TOKEN`) |
 | `gemini`     | `gemini` (Gemini CLI)  |
 | `agy`        | `agy` (Antigravity CLI — install from Google Antigravity; Symphony appends `--dangerously-skip-permissions`) |
 | `kiro`       | `kiro-cli` (Kiro CLI — install from `https://cli.kiro.dev/install`; run `kiro-cli login` or set `KIRO_API_KEY` for headless runs) |
@@ -1381,13 +1390,18 @@ real CLIs are intentionally not in CI — run them locally.
 
 ## Design notes
 
-### Why eight different lifecycles behind one Protocol?
+### Why multiple different lifecycles behind one Protocol?
 
 - **Codex** opens one `app-server` subprocess per issue and speaks the
   current `codex app-server` JSON-RPC protocol; multi-turn within one
   process. Pin to `codex-cli ≥ 0.39` (current upstream).
 - **Claude Code** has no persistent server; each `run_turn` spawns a fresh
   `claude -p` and uses `--resume <session-id>` from turn 2 onward.
+- **GitHub Copilot** spawns a fresh `copilot` subprocess per turn with
+  `--output-format=json --no-ask-user --allow-all-tools`, always supplying
+  `--session-id <uuid>` (reused across turns when `resume_across_turns` is true),
+  forwarding `--model` and `--reasoning-effort` when configured, and adding
+  `--add-dir` for repository roots outside the worktree.
 - **Gemini CLI** is one-shot per invocation with no native session model;
   we synthesize a `gemini-<uuid>` session id for bookkeeping.
 - **AGY / Antigravity CLI** is one-shot per invocation: prompt on stdin via
