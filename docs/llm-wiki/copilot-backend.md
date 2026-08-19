@@ -1,15 +1,16 @@
 # Copilot backend (`copilot` kind)
 
-First-class GitHub Copilot CLI backend, extracted from `pi.py` by TASK-18
-(Phase 1 of `docs/plans/copilot-cli-backend-implementation-plan.md`). See
+First-class GitHub Copilot CLI backend. Phase 1 (TASK-18) extracted it from
+`pi.py`; Phase 2 (TASK-19) implemented the working JSONL agent backend
+(`docs/plans/copilot-cli-backend-implementation-plan.md` §6–9). See
 [[usage-aware-agent-profiles]] for the probe registry context.
 
 ## Module layout
 
 - `src/symphony/backends/copilot.py` — `CopilotBackend(PerTurnCliBackend)`
-  (copilot.py:34) and `CopilotUsageProbe(UsageProbe)` (copilot.py:242);
+  (copilot.py:36) and `CopilotUsageProbe(UsageProbe)` (copilot.py:266);
   eager `USAGE_PROBES["copilot"] = CopilotUsageProbe` at module import
-  (copilot.py:259).
+  (copilot.py:283).
 - `pi.py` holds zero Copilot symbols — the probe class, its registration,
   and the now-unused `datetime`/`timezone` and usage imports were removed.
 - Usage source canonicalized: `USAGE_SOURCE_ALIASES = {"github-copilot":
@@ -17,23 +18,38 @@ First-class GitHub Copilot CLI backend, extracted from `pi.py` by TASK-18
   (usage.py:41/51) — legacy `source: github-copilot` configs and profile
   bindings keep resolving to `CopilotUsageProbe` unchanged.
 
-## CLI contract
+## CLI contract (TASK-19 Phase 2, verified)
 
-- One subprocess per turn: `copilot --output-format=json --no-ask-user
-  --allow-all-tools [-p <prompt>]`; `--model`/`--reasoning-effort` added
-  when configured; prompt and flags joined with `shlex.join`.
-- Permission flags (`--allow-all-tools`, `--no-ask-user`) and `--add-dir`
-  writable-git-roots are hardcoded in `_command_for_turn` — never in
-  `CopilotConfig.command`, which carries only the executable.
-- JSONL events consumed: `assistant.message` (content + `outputTokens`),
-  `result` (`sessionId` + `exitCode`), `session.error`; non-JSON or blank
-  lines ignored.
-- Sessions: `--session-id` threaded across turns; `resume_session` rejects
-  empty/whitespace/NUL ids; a recovered session id different from the
-  expected one raises `TurnFailed`.
+- One subprocess per turn; `_command_for_turn(*, prompt, is_continuation)`
+  returns a single `shlex.join(parts)` string (keyword-only). Base flags
+  `copilot --output-format=json --no-ask-user --allow-all-tools`, then
+  `--model`/`--reasoning-effort` when configured, always `--session-id`,
+  `--add-dir <root>` per `git_roots_outside(cwd, workspace_root)`, and
+  `-p <prompt>` last. `_stdin_payload` returns `None` (prompt travels via
+  `-p`, never stdin).
+- Permission flags are hardcoded in `_command_for_turn` — never in
+  `CopilotConfig.command` (which carries only the executable). Writable
+  roots become repeated `--add-dir`; `--allow-all`/`--yolo` never used.
+- JSONL parsing (`_decode_events` + `_complete_turn`): line-by-line
+  `json.loads`, non-JSON lines and non-dict objects skipped, unknown event
+  types ignored — the parser never raises. `assistant.message.data.content`
+  is the authoritative final response; `assistant.message.data.outputTokens`
+  is accumulated into `_latest_usage` (no synthesis from
+  `premiumRequests`/`totalNanoAiu`); `result.sessionId`/`exitCode` is the
+  authoritative completion signal; `session.error` fails the turn.
+- Sessions: `--session-id` is ALWAYS sent — fresh `str(uuid.uuid4())` on
+  first turn, reused across turns when `resume_across_turns` is true, fresh
+  per turn when false (superset of plan §6, which gated it on resume).
+  `resume_session(session_id)` validates via the shared
+  `_is_valid_session_id` house helper (str, non-empty, printable, ≤512 —
+  "safe to forward", not strict UUID syntax; same pattern as
+  claude_code/opencode/pi). A `result.sessionId` that mismatches the
+  expected recovered id, or a recovered session the CLI never confirms,
+  raises `TurnFailed`.
 - Exhaustion: `_is_genuine_copilot_exhaustion` — rpm/tpm transients are
-  NOT exhaustion (normal retry); quota/usage-limit/credit keywords are
-  (capacity wait).
+  NOT exhaustion (plain `TurnFailed`, retryable); quota/usage-limit/credit
+  keywords emit `EVENT_PROVIDER_USAGE_EXHAUSTED` and raise
+  `ProviderCapacityError` (capacity wait that bypasses the retry budget).
 
 ## Config surface
 
@@ -53,15 +69,20 @@ First-class GitHub Copilot CLI backend, extracted from `pi.py` by TASK-18
   `~/.config/github-copilot/hosts.json` and `~/.config/gh/hosts.yml`; warns
   when agent.kind=copilot and no auth found. Doctor check count 23 -> 24.
 
-## Test coverage (TASK-18)
+## Test coverage (TASK-18 + TASK-19)
 
-- `tests/test_copilot_backend.py` (12 tests): factory returns
-  `CopilotBackend`, pi.py zero-symbol invariant, command flags, session
-  lifecycle/resume/validation, JSONL completion + session.error,
-  config parsing + profile resolution + unknown-field rejection.
+- `tests/test_copilot_backend.py` (32 tests): factory returns
+  `CopilotBackend`, pi.py zero-symbol invariant, command flags (§23),
+  session lifecycle/resume/validation (§24), JSONL completion +
+  session.error + outputTokens telemetry + non-zero `result.exitCode` +
+  recovered-session mismatch/unconfirmed + malformed/unknown-line
+  tolerance (§25), genuine-vs-rate-limit exhaustion (§27), config parsing
+  + profile resolution + unknown-field rejection, and
+  `test_copilot_run_turn_end_to_end` (full `run_turn` via
+  `_FakeSubprocess`).
 - Contract suite: `TestCopilotBackendContract` in
-  `tests/test_backend_contract.py`; `copilot` added to
-  `_SPAWN_MODULES` git-grant parametrization.
+  `tests/test_backend_contract.py:396`; `copilot` in `_SPAWN_MODULES`
+  git-grant parametrization.
 - Registry test asserts both `copilot` and legacy `github-copilot` resolve
   to `CopilotUsageProbe`.
 

@@ -16,10 +16,12 @@ from ..utils.git_sandbox import git_roots_outside
 from ..workflow import CopilotConfig
 from ..workflow.config import _default_copilot_config
 from . import (
+    EVENT_PROVIDER_USAGE_EXHAUSTED,
     EVENT_SESSION_STARTED,
     EVENT_TURN_COMPLETED,
     EVENT_TURN_FAILED,
     BackendInit,
+    ProviderCapacityError,
     TurnResult,
     _is_valid_session_id,
 )
@@ -61,12 +63,20 @@ class CopilotBackend(PerTurnCliBackend):
 
     def is_progress_event(self, event: dict[str, Any]) -> bool:
         event_type = event.get("type")
-        return event_type in {
-            "assistant.message",
-            "assistant.message_delta",
-            "assistant.turn_start",
-            "assistant.turn_end",
-        }
+        if not isinstance(event_type, str):
+            return False
+        return (
+            event_type
+            in {
+                "assistant.message",
+                "assistant.message_delta",
+                "assistant.message_start",
+                "assistant.turn_start",
+                "assistant.turn_end",
+                "model.call_start",
+            }
+            or event_type.startswith("tool.")
+        )
 
     @property
     def session_id(self) -> str | None:
@@ -105,8 +115,11 @@ class CopilotBackend(PerTurnCliBackend):
             parts += ["--session-id", self._session_id]
         else:
             sid = self._copilot_session_id or self._session_id
-            if sid:
-                parts += ["--session-id", sid]
+            if not sid:
+                sid = str(uuid.uuid4())
+                self._session_id = sid
+                self._copilot_session_id = sid
+            parts += ["--session-id", sid]
 
         self._resume_on_next_turn = False
 
@@ -167,10 +180,21 @@ class CopilotBackend(PerTurnCliBackend):
                 )
 
         if self._expected_resume_session_id is not None:
+            if not self._resume_session_confirmed:
+                reason = "copilot did not confirm the requested recovered session"
+                await self._emit(EVENT_TURN_FAILED, {"reason": reason})
+                raise TurnFailed(reason)
             self._expected_resume_session_id = None
             self._resume_session_confirmed = False
 
         if turn_error is not None:
+            if _is_genuine_copilot_exhaustion(turn_error):
+                pool_id = self._usage_pool or self._agent_name
+                await self._emit(
+                    EVENT_PROVIDER_USAGE_EXHAUSTED,
+                    {"pool_id": pool_id, "reason": turn_error},
+                )
+                raise ProviderCapacityError(pool_id=pool_id, message=turn_error)
             await self._emit(
                 EVENT_TURN_FAILED,
                 {
