@@ -1,15 +1,15 @@
 ---
 name: symphony-skill
-description: Single Symphony operator router for Kanban tickets, service/TUI runs, workflow prompts, delegation, production-ready app delivery planning, OneShot runs, monorepo bootstrap, and worker failure triage.
+description: Single Symphony operator router for Kanban tickets, service/TUI runs, WORKFLOW.md and prompt config, lane customization, delegation, production-ready app delivery planning, OneShot runs, repo and monorepo bootstrap, and worker failure triage.
 ---
 
 # Using Symphony
 
 Symphony is a polling orchestrator that reads Kanban tickets and runs a
 coding-agent CLI (Codex, Claude Code, Gemini, AGY/Antigravity, Kiro, OpenCode,
-or Pi) against each ticket in an isolated workspace. This file is the single
-operator router: classify the request, load only the matching reference, then
-act.
+Pi, or Prime Agent) against each ticket in an isolated workspace. This file is
+the single operator router: classify the request, load only the matching
+reference, then act.
 
 Start by reading the target `WORKFLOW.md` and one or two real `kanban/*.md`
 files. Symphony behavior is workflow-specific, and forks commonly customize
@@ -29,7 +29,9 @@ State the route in one line, then open only the reference that route needs.
 | OneShot plan quality, ticket slicing, QA/PDF, vault, or lane gates | ONESHOT-DEEP | `oneshot/reference/decomposition.md`, then the needed OneShot reference |
 | bootstrap Symphony into another repo | BOOTSTRAP | `reference/bootstrapping.md` |
 | bootstrap isolated worktrees for a monorepo/polyrepo | MONOREPO | `monorepo/references/workflow-template.md` and `monorepo/scripts/setup-monorepo.sh` |
-| worker exit, auth stall, blank TUI, stuck service, platform issue | TRIAGE | `reference/troubleshooting.md` or `reference/platform-compat.md` |
+| `worker_exit`, `hook_failed`, auth stall, blank TUI, stuck service | TRIAGE | `reference/troubleshooting.md` |
+| set up or debug Windows, macOS, Linux behavior | PLATFORM | `reference/platform-compat.md` |
+| `.gitignore` for Symphony-generated docs and logs | GITIGNORE | `reference/gitignore-recommendations.md` |
 
 Branch-specific subfolders under `oneshot/` and `monorepo/` intentionally do
 not have their own `SKILL.md`. They provide templates, scripts, and deep
@@ -49,14 +51,15 @@ references for this router.
 - Ticket IDs are an ordering contract. For multi-ticket work, create
   `TASK-001`, then `TASK-002`, then `TASK-003` in task-list order; Symphony
   sorts by stable numeric suffix before mutable fields like priority.
-- The default Verify prompt expects the `symphony/<ID>` branch to be merged or
-  proven ready against the configured target branch before the ticket moves to
-  `Document`.
+- The default Verify prompt proves the `symphony/<ID>` branch would merge
+  cleanly into the configured target branch. The orchestrator performs the one
+  merge itself when the ticket reaches `Done`
+  (`agent.auto_merge_on_done`, default true).
 
 ## Board Ticket Quality Gate
 
-Before registering more than one ticket, write the task list first and reject
-bad slices:
+Before registering more than one ticket, write the task list first, then check
+every entry against every rule below before you create any ticket file:
 
 - Work-type route: classify the request before ticket creation. Use the bugfix
   shape for defects, feature/enhancement shape for bounded behavior changes,
@@ -79,22 +82,6 @@ bad slices:
   and merged, the release-verification ticket runs full functionality QA on the
   merged target. Any defect becomes a new Kanban bug ticket with repro evidence
   and `blocked_by`; the release ticket loops until integration passes.
-- Machine app-release gate: for production application delivery, write
-  repository-root `release-contract.yaml`, label the verifier `app-release`,
-  and label the named delivery ticket `app-release-finalizer`. The verifier
-  writes strict `docs/<verifier>/qa/release-evidence.json` for the exact current
-  target and runs `symphony release check`; historical GREEN text is never
-  approval. Labels opt in, while the host-owned SQLite generation and exact
-  verifier/finalizer run bindings remain authority across label loss. A
-  continuation in the same live run may proceed after approval; a restarted
-  approved verifier is reset to pending Verify and must produce fresh evidence.
-  Repairable file-board failures create grouped repairs plus a fresh verifier,
-  and startup cleanup uses a peer-fenced lease. The target is the local branch
-  tip—synchronize it explicitly because Symphony does not fetch. Remote tracker
-  lifecycle mutation is unsupported: a labeled
-  transition stops before repair creation and an operator must rewind an
-  already-advanced remote card. Unselected remote workflows are not warned or
-  changed by doctor.
 - One contract owner: a ticket owns one behavior/API/data contract, not a
   grab bag.
 - Small enough for one worker: rough limit <=5 files and <=500 net lines for a
@@ -104,6 +91,27 @@ bad slices:
 
 Ticket descriptions are worker prompts. Do not register vague tickets like
 `implement frontend`; register a bounded slice with observable checks.
+
+### Machine app-release gate
+
+Applies only to production application delivery:
+
+- Write repository-root `release-contract.yaml`, label the verifier
+  `app-release`, and label the named delivery ticket `app-release-finalizer`.
+- The verifier writes strict `docs/<verifier>/qa/release-evidence.json` for the
+  exact current target and runs `symphony release check`; historical GREEN text
+  is never approval.
+- The target is the local branch tip—synchronize it explicitly because Symphony
+  does not fetch.
+- Labels opt in, while the host-owned SQLite generation and exact
+  verifier/finalizer run bindings remain authority across label loss.
+- A continuation in the same live run may proceed after approval; a restarted
+  approved verifier is reset to pending Verify and must produce fresh evidence.
+- Repairable file-board failures create grouped repairs plus a fresh verifier,
+  and startup cleanup uses a peer-fenced lease.
+- Remote tracker lifecycle mutation is unsupported: a labeled transition stops
+  before repair creation and an operator must rewind an already-advanced remote
+  card. Doctor neither warns about nor changes unselected remote workflows.
 
 ## Non-Negotiable Preflight
 
@@ -197,22 +205,6 @@ question, not a default:
 If they accept, add the block from `reference/workflow-config.md`
 (`Notifications (Slack)` section). If they decline, omit it. The feature
 is off whenever the block is absent — no extra cleanup needed.
-
-## What To Read Next
-
-| Need | Read |
-| --- | --- |
-| Bootstrap Symphony into a project | `reference/bootstrapping.md` |
-| Add/list/show/move tickets, run TUI/API/service | `reference/operations.md` |
-| Edit `WORKFLOW.md`, agent kind, hooks, tracker, workspace | `reference/workflow-config.md` |
-| Rename lanes, add per-state prompts, customize pipelines | `reference/customization.md` |
-| Delegate independent sub-tasks to Symphony workers | `reference/delegation.md` |
-| Run a single prompt through the OneShot pipeline | `oneshot/reference/operations.md` |
-| Improve OneShot issue decomposition | `oneshot/reference/decomposition.md` |
-| Bootstrap a monorepo worktree workflow | `monorepo/references/workflow-template.md` |
-| Diagnose `worker_exit`, `hook_failed`, blank TUI, auth stalls | `reference/troubleshooting.md` |
-| Set up/debug Windows, macOS, Linux behavior | `reference/platform-compat.md` |
-| Configure `.gitignore` for Symphony-generated docs/logs | `reference/gitignore-recommendations.md` |
 
 ## Headless Triage Signals
 
