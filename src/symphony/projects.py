@@ -622,6 +622,45 @@ def _validate_target_conflicts(repo: Path, workflow_path: Path) -> None:
         # Existing symlinks and real skill directories are never overwritten.
 
 
+def _link_skill_dir(link: Path) -> bool:
+    """Expose ``skills/symphony-skill`` at ``.claude/skills/symphony-skill``.
+
+    Returns whether a link (or copy) was created. POSIX keeps the relative
+    symlink the source checkout ships (it may dangle until the bundle
+    exists). On Windows an unprivileged ``os.symlink`` fails with
+    ``WinError 1314`` (creating symlinks needs SeCreateSymbolicLinkPrivilege
+    or Developer Mode), so the same directory is linked with a junction
+    instead — junctions need no elevation but require an absolute, existing
+    target: a dangling junction is opaque to Git (unlike a dangling POSIX
+    symlink, which commits as a mode-120000 entry), so when the bundle is
+    absent no link is created at all. A verbatim tree copy is the last
+    resort when even junction creation is blocked.
+    """
+    relative = Path("../../skills/symphony-skill")
+    if os.name != "nt":
+        link.symlink_to(relative, target_is_directory=True)
+        return True
+    absolute = (link.parent / relative).resolve()
+    if not absolute.is_dir():
+        return False
+    import _winapi
+
+    try:
+        _winapi.CreateJunction(str(absolute), str(link))
+        return True
+    except OSError:
+        pass
+    made = subprocess.run(
+        ["cmd", "/c", "mklink", "/J", str(link), str(absolute)],
+        capture_output=True,
+        check=False,
+    )
+    if made.returncode == 0:
+        return True
+    shutil.copytree(absolute, link)
+    return True
+
+
 def _bootstrap_missing(
     source: Path,
     repo: Path,
@@ -685,8 +724,8 @@ def _bootstrap_missing(
     _ensure_directory(skills_dir, created_dirs)
     link = skills_dir / "symphony-skill"
     if link not in tracked_paths and not link.exists() and not link.is_symlink():
-        link.symlink_to(Path("../../skills/symphony-skill"), target_is_directory=True)
-        created_files.append(link)
+        if _link_skill_dir(link):
+            created_files.append(link)
 
 
 def _workflow_resources(
