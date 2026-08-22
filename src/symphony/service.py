@@ -24,6 +24,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Literal
 
+from ._shell import _taskkill_tree
 from .errors import SymphonyError
 from .orchestrator.run_registry import RunRegistry, registry_path_for_workflow
 from .runtime_safety import ensure_workflow_repo_is_safe
@@ -450,22 +451,6 @@ def _wait_until(
     return predicate()
 
 
-def _terminate_process_windows(pid: int, *, force: bool = False) -> bool:
-    cmd = ["taskkill", "/PID", str(pid), "/T"]
-    if force:
-        cmd.append("/F")
-    try:
-        completed = subprocess.run(
-            cmd,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            check=False,
-        )
-    except OSError:
-        return False
-    return completed.returncode == 0
-
-
 def terminate_process(pid: int | None, *, force: bool = False) -> bool:
     """Best-effort process-tree termination for a service-managed PID."""
     try:
@@ -475,10 +460,7 @@ def terminate_process(pid: int | None, *, force: bool = False) -> bool:
     if parsed <= 0 or not is_process_running(parsed):
         return False
     if _IS_WIN32:
-        try:
-            return _terminate_process_windows(parsed, force=force)
-        except OSError:
-            return False
+        return _taskkill_tree(parsed, force=force)
     sig = signal.SIGKILL if force else signal.SIGTERM
     try:
         os.killpg(parsed, sig)
