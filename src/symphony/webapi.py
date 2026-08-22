@@ -14,6 +14,9 @@ this blocks DNS-rebinding reads as well as writes. Mutating methods must
 additionally send a JSON content type, which forces a CORS preflight on
 cross-origin HTML/form attempts. Binding to a non-loopback interface is an
 explicit operator opt-in to network exposure and disables the Host check.
+Setting `SYMPHONY_API_TOKEN` adds a credential layer on top: every `/api/`
+request (reads included) must then present it as a bearer token, so an
+exposed bind does not hand full board control to any network peer.
 Fronting the board with a reverse proxy or tunnel is the other opt-in: the
 public name goes in `SYMPHONY_TRUSTED_ORIGINS` so project mutations and the
 chat WebSocket accept it.
@@ -23,6 +26,7 @@ from __future__ import annotations
 
 import asyncio
 import heapq
+import hmac
 import ipaddress
 import json
 import os
@@ -121,6 +125,10 @@ _LOOPBACK_BINDS = {"", "localhost", "127.0.0.1", "::1", "[::1]"}
 # Entries may be full origins (`https://host:port`), bare hostnames (any
 # scheme/port), or `*` to trust every origin.
 TRUSTED_ORIGINS_ENV = "SYMPHONY_TRUSTED_ORIGINS"
+# Optional credential gate for the whole `/api/` surface. Unset or empty
+# keeps the frictionless loopback default; set to a non-empty secret, it
+# requires `Authorization: Bearer <exact token>` on every API request.
+API_TOKEN_ENV = "SYMPHONY_API_TOKEN"
 _CI_EDITABLE_KEYS = {"enabled", "interval_ms", "max_turns", "agent_kind", "modes"}
 BIND_HOST_KEY: web.AppKey[str] = web.AppKey("symphony.bind_host", str)
 CHAT_MANAGER_KEY: web.AppKey[ChatManager] = web.AppKey("symphony.chat", ChatManager)
@@ -225,9 +233,37 @@ def _origin_is_trusted(request: web.Request, origin: str) -> bool:
     return host == _bare_host(_request_host(request))
 
 
+def _configured_api_token() -> str | None:
+    """Bearer token from `SYMPHONY_API_TOKEN`, or None when unset/blank."""
+    token = os.environ.get(API_TOKEN_ENV, "").strip()
+    return token or None
+
+
+def _request_has_valid_bearer(request: web.Request, token: str) -> bool:
+    """`Authorization: Bearer <token>` exact match, in constant time.
+
+    Both sides are compared as UTF-8 bytes: `hmac.compare_digest` rejects
+    non-ASCII `str` inputs, and a client may send any octet sequence.
+    """
+    parts = request.headers.get("Authorization", "").split()
+    if len(parts) != 2 or parts[0].lower() != "bearer":
+        return False
+    return hmac.compare_digest(parts[1].encode("utf-8"), token.encode("utf-8"))
+
+
 @web.middleware
 async def _api_guard(request: web.Request, handler):
     if request.path.startswith("/api/"):
+        # Optional credential layer: reads leak the board too, so when a
+        # token is configured every API request must present it. Order
+        # matters — authenticate before validating anything else.
+        api_token = _configured_api_token()
+        if api_token is not None and not _request_has_valid_bearer(
+            request, api_token
+        ):
+            return _json_error(
+                401, "unauthorized", "missing or invalid bearer token"
+            )
         bind = str(request.app.get(BIND_HOST_KEY) or "127.0.0.1").lower()
         host = _request_host(request)
         if (
@@ -289,7 +325,10 @@ def _wrap(handler: Callable[[web.Request], Awaitable[web.StreamResponse]]):
                 method=request.method,
                 error=str(exc),
             )
-            return _json_error(500, "internal_error", str(exc))
+            # Never echo internal exception text (paths, SQL, library
+            # internals) to HTTP clients — the log line above keeps the
+            # detail for the operator.
+            return _json_error(500, "internal_error", "internal server error")
 
     return wrapped
 
