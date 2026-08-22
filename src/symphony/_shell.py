@@ -280,6 +280,31 @@ def process_group_exists(pid: int) -> bool | None:
     return any(not status.upper().startswith("Z") for status in statuses)
 
 
+def _taskkill_tree(pid: int, *, force: bool = True) -> bool:
+    """Windows process-tree termination via ``taskkill /PID <pid> /T [/F]``.
+
+    ``/T`` walks the whole descendant tree, so a ``bash -lc <agent cli>``
+    wrapper and the real agent CLI grandchildren go down together — the
+    Windows equivalent of SIGKILLing a POSIX process group. Output is
+    discarded and every failure mode (missing taskkill, dead pid, access
+    denied) collapses to ``False`` so callers can fall back to their own
+    ladders.
+    """
+    cmd = ["taskkill", "/PID", str(pid), "/T"]
+    if force:
+        cmd.append("/F")
+    try:
+        completed = subprocess.run(
+            cmd,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            check=False,
+        )
+    except OSError:
+        return False
+    return completed.returncode == 0
+
+
 def kill_process_group(pid: int) -> bool:
     """Sync best-effort SIGKILL of a process group by pid.
 
@@ -289,7 +314,8 @@ def kill_process_group(pid: int) -> bool:
     better than a live agent CLI burning tokens in a reused worktree.
     """
     if sys.platform == "win32":
-        return False
+        # No process groups — taskkill /T is the closest tree-wide analog.
+        return _taskkill_tree(pid)
     return _signal_process_group(pid, signal.SIGKILL)
 
 
@@ -303,12 +329,38 @@ async def terminate_process_tree(
     children, which keep running and burning tokens. Both waits are bounded
     so a caller can never hang on an unreapable child; returns the exit
     code, or ``None`` if the process could not be reaped in time.
+
+    On Windows there are no process groups or signals; the tree is taken
+    down with ``taskkill /T /F`` first, with the single-process
+    terminate/kill ladder kept as a fallback for taskkill-less hosts.
     """
     if proc.returncode is not None:
         return proc.returncode
     pid = proc.pid
-    if sys.platform == "win32" or pid is None:
-        # No POSIX process groups — single-process ladder.
+    if sys.platform == "win32":
+        if pid is not None:
+            try:
+                await asyncio.to_thread(_taskkill_tree, pid)
+            except OSError:
+                pass
+        try:
+            proc.terminate()
+        except OSError:
+            # ProcessLookupError (already gone) or PermissionError
+            # (already terminated but not yet reaped) — both are fine;
+            # safe_proc_wait below is the source of truth.
+            pass
+        rc = await safe_proc_wait(proc, timeout=term_timeout)
+        if rc is None and proc.returncode is None:
+            try:
+                proc.kill()
+            except OSError:
+                pass
+            rc = await safe_proc_wait(proc, timeout=kill_timeout)
+        return proc.returncode if proc.returncode is not None else rc
+
+    if pid is None:
+        # No pid to signal — single-process ladder.
         try:
             proc.terminate()
         except ProcessLookupError:

@@ -15,6 +15,7 @@ import shutil
 import signal
 import shlex
 import subprocess
+import sys
 import uuid
 from dataclasses import replace
 from pathlib import Path
@@ -414,6 +415,7 @@ async def test_codex_stop_reaps_with_safe_proc_wait(
     backend._process = proc  # type: ignore[assignment]
     calls: list[int] = []
     signals: list[tuple[int, int]] = []
+    taskkills: list[int] = []
 
     async def fake_safe_proc_wait(process, *, timeout=None):
         calls.append(process.pid)
@@ -426,13 +428,24 @@ async def test_codex_stop_reaps_with_safe_proc_wait(
         "_signal_process_group",
         lambda pid, sig: signals.append((pid, sig)) or True,
     )
+    if sys.platform == "win32":
+        # Stop the unit test from taskkill-ing an unrelated real pid.
+        monkeypatch.setattr(
+            shell_module,
+            "_taskkill_tree",
+            lambda pid, *, force=True: taskkills.append(pid) or True,
+        )
 
     await backend.stop()
 
-    assert proc.terminated is False
-    assert proc.killed is False
-    assert signals == [(proc.pid, signal.SIGTERM)]
     assert calls == [proc.pid]
+    if sys.platform == "win32":
+        assert taskkills == [proc.pid]
+        assert signals == []
+    else:
+        assert proc.terminated is False
+        assert proc.killed is False
+        assert signals == [(proc.pid, signal.SIGTERM)]
 
 
 @pytest.mark.asyncio
@@ -450,6 +463,7 @@ async def test_gemini_stop_reaps_with_safe_proc_wait(
     backend._active_proc = proc  # type: ignore[assignment]
     calls: list[int] = []
     signals: list[tuple[int, int]] = []
+    taskkills: list[int] = []
 
     async def fake_safe_proc_wait(process, *, timeout=None):
         calls.append(process.pid)
@@ -462,13 +476,24 @@ async def test_gemini_stop_reaps_with_safe_proc_wait(
         "_signal_process_group",
         lambda pid, sig: signals.append((pid, sig)) or True,
     )
+    if sys.platform == "win32":
+        # Stop the unit test from taskkill-ing an unrelated real pid.
+        monkeypatch.setattr(
+            shell_module,
+            "_taskkill_tree",
+            lambda pid, *, force=True: taskkills.append(pid) or True,
+        )
 
     await backend.stop()
 
-    assert proc.terminated is False
-    assert proc.killed is False
-    assert signals == [(proc.pid, signal.SIGTERM)]
     assert calls == [proc.pid]
+    if sys.platform == "win32":
+        assert taskkills == [proc.pid]
+        assert signals == []
+    else:
+        assert proc.terminated is False
+        assert proc.killed is False
+        assert signals == [(proc.pid, signal.SIGTERM)]
 
 
 @pytest.mark.asyncio
@@ -486,6 +511,7 @@ async def test_pi_stop_reaps_with_safe_proc_wait(
     backend._active_proc = proc  # type: ignore[assignment]
     calls: list[int] = []
     signals: list[tuple[int, int]] = []
+    taskkills: list[int] = []
 
     async def fake_safe_proc_wait(process, *, timeout=None):
         calls.append(process.pid)
@@ -498,13 +524,24 @@ async def test_pi_stop_reaps_with_safe_proc_wait(
         "_signal_process_group",
         lambda pid, sig: signals.append((pid, sig)) or True,
     )
+    if sys.platform == "win32":
+        # Stop the unit test from taskkill-ing an unrelated real pid.
+        monkeypatch.setattr(
+            shell_module,
+            "_taskkill_tree",
+            lambda pid, *, force=True: taskkills.append(pid) or True,
+        )
 
     await backend.stop()
 
-    assert proc.terminated is False
-    assert proc.killed is False
-    assert signals == [(proc.pid, signal.SIGTERM)]
     assert calls == [proc.pid]
+    if sys.platform == "win32":
+        assert taskkills == [proc.pid]
+        assert signals == []
+    else:
+        assert proc.terminated is False
+        assert proc.killed is False
+        assert signals == [(proc.pid, signal.SIGTERM)]
 
 
 @pytest.mark.parametrize(
@@ -680,6 +717,11 @@ async def test_claude_run_turn_cancellation_terminates_active_subprocess(
     monkeypatch.setattr(
         claude_module, "terminate_process_tree", fake_terminate_process_tree
     )
+    # claude's _reap helper routes through per_turn._reap_process, which
+    # resolves terminate_process_tree in per_turn's namespace.
+    monkeypatch.setattr(
+        per_turn_module, "terminate_process_tree", fake_terminate_process_tree
+    )
     backend = ClaudeCodeBackend(
         BackendInit(cfg=cfg, cwd=cwd, workspace_root=tmp_path, on_event=_noop_event)
     )
@@ -743,6 +785,10 @@ async def test_terminal_success_does_not_complete_when_inline_reap_is_unconfirme
         events.append(event)
 
     monkeypatch.setattr(module, "terminate_process_tree", _unconfirmed)
+    # claude's inline reap routes through per_turn._reap_process, which
+    # resolves terminate_process_tree in per_turn's namespace (pi overrides
+    # run_turn and uses its own binding; the extra patch is a no-op there).
+    monkeypatch.setattr(per_turn_module, "terminate_process_tree", _unconfirmed)
     backend = backend_cls(
         BackendInit(cfg=cfg, cwd=cwd, workspace_root=tmp_path, on_event=_capture)
     )
@@ -1112,6 +1158,11 @@ async def test_pi_run_turn_cancellation_terminates_active_subprocess(
         fake_create_subprocess_exec,
     )
     monkeypatch.setattr(pi_module, "terminate_process_tree", fake_terminate_process_tree)
+    # pi's _reap helper routes through per_turn._reap_process, which
+    # resolves terminate_process_tree in per_turn's namespace.
+    monkeypatch.setattr(
+        per_turn_module, "terminate_process_tree", fake_terminate_process_tree
+    )
     backend = PiBackend(
         BackendInit(cfg=cfg, cwd=cwd, workspace_root=tmp_path, on_event=_noop_event)
     )
