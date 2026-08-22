@@ -125,7 +125,8 @@ def test_health_reports_starting_before_first_tick() -> None:
 
     assert health["status"] == "starting"
     assert health["tick"]["last_completed_at"] is None
-    assert health["workflow_path"] == "/tmp/no.md"
+    # Rendered with native separators (`\tmp\no.md` on Windows).
+    assert health["workflow_path"] == str(Path("/tmp/no.md"))
 
 
 def test_snapshot_includes_health_summary() -> None:
@@ -256,7 +257,7 @@ async def test_health_endpoint_returns_status() -> None:
         assert resp.status == 200
         data = await resp.json()
         assert data["status"] == "starting"
-        assert data["workflow_path"] == "/tmp/no.md"
+        assert data["workflow_path"] == str(Path("/tmp/no.md"))
         assert data["version"]
         assert data["tick"]["alive"] is False
         assert data["counts"] == {"running": 0, "retrying": 0}

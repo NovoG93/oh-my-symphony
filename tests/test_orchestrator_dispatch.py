@@ -9792,10 +9792,12 @@ async def test_reload_refreshes_reuse_policy_and_hook_env_alongside_workflow_dir
     # observes all three at once via a single `after_create` hook.
     workspace_root = tmp_path / "ws"
     snapshot = tmp_path / "snapshot"
+    # The hook body runs through bash, where a raw Windows path's
+    # backslashes would be eaten as escapes — hand bash a POSIX-styled path.
     after_create = (
         f'echo "$SYMPHONY_WORKFLOW_DIR|'
         f'$SYMPHONY_FEATURE_BASE_BRANCH|'
-        f'$SYMPHONY_MERGE_TARGET_BRANCH" >> {snapshot}'
+        f'$SYMPHONY_MERGE_TARGET_BRANCH" >> {snapshot.as_posix()}'
     )
     old_cfg = _make_config(
         workflow_path=tmp_path / "old" / "WORKFLOW.md",
