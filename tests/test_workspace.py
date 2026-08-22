@@ -13,6 +13,7 @@ import pytest
 from symphony import workspace as workspace_module
 from symphony._shell import resolve_bash
 from symphony.errors import InvalidWorkspaceCwd, SymphonyError
+from tests._win_skips import requires_symlink_privilege
 from symphony.workflow import HooksConfig
 from symphony.workflow import build_service_config, load_workflow
 from symphony.workspace import (
@@ -474,6 +475,7 @@ def test_setup_worktree_script_supports_linked_workflow_dir(tmp_path, lock_backe
     ("merge_target", "should_refresh"),
     [("main", True), ("v1.0", False)],
 )
+@requires_symlink_privilege
 def test_setup_worktree_script_refreshes_only_exact_local_target(
     tmp_path, merge_target, should_refresh
 ):
@@ -535,6 +537,7 @@ def test_setup_worktree_script_refreshes_only_exact_local_target(
 
 
 @pytest.mark.skipif(not _HAS_GIT, reason="git CLI required")
+@requires_symlink_privilege
 def test_setup_worktree_script_preserves_unmerged_branch_tip(tmp_path):
     """A branch with work not in main must remain unchanged on reopen."""
     host = tmp_path / "host"
@@ -601,6 +604,7 @@ def _preserve_worktree_manager(tmp_path: Path, host: Path, monkeypatch) -> Works
 
 @pytest.mark.skipif(not _HAS_GIT, reason="git CLI required")
 @pytest.mark.asyncio
+@requires_symlink_privilege
 async def test_create_or_reuse_preserve_refreshes_clean_merged_worktree(
     tmp_path, monkeypatch
 ):
@@ -645,6 +649,7 @@ async def test_create_or_reuse_preserve_refreshes_clean_merged_worktree(
 
 @pytest.mark.skipif(not _HAS_GIT, reason="git CLI required")
 @pytest.mark.asyncio
+@requires_symlink_privilege
 async def test_create_or_reuse_preserve_keeps_dirty_merged_worktree(
     tmp_path, monkeypatch
 ):
@@ -677,6 +682,7 @@ async def test_create_or_reuse_preserve_keeps_dirty_merged_worktree(
 
 @pytest.mark.skipif(not _HAS_GIT, reason="git CLI required")
 @pytest.mark.asyncio
+@requires_symlink_privilege
 async def test_create_or_reuse_preserve_keeps_clean_divergent_worktree(
     tmp_path, monkeypatch
 ):
@@ -710,6 +716,7 @@ async def test_create_or_reuse_preserve_keeps_clean_divergent_worktree(
 
 @pytest.mark.skipif(not _HAS_GIT, reason="git CLI required")
 @pytest.mark.asyncio
+@requires_symlink_privilege
 async def test_create_or_reuse_preserve_same_tip_is_unchanged(tmp_path, monkeypatch):
     """A branch already at target is not rewritten or reconfigured."""
     host = tmp_path / "host"
@@ -743,6 +750,7 @@ async def test_create_or_reuse_preserve_same_tip_is_unchanged(tmp_path, monkeypa
 
 @pytest.mark.skipif(not _HAS_GIT, reason="git CLI required")
 @pytest.mark.asyncio
+@requires_symlink_privilege
 async def test_create_or_reuse_preserve_missing_target_is_unchanged(
     tmp_path, monkeypatch
 ):
@@ -782,6 +790,7 @@ async def test_create_or_reuse_preserve_missing_target_is_unchanged(
 
 @pytest.mark.skipif(not _HAS_GIT, reason="git CLI required")
 @pytest.mark.asyncio
+@requires_symlink_privilege
 async def test_create_or_reuse_preserve_rejects_non_local_target_expressions(
     tmp_path, monkeypatch
 ):
@@ -862,6 +871,7 @@ async def test_create_or_reuse_preserve_does_not_touch_unexpected_repo(
 
 @pytest.mark.skipif(not _HAS_GIT, reason="git CLI required")
 @pytest.mark.asyncio
+@requires_symlink_privilege
 async def test_create_or_reuse_preserve_does_not_rerun_destructive_hook(
     tmp_path, monkeypatch
 ):
@@ -895,6 +905,7 @@ async def test_create_or_reuse_preserve_does_not_rerun_destructive_hook(
 
 @pytest.mark.skipif(not _HAS_GIT, reason="git CLI required")
 @pytest.mark.asyncio
+@requires_symlink_privilege
 async def test_create_or_reuse_preserve_target_race_is_unchanged(
     tmp_path, monkeypatch
 ):
@@ -947,6 +958,7 @@ async def test_create_or_reuse_preserve_target_race_is_unchanged(
 
 @pytest.mark.skipif(not _HAS_GIT, reason="git CLI required")
 @pytest.mark.asyncio
+@requires_symlink_privilege
 async def test_create_or_reuse_preserve_merge_failure_blocks_without_mutation(
     tmp_path, monkeypatch
 ):
@@ -995,6 +1007,7 @@ async def test_create_or_reuse_preserve_merge_failure_blocks_without_mutation(
 
 @pytest.mark.skipif(not _HAS_GIT, reason="git CLI required")
 @pytest.mark.asyncio
+@requires_symlink_privilege
 async def test_create_or_reuse_preserve_accepts_target_drift_after_fast_forward(
     tmp_path, monkeypatch
 ):
@@ -1043,6 +1056,7 @@ async def test_create_or_reuse_preserve_accepts_target_drift_after_fast_forward(
 
 @pytest.mark.skipif(not _HAS_GIT, reason="git CLI required")
 @pytest.mark.asyncio
+@requires_symlink_privilege
 async def test_file_workflow_after_create_hides_host_symlink_roots_from_git(tmp_path):
     """The file-tracker example links host kanban into the workspace.
 
@@ -2069,6 +2083,7 @@ async def test_board_link_mismatch_fails_dispatch_before_the_first_turn(tmp_path
 
 
 @pytest.mark.asyncio
+@requires_symlink_privilege
 async def test_board_symlink_to_host_board_passes(tmp_path):
     workflow = tmp_path / "repo"
     board = workflow / "board"
