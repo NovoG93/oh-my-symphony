@@ -24,6 +24,7 @@ import json
 import os
 import re
 import subprocess
+import threading
 import time
 import traceback
 from dataclasses import dataclass, replace
@@ -75,7 +76,7 @@ from ..prompt import build_continuation_prompt, build_first_turn_prompt
 from ..runtime_safety import ensure_workflow_repo_is_safe
 from ..skills import render_skill_block
 from ..stats import StatsStore, stats_store_for
-from ..trackers import build_tracker_client
+from ..trackers import TrackerClient, build_tracker_client
 from ..utils.wiki_sweep import sweep as _wiki_sweep_run
 from ..workflow import (
     DEFAULT_TERMINAL_STATES,
@@ -803,6 +804,16 @@ class Orchestrator:
         self._tick_task: asyncio.Task[None] | None = None
         self._tick_event = asyncio.Event()
         self._stopping = False
+        # One cached tracker client per orchestrator lifetime for the
+        # `_tracker_call_*` bridge helpers below — the Jira/Linear adapters
+        # wrap an httpx connection pool per client, so building one per
+        # call threw away connection reuse on every poll tick. Built
+        # lazily on first use, closed in `stop()`. Guarded by a lock
+        # because the bridges run on `asyncio.to_thread` worker threads.
+        self._tracker_client: TrackerClient | None = None
+        self._tracker_client_cfg: ServiceConfig | None = None
+        self._tracker_client_closed = False
+        self._tracker_client_lock = threading.Lock()
         self._refresh_pending = False
         self._observers: list[Callable[[], Awaitable[None]]] = []
         # Operator-driven pause is split into two pieces:
@@ -2673,13 +2684,11 @@ class Orchestrator:
         # authors can then reference it from `claude.command` etc., e.g.
         # `--add-dir "$SYMPHONY_WORKFLOW_DIR/kanban"` so Claude Code accepts
         # writes through the host-board junction installed by after_create.
-        import os as _os
-
-        _os.environ["SYMPHONY_WORKFLOW_DIR"] = str(cfg.workflow_path.parent)
+        os.environ["SYMPHONY_WORKFLOW_DIR"] = str(cfg.workflow_path.parent)
         # The board-tool protocol in the stage prompts and the chat preamble
         # requires the `symphony` CLI; a venv install is not necessarily on
         # the worker's PATH. Prompts reference `${SYMPHONY_CLI:-symphony}`.
-        _os.environ["SYMPHONY_CLI"] = resolve_symphony_cli()
+        os.environ["SYMPHONY_CLI"] = resolve_symphony_cli()
         self._workspace_manager = WorkspaceManager(
             cfg.workspace_root,
             cfg.hooks,
@@ -2782,6 +2791,16 @@ class Orchestrator:
         if self._run_registry is not None:
             self._run_registry.close()
             self._run_registry = None
+        # Close the per-lifetime tracker client AFTER the drains above so
+        # in-flight `asyncio.to_thread` bridges finish first. A bridge that
+        # still slips through afterwards rebuilds rather than touching the
+        # closed pool (see `_shared_tracker_client`).
+        with self._tracker_client_lock:
+            if self._tracker_client is not None:
+                self._tracker_client.close()
+                self._tracker_client = None
+                self._tracker_client_cfg = None
+                self._tracker_client_closed = True
 
     # ------------------------------------------------------------------
     # observers (§13)
@@ -3384,16 +3403,18 @@ class Orchestrator:
         except OSError as exc:
             log.warning("done_count_persist_failed", path=str(path), error=str(exc))
 
-    def _maybe_run_wiki_sweep(self, cfg: ServiceConfig, *, identifier: str) -> None:
+    async def _maybe_run_wiki_sweep(self, cfg: ServiceConfig, *, identifier: str) -> None:
         """C5 — bump the Done counter and run wiki-sweep every Nth time.
 
-        Called from the two Done-transition sites (`_on_worker_exit` and
-        the reconcile-driven path). `sweep_every_n: 0` disables the
-        auto-sweep entirely. The sweep is intentionally synchronous and
-        best-effort: it runs in-process for simplicity (the typical wiki
-        is small), failures only log a warning, and never block the
-        Done transition. The counter is persisted after every Done so
-        sweep cadence survives orchestrator restarts.
+        Called (awaited) from the two Done-transition sites
+        (`_on_worker_exit` and the reconcile-driven path). `sweep_every_n:
+        0` disables the auto-sweep entirely. The sweep is best-effort and
+        runs in-process for simplicity (the typical wiki is small), but
+        off the event loop via `asyncio.to_thread` so a slow filesystem
+        scan cannot stall ticks or delay shutdown. Failures only log a
+        warning and never block the Done transition. The counter is
+        persisted after every Done so sweep cadence survives
+        orchestrator restarts.
         """
         every = cfg.wiki.sweep_every_n
         if every <= 0:
@@ -3406,7 +3427,7 @@ class Orchestrator:
         if root is None:
             return
         try:
-            report = _wiki_sweep_run(root, dry_run=False)
+            report = await asyncio.to_thread(_wiki_sweep_run, root, dry_run=False)
         except Exception as exc:
             log.warning(
                 "wiki_sweep_failed",
@@ -9510,7 +9531,9 @@ class Orchestrator:
                     # configured by `wiki.sweep_every_n` is up. Failures are
                     # absorbed inside the helper so we never block the
                     # Done transition on a wiki housekeeping nudge.
-                    self._maybe_run_wiki_sweep(cfg, identifier=entry.issue.identifier)
+                    await self._maybe_run_wiki_sweep(
+                        cfg, identifier=entry.issue.identifier
+                    )
                 # Don't schedule a continuation — a Done ticket has nothing
                 # to continue. Skip straight to the worker_exit emit below.
             elif not is_terminal and not entry.hit_max_turns:
@@ -10463,7 +10486,7 @@ class Orchestrator:
                                 debug_target=self._issue_debug.get(issue.id),
                             )
                             # C5 — see _on_worker_exit for the rationale.
-                            self._maybe_run_wiki_sweep(
+                            await self._maybe_run_wiki_sweep(
                                 cfg, identifier=entry.issue.identifier
                             )
                     else:
@@ -10552,74 +10575,73 @@ class Orchestrator:
         if debug is not None:
             debug.tracker_error = None
 
-    @staticmethod
-    def _tracker_call_candidates(cfg: ServiceConfig) -> list[Issue]:
-        client = build_tracker_client(cfg)
-        try:
-            return client.fetch_candidate_issues()
-        finally:
-            client.close()
+    def _shared_tracker_client(self, cfg: ServiceConfig) -> TrackerClient:
+        """Lazily built, per-lifetime tracker client for the poll bridges.
 
-    @staticmethod
-    def _tracker_call_states_by_ids(cfg: ServiceConfig, ids: list[str]) -> list[Issue]:
-        client = build_tracker_client(cfg)
-        try:
-            return client.fetch_issue_states_by_ids(ids)
-        finally:
-            client.close()
+        The `_tracker_call_*` helpers below used to open (and close) a
+        fresh client per call — for Jira/Linear that meant a new httpx
+        connection pool on every poll tick. One client is built on first
+        use and reused across calls; `stop()` closes it. It is rebuilt
+        when the live config object changes (hot reload swaps the
+        `ServiceConfig` instance) or, defensively, when a bridge call
+        races past shutdown after the close, rather than touching a
+        closed pool.
+        """
+        with self._tracker_client_lock:
+            client = self._tracker_client
+            if (
+                client is None
+                or self._tracker_client_closed
+                or cfg is not self._tracker_client_cfg
+            ):
+                client = build_tracker_client(cfg)
+                self._tracker_client = client
+                self._tracker_client_cfg = cfg
+                self._tracker_client_closed = False
+            return client
 
-    @staticmethod
-    def _tracker_call_full_by_id(cfg: ServiceConfig, issue_id: str) -> Issue | None:
+    def _tracker_call_candidates(self, cfg: ServiceConfig) -> list[Issue]:
+        return self._shared_tracker_client(cfg).fetch_candidate_issues()
+
+    def _tracker_call_states_by_ids(self, cfg: ServiceConfig, ids: list[str]) -> list[Issue]:
+        return self._shared_tracker_client(cfg).fetch_issue_states_by_ids(ids)
+
+    def _tracker_call_full_by_id(self, cfg: ServiceConfig, issue_id: str) -> Issue | None:
         """Single-issue fetch with full body — used by contract validation."""
-        client = build_tracker_client(cfg)
-        try:
-            return client.fetch_issue_full_by_id(issue_id)
-        finally:
-            client.close()
+        return self._shared_tracker_client(cfg).fetch_issue_full_by_id(issue_id)
 
-    @staticmethod
-    def _tracker_call_terminal_issues(cfg: ServiceConfig) -> list[Issue]:
-        client = build_tracker_client(cfg)
-        try:
-            return client.fetch_issues_by_states(cfg.tracker.terminal_states)
-        finally:
-            client.close()
+    def _tracker_call_terminal_issues(self, cfg: ServiceConfig) -> list[Issue]:
+        return self._shared_tracker_client(cfg).fetch_issues_by_states(
+            cfg.tracker.terminal_states
+        )
 
-    @staticmethod
     def _tracker_call_record_agent_kind(
-        cfg: ServiceConfig, identifier: str, agent_kind: str
+        self, cfg: ServiceConfig, identifier: str, agent_kind: str
     ) -> None:
         """Best-effort: persist the resolved backend onto the ticket.
 
         Adapters that don't implement ``record_agent_kind`` (e.g. Linear,
         where the field has no remote analogue) are silently skipped.
         """
-        client = build_tracker_client(cfg)
-        try:
-            record = getattr(client, "record_agent_kind", None)
-            if record is None:
-                return
-            record(identifier, agent_kind)
-        finally:
-            client.close()
+        record = getattr(self._shared_tracker_client(cfg), "record_agent_kind", None)
+        if record is None:
+            return
+        record(identifier, agent_kind)
 
-    @staticmethod
     def _tracker_call_record_last_agent_kind(
-        cfg: ServiceConfig, identifier: str, agent_kind: str
+        self, cfg: ServiceConfig, identifier: str, agent_kind: str
     ) -> None:
         """Best-effort: persist the audit-only `last_agent_kind` stamp.
 
         Used instead of the pin on `stage_kinds`-routed boards, where writing
         the pin would freeze the first lane's backend for the whole ticket.
         """
-        client = build_tracker_client(cfg)
-        try:
-            record = getattr(client, "record_last_agent_kind", None)
-            if record is None:
-                return
-            record(identifier, agent_kind)
-        finally:
-            client.close()
+        record = getattr(
+            self._shared_tracker_client(cfg), "record_last_agent_kind", None
+        )
+        if record is None:
+            return
+        record(identifier, agent_kind)
 
     # ------------------------------------------------------------------
     # startup cleanup (§8.6)
