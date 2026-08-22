@@ -105,6 +105,7 @@ from .constants import (
     SUPPORTED_WORKSPACE_REUSE_POLICIES,
 )
 from .parser import WorkflowDefinition
+from .presets import board_uses_default_contracts
 
 
 def _build_prompt_config(raw: Any, base_dir: Path) -> PromptConfig:
@@ -968,8 +969,6 @@ def _log_stage_contracts_decision(agent: AgentConfig, tracker: TrackerConfig) ->
     customized board, but it must never be invisible — this is the product's
     evidence floor.
     """
-    from ..orchestrator.contracts import board_uses_default_contracts
-
     mode = (agent.stage_contracts or "auto").strip().lower()
     if agent.stage_contracts_enabled(tracker.active_states):
         return
