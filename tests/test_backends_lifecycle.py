@@ -161,6 +161,66 @@ def test_kill_process_group_uses_platform_native_tree_kill(
         assert killed == [(4242, signal.SIGKILL)]
 
 
+def test_kill_process_group_skips_kill_on_identity_mismatch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A recorded pid whose fingerprint changed must never be signalled.
+
+    The OS reuses pids; killing on a stale recorded pid would take down an
+    unrelated process (on win32, a whole unrelated tree via taskkill /T).
+    The identity gate runs before any platform dispatch, so this test is
+    platform-independent.
+    """
+    signalled: list[int] = []
+    if sys.platform == "win32":
+        monkeypatch.setattr(
+            shell_module,
+            "_taskkill_tree",
+            lambda pid, *, force=True: signalled.append(pid) or True,
+        )
+    else:
+        monkeypatch.setattr(
+            shell_module,
+            "_signal_process_group",
+            lambda pid, sig: signalled.append(pid) or True,
+        )
+    monkeypatch.setattr(
+        shell_module, "process_identity", lambda pid: "live-fingerprint"
+    )
+
+    killed = shell_module.kill_process_group(4242, identity="recorded-fingerprint")
+
+    assert killed is False
+    assert signalled == []
+
+
+def test_kill_process_group_proceeds_on_identity_match(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A matching fingerprint proves the recorded incarnation still lives."""
+    signalled: list[int] = []
+    if sys.platform == "win32":
+        monkeypatch.setattr(
+            shell_module,
+            "_taskkill_tree",
+            lambda pid, *, force=True: signalled.append(pid) or True,
+        )
+    else:
+        monkeypatch.setattr(
+            shell_module,
+            "_signal_process_group",
+            lambda pid, sig: signalled.append(pid) or True,
+        )
+    monkeypatch.setattr(
+        shell_module, "process_identity", lambda pid: "matching-fingerprint"
+    )
+
+    killed = shell_module.kill_process_group(4242, identity="matching-fingerprint")
+
+    assert killed is True
+    assert signalled == [4242]
+
+
 async def _wait_for_file(path: Path, *, timeout_s: float) -> None:
     deadline = time.monotonic() + timeout_s
     while time.monotonic() < deadline:
