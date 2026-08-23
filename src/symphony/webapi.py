@@ -16,7 +16,13 @@ cross-origin HTML/form attempts. Binding to a non-loopback interface is an
 explicit operator opt-in to network exposure and disables the Host check.
 Setting `SYMPHONY_API_TOKEN` adds a credential layer on top: every `/api/`
 request (reads included) must then present it as a bearer token, so an
-exposed bind does not hand full board control to any network peer.
+exposed bind does not hand full board control to any network peer. The
+shipped SPA supports this mode by prompting for the token and sending
+`Authorization: Bearer` on every fetch; the chat WebSocket is the single
+exception where the token may also arrive as a `?token=` query parameter,
+because browsers cannot set headers on a WebSocket handshake (the query
+exception is scoped to that one route — query strings leak into access
+logs, so no other endpoint accepts it).
 Fronting the board with a reverse proxy or tunnel is the other opt-in: the
 public name goes in `SYMPHONY_TRUSTED_ORIGINS` so project mutations and the
 chat WebSocket accept it.
@@ -129,6 +135,12 @@ TRUSTED_ORIGINS_ENV = "SYMPHONY_TRUSTED_ORIGINS"
 # keeps the frictionless loopback default; set to a non-empty secret, it
 # requires `Authorization: Bearer <exact token>` on every API request.
 API_TOKEN_ENV = "SYMPHONY_API_TOKEN"
+# The one route where the token may also arrive as `?token=`: browsers
+# cannot set an Authorization header on a WebSocket handshake, so the SPA
+# appends the query parameter there. Scoped to the exact path — anywhere
+# else a query-supplied token must stay a 401 because query strings are
+# the part of a URL most likely to end up in access logs.
+_CHAT_WS_PATH = "/api/v1/chat/ws"
 _CI_EDITABLE_KEYS = {"enabled", "interval_ms", "max_turns", "agent_kind", "modes"}
 BIND_HOST_KEY: web.AppKey[str] = web.AppKey("symphony.bind_host", str)
 CHAT_MANAGER_KEY: web.AppKey[ChatManager] = web.AppKey("symphony.chat", ChatManager)
@@ -251,6 +263,18 @@ def _request_has_valid_bearer(request: web.Request, token: str) -> bool:
     return hmac.compare_digest(parts[1].encode("utf-8"), token.encode("utf-8"))
 
 
+def _request_has_valid_ws_query_token(request: web.Request, token: str) -> bool:
+    """`?token=<token>` exact match for the chat WS handshake, constant time.
+
+    Same comparison discipline as the bearer helper. Only ever consulted
+    for `_CHAT_WS_PATH` by the API guard.
+    """
+    supplied = request.query.get("token", "")
+    return hmac.compare_digest(
+        supplied.encode("utf-8"), token.encode("utf-8")
+    )
+
+
 @web.middleware
 async def _api_guard(request: web.Request, handler):
     if request.path.startswith("/api/"):
@@ -261,9 +285,14 @@ async def _api_guard(request: web.Request, handler):
         if api_token is not None and not _request_has_valid_bearer(
             request, api_token
         ):
-            return _json_error(
-                401, "unauthorized", "missing or invalid bearer token"
-            )
+            # Browsers cannot set headers on a WebSocket handshake; the
+            # chat socket alone may also present the token as ?token=.
+            if request.path != _CHAT_WS_PATH or not (
+                _request_has_valid_ws_query_token(request, api_token)
+            ):
+                return _json_error(
+                    401, "unauthorized", "missing or invalid bearer token"
+                )
         bind = str(request.app.get(BIND_HOST_KEY) or "127.0.0.1").lower()
         host = _request_host(request)
         if (

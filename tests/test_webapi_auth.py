@@ -1,16 +1,21 @@
 """Auth + loopback gates for the web API (`symphony.webapi`, `symphony.server`).
 
 Covers the optional `SYMPHONY_API_TOKEN` bearer gate on the whole `/api/`
-surface, the loopback-only `/api/v1/_debug/tasks` route, and the guarantee
-that unhandled server errors never echo internal exception text to clients.
+surface — including the chat-WebSocket `?token=` handshake exception that
+keeps the shipped SPA usable in token mode — the loopback-only
+`/api/v1/_debug/tasks` route, and the guarantee that unhandled server
+errors never echo internal exception text to clients.
 """
 
 from __future__ import annotations
 
+import asyncio
 import json
+from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, AsyncIterator, cast
 
+import aiohttp
 import pytest
 import pytest_asyncio
 from aiohttp import web
@@ -19,15 +24,39 @@ from aiohttp.test_utils import TestClient, TestServer
 import symphony.server as server_mod
 from symphony.orchestrator import Orchestrator
 from symphony.server import build_app
+from symphony.workflow import WorkflowState
 from symphony.webapi import (
     API_TOKEN_ENV,
     _request_has_valid_bearer,
+    _request_has_valid_ws_query_token,
     _request_is_loopback,
 )
+
+# The chat WS handshake builds its `hello` frame from the workflow config,
+# so even auth-only tests need a loadable WORKFLOW.md behind the stub.
+AUTH_WORKFLOW_TEXT = """---
+tracker:
+  kind: file
+  board_root: ./kanban
+  active_states: [Todo, Doing]
+  terminal_states: [Done, Archive]
+
+agent:
+  kind: claude
+---
+body
+"""
 
 
 class _StubOrchestrator:
     """Just enough orchestrator surface for the routes these tests hit."""
+
+    def __init__(self, workflow_state: WorkflowState) -> None:
+        self._workflow_state = workflow_state
+
+    @property
+    def workflow_state(self) -> WorkflowState:
+        return self._workflow_state
 
     def snapshot(self) -> dict[str, Any]:
         return {"lanes": [], "running": [], "version": "test"}
@@ -40,10 +69,15 @@ class _StubOrchestrator:
 
 
 @pytest_asyncio.fixture
-async def client() -> AsyncIterator[TestClient]:
+async def client(tmp_path: Path) -> AsyncIterator[TestClient]:
     # build_app types its parameter as Orchestrator; at runtime it only
     # uses the method protocol we mirror in `_StubOrchestrator`.
-    app = build_app(cast(Orchestrator, _StubOrchestrator()))
+    (tmp_path / "WORKFLOW.md").write_text(AUTH_WORKFLOW_TEXT, encoding="utf-8")
+    (tmp_path / "kanban").mkdir()
+    state = WorkflowState(tmp_path / "WORKFLOW.md")
+    cfg, err = state.reload()
+    assert err is None and cfg is not None
+    app = build_app(cast(Orchestrator, _StubOrchestrator(state)))
     server = TestServer(app)
     cli = TestClient(server)
     await cli.start_server()
@@ -136,6 +170,77 @@ def test_request_has_valid_bearer_requires_exact_match() -> None:
     assert not _request_has_valid_bearer(req(""), token)
     # Non-ASCII input must compare (and fail) instead of raising.
     assert not _request_has_valid_bearer(req("Bearer passwörd"), token)
+
+
+# ---------------------------------------------------------------------------
+# SYMPHONY_API_TOKEN × chat WebSocket handshake
+# ---------------------------------------------------------------------------
+
+
+async def test_token_ws_handshake_accepts_query_token(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Browsers cannot set headers on a WS upgrade, so the chat socket is
+    the one route where `?token=` authenticates. A valid token completes
+    the handshake and streams the `hello` frame."""
+    monkeypatch.setenv(API_TOKEN_ENV, "sekrit-token")
+    ws = await client.ws_connect("/api/v1/chat/ws?token=sekrit-token")
+    try:
+        hello = await asyncio.wait_for(ws.receive_json(), timeout=5)
+        assert hello["type"] == "hello"
+    finally:
+        await ws.close()
+
+
+async def test_token_ws_handshake_accepts_bearer_header_too(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv(API_TOKEN_ENV, "sekrit-token")
+    ws = await client.ws_connect(
+        "/api/v1/chat/ws", headers={"Authorization": "Bearer sekrit-token"}
+    )
+    try:
+        hello = await asyncio.wait_for(ws.receive_json(), timeout=5)
+        assert hello["type"] == "hello"
+    finally:
+        await ws.close()
+
+
+async def test_token_ws_handshake_rejects_missing_or_wrong_query_token(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv(API_TOKEN_ENV, "sekrit-token")
+    with pytest.raises(aiohttp.WSServerHandshakeError) as missing:
+        await client.ws_connect("/api/v1/chat/ws")
+    assert missing.value.status == 401
+
+    with pytest.raises(aiohttp.WSServerHandshakeError) as wrong:
+        await client.ws_connect("/api/v1/chat/ws?token=not-the-token")
+    assert wrong.value.status == 401
+
+
+async def test_token_query_param_rejected_on_plain_routes(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The query-param exception is WS-only: a `?token=` on a normal GET
+    must stay a 401 (query strings are the URL part most likely to end
+    up in access logs)."""
+    monkeypatch.setenv(API_TOKEN_ENV, "sekrit-token")
+    resp = await client.get("/api/v1/state", params={"token": "sekrit-token"})
+    assert resp.status == 401
+    assert (await resp.json())["error"]["code"] == "unauthorized"
+
+
+def test_request_has_valid_ws_query_token_requires_exact_match() -> None:
+    def req(query: dict[str, str]) -> Any:
+        return SimpleNamespace(query=query)
+
+    assert _request_has_valid_ws_query_token(req({"token": "tok-123"}), "tok-123")
+    assert not _request_has_valid_ws_query_token(req({"token": "tok-12"}), "tok-123")
+    assert not _request_has_valid_ws_query_token(req({}), "tok-123")
+    assert not _request_has_valid_ws_query_token(req({"token": ""}), "tok-123")
+    # Non-ASCII input must compare (and fail) instead of raising.
+    assert not _request_has_valid_ws_query_token(req({"token": "passwörd"}), "tok-123")
 
 
 # ---------------------------------------------------------------------------

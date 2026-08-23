@@ -19,6 +19,116 @@
 
   const API_BASE = '/api/v1';
 
+  // ------------------------------------------------------------------
+  // API token (SYMPHONY_API_TOKEN mode)
+  //
+  // When the server sets a token, every /api/ fetch needs
+  // `Authorization: Bearer <token>` and the chat WebSocket needs it as
+  // `?token=` (browsers cannot set WS headers). The value lives in
+  // sessionStorage — tab-scoped and cleared when the tab closes — and a
+  // dismissed banner stays hidden until a *new* 401 carries information
+  // (a rejected stored token), so the 5s poll cannot resurrect it.
+  // ------------------------------------------------------------------
+
+  const API_TOKEN_STORAGE_KEY = 'symphony.apiToken';
+
+  function storedApiToken() {
+    try {
+      return sessionStorage.getItem(API_TOKEN_STORAGE_KEY) || null;
+    } catch (_err) {
+      return null;
+    }
+  }
+
+  function storeApiToken(token) {
+    try {
+      if (token) sessionStorage.setItem(API_TOKEN_STORAGE_KEY, token);
+      else sessionStorage.removeItem(API_TOKEN_STORAGE_KEY);
+    } catch (_err) {
+      /* storage disabled — token lasts only for this render cycle */
+    }
+  }
+
+  function withAuthHeaders(headers) {
+    const token = storedApiToken();
+    return token ? { ...headers, Authorization: `Bearer ${token}` } : headers;
+  }
+
+  let authBannerState = { open: false, dismissed: false };
+
+  function handleApiUnauthorized() {
+    const hadToken = Boolean(storedApiToken());
+    if (hadToken) {
+      // The stored token was rejected — drop it so the next save is the
+      // only way forward, and un-dismiss: rejection is new information.
+      storeApiToken(null);
+      authBannerState.dismissed = false;
+    }
+    if (!authBannerState.dismissed) showApiTokenBanner(hadToken);
+  }
+
+  function showApiTokenBanner(rejected) {
+    let root = document.getElementById('api-token-banner-root');
+    if (!root) {
+      root = el('div', { id: 'api-token-banner-root' });
+      const main = document.querySelector('.main');
+      if (!main) return;
+      main.insertBefore(root, main.firstChild);
+    }
+    clearNode(root);
+    const input = el('input', {
+      class: 'input api-token-input',
+      type: 'password',
+      autocomplete: 'off',
+      'aria-label': t('auth.tokenPlaceholder'),
+      placeholder: t('auth.tokenPlaceholder'),
+    });
+    const save = el('button', { class: 'btn btn-primary btn-sm', type: 'button' }, t('auth.tokenSave'));
+    save.addEventListener('click', async () => {
+      const token = input.value.trim();
+      if (!token) {
+        input.focus();
+        return;
+      }
+      storeApiToken(token);
+      authBannerState.dismissed = false;
+      hideApiTokenBanner();
+      showToast(t('auth.tokenSaved'), 'success');
+      // Re-run the board fetch immediately; a chat page also needs its
+      // WebSocket rebuilt so the handshake carries the new ?token=.
+      await refreshBoard();
+      if (state.route === 'chat') renderRoute();
+    });
+    input.addEventListener('keydown', (e) => {
+      if (e.key === 'Enter') save.click();
+    });
+    const dismiss = el('button', {
+      class: 'btn-icon',
+      type: 'button',
+      'aria-label': t('common.close'),
+      onClick: () => {
+        authBannerState.dismissed = true;
+        hideApiTokenBanner();
+      },
+    }, '✕');
+    root.appendChild(el('div', { class: 'banner banner-info api-token-banner', role: 'alert' }, [
+      el('div', { class: 'api-token-banner-copy' }, [
+        el('strong', null, t('auth.tokenBannerTitle')),
+        el('span', null, rejected ? t('auth.tokenRejected') : t('auth.tokenBannerHint')),
+      ]),
+      el('div', { class: 'api-token-banner-form' }, [input, save]),
+      dismiss,
+    ]));
+    authBannerState.open = true;
+    input.focus();
+  }
+
+  function hideApiTokenBanner() {
+    authBannerState.open = false;
+    const root = document.getElementById('api-token-banner-root');
+    if (root) root.remove();
+  }
+
   class ApiError extends Error {
     constructor(message, code, status, data = null) {
       super(message);
@@ -29,7 +139,7 @@
   }
 
   async function apiRequest(path, { method = 'GET', body, headers = {} } = {}) {
-    const init = { method, headers: { ...headers } };
+    const init = { method, headers: withAuthHeaders(headers) };
     if (body !== undefined) {
       init.body = body;
       init.headers['Content-Type'] = 'application/json';
@@ -45,6 +155,7 @@
       }
     }
     if (!res.ok) {
+      if (res.status === 401) handleApiUnauthorized();
       const err = data && data.error;
       throw new ApiError(
         (err && err.message) || t('api.requestFailed', { status: res.status }),
@@ -83,8 +194,11 @@
     },
     getRunDetail: (runId) => apiRequest(`/runs/${encodeURIComponent(runId)}`),
     downloadRunDiagnostic: async (runId) => {
-      const res = await fetch(`${API_BASE}/runs/${encodeURIComponent(runId)}/diagnostic`);
+      const res = await fetch(`${API_BASE}/runs/${encodeURIComponent(runId)}/diagnostic`, {
+        headers: withAuthHeaders({}),
+      });
       if (!res.ok) {
+        if (res.status === 401) handleApiUnauthorized();
         let message = t('api.requestFailed', { status: res.status });
         try {
           const payload = await res.json();
@@ -1117,6 +1231,14 @@
     main.classList.toggle('board-stale', stale);
   }
 
+  // Pointer events on a stale board are already blocked via CSS; keyboard
+  // activation must check the same flag or Enter/Space would act on data
+  // the operator has been told is frozen.
+  function boardIsStale() {
+    const main = document.querySelector('.main');
+    return Boolean(main && main.classList.contains('board-stale'));
+  }
+
   // ------------------------------------------------------------------
   // Skeletons
   // ------------------------------------------------------------------
@@ -1698,6 +1820,7 @@
       'aria-label': t('board.openTicketAria', { id: issue.identifier, title: issue.title }),
       onClick: () => openDrawer(issue.identifier),
       onKeydown: (e) => {
+        if (boardIsStale()) return;
         if (e.target !== card || (e.key !== 'Enter' && e.key !== ' ')) return;
         e.preventDefault();
         openDrawer(issue.identifier);
@@ -3133,6 +3256,7 @@
       attrs.role = 'button';
       attrs.onClick = () => diffPanel.showCommit(commit);
       attrs.onKeydown = (e) => {
+        if (boardIsStale()) return;
         if (e.key !== 'Enter' && e.key !== ' ') return;
         e.preventDefault();
         diffPanel.showCommit(commit);
@@ -4163,7 +4287,13 @@
   function connectChatSocket(view) {
     closeChatSocket();
     const proto = location.protocol === 'https:' ? 'wss' : 'ws';
-    const query = chatState.currentId ? `?session=${encodeURIComponent(chatState.currentId)}` : '';
+    // The API guard cannot read headers browsers never send on a WS
+    // handshake, so token mode authenticates this one route via ?token=.
+    const params = [];
+    if (chatState.currentId) params.push(`session=${encodeURIComponent(chatState.currentId)}`);
+    const token = storedApiToken();
+    if (token) params.push(`token=${encodeURIComponent(token)}`);
+    const query = params.length ? `?${params.join('&')}` : '';
     const socket = new WebSocket(`${proto}://${location.host}/api/v1/chat/ws${query}`);
     chatState.socket = socket;
     socket.onopen = () => {

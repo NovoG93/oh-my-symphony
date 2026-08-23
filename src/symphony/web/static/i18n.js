@@ -102,6 +102,14 @@
     'conn.summary': '{running} running · {retrying} retrying',
     'conn.staleAgo': 'updated {n}s ago',
 
+    // -- API token prompt (SYMPHONY_API_TOKEN mode) -----------------------
+    'auth.tokenBannerTitle': 'This board requires an API token',
+    'auth.tokenBannerHint': 'SYMPHONY_API_TOKEN is set on the server — enter it to load the board.',
+    'auth.tokenRejected': 'The stored token was rejected — enter it again.',
+    'auth.tokenPlaceholder': 'API token',
+    'auth.tokenSave': 'Connect',
+    'auth.tokenSaved': 'Token saved — reconnecting',
+
 
     // -- Product Preview --------------------------------------------------
     'preview.title': 'Product Preview',
@@ -673,6 +681,14 @@
     'conn.unreachable': '오케스트레이터에 연결할 수 없음',
     'conn.summary': '{running}개 실행 중 · {retrying}개 재시도 중',
     'conn.staleAgo': '{n}초 전 업데이트',
+
+    // -- API token prompt (SYMPHONY_API_TOKEN mode) -----------------------
+    'auth.tokenBannerTitle': '이 보드에는 API 토큰이 필요합니다',
+    'auth.tokenBannerHint': '서버에 SYMPHONY_API_TOKEN이 설정되어 있습니다 — 토큰을 입력하면 보드를 불러옵니다.',
+    'auth.tokenRejected': '저장된 토큰이 거부되었습니다 — 다시 입력해 주세요.',
+    'auth.tokenPlaceholder': 'API 토큰',
+    'auth.tokenSave': '연결',
+    'auth.tokenSaved': '토큰을 저장했습니다 — 다시 연결하는 중',
 
 
     // -- Product Preview --------------------------------------------------
