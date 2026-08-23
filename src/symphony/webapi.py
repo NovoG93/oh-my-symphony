@@ -1141,7 +1141,7 @@ def _register_issue_routes(
         query = (request.query.get("query") or "").strip()[:300] or None
         status = (request.query.get("status") or "").strip()[:100] or None
         agent = (request.query.get("agent") or "").strip()[:100] or None
-        runs, registry_error = orchestrator.recent_runs(
+        runs, registry_error = await orchestrator.recent_runs(
             issue_id=issue_id,
             limit=limit,
             query=query,
@@ -1165,7 +1165,7 @@ def _register_issue_routes(
             return _json_error(
                 400, "invalid_run_id", "run_id must be 32 lowercase hex characters"
             )
-        detail, registry_error = orchestrator.run_detail(run_id)
+        detail, registry_error = await orchestrator.run_detail(run_id)
         if registry_error:
             return _json_error(503, "run_registry_unavailable", registry_error)
         if detail is None:
@@ -1184,7 +1184,7 @@ def _register_issue_routes(
             return _json_error(
                 400, "invalid_run_id", "run_id must be 32 lowercase hex characters"
             )
-        diagnostic, registry_error = orchestrator.run_diagnostic(run_id)
+        diagnostic, registry_error = await orchestrator.run_diagnostic(run_id)
         if registry_error:
             return _json_error(503, "run_registry_unavailable", registry_error)
         if diagnostic is None:

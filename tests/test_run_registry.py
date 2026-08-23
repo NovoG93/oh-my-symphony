@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
+import sys
 import threading
 import time
 from dataclasses import replace
@@ -2220,3 +2221,79 @@ def test_continuation_acquisition_race_has_exactly_one_successor(tmp_path: Path)
             "SELECT COUNT(*) FROM runs WHERE continued_from_run_id = ?",
             (predecessor,),
         ).fetchone() == (1,)
+
+
+# ---------------------------------------------------------------------------
+# _pid_alive: POSIX mapping + real win32 probe (ITEM 3)
+# ---------------------------------------------------------------------------
+
+
+def test_pid_alive_posix_mapping(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The POSIX branch maps os.kill outcomes: ProcessLookupError -> dead,
+    other OSError -> conservatively alive, clean -> alive."""
+    import sys
+
+    monkeypatch.setattr(sys, "platform", "linux")
+
+    def _with_kill(fake) -> bool:
+        monkeypatch.setattr(run_registry_mod.os, "kill", fake)
+        return run_registry_mod._pid_alive(1234)
+
+    def _raise(exc: BaseException):
+        def _inner(_pid, _sig):
+            raise exc
+
+        return _inner
+
+    def _ok(_pid, _sig):
+        return None
+
+    assert _with_kill(_raise(ProcessLookupError())) is False
+    assert _with_kill(_raise(PermissionError())) is True
+    assert _with_kill(_ok) is True
+
+
+@pytest.mark.skipif(
+    sys.platform != "win32",
+    reason="win32 liveness probe exercises the real Win32 API surface",
+)
+def test_pid_alive_win32_probe_on_real_processes() -> None:
+    """OpenProcess/GetExitCodeProcess probe against real child processes:
+    a live child reads alive; an exited-but-handle-held child and a
+    terminated+reaped child read dead; an unknown pid reads dead."""
+    import subprocess
+
+    live = subprocess.Popen(
+        ["ping", "-n", "30", "127.0.0.1"],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        creationflags=subprocess.CREATE_NO_WINDOW,
+    )
+    try:
+        assert run_registry_mod._pid_alive(live.pid) is True
+    finally:
+        live.kill()
+        live.wait()
+
+    exited = subprocess.Popen(
+        [
+            sys.executable,
+            "-c",
+            "import time; time.sleep(0.2)",
+        ],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        creationflags=subprocess.CREATE_NO_WINDOW,
+    )
+    time.sleep(0.8)  # exited, but the Popen handle keeps the pid resolvable
+    try:
+        assert run_registry_mod._pid_alive(exited.pid) is False
+    finally:
+        exited.wait()
+
+    assert run_registry_mod._pid_alive(live.pid) is False, (
+        "reaped child pid must read dead"
+    )
+    assert run_registry_mod._pid_alive(4_000_000) is False, (
+        "never-existing pid must read dead"
+    )
