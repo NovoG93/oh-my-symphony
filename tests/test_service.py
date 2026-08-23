@@ -33,6 +33,10 @@ from symphony.service import (
 )
 
 
+SERVICE_CAPABILITY = "a" * 43
+OTHER_SERVICE_CAPABILITY = "b" * 43
+
+
 def _workflow(tmp_path: Path) -> Path:
     workflow = tmp_path / "WORKFLOW.md"
     workflow.write_text("---\ntracker: {kind: file}\n---\nbody\n", encoding="utf-8")
@@ -186,6 +190,64 @@ def test_service_status_uses_current_process_checker(
     assert status.state == "running"
 
 
+def test_stale_service_status_uses_recorded_instance_for_health_probe(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    workflow = _workflow(tmp_path)
+    save_record(_record(workflow, pid=1234, service_instance_id="instance-a"))
+    seen: list[tuple[str, int, Path, str | None]] = []
+
+    def _reachable(
+        host: str,
+        port: int,
+        served_workflow: str | Path,
+        *,
+        service_instance_id: str | None = None,
+    ) -> bool:
+        seen.append((host, port, Path(served_workflow), service_instance_id))
+        return service_instance_id == "instance-a"
+
+    monkeypatch.setattr(
+        service_module, "is_symphony_workflow_reachable", _reachable
+    )
+
+    status = service_status(workflow, is_running=lambda _pid: False)
+
+    assert status.state == "running"
+    assert status.api_reachable is True
+    assert seen == [("127.0.0.1", 9999, workflow.resolve(), "instance-a")]
+
+
+def test_stale_port_owner_hint_uses_recorded_instance_for_health_probe(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    workflow = _workflow(tmp_path)
+    save_record(_record(workflow, pid=1234, service_instance_id="instance-a"))
+    seen: list[tuple[str, int, Path, str | None]] = []
+
+    def _reachable(
+        host: str,
+        port: int,
+        served_workflow: str | Path,
+        *,
+        service_instance_id: str | None = None,
+    ) -> bool:
+        seen.append((host, port, Path(served_workflow), service_instance_id))
+        return service_instance_id == "instance-a"
+
+    monkeypatch.setattr(
+        service_module, "is_symphony_workflow_reachable", _reachable
+    )
+
+    hint = service_module.port_owner_hint(
+        workflow, 9999, is_running=lambda _pid: False
+    )
+
+    assert hint is not None
+    assert "recorded Symphony API responds" in hint
+    assert seen == [("127.0.0.1", 9999, workflow.resolve(), "instance-a")]
+
+
 def test_exact_workflow_probe_uses_health_identity(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -234,27 +296,131 @@ def test_service_identity_probe_accepts_exact_instance_and_serving_pid(
         "_probe_json",
         lambda *_args: {
             "workflow_path": str(workflow),
-            "service_instance_id": "instance-a",
+            "service_instance_id": SERVICE_CAPABILITY,
             "orchestrator_pid": 5678,
         },
     )
 
     identity = service_module.probe_service_endpoint_identity(
-        "127.0.0.1", 9999, workflow, "instance-a"
+        "127.0.0.1", 9999, workflow, SERVICE_CAPABILITY
     )
 
     assert identity is not None
     assert identity.orchestrator_pid == 5678
 
 
+def test_service_identity_probe_sends_instance_header(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    workflow = _workflow(tmp_path).resolve()
+    seen: dict[str, object] = {}
+
+    class Response:
+        status = 200
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args: object) -> None:
+            return None
+
+        def read(self, _limit: int) -> bytes:
+            return json.dumps(
+                {
+                    "workflow_path": str(workflow),
+                    "service_instance_id": SERVICE_CAPABILITY,
+                    "orchestrator_pid": 5678,
+                }
+            ).encode()
+
+    class Opener:
+        def open(self, request: object, **_kwargs: object) -> Response:
+            seen["instance_header"] = request.get_header(  # type: ignore[attr-defined]
+                "X-symphony-service-instance"
+            )
+            return Response()
+
+    monkeypatch.setattr(
+        service_module.urllib.request,
+        "build_opener",
+        lambda *_handlers: Opener(),
+    )
+
+    identity = service_module.probe_service_endpoint_identity(
+        "127.0.0.1", 9999, workflow, SERVICE_CAPABILITY
+    )
+
+    assert identity is not None
+    assert identity.orchestrator_pid == 5678
+    assert seen == {"instance_header": SERVICE_CAPABILITY}
+
+
+def test_service_identity_probe_rejects_weak_instance_without_http_probe(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    workflow = _workflow(tmp_path).resolve()
+    monkeypatch.setattr(
+        service_module,
+        "_probe_json",
+        lambda *_args: pytest.fail("weak service instance IDs must not be probed"),
+    )
+
+    assert (
+        service_module.probe_service_endpoint_identity(
+            "127.0.0.1", 9999, workflow, "instance-a"
+        )
+        is None
+    )
+
+
+def test_probe_json_does_not_send_short_service_instance_header(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    seen: dict[str, object] = {}
+
+    class Response:
+        status = 200
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args: object) -> None:
+            return None
+
+        def read(self, _limit: int) -> bytes:
+            return b"{}"
+
+    class Opener:
+        def open(self, request: object, **_kwargs: object) -> Response:
+            seen["instance_header"] = request.get_header(  # type: ignore[attr-defined]
+                "X-symphony-service-instance"
+            )
+            return Response()
+
+    monkeypatch.setattr(
+        service_module.urllib.request,
+        "build_opener",
+        lambda *_handlers: Opener(),
+    )
+
+    assert service_module._probe_json(
+        "127.0.0.1", 9999, "/api/v1/health", "instance-a"
+    ) == {}
+    assert seen == {"instance_header": None}
+
+
 @pytest.mark.parametrize(
     ("service_instance_id", "served_instance_id"),
     [
-        pytest.param("instance-a", None, id="missing"),
-        pytest.param("instance-a", "", id="empty"),
-        pytest.param("instance-a", True, id="boolean"),
-        pytest.param("instance-a", "instance-b", id="mismatch"),
-        pytest.param("instance-a", "x" * 129, id="oversized-served"),
+        pytest.param(SERVICE_CAPABILITY, None, id="missing"),
+        pytest.param(SERVICE_CAPABILITY, "", id="empty"),
+        pytest.param(SERVICE_CAPABILITY, True, id="boolean"),
+        pytest.param(
+            SERVICE_CAPABILITY,
+            OTHER_SERVICE_CAPABILITY,
+            id="mismatch",
+        ),
+        pytest.param(SERVICE_CAPABILITY, "x" * 129, id="oversized-served"),
         pytest.param("", "", id="empty-expected"),
         pytest.param("   ", "   ", id="whitespace-expected"),
         pytest.param("x" * 129, "x" * 129, id="oversized-expected"),
@@ -306,14 +472,14 @@ def test_service_identity_probe_rejects_invalid_orchestrator_pid(
         "_probe_json",
         lambda *_args: {
             "workflow_path": str(workflow),
-            "service_instance_id": "instance-a",
+            "service_instance_id": SERVICE_CAPABILITY,
             "orchestrator_pid": served_pid,
         },
     )
 
     assert (
         service_module.probe_service_endpoint_identity(
-            "127.0.0.1", 9999, workflow, "instance-a"
+            "127.0.0.1", 9999, workflow, SERVICE_CAPABILITY
         )
         is None
     )
@@ -328,14 +494,14 @@ def test_service_identity_probe_rejects_other_workflow(
         "_probe_json",
         lambda *_args: {
             "workflow_path": str(tmp_path / "other" / "WORKFLOW.md"),
-            "service_instance_id": "instance-a",
+            "service_instance_id": SERVICE_CAPABILITY,
             "orchestrator_pid": 5678,
         },
     )
 
     assert (
         service_module.probe_service_endpoint_identity(
-            "127.0.0.1", 9999, workflow, "instance-a"
+            "127.0.0.1", 9999, workflow, SERVICE_CAPABILITY
         )
         is None
     )

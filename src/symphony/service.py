@@ -31,7 +31,9 @@ from .orchestrator.run_registry import RunRegistry, registry_path_for_workflow
 from .runtime_safety import ensure_workflow_repo_is_safe
 from .service_identity import (
     SERVICE_INSTANCE_ENV,
+    SERVICE_INSTANCE_HEADER,
     normalize_service_instance_id,
+    normalize_service_probe_credential,
 )
 from .workflow import (
     ServerConfig,
@@ -83,10 +85,21 @@ def _probe_host(host: str) -> str:
     return f"[{normalized}]" if ":" in normalized else normalized
 
 
-def _probe_json(host: str, port: int, endpoint: str) -> Any | None:
+def _probe_json(
+    host: str,
+    port: int,
+    endpoint: str,
+    service_instance_id: str | None = None,
+) -> Any | None:
     try:
         url = f"http://{_probe_host(host)}:{port}{endpoint}"
-        request = urllib.request.Request(url, headers={"Accept": "application/json"})
+        headers = {"Accept": "application/json"}
+        normalized_instance_id = normalize_service_probe_credential(
+            service_instance_id
+        )
+        if normalized_instance_id is not None:
+            headers[SERVICE_INSTANCE_HEADER] = normalized_instance_id
+        request = urllib.request.Request(url, headers=headers)
         opener = urllib.request.build_opener(_RejectRedirects())
         with opener.open(request, timeout=0.5) as response:
             if response.status != 200:
@@ -249,10 +262,14 @@ def _payload_serves_workflow(payload: object, workflow_path: str | Path) -> bool
 
 
 def is_symphony_workflow_reachable(
-    host: str, port: int, workflow_path: str | Path
+    host: str,
+    port: int,
+    workflow_path: str | Path,
+    *,
+    service_instance_id: str | None = None,
 ) -> bool:
     """Return whether a port serves Symphony for the exact workflow."""
-    payload = _probe_json(host, port, "/api/v1/health")
+    payload = _probe_json(host, port, "/api/v1/health", service_instance_id)
     return _payload_serves_workflow(payload, workflow_path)
 
 
@@ -263,14 +280,14 @@ def probe_service_endpoint_identity(
     service_instance_id: str,
 ) -> ServiceEndpointIdentity | None:
     """Return the serving PID only for an exact managed-service identity."""
-    expected_instance_id = normalize_service_instance_id(service_instance_id)
+    expected_instance_id = normalize_service_probe_credential(service_instance_id)
     if expected_instance_id is None:
         return None
-    payload = _probe_json(host, port, "/api/v1/health")
+    payload = _probe_json(host, port, "/api/v1/health", expected_instance_id)
     if not _payload_serves_workflow(payload, workflow_path):
         return None
     assert isinstance(payload, dict)
-    served_instance_id = normalize_service_instance_id(
+    served_instance_id = normalize_service_probe_credential(
         payload.get("service_instance_id")
     )
     if served_instance_id != expected_instance_id:
@@ -300,8 +317,16 @@ def port_owner_hint(
     if pid_alive:
         api_alive = False
     elif is_api_reachable is None:
+        probe_kwargs = (
+            {"service_instance_id": record.service_instance_id}
+            if record.service_instance_id is not None
+            else {}
+        )
         api_alive = is_symphony_workflow_reachable(
-            record.host, record.port, _resolved(workflow_path)
+            record.host,
+            record.port,
+            _resolved(workflow_path),
+            **probe_kwargs,
         )
     else:
         api_alive = is_api_reachable(record.host, record.port)
@@ -423,8 +448,16 @@ def service_status(
     if pid_running:
         api_reachable = False
     elif is_api_reachable is None:
+        probe_kwargs = (
+            {"service_instance_id": record.service_instance_id}
+            if record.service_instance_id is not None
+            else {}
+        )
         api_reachable = is_symphony_workflow_reachable(
-            record.host, record.port, _resolved(workflow_path)
+            record.host,
+            record.port,
+            _resolved(workflow_path),
+            **probe_kwargs,
         )
     else:
         api_reachable = is_api_reachable(record.host, record.port)

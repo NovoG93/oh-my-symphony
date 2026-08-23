@@ -1190,6 +1190,11 @@ class Orchestrator:
         return self._workflow_state
 
     @property
+    def service_instance_id(self) -> str | None:
+        """Per-launch managed-service capability, absent for foreground runs."""
+        return self._service_instance_id
+
+    @property
     def stats(self) -> StatsStore | None:
         return self._stats
 
