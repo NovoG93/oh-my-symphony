@@ -13,6 +13,7 @@ import ctypes
 import hashlib
 import json
 import os
+import secrets
 import signal
 import subprocess
 import sys
@@ -22,12 +23,16 @@ import urllib.request
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Callable, Literal
+from typing import Any, Callable, Literal, Mapping
 
 from ._shell import _taskkill_tree
 from .errors import SymphonyError
 from .orchestrator.run_registry import RunRegistry, registry_path_for_workflow
 from .runtime_safety import ensure_workflow_repo_is_safe
+from .service_identity import (
+    SERVICE_INSTANCE_ENV,
+    normalize_service_instance_id,
+)
 from .workflow import (
     ServerConfig,
     build_service_config,
@@ -113,6 +118,12 @@ class ServiceRecord:
     log_path: Path
     started_at: str
     orchestrator_command: list[str] = field(default_factory=list)
+    service_instance_id: str | None = None
+
+
+@dataclass(frozen=True)
+class ServiceEndpointIdentity:
+    orchestrator_pid: int
 
 
 @dataclass(frozen=True)
@@ -172,6 +183,7 @@ def _record_to_json(record: ServiceRecord) -> dict[str, Any]:
         "log_path": str(record.log_path),
         "started_at": record.started_at,
         "orchestrator_command": list(record.orchestrator_command),
+        "service_instance_id": record.service_instance_id,
     }
 
 
@@ -191,6 +203,9 @@ def _record_from_json(data: dict[str, Any]) -> ServiceRecord:
         orchestrator_command=[
             str(part) for part in data.get("orchestrator_command", [])
         ],
+        service_instance_id=normalize_service_instance_id(
+            data.get("service_instance_id")
+        ),
     )
 
 
@@ -216,23 +231,58 @@ def is_symphony_api_reachable(host: str, port: int) -> bool:
     return isinstance(payload, dict) and "health" in payload and "counts" in payload
 
 
-def is_symphony_workflow_reachable(
-    host: str, port: int, workflow_path: str | Path
-) -> bool:
-    """Return whether a port serves Symphony for the exact workflow."""
-    payload = _probe_json(host, port, "/api/v1/health")
-    served_workflow = (
-        payload.get("workflow_path") if isinstance(payload, dict) else None
-    )
+def _payload_serves_workflow(payload: object, workflow_path: str | Path) -> bool:
+    if not isinstance(payload, dict):
+        return False
+    served_workflow = payload.get("workflow_path")
     if not isinstance(served_workflow, str) or not served_workflow.strip():
         return False
     try:
         served_path = Path(served_workflow).expanduser()
         if not served_path.is_absolute():
             return False
-        return served_path.resolve() == _resolved(workflow_path)
+        if served_path.resolve() != _resolved(workflow_path):
+            return False
     except (OSError, RuntimeError, ValueError):
         return False
+    return True
+
+
+def is_symphony_workflow_reachable(
+    host: str, port: int, workflow_path: str | Path
+) -> bool:
+    """Return whether a port serves Symphony for the exact workflow."""
+    payload = _probe_json(host, port, "/api/v1/health")
+    return _payload_serves_workflow(payload, workflow_path)
+
+
+def probe_service_endpoint_identity(
+    host: str,
+    port: int,
+    workflow_path: str | Path,
+    service_instance_id: str,
+) -> ServiceEndpointIdentity | None:
+    """Return the serving PID only for an exact managed-service identity."""
+    expected_instance_id = normalize_service_instance_id(service_instance_id)
+    if expected_instance_id is None:
+        return None
+    payload = _probe_json(host, port, "/api/v1/health")
+    if not _payload_serves_workflow(payload, workflow_path):
+        return None
+    assert isinstance(payload, dict)
+    served_instance_id = normalize_service_instance_id(
+        payload.get("service_instance_id")
+    )
+    if served_instance_id != expected_instance_id:
+        return None
+    served_pid = payload.get("orchestrator_pid")
+    if (
+        not isinstance(served_pid, int)
+        or isinstance(served_pid, bool)
+        or served_pid <= 0
+    ):
+        return None
+    return ServiceEndpointIdentity(orchestrator_pid=served_pid)
 
 
 def port_owner_hint(
@@ -418,11 +468,19 @@ def build_orchestrator_command(
     ]
 
 
-def _popen_detached(command: list[str], *, cwd: Path, log_path: Path) -> int:
+def _popen_detached(
+    command: list[str],
+    *,
+    cwd: Path,
+    log_path: Path,
+    env_overrides: Mapping[str, str] | None = None,
+) -> int:
     log_path.parent.mkdir(parents=True, exist_ok=True)
     log_handle = log_path.open("ab")
     env = os.environ.copy()
     env.setdefault("PYTHONUNBUFFERED", "1")
+    if env_overrides:
+        env.update(env_overrides)
     kwargs: dict[str, Any] = {
         "cwd": str(cwd),
         "stdout": log_handle,
@@ -760,11 +818,13 @@ def _start_locked(args: argparse.Namespace, *, workflow: Path, cfg: Any) -> int:
         port=port,
     )
     orchestrator_pid: int | None = None
+    service_instance_id = secrets.token_urlsafe(32)
     try:
         orchestrator_pid = _popen_detached(
             orchestrator_command,
             cwd=workflow_dir,
             log_path=log_path,
+            env_overrides={SERVICE_INSTANCE_ENV: service_instance_id},
         )
         if not _wait_until(lambda: is_process_running(orchestrator_pid), timeout_s=2.0):
             print(
@@ -787,6 +847,7 @@ def _start_locked(args: argparse.Namespace, *, workflow: Path, cfg: Any) -> int:
         log_path=log_path.resolve(),
         started_at=_utc_now(),
         orchestrator_command=orchestrator_command,
+        service_instance_id=service_instance_id,
     )
     try:
         save_record(record)
@@ -812,6 +873,36 @@ def _stop(args: argparse.Namespace) -> int:
 
     all_stopped = True
     for label, pid in (("orchestrator", record.orchestrator_pid),):
+        if _IS_WIN32 and not args.force and record.service_instance_id is not None:
+            if is_process_running(pid):
+                terminate_process(pid)
+                _wait_until(
+                    lambda pid=pid: not is_process_running(pid),
+                    timeout_s=float(args.timeout),
+                )
+            identity = probe_service_endpoint_identity(
+                record.host,
+                record.port,
+                record.workflow_path,
+                record.service_instance_id,
+            )
+            if identity is None:
+                stopped = False
+            else:
+                serving_pid = identity.orchestrator_pid
+                if is_process_running(serving_pid):
+                    terminate_process(serving_pid, force=True)
+                stopped = _wait_until(
+                    lambda serving_pid=serving_pid, pid=pid: (
+                        not is_process_running(serving_pid)
+                        and not is_process_running(pid)
+                    ),
+                    timeout_s=2.0,
+                )
+            if not stopped:
+                all_stopped = False
+                print(f"warning: {label} pid={pid} is still running", file=sys.stderr)
+            continue
         if not is_process_running(pid):
             continue
         terminate_process(pid)

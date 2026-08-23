@@ -74,6 +74,7 @@ from ..issue import BlockerRef, Issue, normalize_state
 from ..logging import get_logger
 from ..prompt import build_continuation_prompt, build_first_turn_prompt
 from ..runtime_safety import ensure_workflow_repo_is_safe
+from ..service_identity import SERVICE_INSTANCE_ENV, normalize_service_instance_id
 from ..skills import render_skill_block
 from ..stats import StatsStore, stats_store_for
 from ..trackers import TrackerClient, build_tracker_client
@@ -249,6 +250,22 @@ class _ReleaseDispatchAuthority:
     app_release: bool = False
     cycle_verifier: bool = False
     finalizer: bool = False
+
+
+@dataclass(frozen=True)
+class _AgentPhaseState:
+    issue: Issue
+    cfg: ServiceConfig
+    client: AgentBackend
+    first_prompt: str
+    current_state: str
+    known_app_release: bool
+
+
+@dataclass(frozen=True)
+class _AgentPhaseTransition:
+    state: _AgentPhaseState
+    is_rewind: bool
 
 
 class _ReleaseTransitionAuthorityLost(SymphonyError):
@@ -863,6 +880,9 @@ class Orchestrator:
         improvement_runner: ImprovementRunner | None = None,
         improvement_lease: Lease | None = None,
     ) -> None:
+        self._service_instance_id = normalize_service_instance_id(
+            os.environ.pop(SERVICE_INSTANCE_ENV, None)
+        )
         self._workflow_state = workflow_state
         # Initiative D — backend factory via constructor injection. None
         # falls back to the module-level `build_backend`, looked up at call
@@ -3107,6 +3127,8 @@ class Orchestrator:
             "version": __version__,
             "generated_at": _utc_iso_z(),
             "workflow_path": str(self._workflow_state.path),
+            "service_instance_id": self._service_instance_id,
+            "orchestrator_pid": os.getpid(),
             "tick": {
                 "alive": tick_alive,
                 "started": tick_started,
@@ -7023,245 +7045,35 @@ class Orchestrator:
 
                     if is_phase_transition:
                         try:
-                            is_rewind = _is_rewind_transition(
-                                prev_phase_state,
-                                current_state,
-                                cfg.tracker.active_states,
-                            )
-                            # v0.6.7 — contract validator. When the agent
-                            # moved forward (not a rewind), check that
-                            # the producing stage actually wrote the
-                            # sections its prompt promised. On failure:
-                            # write the tracker state back to the
-                            # producing stage, append a ## Contract
-                            # Failure note, and treat the situation as
-                            # a forced rewind so the rebuild + budget
-                            # bookkeeping below still apply.
-                            if not is_rewind and cfg.agent.stage_contracts_enabled(
-                                cfg.tracker.active_states
-                            ):
-                                if prev_phase_state in {
-                                    "in progress",
-                                    "verify",
-                                    "document",
-                                    # legacy lane name (pre-rename boards)
-                                    "learn",
-                                    "done",
-                                }:
-                                    # IMPORTANT: contract eval reads
-                                    # `issue.description`, so we MUST use
-                                    # the full-body refresh — not the
-                                    # minimal `_refresh_issue_state`, which
-                                    # returns description=None for every
-                                    # tracker adapter and would falsely
-                                    # fail every forward transition. See
-                                    # tests/test_orchestrator_contract_
-                                    # integration.py for the regression
-                                    # the v0.6.7 release surfaced.
-                                    refreshed_for_contract = (
-                                        await self._refresh_issue_full(
-                                            cfg, running_issue_id
-                                        )
-                                    )
-                                    if refreshed_for_contract is not None:
-                                        issue = refreshed_for_contract
-                                        known_app_release = (
-                                            known_app_release
-                                            or _has_app_release_label(issue)
-                                        )
-                                        running_entry = self._running.get(
-                                            running_issue_id
-                                        )
-                                        if running_entry is not None:
-                                            running_entry.issue = issue
-                                        current_state = normalize_state(issue.state)
-                                contract = evaluate_contract(
-                                    producing_state=prev_phase_state,
-                                    ticket_body=issue.description or "",
-                                    identifier=issue.identifier,
-                                    docs_root=workspace.path / "docs",
-                                    artifact_store_root=(
-                                        self._artifact_store.root
-                                        if (
-                                            cfg.artifacts.require_for_done
-                                            and self._artifact_store is not None
-                                        )
-                                        else None
-                                    ),
-                                )
-                                if not contract.passed:
-                                    log.warning(
-                                        "stage_contract_failed",
-                                        issue_id=issue.id,
-                                        identifier=issue.identifier,
-                                        producing_state=prev_phase_state,
-                                        advanced_to=current_state,
-                                        missing=contract.missing,
-                                    )
-                                    await asyncio.to_thread(
-                                        self._tracker_call_append_note,
-                                        cfg,
-                                        issue,
-                                        contract.note_heading,
-                                        contract.note_body,
-                                    )
-                                    await asyncio.to_thread(
-                                        self._tracker_call_update_state,
-                                        cfg,
-                                        issue,
-                                        prev_phase_state_raw or prev_phase_state,
-                                    )
-                                    # Pull the freshly-rewound body so the
-                                    # next backend rebuild's first prompt
-                                    # sees the ## Contract Failure note we
-                                    # just appended (full-body fetch — see
-                                    # the comment above the preflight
-                                    # refresh for why minimal would erase
-                                    # description).
-                                    refreshed = await self._refresh_issue_full(
-                                        cfg, running_issue_id
-                                    )
-                                    if refreshed is not None:
-                                        issue = refreshed
-                                    issue = replace(
-                                        issue,
-                                        state=(
-                                            prev_phase_state_raw or prev_phase_state
-                                        ),
-                                    )
-                                    running_entry = self._running.get(running_issue_id)
-                                    if running_entry is not None:
-                                        running_entry.issue = issue
-                                    current_state = normalize_state(issue.state)
-                                    is_rewind = True
-                                elif contract.warnings:
-                                    # Soft S2 advisories (e.g. a non-passing AC
-                                    # Scorecard row): surface as a ticket note
-                                    # without rewinding so the pipeline proceeds.
-                                    log.warning(
-                                        "stage_contract_warn",
-                                        issue_id=issue.id,
-                                        identifier=issue.identifier,
-                                        producing_state=prev_phase_state,
-                                        advanced_to=current_state,
-                                        warnings=contract.warnings,
-                                    )
-                                    await asyncio.to_thread(
-                                        self._tracker_call_append_note,
-                                        cfg,
-                                        issue,
-                                        "Contract Warning",
-                                        contract.warning_note.split("\n", 1)[1],
-                                    )
-                            if is_rewind:
-                                debug = self._issue_debug.setdefault(
-                                    running_issue_id, _IssueDebug()
-                                )
-                                debug.rewind_count += 1
-                                if (
-                                    cfg.agent.max_attempts > 0
-                                    and debug.rewind_count > cfg.agent.max_attempts
-                                ):
-                                    rewind_target = _rewind_budget_target_state(cfg)
-                                    if rewind_target:
-                                        await asyncio.to_thread(
-                                            self._tracker_call_update_state,
-                                            cfg,
-                                            issue,
-                                            rewind_target,
-                                        )
-                                        issue = replace(issue, state=rewind_target)
-                                    running_entry = self._running.get(running_issue_id)
-                                    if running_entry is not None:
-                                        running_entry.issue = issue
-                                    log.warning(
-                                        "rewind_budget_exceeded",
-                                        issue_id=issue.id,
-                                        identifier=issue.identifier,
-                                        from_state=prev_phase_state,
-                                        to_state=current_state,
-                                        rewind_count=debug.rewind_count,
-                                        max_attempts=cfg.agent.max_attempts,
-                                        # F-32: a board with no block/human
-                                        # terminal lane keeps its state; the
-                                        # worker still stops.
-                                        target_state=rewind_target or "(none)",
-                                    )
-                                    break
-                            running_entry = self._running.get(running_issue_id)
-                            if running_entry is not None:
-                                running_entry.consecutive_empty_turns = 0
-                                running_entry.hit_empty_response_loop = False
-                            # F-01: route the *new* lane's backend. The ticket
-                            # walks several states inside one dispatch, so the
-                            # kind must be re-resolved from the unrouted config
-                            # here — not reused from the lane we started in.
-                            phase_cfg = _config_for_issue_agent(base_cfg, issue)
-                            if phase_cfg.agent.kind != cfg.agent.kind:
-                                log.info(
-                                    "stage_backend_rerouted",
-                                    issue_id=issue.id,
-                                    identifier=issue.identifier,
-                                    from_state=prev_phase_state,
-                                    to_state=current_state,
-                                    from_kind=cfg.agent.kind,
-                                    to_kind=phase_cfg.agent.kind,
-                                )
-                            cfg = phase_cfg
-                            if running_entry is not None:
-                                running_entry.agent_kind = cfg.agent.kind
-                            (
-                                client,
-                                first_prompt,
-                            ) = await self._rebuild_backend_for_phase(
-                                issue=issue,
+                            transition = await self._transition_agent_phase(
+                                phase_state=_AgentPhaseState(
+                                    issue=issue,
+                                    cfg=cfg,
+                                    client=client,
+                                    first_prompt=first_prompt,
+                                    current_state=current_state,
+                                    known_app_release=known_app_release,
+                                ),
                                 running_issue_id=running_issue_id,
-                                cfg=cfg,
+                                base_cfg=base_cfg,
                                 workspace_path=workspace.path,
                                 attempt=attempt,
                                 doc_language=doc_language,
-                                old_client=client,
-                                is_rewind=is_rewind,
-                                turn_number=debug.completed_turn_count + turn_number,
+                                producing_state=prev_phase_state,
+                                producing_state_raw=prev_phase_state_raw,
+                                turn_number=turn_number,
                             )
+                            if transition is None:
+                                break
+                            phase_state = transition.state
+                            issue = phase_state.issue
+                            cfg = phase_state.cfg
+                            client = phase_state.client
+                            first_prompt = phase_state.first_prompt
+                            current_state = phase_state.current_state
+                            known_app_release = phase_state.known_app_release
+                            is_rewind = transition.is_rewind
                             running_entry = self._running.get(running_issue_id)
-                            if running_entry is not None:
-                                # New backend instance — refresh the
-                                # `_on_codex_event` reference so the stall
-                                # predicate keeps routing to the live driver.
-                                running_entry.client = client
-                                running_entry.thread_id = None
-                                running_entry.session_id = None
-                                running_entry.turn_id = None
-                                running_entry.resume_session_id = None
-                                running_entry.last_completed_turn_event = 0
-                                # New backend session reports absolute token
-                                # totals from 0; the high-water marks below
-                                # MUST reset or `_apply_token_totals` computes
-                                # `max(new - old_high, 0) = 0` and silently
-                                # drops every token from the new phase until
-                                # the cumulative count overtakes the old mark.
-                                # Cumulative `codex_*_tokens` are NOT reset;
-                                # state-local totals reset so
-                                # max_total_tokens_by_state is measured per
-                                # stage, not against ticket lifetime usage.
-                                running_entry.last_reported_input_tokens = 0
-                                running_entry.last_reported_cache_input_tokens = 0
-                                running_entry.last_reported_output_tokens = 0
-                                running_entry.last_reported_total_tokens = 0
-                                running_entry.codex_state_input_tokens = 0
-                                running_entry.codex_state_cache_input_tokens = 0
-                                running_entry.codex_state_output_tokens = 0
-                                running_entry.codex_state_total_tokens = 0
-                                # Per-stage EMA window restarts with the
-                                # new state so first-turn cost in the new
-                                # stage isn't inflated by the prior
-                                # stage's cumulative total.
-                                running_entry.last_ema_state_total_tokens = 0
-                                running_entry.hit_token_budget = False
-                                running_entry.token_budget_cap = 0
-                                debug.state_turn_state = current_state
-                                debug.state_turn_count = 0
                             log.info(
                                 "worker_phase_transition",
                                 issue_id=issue.id,
@@ -7527,14 +7339,16 @@ class Orchestrator:
                         and state != prev_phase_state
                     ):
                         try:
+                            finalizer_identifier = (
+                                running.release_gate_finalizer or issue.identifier
+                            )
                             finalizer_gate = cast(
                                 ReleaseGate | None,
                                 self._release_registry_call(
                                     cfg,
                                     "read_finalizer_gate_after_turn",
                                     lambda registry: registry.get_release_gate(
-                                        running.release_gate_finalizer
-                                        or issue.identifier
+                                        finalizer_identifier
                                     ),
                                 ),
                             )
@@ -7786,6 +7600,263 @@ class Orchestrator:
                         running_issue_id, outcome, error, owning_task=owning_task
                     )
                 )
+
+    async def _transition_agent_phase(
+        self,
+        *,
+        phase_state: _AgentPhaseState,
+        running_issue_id: str,
+        base_cfg: ServiceConfig,
+        workspace_path: Path,
+        attempt: int | None,
+        doc_language: str,
+        producing_state: str,
+        producing_state_raw: str,
+        turn_number: int,
+    ) -> _AgentPhaseTransition | None:
+        issue = phase_state.issue
+        cfg = phase_state.cfg
+        client = phase_state.client
+        first_prompt = phase_state.first_prompt
+        current_state = phase_state.current_state
+        known_app_release = phase_state.known_app_release
+        debug = self._issue_debug.setdefault(running_issue_id, _IssueDebug())
+
+        is_rewind = _is_rewind_transition(
+            producing_state,
+            current_state,
+            cfg.tracker.active_states,
+        )
+        # v0.6.7 — contract validator. When the agent
+        # moved forward (not a rewind), check that
+        # the producing stage actually wrote the
+        # sections its prompt promised. On failure:
+        # write the tracker state back to the
+        # producing stage, append a ## Contract
+        # Failure note, and treat the situation as
+        # a forced rewind so the rebuild + budget
+        # bookkeeping below still apply.
+        if not is_rewind and cfg.agent.stage_contracts_enabled(
+            cfg.tracker.active_states
+        ):
+            if producing_state in {
+                "in progress",
+                "verify",
+                "document",
+                # legacy lane name (pre-rename boards)
+                "learn",
+                "done",
+            }:
+                # IMPORTANT: contract eval reads
+                # `issue.description`, so we MUST use
+                # the full-body refresh — not the
+                # minimal `_refresh_issue_state`, which
+                # returns description=None for every
+                # tracker adapter and would falsely
+                # fail every forward transition. See
+                # tests/test_orchestrator_contract_
+                # integration.py for the regression
+                # the v0.6.7 release surfaced.
+                refreshed_for_contract = await self._refresh_issue_full(
+                    cfg, running_issue_id
+                )
+                if refreshed_for_contract is not None:
+                    issue = refreshed_for_contract
+                    known_app_release = known_app_release or _has_app_release_label(
+                        issue
+                    )
+                    running_entry = self._running.get(running_issue_id)
+                    if running_entry is not None:
+                        running_entry.issue = issue
+                    current_state = normalize_state(issue.state)
+            contract = evaluate_contract(
+                producing_state=producing_state,
+                ticket_body=issue.description or "",
+                identifier=issue.identifier,
+                docs_root=workspace_path / "docs",
+                artifact_store_root=(
+                    self._artifact_store.root
+                    if (
+                        cfg.artifacts.require_for_done
+                        and self._artifact_store is not None
+                    )
+                    else None
+                ),
+            )
+            if not contract.passed:
+                log.warning(
+                    "stage_contract_failed",
+                    issue_id=issue.id,
+                    identifier=issue.identifier,
+                    producing_state=producing_state,
+                    advanced_to=current_state,
+                    missing=contract.missing,
+                )
+                await asyncio.to_thread(
+                    self._tracker_call_append_note,
+                    cfg,
+                    issue,
+                    contract.note_heading,
+                    contract.note_body,
+                )
+                await asyncio.to_thread(
+                    self._tracker_call_update_state,
+                    cfg,
+                    issue,
+                    producing_state_raw or producing_state,
+                )
+                # Pull the freshly-rewound body so the
+                # next backend rebuild's first prompt
+                # sees the ## Contract Failure note we
+                # just appended (full-body fetch — see
+                # the comment above the preflight
+                # refresh for why minimal would erase
+                # description).
+                refreshed = await self._refresh_issue_full(cfg, running_issue_id)
+                if refreshed is not None:
+                    issue = refreshed
+                issue = replace(
+                    issue,
+                    state=(producing_state_raw or producing_state),
+                )
+                running_entry = self._running.get(running_issue_id)
+                if running_entry is not None:
+                    running_entry.issue = issue
+                current_state = normalize_state(issue.state)
+                is_rewind = True
+            elif contract.warnings:
+                # Soft S2 advisories (e.g. a non-passing AC
+                # Scorecard row): surface as a ticket note
+                # without rewinding so the pipeline proceeds.
+                log.warning(
+                    "stage_contract_warn",
+                    issue_id=issue.id,
+                    identifier=issue.identifier,
+                    producing_state=producing_state,
+                    advanced_to=current_state,
+                    warnings=contract.warnings,
+                )
+                await asyncio.to_thread(
+                    self._tracker_call_append_note,
+                    cfg,
+                    issue,
+                    "Contract Warning",
+                    contract.warning_note.split("\n", 1)[1],
+                )
+        if is_rewind:
+            debug.rewind_count += 1
+            if (
+                cfg.agent.max_attempts > 0
+                and debug.rewind_count > cfg.agent.max_attempts
+            ):
+                rewind_target = _rewind_budget_target_state(cfg)
+                if rewind_target:
+                    await asyncio.to_thread(
+                        self._tracker_call_update_state,
+                        cfg,
+                        issue,
+                        rewind_target,
+                    )
+                    issue = replace(issue, state=rewind_target)
+                running_entry = self._running.get(running_issue_id)
+                if running_entry is not None:
+                    running_entry.issue = issue
+                log.warning(
+                    "rewind_budget_exceeded",
+                    issue_id=issue.id,
+                    identifier=issue.identifier,
+                    from_state=producing_state,
+                    to_state=current_state,
+                    rewind_count=debug.rewind_count,
+                    max_attempts=cfg.agent.max_attempts,
+                    # F-32: a board with no block/human
+                    # terminal lane keeps its state; the
+                    # worker still stops.
+                    target_state=rewind_target or "(none)",
+                )
+                return None
+        running_entry = self._running.get(running_issue_id)
+        if running_entry is not None:
+            running_entry.consecutive_empty_turns = 0
+            running_entry.hit_empty_response_loop = False
+        # F-01: route the *new* lane's backend. The ticket
+        # walks several states inside one dispatch, so the
+        # kind must be re-resolved from the unrouted config
+        # here — not reused from the lane we started in.
+        phase_cfg = _config_for_issue_agent(base_cfg, issue)
+        if phase_cfg.agent.kind != cfg.agent.kind:
+            log.info(
+                "stage_backend_rerouted",
+                issue_id=issue.id,
+                identifier=issue.identifier,
+                from_state=producing_state,
+                to_state=current_state,
+                from_kind=cfg.agent.kind,
+                to_kind=phase_cfg.agent.kind,
+            )
+        cfg = phase_cfg
+        if running_entry is not None:
+            running_entry.agent_kind = cfg.agent.kind
+        client, first_prompt = await self._rebuild_backend_for_phase(
+            issue=issue,
+            running_issue_id=running_issue_id,
+            cfg=cfg,
+            workspace_path=workspace_path,
+            attempt=attempt,
+            doc_language=doc_language,
+            old_client=client,
+            is_rewind=is_rewind,
+            turn_number=debug.completed_turn_count + turn_number,
+        )
+        running_entry = self._running.get(running_issue_id)
+        if running_entry is not None:
+            # New backend instance — refresh the
+            # `_on_codex_event` reference so the stall
+            # predicate keeps routing to the live driver.
+            running_entry.client = client
+            running_entry.thread_id = None
+            running_entry.session_id = None
+            running_entry.turn_id = None
+            running_entry.resume_session_id = None
+            running_entry.last_completed_turn_event = 0
+            # New backend session reports absolute token
+            # totals from 0; the high-water marks below
+            # MUST reset or `_apply_token_totals` computes
+            # `max(new - old_high, 0) = 0` and silently
+            # drops every token from the new phase until
+            # the cumulative count overtakes the old mark.
+            # Cumulative `codex_*_tokens` are NOT reset;
+            # state-local totals reset so
+            # max_total_tokens_by_state is measured per
+            # stage, not against ticket lifetime usage.
+            running_entry.last_reported_input_tokens = 0
+            running_entry.last_reported_cache_input_tokens = 0
+            running_entry.last_reported_output_tokens = 0
+            running_entry.last_reported_total_tokens = 0
+            running_entry.codex_state_input_tokens = 0
+            running_entry.codex_state_cache_input_tokens = 0
+            running_entry.codex_state_output_tokens = 0
+            running_entry.codex_state_total_tokens = 0
+            # Per-stage EMA window restarts with the
+            # new state so first-turn cost in the new
+            # stage isn't inflated by the prior
+            # stage's cumulative total.
+            running_entry.last_ema_state_total_tokens = 0
+            running_entry.hit_token_budget = False
+            running_entry.token_budget_cap = 0
+            debug.state_turn_state = current_state
+            debug.state_turn_count = 0
+        return _AgentPhaseTransition(
+            state=_AgentPhaseState(
+                issue=issue,
+                cfg=cfg,
+                client=client,
+                first_prompt=first_prompt,
+                current_state=current_state,
+                known_app_release=known_app_release,
+            ),
+            is_rewind=is_rewind,
+        )
 
     async def _rebuild_backend_for_phase(
         self,
