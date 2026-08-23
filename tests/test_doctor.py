@@ -17,6 +17,7 @@ from symphony import service as service_module
 from symphony.service import ServiceRecord, save_record
 from symphony.cli.doctor import (
     check_after_create_hook,
+    check_api_token_env,
     check_app_release_contract,
     check_agy_state_dir,
     check_agent_cli,
@@ -647,18 +648,88 @@ def test_run_checks_returns_one_result_per_check(tmp_path: Path) -> None:
         """,
     )
     results = run_checks(cfg)
-    # protected repository + port + shell + max_turns + agent + pi_auth
-    # + prime_agent_auth + gemini_auth + agy_state + kiro_auth + prompts
-    # + after_create + workspace + git_history + agent_git_grant + tracker
-    # + board.reachable + deep_merge_contract + stage_contracts + board.cli
-    # + board.dependencies + app.release-contract + state.db = 23
-    assert len(results) == 23
+    # protected repository + port + api_token + shell + max_turns + agent
+    # + pi_auth + prime_agent_auth + gemini_auth + agy_state + kiro_auth
+    # + prompts + after_create + workspace + git_history + agent_git_grant
+    # + tracker + board.reachable + deep_merge_contract + stage_contracts
+    # + board.cli + board.dependencies + app.release-contract + state.db = 24
+    assert len(results) == 24
     assert {r.name.split("=")[0].split(".")[0] for r in results} >= {
         "agent",
         "hooks",
         "workspace",
         "tracker",
     }
+
+
+def test_api_token_env_unset_passes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    cfg = _build_cfg(
+        tmp_path,
+        """
+        tracker: { kind: file, board_root: ./kanban }
+        agent: { kind: codex }
+        codex: { command: codex app-server }
+        """,
+    )
+    monkeypatch.delenv("SYMPHONY_API_TOKEN", raising=False)
+    result = check_api_token_env(cfg)
+    assert result.status == "pass"
+    assert "unset" in result.message
+
+
+def test_api_token_env_internal_whitespace_warns(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A token with inner spaces can never match the two-word bearer
+    parse, so every /api/ request 401s — advisory, not a failure."""
+    cfg = _build_cfg(
+        tmp_path,
+        """
+        tracker: { kind: file, board_root: ./kanban }
+        agent: { kind: codex }
+        codex: { command: codex app-server }
+        """,
+    )
+    monkeypatch.setenv("SYMPHONY_API_TOKEN", "sekrit token")
+    result = check_api_token_env(cfg)
+    assert result.status == "warn"
+    assert "whitespace" in result.message
+
+
+def test_api_token_env_surrounding_whitespace_passes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    cfg = _build_cfg(
+        tmp_path,
+        """
+        tracker: { kind: file, board_root: ./kanban }
+        agent: { kind: codex }
+        codex: { command: codex app-server }
+        """,
+    )
+    monkeypatch.setenv("SYMPHONY_API_TOKEN", "  sekrit-token\t")
+    result = check_api_token_env(cfg)
+    assert result.status == "pass"
+    assert "required" in result.message
+
+
+def test_api_token_env_blank_passes_as_unset(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    cfg = _build_cfg(
+        tmp_path,
+        """
+        tracker: { kind: file, board_root: ./kanban }
+        agent: { kind: codex }
+        codex: { command: codex app-server }
+        """,
+    )
+    monkeypatch.setenv("SYMPHONY_API_TOKEN", "   ")
+    result = check_api_token_env(cfg)
+    assert result.status == "pass"
+    assert "unset" in result.message
 
 
 def test_pi_auth_skipped_for_non_pi(tmp_path: Path) -> None:
