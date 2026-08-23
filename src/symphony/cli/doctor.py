@@ -151,7 +151,18 @@ def check_agent_cli(cfg: ServiceConfig) -> CheckResult:
 
     name = f"agent.kind={kind}"
     try:
-        argv = shlex.split(command)
+        if _IS_WIN32:
+            # POSIX-mode shlex eats backslashes: `D:\tools\python.exe`
+            # would reach shutil.which as `D:toolspython.exe` and the
+            # preflight bogus-fails with "not on $PATH". Whitespace mode
+            # keeps backslashes (and the quotes shlex leaves attached to
+            # a quoted token), so strip those surrounding quotes from the
+            # binary before resolving it.
+            argv = shlex.split(command, posix=False)
+            if argv:
+                argv[0] = argv[0].strip("\"'")
+        else:
+            argv = shlex.split(command)
     except ValueError as exc:
         return CheckResult(name, "fail", f"command not parseable: {exc}")
     if not argv:
