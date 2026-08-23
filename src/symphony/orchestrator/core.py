@@ -375,6 +375,103 @@ def _normalize_agent_pid(value: object) -> int | None:
     return None
 
 
+def _reclaim_kill_confirm(record: RunRecord) -> str | None:
+    """Prove-and-kill one reclaimed run's recorded backend process.
+
+    Pure OS work — identity probe, process-group kill, and the bounded
+    gone-confirm poll — with no registry access, so callers can run it
+    inside ``asyncio.to_thread`` without breaking the registry's
+    thread-affine SQLite connection. Returns the outcome label
+    ("killed" / "not_found" / "identity_mismatch"), or ``None`` when the
+    incarnation could not be proven and the caller must NOT finalize.
+    """
+    pid = record.backend_agent_pid
+    if pid is not None and pid <= 0:
+        log.warning(
+            "reclaim_invalid_orphan_agent_pid",
+            issue_id=record.issue_id,
+            identifier=record.identifier,
+            pid=pid,
+        )
+        return None
+    if pid is None:
+        return "no_backend_pid"
+    expected_identity = record.backend_process_identity
+    current_identity = process_identity(pid)
+    group_exists = process_group_exists(pid)
+    if current_identity is None:
+        if group_exists is not False:
+            log.warning(
+                "reclaim_backend_identity_ambiguous",
+                issue_id=record.issue_id,
+                identifier=record.identifier,
+                pid=pid,
+            )
+            return None
+        outcome = "not_found"
+    elif expected_identity is None:
+        # Pre-v8 or failed identity capture: never signal a reusable
+        # numeric pid without proving it is the recorded incarnation.
+        log.warning(
+            "reclaim_backend_identity_missing",
+            issue_id=record.issue_id,
+            identifier=record.identifier,
+            pid=pid,
+        )
+        return None
+    elif current_identity != expected_identity:
+        # The recorded process incarnation is gone and this pid was
+        # reused. Do not signal the unrelated replacement.
+        outcome = "identity_mismatch"
+    else:
+        try:
+            killed = kill_process_group(pid)
+        except Exception as exc:
+            log.warning(
+                "reclaim_killed_orphan_agent",
+                issue_id=record.issue_id,
+                identifier=record.identifier,
+                pid=pid,
+                outcome=f"error: {type(exc).__name__}",
+            )
+            return None
+        if killed:
+            deadline = time.monotonic() + 1.0
+            confirmed_gone = process_group_exists(pid) is False
+            while not confirmed_gone and time.monotonic() < deadline:
+                time.sleep(0.05)
+                confirmed_gone = process_group_exists(pid) is False
+            if not confirmed_gone:
+                log.warning(
+                    "reclaim_killed_orphan_agent",
+                    issue_id=record.issue_id,
+                    identifier=record.identifier,
+                    pid=pid,
+                    outcome="unconfirmed",
+                )
+                return None
+            outcome = "killed"
+        elif process_group_exists(pid) is False:
+            outcome = "not_found"
+        else:
+            log.warning(
+                "reclaim_killed_orphan_agent",
+                issue_id=record.issue_id,
+                identifier=record.identifier,
+                pid=pid,
+                outcome="ambiguous",
+            )
+            return None
+    log.warning(
+        "reclaim_killed_orphan_agent",
+        issue_id=record.issue_id,
+        identifier=record.identifier,
+        pid=pid,
+        outcome=outcome,
+    )
+    return outcome
+
+
 def _backend_agent_pid(backend: AgentBackend) -> int | None:
     return _normalize_agent_pid(getattr(backend, "pid", None))
 
@@ -1039,8 +1136,13 @@ class Orchestrator:
                 try:
                     # win32 kill_process_group shells out to `taskkill /T`;
                     # keep that subprocess off the event loop so stop()
-                    # drains never stall the service on a slow kill.
-                    killed = await asyncio.to_thread(kill_process_group, agent_pgid)
+                    # drains never stall the service on a slow kill. The
+                    # recorded identity fingerprint gates pid reuse.
+                    killed = await asyncio.to_thread(
+                        kill_process_group,
+                        agent_pgid,
+                        identity=self._agent_pid_identity(entry),
+                    )
                 except Exception as exc:
                     log.warning(
                         "worker_process_kill_failed_on_stop",
@@ -1088,11 +1190,20 @@ class Orchestrator:
         self._last_registry_error = None
         return result
 
-    def _ensure_run_registry(self, cfg: ServiceConfig) -> None:
+    def _open_run_registry(self, cfg: ServiceConfig) -> tuple[RunRegistry | None, bool]:
+        """Open (or reuse) the run registry connection.
+
+        Returns ``(registry, fresh)``. ``fresh`` is True only when a NEW
+        connection was opened (callers run reclaim + open-maintenance
+        then); an existing path-matched registry returns ``(registry,
+        False)`` so maintenance is skipped, mirroring the historical
+        early return. Open failures log, bump the error counters, and
+        return ``(None, False)``.
+        """
         self._run_registry_initialized = True
         path = registry_path_for_workflow(cfg.workflow_path)
         if self._run_registry is not None and self._run_registry.path == path:
-            return
+            return self._run_registry, False
         if self._run_registry is not None:
             self._run_registry.close()
         try:
@@ -1102,14 +1213,62 @@ class Orchestrator:
             self._registry_error_count += 1
             self._last_registry_error = f"open: {exc}"
             log.error("run_registry_open_failed", path=str(path), error=str(exc))
-            return
-        registry = self._run_registry
-        self._reclaim_dead_owner_runs(registry, path=path)
+            return None, False
+        return self._run_registry, True
+
+    def _finish_run_registry_open(
+        self, registry: RunRegistry, cfg: ServiceConfig, path: Path
+    ) -> None:
+        """Post-open maintenance: expire stale leases, rehydrate flags."""
         expired = self._registry_guard("expire_stale", registry.expire_stale, 0)
         if expired:
             log.info("run_leases_expired_on_start", count=expired, path=str(path))
         flags = self._registry_guard("list_issue_flags", registry.list_issue_flags, [])
         self._rehydrate_issue_flags(flags, cfg=cfg, registry=registry)
+
+    def _ensure_run_registry(self, cfg: ServiceConfig) -> None:
+        """Open the registry and reclaim dead-owner leases (blocking form).
+
+        The per-record kill+confirm (taskkill / SIGKILL plus the bounded
+        gone-confirm poll) runs inline on the calling thread, completing
+        before this returns. Event-loop callers must use
+        `_ensure_run_registry_async` instead so the OS kill never stalls
+        the tick loop.
+        """
+        registry, fresh = self._open_run_registry(cfg)
+        if not fresh or registry is None:
+            return
+        self._reclaim_dead_owner_runs(registry, path=registry.path)
+        self._finish_run_registry_open(registry, cfg, registry.path)
+
+    async def _ensure_run_registry_async(self, cfg: ServiceConfig) -> None:
+        """Event-loop form of `_ensure_run_registry`.
+
+        Identical semantics — open, reclaim dead owners (kill+confirm
+        completed before return, 'reclaiming' fence observable mid-kill),
+        expire, rehydrate — except each record's blocking kill+confirm
+        runs in a worker thread, so the tick loop keeps servicing ticks
+        while a slow taskkill drains.
+        """
+        registry, fresh = self._open_run_registry(cfg)
+        if not fresh or registry is None:
+            return
+        await self._reclaim_dead_owner_runs_async(registry, path=registry.path)
+        self._finish_run_registry_open(registry, cfg, registry.path)
+
+    def _ensure_run_registry_open_only(self, cfg: ServiceConfig) -> None:
+        """Open + maintenance for sync callers that must never block.
+
+        Same as `_ensure_run_registry` minus the OS-level dead-owner
+        reclaim: the release-gate fallback runs on the event loop and a
+        taskkill there would stall ticks. Dead-owner leases are still
+        honored (they block acquisition) and reclaimed by the next tick's
+        off-loop pass, so correctness never depends on this side effect.
+        """
+        registry, fresh = self._open_run_registry(cfg)
+        if not fresh or registry is None:
+            return
+        self._finish_run_registry_open(registry, cfg, registry.path)
 
     def _reclaim_dead_owner_runs(
         self, registry: RunRegistry, *, path: Path | None = None
@@ -1132,14 +1291,40 @@ class Orchestrator:
             path=str(path or registry.path),
         )
 
+    async def _reclaim_dead_owner_runs_async(
+        self, registry: RunRegistry, *, path: Path | None = None
+    ) -> None:
+        """`_reclaim_dead_owner_runs` with each kill+confirm off the loop."""
+        reclaimed = self._registry_guard(
+            "reclaim_dead_owner", registry.reclaim_dead_owner_leases, []
+        )
+        if not reclaimed:
+            return
+        finalized = []
+        for record in reclaimed:
+            if await self._reap_and_finalize_reclaimed_run_async(registry, record):
+                finalized.append(record)
+        log.info(
+            "run_leases_reclaimed_dead_owner",
+            count=len(finalized),
+            pending_count=len(reclaimed) - len(finalized),
+            identifiers=[record.identifier for record in finalized],
+            path=str(path or registry.path),
+        )
+
     def _release_registry_required(self, cfg: ServiceConfig) -> RunRegistry:
         """Return the release authority store or fail closed.
 
         Ordinary lease bookkeeping intentionally degrades when SQLite is
         unavailable. Application release authority cannot: a missing read
         must never turn a pending verifier or finalizer into a normal ticket.
+
+        Opens without the OS-level reclaim (see
+        `_ensure_run_registry_open_only`) — this fallback can run on the
+        event loop, and dead-owner cleanup is covered by the per-tick
+        off-loop reclaim pass.
         """
-        self._ensure_run_registry(cfg)
+        self._ensure_run_registry_open_only(cfg)
         registry = self._run_registry
         if registry is None:
             raise SymphonyError(
@@ -2003,90 +2188,39 @@ class Orchestrator:
     def _reap_and_finalize_reclaimed_run(
         self, registry: RunRegistry, record: RunRecord
     ) -> bool:
-        """Verify process incarnation, reap it, then release the SQLite fence."""
-        pid = record.backend_agent_pid
-        if pid is not None and pid <= 0:
-            log.warning(
-                "reclaim_invalid_orphan_agent_pid",
-                issue_id=record.issue_id,
-                identifier=record.identifier,
-                pid=pid,
-            )
+        """Verify process incarnation, reap it, then release the SQLite fence.
+
+        Blocking form for synchronous callers (tests, the sync ensure
+        fallback): the OS-level kill+confirm runs inline on this thread.
+        The registry finalize below stays on the caller's thread so the
+        SQLite connection never crosses threads.
+        """
+        outcome = _reclaim_kill_confirm(record)
+        if outcome is None:
             return False
-        if pid is not None:
-            expected_identity = record.backend_process_identity
-            current_identity = process_identity(pid)
-            group_exists = process_group_exists(pid)
-            if current_identity is None:
-                if group_exists is not False:
-                    log.warning(
-                        "reclaim_backend_identity_ambiguous",
-                        issue_id=record.issue_id,
-                        identifier=record.identifier,
-                        pid=pid,
-                    )
-                    return False
-                outcome = "not_found"
-            elif expected_identity is None:
-                # Pre-v8 or failed identity capture: never signal a reusable
-                # numeric pid without proving it is the recorded incarnation.
-                log.warning(
-                    "reclaim_backend_identity_missing",
-                    issue_id=record.issue_id,
-                    identifier=record.identifier,
-                    pid=pid,
-                )
-                return False
-            elif current_identity != expected_identity:
-                # The recorded process incarnation is gone and this pid was
-                # reused. Do not signal the unrelated replacement.
-                outcome = "identity_mismatch"
-            else:
-                try:
-                    killed = kill_process_group(pid)
-                except Exception as exc:
-                    log.warning(
-                        "reclaim_killed_orphan_agent",
-                        issue_id=record.issue_id,
-                        identifier=record.identifier,
-                        pid=pid,
-                        outcome=f"error: {type(exc).__name__}",
-                    )
-                    return False
-                if killed:
-                    deadline = time.monotonic() + 1.0
-                    confirmed_gone = process_group_exists(pid) is False
-                    while not confirmed_gone and time.monotonic() < deadline:
-                        time.sleep(0.05)
-                        confirmed_gone = process_group_exists(pid) is False
-                    if not confirmed_gone:
-                        log.warning(
-                            "reclaim_killed_orphan_agent",
-                            issue_id=record.issue_id,
-                            identifier=record.identifier,
-                            pid=pid,
-                            outcome="unconfirmed",
-                        )
-                        return False
-                    outcome = "killed"
-                elif process_group_exists(pid) is False:
-                    outcome = "not_found"
-                else:
-                    log.warning(
-                        "reclaim_killed_orphan_agent",
-                        issue_id=record.issue_id,
-                        identifier=record.identifier,
-                        pid=pid,
-                        outcome="ambiguous",
-                    )
-                    return False
-            log.warning(
-                "reclaim_killed_orphan_agent",
-                issue_id=record.issue_id,
-                identifier=record.identifier,
-                pid=pid,
-                outcome=outcome,
+        return bool(
+            self._registry_guard(
+                "finalize_reclaimed_lease",
+                lambda: registry.finalize_reclaimed_lease(record.run_id),
+                False,
             )
+        )
+
+    async def _reap_and_finalize_reclaimed_run_async(
+        self, registry: RunRegistry, record: RunRecord
+    ) -> bool:
+        """Off-event-loop form of `_reap_and_finalize_reclaimed_run`.
+
+        The blocking kill+confirm (taskkill + bounded gone-confirm poll)
+        runs in a worker thread; the SQLite claim state and the finalize
+        below stay on the event-loop thread, preserving the registry's
+        thread-affine connection. The kill still completes before this
+        coroutine returns, so the 'reclaiming' fence is observable
+        mid-kill and finalized only afterwards.
+        """
+        outcome = await asyncio.to_thread(_reclaim_kill_confirm, record)
+        if outcome is None:
+            return False
         return bool(
             self._registry_guard(
                 "finalize_reclaimed_lease",
@@ -2096,7 +2230,7 @@ class Orchestrator:
         )
 
 
-    def recent_runs(
+    async def recent_runs(
         self,
         issue_id: str | None = None,
         limit: int = 50,
@@ -2109,7 +2243,9 @@ class Orchestrator:
         if registry is None:
             cfg = self._workflow_state.current()
             if cfg is not None:
-                self._ensure_run_registry(cfg)
+                # Async: the fallback open's dead-owner reclaim (taskkill)
+                # must not block the web loop this handler runs on.
+                await self._ensure_run_registry_async(cfg)
                 registry = self._run_registry
         if registry is None:
             return [], "run registry unavailable"
@@ -2129,12 +2265,12 @@ class Orchestrator:
             return [], self._last_registry_error
         return [_run_record_payload(row) for row in rows], None
 
-    def run_detail(self, run_id: str) -> tuple[dict[str, Any] | None, str | None]:
+    async def run_detail(self, run_id: str) -> tuple[dict[str, Any] | None, str | None]:
         registry = self._run_registry
         if registry is None:
             cfg = self._workflow_state.current()
             if cfg is not None:
-                self._ensure_run_registry(cfg)
+                await self._ensure_run_registry_async(cfg)
                 registry = self._run_registry
         if registry is None:
             return None, "run registry unavailable"
@@ -2147,12 +2283,12 @@ class Orchestrator:
             self._last_registry_error = f"run_detail: {exc}"
             return None, self._last_registry_error
 
-    def run_diagnostic(self, run_id: str) -> tuple[dict[str, Any] | None, str | None]:
+    async def run_diagnostic(self, run_id: str) -> tuple[dict[str, Any] | None, str | None]:
         registry = self._run_registry
         if registry is None:
             cfg = self._workflow_state.current()
             if cfg is not None:
-                self._ensure_run_registry(cfg)
+                await self._ensure_run_registry_async(cfg)
                 registry = self._run_registry
         if registry is None:
             return None, "run registry unavailable"
@@ -2500,6 +2636,29 @@ class Orchestrator:
         )
         return False
 
+    def _agent_pid_identity(self, entry: RunningEntry) -> str | None:
+        """Return the identity fingerprint recorded with this entry's pid.
+
+        The registry's heartbeat persists ``process_identity(pid)`` as
+        ``backend_process_identity`` at the moment `_sync_backend_agent_pid`
+        first records the pid, so the fingerprint survives restarts. None
+        when no registry/run row backs the entry, or when the platform
+        cannot prove identity (win32) — callers pass ``identity=None``
+        through, which keeps the ungated kill-with-warn-once behavior.
+        Lookup failures degrade to None rather than blocking a legitimate
+        kill: the fingerprint is hardening, not authority.
+        """
+        registry = self._run_registry
+        if registry is None or not entry.run_id:
+            return None
+        try:
+            record = registry.get_run(entry.run_id)
+        except KeyError:
+            return None
+        except Exception:
+            return None
+        return record.backend_process_identity
+
     def _sync_backend_agent_pid(
         self, issue_id: str, backend_agent_pid: int | None
     ) -> None:
@@ -2746,7 +2905,7 @@ class Orchestrator:
                 max_ticket_bytes=cfg.artifacts.max_ticket_mb * 1024 * 1024,
             )
             self._ensure_artifact_dir_git_excluded(cfg)
-        self._ensure_run_registry(cfg)
+        await self._ensure_run_registry_async(cfg)
         await self._startup_terminal_cleanup(cfg)
         self._spawn_tick_loop()
 
@@ -3696,11 +3855,11 @@ class Orchestrator:
             )
             self._workspace_manager.update_reuse_policy(cfg.workspace_reuse_policy)
             self._workspace_manager.update_hook_env(_branch_hook_env(cfg))
-        self._ensure_run_registry(cfg)
+        await self._ensure_run_registry_async(cfg)
         self._heartbeat_running_leases()
         if self._run_registry is not None:
             registry = self._run_registry
-            self._reclaim_dead_owner_runs(registry)
+            await self._reclaim_dead_owner_runs_async(registry)
             expired = self._registry_guard("expire_stale", registry.expire_stale, 0)
             if expired:
                 log.info("run_leases_expired", count=expired)
@@ -9713,7 +9872,9 @@ class Orchestrator:
             try:
                 agent_pgid = _normalize_agent_pid(entry.agent_pgid)
                 if agent_pgid is not None and not skip_kill:
-                    killed = kill_process_group(agent_pgid)
+                    killed = kill_process_group(
+                        agent_pgid, identity=self._agent_pid_identity(entry)
+                    )
                     log.warning(
                         "force_eject_killed_process_group",
                         issue_id=issue_id,
@@ -10135,7 +10296,9 @@ class Orchestrator:
                 if agent_pgid is not None:
                     try:
                         killed = await asyncio.to_thread(
-                            kill_process_group, agent_pgid
+                            kill_process_group,
+                            agent_pgid,
+                            identity=self._agent_pid_identity(entry),
                         )
                         log.warning(
                             "force_eject_killed_process_group",
