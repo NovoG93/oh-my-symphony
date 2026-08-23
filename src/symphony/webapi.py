@@ -14,15 +14,17 @@ this blocks DNS-rebinding reads as well as writes. Mutating methods must
 additionally send a JSON content type, which forces a CORS preflight on
 cross-origin HTML/form attempts. Binding to a non-loopback interface is an
 explicit operator opt-in to network exposure and disables the Host check.
-Setting `SYMPHONY_API_TOKEN` adds a credential layer on top: every `/api/`
-request (reads included) must then present it as a bearer token, so an
-exposed bind does not hand full board control to any network peer. The
-shipped SPA supports this mode by prompting for the token and sending
-`Authorization: Bearer` on every fetch; the chat WebSocket is the single
-exception where the token may also arrive as a `?token=` query parameter,
+Setting `SYMPHONY_API_TOKEN` adds a credential layer on top: every operator
+`/api/` request (reads included) must then present it as a bearer token, so an
+exposed bind does not hand full board control to any network peer. The exact
+managed-service health probe may instead present its separate per-launch
+capability header; that capability authorizes only `/api/v1/health`. The
+shipped SPA supports operator-token mode by prompting for the token and sending
+`Authorization: Bearer` on every fetch. The chat WebSocket is the only route
+where the operator token may also arrive as a `?token=` query parameter,
 because browsers cannot set headers on a WebSocket handshake (the query
-exception is scoped to that one route — query strings leak into access
-logs, so no other endpoint accepts it).
+exception is scoped to that one route — query strings leak into access logs,
+so no other endpoint accepts it).
 Fronting the board with a reverse proxy or tunnel is the other opt-in: the
 public name goes in `SYMPHONY_TRUSTED_ORIGINS` so project mutations and the
 chat WebSocket accept it.
@@ -58,6 +60,10 @@ from .errors import (
 )
 from .issue import Issue, registration_order_key
 from .logging import get_logger
+from .service_identity import (
+    SERVICE_INSTANCE_HEADER,
+    normalize_service_probe_credential,
+)
 from .skills import normalize_skill_names
 from .artifacts import ArtifactRecord, ArtifactStore
 from .stats import StatsStore, stats_store_for
@@ -131,9 +137,10 @@ _LOOPBACK_BINDS = {"", "localhost", "127.0.0.1", "::1", "[::1]"}
 # Entries may be full origins (`https://host:port`), bare hostnames (any
 # scheme/port), or `*` to trust every origin.
 TRUSTED_ORIGINS_ENV = "SYMPHONY_TRUSTED_ORIGINS"
-# Optional credential gate for the whole `/api/` surface. Unset or empty
-# keeps the frictionless loopback default; set to a non-empty secret, it
-# requires `Authorization: Bearer <exact token>` on every API request.
+# Optional credential gate for operator requests across the `/api/` surface.
+# Unset/empty keeps the frictionless loopback default. The one non-operator
+# path is the exact managed-service health probe, authenticated by its separate
+# per-launch capability and scoped to `/api/v1/health` below.
 API_TOKEN_ENV = "SYMPHONY_API_TOKEN"
 # The one route where the token may also arrive as `?token=`: browsers
 # cannot set an Authorization header on a WebSocket handshake, so the SPA
@@ -141,9 +148,13 @@ API_TOKEN_ENV = "SYMPHONY_API_TOKEN"
 # else a query-supplied token must stay a 401 because query strings are
 # the part of a URL most likely to end up in access logs.
 _CHAT_WS_PATH = "/api/v1/chat/ws"
+_HEALTH_PATH = "/api/v1/health"
 _CI_EDITABLE_KEYS = {"enabled", "interval_ms", "max_turns", "agent_kind", "modes"}
 BIND_HOST_KEY: web.AppKey[str] = web.AppKey("symphony.bind_host", str)
 CHAT_MANAGER_KEY: web.AppKey[ChatManager] = web.AppKey("symphony.chat", ChatManager)
+SERVICE_INSTANCE_ID_KEY: web.AppKey[str | None] = web.AppKey(
+    "symphony.service_instance_id"
+)
 _MAX_CHAT_MESSAGE = 32_000
 
 
@@ -275,21 +286,43 @@ def _request_has_valid_ws_query_token(request: web.Request, token: str) -> bool:
     )
 
 
+def _request_has_valid_service_instance(
+    request: web.Request, expected_instance_id: str | None
+) -> bool:
+    """Authenticate only the managed service's exact health probe."""
+    expected = normalize_service_probe_credential(expected_instance_id)
+    supplied = normalize_service_probe_credential(
+        request.headers.get(SERVICE_INSTANCE_HEADER)
+    )
+    if expected is None or supplied is None:
+        return False
+    return hmac.compare_digest(
+        supplied.encode("utf-8"), expected.encode("utf-8")
+    )
+
+
 @web.middleware
 async def _api_guard(request: web.Request, handler):
     if request.path.startswith("/api/"):
-        # Optional credential layer: reads leak the board too, so when a
-        # token is configured every API request must present it. Order
-        # matters — authenticate before validating anything else.
+        # Optional credential layer: reads leak the board too, so every
+        # operator request must present the API token. The only alternate
+        # capability is the managed service's exact health probe below.
+        # Order matters — authenticate before validating anything else.
         api_token = _configured_api_token()
         if api_token is not None and not _request_has_valid_bearer(
             request, api_token
         ):
             # Browsers cannot set headers on a WebSocket handshake; the
             # chat socket alone may also present the token as ?token=.
-            if request.path != _CHAT_WS_PATH or not (
+            ws_authorized = request.path == _CHAT_WS_PATH and (
                 _request_has_valid_ws_query_token(request, api_token)
-            ):
+            )
+            health_authorized = request.path == _HEALTH_PATH and (
+                _request_has_valid_service_instance(
+                    request, request.app.get(SERVICE_INSTANCE_ID_KEY)
+                )
+            )
+            if not ws_authorized and not health_authorized:
                 return _json_error(
                     401, "unauthorized", "missing or invalid bearer token"
                 )
@@ -3195,6 +3228,9 @@ def _register_meta_routes(
 
 def register_web_routes(app: web.Application, orchestrator: Orchestrator) -> None:
     ctx = _Ctx(orchestrator)
+    app[SERVICE_INSTANCE_ID_KEY] = normalize_service_probe_credential(
+        getattr(orchestrator, "service_instance_id", None)
+    )
     app.middlewares.append(_api_guard)
     _register_issue_routes(app, ctx, orchestrator)
     _register_workflow_routes(app, ctx, orchestrator)

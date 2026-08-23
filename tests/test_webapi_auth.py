@@ -46,17 +46,28 @@ agent:
 ---
 body
 """
+SERVICE_CAPABILITY = "a" * 43
 
 
 class _StubOrchestrator:
     """Just enough orchestrator surface for the routes these tests hit."""
 
-    def __init__(self, workflow_state: WorkflowState) -> None:
+    def __init__(
+        self,
+        workflow_state: WorkflowState,
+        *,
+        service_instance_id: str | None = None,
+    ) -> None:
         self._workflow_state = workflow_state
+        self._service_instance_id = service_instance_id
 
     @property
     def workflow_state(self) -> WorkflowState:
         return self._workflow_state
+
+    @property
+    def service_instance_id(self) -> str | None:
+        return self._service_instance_id
 
     def snapshot(self) -> dict[str, Any]:
         return {"lanes": [], "running": [], "version": "test"}
@@ -65,11 +76,15 @@ class _StubOrchestrator:
         return False
 
     def health(self) -> dict[str, Any]:
-        return {"ok": True}
+        return {
+            "ok": True,
+            "service_instance_id": self._service_instance_id,
+        }
 
 
-@pytest_asyncio.fixture
-async def client(tmp_path: Path) -> AsyncIterator[TestClient]:
+async def _start_client(
+    tmp_path: Path, *, service_instance_id: str | None
+) -> TestClient:
     # build_app types its parameter as Orchestrator; at runtime it only
     # uses the method protocol we mirror in `_StubOrchestrator`.
     (tmp_path / "WORKFLOW.md").write_text(AUTH_WORKFLOW_TEXT, encoding="utf-8")
@@ -77,10 +92,21 @@ async def client(tmp_path: Path) -> AsyncIterator[TestClient]:
     state = WorkflowState(tmp_path / "WORKFLOW.md")
     cfg, err = state.reload()
     assert err is None and cfg is not None
-    app = build_app(cast(Orchestrator, _StubOrchestrator(state)))
+    app = build_app(
+        cast(
+            Orchestrator,
+            _StubOrchestrator(state, service_instance_id=service_instance_id),
+        )
+    )
     server = TestServer(app)
     cli = TestClient(server)
     await cli.start_server()
+    return cli
+
+
+@pytest_asyncio.fixture
+async def client(tmp_path: Path) -> AsyncIterator[TestClient]:
+    cli = await _start_client(tmp_path, service_instance_id=SERVICE_CAPABILITY)
     try:
         yield cli
     finally:
@@ -144,6 +170,48 @@ async def test_token_set_gates_mutation_routes_too(
         "/api/v1/refresh", json={}, headers={"Authorization": "Bearer sekrit-token"}
     )
     assert allowed.status == 202
+
+
+async def test_tokenized_health_accepts_only_exact_service_instance_header(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv(API_TOKEN_ENV, "sekrit-token")
+    header = "X-Symphony-Service-Instance"
+
+    missing = await client.get("/api/v1/health")
+    assert missing.status == 401
+
+    wrong = await client.get("/api/v1/health", headers={header: "b" * 43})
+    assert wrong.status == 401
+
+    health = await client.get(
+        "/api/v1/health", headers={header: SERVICE_CAPABILITY}
+    )
+    assert health.status == 200
+    assert (await health.json())["service_instance_id"] == SERVICE_CAPABILITY
+
+    other_route = await client.get(
+        "/api/v1/state", headers={header: SERVICE_CAPABILITY}
+    )
+    assert other_route.status == 401
+
+
+async def test_tokenized_health_rejects_short_foreground_instance_id(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv(API_TOKEN_ENV, "sekrit-token")
+    short_id_client = await _start_client(
+        tmp_path, service_instance_id="instance-a"
+    )
+    try:
+        response = await short_id_client.get(
+            "/api/v1/health",
+            headers={"X-Symphony-Service-Instance": "instance-a"},
+        )
+    finally:
+        await short_id_client.close()
+
+    assert response.status == 401
 
 
 async def test_token_not_required_outside_api_paths(
