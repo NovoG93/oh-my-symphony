@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 import subprocess
 from pathlib import Path
@@ -515,10 +516,16 @@ class _FakeChatBackend:
         answer = _ANSWER
         if "offer a separate project" in prompt:
             target = self.init.cwd.parent / "chat-todo-app"
+            # Native Windows paths contain backslashes that are invalid as
+            # raw JSON escapes; chat's strict parser rejects such payloads,
+            # so the marker must be built with a real JSON encoder.
             answer = (
                 "1. Create and register a separate Todo app.\n"
-                '<symphony-project-setup>{"choice": 1, "name": "Todo App", '
-                f'"path": "{target}"}}</symphony-project-setup>'
+                "<symphony-project-setup>"
+                + json.dumps(
+                    {"choice": 1, "name": "Todo App", "path": str(target)}
+                )
+                + "</symphony-project-setup>"
             )
         await self._emit(EVENT_TURN_STARTED, {})
         if self.init.cfg.agent.kind == "prime-agent":

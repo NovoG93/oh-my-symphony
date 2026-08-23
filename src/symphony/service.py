@@ -44,6 +44,12 @@ ServiceState = Literal["running", "stopped"]
 # at evaluation time, marking Win-only branches as unreachable on macOS/Linux.
 # A separately-bound bool keeps every branch analyzable on every host.
 _IS_WIN32: bool = sys.platform == "win32"
+# POSIX-only signal APIs resolved once (same pattern as the getattr'd
+# CREATE_NEW_PROCESS_GROUP flags in _spawn): the module imports and
+# type-checks on win32, while the guarded branches below keep their exact
+# POSIX behavior — os.killpg and signal.SIGKILL always exist there.
+_killpg: Callable[[int, int], None] | None = getattr(os, "killpg", None)
+_SIGKILL: int = getattr(signal, "SIGKILL", signal.SIGTERM)
 DEFAULT_SERVICE_PORT = 9999
 
 
@@ -461,9 +467,12 @@ def terminate_process(pid: int | None, *, force: bool = False) -> bool:
         return False
     if _IS_WIN32:
         return _taskkill_tree(parsed, force=force)
-    sig = signal.SIGKILL if force else signal.SIGTERM
+    sig = _SIGKILL if force else signal.SIGTERM
     try:
-        os.killpg(parsed, sig)
+        if _killpg is None:  # pragma: no cover - win32 returned above
+            os.kill(parsed, sig)
+            return True
+        _killpg(parsed, sig)
     except ProcessLookupError:
         return False
     except PermissionError:
@@ -545,15 +554,29 @@ def _owned_workspace_paths(workflow_path: Path, *, owner_pid: int | None) -> lis
         registry.close()
 
 
+# `ps -axo pid=,command=` on POSIX; on win32 the same `pid<space>command`
+# line shape comes from PowerShell CIM (wmic is deprecated/removed on
+# modern Windows). Null command lines render as an empty command column,
+# which the shared substring match below simply never matches.
+_WIN_PROCESS_ENUMERATOR = [
+    "powershell",
+    "-NoProfile",
+    "-Command",
+    "Get-CimInstance Win32_Process | "
+    "ForEach-Object { '{0} {1}' -f $_.ProcessId, $_.CommandLine }",
+]
+
+
 def _workspace_bound_process_pids(workspace_paths: list[Path]) -> list[int]:
-    if _IS_WIN32 or not workspace_paths:
+    if not workspace_paths:
         return []
     needles = [str(path) for path in workspace_paths if str(path)]
     if not needles:
         return []
+    enumerator = _WIN_PROCESS_ENUMERATOR if _IS_WIN32 else ["ps", "-axo", "pid=,command="]
     try:
         completed = subprocess.run(
-            ["ps", "-axo", "pid=,command="],
+            enumerator,
             stdout=subprocess.PIPE,
             stderr=subprocess.DEVNULL,
             text=True,
