@@ -201,12 +201,19 @@ def _pid_alive_win32(pid: int) -> bool:
     STILL_ACTIVE = 259
     ERROR_ACCESS_DENIED = 5
 
-    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    # These attributes are only defined by ctypes on Windows. Resolve them
+    # dynamically so Linux Pyright can analyze this guarded helper; if an
+    # unusual Windows runtime lacks either API, conservatively honor the lease.
+    win_dll = getattr(ctypes, "WinDLL", None)
+    get_last_error = getattr(ctypes, "get_last_error", None)
+    if win_dll is None or get_last_error is None:
+        return True
+    kernel32 = win_dll("kernel32", use_last_error=True)
     handle = kernel32.OpenProcess(
         PROCESS_QUERY_LIMITED_INFORMATION, False, ctypes.c_ulong(pid)
     )
     if not handle:
-        return ctypes.get_last_error() == ERROR_ACCESS_DENIED
+        return get_last_error() == ERROR_ACCESS_DENIED
     try:
         exit_code = ctypes.c_ulong()
         if not kernel32.GetExitCodeProcess(handle, ctypes.byref(exit_code)):
