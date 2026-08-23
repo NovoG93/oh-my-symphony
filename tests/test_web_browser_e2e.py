@@ -98,7 +98,7 @@ class _StubOrchestrator:
     def issue_snapshot(self, _identifier: str) -> dict[str, Any] | None:
         return None
 
-    def recent_runs(
+    async def recent_runs(
         self,
         issue_id: str | None = None,
         limit: int = 50,
@@ -133,7 +133,7 @@ class _StubOrchestrator:
             "failure_message": None,
         }
 
-    def run_detail(self, run_id: str) -> tuple[dict[str, Any] | None, str | None]:
+    async def run_detail(self, run_id: str) -> tuple[dict[str, Any] | None, str | None]:
         if run_id != "a" * 32:
             return None, None
         return {
@@ -154,8 +154,8 @@ class _StubOrchestrator:
             ],
         }, None
 
-    def run_diagnostic(self, run_id: str) -> tuple[dict[str, Any] | None, str | None]:
-        detail, error = self.run_detail(run_id)
+    async def run_diagnostic(self, run_id: str) -> tuple[dict[str, Any] | None, str | None]:
+        detail, error = await self.run_detail(run_id)
         return ({"schema_version": 1, **detail} if detail else None), error
 
     def request_refresh(self) -> bool:
