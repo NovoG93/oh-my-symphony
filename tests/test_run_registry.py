@@ -1124,7 +1124,7 @@ def test_v5_release_completion_without_ticket_token_is_invalidated(
     assert list(tmp_path.glob("state.db.backup-*"))
 
 
-def test_concurrent_v4_to_v6_migration_backfills_once_after_same_version_read(
+def test_concurrent_v4_migration_applies_each_pending_version_once(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1230,7 +1230,12 @@ def test_concurrent_v4_to_v6_migration_backfills_once_after_same_version_read(
     assert not any(starter.is_alive() for starter in starters)
     assert errors == []
     assert len(results) == 2
-    assert sorted(applied for applied, _generation in results) == [(), (5, 6, 7, 8)]
+    applied_versions = sorted(
+        version
+        for applied, _generation in results
+        for version in applied
+    )
+    assert applied_versions == [5, 6, 7, 8]
     generations = {generation for _applied, generation in results}
     assert len(generations) == 1
     assert next(iter(generations))
@@ -2226,6 +2231,18 @@ def test_continuation_acquisition_race_has_exactly_one_successor(tmp_path: Path)
 # ---------------------------------------------------------------------------
 # _pid_alive: POSIX mapping + real win32 probe (ITEM 3)
 # ---------------------------------------------------------------------------
+
+
+def test_pid_alive_win32_defaults_alive_without_win32_ctypes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An unavailable Win32 API must never authorize duplicate dispatch."""
+    import ctypes
+
+    monkeypatch.delattr(ctypes, "WinDLL", raising=False)
+    monkeypatch.delattr(ctypes, "get_last_error", raising=False)
+
+    assert run_registry_mod._pid_alive_win32(1234) is True
 
 
 def test_pid_alive_posix_mapping(monkeypatch: pytest.MonkeyPatch) -> None:
