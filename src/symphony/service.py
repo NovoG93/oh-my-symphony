@@ -567,10 +567,29 @@ _WIN_PROCESS_ENUMERATOR = [
 ]
 
 
+def _workspace_needle_forms(path: str) -> tuple[str, ...]:
+    """Normalized substring forms of one workspace path for process matching.
+
+    Command lines record paths with either separator and, on Windows,
+    case-insensitive casing; Git-Bash workers may also render a native
+    ``D:\\a\\b`` path in MSYS form ``/d/a/b``. All forms are separator-
+    normalized (``/``) and casefolded so the match survives every spelling.
+    """
+    normalized = path.replace("\\", "/").casefold()
+    forms = {normalized}
+    if len(normalized) > 1 and normalized[1] == ":":
+        forms.add("/" + normalized[0] + normalized[2:])
+    return tuple(forms)
+
+
 def _workspace_bound_process_pids(workspace_paths: list[Path]) -> list[int]:
     if not workspace_paths:
         return []
-    needles = [str(path) for path in workspace_paths if str(path)]
+    needles: list[tuple[str, ...]] = [
+        _workspace_needle_forms(str(path))
+        for path in workspace_paths
+        if str(path)
+    ]
     if not needles:
         return []
     enumerator = _WIN_PROCESS_ENUMERATOR if _IS_WIN32 else ["ps", "-axo", "pid=,command="]
@@ -601,7 +620,8 @@ def _workspace_bound_process_pids(workspace_paths: list[Path]) -> list[int]:
             continue
         if pid == current_pid:
             continue
-        if any(needle in command for needle in needles):
+        normalized_command = command.replace("\\", "/").casefold()
+        if any(any(form in normalized_command for form in forms) for forms in needles):
             pids.append(pid)
     return pids
 
