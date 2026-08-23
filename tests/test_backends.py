@@ -23,6 +23,8 @@ from typing import Any
 
 import pytest
 
+from tests._win_skips import requires_symlink_privilege
+
 import symphony._shell as shell_module
 import symphony.backends.claude_code as claude_module
 import symphony.backends.codex as codex_module
@@ -2093,6 +2095,7 @@ def test_sandbox_uses_workspace_write_negatives() -> None:
     assert _sandbox_uses_workspace_write() is False
 
 
+@requires_symlink_privilege
 def test_scan_workspace_symlinks_collects_resolved_targets(tmp_path: Path) -> None:
     host = tmp_path / "host"
     host.mkdir()
@@ -2117,6 +2120,7 @@ def test_scan_workspace_symlinks_empty_when_no_symlinks(tmp_path: Path) -> None:
     assert _scan_workspace_symlinks(tmp_path) == []
 
 
+@requires_symlink_privilege
 def test_scan_workspace_symlinks_dedupes_across_roots(tmp_path: Path) -> None:
     host = tmp_path / "host_docs"
     host.mkdir()
@@ -2292,6 +2296,7 @@ def test_inject_writable_roots_only_substitutes_first_codex_token() -> None:
     assert _inject_writable_roots(cmd, ["/a"]) == cmd
 
 
+@requires_symlink_privilege
 def test_codex_start_command_prep_injects_when_symlinks_exist(
     tmp_path: Path,
 ) -> None:
@@ -2337,6 +2342,7 @@ def test_codex_start_command_prep_injects_when_symlinks_exist(
     assert str(host_docs.resolve()) in env["SYMPHONY_CODEX_WRITABLE_ROOTS"]
 
 
+@requires_symlink_privilege
 def test_codex_turn_payload_carries_symlink_writable_roots(tmp_path: Path) -> None:
     host_docs = tmp_path / "host_docs"
     host_docs.mkdir()
@@ -2380,6 +2386,7 @@ def test_codex_turn_payload_carries_symlink_writable_roots(tmp_path: Path) -> No
     assert params["sandboxPolicy"]["writableRoots"] == [str(host_docs.resolve())]
 
 
+@requires_symlink_privilege
 def test_codex_start_command_prep_noop_when_not_workspace_write(
     tmp_path: Path,
 ) -> None:
@@ -2438,6 +2445,7 @@ def test_codex_start_command_prep_noop_when_no_symlinks(tmp_path: Path) -> None:
     assert "SYMPHONY_CODEX_WRITABLE_ROOTS" not in env
 
 
+@requires_symlink_privilege
 def test_codex_start_command_prep_uses_env_var_for_wrapper(tmp_path: Path) -> None:
     """Wrapper script case: -c arg injection can't reach codex, so the env
     var is the only signal the wrapper has to honor."""

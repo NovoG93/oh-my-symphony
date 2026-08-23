@@ -28,7 +28,7 @@ import subprocess
 import sys
 from functools import lru_cache
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 
 # Common Git for Windows install locations. Scoop and Winget installs land
@@ -48,6 +48,11 @@ _WSL_LAUNCHER_FRAGMENTS = (
     r"\windows\system32\bash.exe",
     r"\microsoft\windowsapps\bash.exe",
 )
+
+# POSIX-only signal API resolved once so this module imports and type-checks
+# on win32 too; every caller guards with a platform check before reaching it.
+# On POSIX `os.killpg` always exists, so the runtime behavior is unchanged.
+_killpg: Callable[[int, int], None] | None = getattr(os, "killpg", None)
 
 
 def _is_wsl_launcher(path: str) -> bool:
@@ -180,8 +185,15 @@ def _signal_process_group(pid: int, sig: int) -> bool:
     so it leads its own group — otherwise ``killpg`` raises and we fall back
     to signalling only the direct child (the pre-R2 behavior).
     """
+    if _killpg is None:
+        # win32: no process groups — signal only the direct child.
+        try:
+            os.kill(pid, sig)
+            return True
+        except OSError:
+            return False
     try:
-        os.killpg(pid, sig)
+        _killpg(pid, sig)
         return True
     except ProcessLookupError:
         return False

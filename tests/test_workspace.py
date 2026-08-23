@@ -223,7 +223,17 @@ async def test_hook_failure_preserves_full_output_artifacts(tmp_path):
     payload = json.loads(meta.read_text(encoding="utf-8"))
     stdout_path = Path(payload["stdout"])
     stderr_path = Path(payload["stderr"])
-    assert stdout_path.read_text(encoding="utf-8") == full_stdout
+    captured_stdout = stdout_path.read_text(encoding="utf-8")
+    # Git for Windows bash appends a terminal-init clear sequence
+    # (cursor-home + erase-screen + erase-scrollback) to a login shell's
+    # stdout when the script exits via the explicit `exit` builtin — even
+    # with --noprofile/--norc, so it is the binary itself, not any profile.
+    # Hook output captures that platform trailer; the contract under test
+    # (the full hook payload survives into the artifact) ignores it.
+    _GIT_BASH_EXIT_TRAILER = "\x1b[H\x1b[2J\x1b[3J"
+    if captured_stdout.endswith(_GIT_BASH_EXIT_TRAILER):
+        captured_stdout = captured_stdout[: -len(_GIT_BASH_EXIT_TRAILER)]
+    assert captured_stdout == full_stdout
     assert stderr_path.read_text(encoding="utf-8") == full_stderr
     assert str(meta) in str(exc_info.value)
     assert not (root / "MT-HOOK").exists()
