@@ -8,7 +8,6 @@ import json
 import sqlite3
 import shutil
 import subprocess
-import sys
 import threading
 from dataclasses import replace
 from datetime import datetime, timezone
@@ -2937,14 +2936,6 @@ def test_startup_rejects_replayed_completed_finalizer_ticket_version(
     assert removed == []
 
 
-@pytest.mark.skipif(
-    sys.platform == "win32",
-    reason=(
-        "hangs on Windows hosts once gate validation proceeds past the "
-        "byte-exact contract compare (RunRegistry/_startup_terminal_cleanup "
-        "deadlock); Linux CI covers the behavior"
-    ),
-)
 def test_startup_preserves_workspace_for_active_peer_finalizer(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

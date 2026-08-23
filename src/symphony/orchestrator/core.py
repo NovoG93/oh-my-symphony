@@ -32,7 +32,7 @@ from datetime import datetime, timedelta, timezone
 from enum import Enum
 from functools import partial
 from pathlib import Path, PurePosixPath
-from typing import Any, Awaitable, Callable, Coroutine, cast
+from typing import Any, Awaitable, Callable, Coroutine, TypeVar, cast
 
 from .. import __version__
 from .._shell import kill_process_group, process_group_exists, process_identity
@@ -253,6 +253,33 @@ class _ReleaseDispatchAuthority:
 
 class _ReleaseTransitionAuthorityLost(SymphonyError):
     """A stale release worker must exit without mutating its replacement."""
+
+
+_T = TypeVar("_T")
+
+
+class _TrackerClientUnavailable(SymphonyError):
+    """The shared tracker client is closed or closing (stop() raced a poll).
+
+    Raised by `_checkout_shared_tracker_client` and by bridge invocations
+    that observe the pool closing mid-call. Callers already treat tracker
+    bridge failures as retryable (next tick rebuilds or skips), so this is
+    a clean, loggable dead-end rather than a thread-killing RuntimeError.
+    """
+
+
+# httpx raises a bare RuntimeError with this message from `Client.send`
+# once `close()` has run — the exact text is its only stable contract.
+_HTTPX_CLIENT_CLOSED_MARKERS = (
+    "client has been closed",
+    "client has already been closed",
+)
+
+
+def _is_closed_client_runtime_error(exc: BaseException) -> bool:
+    return isinstance(exc, RuntimeError) and any(
+        marker in str(exc) for marker in _HTTPX_CLIENT_CLOSED_MARKERS
+    )
 
 
 # The one path a continuous-improvement agent turn may write in the host
@@ -810,10 +837,17 @@ class Orchestrator:
         # call threw away connection reuse on every poll tick. Built
         # lazily on first use, closed in `stop()`. Guarded by a lock
         # because the bridges run on `asyncio.to_thread` worker threads.
+        # The lock is reentrant: checkout delegates may re-enter guarded
+        # helpers on the same thread.
         self._tracker_client: TrackerClient | None = None
         self._tracker_client_cfg: ServiceConfig | None = None
         self._tracker_client_closed = False
-        self._tracker_client_lock = threading.Lock()
+        # `closing` covers the window while stop() is closing the pool:
+        # new checkouts fail fast instead of rebuilding into a pool that
+        # is about to disappear (or leaking a fresh client past stop()).
+        self._tracker_client_closing = False
+        self._tracker_client_close_race_logged = False
+        self._tracker_client_lock = threading.RLock()
         self._refresh_pending = False
         self._observers: list[Callable[[], Awaitable[None]]] = []
         # Operator-driven pause is split into two pieces:
@@ -1003,7 +1037,10 @@ class Orchestrator:
             agent_pgid = _normalize_agent_pid(entry.agent_pgid)
             if agent_pgid is not None:
                 try:
-                    killed = kill_process_group(agent_pgid)
+                    # win32 kill_process_group shells out to `taskkill /T`;
+                    # keep that subprocess off the event loop so stop()
+                    # drains never stall the service on a slow kill.
+                    killed = await asyncio.to_thread(kill_process_group, agent_pgid)
                 except Exception as exc:
                     log.warning(
                         "worker_process_kill_failed_on_stop",
@@ -2792,10 +2829,14 @@ class Orchestrator:
             self._run_registry.close()
             self._run_registry = None
         # Close the per-lifetime tracker client AFTER the drains above so
-        # in-flight `asyncio.to_thread` bridges finish first. A bridge that
-        # still slips through afterwards rebuilds rather than touching the
-        # closed pool (see `_shared_tracker_client`).
+        # in-flight `asyncio.to_thread` bridges finish first. Bridges that
+        # still slip through afterwards raise a clean retryable
+        # `TrackerClientUnavailable` (see `_invoke_shared_tracker_client`)
+        # instead of touching the closed pool or rebuilding past shutdown.
         with self._tracker_client_lock:
+            # New checkouts must fail fast while the pool is closing; a
+            # rebuild here would race the close and leak a fresh client.
+            self._tracker_client_closing = True
             if self._tracker_client is not None:
                 self._tracker_client.close()
                 self._tracker_client = None
@@ -9634,7 +9675,12 @@ class Orchestrator:
         await self._notify_observers()
 
     def _force_eject_zombie(
-        self, issue_id: str, entry: RunningEntry, cfg: ServiceConfig
+        self,
+        issue_id: str,
+        entry: RunningEntry,
+        cfg: ServiceConfig,
+        *,
+        skip_kill: bool = False,
     ) -> None:
         """Forcibly free a worker slot when cancellation didn't propagate.
 
@@ -9648,6 +9694,11 @@ class Orchestrator:
         own `finally` and `_on_worker_exit_impl` both gate on task identity
         (`entry_foreign_to`) before touching `_running`, so a foreign exit
         skips the live replacement entry instead of ejecting it.
+
+        `skip_kill=True` marks that the caller already performed (and
+        logged) the process-group kill for this entry — used by the async
+        reconcile path, which runs the kill off the event loop via
+        `asyncio.to_thread` (M1) before dropping bookkeeping here.
         """
         removed_entry = self._running.pop(issue_id, None)
         owned_transition = self._app_release_transition_locks.get(issue_id)
@@ -9661,7 +9712,7 @@ class Orchestrator:
         try:
             try:
                 agent_pgid = _normalize_agent_pid(entry.agent_pgid)
-                if agent_pgid is not None:
+                if agent_pgid is not None and not skip_kill:
                     killed = kill_process_group(agent_pgid)
                     log.warning(
                         "force_eject_killed_process_group",
@@ -10053,7 +10104,7 @@ class Orchestrator:
     # reconciliation (§16.3)
     # ------------------------------------------------------------------
 
-    def _reconcile_stall_state(
+    async def _reconcile_stall_state(
         self,
         issue_id: str,
         entry: RunningEntry,
@@ -10072,7 +10123,35 @@ class Orchestrator:
                     identifier=entry.issue.identifier,
                     elapsed_since_cancel_s=round(since_cancel, 1),
                 )
-                self._force_eject_zombie(issue_id, entry, cfg)
+                # M1: win32 kill_process_group shells out to `taskkill /T`.
+                # This coroutine runs on the tick loop, so the kill must go
+                # through a worker thread before the (synchronous) eject
+                # bookkeeping drops the entry. A kill failure still lets
+                # the eject's finallies release the lease and schedule the
+                # retry, then surfaces to the per-issue reconcile guard —
+                # exactly the pre-M1 containment (AF-07).
+                agent_pgid = _normalize_agent_pid(entry.agent_pgid)
+                kill_failure: Exception | None = None
+                if agent_pgid is not None:
+                    try:
+                        killed = await asyncio.to_thread(
+                            kill_process_group, agent_pgid
+                        )
+                        log.warning(
+                            "force_eject_killed_process_group",
+                            issue_id=issue_id,
+                            identifier=entry.issue.identifier,
+                            agent_kind=self._entry_agent_kind(entry),
+                            pid=agent_pgid,
+                            killed=killed,
+                        )
+                    except Exception as exc:
+                        kill_failure = exc
+                self._force_eject_zombie(
+                    issue_id, entry, cfg, skip_kill=True
+                )
+                if kill_failure is not None:
+                    raise kill_failure
             return
         if self.is_paused(issue_id):
             return
@@ -10124,7 +10203,7 @@ class Orchestrator:
                 self._heartbeat_run_lease(issue_id, entry)
                 stall_timeout_ms = self._stall_timeout_ms_for_entry(cfg, entry)
                 if stall_timeout_ms > 0:
-                    self._reconcile_stall_state(
+                    await self._reconcile_stall_state(
                         issue_id,
                         entry,
                         cfg,
@@ -10583,36 +10662,88 @@ class Orchestrator:
         connection pool on every poll tick. One client is built on first
         use and reused across calls; `stop()` closes it. It is rebuilt
         when the live config object changes (hot reload swaps the
-        `ServiceConfig` instance) or, defensively, when a bridge call
-        races past shutdown after the close, rather than touching a
-        closed pool.
+        `ServiceConfig` instance). Once `stop()` starts closing the pool
+        (or has finished closing it) checkouts raise
+        `_TrackerClientUnavailable` instead of rebuilding — a rebuild
+        would race the close, leak a client past shutdown, or hand the
+        caller a pool that is about to be closed under it.
         """
         with self._tracker_client_lock:
+            if self._tracker_client_closing or self._tracker_client_closed:
+                raise _TrackerClientUnavailable(
+                    "tracker client is closed for this orchestrator lifetime"
+                )
             client = self._tracker_client
-            if (
-                client is None
-                or self._tracker_client_closed
-                or cfg is not self._tracker_client_cfg
-            ):
+            if client is None or cfg is not self._tracker_client_cfg:
                 client = build_tracker_client(cfg)
                 self._tracker_client = client
                 self._tracker_client_cfg = cfg
                 self._tracker_client_closed = False
             return client
 
+    def _invoke_shared_tracker_client(
+        self, cfg: ServiceConfig, op: Callable[[TrackerClient], _T]
+    ) -> _T:
+        """Run one tracker call on the shared client, closing-race safe.
+
+        A `stop()` racing this call on another thread can close the httpx
+        pool between checkout and use; httpx then raises a bare
+        `RuntimeError`. Convert it (logged once) into the retryable
+        `_TrackerClientUnavailable` so the `asyncio.to_thread` bridge
+        surfaces a clean failure the next tick can retry instead of an
+        opaque RuntimeError from a dying context.
+        """
+        try:
+            client = self._shared_tracker_client(cfg)
+        except _TrackerClientUnavailable:
+            self._log_tracker_close_race()
+            raise
+        try:
+            return op(client)
+        except _TrackerClientUnavailable:
+            raise
+        except Exception as exc:
+            if not _is_closed_client_runtime_error(exc):
+                raise
+            self._log_tracker_close_race()
+            raise _TrackerClientUnavailable(
+                "tracker client closed during call"
+            ) from exc
+
+    def _log_tracker_close_race(self) -> None:
+        if self._tracker_client_close_race_logged:
+            return
+        self._tracker_client_close_race_logged = True
+        log.warning(
+            "tracker_client_close_race",
+            detail=(
+                "shared tracker client closed while a bridge call was in "
+                "flight; failing this poll retryably"
+            ),
+        )
+
     def _tracker_call_candidates(self, cfg: ServiceConfig) -> list[Issue]:
-        return self._shared_tracker_client(cfg).fetch_candidate_issues()
+        return self._invoke_shared_tracker_client(
+            cfg, lambda client: client.fetch_candidate_issues()
+        )
 
     def _tracker_call_states_by_ids(self, cfg: ServiceConfig, ids: list[str]) -> list[Issue]:
-        return self._shared_tracker_client(cfg).fetch_issue_states_by_ids(ids)
+        return self._invoke_shared_tracker_client(
+            cfg, lambda client: client.fetch_issue_states_by_ids(ids)
+        )
 
     def _tracker_call_full_by_id(self, cfg: ServiceConfig, issue_id: str) -> Issue | None:
         """Single-issue fetch with full body — used by contract validation."""
-        return self._shared_tracker_client(cfg).fetch_issue_full_by_id(issue_id)
+        return self._invoke_shared_tracker_client(
+            cfg, lambda client: client.fetch_issue_full_by_id(issue_id)
+        )
 
     def _tracker_call_terminal_issues(self, cfg: ServiceConfig) -> list[Issue]:
-        return self._shared_tracker_client(cfg).fetch_issues_by_states(
-            cfg.tracker.terminal_states
+        return self._invoke_shared_tracker_client(
+            cfg,
+            lambda client: client.fetch_issues_by_states(
+                cfg.tracker.terminal_states
+            ),
         )
 
     def _tracker_call_record_agent_kind(
@@ -10621,12 +10752,19 @@ class Orchestrator:
         """Best-effort: persist the resolved backend onto the ticket.
 
         Adapters that don't implement ``record_agent_kind`` (e.g. Linear,
-        where the field has no remote analogue) are silently skipped.
+        where the field has no remote analogue) are silently skipped, and
+        so is a call that races `stop()` closing the shared client.
         """
-        record = getattr(self._shared_tracker_client(cfg), "record_agent_kind", None)
-        if record is None:
+
+        def _record(client: TrackerClient) -> None:
+            record = getattr(client, "record_agent_kind", None)
+            if record is not None:
+                record(identifier, agent_kind)
+
+        try:
+            self._invoke_shared_tracker_client(cfg, _record)
+        except _TrackerClientUnavailable:
             return
-        record(identifier, agent_kind)
 
     def _tracker_call_record_last_agent_kind(
         self, cfg: ServiceConfig, identifier: str, agent_kind: str
@@ -10635,13 +10773,18 @@ class Orchestrator:
 
         Used instead of the pin on `stage_kinds`-routed boards, where writing
         the pin would freeze the first lane's backend for the whole ticket.
+        Races with `stop()` closing the shared client are silently skipped.
         """
-        record = getattr(
-            self._shared_tracker_client(cfg), "record_last_agent_kind", None
-        )
-        if record is None:
+
+        def _record(client: TrackerClient) -> None:
+            record = getattr(client, "record_last_agent_kind", None)
+            if record is not None:
+                record(identifier, agent_kind)
+
+        try:
+            self._invoke_shared_tracker_client(cfg, _record)
+        except _TrackerClientUnavailable:
             return
-        record(identifier, agent_kind)
 
     # ------------------------------------------------------------------
     # startup cleanup (§8.6)
