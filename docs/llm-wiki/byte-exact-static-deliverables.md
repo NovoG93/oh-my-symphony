@@ -63,6 +63,8 @@ The TASK-9 artifact `profile-smoke.txt` was removed without rewriting history:
 | 2026-08-19 (TASK-22) | Re-applied the pattern unchanged for `copilot-smoke.txt` | third end-to-end confirmation; same bytes (`4f 4b 0a`) and sha256 `a12b7cb4…` for `OK\n`; fixture at `work/expected-ok.txt`; committed content re-proven via `git show HEAD:<path>` when re-run commands are gated |
 | 2026-08-29 (TASK-23) | Re-applied the pattern for `verify-upstream-smoke.txt` (`all systems go\n`) | fourth end-to-end confirmation; `printf 'all systems go\n'` -> 15 bytes `61 6c 6c … 6f 0a`, sha256 `5b0128ca…`; fixture at `work/expected-upstream-smoke.txt` |
 | 2026-08-29 (TASK-23) | Ticket contract headings must match exactly — `## Merge Status: <subtitle>` failed the gate as "missing ## Merge Status" | the gate matches heading strings verbatim (extends TASK-22's "gate reads the kanban body, not the vault" lesson); subtitles belong in the body, never in the heading |
+| 2026-08-29 (TASK-24) | Byte-exact discipline applied to a program's *stdout*: AC is "prints exactly `hello from symphony`", proved by a subprocess test (`result.stdout == "hello from symphony\n"`) plus `od` hexdump (20 bytes `68 65 6c … 79 0a`) | extends the static-file pattern to code deliverables — the output, not a file, is the byte-exact deliverable; the same `od`/`wc` proof chain applies to stdout |
+| 2026-08-29 (TASK-24) | Exact-heading rule recurred: verify wrote `## Merge Status: <subtitle>` again despite the TASK-23 row; Document renamed it to bare `## Merge Status` | the gate matches headings verbatim — the subtitle variant still fails the contract as "missing ## Merge Status"; producing stages must use the bare heading, subtitle moves into the body |
 
 ## Not covered
 
