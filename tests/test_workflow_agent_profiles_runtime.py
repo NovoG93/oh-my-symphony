@@ -659,7 +659,6 @@ def test_dispatch_logs_profile_model_reasoning_effort(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     import asyncio
-    from datetime import datetime, timezone
     import symphony.orchestrator.core as core_mod
     from symphony.orchestrator import Orchestrator
     from symphony.workflow.state import WorkflowState
@@ -910,6 +909,4 @@ def test_orchestrator_stage_transition_persists_profile_to_run_record(
     assert rec.agent_profile == "sonnet-builder"
     assert rec.model == "sonnet"
     assert rec.reasoning_effort == ""
-
-
 

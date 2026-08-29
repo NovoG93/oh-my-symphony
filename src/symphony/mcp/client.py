@@ -20,9 +20,11 @@ class SymphonyClient:
         base_url: str,
         timeout: float = 30.0,
         transport: httpx.AsyncBaseTransport | None = None,
+        api_token: str | None = None,
     ) -> None:
         self._base_url = base_url.rstrip("/")
         self._timeout = timeout
+        self._api_token = api_token
         self._client = httpx.AsyncClient(
             base_url=self._base_url, timeout=timeout, transport=transport
         )
@@ -43,7 +45,14 @@ class SymphonyClient:
         last_exc: Exception | None = None
         for attempt in range(attempts):
             try:
-                resp = await self._client.request(method, path, json=json, params=params)
+                headers = (
+                    {"Authorization": f"Bearer {self._api_token}"}
+                    if self._api_token
+                    else None
+                )
+                resp = await self._client.request(
+                    method, path, json=json, params=params, headers=headers
+                )
                 if resp.status_code in (429, 500, 502, 503, 504) and retry and attempt < attempts - 1:
                     await _backoff(attempt)
                     continue
@@ -177,7 +186,12 @@ class SymphonyClient:
     async def get_artifact_file(self, identifier: str, name: str) -> dict:
         """Fetch a raw artifact file (bytes + content type); not JSON-decoded."""
         resp = await self._client.get(
-            f"/api/v1/issues/{identifier}/artifacts/{name}"
+            f"/api/v1/issues/{identifier}/artifacts/{name}",
+            headers=(
+                {"Authorization": f"Bearer {self._api_token}"}
+                if self._api_token
+                else None
+            ),
         )
         if resp.status_code == 404:
             raise NotFound("artifact not found in symphony")
