@@ -9,7 +9,9 @@
 - Observed `upstream/main`: `1f56213aebbab69f8cd73bf0f4f8c63f16307eaf`.
 - M1: `b92ba932ea52ec5fe56b467320cb40401c35a1b1`.
 - M1 parents: `d97795affee1e800fb57539e799bc8559e61f6ad` and `aaf2b72da3b97fb9d0b71fb881fafea38f59de6d`.
-- M2: **pending**. No M2 hash is invented here: the hash must be finalized after M2 because the promotion and its ledger evidence are self-referential in timing.
+- M2: `bec62af9ec1fe8ce9f0d0aa72f171c7a6417d34a`, subject `merge: integrate upstream functional hardening`.
+  - Parents: `d97795affee1e800fb57539e799bc8559e61f6ad` and `da286d22c5ea4cf78c2365d3655ea0fa658e63c9`.
+  - The subsequent docs-only commit is necessary because a commit cannot contain its own final hash.
 
 The integration intentionally used `upstream/dev`: it is the requested functional-hardening line and its range is auditable from the recorded base to the integrated head. Upstream/main-only release and documentation commits were excluded because they are outside this functional-dev synchronization scope and are not ancestors in the selected dev range.
 
@@ -51,6 +53,8 @@ Every commit in `git log --reverse 8b28dbba8f2b59952acea518d52b68c5a42bc1b0..aaf
 Batch-focused and full evidence recorded for M1: **2722 passed / 14 skipped / 83.81%**; affected tests **566 passed**; security **159 passed**; live API **10/10**; Ruff, Pyright, i18n, uv-lock, MCP, CLI, service, Node, and diff checks passed. The orphan-isolated check passed. Doctor has the expected protected-repository and missing-Copilot FAILs described above.
 
 Windows-native tests were unavailable and are explicitly **not claimed**. On **2026-08-29**, the user explicitly waived the Windows-native proof and authorized proceeding with M2. This waiver does not convert unrun checks into evidence: residual risk remains for backend process-tree termination, Win32 path/junction/locking/argv behavior, doctor path handling, capability-probed skips, run-registry liveness, hook capture, and cross-platform service/core checks. These scenarios remain required follow-up validation.
+
+Post-M2 verification passed: **2722 passed / 14 skipped / 83.81%**; Ruff, Pyright, uv-lock, and i18n checks passed; focused evidence passed (**574/159**); MCP and service smokes passed; ancestry checks passed. Windows-native proof remains explicitly waived, not claimed.
 
 ## Future upstream audit commands
 
