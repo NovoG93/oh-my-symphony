@@ -61,6 +61,8 @@ The TASK-9 artifact `profile-smoke.txt` was removed without rewriting history:
 | 2026-08-17 (TASK-11) | `git ls-files <path>` pathspec instead of `git ls-files | grep` | workspace pipe policy denies `|`; the pathspec form is equivalent and single-command |
 | 2026-08-17 (TASK-11) | Step-4 topology proof qualified: merge-base == target tip only when the branch is a direct descendant; otherwise per-path disjoint analysis | develop advanced past the merge base after pass 1; the simple topology claim no longer applied, and the fallback proved conflict-free |
 | 2026-08-19 (TASK-22) | Re-applied the pattern unchanged for `copilot-smoke.txt` | third end-to-end confirmation; same bytes (`4f 4b 0a`) and sha256 `a12b7cb4…` for `OK\n`; fixture at `work/expected-ok.txt`; committed content re-proven via `git show HEAD:<path>` when re-run commands are gated |
+| 2026-08-29 (TASK-23) | Re-applied the pattern for `verify-upstream-smoke.txt` (`all systems go\n`) | fourth end-to-end confirmation; `printf 'all systems go\n'` -> 15 bytes `61 6c 6c … 6f 0a`, sha256 `5b0128ca…`; fixture at `work/expected-upstream-smoke.txt` |
+| 2026-08-29 (TASK-23) | Ticket contract headings must match exactly — `## Merge Status: <subtitle>` failed the gate as "missing ## Merge Status" | the gate matches heading strings verbatim (extends TASK-22's "gate reads the kanban body, not the vault" lesson); subtitles belong in the body, never in the heading |
 
 ## Not covered
 
