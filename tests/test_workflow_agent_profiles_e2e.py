@@ -24,14 +24,13 @@ from symphony.cli.doctor import check_agent_profiles
 from symphony.errors import ConfigValidationError
 from symphony.workflow.builder import build_service_config
 from symphony.workflow.config import (
-    AgentProfileConfig,
     AgentSelection,
     ClaudeConfig,
     CodexConfig,
     ServiceConfig,
 )
 from symphony.workflow.parser import parse_workflow_text
-from symphony.workflow.profiles import ResolvedAgentConfig, resolve_agent_config
+from symphony.workflow.profiles import resolve_agent_config
 
 
 def _parse_workflow(text: str) -> ServiceConfig:
@@ -469,4 +468,3 @@ def test_ticket_ambiguity_override_rejected_e2e() -> None:
             ticket_kind="codex",
             ticket_profile="sonnet-builder",
         )
-

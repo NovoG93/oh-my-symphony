@@ -75,7 +75,11 @@ def build_mcp(settings: Settings) -> FastMCP:
             enable_dns_rebinding_protection=False
         ),
     )
-    client = SymphonyClient(settings.symphony_base_url, settings.timeout_seconds)
+    client = SymphonyClient(
+        settings.symphony_base_url,
+        settings.timeout_seconds,
+        api_token=settings.symphony_api_token,
+    )
     policy = Policy(settings.allowed_projects, allow_control=settings.allow_control)
     idem = IdempotencyStore(settings.idempotency_db)
 

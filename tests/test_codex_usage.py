@@ -1,13 +1,11 @@
 from __future__ import annotations
 
-import asyncio
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 import textwrap
 import pytest
 
 from symphony.backends import (
-    EVENT_NOTIFICATION,
     EVENT_PROVIDER_USAGE_EXHAUSTED,
     BackendInit,
     ProviderCapacityError,
@@ -21,7 +19,6 @@ from symphony.backends.codex import (
 from symphony.backends.usage import (
     ProviderUsageSnapshot,
     UsageProbe,
-    UsageWindow,
     USAGE_PROBES,
     get_usage_probe,
 )
@@ -31,7 +28,7 @@ from symphony.orchestrator.core import Orchestrator, _EligibilityDisposition
 from symphony.orchestrator.entries import RunningEntry
 from symphony.orchestrator.usage import ProviderUsageManager, UsageDecision
 from symphony.workflow.builder import build_service_config
-from symphony.workflow.config import CodexConfig, ServiceConfig, UsagePoolConfig
+from symphony.workflow.config import ServiceConfig, UsagePoolConfig
 from symphony.workflow.parser import parse_workflow_text
 from symphony.workflow.state import WorkflowState
 

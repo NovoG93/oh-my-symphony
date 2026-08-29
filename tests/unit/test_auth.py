@@ -26,6 +26,11 @@ def test_verify_token_requires_configured_token():
         verify_token("abc", None)
 
 
+def test_verify_token_rejects_non_ascii_without_server_error():
+    with pytest.raises(AuthenticationError):
+        verify_token("Bearer café", "secret")
+
+
 async def _ok_app(scope, receive, send):
     assert scope["type"] == "http"
     resp = JSONResponse({"ok": True})
