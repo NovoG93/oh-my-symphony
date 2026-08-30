@@ -9321,8 +9321,15 @@ class Orchestrator:
         # Rate limits.
         rl = event.get("rate_limits")
         if isinstance(rl, dict):
-            self._latest_rate_limits = rl
-            from ..backends.codex import normalize_codex_rate_limits
+            from ..backends.codex import (
+                _merge_sparse_rate_limit_fields,
+                normalize_codex_rate_limits,
+            )
+
+            self._latest_rate_limits = _merge_sparse_rate_limit_fields(
+                self._latest_rate_limits,
+                rl,
+            )
 
             pool_id = "codex"
             if entry is not None and entry.agent_profile:
@@ -9331,7 +9338,11 @@ class Orchestrator:
                     pool_id = prof.usage_pool
             elif entry is not None and entry.agent_kind:
                 pool_id = entry.agent_kind
-            snap = normalize_codex_rate_limits(rl, pool_id=pool_id)
+            snap = normalize_codex_rate_limits(
+                self._latest_rate_limits,
+                pool_id=pool_id,
+                previous=self._usage_manager.snapshot(pool_id),
+            )
             self._usage_manager.set_snapshot(pool_id, snap)
 
         # Provider quota / capacity exhaustion event.
