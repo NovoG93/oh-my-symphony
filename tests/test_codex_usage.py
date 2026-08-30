@@ -403,6 +403,46 @@ async def test_codex_updated_notification_updates_shared_pool(tmp_path: Path) ->
     assert latest["credits"]["balance"] == "10"
 
 
+@pytest.mark.asyncio
+async def test_orchestrator_merges_sparse_direct_codex_rate_limit_events() -> None:
+    orch = _orch()
+    issue = _issue("TASK-SPARSE")
+    orch._running[issue.id] = RunningEntry(
+        issue=issue,
+        started_at=datetime.now(timezone.utc),
+        retry_attempt=0,
+        worker_task=None,
+        workspace_path=Path("/tmp/ws-task-sparse"),
+    )
+
+    await orch._on_codex_event(
+        issue.id,
+        {
+            "event": "notification",
+            "rate_limits": {
+                "primary": {"usedPercent": 10, "windowDurationMins": 300},
+                "secondary": {"usedPercent": 20, "windowDurationMins": 10080},
+            },
+        },
+    )
+    await orch._on_codex_event(
+        issue.id,
+        {
+            "event": "notification",
+            "rate_limits": {
+                "primary": {"usedPercent": 30, "windowDurationMins": 300},
+                "secondary": None,
+            },
+        },
+    )
+
+    snapshot = orch._usage_manager.snapshot("codex")
+    assert snapshot is not None
+    assert snapshot.windows["five_hour"].used_percent == 30.0
+    assert snapshot.windows["weekly"].used_percent == 20.0
+    assert orch._latest_rate_limits["secondary"]["usedPercent"] == 20
+
+
 def test_codex_unknown_window_is_preserved_or_ignored_safely() -> None:
     raw = {
         "weird_custom_window": {

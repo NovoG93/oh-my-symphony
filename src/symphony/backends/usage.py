@@ -31,12 +31,12 @@ class ProviderUsageSnapshot:
     pool_id: str
     source: str
     windows: dict[str, UsageWindow] = field(default_factory=dict)
-    credits: ProviderCreditInfo | None = None
     hard_limit_reached: bool = False
     # Only authoritative telemetry may block scheduling.
     authoritative: bool = True
     observed_at: datetime | None = None
     stale: bool = False
+    credits: ProviderCreditInfo | None = None
 
 
 @runtime_checkable
