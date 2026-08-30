@@ -3031,6 +3031,13 @@
     }
   }
 
+  // Keep quota decisions on the raw numeric values, but avoid exposing the
+  // long floating-point tails produced when AGY reports remaining_fraction.
+  function formatUsagePercent(value) {
+    if (value == null || !Number.isFinite(Number(value))) return value;
+    return Math.round(Number(value) * 100) / 100;
+  }
+
   function buildProviderUsageCard(usagePools, providerUsage) {
     const card = el('div', { class: 'card-panel provider-usage-card', id: 'provider-usage-card' });
     card.appendChild(el('h3', null, t('usage.providerUsage')));
@@ -3093,14 +3100,12 @@
         );
       }
 
-      // Collect all window keys
-      const windowKeys = new Set();
-      if (poolCfg && poolCfg.caps) {
-        for (const k of Object.keys(poolCfg.caps)) windowKeys.add(k);
-      }
-      if (poolData && poolData.windows) {
-        for (const k of Object.keys(poolData.windows)) windowKeys.add(k);
-      }
+      // Collect reported windows only.  Caps are deliberately not allowed to
+      // manufacture empty rows (a provider may omit a window while logging in
+      // or while its quota endpoint is unavailable).
+      const reportedWindows = poolData && poolData.windows && typeof poolData.windows === 'object' && !Array.isArray(poolData.windows)
+        ? poolData.windows : {};
+      const windowKeys = new Set(Object.keys(reportedWindows));
 
       if (windowKeys.size === 0) {
         poolSec.appendChild(el('div', { class: 'history-muted usage-empty-pool' }, t('usage.unavailable')));
@@ -3112,21 +3117,60 @@
           monthly: t('usage.monthly'),
         };
         const windowsList = el('div', { class: 'usage-windows-list' });
-        for (const winKey of Array.from(windowKeys).sort()) {
-          const winData = (poolData && poolData.windows && poolData.windows[winKey]) || {};
-          const cap = poolCfg && poolCfg.caps ? poolCfg.caps[winKey] : null;
+        const grouped = poolSource === 'agy' || (poolCfg && poolCfg.quota_group);
+        const windowPart = (value) => {
+          // The API keeps malformed/unknown quota metadata for diagnostics.
+          // Never pass an object through as a DOM child: el() expects a
+          // Node/string/number and appendChild would otherwise crash the SPA.
+          return (typeof value === 'string' || typeof value === 'number') && String(value) !== ''
+            ? String(value) : null;
+        };
+        const windowInfo = (winKey, winData) => {
+          const rawGroup = windowPart(winData && (winData.group || winData.group_key));
+          const rawPeriod = windowPart(winData && (winData.period || winData.period_key));
+          const keyParts = String(winKey).match(/^(gemini|third_party)_(five_hour|weekly)$/);
+          return {
+            group: rawGroup || (keyParts && keyParts[1]) || null,
+            period: rawPeriod || (keyParts && keyParts[2]) || winKey,
+          };
+        };
+        const sortedKeys = Array.from(windowKeys).sort((a, b) => {
+          const ia = windowInfo(a, reportedWindows[a]);
+          const ib = windowInfo(b, reportedWindows[b]);
+          return String(ia.group || '').localeCompare(String(ib.group || '')) || String(ia.period).localeCompare(String(ib.period));
+        });
+        let lastGroup = null;
+        for (const winKey of sortedKeys) {
+          const winData = reportedWindows[winKey] || {};
+          const info = windowInfo(winKey, winData);
+          if (grouped && info.group && info.group !== lastGroup) {
+            const groupLabel = info.group === 'gemini' ? t('usage.groupGemini')
+              : info.group === 'third_party' ? t('usage.groupThirdParty') : info.group;
+            windowsList.appendChild(el('h5', { class: 'usage-window-group', 'data-quota-group': info.group }, groupLabel));
+            lastGroup = info.group;
+          }
+          // Grouped pools use the short cap names (five_hour/weekly), but
+          // only for the configured quota group. Flat pools retain exact-key
+          // behavior for backwards compatibility.
+          const cap = poolCfg && poolCfg.caps
+            ? poolCfg.quota_group != null
+              ? (info.group === poolCfg.quota_group ? poolCfg.caps[info.period] : null)
+              : poolCfg.caps[winKey]
+            : null;
           const used = winData.used_percent;
           let remaining = winData.remaining_percent;
           if (remaining == null && used != null) {
             remaining = Math.round((100 - used) * 100) / 100;
           }
           const resetsAt = winData.resets_at;
-          const winTitle = winLabels[winKey] || winKey.replace(/_/g, ' ');
+          const winTitle = winLabels[info.period] || winLabels[winKey] || winKey.replace(/_/g, ' ');
+          const displayUsed = formatUsagePercent(used);
+          const displayRemaining = formatUsagePercent(remaining);
 
           const row = el('div', { class: 'usage-window-row' });
           const winHeader = el('div', { class: 'usage-window-header' }, [
             el('span', { class: 'usage-window-title' }, winTitle),
-            el('span', { class: 'usage-window-used-label' }, used != null ? t('usage.usedPercent', { n: used }) : t('usage.unavailable')),
+            el('span', { class: 'usage-window-used-label' }, used != null ? t('usage.usedPercent', { n: displayUsed }) : t('usage.unavailable')),
           ]);
           row.appendChild(winHeader);
 
@@ -3145,7 +3189,7 @@
           // Meta row: remaining, cap, reset time
           const metaItems = [];
           if (remaining != null) {
-            metaItems.push(el('span', { class: 'usage-meta-item usage-meta-remaining' }, `${t('usage.remaining')}: ${t('usage.remainingPercent', { n: remaining })}`));
+            metaItems.push(el('span', { class: 'usage-meta-item usage-meta-remaining' }, `${t('usage.remaining')}: ${t('usage.remainingPercent', { n: displayRemaining })}`));
           }
           if (cap != null) {
             metaItems.push(el('span', { class: 'usage-meta-item usage-meta-cap' }, `${t('usage.configuredCap')}: ${t('usage.capPercent', { n: cap })}`));

@@ -584,6 +584,8 @@
     'usage.usedPercent': '{n}% used',
     'usage.remainingPercent': '{n}% remaining',
     'usage.capPercent': '{n}%',
+    'usage.groupGemini': 'Gemini Models',
+    'usage.groupThirdParty': 'Claude/GPT Models',
 
     // -- Priorities -------------------------------------------------------
     'priority.urgent': 'Urgent',
@@ -1191,6 +1193,8 @@
     'usage.usedPercent': '{n}% 사용됨',
     'usage.remainingPercent': '{n}% 남음',
     'usage.capPercent': '{n}%',
+    'usage.groupGemini': 'Gemini 모델',
+    'usage.groupThirdParty': 'Claude/GPT 모델',
 
     'priority.urgent': '긴급',
 

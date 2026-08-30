@@ -346,8 +346,16 @@ usage_pools:
 
   agy:          # builder
     source: agy
+    quota_group: gemini
     caps:
-      daily: 80
+      five_hour: 80
+      weekly: 70
+
+  # A Claude/GPT AGY profile should use quota_group: third_party. If a
+  # workflow dispatches both model families, define separate pools (for
+  # example agy-gemini and agy-third-party) and point each profile's
+  # usage_pool at the matching pool; caps are enforced only within that
+  # selected quota group.
 
   copilot:      # reviewer (Verify) — GitHub Copilot CLI
     source: copilot

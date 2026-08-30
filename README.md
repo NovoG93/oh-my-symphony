@@ -248,6 +248,28 @@ Usage is modeled **per shared usage pool/provider quota** (`usage_pools:`), neve
 - **Capacity Exhaustion:** If a provider signals hard quota exhaustion at runtime (`EVENT_PROVIDER_USAGE_EXHAUSTED`), the attempt halts without burning the retry budget, returning the ticket to `waiting_provider_usage` until capacity returns.
 - **Provider Usage UI Card:** Runtime quota telemetry (used %, remaining %, reset countdown, capacity paused state) is displayed in the built-in web UI next to Agent Policy.
 
+AGY exposes separate quota groups for Gemini Models and Claude/GPT Models. A
+pool can select the group whose account capacity it should enforce:
+
+```yaml
+usage_pools:
+  agy-gemini:
+    source: agy
+    quota_group: gemini
+    caps: { five_hour: 80, weekly: 70 }
+  agy-third-party:
+    source: agy
+    quota_group: third_party
+    caps: { five_hour: 80, weekly: 70 }
+
+agent_profiles:
+  gemini-builder: { kind: agy, usage_pool: agy-gemini }
+  claude-reviewer: { kind: agy, usage_pool: agy-third-party }
+```
+
+Use separate pools when both model families are dispatched: exhaustion in the
+unselected AGY group does not pause a profile using the other group.
+
 #### Resolution Precedence (8 Tiers)
 Symphony resolves the effective agent per dispatch using 8 deterministic tiers:
 1. `dispatch_profile` (explicit CLI / runtime dispatch profile)

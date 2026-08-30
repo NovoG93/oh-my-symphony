@@ -2484,6 +2484,13 @@ agent: { kind: codex }
                 remaining_percent=49.0,
                 resets_at=datetime(2026, 8, 20, 14, 0, tzinfo=timezone.utc),
             ),
+            # A malformed legacy probe value must not become bare NaN in the
+            # JSON response (browsers reject it while parsing API state).
+            "malformed": UsageWindow(
+                key="malformed",
+                used_percent=float("nan"),
+                remaining_percent=float("inf"),
+            ),
         },
         credits=ProviderCreditInfo(
             has_credits=True,
@@ -2506,6 +2513,8 @@ agent: { kind: codex }
     assert pu["codex"]["windows"]["five_hour"]["used_percent"] == 63.0
     assert pu["codex"]["windows"]["five_hour"]["remaining_percent"] == 37.0
     assert pu["codex"]["windows"]["five_hour"]["resets_at"] == "2026-08-17T23:00:00+00:00"
+    assert pu["codex"]["windows"]["malformed"]["used_percent"] is None
+    assert pu["codex"]["windows"]["malformed"]["remaining_percent"] is None
     assert pu["codex"]["credits"] == {
         "has_credits": True,
         "unlimited": False,
@@ -2551,4 +2560,3 @@ agent: { kind: claude }
     orch = Orchestrator(wf_state, usage_manager=mgr)
     pu = orch.snapshot()["provider_usage"]
     assert pu["claude"]["windows"]["five_hour"]["remaining_percent"] == 58.0
-

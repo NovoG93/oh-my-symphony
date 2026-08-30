@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import asyncio
 import copy
+import math
 import json
 import os
 import re
@@ -3215,7 +3216,15 @@ class Orchestrator:
             if snap is not None and snap.windows:
                 for w_key, w in snap.windows.items():
                     used = w.used_percent
+                    if isinstance(used, (int, float)) and not isinstance(used, bool):
+                        used = float(used) if math.isfinite(float(used)) else None
                     remaining = w.remaining_percent
+                    if isinstance(remaining, (int, float)) and not isinstance(remaining, bool):
+                        remaining = (
+                            float(remaining)
+                            if math.isfinite(float(remaining))
+                            else None
+                        )
                     if remaining is None and used is not None:
                         remaining = (
                             round(100.0 - float(used), 2)
@@ -3232,7 +3241,15 @@ class Orchestrator:
                         "remaining_percent": remaining,
                         "resets_at": resets,
                     }
-            elif pool_cfg is not None and pool_cfg.caps:
+                    if w.group_key is not None:
+                        windows_proj[w_key]["group"] = w.group_key
+                    if w.period_key is not None:
+                        windows_proj[w_key]["period"] = w.period_key
+            elif (
+                pool_cfg is not None
+                and pool_cfg.caps
+                and pool_cfg.quota_group is None
+            ):
                 for w_key in pool_cfg.caps:
                     windows_proj[w_key] = {
                         "used_percent": None,

@@ -17,6 +17,8 @@ class UsageWindow:
     used_percent: float | None
     remaining_percent: float | None
     resets_at: datetime | None = None
+    group_key: str | None = None
+    period_key: str | None = None
 
 
 @dataclass(frozen=True)
