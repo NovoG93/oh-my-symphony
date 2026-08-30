@@ -2443,7 +2443,11 @@ agent:
 def test_snapshot_exposes_provider_usage(tmp_path: Path) -> None:
     """Stage 5: orchestrator.snapshot() includes provider_usage mapping."""
     from datetime import datetime, timezone
-    from symphony.backends.usage import ProviderUsageSnapshot, UsageWindow
+    from symphony.backends.usage import (
+        ProviderCreditInfo,
+        ProviderUsageSnapshot,
+        UsageWindow,
+    )
     from symphony.orchestrator.core import Orchestrator
     from symphony.orchestrator.usage import ProviderUsageManager
     from symphony.workflow import WorkflowState
@@ -2481,6 +2485,11 @@ agent: { kind: codex }
                 resets_at=datetime(2026, 8, 20, 14, 0, tzinfo=timezone.utc),
             ),
         },
+        credits=ProviderCreditInfo(
+            has_credits=True,
+            unlimited=False,
+            balance="42.5",
+        ),
         hard_limit_reached=False,
         authoritative=True,
     )
@@ -2497,6 +2506,11 @@ agent: { kind: codex }
     assert pu["codex"]["windows"]["five_hour"]["used_percent"] == 63.0
     assert pu["codex"]["windows"]["five_hour"]["remaining_percent"] == 37.0
     assert pu["codex"]["windows"]["five_hour"]["resets_at"] == "2026-08-17T23:00:00+00:00"
+    assert pu["codex"]["credits"] == {
+        "has_credits": True,
+        "unlimited": False,
+        "balance": "42.5",
+    }
 
 
 def test_remaining_percent_is_100_minus_used_percent(tmp_path: Path) -> None:
@@ -2537,5 +2551,4 @@ agent: { kind: claude }
     orch = Orchestrator(wf_state, usage_manager=mgr)
     pu = orch.snapshot()["provider_usage"]
     assert pu["claude"]["windows"]["five_hour"]["remaining_percent"] == 58.0
-
 

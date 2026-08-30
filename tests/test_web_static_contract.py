@@ -546,12 +546,18 @@ def test_provider_usage_card_exists() -> None:
     assert ".provider-usage-card" in css
     assert ".usage-bar-track" in css
     assert ".usage-bar-fill" in css
+    assert ".settings-body > .provider-usage-card { grid-column: 1 / -1;" in css
+    assert "grid-template-columns: repeat(auto-fit, minmax(min(100%, 24rem), 1fr))" in css
     assert "'usage.providerUsage': 'Provider Usage'" in i18n
     assert "'usage.providerUsage': '공급자 사용량'" in i18n
     assert "'usage.capacityPaused': 'Capacity paused'" in i18n
     assert "'usage.availableAfter': 'Available after'" in i18n
     assert "Capacity paused" in js or "t('usage.capacityPaused')" in js
     assert "Available after" in js or "t('usage.availableAfter')" in js
+    assert "credits.has_credits === true || credits.unlimited === true" in js
+    assert "'usage.capPercent': '{n}%'" in i18n
+    assert "'usage.capPercent': 'Configured cap: {n}%'" not in i18n
+    assert "'usage.capPercent': '설정된 상한: {n}%'" not in i18n
 
 
 def test_waiting_provider_usage_has_translation() -> None:

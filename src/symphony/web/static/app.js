@@ -3138,6 +3138,19 @@
         poolSec.appendChild(windowsList);
       }
 
+      const credits = poolData && poolData.credits;
+      if (credits && (credits.has_credits === true || credits.unlimited === true)) {
+        let creditsValue = t('usage.creditsAvailable');
+        if (credits.unlimited === true) {
+          creditsValue = t('usage.unlimitedCredits');
+        } else if (credits.balance != null) {
+          creditsValue = t('usage.creditBalance', { n: credits.balance });
+        }
+        poolSec.appendChild(el('div', { class: 'usage-credits' }, [
+          el('span', { class: 'usage-credits-label' }, t('usage.credits')),
+          el('span', { class: 'usage-credits-value' }, creditsValue),
+        ]));
+      }
 
       list.appendChild(poolSec);
     }

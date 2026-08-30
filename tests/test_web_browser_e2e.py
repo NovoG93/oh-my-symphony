@@ -59,6 +59,21 @@ tracker:
 agent:
   kind: codex
 
+usage_pools:
+  codex:
+    source: codex
+    caps:
+      five_hour: 80
+      weekly: 90
+  claude:
+    source: claude
+    caps:
+      five_hour: 75
+  agy:
+    source: agy
+    caps:
+      weekly: 85
+
 prompts:
   stages:
     Todo: ./prompts/stages/todo.md
@@ -93,6 +108,57 @@ class _StubOrchestrator:
                 "seconds_running": 0,
             },
             "rate_limits": None,
+            "provider_usage": {
+                "agy": {
+                    "source": "agy",
+                    "windows": {
+                        "weekly": {
+                            "used_percent": 85,
+                            "remaining_percent": 15,
+                            "resets_at": "2026-09-01T00:00:00+00:00",
+                        }
+                    },
+                    "status": "capacity_paused",
+                    "stale": False,
+                    "authoritative": True,
+                },
+                "claude": {
+                    "source": "claude",
+                    "windows": {
+                        "five_hour": {
+                            "used_percent": 25,
+                            "remaining_percent": 75,
+                            "resets_at": None,
+                        }
+                    },
+                    "status": "available",
+                    "stale": True,
+                    "authoritative": False,
+                },
+                "codex": {
+                    "source": "codex",
+                    "windows": {
+                        "five_hour": {
+                            "used_percent": 12,
+                            "remaining_percent": 88,
+                            "resets_at": "2026-08-30T15:00:00+00:00",
+                        },
+                        "weekly": {
+                            "used_percent": 34,
+                            "remaining_percent": 66,
+                            "resets_at": "2026-09-05T00:00:00+00:00",
+                        },
+                    },
+                    "credits": {
+                        "has_credits": True,
+                        "unlimited": False,
+                        "balance": "42.5",
+                    },
+                    "status": "available",
+                    "stale": False,
+                    "authoritative": True,
+                },
+            },
         }
 
     def issue_snapshot(self, _identifier: str) -> dict[str, Any] | None:
@@ -411,6 +477,8 @@ async def _exercise_settings_layout(page: Any, web_base_url: str) -> None:
         await page.set_viewport_size({"width": width, "height": 900})
         await page.goto(f"{web_base_url}/#/settings", wait_until="networkidle")
         await page.locator(".settings-card").first.wait_for()
+        provider_card = page.locator("#provider-usage-card")
+        await provider_card.wait_for()
         assert await page.locator(".settings-body").get_by_role(
             "heading", level=2
         ).all_text_contents() == [
@@ -419,6 +487,33 @@ async def _exercise_settings_layout(page: Any, web_base_url: str) -> None:
             "Automation",
         ]
         await _assert_no_document_overflow(page, f"settings at {width}px")
+        provider_dims = await provider_card.evaluate(
+            """node => ({
+              scrollWidth: node.scrollWidth,
+              clientWidth: node.clientWidth,
+              gridColumnStart: getComputedStyle(node).gridColumnStart,
+              gridColumnEnd: getComputedStyle(node).gridColumnEnd,
+              rect: node.getBoundingClientRect().toJSON(),
+            })"""
+        )
+        heading_rect = await page.locator(".settings-section-heading").first.evaluate(
+            "node => node.getBoundingClientRect().toJSON()"
+        )
+        assert provider_dims["scrollWidth"] <= provider_dims["clientWidth"] + 2
+        assert provider_dims["gridColumnStart"] == "1"
+        assert provider_dims["gridColumnEnd"] == "-1"
+        assert abs(provider_dims["rect"]["width"] - heading_rect["width"]) <= 2
+        pools = provider_card.locator(".provider-usage-pool")
+        assert await pools.count() == 3
+        pool_rects = await pools.evaluate_all(
+            "nodes => nodes.map(node => node.getBoundingClientRect().toJSON())"
+        )
+        assert min(rect["width"] for rect in pool_rects) >= 220
+        same_row = abs(pool_rects[0]["top"] - pool_rects[1]["top"]) <= 2
+        assert same_row is (width >= 1100), (width, pool_rects)
+        usage_text = await provider_card.inner_text()
+        assert "Configured cap: Configured cap:" not in usage_text
+        assert "Credits\nBalance: 42.5" in usage_text
         cards = page.locator(".settings-card")
         for index in range(await cards.count()):
             dims = await cards.nth(index).evaluate(
