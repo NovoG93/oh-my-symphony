@@ -346,8 +346,10 @@ usage_pools:
 
   agy:          # builder
     source: agy
+    quota_group: gemini
     caps:
-      daily: 80
+      five_hour: 80
+      weekly: 70
 
   copilot:      # reviewer (Verify) — GitHub Copilot CLI
     source: copilot
