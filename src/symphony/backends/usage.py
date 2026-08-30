@@ -20,10 +20,18 @@ class UsageWindow:
 
 
 @dataclass(frozen=True)
+class ProviderCreditInfo:
+    has_credits: bool
+    unlimited: bool
+    balance: str | None = None
+
+
+@dataclass(frozen=True)
 class ProviderUsageSnapshot:
     pool_id: str
     source: str
     windows: dict[str, UsageWindow] = field(default_factory=dict)
+    credits: ProviderCreditInfo | None = None
     hard_limit_reached: bool = False
     # Only authoritative telemetry may block scheduling.
     authoritative: bool = True

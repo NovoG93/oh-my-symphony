@@ -149,6 +149,131 @@ def test_codex_rate_limits_read_normalization() -> None:
     assert result.windows["weekly"].used_percent == 33.3
 
 
+def test_codex_0147_payload_restores_both_windows_without_metadata_windows() -> None:
+    raw = {
+        "rateLimits": {
+            "limitId": "codex",
+            "limitName": None,
+            "primary": {
+                "usedPercent": 12,
+                "windowDurationMins": 300,
+                "resetsAt": 1788105600,
+            },
+            "secondary": {
+                "usedPercent": 34,
+                "windowDurationMins": 10080,
+                "resetsAt": 1788710400,
+            },
+            "credits": {
+                "hasCredits": False,
+                "unlimited": False,
+                "balance": None,
+            },
+            "individualLimit": None,
+            "planType": "plus",
+            "rateLimitReachedType": None,
+        },
+        "rateLimitsByLimitId": None,
+        "rateLimitResetCredits": {
+            "availableCount": 0,
+            "credits": [],
+        },
+    }
+
+    result = normalize_codex_rate_limits(raw)
+
+    assert set(result.windows) == {"five_hour", "weekly"}
+    assert result.windows["five_hour"].used_percent == 12.0
+    assert result.windows["weekly"].used_percent == 34.0
+    assert result.credits is None
+
+
+def test_codex_rate_limits_by_limit_id_codex_fallback_is_supported() -> None:
+    raw = {
+        "rateLimitsByLimitId": {
+            "other": {
+                "primary": {"usedPercent": 99, "windowDurationMins": 300},
+            },
+            "codex": {
+                "limitId": "codex",
+                "primary": {"usedPercent": 21, "windowDurationMins": 300},
+                "secondary": {"usedPercent": 43, "windowDurationMins": 10080},
+                "rateLimitReachedType": None,
+            },
+        },
+    }
+
+    result = normalize_codex_rate_limits(raw)
+
+    assert result.windows["five_hour"].used_percent == 21.0
+    assert result.windows["weekly"].used_percent == 43.0
+
+
+def test_codex_weekly_only_initial_snapshot_stays_weekly_only() -> None:
+    raw = {
+        "rateLimits": {
+            "limitId": "codex",
+            "primary": {"usedPercent": 31, "windowDurationMins": 10080},
+            "secondary": None,
+            "credits": None,
+            "individualLimit": None,
+        }
+    }
+
+    result = normalize_codex_rate_limits(raw)
+
+    assert set(result.windows) == {"weekly"}
+
+
+@pytest.mark.parametrize(
+    ("credits", "expected_unlimited", "expected_balance"),
+    [
+        ({"hasCredits": True, "unlimited": False, "balance": "42.5"}, False, "42.5"),
+        ({"hasCredits": False, "unlimited": True, "balance": None}, True, None),
+    ],
+)
+def test_codex_usable_credits_are_normalized_separately(
+    credits: dict[str, object],
+    expected_unlimited: bool,
+    expected_balance: str | None,
+) -> None:
+    result = normalize_codex_rate_limits(
+        {
+            "rateLimits": {
+                "primary": {"usedPercent": 1, "windowDurationMins": 300},
+                "credits": credits,
+            }
+        }
+    )
+
+    assert set(result.windows) == {"five_hour"}
+    assert result.credits is not None
+    assert result.credits.unlimited is expected_unlimited
+    assert result.credits.balance == expected_balance
+
+
+def test_codex_credits_never_participate_in_scheduling_caps() -> None:
+    result = normalize_codex_rate_limits(
+        {
+            "rateLimits": {
+                "credits": {
+                    "hasCredits": True,
+                    "unlimited": False,
+                    "balance": "0",
+                }
+            }
+        }
+    )
+    manager = ProviderUsageManager()
+    manager.set_snapshot("codex", result)
+
+    assert result.windows == {}
+    assert manager.evaluate(
+        "codex",
+        UsagePoolConfig(source="codex", caps={"five_hour": 1.0}),
+    ) == UsageDecision.READY
+
+
 def test_codex_multiple_limit_ids_are_preserved() -> None:
     raw = {
         "limit_300": {
@@ -189,6 +314,31 @@ async def test_codex_updated_notification_updates_shared_pool(tmp_path: Path) ->
     )
     backend = CodexAppServerBackend(init)
 
+    await backend._handle_notification(
+        {
+            "method": "account/rateLimits/updated",
+            "params": {
+                "rateLimits": {
+                    "primary": {
+                        "usedPercent": 10,
+                        "windowDurationMins": 300,
+                        "resetsAt": 1788105600,
+                    },
+                    "secondary": {
+                        "usedPercent": 64,
+                        "windowDurationMins": 10080,
+                        "resetsAt": 1788710400,
+                    },
+                    "credits": {
+                        "hasCredits": True,
+                        "unlimited": False,
+                        "balance": "10",
+                    },
+                }
+            },
+        }
+    )
+
     notification = {
         "method": "account/rateLimits/updated",
         "params": {
@@ -197,10 +347,8 @@ async def test_codex_updated_notification_updates_shared_pool(tmp_path: Path) ->
                     "usedPercent": 82.5,
                     "windowDurationMins": 300,
                 },
-                "secondary": {
-                    "usedPercent": 64.0,
-                    "windowDurationMins": 10080,
-                },
+                "secondary": None,
+                "credits": None,
             }
         },
     }
@@ -212,6 +360,47 @@ async def test_codex_updated_notification_updates_shared_pool(tmp_path: Path) ->
     assert snapshot is not None
     assert snapshot.windows["five_hour"].used_percent == 82.5
     assert snapshot.windows["weekly"].used_percent == 64.0
+    assert snapshot.windows["weekly"].resets_at == datetime.fromtimestamp(
+        1788710400, tz=timezone.utc
+    )
+    assert snapshot.credits is not None
+    assert snapshot.credits.balance == "10"
+    latest = backend.latest_rate_limits
+    assert latest is not None
+    assert latest["secondary"]["usedPercent"] == 64
+    assert latest["credits"]["balance"] == "10"
+
+    await backend._handle_notification(
+        {
+            "method": "account/rateLimits/updated",
+            "params": {
+                "rateLimits": {
+                    "primary": {
+                        "usedPercent": None,
+                        "windowDurationMins": 300,
+                        "resetsAt": None,
+                    },
+                    "credits": {
+                        "hasCredits": True,
+                        "unlimited": None,
+                        "balance": None,
+                    },
+                }
+            },
+        }
+    )
+    snapshot = manager.snapshot("codex")
+    assert snapshot is not None
+    assert snapshot.windows["five_hour"].used_percent == 82.5
+    assert snapshot.windows["five_hour"].resets_at == datetime.fromtimestamp(
+        1788105600, tz=timezone.utc
+    )
+    latest = backend.latest_rate_limits
+    assert latest is not None
+    assert latest["primary"]["usedPercent"] == 82.5
+    assert latest["primary"]["resetsAt"] == 1788105600
+    assert latest["credits"]["unlimited"] is False
+    assert latest["credits"]["balance"] == "10"
 
 
 def test_codex_unknown_window_is_preserved_or_ignored_safely() -> None:

@@ -463,6 +463,7 @@ def test_provider_usage_snapshot_dataclass() -> None:
     assert minimal.authoritative is True
     assert minimal.observed_at is None
     assert minimal.stale is False
+    assert minimal.credits is None
 
     with pytest.raises(FrozenInstanceError):
         snapshot.hard_limit_reached = True  # type: ignore[misc]

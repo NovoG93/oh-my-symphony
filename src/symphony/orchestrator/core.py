@@ -3261,6 +3261,12 @@ class Orchestrator:
                 "stale": stale,
                 "authoritative": authoritative,
             }
+            if snap is not None and snap.credits is not None:
+                result[pool_id]["credits"] = {
+                    "has_credits": snap.credits.has_credits,
+                    "unlimited": snap.credits.unlimited,
+                    "balance": snap.credits.balance,
+                }
 
         return result
 

@@ -566,6 +566,10 @@
     'usage.daily': 'Daily',
     'usage.monthly': 'Monthly',
     'usage.remaining': 'Remaining',
+    'usage.credits': 'Credits',
+    'usage.creditsAvailable': 'Available',
+    'usage.unlimitedCredits': 'Unlimited',
+    'usage.creditBalance': 'Balance: {n}',
     'usage.configuredCap': 'Configured cap',
     'usage.unavailable': 'Usage unavailable',
     'usage.stale': 'stale',
@@ -579,7 +583,7 @@
     'usage.tasksPaused': 'New {pool} tasks paused',
     'usage.usedPercent': '{n}% used',
     'usage.remainingPercent': '{n}% remaining',
-    'usage.capPercent': 'Configured cap: {n}%',
+    'usage.capPercent': '{n}%',
 
     // -- Priorities -------------------------------------------------------
     'priority.urgent': 'Urgent',
@@ -1169,6 +1173,10 @@
     'usage.daily': '일간',
     'usage.monthly': '월간',
     'usage.remaining': '남음',
+    'usage.credits': '크레딧',
+    'usage.creditsAvailable': '사용 가능',
+    'usage.unlimitedCredits': '무제한',
+    'usage.creditBalance': '잔액: {n}',
     'usage.configuredCap': '설정된 상한',
     'usage.unavailable': '사용량 정보 없음',
     'usage.stale': '오래됨',
@@ -1182,7 +1190,7 @@
     'usage.tasksPaused': '새 {pool} 작업 일시정지',
     'usage.usedPercent': '{n}% 사용됨',
     'usage.remainingPercent': '{n}% 남음',
-    'usage.capPercent': '설정된 상한: {n}%',
+    'usage.capPercent': '{n}%',
 
     'priority.urgent': '긴급',
 

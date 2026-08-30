@@ -2287,8 +2287,9 @@ a { color: inherit; }
 .cycle-chip { border-radius: 999px; padding: .05rem .4rem; color: var(--danger); background: color-mix(in srgb, var(--danger) 10%, transparent); font-size: .68rem; font-weight: 700; }
 
 /* Provider Usage Card ---------------------------------------------------- */
-.provider-usage-card { margin-top: 1.5rem; }
-.provider-usage-list { display: flex; flex-direction: column; gap: 1.25rem; margin-top: 1rem; }
+.provider-usage-card { min-width: 0; margin-top: 1.5rem; }
+.settings-body > .provider-usage-card { grid-column: 1 / -1; width: 100%; }
+.provider-usage-list { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 24rem), 1fr)); gap: 1.25rem; margin-top: 1rem; }
 .provider-usage-pool { padding: 1rem; border: 1px solid var(--border); border-radius: 6px; background: var(--surface-1); }
 .usage-pool-header { display: flex; align-items: center; justify-content: space-between; gap: 1rem; margin-bottom: .75rem; }
 .usage-pool-title-group { display: flex; align-items: baseline; gap: .75rem; flex-wrap: wrap; }
@@ -2311,4 +2312,12 @@ a { color: inherit; }
 .usage-bar-fill--estimated { background-image: repeating-linear-gradient(45deg, transparent, transparent 4px, rgba(255,255,255,.25) 4px, rgba(255,255,255,.25) 8px); }
 .usage-window-meta { display: flex; flex-wrap: wrap; gap: .75rem 1.25rem; font-size: .75rem; color: var(--text-secondary); }
 .usage-meta-item { display: inline-flex; align-items: center; }
+.usage-credits { display: flex; align-items: center; justify-content: space-between; gap: .75rem; margin-top: .85rem; padding-top: .75rem; border-top: 1px solid var(--border); font-size: .75rem; }
+.usage-credits-label { color: var(--text-secondary); font-weight: 650; }
+.usage-credits-value { min-width: 0; overflow-wrap: anywhere; color: var(--text-primary); font-family: var(--font-mono); text-align: right; }
 .usage-empty, .usage-empty-pool { font-size: .8125rem; padding: .5rem 0; }
+
+@media (max-width: 768px) {
+  .provider-usage-list { grid-template-columns: minmax(0, 1fr); }
+  .usage-pool-header { align-items: flex-start; flex-direction: column; }
+}
