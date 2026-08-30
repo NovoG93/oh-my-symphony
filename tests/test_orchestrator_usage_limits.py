@@ -61,6 +61,33 @@ def _orch(cfg: ServiceConfig | None = None) -> Orchestrator:
     return Orchestrator(state)
 
 
+def test_provider_usage_projection_exposes_group_and_period_without_empty_rows() -> None:
+    cfg = _parse_config("""
+    tracker: {kind: file}
+    agent: {kind: codex}
+    usage_pools:
+      agy:
+        source: agy
+        quota_group: gemini
+        caps: {five_hour: 80, weekly: 70}
+    """)
+    orch = _orch(cfg)
+    orch.usage_manager.set_snapshot("agy", ProviderUsageSnapshot(
+        "agy", "agy", windows={
+            "gemini_five_hour": UsageWindow(
+                "gemini_five_hour", 20, 80, None, "gemini", "five_hour"
+            )
+        }
+    ))
+    windows = orch.provider_usage_snapshot()["agy"]["windows"]
+    assert windows["gemini_five_hour"]["group"] == "gemini"
+    assert windows["gemini_five_hour"]["period"] == "five_hour"
+    assert "weekly" not in windows
+    # A grouped pool with no telemetry must not synthesize empty rows.
+    orch.usage_manager.snapshots.pop("agy")
+    assert orch.provider_usage_snapshot()["agy"]["windows"] == {}
+
+
 # --- Stage 6.10 Scheduler Tests ---
 
 

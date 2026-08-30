@@ -1062,7 +1062,7 @@ def _validated_usage_pools(raw: Any) -> dict[str, UsagePoolConfig]:
                 f"usage_pools[{name!r}] must be a mapping",
                 value=pool_data,
             )
-        allowed_keys = {"source", "caps"}
+        allowed_keys = {"source", "caps", "quota_group"}
         for k in pool_data:
             if k not in allowed_keys:
                 raise ConfigValidationError(
@@ -1115,7 +1115,23 @@ def _validated_usage_pools(raw: Any) -> dict[str, UsagePoolConfig]:
                 )
             caps[window] = num_val
 
-        out[name] = UsagePoolConfig(source=source, caps=caps)
+        quota_group_raw = pool_data.get("quota_group")
+        if quota_group_raw is not None and (
+            not isinstance(quota_group_raw, str) or not quota_group_raw.strip()
+        ):
+            raise ConfigValidationError(
+                f"usage_pools[{name!r}].quota_group must be a non-empty string",
+                value=quota_group_raw,
+            )
+        quota_group = quota_group_raw.strip() if isinstance(quota_group_raw, str) else None
+        if quota_group is not None:
+            quota_group = quota_group.lower()
+            if quota_group not in {"gemini", "third_party"}:
+                raise ConfigValidationError(
+                    f"usage_pools[{name!r}].quota_group must be 'gemini' or 'third_party'",
+                    value=quota_group_raw,
+                )
+        out[name] = UsagePoolConfig(source=source, caps=caps, quota_group=quota_group)
     return out
 
 

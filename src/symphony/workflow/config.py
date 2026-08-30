@@ -128,6 +128,7 @@ class UsagePoolConfig:
 
     source: str
     caps: dict[str, float]
+    quota_group: str | None = None
 
 
 @dataclass(frozen=True)
@@ -892,4 +893,3 @@ class ServiceConfig:
             dispatch_kind=dispatch_kind,
             agent_profiles=self.agent_profiles,
         )
-

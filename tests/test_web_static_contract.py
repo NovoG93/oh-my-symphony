@@ -558,6 +558,22 @@ def test_provider_usage_card_exists() -> None:
     assert "'usage.capPercent': '{n}%'" in i18n
     assert "'usage.capPercent': 'Configured cap: {n}%'" not in i18n
     assert "'usage.capPercent': '설정된 상한: {n}%'" not in i18n
+    assert "usage.groupGemini" in js
+    assert "usage.groupThirdParty" in js
+    assert "'usage.groupGemini': 'Gemini Models'" in i18n
+    assert "'usage.groupThirdParty': 'Claude/GPT Models'" in i18n
+    assert "data-quota-group" in js
+    assert "reportedWindows" in js
+    assert "function formatUsagePercent(value)" in js
+    # AGY may preserve malformed quota metadata; object-valued group/period
+    # fields previously reached appendChild and crashed the settings route.
+    assert "typeof value === 'string' || typeof value === 'number'" in js
+    assert "typeof poolData.windows === 'object' && !Array.isArray(poolData.windows)" in js
+    # Legacy pools remain exact-key only; short period aliases are scoped to a
+    # configured, matching quota group.
+    assert "poolCfg.quota_group != null" in js
+    assert "info.group === poolCfg.quota_group ? poolCfg.caps[info.period] : null" in js
+    assert "poolCfg.caps[winKey]" in js
 
 
 def test_waiting_provider_usage_has_translation() -> None:

@@ -860,6 +860,7 @@ def _workflow_payload(cfg: ServiceConfig) -> dict[str, Any]:
             name: {
                 "source": pool.source,
                 "caps": dict(pool.caps),
+                **({"quota_group": pool.quota_group} if pool.quota_group is not None else {}),
             }
             for name, pool in cfg.usage_pools.items()
         },

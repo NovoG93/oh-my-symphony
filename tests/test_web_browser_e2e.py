@@ -71,8 +71,10 @@ usage_pools:
       five_hour: 75
   agy:
     source: agy
+    quota_group: gemini
     caps:
-      weekly: 85
+      five_hour: 80
+      weekly: 70
 
 prompts:
   stages:
@@ -112,10 +114,36 @@ class _StubOrchestrator:
                 "agy": {
                     "source": "agy",
                     "windows": {
-                        "weekly": {
+                        "gemini_five_hour": {
+                            "group": "gemini",
+                            "period": "five_hour",
+                            "used_percent": 20.123456789,
+                            "remaining_percent": 79.876543211,
+                            "resets_at": "2026-08-30T18:00:00+00:00",
+                        },
+                        "gemini_weekly": {
+                            # A malformed metadata value must not take down
+                            # the whole settings route (the API preserves
+                            # unknown provider fields for diagnostics).
+                            "group": {"unexpected": "object"},
+                            "period": "weekly",
                             "used_percent": 85,
                             "remaining_percent": 15,
                             "resets_at": "2026-09-01T00:00:00+00:00",
+                        },
+                        "third_party_five_hour": {
+                            "group": "third_party",
+                            "period": "five_hour",
+                            "used_percent": 45,
+                            "remaining_percent": 55,
+                            "resets_at": "2026-08-30T19:00:00+00:00",
+                        },
+                        "third_party_weekly": {
+                            "group": "third_party",
+                            "period": "weekly",
+                            "used_percent": 35,
+                            "remaining_percent": 65,
+                            "resets_at": "2026-09-02T00:00:00+00:00",
                         }
                     },
                     "status": "capacity_paused",
@@ -514,6 +542,17 @@ async def _exercise_settings_layout(page: Any, web_base_url: str) -> None:
         usage_text = await provider_card.inner_text()
         assert "Configured cap: Configured cap:" not in usage_text
         assert "Credits\nBalance: 42.5" in usage_text
+        agy_pool = provider_card.locator('[data-pool-id="agy"]')
+        assert await agy_pool.get_by_role("heading", level=5).all_text_contents() == [
+            "Gemini Models",
+            "Claude/GPT Models",
+        ]
+        assert await agy_pool.locator(".usage-window-row").count() == 4
+        assert await agy_pool.locator(".usage-meta-cap").count() == 2
+        assert "Configured cap: 80%" in await agy_pool.inner_text()
+        assert "Configured cap: 70%" in await agy_pool.inner_text()
+        assert "20.12% used" in await agy_pool.inner_text()
+        assert "79.88% remaining" in await agy_pool.inner_text()
         cards = page.locator(".settings-card")
         for index in range(await cards.count()):
             dims = await cards.nth(index).evaluate(
