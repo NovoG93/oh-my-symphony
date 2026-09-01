@@ -1280,6 +1280,7 @@ subset of `runs`, `preview`, `projects`, and `debug`:
 export SYMPHONY_API_TOKEN_FILE=/home/symphony/.config/symphony/api-token
 export SYMPHONY_TRUSTED_ORIGINS=http://192.168.0.60:9999
 export SYMPHONY_REMOTE_OPERATOR_CAPABILITIES=runs,preview,projects
+export SYMPHONY_API_AUTH_MODE=operator
 ```
 
 Remote privileged requests require all three settings: a valid bearer token,
@@ -1287,6 +1288,10 @@ an exact trusted Host (including port), and the matching capability. Loopback
 requests remain passwordless. `GET /api/v1/operator-capabilities` reports the
 effective per-capability grants without exposing token contents. `debug` is
 intentionally omitted above and remains loopback-only.
+`SYMPHONY_API_AUTH_MODE=global` is the default and keeps the legacy bearer
+requirement on remote API requests; `operator` is an explicit opt-in that
+leaves unaffected board/workflow/Git/chat/statistics reads passwordless while
+applying the capability gate only to privileged surfaces.
 
 ### CLI Kanban TUI (primary UI)
 

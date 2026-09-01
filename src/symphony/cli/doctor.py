@@ -145,6 +145,9 @@ def check_api_token_env(cfg: ServiceConfig) -> CheckResult:
     del cfg  # env-only check; the signature keeps the common shape
     raw = os.environ.get("SYMPHONY_API_TOKEN")
     effective_raw = raw.strip() if raw is not None else ""
+    auth_mode = os.environ.get("SYMPHONY_API_AUTH_MODE", "global").strip().lower()
+    if auth_mode not in {"global", "operator"}:
+        return CheckResult(name, "fail", "SYMPHONY_API_AUTH_MODE must be 'global' or 'operator'")
     token_file = os.environ.get("SYMPHONY_API_TOKEN_FILE", "").strip()
     capabilities_raw = os.environ.get("SYMPHONY_REMOTE_OPERATOR_CAPABILITIES", "")
     capabilities = {
@@ -164,17 +167,17 @@ def check_api_token_env(cfg: ServiceConfig) -> CheckResult:
             "SYMPHONY_REMOTE_OPERATOR_CAPABILITIES contains unknown values: "
             + ", ".join(sorted(unknown)),
         )
-    if "*" in origins and capabilities:
+    if "*" in origins and (capabilities or auth_mode == "operator"):
         return CheckResult(
             name, "fail",
             "wildcard SYMPHONY_TRUSTED_ORIGINS cannot authorize remote operator capabilities",
         )
-    if capabilities and not (effective_raw or token_file):
+    if (capabilities or auth_mode == "operator") and not (effective_raw or token_file):
         return CheckResult(
             name, "fail",
             "remote operator capabilities are enabled but no API token or token file is configured",
         )
-    if capabilities and not origins:
+    if (capabilities or auth_mode == "operator") and not origins:
         return CheckResult(
             name, "fail",
             "remote operator capabilities are enabled but SYMPHONY_TRUSTED_ORIGINS is empty",

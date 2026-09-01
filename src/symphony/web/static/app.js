@@ -55,6 +55,12 @@
   }
 
   let authBannerState = { open: false, dismissed: false };
+  let operatorAuthPromptRequested = false;
+
+  function requestOperatorAuthPrompt() {
+    operatorAuthPromptRequested = true;
+    showApiTokenBanner(false);
+  }
 
   function handleApiUnauthorized() {
     revokeOperatorCapabilities();
@@ -65,7 +71,10 @@
       storeApiToken(null);
       authBannerState.dismissed = false;
     }
-    if (!authBannerState.dismissed) showApiTokenBanner(hadToken);
+    const globalAuth = state.operatorCapabilities.authMode !== 'operator';
+    if (globalAuth || hadToken || operatorAuthPromptRequested) {
+      if (!authBannerState.dismissed) showApiTokenBanner(hadToken);
+    }
   }
 
   function showApiTokenBanner(rejected) {
@@ -92,10 +101,18 @@
         return;
       }
       storeApiToken(token);
+      operatorAuthPromptRequested = false;
       authBannerState.dismissed = false;
       hideApiTokenBanner();
       showToast(t('auth.tokenSaved'), 'success');
-      await refreshOperatorCapabilities();
+      const capability = await refreshOperatorCapabilities();
+      if (capability.tokenValid === false) {
+        storeApiToken(null);
+        operatorAuthPromptRequested = true;
+        authBannerState.dismissed = false;
+        showApiTokenBanner(true);
+        return;
+      }
       // Re-run the board fetch immediately; a chat page also needs its
       // WebSocket rebuilt so the handshake carries the new ?token=.
       await refreshBoard();
@@ -347,7 +364,7 @@
     openModalBackdrop: null,
     openMenu: null,
     wfRerender: null,
-    operatorCapabilities: { loaded: false, grants: {}, reason: null, authBlocked: false },
+    operatorCapabilities: { loaded: false, grants: {}, reason: null, authBlocked: false, authMode: null },
   };
 
   // The server deliberately returns a small, request-specific capability
@@ -360,7 +377,10 @@
 
   function revokeOperatorCapabilities() {
     const hadGrant = Object.values(state.operatorCapabilities.grants || {}).some(Boolean);
-    state.operatorCapabilities = { loaded: true, grants: {}, reason: t('operator.capabilityDenied'), authBlocked: true };
+    state.operatorCapabilities = {
+      loaded: true, grants: {}, reason: t('operator.capabilityDenied'), authBlocked: true,
+      authMode: state.operatorCapabilities.authMode,
+    };
     // Do not leave a privileged timer alive after authorization has failed.
     cancelRunsPoll();
     cancelPreviewPoll();
@@ -379,13 +399,21 @@
         if (typeof source[name] === 'boolean') grants[name] = source[name];
       }
     }
-    return { loaded: true, grants, reason: payload && (payload.denial_reason || payload.reason) || null, authBlocked: false };
+    return {
+      loaded: true,
+      grants,
+      reason: payload && (payload.denial_reason || payload.reason) || null,
+      authBlocked: false,
+      authMode: payload && (payload.auth_mode || payload.mode) === 'operator' ? 'operator' : 'global',
+      tokenValid: typeof (payload && payload.token_valid) === 'boolean' ? payload.token_valid : null,
+    };
   }
 
   let operatorCapabilitiesRequest = null;
   async function refreshOperatorCapabilities() {
     if (operatorCapabilitiesRequest) return operatorCapabilitiesRequest;
-    operatorCapabilitiesRequest = api.getOperatorCapabilities().then((payload) => {
+    const timeout = new Promise((_, reject) => setTimeout(() => reject(new Error('capability discovery timed out')), 5000));
+    operatorCapabilitiesRequest = Promise.race([api.getOperatorCapabilities(), timeout]).then((payload) => {
       const previous = JSON.stringify(state.operatorCapabilities);
       state.operatorCapabilities = normalizeOperatorCapabilities(payload);
       renderProjectSwitcher();
@@ -1105,11 +1133,12 @@
         selected: project.id === (current && current.id),
       }, project.name));
     }
-    selector.disabled = state.projects.length === 0 || !operatorCapabilityAllowed('projects');
+    selector.disabled = state.projects.length === 0;
+    selector.title = !operatorCapabilityAllowed('projects') ? t('operator.projectsLocked') : '';
     const manageButton = document.getElementById('manage-projects');
     if (manageButton) {
-      manageButton.disabled = !operatorCapabilityAllowed('projects');
-      manageButton.title = manageButton.disabled ? t('operator.projectsLocked') : '';
+      manageButton.disabled = false;
+      manageButton.title = !operatorCapabilityAllowed('projects') ? t('operator.projectsLocked') : '';
     }
     if (current) {
       setProjectPath(pathEl, current.repo_path);
@@ -1119,7 +1148,10 @@
   }
 
   async function switchProject(projectId) {
-    if (!operatorCapabilityAllowed('projects')) return;
+    if (!operatorCapabilityAllowed('projects')) {
+      requestOperatorAuthPrompt();
+      return;
+    }
     if (!projectId || projectId === (state.currentProject && state.currentProject.id)) return;
     const selector = document.getElementById('project-selector');
     if (selector) selector.disabled = true;
@@ -1145,7 +1177,7 @@
 
   function openManageProjectsDialog() {
     if (!operatorCapabilityAllowed('projects')) {
-      showToast(t('operator.capabilityDenied'), 'info');
+      requestOperatorAuthPrompt();
       return;
     }
     const nameInput = el('input', {
@@ -2469,6 +2501,7 @@
       page.appendChild(el('section', { class: 'empty-state operator-locked', role: 'status' }, [
         el('strong', null, t('operator.runsLocked')),
         el('span', null, t('operator.runsLockedHint')),
+        el('button', { class: 'btn btn-primary operator-auth-request', type: 'button', onClick: requestOperatorAuthPrompt }, t('auth.tokenSave')),
       ]));
       container.appendChild(page);
       return;
@@ -4523,7 +4556,9 @@
           }
         },
       }, t('chat.projectSetupSelect', { choice: action.choice }))
-      : null;
+      : (!operatorCapabilityAllowed('projects') && (status === 'pending' || status === 'failed'))
+        ? el('button', { class: 'btn btn-sm operator-auth-request', type: 'button', onClick: requestOperatorAuthPrompt }, t('auth.tokenSave'))
+        : null;
     const node = el('section', {
       class: `chat-project-setup ${status}`,
       'data-project-setup-id': action.action_id,
@@ -4741,7 +4776,10 @@
       : el('button', { class: 'btn preview-open', type: 'button', disabled: true }, t('preview.open'));
 
     return el('div', { class: `preview-actions${controlsAllowed ? '' : ' operator-locked-controls'}`, 'aria-label': t('preview.controls') }, [
-      !controlsAllowed ? el('p', { class: 'operator-locked-hint' }, t('operator.previewTelemetryOnly')) : null,
+      !controlsAllowed ? el('div', { class: 'operator-locked-hint' }, [
+        el('span', null, t('operator.previewTelemetryOnly')),
+        el('button', { class: 'btn btn-sm operator-auth-request', type: 'button', onClick: requestOperatorAuthPrompt }, t('auth.tokenSave')),
+      ]) : null,
       launch, open, restart, stop,
     ]);
   }
@@ -5323,7 +5361,7 @@
     });
   }
 
-  function boot() {
+  async function boot() {
     // Static markup in index.html is translated once here, then again on every
     // language change; the SPA views are rebuilt wholesale by renderRoute().
     window.i18n.applyStaticNodes();
@@ -5337,7 +5375,9 @@
     const manageButton = document.getElementById('manage-projects');
     if (manageButton) manageButton.addEventListener('click', openManageProjectsDialog);
     handleRouteChange();
-    refreshOperatorCapabilities();
+    // Discover auth mode before board polling so operator mode cannot race a
+    // normal 401 into showing the global token banner.
+    await refreshOperatorCapabilities();
     loadProjects();
     pollBoard();
   }

@@ -1479,10 +1479,12 @@ async def _exercise_remote_operator_capabilities(page: Any, base_url: str) -> No
                 body='{"error":{"code":"capability_unavailable","message":"temporary outage"}}',
             )
             return
-        authorized = bool(route.request.headers.get("authorization"))
+        authorized = route.request.headers.get("authorization") == "Bearer browser-test-token"
+        token_valid = bool(route.request.headers.get("authorization")) and authorized
         await route.fulfill(
             content_type="application/json",
             body=json.dumps({
+                "auth_mode": "operator",
                 "capabilities": {
                     "runs": authorized,
                     "preview": authorized,
@@ -1490,6 +1492,7 @@ async def _exercise_remote_operator_capabilities(page: Any, base_url: str) -> No
                     "debug": False,
                 },
                 "denial_reason": None if authorized else "missing or invalid bearer token",
+                "token_valid": token_valid,
             }),
         )
 
@@ -1525,6 +1528,12 @@ async def _exercise_remote_operator_capabilities(page: Any, base_url: str) -> No
         await page.locator(".operator-locked").wait_for()
         assert calls["runs"] == 0
         assert await page.locator(".operator-locked").inner_text() != ""
+        await page.goto(f"{base_url}/#/board", wait_until="networkidle")
+        assert await page.locator("#api-token-banner-root").count() == 0
+        await page.goto(f"{base_url}/#/runs", wait_until="networkidle")
+        await page.locator(".operator-locked").wait_for()
+        await page.get_by_role("button", name="Connect", exact=True).click()
+        await page.locator(".api-token-input").wait_for()
         await page.evaluate("window.i18n.setLang('ko')")
         assert "실행 기록" in await page.locator(".operator-locked").inner_text()
         await page.evaluate("window.i18n.setLang('en')")
@@ -1534,7 +1543,12 @@ async def _exercise_remote_operator_capabilities(page: Any, base_url: str) -> No
         await page.goto(f"{base_url}/#/board", wait_until="networkidle")
         token = page.locator(".api-token-input")
         await token.wait_for()
-        assert await page.locator("#manage-projects").is_disabled()
+        assert not await page.locator("#manage-projects").is_disabled()
+        await token.fill("wrong-token")
+        await page.get_by_role("button", name="Connect").click()
+        await page.locator(".api-token-input").wait_for()
+        assert "rejected" in (await page.locator(".api-token-banner").inner_text()).lower()
+        token = page.locator(".api-token-input")
         await token.fill("browser-test-token")
         await page.get_by_role("button", name="Connect").click()
         await page.wait_for_function(

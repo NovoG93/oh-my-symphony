@@ -149,6 +149,7 @@ TRUSTED_ORIGINS_ENV = "SYMPHONY_TRUSTED_ORIGINS"
 API_TOKEN_ENV = "SYMPHONY_API_TOKEN"
 API_TOKEN_FILE_ENV = "SYMPHONY_API_TOKEN_FILE"
 REMOTE_CAPABILITIES_ENV = "SYMPHONY_REMOTE_OPERATOR_CAPABILITIES"
+API_AUTH_MODE_ENV = "SYMPHONY_API_AUTH_MODE"
 REMOTE_CAPABILITIES = frozenset({"runs", "preview", "projects", "debug"})
 # The one route where the token may also arrive as `?token=`: browsers
 # cannot set an Authorization header on a WebSocket handshake, so the SPA
@@ -286,6 +287,11 @@ def _remote_capabilities() -> set[str]:
             if item.strip()} & REMOTE_CAPABILITIES
 
 
+def _api_auth_mode() -> str:
+    mode = os.environ.get(API_AUTH_MODE_ENV, "global").strip().lower()
+    return mode if mode in {"global", "operator"} else "global"
+
+
 def _privileged_authorized(request: web.Request, capability: str) -> bool:
     """Authorize a privileged operation, preserving loopback convenience."""
     if _local_operator(request):
@@ -320,6 +326,7 @@ def _capability_state(request: web.Request) -> dict[str, Any]:
     else:
         reason = "capability is not enabled"
     return {
+        "auth_mode": _api_auth_mode(),
         "loopback": loopback,
         "token_configured": token is not None,
         "token_valid": bearer,
@@ -424,7 +431,7 @@ async def _api_guard(request: web.Request, handler):
         local = _local_operator(request)
         # Capability discovery must remain reachable so the SPA can prompt.
         capability_probe = request.path == "/api/v1/operator-capabilities"
-        if api_token is not None and not local and not capability_probe and not _request_has_valid_bearer(
+        if api_token is not None and _api_auth_mode() == "global" and not local and not capability_probe and not _request_has_valid_bearer(
             request, api_token
         ):
             # Browsers cannot set headers on a WebSocket handshake; the

@@ -108,6 +108,12 @@ def test_web_remote_operator_capabilities_fail_closed() -> None:
     assert "!Array.isArray(source)" in js
     assert "function operatorCapabilityAllowed(name)" in js
     assert "function revokeOperatorCapabilities()" in js
+    assert "authMode: null" in js
+    assert "auth_mode || payload.mode" in js
+    assert "token_valid" in js
+    assert "capability discovery timed out" in js
+    assert "Promise.race([api.getOperatorCapabilities(), timeout])" in js
+    assert "const globalAuth = state.operatorCapabilities.authMode !== 'operator';" in js
     assert "revokeOperatorCapabilities();" in js
     assert "cancelRunsPoll();" in js
     assert "cancelPreviewPoll();" in js

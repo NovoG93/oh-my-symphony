@@ -11,6 +11,7 @@ from symphony.webapi import (
     SERVICE_INSTANCE_ID_KEY,
     REMOTE_CAPABILITIES_ENV,
     _api_guard,
+    _api_auth_mode,
     _capability_state,
     _host_is_declared_trusted,
     _host_is_declared_trusted_ordinary,
@@ -36,6 +37,30 @@ class _Request:
 def test_capability_parser_allowlists_known_values(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv(REMOTE_CAPABILITIES_ENV, "runs, PREVIEW;unknown,projects")
     assert _remote_capabilities() == {"runs", "preview", "projects"}
+
+
+def test_auth_mode_defaults_global_and_rejects_unknown_at_runtime(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("SYMPHONY_API_AUTH_MODE", raising=False)
+    assert _api_auth_mode() == "global"
+    monkeypatch.setenv("SYMPHONY_API_AUTH_MODE", "bogus")
+    assert _api_auth_mode() == "global"
+
+
+@pytest.mark.asyncio
+async def test_operator_mode_leaves_ordinary_remote_api_passwordless(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("SYMPHONY_API_AUTH_MODE", "operator")
+    monkeypatch.setenv("SYMPHONY_API_TOKEN", "secret")
+    request = _Request(remote="192.0.2.10", host="other.example", path="/api/v1/state")
+
+    async def handler(_request: _Request) -> web.Response:
+        return web.json_response({"ok": True})
+
+    response = await _api_guard(request, handler)
+    assert response.status == 200
 
 
 def test_loopback_bypasses_remote_credentials(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -137,6 +162,7 @@ def test_doctor_detects_empty_token_file(tmp_path, monkeypatch: pytest.MonkeyPat
 
 
 def test_doctor_blocks_capabilities_without_token_or_origin(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("SYMPHONY_API_AUTH_MODE", "operator")
     monkeypatch.setenv(REMOTE_CAPABILITIES_ENV, "runs")
     monkeypatch.delenv("SYMPHONY_API_TOKEN", raising=False)
     monkeypatch.delenv("SYMPHONY_API_TOKEN_FILE", raising=False)
@@ -145,9 +171,28 @@ def test_doctor_blocks_capabilities_without_token_or_origin(monkeypatch: pytest.
 
 
 def test_doctor_blocks_whitespace_token_without_usable_file(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("SYMPHONY_API_AUTH_MODE", "operator")
     monkeypatch.setenv(REMOTE_CAPABILITIES_ENV, "runs")
     monkeypatch.setenv("SYMPHONY_API_TOKEN", "   ")
     monkeypatch.delenv("SYMPHONY_API_TOKEN_FILE", raising=False)
+    monkeypatch.setenv("SYMPHONY_TRUSTED_ORIGINS", "https://symphony.example")
+    assert check_api_token_env(None).status == "fail"  # type: ignore[arg-type]
+
+
+def test_doctor_rejects_unknown_auth_mode(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("SYMPHONY_API_AUTH_MODE", "sometimes")
+    assert check_api_token_env(None).status == "fail"  # type: ignore[arg-type]
+
+
+def test_doctor_global_mode_still_validates_configured_capabilities(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("SYMPHONY_API_AUTH_MODE", raising=False)
+    monkeypatch.setenv(REMOTE_CAPABILITIES_ENV, "runs")
+    monkeypatch.setenv("SYMPHONY_API_TOKEN", "secret")
+    monkeypatch.delenv("SYMPHONY_TRUSTED_ORIGINS", raising=False)
+    assert check_api_token_env(None).status == "fail"  # type: ignore[arg-type]
+    monkeypatch.delenv("SYMPHONY_API_TOKEN", raising=False)
     monkeypatch.setenv("SYMPHONY_TRUSTED_ORIGINS", "https://symphony.example")
     assert check_api_token_env(None).status == "fail"  # type: ignore[arg-type]
 
