@@ -1954,6 +1954,9 @@ a { color: inherit; }
 .preview-status.unhealthy { color: #ffd269; border-color: #8c6d25; }
 .preview-status.failed { color: #ff8a7f; border-color: #a74840; }
 .preview-actions { display: flex; gap: .5rem; align-items: center; flex-wrap: wrap; position: relative; z-index: 1; }
+.operator-locked { min-height: 18rem; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: .55rem; text-align: center; }
+.operator-locked-hint { flex-basis: 100%; color: var(--text-muted); font-size: .85rem; margin: 0; }
+.operator-locked-controls { flex-wrap: wrap; }
 .preview-command-deck .btn { border-radius: 2px; border-color: #626761; background: #2c302e; color: #f3f1e9; }
 .preview-command-deck .btn:hover { background: #3a3f3c; }
 .preview-command-deck .btn-primary { color: #201a08; border-color: #ffb000; background: #ffb000; font-weight: 750; }

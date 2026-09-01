@@ -22,7 +22,11 @@ from aiohttp import web
 
 from .logging import get_logger
 from .orchestrator import Orchestrator
-from .webapi import BIND_HOST_KEY, _request_is_loopback, register_web_routes
+from .webapi import (
+    BIND_HOST_KEY,
+    _privileged_authorized,
+    register_web_routes,
+)
 
 
 log = get_logger()
@@ -164,7 +168,7 @@ def build_app(orchestrator: Orchestrator) -> web.Application:
         # at — exactly what py-spy can't show us across the await boundary.
         # Live stacks and coroutine reprs can name local paths and prompt
         # text, so this stays loopback-only like the run diagnostics.
-        if not _request_is_loopback(request):
+        if not _privileged_authorized(request, "debug"):
             return _error_response(
                 403,
                 "debug_tasks_local_only",

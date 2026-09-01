@@ -21,7 +21,6 @@ import pytest_asyncio
 from aiohttp import web
 from aiohttp.test_utils import TestClient, TestServer
 
-import symphony.server as server_mod
 from symphony.orchestrator import Orchestrator
 from symphony.server import build_app
 from symphony.workflow import WorkflowState
@@ -112,6 +111,27 @@ async def client(tmp_path: Path) -> AsyncIterator[TestClient]:
         yield cli
     finally:
         await cli.close()
+
+
+@pytest.fixture(autouse=True)
+def configured_token_tests_use_remote_boundary(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Token assertions must exercise the remote credential layer.
+
+    TestClient peers are loopback by design; when a token is configured, the
+    production local operator intentionally remains passwordless. This seam
+    models a non-local peer for the legacy bearer-gate tests.
+    """
+    from symphony import webapi
+
+    original_local_operator = webapi._local_operator
+    monkeypatch.setattr(
+        webapi,
+        "_local_operator",
+        lambda request: webapi._configured_api_token() is None
+        and original_local_operator(request),
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -346,7 +366,9 @@ async def test_debug_tasks_rejects_non_loopback_peer(
 ) -> None:
     # Simulate a request whose remote peer is off-machine (e.g. served
     # behind a LAN bind) by forcing the shared loopback predicate off.
-    monkeypatch.setattr(server_mod, "_request_is_loopback", lambda _request: False)
+    monkeypatch.setattr(
+        "symphony.server._privileged_authorized", lambda _request, _capability: False
+    )
     resp = await client.get("/api/v1/_debug/tasks")
     assert resp.status == 403
     payload = await resp.json()

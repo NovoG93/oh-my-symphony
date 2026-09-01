@@ -12,6 +12,12 @@ Versioning: [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Remote operator capabilities.** Reverse-proxy operators can selectively
+  expose Runs, Preview, and Projects with a token file, exact trusted Host,
+  and `SYMPHONY_REMOTE_OPERATOR_CAPABILITIES`; loopback access remains
+  passwordless, wildcard origins never grant privileged access, and debug
+  diagnostics remain loopback-only by default.
+
 - **Usage-aware agent profiles.** Shared usage pools (`usage_pools:`) and the
   per-profile `usage_pool` reference — usage is modeled per pool/provider
   quota, never per named profile: profiles define HOW an agent runs, pools

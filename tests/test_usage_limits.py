@@ -794,7 +794,9 @@ def test_grouped_usage_only_enforces_selected_group_and_recovers_after_reset() -
     third_party = UsagePoolConfig("agy", {"five_hour": 80}, quota_group="third_party")
     assert manager.evaluate("agy", gemini) == UsageDecision.READY
     assert manager.evaluate("agy", third_party) == UsageDecision.WAIT_PROVIDER_USAGE
-    assert "agy third_party five_hour" in format_wait_reason("agy", third_party, snap)
+    assert "agy third_party five_hour" in format_wait_reason(
+        "agy", third_party, snap, now=now
+    )
 
     # A reset window is no longer a blocker on the next scheduler decision.
     recovered = UsageWindow(

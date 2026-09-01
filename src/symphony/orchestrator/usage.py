@@ -207,10 +207,12 @@ def format_wait_reason(
     pool_id: str,
     pool: UsagePoolConfig,
     snapshot: ProviderUsageSnapshot | None,
+    *,
+    now: datetime | None = None,
 ) -> str:
     """Format a human-readable reason for waiting on provider usage."""
     if snapshot is not None:
-        now = datetime.now(timezone.utc)
+        now = now or datetime.now(timezone.utc)
         if snapshot.hard_limit_reached:
             resets_info = ""
             for w in snapshot.windows.values():

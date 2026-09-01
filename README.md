@@ -1235,11 +1235,18 @@ allowlists cannot know, and project creation fails with `forbidden_origin`
 SYMPHONY_TRUSTED_ORIGINS=https://symphony.example.com symphony ./WORKFLOW.md --port 9999
 ```
 
-Comma-separate several entries; a bare hostname matches any scheme and
-port, and `*` trusts every origin. Everything the tunnel exposes is
+Comma-separate several entries. For remote privileged operator features,
+use an exact origin (including the port); wildcard `*` is never accepted as
+privileged trust. Everything the tunnel exposes is
 reachable by whoever can reach the tunnel, so put authentication (for
 example Cloudflare Access) in front of it. Symphony can also require a bearer
 token on every operator `/api/` request:
+
+The proxy must preserve the original public `Host` (including its port) and
+send standard proxy evidence such as `Forwarded`, `X-Forwarded-For`,
+`X-Forwarded-Host`, or `X-Real-IP`. A headerless proxy that rewrites the
+upstream Host to a loopback name is unsupported: it is indistinguishable from
+a genuine local client and cannot safely receive privileged capabilities.
 
 ```bash
 export SYMPHONY_TRUSTED_ORIGINS=https://symphony.example.com
@@ -1264,6 +1271,22 @@ only for `/api/v1/health`; it never persists or reuses the operator API token.
 Managed start generates this capability from 256 random bits. Health capability
 headers must also be URL-safe and 32–128 characters; short or malformed
 manually inherited service IDs never bypass bearer authentication.
+
+To selectively expose loopback-gated operator panels through that trusted
+front door, set `SYMPHONY_REMOTE_OPERATOR_CAPABILITIES` to a comma-separated
+subset of `runs`, `preview`, `projects`, and `debug`:
+
+```bash
+export SYMPHONY_API_TOKEN_FILE=/home/symphony/.config/symphony/api-token
+export SYMPHONY_TRUSTED_ORIGINS=http://192.168.0.60:9999
+export SYMPHONY_REMOTE_OPERATOR_CAPABILITIES=runs,preview,projects
+```
+
+Remote privileged requests require all three settings: a valid bearer token,
+an exact trusted Host (including port), and the matching capability. Loopback
+requests remain passwordless. `GET /api/v1/operator-capabilities` reports the
+effective per-capability grants without exposing token contents. `debug` is
+intentionally omitted above and remains loopback-only.
 
 ### CLI Kanban TUI (primary UI)
 

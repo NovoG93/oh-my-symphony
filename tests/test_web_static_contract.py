@@ -99,6 +99,31 @@ def test_web_runs_page_contract() -> None:
     assert ".run-metadata-link" in css
 
 
+def test_web_remote_operator_capabilities_fail_closed() -> None:
+    js = _script_bundle()
+    css = (STATIC_ROOT / "style.css").read_text(encoding="utf-8")
+    assert "getOperatorCapabilities: () => apiRequest('/operator-capabilities')" in js
+    assert "function normalizeOperatorCapabilities(payload)" in js
+    assert "const source = payload && payload.capabilities;" in js
+    assert "!Array.isArray(source)" in js
+    assert "function operatorCapabilityAllowed(name)" in js
+    assert "function revokeOperatorCapabilities()" in js
+    assert "revokeOperatorCapabilities();" in js
+    assert "cancelRunsPoll();" in js
+    assert "cancelPreviewPoll();" in js
+    assert "authBlocked: true" in js
+    assert "if (!state.operatorCapabilities.authBlocked)" in js
+    assert "['runs', 'preview', 'chat'].includes(state.route)" in js
+    assert "operatorCapabilitiesRequest" in js
+    assert "if (!operatorCapabilityAllowed('runs'))" in js
+    assert "operator-locked-hint" in js
+    assert "operatorCapabilityAllowed('projects')" in js
+    assert "operatorCapabilityAllowed('preview')" in js
+    assert "'operator.runsLocked'" in js
+    assert "'operator.previewTelemetryOnly'" in js
+    assert ".operator-locked" in css
+
+
 def test_web_git_page_contract() -> None:
     js = _script_bundle()
     css = (STATIC_ROOT / "style.css").read_text(encoding="utf-8")

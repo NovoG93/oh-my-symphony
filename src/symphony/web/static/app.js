@@ -57,6 +57,7 @@
   let authBannerState = { open: false, dismissed: false };
 
   function handleApiUnauthorized() {
+    revokeOperatorCapabilities();
     const hadToken = Boolean(storedApiToken());
     if (hadToken) {
       // The stored token was rejected — drop it so the next save is the
@@ -94,6 +95,7 @@
       authBannerState.dismissed = false;
       hideApiTokenBanner();
       showToast(t('auth.tokenSaved'), 'success');
+      await refreshOperatorCapabilities();
       // Re-run the board fetch immediately; a chat page also needs its
       // WebSocket rebuilt so the handshake carries the new ?token=.
       await refreshBoard();
@@ -298,6 +300,7 @@
     startPreview: () => apiRequest('/preview/start', { method: 'POST', body: '{}' }),
     stopPreview: () => apiRequest('/preview/stop', { method: 'POST', body: '{}' }),
     restartPreview: () => apiRequest('/preview/restart', { method: 'POST', body: '{}' }),
+    getOperatorCapabilities: () => apiRequest('/operator-capabilities'),
   };
 
   // ------------------------------------------------------------------
@@ -344,7 +347,57 @@
     openModalBackdrop: null,
     openMenu: null,
     wfRerender: null,
+    operatorCapabilities: { loaded: false, grants: {}, reason: null, authBlocked: false },
   };
+
+  // The server deliberately returns a small, request-specific capability
+  // document.  Accept both the object and list forms so older deployments
+  // can roll forward without making the UI optimistic.  Unknown/malformed
+  // responses remain locked (fail closed).
+  function operatorCapabilityAllowed(name) {
+    return state.operatorCapabilities.loaded === true && state.operatorCapabilities.grants[name] === true;
+  }
+
+  function revokeOperatorCapabilities() {
+    const hadGrant = Object.values(state.operatorCapabilities.grants || {}).some(Boolean);
+    state.operatorCapabilities = { loaded: true, grants: {}, reason: t('operator.capabilityDenied'), authBlocked: true };
+    // Do not leave a privileged timer alive after authorization has failed.
+    cancelRunsPoll();
+    cancelPreviewPoll();
+    renderProjectSwitcher();
+    if (hadGrant && ['runs', 'preview', 'chat'].includes(state.route)) renderRoute();
+  }
+
+  function normalizeOperatorCapabilities(payload) {
+    // `capabilities` is an effective per-request grant map. Do not infer
+    // grants from arrays or legacy configured-capability inventories: those
+    // shapes cannot prove that this request passed token/Host authorization.
+    const source = payload && payload.capabilities;
+    const grants = {};
+    if (source && typeof source === 'object' && !Array.isArray(source)) {
+      for (const name of ['runs', 'preview', 'projects', 'debug']) {
+        if (typeof source[name] === 'boolean') grants[name] = source[name];
+      }
+    }
+    return { loaded: true, grants, reason: payload && (payload.denial_reason || payload.reason) || null, authBlocked: false };
+  }
+
+  let operatorCapabilitiesRequest = null;
+  async function refreshOperatorCapabilities() {
+    if (operatorCapabilitiesRequest) return operatorCapabilitiesRequest;
+    operatorCapabilitiesRequest = api.getOperatorCapabilities().then((payload) => {
+      const previous = JSON.stringify(state.operatorCapabilities);
+      state.operatorCapabilities = normalizeOperatorCapabilities(payload);
+      renderProjectSwitcher();
+      if (previous !== JSON.stringify(state.operatorCapabilities) && state.route !== 'board') renderRoute();
+      return state.operatorCapabilities;
+    }).catch((err) => {
+      revokeOperatorCapabilities();
+      state.operatorCapabilities.reason = err.message;
+      return state.operatorCapabilities;
+    }).finally(() => { operatorCapabilitiesRequest = null; });
+    return operatorCapabilitiesRequest;
+  }
 
   // ------------------------------------------------------------------
   // DOM helpers
@@ -1052,7 +1105,12 @@
         selected: project.id === (current && current.id),
       }, project.name));
     }
-    selector.disabled = state.projects.length === 0;
+    selector.disabled = state.projects.length === 0 || !operatorCapabilityAllowed('projects');
+    const manageButton = document.getElementById('manage-projects');
+    if (manageButton) {
+      manageButton.disabled = !operatorCapabilityAllowed('projects');
+      manageButton.title = manageButton.disabled ? t('operator.projectsLocked') : '';
+    }
     if (current) {
       setProjectPath(pathEl, current.repo_path);
       setProjectPath(workflowPathEl, current.workflow_path);
@@ -1061,6 +1119,7 @@
   }
 
   async function switchProject(projectId) {
+    if (!operatorCapabilityAllowed('projects')) return;
     if (!projectId || projectId === (state.currentProject && state.currentProject.id)) return;
     const selector = document.getElementById('project-selector');
     if (selector) selector.disabled = true;
@@ -1085,6 +1144,10 @@
   }
 
   function openManageProjectsDialog() {
+    if (!operatorCapabilityAllowed('projects')) {
+      showToast(t('operator.capabilityDenied'), 'info');
+      return;
+    }
     const nameInput = el('input', {
       class: 'input',
       id: 'project-name-input',
@@ -2402,6 +2465,14 @@
 
   function renderRunsPage(container) {
     const page = el('div', { class: 'page page-runs' });
+    if (!operatorCapabilityAllowed('runs')) {
+      page.appendChild(el('section', { class: 'empty-state operator-locked', role: 'status' }, [
+        el('strong', null, t('operator.runsLocked')),
+        el('span', null, t('operator.runsLockedHint')),
+      ]));
+      container.appendChild(page);
+      return;
+    }
     page._runs = [];
     page._detail = null;
 
@@ -4429,6 +4500,7 @@
     const canSelect = (status === 'pending' || status === 'failed') &&
       !chatProjectSetupExpired(action) &&
       chatState.snapshot && chatState.snapshot.mode === 'edit' &&
+      operatorCapabilityAllowed('projects') &&
       Boolean(chatConfirmationToken(chatState.currentId));
     const actionButton = canSelect
       ? el('button', {
@@ -4619,6 +4691,7 @@
 
   function buildPreviewActions(data, body) {
     const configured = Boolean(data.configured);
+    const controlsAllowed = operatorCapabilityAllowed('preview');
     const enabled = data.enabled !== false;
     const running = Boolean(data.running);
     const gateReady = !data.release_gate || data.release_gate.ready !== false;
@@ -4642,19 +4715,19 @@
     const launch = el('button', {
       class: 'btn btn-primary preview-launch',
       type: 'button',
-      disabled: !configured || !enabled || !gateReady || running,
+      disabled: !controlsAllowed || !configured || !enabled || !gateReady || running,
       onClick: (event) => act('startPreview', event.currentTarget),
     }, t('preview.launch'));
     const restart = el('button', {
-      class: 'btn',
+      class: 'btn preview-restart',
       type: 'button',
-      disabled: !configured || !enabled || !gateReady || !running,
+      disabled: !controlsAllowed || !configured || !enabled || !gateReady || !running,
       onClick: (event) => act('restartPreview', event.currentTarget),
     }, t('preview.restart'));
     const stop = el('button', {
-      class: 'btn btn-danger-outline',
+      class: 'btn btn-danger-outline preview-stop',
       type: 'button',
-      disabled: !running,
+      disabled: !controlsAllowed || !running,
       onClick: (event) => act('stopPreview', event.currentTarget),
     }, t('preview.stop'));
     const open = url && running
@@ -4667,7 +4740,10 @@
       }, t('preview.open'))
       : el('button', { class: 'btn preview-open', type: 'button', disabled: true }, t('preview.open'));
 
-    return el('div', { class: 'preview-actions', 'aria-label': t('preview.controls') }, [launch, open, restart, stop]);
+    return el('div', { class: `preview-actions${controlsAllowed ? '' : ' operator-locked-controls'}`, 'aria-label': t('preview.controls') }, [
+      !controlsAllowed ? el('p', { class: 'operator-locked-hint' }, t('operator.previewTelemetryOnly')) : null,
+      launch, open, restart, stop,
+    ]);
   }
 
   function buildPreviewNotice(data) {
@@ -4811,7 +4887,9 @@
     body.appendChild(metrics);
     body.appendChild(buildPreviewStage(data));
     body.appendChild(lower);
-    previewPollTimer = setTimeout(() => refreshPreviewPage(body, false), 3000);
+    if (!state.operatorCapabilities.authBlocked) {
+      previewPollTimer = setTimeout(() => refreshPreviewPage(body, false), 3000);
+    }
   }
 
   async function refreshPreviewPage(body, announce) {
@@ -4829,7 +4907,9 @@
         el('span', null, err.message),
         el('button', { class: 'btn', type: 'button', onClick: () => refreshPreviewPage(body, false) }, t('common.refresh')),
       ]));
-      previewPollTimer = setTimeout(() => refreshPreviewPage(body, false), 5000);
+      if (!state.operatorCapabilities.authBlocked) {
+        previewPollTimer = setTimeout(() => refreshPreviewPage(body, false), 5000);
+      }
     }
   }
 
@@ -5188,6 +5268,7 @@
       const board = await api.getBoard();
       state.connected = true;
       state.lastSuccessfulPollAt = Date.now();
+      await refreshOperatorCapabilities();
       if (!holdRender) {
         const firstLoad = !state.board;
         state.board = board;
@@ -5256,6 +5337,7 @@
     const manageButton = document.getElementById('manage-projects');
     if (manageButton) manageButton.addEventListener('click', openManageProjectsDialog);
     handleRouteChange();
+    refreshOperatorCapabilities();
     loadProjects();
     pollBoard();
   }

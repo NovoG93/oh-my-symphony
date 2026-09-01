@@ -144,9 +144,56 @@ def check_api_token_env(cfg: ServiceConfig) -> CheckResult:
     name = "server.api_token"
     del cfg  # env-only check; the signature keeps the common shape
     raw = os.environ.get("SYMPHONY_API_TOKEN")
+    effective_raw = raw.strip() if raw is not None else ""
+    token_file = os.environ.get("SYMPHONY_API_TOKEN_FILE", "").strip()
+    capabilities_raw = os.environ.get("SYMPHONY_REMOTE_OPERATOR_CAPABILITIES", "")
+    capabilities = {
+        value.strip().lower()
+        for value in capabilities_raw.replace(";", ",").split(",")
+        if value.strip()
+    }
+    unknown = capabilities - {"runs", "preview", "projects", "debug"}
+    origins = {
+        value.strip()
+        for value in os.environ.get("SYMPHONY_TRUSTED_ORIGINS", "")
+        .replace(";", ",").split(",") if value.strip()
+    }
+    if unknown:
+        return CheckResult(
+            name, "fail",
+            "SYMPHONY_REMOTE_OPERATOR_CAPABILITIES contains unknown values: "
+            + ", ".join(sorted(unknown)),
+        )
+    if "*" in origins and capabilities:
+        return CheckResult(
+            name, "fail",
+            "wildcard SYMPHONY_TRUSTED_ORIGINS cannot authorize remote operator capabilities",
+        )
+    if capabilities and not (effective_raw or token_file):
+        return CheckResult(
+            name, "fail",
+            "remote operator capabilities are enabled but no API token or token file is configured",
+        )
+    if capabilities and not origins:
+        return CheckResult(
+            name, "fail",
+            "remote operator capabilities are enabled but SYMPHONY_TRUSTED_ORIGINS is empty",
+        )
+    if token_file:
+        try:
+            token_path = Path(token_file).expanduser()
+            token_value = token_path.read_text(encoding="utf-8").strip()
+            if not token_value:
+                return CheckResult(name, "fail", f"API token file is empty: {token_file}")
+            if any(ch.isspace() for ch in token_value):
+                return CheckResult(name, "fail", f"API token file contains internal whitespace: {token_file}")
+        except (OSError, UnicodeError):
+            return CheckResult(name, "fail", f"API token file is unreadable: {token_file}")
     if raw is None:
+        if token_file:
+            return CheckResult(name, "pass", "token file set; bearer token required on /api/")
         return CheckResult(name, "pass", "unset (no credential gate)")
-    token = raw.strip()
+    token = effective_raw
     if not token:
         return CheckResult(name, "pass", "blank (behaves as unset)")
     if any(ch.isspace() for ch in token):

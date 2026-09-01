@@ -19,6 +19,11 @@ Setting `SYMPHONY_API_TOKEN` adds a credential layer on top: every operator
 exposed bind does not hand full board control to any network peer. The exact
 managed-service health probe may instead present its separate per-launch
 capability header; that capability authorizes only `/api/v1/health`. The
+remote operator capabilities (`runs`, `preview`, `projects`, and `debug`) may
+selectively expose loopback-gated surfaces to a reverse proxy. A remote
+privileged request requires the configured bearer token, an exact explicitly
+trusted Host, and the matching capability; wildcard origins never satisfy the
+Host trust requirement. The
 shipped SPA supports operator-token mode by prompting for the token and sending
 `Authorization: Bearer` on every fetch. The chat WebSocket is the only route
 where the operator token may also arrive as a `?token=` query parameter,
@@ -143,6 +148,8 @@ TRUSTED_ORIGINS_ENV = "SYMPHONY_TRUSTED_ORIGINS"
 # per-launch capability and scoped to `/api/v1/health` below.
 API_TOKEN_ENV = "SYMPHONY_API_TOKEN"
 API_TOKEN_FILE_ENV = "SYMPHONY_API_TOKEN_FILE"
+REMOTE_CAPABILITIES_ENV = "SYMPHONY_REMOTE_OPERATOR_CAPABILITIES"
+REMOTE_CAPABILITIES = frozenset({"runs", "preview", "projects", "debug"})
 # The one route where the token may also arrive as `?token=`: browsers
 # cannot set an Authorization header on a WebSocket handshake, so the SPA
 # appends the query parameter there. Scoped to the exact path — anywhere
@@ -190,6 +197,11 @@ def _request_host(request: web.Request) -> str:
     return raw.rsplit(":", 1)[0]
 
 
+def _request_host_netloc(request: web.Request) -> str:
+    """Normalized Host header including an explicitly supplied port."""
+    return (request.host or "").strip().lower().rstrip("/")
+
+
 def _bare_host(host: str) -> str:
     """Strip IPv6 brackets so Host and Origin hostnames compare equal."""
     return host.strip().lower().removeprefix("[").removesuffix("]")
@@ -218,14 +230,104 @@ def _trusted_origins() -> set[str]:
 def _host_is_declared_trusted(host: str) -> bool:
     """Does `SYMPHONY_TRUSTED_ORIGINS` name this Host header?"""
     trusted = _trusted_origins()
+    # A wildcard is useful for ordinary CORS, but can never establish the
+    # explicit Host trust required for privileged remote operator actions.
+    normalized_host = host.strip().lower().rstrip("/")
+    if not normalized_host:
+        return False
+    for entry in trusted:
+        parsed = urlsplit(entry)
+        if parsed.hostname is not None:
+            # Full origins must match the complete Host netloc, including
+            # port. This prevents a trusted service on :8443 authorizing :9999.
+            if parsed.netloc.lower() == normalized_host:
+                return True
+        elif entry.lower() == normalized_host:
+            return True
+    return False
+
+
+def _host_is_declared_trusted_ordinary(host: str) -> bool:
+    """Legacy host gate, where wildcard remains valid for ordinary APIs."""
+    trusted = _trusted_origins()
     if "*" in trusted:
         return True
-    bare = _bare_host(host)
-    if not bare:
-        return False
+    for entry in trusted:
+        if "://" in entry:
+            if _host_is_declared_trusted(host):
+                return True
+        else:
+            host_name = host.rsplit(":", 1)[0] if ":" in host and not host.startswith("[") else host
+            if _bare_host(host_name) == _bare_host(entry):
+                return True
+    return False
+
+
+def _has_proxy_evidence(request: web.Request) -> bool:
     return any(
-        bare == _bare_host(urlsplit(entry).hostname or entry) for entry in trusted
+        key.lower() in {name.lower() for name in request.headers}
+        for key in ("Forwarded", "X-Forwarded-For", "X-Forwarded-Host", "X-Real-IP")
     )
+
+
+def _local_operator(request: web.Request) -> bool:
+    """A loopback peer is local only when it addressed a loopback Host."""
+    return (
+        _request_is_loopback(request)
+        and _host_is_loopback(_request_host(request))
+        and not _has_proxy_evidence(request)
+    )
+
+
+def _remote_capabilities() -> set[str]:
+    """Return only recognized remote operator capabilities."""
+    raw = os.environ.get(REMOTE_CAPABILITIES_ENV, "")
+    return {item.strip().lower() for item in raw.replace(";", ",").split(",")
+            if item.strip()} & REMOTE_CAPABILITIES
+
+
+def _privileged_authorized(request: web.Request, capability: str) -> bool:
+    """Authorize a privileged operation, preserving loopback convenience."""
+    if _local_operator(request):
+        return True
+    token = _configured_api_token()
+    return bool(
+        token
+        and _request_has_valid_bearer(request, token)
+        and _host_is_declared_trusted(_request_host_netloc(request))
+        and capability in _remote_capabilities()
+    )
+
+
+def _capability_state(request: web.Request) -> dict[str, Any]:
+    loopback = _local_operator(request)
+    token = _configured_api_token()
+    host_trusted = _host_is_declared_trusted(_request_host_netloc(request))
+    bearer = bool(token and _request_has_valid_bearer(request, token))
+    configured = _remote_capabilities()
+    capabilities = {
+        capability: loopback or (bearer and host_trusted and capability in configured)
+        for capability in sorted(REMOTE_CAPABILITIES)
+    }
+    if loopback:
+        reason = None
+    elif not token:
+        reason = "remote operator token is not configured"
+    elif not bearer:
+        reason = "missing or invalid bearer token"
+    elif not host_trusted:
+        reason = "current Host is not explicitly trusted"
+    else:
+        reason = "capability is not enabled"
+    return {
+        "loopback": loopback,
+        "token_configured": token is not None,
+        "token_valid": bearer,
+        "host_trusted": host_trusted,
+        "capabilities": capabilities,
+        "configured_capabilities": sorted(configured),
+        "denial_reason": reason,
+    }
 
 
 def _origin_is_trusted(request: web.Request, origin: str) -> bool:
@@ -319,7 +421,10 @@ async def _api_guard(request: web.Request, handler):
         # capability is the managed service's exact health probe below.
         # Order matters — authenticate before validating anything else.
         api_token = _configured_api_token()
-        if api_token is not None and not _request_has_valid_bearer(
+        local = _local_operator(request)
+        # Capability discovery must remain reachable so the SPA can prompt.
+        capability_probe = request.path == "/api/v1/operator-capabilities"
+        if api_token is not None and not local and not capability_probe and not _request_has_valid_bearer(
             request, api_token
         ):
             # Browsers cannot set headers on a WebSocket handshake; the
@@ -338,12 +443,13 @@ async def _api_guard(request: web.Request, handler):
                 )
         bind = str(request.app.get(BIND_HOST_KEY) or "127.0.0.1").lower()
         host = _request_host(request)
+        host_netloc = _request_host_netloc(request)
         if (
             bind in _LOOPBACK_BINDS
             and host not in _ALLOWED_HOSTS
             # A proxy that forwards the public Host verbatim is still the
             # operator's own front door once they have declared it.
-            and not _host_is_declared_trusted(host)
+            and not _host_is_declared_trusted_ordinary(host_netloc)
         ):
             return _json_error(
                 403, "forbidden_host", f"host {request.host!r} not allowed"
@@ -1180,7 +1286,7 @@ def _register_issue_routes(
     app: web.Application, ctx: _Ctx, orchestrator: Orchestrator
 ) -> None:
     async def handle_runs(request: web.Request) -> web.Response:
-        if not _request_is_loopback(request):
+        if not _privileged_authorized(request, "runs"):
             return _json_error(
                 403,
                 "run_diagnostics_local_only",
@@ -1208,7 +1314,7 @@ def _register_issue_routes(
         return web.json_response(payload, headers={"Cache-Control": "no-store"})
 
     async def handle_run_detail(request: web.Request) -> web.Response:
-        if not _request_is_loopback(request):
+        if not _privileged_authorized(request, "runs"):
             return _json_error(
                 403,
                 "run_diagnostics_local_only",
@@ -1227,7 +1333,7 @@ def _register_issue_routes(
         return web.json_response(detail, headers={"Cache-Control": "no-store"})
 
     async def handle_run_diagnostic(request: web.Request) -> web.Response:
-        if not _request_is_loopback(request):
+        if not _privileged_authorized(request, "runs"):
             return _json_error(
                 403,
                 "run_diagnostics_local_only",
@@ -2934,8 +3040,7 @@ def _register_preview_routes(
                 "unsupported_media_type",
                 "Product Preview actions require application/json",
             )
-        bind = str(request.app.get(BIND_HOST_KEY) or "127.0.0.1").lower()
-        if bind not in _LOOPBACK_BINDS:
+        if not _privileged_authorized(request, "preview"):
             return _json_error(
                 403,
                 "preview_loopback_required",
@@ -3045,18 +3150,7 @@ def _current_project_payload(ctx: _Ctx, projects: list[Project]) -> dict[str, An
 
 def _project_mutation_error(request: web.Request) -> web.Response | None:
     """Project setup can write arbitrary paths, so it is loopback-only."""
-    bind = str(request.app.get(BIND_HOST_KEY) or "127.0.0.1").lower()
-    if bind not in _LOOPBACK_BINDS:
-        return _json_error(
-            403, "project_mutation_forbidden", "project management is loopback-only"
-        )
-    remote = request.remote
-    try:
-        if remote is None or not ipaddress.ip_address(remote).is_loopback:
-            return _json_error(
-                403, "project_mutation_forbidden", "project management is loopback-only"
-            )
-    except ValueError:
+    if not _privileged_authorized(request, "projects"):
         return _json_error(
             403, "project_mutation_forbidden", "project management is loopback-only"
         )
@@ -3213,6 +3307,15 @@ def _register_project_routes(app: web.Application, ctx: _Ctx) -> None:
 def _register_meta_routes(
     app: web.Application, ctx: _Ctx, orchestrator: Orchestrator
 ) -> None:
+    async def handle_operator_capabilities(request: web.Request) -> web.Response:
+        state = _capability_state(request)
+        # Do not expose raw token material or unrecognized configuration.
+        return web.json_response(state, headers={"Cache-Control": "no-store"})
+
+    app.router.add_get(
+        "/api/v1/operator-capabilities", _wrap(handle_operator_capabilities)
+    )
+
     async def handle_stats(request: web.Request) -> web.Response:
         try:
             days = int(request.query.get("days", "30"))

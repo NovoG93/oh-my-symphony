@@ -1458,6 +1458,148 @@ async def _exercise_runs_page(page: Any, base_url: str) -> None:
     await page.get_by_role("button", name="+ New Issue").wait_for()
 
 
+async def _exercise_remote_operator_capabilities(page: Any, base_url: str) -> None:
+    """Exercise the browser's capability gate without changing server config."""
+    # Isolate token and capability state from the shared page used by the
+    # subsequent CRUD/layout scenarios.
+    browser = page.context.browser
+    assert browser is not None
+    scenario_context = await browser.new_context(viewport={"width": 1440, "height": 960})
+    scenario_page = await scenario_context.new_page()
+    page = scenario_page
+    capability_failure = False
+    calls = {"capabilities": 0, "runs": 0, "preview": 0, "preview_mutations": 0}
+
+    async def capability(route: Any) -> None:
+        calls["capabilities"] += 1
+        if capability_failure:
+            await route.fulfill(
+                status=503,
+                content_type="application/json",
+                body='{"error":{"code":"capability_unavailable","message":"temporary outage"}}',
+            )
+            return
+        authorized = bool(route.request.headers.get("authorization"))
+        await route.fulfill(
+            content_type="application/json",
+            body=json.dumps({
+                "capabilities": {
+                    "runs": authorized,
+                    "preview": authorized,
+                    "projects": authorized,
+                    "debug": False,
+                },
+                "denial_reason": None if authorized else "missing or invalid bearer token",
+            }),
+        )
+
+    async def board(route: Any) -> None:
+        if not route.request.headers.get("authorization"):
+            await route.fulfill(
+                status=401,
+                content_type="application/json",
+                body='{"error":{"code":"api_token_required","message":"API token required"}}',
+            )
+            return
+        await route.continue_()
+
+    async def runs(route: Any) -> None:
+        calls["runs"] += 1
+        await route.continue_()
+
+    async def preview(route: Any) -> None:
+        calls["preview"] += 1
+        if route.request.method != "GET":
+            calls["preview_mutations"] += 1
+        await route.continue_()
+
+    await page.route("**/api/v1/operator-capabilities", capability)
+    await page.route("**/api/v1/board", board)
+    await page.route("**/api/v1/runs**", runs)
+    await page.route("**/api/v1/preview**", preview)
+    try:
+        # This context starts without a tab-scoped credential. Navigate to the
+        # application origin before any storage/API assertions.
+        await page.goto(f"{base_url}/#/board", wait_until="networkidle")
+        await page.goto(f"{base_url}/#/runs", wait_until="networkidle")
+        await page.locator(".operator-locked").wait_for()
+        assert calls["runs"] == 0
+        assert await page.locator(".operator-locked").inner_text() != ""
+        await page.evaluate("window.i18n.setLang('ko')")
+        assert "실행 기록" in await page.locator(".operator-locked").inner_text()
+        await page.evaluate("window.i18n.setLang('en')")
+
+        # The board remains reachable, but its first API request prompts for a
+        # token. Saving it refreshes capabilities and restores the gated UI.
+        await page.goto(f"{base_url}/#/board", wait_until="networkidle")
+        token = page.locator(".api-token-input")
+        await token.wait_for()
+        assert await page.locator("#manage-projects").is_disabled()
+        await token.fill("browser-test-token")
+        await page.get_by_role("button", name="Connect").click()
+        await page.wait_for_function(
+            "() => document.querySelector('#api-token-banner-root') === null"
+        )
+        await page.goto(f"{base_url}/#/runs", wait_until="networkidle")
+        await page.locator("#runs-search").wait_for()
+        assert calls["runs"] >= 1
+        runs_before_revoke = calls["runs"]
+        await page.evaluate("sessionStorage.removeItem('symphony.apiToken')")
+        await page.reload(wait_until="networkidle")
+        await page.locator(".operator-locked").wait_for()
+        # An authorized request may complete during reload. Once the locked
+        # view is visible, however, the forbidden poller must stay stopped.
+        runs_after_lock = calls["runs"]
+        await page.wait_for_timeout(5500)
+        assert calls["runs"] == runs_after_lock
+        await page.evaluate("sessionStorage.setItem('symphony.apiToken', 'browser-test-token')")
+        await page.reload(wait_until="networkidle")
+        await page.locator("#runs-search").wait_for()
+        assert calls["runs"] > runs_before_revoke
+        await page.goto(f"{base_url}/#/stats", wait_until="networkidle")
+        await page.get_by_role("heading", name="Stats", exact=True).wait_for()
+        await page.set_viewport_size({"width": 360, "height": 800})
+        await _assert_no_document_overflow(page, "remote capability mobile stats")
+        await page.set_viewport_size({"width": 1440, "height": 960})
+        await page.goto(f"{base_url}/#/board", wait_until="networkidle")
+        assert not await page.locator("#manage-projects").is_disabled()
+
+        await page.goto(f"{base_url}/#/preview", wait_until="networkidle")
+        await page.locator(".preview-actions").wait_for()
+        # Authorized preview controls are enabled where the preview state
+        # allows them; the endpoint remains polled for telemetry.
+        assert calls["preview"] >= 1
+
+        capability_failure = True
+        await page.reload(wait_until="networkidle")
+        await page.locator(".preview-actions").wait_for()
+        preview_after_failure = calls["preview"]
+        await page.wait_for_timeout(5500)
+        assert calls["preview"] == preview_after_failure
+        capability_failure = False
+        await page.reload(wait_until="networkidle")
+        await page.locator(".preview-actions").wait_for()
+
+        preview_before_revoke = calls["preview"]
+        await page.evaluate("sessionStorage.removeItem('symphony.apiToken')")
+        # Reload the current Preview document so revocation causes a fresh
+        # capability request; a same-document goto can retain the SPA's
+        # previously authorized snapshot.
+        await page.reload(wait_until="networkidle")
+        await page.locator(".operator-locked-hint").wait_for()
+        assert await page.locator(".preview-launch").is_disabled()
+        assert await page.locator(".preview-restart").is_disabled()
+        assert await page.locator(".preview-stop").is_disabled()
+        assert calls["preview"] > preview_before_revoke
+        assert calls["preview_mutations"] == 0
+    finally:
+        await page.unroute("**/api/v1/operator-capabilities", capability)
+        await page.unroute("**/api/v1/board", board)
+        await page.unroute("**/api/v1/runs**", runs)
+        await page.unroute("**/api/v1/preview**", preview)
+        await scenario_context.close()
+
+
 async def _exercise_request_schedule(
     page: Any, base_url: str, errors: list[str]
 ) -> None:
@@ -1523,6 +1665,7 @@ async def test_web_board_browser_e2e(web_base_url: str) -> None:
             await _exercise_request_schedule(page, web_base_url, errors)
             await _exercise_column_scope(page, web_base_url)
             await _exercise_runs_page(page, web_base_url)
+            await _exercise_remote_operator_capabilities(page, web_base_url)
             await _exercise_issue_crud(page)
             await _exercise_settings_layout(page, web_base_url)
             await _exercise_mobile_layout(page, web_base_url)
