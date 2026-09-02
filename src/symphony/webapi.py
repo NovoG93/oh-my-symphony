@@ -8,42 +8,26 @@ stay interchangeable.
 Board mutations require `tracker.kind: file`. Read endpoints degrade to
 live-run info only for Linear / Jira boards.
 
-Security model: local operator tool. When the server is bound to loopback
-(the default), every `/api/` request must carry a loopback Host header —
-this blocks DNS-rebinding reads as well as writes. Mutating methods must
-additionally send a JSON content type, which forces a CORS preflight on
-cross-origin HTML/form attempts. Binding to a non-loopback interface is an
-explicit operator opt-in to network exposure and disables the Host check.
-Setting `SYMPHONY_API_TOKEN` adds a credential layer on top: every operator
-`/api/` request (reads included) must then present it as a bearer token, so an
-exposed bind does not hand full board control to any network peer. The exact
-managed-service health probe may instead present its separate per-launch
-capability header; that capability authorizes only `/api/v1/health`. The
-shipped SPA supports operator-token mode by prompting for the token and sending
-`Authorization: Bearer` on every fetch. The chat WebSocket is the only route
-where the operator token may also arrive as a `?token=` query parameter,
-because browsers cannot set headers on a WebSocket handshake (the query
-exception is scoped to that one route — query strings leak into access logs,
-so no other endpoint accepts it).
-Fronting the board with a reverse proxy or tunnel is the other opt-in: the
-public name goes in `SYMPHONY_TRUSTED_ORIGINS` so project mutations and the
-chat WebSocket accept it.
+Security is enforced by :mod:`symphony.web_policy`. Every API route belongs to
+an explicit capability group, and application construction fails if a route
+is unclassified. The supported modes are authenticated ``token``,
+trusted-network ``disabled``, and deny-by-default ``capabilities``. Exact Host
+and Origin checks protect the browser boundary. Chat WebSockets use a
+single-use 30-second ticket so the long-lived API token never appears in URLs.
 """
 
 from __future__ import annotations
 
 import asyncio
 import heapq
-import hmac
 import ipaddress
 import json
-import os
 import re
 from functools import partial
 from datetime import date, datetime
 from pathlib import Path
 from typing import Any, Awaitable, Callable
-from urllib.parse import quote, urlsplit
+from urllib.parse import quote
 
 from aiohttp import WSCloseCode, WSMsgType, web
 
@@ -60,10 +44,6 @@ from .errors import (
 )
 from .issue import Issue, registration_order_key
 from .logging import get_logger
-from .service_identity import (
-    SERVICE_INSTANCE_HEADER,
-    normalize_service_probe_credential,
-)
 from .skills import normalize_skill_names
 from .artifacts import ArtifactRecord, ArtifactStore
 from .stats import StatsStore, stats_store_for
@@ -113,6 +93,18 @@ from .workflow.mutate import (
 )
 from .workflow.preflight import stage_turn_budget_error
 from .workflow.presets import LANE_PRESETS, get_lane_preset, guess_lane_preset
+from . import web_policy as _web_policy
+from .web_policy import (
+    BIND_HOST_KEY,
+    WebSocketTicketStore,
+    policy_middleware,
+    resolve_policy,
+)
+
+API_TOKEN_ENV = _web_policy.API_TOKEN_ENV
+API_TOKEN_FILE_ENV = _web_policy.API_TOKEN_FILE_ENV
+TRUSTED_ORIGINS_ENV = _web_policy.TRUSTED_ORIGINS_ENV
+_request_has_valid_bearer = _web_policy.request_has_valid_bearer
 
 log = get_logger()
 
@@ -128,33 +120,11 @@ _RUN_ID_RE = re.compile(r"^[0-9a-f]{32}$")
 _MAX_TITLE = 300
 _MAX_BODY = 128_000
 _MAX_LABELS = 20
-_ALLOWED_HOSTS = {"localhost", "127.0.0.1", "[::1]"}
 _LOOPBACK_BINDS = {"", "localhost", "127.0.0.1", "::1", "[::1]"}
-# Operators who front the board with a reverse proxy or tunnel (cloudflared,
-# ngrok, ssh -L with a rewritten Host) reach it under a public name the
-# loopback allowlists cannot know. They declare it here, comma separated:
-#   SYMPHONY_TRUSTED_ORIGINS=https://symphony.example.com
-# Entries may be full origins (`https://host:port`), bare hostnames (any
-# scheme/port), or `*` to trust every origin.
-TRUSTED_ORIGINS_ENV = "SYMPHONY_TRUSTED_ORIGINS"
-# Optional credential gate for operator requests across the `/api/` surface.
-# Unset/empty keeps the frictionless loopback default. The one non-operator
-# path is the exact managed-service health probe, authenticated by its separate
-# per-launch capability and scoped to `/api/v1/health` below.
-API_TOKEN_ENV = "SYMPHONY_API_TOKEN"
-API_TOKEN_FILE_ENV = "SYMPHONY_API_TOKEN_FILE"
-# The one route where the token may also arrive as `?token=`: browsers
-# cannot set an Authorization header on a WebSocket handshake, so the SPA
-# appends the query parameter there. Scoped to the exact path — anywhere
-# else a query-supplied token must stay a 401 because query strings are
-# the part of a URL most likely to end up in access logs.
-_CHAT_WS_PATH = "/api/v1/chat/ws"
-_HEALTH_PATH = "/api/v1/health"
 _CI_EDITABLE_KEYS = {"enabled", "interval_ms", "max_turns", "agent_kind", "modes"}
-BIND_HOST_KEY: web.AppKey[str] = web.AppKey("symphony.bind_host", str)
 CHAT_MANAGER_KEY: web.AppKey[ChatManager] = web.AppKey("symphony.chat", ChatManager)
-SERVICE_INSTANCE_ID_KEY: web.AppKey[str | None] = web.AppKey(
-    "symphony.service_instance_id"
+WS_TICKETS_KEY: web.AppKey[WebSocketTicketStore] = web.AppKey(
+    "symphony.websocket_tickets", WebSocketTicketStore
 )
 _MAX_CHAT_MESSAGE = 32_000
 
@@ -182,181 +152,9 @@ def _request_is_loopback(request: web.Request) -> bool:
         return False
 
 
-def _request_host(request: web.Request) -> str:
-    """Host header without the port — bracket-aware for IPv6 literals."""
-    raw = (request.host or "").strip().lower()
-    if raw.startswith("["):
-        return raw.split("]", 1)[0] + "]"
-    return raw.rsplit(":", 1)[0]
-
-
-def _bare_host(host: str) -> str:
-    """Strip IPv6 brackets so Host and Origin hostnames compare equal."""
-    return host.strip().lower().removeprefix("[").removesuffix("]")
-
-
-def _host_is_loopback(host: str) -> bool:
-    bare = _bare_host(host)
-    if bare == "localhost":
-        return True
-    try:
-        return ipaddress.ip_address(bare).is_loopback
-    except ValueError:
-        return False
-
-
-def _trusted_origins() -> set[str]:
-    """Operator-declared origins from `SYMPHONY_TRUSTED_ORIGINS`."""
-    raw = os.environ.get(TRUSTED_ORIGINS_ENV, "")
-    return {
-        entry.strip().lower().rstrip("/")
-        for entry in raw.replace(";", ",").split(",")
-        if entry.strip()
-    }
-
-
-def _host_is_declared_trusted(host: str) -> bool:
-    """Does `SYMPHONY_TRUSTED_ORIGINS` name this Host header?"""
-    trusted = _trusted_origins()
-    if "*" in trusted:
-        return True
-    bare = _bare_host(host)
-    if not bare:
-        return False
-    return any(
-        bare == _bare_host(urlsplit(entry).hostname or entry) for entry in trusted
-    )
-
-
-def _origin_is_trusted(request: web.Request, origin: str) -> bool:
-    """Is this browser Origin allowed to mutate this board?
-
-    A missing Origin is fine — non-browser clients omit it, and browsers
-    always send one on the cross-origin requests we care about. Anything
-    else has to be loopback, the very host the browser addressed, or an
-    origin the operator declared.
-    """
-    if not origin:
-        return True
-    trusted = _trusted_origins()
-    if "*" in trusted:
-        return True
-    normalized = origin.strip().lower().rstrip("/")
-    if normalized in trusted:
-        return True
-    host = _bare_host(urlsplit(origin).hostname or "")
-    if not host:
-        # `Origin: null` — sandboxed iframe, file://, or a redirected form post.
-        return False
-    if host in trusted:
-        return True
-    if _host_is_loopback(host):
-        # Same machine. A TLS-terminating proxy or port forward in front of
-        # the board changes the scheme or port but not the trust boundary.
-        return True
-    return host == _bare_host(_request_host(request))
-
-
-def _configured_api_token() -> str | None:
-    """Bearer token from env, or its optional file fallback."""
-    token = os.environ.get(API_TOKEN_ENV, "").strip()
-    if token:
-        return token
-    token_file = os.environ.get(API_TOKEN_FILE_ENV, "").strip()
-    if not token_file:
-        return None
-    try:
-        value = Path(token_file).expanduser().read_text(encoding="utf-8").strip()
-    except OSError:
-        return None
-    return value or None
-
-
-def _request_has_valid_bearer(request: web.Request, token: str) -> bool:
-    """`Authorization: Bearer <token>` exact match, in constant time.
-
-    Both sides are compared as UTF-8 bytes: `hmac.compare_digest` rejects
-    non-ASCII `str` inputs, and a client may send any octet sequence.
-    """
-    parts = request.headers.get("Authorization", "").split()
-    if len(parts) != 2 or parts[0].lower() != "bearer":
-        return False
-    return hmac.compare_digest(parts[1].encode("utf-8"), token.encode("utf-8"))
-
-
-def _request_has_valid_ws_query_token(request: web.Request, token: str) -> bool:
-    """`?token=<token>` exact match for the chat WS handshake, constant time.
-
-    Same comparison discipline as the bearer helper. Only ever consulted
-    for `_CHAT_WS_PATH` by the API guard.
-    """
-    supplied = request.query.get("token", "")
-    return hmac.compare_digest(
-        supplied.encode("utf-8"), token.encode("utf-8")
-    )
-
-
-def _request_has_valid_service_instance(
-    request: web.Request, expected_instance_id: str | None
-) -> bool:
-    """Authenticate only the managed service's exact health probe."""
-    expected = normalize_service_probe_credential(expected_instance_id)
-    supplied = normalize_service_probe_credential(
-        request.headers.get(SERVICE_INSTANCE_HEADER)
-    )
-    if expected is None or supplied is None:
-        return False
-    return hmac.compare_digest(
-        supplied.encode("utf-8"), expected.encode("utf-8")
-    )
-
-
 @web.middleware
 async def _api_guard(request: web.Request, handler):
-    if request.path.startswith("/api/"):
-        # Optional credential layer: reads leak the board too, so every
-        # operator request must present the API token. The only alternate
-        # capability is the managed service's exact health probe below.
-        # Order matters — authenticate before validating anything else.
-        api_token = _configured_api_token()
-        if api_token is not None and not _request_has_valid_bearer(
-            request, api_token
-        ):
-            # Browsers cannot set headers on a WebSocket handshake; the
-            # chat socket alone may also present the token as ?token=.
-            ws_authorized = request.path == _CHAT_WS_PATH and (
-                _request_has_valid_ws_query_token(request, api_token)
-            )
-            health_authorized = request.path == _HEALTH_PATH and (
-                _request_has_valid_service_instance(
-                    request, request.app.get(SERVICE_INSTANCE_ID_KEY)
-                )
-            )
-            if not ws_authorized and not health_authorized:
-                return _json_error(
-                    401, "unauthorized", "missing or invalid bearer token"
-                )
-        bind = str(request.app.get(BIND_HOST_KEY) or "127.0.0.1").lower()
-        host = _request_host(request)
-        if (
-            bind in _LOOPBACK_BINDS
-            and host not in _ALLOWED_HOSTS
-            # A proxy that forwards the public Host verbatim is still the
-            # operator's own front door once they have declared it.
-            and not _host_is_declared_trusted(host)
-        ):
-            return _json_error(
-                403, "forbidden_host", f"host {request.host!r} not allowed"
-            )
-        if (
-            request.method in {"POST", "PUT", "PATCH", "DELETE"}
-            and request.body_exists
-            and request.content_type != "application/json"
-        ):
-            return _json_error(
-                415, "unsupported_media_type", "mutations require application/json"
-            )
-    return await handler(request)
+    return await policy_middleware(request, handler)
 
 
 async def _read_json(request: web.Request) -> dict[str, Any]:
@@ -2553,6 +2351,8 @@ def _register_chat_routes(
         ),
     )
     app[CHAT_MANAGER_KEY] = manager
+    tickets = WebSocketTicketStore()
+    app[WS_TICKETS_KEY] = tickets
     websockets: set[web.WebSocketResponse] = set()
 
     # The singular `/chat/session` routes predate multi-session support and
@@ -2605,8 +2405,12 @@ def _register_chat_routes(
     async def _confirm_project_setup(
         request: web.Request, session_id: str | None, action_id: str
     ) -> web.Response:
-        # This crosses from chat into global registry/Git mutation. Preserve the
-        # same loopback + same-origin boundary as the Project management form.
+        # This crosses from chat into global registry/Git mutation. The message
+        # endpoint multiplexes ordinary chat and numeric setup confirmation, so
+        # its route-level chat+board policy is intentionally supplemented here.
+        denied = _web_policy.capability_denial(request, {"projects"})
+        if denied is not None:
+            return denied
         denied = _project_mutation_error(request)
         if denied is not None:
             return denied
@@ -2741,10 +2545,17 @@ def _register_chat_routes(
             return _json_error(409, exc.code, exc.message)
         return web.json_response(snapshot)
 
-    def _origin_allowed(request: web.Request) -> bool:
-        # Browsers do not apply CORS to WebSocket upgrades; without this an
-        # arbitrary web page could stream the operator's transcript.
-        return _origin_is_trusted(request, request.headers.get("Origin") or "")
+    def _ticket_origin(request: web.Request) -> str:
+        return (request.headers.get("Origin") or f"{request.scheme}://{request.host}").lower().rstrip("/")
+
+    async def handle_ws_ticket(request: web.Request) -> web.Response:
+        policy = resolve_policy(str(request.app.get(BIND_HOST_KEY) or "127.0.0.1"))
+        value, expires_in = tickets.issue(
+            origin=_ticket_origin(request),
+            grants=policy.grants_for(request),
+            policy_fingerprint=policy.fingerprint(),
+        )
+        return web.json_response({"ticket": value, "expires_in": expires_in})
 
     async def _pump(
         queue: asyncio.Queue[dict[str, Any] | None], ws: web.WebSocketResponse
@@ -2760,11 +2571,19 @@ def _register_chat_routes(
                 return
 
     async def handle_chat_ws(request: web.Request) -> web.StreamResponse:
-        bind = str(request.app.get(BIND_HOST_KEY) or "127.0.0.1").lower()
-        if bind in _LOOPBACK_BINDS and not _origin_allowed(request):
-            return _json_error(
-                403, "forbidden_origin", "cross-origin websocket rejected"
+        ticket = request.query.get("ticket", "")
+        current = resolve_policy(str(request.app.get(BIND_HOST_KEY) or "127.0.0.1"))
+        required = frozenset({"chat"})
+        if (
+            not required.issubset(current.effective_grants)
+            or not tickets.consume(
+                ticket,
+                origin=_ticket_origin(request),
+                required=required,
+                policy_fingerprint=current.fingerprint(),
             )
+        ):
+            return _json_error(401, "invalid_websocket_ticket", "missing, expired, or used websocket ticket")
         raw_focus = (request.query.get("session") or "").strip()
         focus = _check_chat_session_id(raw_focus) if raw_focus else None
         ws = web.WebSocketResponse(heartbeat=30)
@@ -2851,6 +2670,7 @@ def _register_chat_routes(
         "/api/v1/chat/sessions/{session_id}/reattach",
         _wrap(handle_chat_session_reattach),
     )
+    app.router.add_post("/api/v1/chat/ws-ticket", _wrap(handle_ws_ticket))
     app.router.add_get("/api/v1/chat/ws", handle_chat_ws)
 
 
@@ -2932,13 +2752,6 @@ def _register_preview_routes(
                 415,
                 "unsupported_media_type",
                 "Product Preview actions require application/json",
-            )
-        bind = str(request.app.get(BIND_HOST_KEY) or "127.0.0.1").lower()
-        if bind not in _LOOPBACK_BINDS:
-            return _json_error(
-                403,
-                "preview_loopback_required",
-                "Product Preview process control is available only on loopback",
             )
         body = await _read_json(request)
         if body:
@@ -3043,31 +2856,7 @@ def _current_project_payload(ctx: _Ctx, projects: list[Project]) -> dict[str, An
 
 
 def _project_mutation_error(request: web.Request) -> web.Response | None:
-    """Project setup can write arbitrary paths, so it is loopback-only."""
-    bind = str(request.app.get(BIND_HOST_KEY) or "127.0.0.1").lower()
-    if bind not in _LOOPBACK_BINDS:
-        return _json_error(
-            403, "project_mutation_forbidden", "project management is loopback-only"
-        )
-    remote = request.remote
-    try:
-        if remote is None or not ipaddress.ip_address(remote).is_loopback:
-            return _json_error(
-                403, "project_mutation_forbidden", "project management is loopback-only"
-            )
-    except ValueError:
-        return _json_error(
-            403, "project_mutation_forbidden", "project management is loopback-only"
-        )
-    origin = request.headers.get("Origin")
-    if not _origin_is_trusted(request, origin or ""):
-        return _json_error(
-            403,
-            "forbidden_origin",
-            f"origin {origin!r} may not manage projects; set "
-            f"{TRUSTED_ORIGINS_ENV}={origin} if you front this board with a "
-            "reverse proxy or tunnel",
-        )
+    """Apply project-setup request-size limits after shared authorization."""
     if request.content_length is not None and request.content_length > 16_384:
         return _json_error(413, "request_too_large", "project request is too large")
     return None
@@ -3250,9 +3039,6 @@ def _register_meta_routes(
 
 def register_web_routes(app: web.Application, orchestrator: Orchestrator) -> None:
     ctx = _Ctx(orchestrator)
-    app[SERVICE_INSTANCE_ID_KEY] = normalize_service_probe_credential(
-        getattr(orchestrator, "service_instance_id", None)
-    )
     app.middlewares.append(_api_guard)
     _register_issue_routes(app, ctx, orchestrator)
     _register_workflow_routes(app, ctx, orchestrator)

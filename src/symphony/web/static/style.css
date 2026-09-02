@@ -248,6 +248,13 @@ a { color: inherit; }
   color: var(--text-muted);
 }
 
+.auth-policy-status {
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
 .conn-dot {
   width: 0.5926rem;
   height: 0.5926rem;

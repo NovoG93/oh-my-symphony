@@ -267,8 +267,8 @@ def test_web_chat_multi_session_contract() -> None:
     assert "listing.default_agent_kind" in js
     assert "function focusChatSocket(sessionId)" in js
     assert "JSON.stringify({ type: 'focus', session_id: sessionId || null })" in js
-    # The WS URL builder encodes the focused session (and, in token mode,
-    # the `?token=` handshake credential) as query parameters.
+    # The WS URL builder encodes the focused session; authentication uses a
+    # separate short-lived ticket rather than the long-lived bearer.
     assert "params.push(`session=${encodeURIComponent(chatState.currentId)}`)" in js
     assert ".chat-session-bar" in css
     assert ".chat-tab.active" in css
@@ -305,7 +305,7 @@ def test_web_api_token_prompt_contract() -> None:
     """M6 — SYMPHONY_API_TOKEN mode must not brick the shipped SPA.
 
     The central fetch attaches a stored bearer on every request, the chat
-    WebSocket appends `?token=` (browsers cannot set WS headers), and a
+    WebSocket exchanges it for a single-use ticket, and a
     401 surfaces a dismissible prompt instead of a silently dead board.
     A rejected stored token is dropped and the prompt re-shown once.
     """
@@ -316,8 +316,10 @@ def test_web_api_token_prompt_contract() -> None:
     assert "function withAuthHeaders(headers)" in js
     assert "Authorization: `Bearer ${token}`" in js
     assert "if (res.status === 401) handleApiUnauthorized();" in js
-    # WS handshake carries the token as a query parameter.
-    assert "params.push(`token=${encodeURIComponent(token)}`)" in js
+    # WS URLs carry only the short-lived ticket, never the API token.
+    assert "createWebSocketTicket" in js
+    assert "params.push(`ticket=${encodeURIComponent(ticket.ticket)}`)" in js
+    assert "params.push(`token=${encodeURIComponent(token)}`)" not in js
     # Dismissible inline prompt: password input + connect, i18n'd both ways.
     assert "id: 'api-token-banner-root'" in js
     assert "type: 'password'" in js

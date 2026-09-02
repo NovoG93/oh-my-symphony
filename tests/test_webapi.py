@@ -2055,21 +2055,21 @@ async def test_project_mutations_reject_cross_origin(
 async def test_project_mutations_accept_local_and_declared_origins(
     board_dir: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """A TLS-terminating proxy or tunnel must not look like an attacker.
+    """Only exact configured browser origins may mutate projects.
 
     The empty payload stops each request at field validation, so a 400
     proves the origin guard let it through without touching the registry.
     """
     client = await _project_client(board_dir, monkeypatch, _FakeProjectRegistry([]))
     try:
-        # Same machine, different scheme and port than the browser used.
+        # Loopback is not an ambient Origin bypass: scheme and port matter.
         for origin in ("https://127.0.0.1:9999", "http://localhost:1234"):
-            allowed = await client.post(
+            rejected = await client.post(
                 "/api/v1/projects", json={"name": "", "path": ""},
                 headers={"Origin": origin},
             )
-            assert allowed.status == 400, origin
-            assert (await allowed.json())["error"]["code"] == "invalid_project_name"
+            assert rejected.status == 403, origin
+            assert (await rejected.json())["error"]["code"] == "forbidden_origin"
 
         tunnel = "https://symphony.example.com"
         blocked = await client.post(
@@ -2078,7 +2078,7 @@ async def test_project_mutations_accept_local_and_declared_origins(
             headers={"Origin": tunnel},
         )
         assert blocked.status == 403
-        assert TRUSTED_ORIGINS_ENV in (await blocked.json())["error"]["message"]
+        assert (await blocked.json())["error"]["code"] == "forbidden_origin"
 
         monkeypatch.setenv(TRUSTED_ORIGINS_ENV, f"{tunnel} , https://other.example")
         declared = await client.post(
@@ -2537,5 +2537,4 @@ agent: { kind: claude }
     orch = Orchestrator(wf_state, usage_manager=mgr)
     pu = orch.snapshot()["provider_usage"]
     assert pu["claude"]["windows"]["five_hour"]["remaining_percent"] == 58.0
-
 

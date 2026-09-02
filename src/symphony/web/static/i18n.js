@@ -110,6 +110,10 @@
     'auth.tokenPlaceholder': 'API token',
     'auth.tokenSave': 'Connect',
     'auth.tokenSaved': 'Token saved — reconnecting',
+    'auth.disabledBadge': 'Authentication disabled',
+    'auth.modeBadge': 'Security: {mode}',
+    'auth.lockedTitle': 'This page is locked',
+    'auth.lockedHint': 'Required capabilities: {capabilities}',
 
 
     // -- Product Preview --------------------------------------------------
@@ -717,6 +721,10 @@
     'auth.tokenPlaceholder': 'API 토큰',
     'auth.tokenSave': '연결',
     'auth.tokenSaved': '토큰을 저장했습니다 — 다시 연결하는 중',
+    'auth.disabledBadge': '인증 비활성화됨',
+    'auth.modeBadge': '보안: {mode}',
+    'auth.lockedTitle': '이 페이지는 잠겨 있습니다',
+    'auth.lockedHint': '필요한 권한: {capabilities}',
 
 
     // -- Product Preview --------------------------------------------------

@@ -20,11 +20,11 @@
   const API_BASE = '/api/v1';
 
   // ------------------------------------------------------------------
-  // API token (SYMPHONY_API_TOKEN mode)
+  // API token (`token` policy mode)
   //
   // When the server sets a token, every /api/ fetch needs
-  // `Authorization: Bearer <token>` and the chat WebSocket needs it as
-  // `?token=` (browsers cannot set WS headers). The value lives in
+  // `Authorization: Bearer <token>`. WebSockets use a short-lived ticket so
+  // the long-lived token never appears in a URL. The value lives in
   // sessionStorage — tab-scoped and cleared when the tab closes — and a
   // dismissed banner stays hidden until a *new* 401 carries information
   // (a rejected stored token), so the 5s poll cannot resurrect it.
@@ -57,6 +57,10 @@
   let authBannerState = { open: false, dismissed: false };
 
   function handleApiUnauthorized() {
+    if (state.policy && state.policy.mode !== 'token') return;
+    closeChatSocket();
+    cancelPreviewPoll();
+    cancelRunsPoll();
     const hadToken = Boolean(storedApiToken());
     if (hadToken) {
       // The stored token was rejected — drop it so the next save is the
@@ -95,7 +99,8 @@
       hideApiTokenBanner();
       showToast(t('auth.tokenSaved'), 'success');
       // Re-run the board fetch immediately; a chat page also needs its
-      // WebSocket rebuilt so the handshake carries the new ?token=.
+      // WebSocket rebuilt so it can obtain a ticket with the new bearer.
+      await refreshPolicy();
       await refreshBoard();
       if (state.route === 'chat') renderRoute();
     });
@@ -164,6 +169,9 @@
     if (!res.ok) {
       if (res.status === 401) handleApiUnauthorized();
       const err = data && data.error;
+      if (res.status === 403 && err && err.code === 'missing_capability') {
+        refreshPolicy().then(() => renderRoute());
+      }
       throw new ApiError(
         (err && err.message) || t('api.requestFailed', { status: res.status }),
         (err && err.code) || 'unknown_error',
@@ -175,6 +183,8 @@
   }
 
   const api = {
+    getPolicy: () => apiRequest('/auth/policy'),
+    createWebSocketTicket: () => apiRequest('/chat/ws-ticket', { method: 'POST', body: '{}' }),
     getState: () => apiRequest('/state'),
     getBoard: () => apiRequest('/board'),
     getRequests: () => apiRequest('/requests'),
@@ -320,6 +330,7 @@
     projects: [],
     currentProject: null,
     workflow: null,
+    policy: null,
     branches: [],
     // Remotes + gh availability decide which Git page actions are usable.
     gitRemote: null,
@@ -1154,6 +1165,20 @@
     closeChatSocket();
     cancelPreviewPoll();
     cancelRunsPoll();
+    const pageCapabilities = {
+      board: ['board'], runs: ['runs'], stats: ['workers'], workflow: ['workflow'],
+      git: ['git'], chat: ['chat'], preview: ['preview'],
+      settings: ['board', 'workflow', 'git'],
+    };
+    const required = pageCapabilities[state.route] || [];
+    const grants = new Set((state.policy && state.policy.effective_grants) || []);
+    if (state.policy && required.some((capability) => !grants.has(capability))) {
+      view.appendChild(el('section', { class: 'empty-state policy-locked', role: 'status' }, [
+        el('h2', null, t('auth.lockedTitle')),
+        el('p', null, t('auth.lockedHint', { capabilities: required.join(', ') })),
+      ]));
+      return;
+    }
     switch (state.route) {
       case 'board':
         renderBoardPage(view);
@@ -4450,15 +4475,18 @@
     socket.send(JSON.stringify({ type: 'focus', session_id: sessionId || null }));
   }
 
-  function connectChatSocket(view) {
+  async function connectChatSocket(view) {
     closeChatSocket();
     const proto = location.protocol === 'https:' ? 'wss' : 'ws';
-    // The API guard cannot read headers browsers never send on a WS
-    // handshake, so token mode authenticates this one route via ?token=.
     const params = [];
     if (chatState.currentId) params.push(`session=${encodeURIComponent(chatState.currentId)}`);
-    const token = storedApiToken();
-    if (token) params.push(`token=${encodeURIComponent(token)}`);
+    let ticket;
+    try {
+      ticket = await api.createWebSocketTicket();
+    } catch (_err) {
+      return;
+    }
+    params.push(`ticket=${encodeURIComponent(ticket.ticket)}`);
     const query = params.length ? `?${params.join('&')}` : '';
     const socket = new WebSocket(`${proto}://${location.host}/api/v1/chat/ws${query}`);
     chatState.socket = socket;
@@ -5185,7 +5213,35 @@
     });
   }
 
-  function boot() {
+  function renderPolicyStatus() {
+    let badge = document.getElementById('auth-policy-status');
+    if (!badge) {
+      badge = el('span', { id: 'auth-policy-status', class: 'auth-policy-status badge' });
+      const footer = document.querySelector('.sidebar-footer');
+      if (footer) footer.prepend(badge);
+    }
+    if (!state.policy) {
+      badge.textContent = '';
+      badge.hidden = true;
+      return;
+    }
+    badge.hidden = false;
+    badge.textContent = state.policy.mode === 'disabled'
+      ? t('auth.disabledBadge')
+      : t('auth.modeBadge', { mode: state.policy.mode });
+  }
+
+  async function refreshPolicy() {
+    try {
+      state.policy = await api.getPolicy();
+      if (state.policy.mode !== 'token') hideApiTokenBanner();
+    } catch (_err) {
+      state.policy = null;
+    }
+    renderPolicyStatus();
+  }
+
+  async function boot() {
     // Static markup in index.html is translated once here, then again on every
     // language change; the SPA views are rebuilt wholesale by renderRoute().
     window.i18n.applyStaticNodes();
@@ -5194,6 +5250,7 @@
       updateConnectionIndicator();
     });
     wireGlobalShortcuts();
+    await refreshPolicy();
     const selector = document.getElementById('project-selector');
     if (selector) selector.addEventListener('change', () => switchProject(selector.value));
     const manageButton = document.getElementById('manage-projects');

@@ -676,15 +676,14 @@ def test_api_token_env_unset_passes(
     )
     monkeypatch.delenv("SYMPHONY_API_TOKEN", raising=False)
     result = check_api_token_env(cfg)
-    assert result.status == "pass"
-    assert "unset" in result.message
+    assert result.status == "warn"
+    assert "mode=disabled" in result.message
 
 
-def test_api_token_env_internal_whitespace_warns(
+def test_api_token_env_internal_whitespace_fails(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """A token with inner spaces can never match the two-word bearer
-    parse, so every /api/ request 401s — advisory, not a failure."""
+    """A token with inner spaces can never match a bearer word."""
     cfg = _build_cfg(
         tmp_path,
         """
@@ -695,7 +694,7 @@ def test_api_token_env_internal_whitespace_warns(
     )
     monkeypatch.setenv("SYMPHONY_API_TOKEN", "sekrit token")
     result = check_api_token_env(cfg)
-    assert result.status == "warn"
+    assert result.status == "fail"
     assert "whitespace" in result.message
 
 
@@ -713,7 +712,7 @@ def test_api_token_env_surrounding_whitespace_passes(
     monkeypatch.setenv("SYMPHONY_API_TOKEN", "  sekrit-token\t")
     result = check_api_token_env(cfg)
     assert result.status == "pass"
-    assert "required" in result.message
+    assert "mode=token" in result.message
 
 
 def test_api_token_env_blank_passes_as_unset(
@@ -729,8 +728,29 @@ def test_api_token_env_blank_passes_as_unset(
     )
     monkeypatch.setenv("SYMPHONY_API_TOKEN", "   ")
     result = check_api_token_env(cfg)
-    assert result.status == "pass"
-    assert "unset" in result.message
+    assert result.status == "warn"
+    assert "mode=disabled" in result.message
+
+
+def test_api_token_file_permissions_must_be_private(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    cfg = _build_cfg(
+        tmp_path,
+        """
+        tracker: { kind: file, board_root: ./kanban }
+        agent: { kind: codex }
+        codex: { command: codex app-server }
+        """,
+    )
+    token_file = tmp_path / "api-token"
+    token_file.write_text("secret\n")
+    token_file.chmod(0o644)
+    monkeypatch.setenv("SYMPHONY_API_AUTH_MODE", "token")
+    monkeypatch.setenv("SYMPHONY_API_TOKEN_FILE", str(token_file))
+    result = check_api_token_env(cfg)
+    assert result.status == "fail"
+    assert "permissions" in result.message
 
 
 def test_pi_auth_skipped_for_non_pi(tmp_path: Path) -> None:

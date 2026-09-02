@@ -1,11 +1,4 @@
-"""Auth + loopback gates for the web API (`symphony.webapi`, `symphony.server`).
-
-Covers the optional `SYMPHONY_API_TOKEN` bearer gate on the whole `/api/`
-surface — including the chat-WebSocket `?token=` handshake exception that
-keeps the shipped SPA usable in token mode — the loopback-only
-`/api/v1/_debug/tasks` route, and the guarantee that unhandled server
-errors never echo internal exception text to clients.
-"""
+"""Authorization policy gates for the board web API."""
 
 from __future__ import annotations
 
@@ -29,8 +22,15 @@ from symphony.webapi import (
     API_TOKEN_ENV,
     API_TOKEN_FILE_ENV,
     _request_has_valid_bearer,
-    _request_has_valid_ws_query_token,
     _request_is_loopback,
+)
+from symphony.web_policy import (
+    AUTH_MODE_ENV,
+    BIND_HOST_KEY,
+    CAPABILITIES_ENV,
+    TRUSTED_ORIGINS_ENV,
+    ROUTE_POLICIES_KEY,
+    validate_route_policies,
 )
 
 # The chat WS handshake builds its `hello` frame from the workflow config,
@@ -84,7 +84,7 @@ class _StubOrchestrator:
 
 
 async def _start_client(
-    tmp_path: Path, *, service_instance_id: str | None
+    tmp_path: Path, *, service_instance_id: str | None, bind_host: str | None = None
 ) -> TestClient:
     # build_app types its parameter as Orchestrator; at runtime it only
     # uses the method protocol we mirror in `_StubOrchestrator`.
@@ -99,6 +99,8 @@ async def _start_client(
             _StubOrchestrator(state, service_instance_id=service_instance_id),
         )
     )
+    if bind_host is not None:
+        app[BIND_HOST_KEY] = bind_host
     server = TestServer(app)
     cli = TestClient(server)
     await cli.start_server()
@@ -187,23 +189,24 @@ async def test_token_set_gates_mutation_routes_too(
     assert allowed.status == 202
 
 
-async def test_tokenized_health_accepts_only_exact_service_instance_header(
+async def test_health_is_public_and_never_returns_service_probe_credential(
     client: TestClient, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     monkeypatch.setenv(API_TOKEN_ENV, "sekrit-token")
     header = "X-Symphony-Service-Instance"
 
     missing = await client.get("/api/v1/health")
-    assert missing.status == 401
+    assert missing.status == 200
+    assert "service_instance_id" not in await missing.json()
 
     wrong = await client.get("/api/v1/health", headers={header: "b" * 43})
-    assert wrong.status == 401
+    assert wrong.status == 200
 
     health = await client.get(
         "/api/v1/health", headers={header: SERVICE_CAPABILITY}
     )
     assert health.status == 200
-    assert (await health.json())["service_instance_id"] == SERVICE_CAPABILITY
+    assert "service_instance_id" not in await health.json()
 
     other_route = await client.get(
         "/api/v1/state", headers={header: SERVICE_CAPABILITY}
@@ -211,7 +214,7 @@ async def test_tokenized_health_accepts_only_exact_service_instance_header(
     assert other_route.status == 401
 
 
-async def test_tokenized_health_rejects_short_foreground_instance_id(
+async def test_health_never_returns_short_foreground_instance_id(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     monkeypatch.setenv(API_TOKEN_ENV, "sekrit-token")
@@ -223,10 +226,12 @@ async def test_tokenized_health_rejects_short_foreground_instance_id(
             "/api/v1/health",
             headers={"X-Symphony-Service-Instance": "instance-a"},
         )
+        payload = await response.json()
     finally:
         await short_id_client.close()
 
-    assert response.status == 401
+    assert response.status == 200
+    assert "service_instance_id" not in payload
 
 
 async def test_token_not_required_outside_api_paths(
@@ -255,41 +260,146 @@ def test_request_has_valid_bearer_requires_exact_match() -> None:
     assert not _request_has_valid_bearer(req("Bearer passwörd"), token)
 
 
+async def test_policy_discovery_v2_never_exposes_token(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv(AUTH_MODE_ENV, "token")
+    monkeypatch.setenv(API_TOKEN_ENV, "sekrit-token")
+    anonymous = await client.get("/api/v1/auth/policy")
+    assert anonymous.status == 200
+    payload = await anonymous.json()
+    assert payload["version"] == 2
+    assert payload["mode"] == "token"
+    assert payload["token_configured"] is True
+    assert payload["authenticated"] is False
+    assert payload["effective_grants"] == []
+    assert "sekrit-token" not in json.dumps(payload)
+
+    authenticated = await client.get(
+        "/api/v1/auth/policy",
+        headers={"Authorization": "Bearer sekrit-token"},
+    )
+    assert (await authenticated.json())["authenticated"] is True
+
+
+async def test_capabilities_mode_ignores_bearer_and_denies_missing_group(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv(AUTH_MODE_ENV, "capabilities")
+    monkeypatch.setenv(API_TOKEN_ENV, "ignored-token")
+    monkeypatch.setenv(CAPABILITIES_ENV, "board")
+    assert (await client.get("/api/v1/board")).status == 200
+    denied = await client.get(
+        "/api/v1/state", headers={"Authorization": "Bearer ignored-token"}
+    )
+    assert denied.status == 403
+    assert (await denied.json())["error"]["code"] == "missing_capability"
+
+
+def test_every_board_api_route_has_policy_metadata(tmp_path: Path) -> None:
+    (tmp_path / "WORKFLOW.md").write_text(AUTH_WORKFLOW_TEXT, encoding="utf-8")
+    (tmp_path / "kanban").mkdir()
+    state = WorkflowState(tmp_path / "WORKFLOW.md")
+    assert state.reload()[1] is None
+    app = build_app(cast(Orchestrator, _StubOrchestrator(state)))
+    validate_route_policies(app)
+    api_routes = [
+        route for route in app.router.routes()
+        if route.resource and route.resource.canonical.startswith("/api/")
+    ]
+    assert len(app[ROUTE_POLICIES_KEY]) == len(api_routes)
+
+
+async def test_non_loopback_requires_exact_host_and_trusted_origin(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    client = await _start_client(
+        tmp_path, service_instance_id=SERVICE_CAPABILITY, bind_host="0.0.0.0"
+    )
+    monkeypatch.setenv(AUTH_MODE_ENV, "capabilities")
+    monkeypatch.setenv(CAPABILITIES_ENV, "board")
+    monkeypatch.setenv(TRUSTED_ORIGINS_ENV, "https://ops.example:9443")
+    try:
+        assert (await client.get("/api/v1/board")).status == 403
+        allowed_headers = {"Host": "ops.example:9443"}
+        assert (await client.get("/api/v1/board", headers=allowed_headers)).status == 200
+        rejected = await client.post(
+            "/api/v1/issues",
+            json={},
+            headers={**allowed_headers, "Origin": "http://ops.example:9443"},
+        )
+        assert rejected.status == 403
+        assert (await rejected.json())["error"]["code"] == "forbidden_origin"
+    finally:
+        await client.close()
+
+
+async def test_websocket_ticket_observes_capability_revocation(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv(AUTH_MODE_ENV, "capabilities")
+    monkeypatch.setenv(CAPABILITIES_ENV, "chat")
+    issued = await client.post("/api/v1/chat/ws-ticket", json={})
+    ticket = (await issued.json())["ticket"]
+    monkeypatch.setenv(CAPABILITIES_ENV, "")
+    with pytest.raises(aiohttp.WSServerHandshakeError) as revoked:
+        await client.ws_connect(f"/api/v1/chat/ws?ticket={ticket}")
+    assert revoked.value.status == 401
+
+
+async def test_chat_mutation_requires_chat_and_board(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv(AUTH_MODE_ENV, "capabilities")
+    monkeypatch.setenv(CAPABILITIES_ENV, "chat")
+    assert (await client.get("/api/v1/chat/sessions")).status == 200
+    denied = await client.post("/api/v1/chat/sessions", json={})
+    assert denied.status == 403
+    monkeypatch.setenv(CAPABILITIES_ENV, "chat,board")
+    allowed = await client.post("/api/v1/chat/sessions", json={})
+    assert allowed.status != 403
+
+
 # ---------------------------------------------------------------------------
 # SYMPHONY_API_TOKEN × chat WebSocket handshake
 # ---------------------------------------------------------------------------
 
 
-async def test_token_ws_handshake_accepts_query_token(
+async def test_token_ws_handshake_uses_single_use_ticket(
     client: TestClient, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Browsers cannot set headers on a WS upgrade, so the chat socket is
-    the one route where `?token=` authenticates. A valid token completes
-    the handshake and streams the `hello` frame."""
+    """The long-lived bearer is exchanged for a short-lived URL ticket."""
     monkeypatch.setenv(API_TOKEN_ENV, "sekrit-token")
-    ws = await client.ws_connect("/api/v1/chat/ws?token=sekrit-token")
-    try:
-        hello = await asyncio.wait_for(ws.receive_json(), timeout=5)
-        assert hello["type"] == "hello"
-    finally:
-        await ws.close()
-
-
-async def test_token_ws_handshake_accepts_bearer_header_too(
-    client: TestClient, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    monkeypatch.setenv(API_TOKEN_ENV, "sekrit-token")
-    ws = await client.ws_connect(
-        "/api/v1/chat/ws", headers={"Authorization": "Bearer sekrit-token"}
+    response = await client.post(
+        "/api/v1/chat/ws-ticket",
+        json={},
+        headers={"Authorization": "Bearer sekrit-token"},
     )
+    assert response.status == 200
+    ticket = (await response.json())["ticket"]
+    ws = await client.ws_connect(f"/api/v1/chat/ws?ticket={ticket}")
     try:
         hello = await asyncio.wait_for(ws.receive_json(), timeout=5)
         assert hello["type"] == "hello"
     finally:
         await ws.close()
+    with pytest.raises(aiohttp.WSServerHandshakeError) as reused:
+        await client.ws_connect(f"/api/v1/chat/ws?ticket={ticket}")
+    assert reused.value.status == 401
 
 
-async def test_token_ws_handshake_rejects_missing_or_wrong_query_token(
+async def test_token_ws_handshake_rejects_long_lived_bearer_header(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv(API_TOKEN_ENV, "sekrit-token")
+    with pytest.raises(aiohttp.WSServerHandshakeError) as rejected:
+        await client.ws_connect(
+            "/api/v1/chat/ws", headers={"Authorization": "Bearer sekrit-token"}
+        )
+    assert rejected.value.status == 401
+
+
+async def test_token_ws_handshake_rejects_missing_or_wrong_ticket(
     client: TestClient, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     monkeypatch.setenv(API_TOKEN_ENV, "sekrit-token")
@@ -298,32 +408,18 @@ async def test_token_ws_handshake_rejects_missing_or_wrong_query_token(
     assert missing.value.status == 401
 
     with pytest.raises(aiohttp.WSServerHandshakeError) as wrong:
-        await client.ws_connect("/api/v1/chat/ws?token=not-the-token")
+        await client.ws_connect("/api/v1/chat/ws?ticket=not-a-ticket")
     assert wrong.value.status == 401
 
 
 async def test_token_query_param_rejected_on_plain_routes(
     client: TestClient, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """The query-param exception is WS-only: a `?token=` on a normal GET
-    must stay a 401 (query strings are the URL part most likely to end
-    up in access logs)."""
+    """Long-lived tokens are never accepted in query strings."""
     monkeypatch.setenv(API_TOKEN_ENV, "sekrit-token")
     resp = await client.get("/api/v1/state", params={"token": "sekrit-token"})
     assert resp.status == 401
     assert (await resp.json())["error"]["code"] == "unauthorized"
-
-
-def test_request_has_valid_ws_query_token_requires_exact_match() -> None:
-    def req(query: dict[str, str]) -> Any:
-        return SimpleNamespace(query=query)
-
-    assert _request_has_valid_ws_query_token(req({"token": "tok-123"}), "tok-123")
-    assert not _request_has_valid_ws_query_token(req({"token": "tok-12"}), "tok-123")
-    assert not _request_has_valid_ws_query_token(req({}), "tok-123")
-    assert not _request_has_valid_ws_query_token(req({"token": ""}), "tok-123")
-    # Non-ASCII input must compare (and fail) instead of raising.
-    assert not _request_has_valid_ws_query_token(req({"token": "passwörd"}), "tok-123")
 
 
 # ---------------------------------------------------------------------------
@@ -332,8 +428,9 @@ def test_request_has_valid_ws_query_token_requires_exact_match() -> None:
 
 
 async def test_debug_tasks_allowed_from_loopback_peer(
-    client: TestClient,
+    client: TestClient, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    monkeypatch.setenv(CAPABILITIES_ENV, "debug")
     # TestClient connects over 127.0.0.1 — a real loopback peer.
     resp = await client.get("/api/v1/_debug/tasks")
     assert resp.status == 200
@@ -344,6 +441,7 @@ async def test_debug_tasks_allowed_from_loopback_peer(
 async def test_debug_tasks_rejects_non_loopback_peer(
     client: TestClient, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    monkeypatch.setenv(CAPABILITIES_ENV, "debug")
     # Simulate a request whose remote peer is off-machine (e.g. served
     # behind a LAN bind) by forcing the shared loopback predicate off.
     monkeypatch.setattr(server_mod, "_request_is_loopback", lambda _request: False)

@@ -282,11 +282,12 @@ async def test_health_endpoint_returns_status(monkeypatch) -> None:
         data = await resp.json()
         assert data["status"] == "starting"
         assert data["workflow_path"] == str(Path("/tmp/no.md"))
-        assert data["service_instance_id"] == "instance-http"
+        assert "service_instance_id" not in data
         assert data["orchestrator_pid"] == os.getpid()
         assert data["version"]
         assert data["tick"]["alive"] is False
+        assert "last_error" not in data["tick"]
         assert data["counts"] == {"running": 0, "retrying": 0}
-        assert data["run_registry"]["enabled"] is False
+        assert "run_registry" not in data
     finally:
         await client.close()

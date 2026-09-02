@@ -1204,44 +1204,53 @@ JSON API endpoints:
 
 #### Behind a reverse proxy or tunnel
 
-The board trusts loopback. If you front it with cloudflared, ngrok, nginx,
-or any other proxy, the browser arrives under a public name that loopback
-allowlists cannot know, and project creation fails with `forbidden_origin`
-(or `forbidden_host`). Declare the public front door:
+Every API route is assigned one of these capabilities: `board`, `workers`,
+`workflow`, `git`, `chat`, `runs`, `preview`, `projects`, or `debug`. Choose one
+authorization mode:
+
+- `token`: a valid bearer grants all normal capabilities; `debug` remains an
+  explicit capability opt-in.
+- `disabled`: authentication is off and all normal capabilities are granted;
+  use only on a trusted network.
+- `capabilities`: tokens are ignored and only the comma-separated
+  `SYMPHONY_REMOTE_OPERATOR_CAPABILITIES` are granted. This is also a
+  trusted-network mode: every client that reaches the direct bind receives the
+  configured grants.
+
+When the mode is unset, a configured token infers `token`; a tokenless
+loopback bind infers `disabled`; a non-loopback bind refuses to start. Legacy
+`global` and `operator` values safely alias `token` with a Doctor warning.
+
+Reverse proxies and non-loopback binds require every browser front door as an
+exact origin (scheme, host, and optional port). Wildcards and bare hostnames are
+rejected:
 
 ```bash
-SYMPHONY_TRUSTED_ORIGINS=https://symphony.example.com symphony ./WORKFLOW.md --port 9999
-```
-
-Comma-separate several entries; a bare hostname matches any scheme and
-port, and `*` trusts every origin. Everything the tunnel exposes is
-reachable by whoever can reach the tunnel, so put authentication (for
-example Cloudflare Access) in front of it. Symphony can also require a bearer
-token on every operator `/api/` request:
-
-```bash
-export SYMPHONY_TRUSTED_ORIGINS=https://symphony.example.com
-export SYMPHONY_API_TOKEN="$(python -c 'import secrets; print(secrets.token_urlsafe(32))')"
+SYMPHONY_API_AUTH_MODE=token \
+SYMPHONY_TRUSTED_ORIGINS=https://symphony.example.com \
+SYMPHONY_API_TOKEN_FILE="$HOME/.config/symphony/api-token" \
 symphony ./WORKFLOW.md --host 0.0.0.0 --port 9999
-
-curl -H "Authorization: Bearer $SYMPHONY_API_TOKEN" \
-  http://127.0.0.1:9999/api/v1/state
 ```
 
-When the token is set, the built-in web app prompts after its first `401` and
-keeps the value in tab-scoped `sessionStorage`; API fetches and the Chat
-WebSocket then attach it automatically. An unset or blank value preserves the
-frictionless loopback default. Use one whitespace-free random value and keep it
-out of `WORKFLOW.md`, shell history, screenshots, and logs. `symphony doctor`
-reports whether the gate is enabled and warns about values that can never
-match. Browsers cannot set an Authorization header on a WebSocket handshake,
-so Chat sends the token once as `?token=`; configure proxies and access logs to
-omit or redact query strings, or put an upstream access layer in front.
-The managed-service controller uses a separate random per-launch capability
-only for `/api/v1/health`; it never persists or reuses the operator API token.
-Managed start generates this capability from 256 random bits. Health capability
-headers must also be URL-safe and 32–128 characters; short or malformed
-manually inherited service IDs never bypass bearer authentication.
+Comma-separate multiple exact origins. Host and Origin checks mitigate DNS
+rebinding and CSRF; they are not authentication. For agenticOS-style
+capability-only deployment:
+
+```bash
+export SYMPHONY_API_AUTH_MODE=capabilities
+export SYMPHONY_API_TOKEN_FILE=/home/symphony/.config/symphony/api-token
+export SYMPHONY_TRUSTED_ORIGINS=https://symphony.example.com
+export SYMPHONY_REMOTE_OPERATOR_CAPABILITIES=board,workers,workflow,git,chat,runs,preview,projects
+symphony ./WORKFLOW.md --host 0.0.0.0 --port 9999
+```
+
+The token file is retained for switching to `token` mode but ignored in
+`capabilities` mode. The SPA stores a token only in tab-scoped
+`sessionStorage`. Chat exchanges the bearer for a single-use 30-second
+WebSocket ticket, so the long-lived credential never appears in URLs or access
+logs. `/api/v1/health` and `/api/v1/auth/policy` are public and sanitized; they
+never return token or managed-service probe material. Run `symphony doctor`
+before exposing or switching a service.
 
 ### CLI Kanban TUI (primary UI)
 
