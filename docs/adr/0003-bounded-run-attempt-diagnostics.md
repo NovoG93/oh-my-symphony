@@ -1,5 +1,13 @@
 # Bounded attempt diagnostics for the run explorer
 
+> **Superseded security boundary (current policy):** The original loopback-only
+> Runs API decision below is retained as historical ADR context. Runs endpoints
+> now follow the shared web authorization policy: `token`, `disabled`, or
+> `capabilities` mode, with the configured `runs` capability and the same exact
+> Host/Origin checks as other API routes. Deployments exposing Runs remotely
+> must use the applicable bearer/capability policy and must not rely on
+> loopback-only enforcement.
+
 ## Decision
 
 Every acquired worker lease remains a single durable Run attempt identified by the existing SQLite `runs.run_id`. Continuation turns, workflow phase changes, and in-process backend retries are lifecycle events within that attempt; a later redispatch after terminal exit acquires a new `run_id`. The nullable numeric `attempt` field remains retry metadata and is not an identity. The run explorer adds an additive schema migration with summary fields on `runs` and a new attempt-event table; it does not reactivate the inert `run_events` table left by the removed flow engine.

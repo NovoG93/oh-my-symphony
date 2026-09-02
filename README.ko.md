@@ -808,6 +808,9 @@ symphony ./WORKFLOW.md --port 9999
   ([Chat intake](#chat-intake--채팅에-요청하면-보드가-배달한다) 참고).
 - **Preview** — 분리된 대상 브랜치 체크아웃에서 루프백 전용 제품 미리보기를
   시작·재시작·중지하고, 상태 확인·URL·제한된 로그를 본다.
+- **Runs** — 기록된 시도를 검색·필터링하고, 제한된 민감정보 제거 타임라인과
+  토큰·워크스페이스·브랜치·커밋 정보를 확인하며 진단 JSON을 내려받는다.
+  `runs` capability가 허용된 웹 정책에서는 원격에서도 사용할 수 있다.
 - **Stats** — 일별 토큰, 처리량, 컬럼별 체류 시간, 에이전트별 합계, 평균
   사이클 타임 (`.symphony/stats.jsonl` 기반).
 - **Settings** — 실제 로컬 브랜치 드롭다운으로 브랜치 정책을 설정하고,
@@ -840,10 +843,32 @@ JSON API 엔드포인트:
 #### 리버스 프록시·터널 보안
 
 HTTP 인증 모드는 `token`, `disabled`, `capabilities` 세 가지다. `token`은
-유효한 bearer에 일반 권한을 모두 부여하고, `disabled`는 신뢰 네트워크에서 인증을
-끄며, `capabilities`는 토큰을 무시하고 명시한 권한만 부여한다. `debug`는 모든
-모드에서 별도로 명시해야 한다. 비루프백 바인드는 정확한 origin과 명시적 모드가
-필수이며 와일드카드는 거부된다:
+유효한 bearer에 일반 capability를 모두 부여하지만 `debug`는 별도 허용이 필요하다.
+`disabled`는 인증을 끄고 일반 capability를 모두 부여하므로 신뢰 네트워크에서만
+사용한다. `capabilities`는 bearer를 무시하고
+`SYMPHONY_REMOTE_OPERATOR_CAPABILITIES`에 나열된 capability만 부여한다.
+세 모드 모두 `debug`를 명시적으로 나열하지 않으면 허용하지 않는다.
+
+`SYMPHONY_API_AUTH_MODE`가 설정되지 않았을 때 `SYMPHONY_API_TOKEN` 또는
+`SYMPHONY_API_TOKEN_FILE`이 설정되어 있으면 `token`으로 추론한다. 토큰이 없는
+루프백 bind는 `disabled`로 추론하고, 비루프백 bind는 명시적인 모드가 없으면
+시작을 거부한다. 폐기 예정인 `global`과 `operator` 값은 `token` 별칭으로
+허용되며 경고를 출력하지만 passwordless 동작을 되살리지 않는다.
+
+`token` 모드의 보호된 경로에서 bearer가 없거나 틀리면 `401`이다. `capabilities`
+모드에서 bearer는 권한을 늘릴 수 없으며, 각 경로에 필요한 capability가 없으면
+`403`이 반환된다. `GET /api/v1/health`와 `GET /api/v1/auth/policy`만 공개 API
+엔드포인트이며, 응답은 정제된 상태·정책 정보만 반환하고 토큰이나 service probe
+credential을 노출하지 않는다. Runs API(`/api/v1/runs`)도 `runs` capability로
+보호되므로 원격 접근이 가능하다.
+
+리버스 프록시와 비루프백 bind에는 모든 브라우저 진입점의 정확한 trusted origin이
+필요하다. `SYMPHONY_TRUSTED_ORIGINS`에는 스킴(scheme), 호스트(host), 필요하면
+포트를 포함한 정확한 `http://` 또는 `https://` origin을 쉼표로 나열한다.
+와일드카드, 경로, bare hostname은 거부된다. 요청의 `Host`도 포트를 포함해
+정확히 일치해야 한다. Host/Origin 검사는 DNS rebinding과 CSRF를 줄이는 장치이지
+인증 자체는 아니다. 프록시는 등록된 모든 프로젝트 포트를 외부에 노출하고,
+외부 호스트명과 Host/Origin을 보존해야 프로젝트 전환 시 올바른 포트에 도달한다.
 
 ```bash
 export SYMPHONY_API_AUTH_MODE=capabilities
@@ -852,13 +877,32 @@ export SYMPHONY_REMOTE_OPERATOR_CAPABILITIES=board,workers,workflow,git,chat,run
 symphony ./WORKFLOW.md --host 0.0.0.0 --port 9999
 ```
 
-`token` 모드의 토큰은 탭 범위 `sessionStorage`에만 저장된다. Chat은 bearer를
-30초짜리 일회용 WebSocket ticket으로 교환하므로 장기 토큰이 URL이나 접근 로그에
-남지 않는다. `/api/v1/health`와 정책 조회 응답은 공개·정제되며 비밀 값을 반환하지
-않는다. 공개 또는 모드 전환 전 `symphony doctor`를 실행한다.
-관리형 시작은 이 capability를 256비트 임의 값으로 생성한다. health capability
-헤더는 URL-safe 32–128자만 허용하므로 짧거나 형식이 잘못된 수동 service ID는
-bearer 인증을 우회할 수 없다.
+`token` 모드의 토큰은 탭 범위 `sessionStorage`에만 저장된다. Chat은 인증된
+`POST /api/v1/chat/ws-ticket`를 통해 bearer(또는 다른 모드의 capability 허용)를
+origin에 묶인 30초짜리 일회용 WebSocket ticket으로 교환한다. 이후 WebSocket
+handshake에는 이 ticket만 사용하며 장기 토큰을 URL query parameter에 넣지 않는다.
+공개 또는 모드 전환 전 `symphony doctor`를 실행한다.
+
+#### API 키 생성·보관
+
+`token` 모드에서는 강력하고 공백이 없는 비밀 값을 저장소 밖에 생성한다:
+
+```bash
+install -d -m 0700 "$HOME/.config/symphony"
+chmod 0700 "$HOME/.config/symphony"
+openssl rand -hex 32 > "$HOME/.config/symphony/api-token"
+chmod 0600 "$HOME/.config/symphony/api-token"
+export SYMPHONY_API_AUTH_MODE=token
+export SYMPHONY_API_TOKEN_FILE="$HOME/.config/symphony/api-token"
+```
+
+토큰 파일이나 값을 commit하지 말고, `WORKFLOW.md`에 넣거나 셸 기록·프록시
+access log·티켓·스크린샷에 출력/복사하지 않는다. 프로세스 관리자가 환경 변수를
+안전하게 보호할 때만 `SYMPHONY_API_TOKEN`을 사용하고, 배포에서는 보통
+`SYMPHONY_API_TOKEN_FILE`이 더 안전하다. MCP를 배포한다면 MCP 자체의
+`SYMPHONY_MCP_TOKEN(_FILE)`과 MCP→Symphony용 `SYMPHONY_API_TOKEN(_FILE)`은
+서로 독립된 credential이다. 생성·systemd drop-in·Codex 설정은
+[`deploy/README.md`](deploy/README.md)를 참고한다.
 
 ### CLI Kanban TUI (primary UI)
 
@@ -1121,8 +1165,8 @@ detail 확인을 할 수 있다.
 
 - Run lease와 이슈 safety flag는 SQLite에 저장되지만, hard crash 뒤 실행 중이던
   in-process worker에 다시 붙지는 않는다. Markdown 티켓 상태가 recovery checkpoint다.
-- Retry attempt는 보존되지만, 과거 attempt를 운영자가 훑어볼 first-class run
-  history CLI/API는 아직 없다.
+- Run attempt는 로컬 registry에 보존되며 `runs` capability가 허용되면 웹 Runs
+  API(`/api/v1/runs`)에서 조회할 수 있다.
 - Claude Code의 턴 중간 스트리밍 사용량 이벤트는 읽지만 노출하지 않는다 —
   토큰 합계의 진실의 원천은 종료 `result` 이벤트다.
 - OpenCode 토큰 사용량은 JSON 이벤트에서 best-effort로 파싱한다. 알 수 없는

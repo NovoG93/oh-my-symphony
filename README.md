@@ -1191,8 +1191,8 @@ only). From the browser you can:
   a detached target-branch checkout, with a health check, URL, and bounded logs.
 - **Runs** — search and filter recorded attempts; inspect bounded, redacted
   lifecycle timelines, token usage, workspace/branch/commit references, and
-  download a diagnostic JSON bundle. Because this surface includes local paths
-  and failure excerpts, its API is available only to loopback clients.
+  download a diagnostic JSON bundle. Runs are protected by the `runs`
+  capability and can be used remotely when the selected web policy grants it.
 - **Stats** — tokens per day, throughput, per-column dwell time, per-agent
   totals, average cycle time (from `.symphony/stats.jsonl`).
 - **Settings** — branch policy (feature base / merge target) from a real
@@ -1239,13 +1239,36 @@ authorization mode:
   trusted-network mode: every client that reaches the direct bind receives the
   configured grants.
 
-When the mode is unset, a configured token infers `token`; a tokenless
-loopback bind infers `disabled`; a non-loopback bind refuses to start. Legacy
-`global` and `operator` values safely alias `token` with a Doctor warning.
+The mode is resolved as follows when `SYMPHONY_API_AUTH_MODE` is unset: a
+configured `SYMPHONY_API_TOKEN` or `SYMPHONY_API_TOKEN_FILE` infers `token`; a
+tokenless loopback bind infers `disabled`; and a non-loopback bind refuses to
+start until you choose a mode explicitly. The deprecated `global` and
+`operator` values are accepted as aliases for `token` and emit a warning;
+they do not restore passwordless behavior.
+
+In `token` mode, missing or incorrect `Authorization: Bearer <token>` headers
+return `401` on protected routes. In `disabled` mode, normal capabilities are
+available without a bearer, so use it only on a trusted network. In
+`capabilities` mode there is no bearer authentication: the configured
+comma-separated `SYMPHONY_REMOTE_OPERATOR_CAPABILITIES` list is the complete
+grant set, and a bearer cannot expand it. All three modes keep `debug` out of
+the normal grant set unless `debug` is explicitly listed; debug endpoints are
+never an implicit grant.
+
+`GET /api/v1/health` and `GET /api/v1/auth/policy` are the only public API
+endpoints. They return sanitized status/policy information and never disclose
+tokens or service probe credentials. Every other API route is classified by
+capability, including remote Runs (`runs`) and project switching (`projects`).
 
 Reverse proxies and non-loopback binds require every browser front door as an
-exact origin (scheme, host, and optional port). Wildcards and bare hostnames are
-rejected:
+exact trusted origin (scheme, host, and optional port). Set
+`SYMPHONY_TRUSTED_ORIGINS` to comma-separated exact `http://` or `https://`
+origins; wildcards, paths, and bare hostnames are rejected. Requests must also
+present an exact matching `Host` (including the port where applicable).
+These Host/Origin checks mitigate DNS rebinding and CSRF but are not
+authentication. A proxy must expose every registered project port, and must
+preserve the public Host/Origin values when forwarding requests; otherwise
+project switching can reach the wrong port or fail its policy checks:
 
 ```bash
 SYMPHONY_API_AUTH_MODE=token \
@@ -1260,19 +1283,39 @@ capability-only deployment:
 
 ```bash
 export SYMPHONY_API_AUTH_MODE=capabilities
-export SYMPHONY_API_TOKEN_FILE=/home/symphony/.config/symphony/api-token
 export SYMPHONY_TRUSTED_ORIGINS=https://symphony.example.com
 export SYMPHONY_REMOTE_OPERATOR_CAPABILITIES=board,workers,workflow,git,chat,runs,preview,projects
 symphony ./WORKFLOW.md --host 0.0.0.0 --port 9999
 ```
 
-The token file is retained for switching to `token` mode but ignored in
-`capabilities` mode. The SPA stores a token only in tab-scoped
-`sessionStorage`. Chat exchanges the bearer for a single-use 30-second
-WebSocket ticket, so the long-lived credential never appears in URLs or access
-logs. `/api/v1/health` and `/api/v1/auth/policy` are public and sanitized; they
-never return token or managed-service probe material. Run `symphony doctor`
-before exposing or switching a service.
+The SPA stores a token only in tab-scoped `sessionStorage`. For Chat, an
+authenticated `POST /api/v1/chat/ws-ticket` exchanges the bearer (in `token`
+mode) or capability grant (in the other modes) for a single-use,
+origin-bound, 30-second WebSocket ticket. The subsequent WebSocket handshake
+must use that ticket; do not put a long-lived API token in a URL query
+parameter.
+Run `symphony doctor` before exposing or switching a service.
+
+#### Minting and storing an API key
+
+For `token` mode, mint a strong whitespace-free secret and store it outside
+the repository. For example:
+
+```bash
+install -d -m 0700 "$HOME/.config/symphony"
+chmod 0700 "$HOME/.config/symphony"
+openssl rand -hex 32 > "$HOME/.config/symphony/api-token"
+chmod 0600 "$HOME/.config/symphony/api-token"
+export SYMPHONY_API_AUTH_MODE=token
+export SYMPHONY_API_TOKEN_FILE="$HOME/.config/symphony/api-token"
+```
+
+Do not commit the token file, put the value in `WORKFLOW.md`, or log/copy the
+credential into shell transcripts, proxy access logs, tickets, or screenshots.
+Use `SYMPHONY_API_TOKEN` only when your process manager can protect its
+environment; `SYMPHONY_API_TOKEN_FILE` is generally safer for deployment.
+The MCP gateway has a separate caller credential and mode-dependent upstream
+setup; see [Deploying `symphony-mcp`](deploy/README.md).
 
 ### CLI Kanban TUI (primary UI)
 
@@ -1514,8 +1557,8 @@ Fork-specific gaps:
 - Run leases and issue safety flags persist in SQLite, but Symphony still does
   not reattach to an in-process worker after a hard crash. Markdown ticket
   state is the recovery checkpoint.
-- Retry attempts persist, but there is not yet a first-class run-history CLI or
-  API for operators to browse old attempts.
+- Run attempts persist in the local registry and are available through the web
+  Runs API (`/api/v1/runs`) when the `runs` capability is granted.
 - Claude Code's mid-turn streaming usage events are read but not surfaced;
   the terminal `result` event is the source of truth for token totals.
 - OpenCode token usage is parsed best-effort from JSON events; unknown event
