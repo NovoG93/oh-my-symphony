@@ -14,6 +14,7 @@ Tests cover:
 from __future__ import annotations
 
 from pathlib import Path
+import json
 import textwrap
 from unittest.mock import AsyncMock, patch
 import pytest
@@ -194,6 +195,155 @@ def test_agy_model_specific_quota_buckets_are_preserved() -> None:
     assert snapshot.windows["gemini-2.5-pro"].used_percent == 25.0
     assert snapshot.windows["claude-3-7-sonnet"].used_percent == 60.0
     assert snapshot.windows["gpt-5.6-sol"].used_percent == 10.0
+
+
+def test_agy_122_grouped_quota_is_order_independent() -> None:
+    raw = {
+        "status": "SUCCESS",
+        "command": {"name": "usage", "data": {"groups": [
+            {"name": "Claude and GPT models", "buckets": [
+                {"id": "3p-weekly", "window": "weekly", "remaining_fraction": 0.4413555860519409,
+                 "reset_time": "2026-09-05T07:22:30Z"},
+                {"id": "3p-5h", "window": "5h", "remaining_fraction": 1,
+                 "reset_time": "2026-08-30T22:05:19Z"},
+            ]},
+            {"name": "Gemini Models", "buckets": [
+                {"id": "gemini-5h", "window": "5h", "remaining_fraction": 1,
+                 "reset_time": "2026-08-30T21:48:19Z"},
+                {"id": "gemini-weekly", "window": "weekly", "remaining_fraction": 0.9570363759994507,
+                 "reset_time": "2026-09-05T07:22:39Z"},
+            ]},
+        ]}}
+    }
+    snapshot = normalize_agy_usage(raw)
+    assert set(snapshot.windows) == {
+        "gemini_five_hour", "gemini_weekly",
+        "third_party_five_hour", "third_party_weekly",
+    }
+    weekly = snapshot.windows["third_party_weekly"]
+    assert weekly.group_key == "third_party"
+    assert weekly.period_key == "weekly"
+    assert weekly.used_percent == pytest.approx(55.8644414)
+    assert weekly.remaining_percent == pytest.approx(44.1355586)
+    assert weekly.resets_at is not None
+    assert weekly.resets_at.isoformat() == "2026-09-05T07:22:30+00:00"
+
+
+def test_agy_grouped_malformed_and_unknown_buckets_are_ignored() -> None:
+    raw = {"command": {"data": {"groups": [
+        {"name": "Gemini Models", "buckets": [
+            {"window": "monthly", "remaining_fraction": 0.5},
+            {"window": "weekly", "remaining_fraction": "bad"},
+            {"window": "5h", "remaining_fraction": 0.25},
+            "metadata",
+        ]},
+        {"name": "Other", "buckets": [{"window": "5h", "remaining_fraction": 0}]},
+    ]}}}
+    snapshot = normalize_agy_usage(raw)
+    assert set(snapshot.windows) == {"gemini_five_hour"}
+    assert snapshot.windows["gemini_five_hour"].used_percent == 75.0
+
+
+@pytest.mark.asyncio
+async def test_agy_probe_rejects_failed_status_and_empty_group_parse() -> None:
+    class Proc:
+        returncode = 0
+        async def communicate(self):
+            return (json.dumps({"status": "ERROR"}).encode(), b"")
+    with patch("asyncio.create_subprocess_shell", return_value=Proc()):
+        assert await AgyUsageProbe().fetch_usage() is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("payload", [
+    {"command": {"data": {"groups": {}}}},
+    {"command": {"data": {}}},
+    {"command": "not-an-envelope"},
+])
+async def test_agy_probe_rejects_malformed_command_envelope(payload: dict) -> None:
+    class Proc:
+        returncode = 0
+        async def communicate(self):
+            return (json.dumps(payload).encode(), b"")
+    with patch("asyncio.create_subprocess_shell", return_value=Proc()):
+        assert await AgyUsageProbe().fetch_usage() is None
+
+
+@pytest.mark.asyncio
+async def test_agy_probe_rejects_empty_legacy_and_manager_retains_stale() -> None:
+    class Proc:
+        returncode = 0
+        async def communicate(self):
+            return (b'{"buckets": []}', b"")
+    with patch("asyncio.create_subprocess_shell", return_value=Proc()):
+        assert await AgyUsageProbe().fetch_usage() is None
+
+
+def test_agy_command_metadata_does_not_hide_valid_legacy_buckets() -> None:
+    snapshot = normalize_agy_usage({
+        "command": {"name": "metadata"},
+        "quotas": {"weekly": {"used_percent": 25, "remaining_percent": 75}},
+    })
+    assert snapshot.windows["weekly"].used_percent == 25
+
+
+def test_agy_groups_empty_falls_back_to_legacy_quotas() -> None:
+    snapshot = normalize_agy_usage({
+        "command": {"data": {"groups": []}},
+        "quotas": {"weekly": {"used_percent": 25, "remaining_percent": 75}},
+    })
+    assert set(snapshot.windows) == {"weekly"}
+
+
+def test_agy_legacy_invalid_bucket_is_not_authoritative() -> None:
+    snapshot = normalize_agy_usage({
+        "buckets": {"metadata": {"description": "not usage"},
+                     "weekly": {"used_percent": "bad"}}
+    })
+    assert snapshot.windows == {}
+
+
+def test_agy_legacy_non_finite_bucket_values_are_ignored() -> None:
+    """Never let NaN/Infinity reach the JSON API and browser JSON.parse."""
+    snapshot = normalize_agy_usage({
+        "buckets": {
+            "nan-used": {"used_percent": "NaN"},
+            "infinite-remaining": {"remaining_percent": "Infinity"},
+            "valid": {"used_percent": 25},
+        }
+    })
+    assert set(snapshot.windows) == {"valid"}
+
+
+def test_agy_legacy_used_limit_non_finite_values_are_ignored() -> None:
+    """The legacy used/limit alias must also fail open on bad telemetry."""
+    snapshot = normalize_agy_usage({
+        "buckets": {
+            "nan-used": {"used": "NaN", "limit": 1},
+            "infinite-used": {"used": "Infinity", "limit": 1},
+            "infinite-limit": {"used": 1, "limit": "Infinity"},
+            "valid": {"used": 1, "limit": 4},
+        }
+    })
+    assert set(snapshot.windows) == {"valid"}
+    assert snapshot.windows["valid"].used_percent == 25.0
+
+
+@pytest.mark.asyncio
+async def test_agy_probe_manager_retains_stale_on_invalid_legacy_payload() -> None:
+    initial = ProviderUsageSnapshot(
+        "agy", "agy", windows={"weekly": UsageWindow("weekly", 20, 80)}
+    )
+    class Proc:
+        returncode = 0
+        async def communicate(self):
+            return (b'{"buckets": {"weekly": {"used_percent": "bad"}}}', b"")
+    manager = ProviderUsageManager(probes={"agy": AgyUsageProbe()})
+    manager.set_snapshot("agy", initial)
+    with patch("asyncio.create_subprocess_shell", return_value=Proc()):
+        result = await manager.refresh("agy")
+    assert result is not None and result.stale is True
+    assert result.windows["weekly"].used_percent == 20
 
 
 @pytest.mark.asyncio

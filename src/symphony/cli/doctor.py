@@ -43,6 +43,15 @@ from ..runtime_safety import (
     workflow_uses_protected_source_repo,
 )
 from ..orchestrator.release_contracts import inspect_release_contract
+from ..web_policy import (
+    API_TOKEN_FILE_ENV,
+    AUTH_MODE_ENV,
+    CAPABILITIES_ENV,
+    LOOPBACK_BINDS,
+    PolicyConfigurationError,
+    configured_api_token,
+    resolve_policy,
+)
 from ..orchestrator.release_cycle import (
     has_release_finalizer_lane,
     has_release_success_terminal,
@@ -130,6 +139,58 @@ def check_port(
     )
 
 
+def check_api_token_env(
+    cfg: ServiceConfig, *, host: str = "127.0.0.1"
+) -> CheckResult:
+    """Validate the complete HTTP authorization environment."""
+    name = "server.api_token"
+    del cfg  # the security contract is environment/bind scoped
+    try:
+        policy = resolve_policy(host)
+    except PolicyConfigurationError as exc:
+        return CheckResult(name, "fail", str(exc))
+    if policy.token and any(ch.isspace() for ch in policy.token):
+        return CheckResult(
+            name,
+            "fail",
+            "configured API token contains internal whitespace and cannot be used as one bearer word",
+        )
+
+    token_file = os.environ.get(API_TOKEN_FILE_ENV, "").strip()
+    if token_file:
+        try:
+            mode = Path(token_file).expanduser().stat().st_mode & 0o777
+        except OSError as exc:
+            return CheckResult(name, "fail", f"cannot read API token file: {exc}")
+        if os.name != "nt" and mode & 0o077:
+            return CheckResult(
+                name, "fail", f"API token file permissions are {mode:o}; require 600 or stricter"
+            )
+
+    requested = os.environ.get(AUTH_MODE_ENV, "").strip().lower()
+    warnings: list[str] = []
+    if requested in {"global", "operator"}:
+        warnings.append(f"{requested!r} is deprecated and safely aliases 'token'")
+    if policy.mode in {"disabled", "capabilities"}:
+        warnings.append(
+            f"{policy.mode} is a trusted-network mode: every reachable client receives its grants"
+        )
+    if policy.mode == "capabilities" and configured_api_token() is not None:
+        warnings.append("configured API token is ignored in capabilities mode")
+    if policy.mode in {"token", "disabled"} and os.environ.get(CAPABILITIES_ENV, "").strip():
+        normal = policy.configured_grants - {"debug"}
+        if normal:
+            warnings.append("normal capability entries are ignored in this mode")
+    if policy.mode == "token" and host.lower() not in LOOPBACK_BINDS:
+        warnings.append("direct HTTP bearer tokens are plaintext unless protected by TLS")
+    if host.lower() not in LOOPBACK_BINDS and not policy.trusted_origins:
+        return CheckResult(name, "fail", "non-loopback services require exact trusted origins/hosts")
+    message = f"mode={policy.mode}; grants={','.join(sorted(policy.effective_grants)) or 'none'}"
+    if warnings:
+        return CheckResult(name, "warn", message + "; " + "; ".join(warnings))
+    return CheckResult(name, "pass", message)
+
+
 def check_agent_cli(cfg: ServiceConfig) -> CheckResult:
     kind = cfg.agent.kind
     if kind == "codex":
@@ -155,7 +216,18 @@ def check_agent_cli(cfg: ServiceConfig) -> CheckResult:
 
     name = f"agent.kind={kind}"
     try:
-        argv = shlex.split(command)
+        if _IS_WIN32:
+            # POSIX-mode shlex eats backslashes: `D:\tools\python.exe`
+            # would reach shutil.which as `D:toolspython.exe` and the
+            # preflight bogus-fails with "not on $PATH". Whitespace mode
+            # keeps backslashes (and the quotes shlex leaves attached to
+            # a quoted token), so strip those surrounding quotes from the
+            # binary before resolving it.
+            argv = shlex.split(command, posix=False)
+            if argv:
+                argv[0] = argv[0].strip("\"'")
+        else:
+            argv = shlex.split(command)
     except ValueError as exc:
         return CheckResult(name, "fail", f"command not parseable: {exc}")
     if not argv:
@@ -1172,6 +1244,7 @@ def run_checks(cfg: ServiceConfig, host: str = "127.0.0.1") -> list[CheckResult]
     return [
         check_source_repository(cfg),
         check_port(cfg, host=host),
+        check_api_token_env(cfg, host=host),
         check_shell(),
         check_stage_turn_budget(cfg),
         check_agent_cli(cfg),

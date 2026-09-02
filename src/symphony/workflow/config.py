@@ -48,6 +48,7 @@ from .constants import (
     DEFAULT_WORKSPACE_REUSE_POLICY,
     SUPPORTED_CI_MODES,
 )
+from .presets import board_uses_default_contracts
 
 
 @dataclass(frozen=True)
@@ -127,6 +128,7 @@ class UsagePoolConfig:
 
     source: str
     caps: dict[str, float]
+    quota_group: str | None = None
 
 
 @dataclass(frozen=True)
@@ -285,8 +287,6 @@ class AgentConfig:
 
     def stage_contracts_enabled(self, active_states: "tuple[str, ...]") -> bool:
         """Resolve `agent.stage_contracts` against the board's lanes."""
-        from ..orchestrator.contracts import board_uses_default_contracts
-
         mode = (self.stage_contracts or "auto").strip().lower()
         if mode == "on":
             return True
@@ -893,4 +893,3 @@ class ServiceConfig:
             dispatch_kind=dispatch_kind,
             agent_profiles=self.agent_profiles,
         )
-

@@ -463,6 +463,7 @@ def test_provider_usage_snapshot_dataclass() -> None:
     assert minimal.authoritative is True
     assert minimal.observed_at is None
     assert minimal.stale is False
+    assert minimal.credits is None
 
     with pytest.raises(FrozenInstanceError):
         snapshot.hard_limit_reached = True  # type: ignore[misc]
@@ -669,6 +670,25 @@ async def test_provider_usage_manager_refresh_failure_marks_existing_stale() -> 
 
 
 @pytest.mark.asyncio
+async def test_provider_usage_manager_retains_stale_on_empty_parse() -> None:
+    initial = ProviderUsageSnapshot(
+        pool_id="agy", source="agy",
+        windows={"weekly": UsageWindow("weekly", 20, 80)},
+    )
+
+    class EmptyProbe:
+        async def fetch_usage(self) -> ProviderUsageSnapshot | None:
+            return None
+
+    manager = ProviderUsageManager(probes={"agy": EmptyProbe()})
+    manager.set_snapshot("agy", initial)
+    result = await manager.refresh("agy")
+    assert result is not None
+    assert result.stale is True
+    assert result.windows["weekly"].used_percent == 20
+
+
+@pytest.mark.asyncio
 async def test_provider_usage_manager_refresh_if_needed_respects_cache_ttl() -> None:
     call_count = 0
 
@@ -700,7 +720,7 @@ async def test_provider_usage_manager_refresh_if_needed_respects_cache_ttl() -> 
 
 
 def test_provider_usage_manager_format_wait_reason() -> None:
-    now = datetime(2026, 8, 17, 14, 0, 0, tzinfo=timezone.utc)
+    now = datetime.now(timezone.utc) + timedelta(days=1)
     pool = UsagePoolConfig(source="codex", caps={"weekly": 70.0})
     snap = ProviderUsageSnapshot(
         pool_id="codex",
@@ -713,7 +733,7 @@ def test_provider_usage_manager_format_wait_reason() -> None:
     )
     reason = format_wait_reason("codex", pool, snap)
     assert "codex weekly usage cap reached (75.0% >= 70.0%)" in reason
-    assert "2026-08-17T14:00:00+00:00" in reason
+    assert now.isoformat() in reason
 
     hard_snap = ProviderUsageSnapshot(
         pool_id="codex",
@@ -722,3 +742,83 @@ def test_provider_usage_manager_format_wait_reason() -> None:
     )
     hard_reason = format_wait_reason("codex", pool, hard_snap)
     assert "codex provider hard usage limit reached" in hard_reason
+
+
+def test_quota_group_config_validates_and_preserves_legacy_defaults() -> None:
+    cfg = _parse("""
+    usage_pools:
+      agy:
+        source: agy
+        quota_group: gemini
+        caps: {five_hour: 80, weekly: 70}
+      legacy:
+        source: codex
+        caps: {weekly: 70}
+    """)
+    assert cfg.usage_pools["agy"].quota_group == "gemini"
+    assert cfg.usage_pools["legacy"].quota_group is None
+    with pytest.raises(ConfigValidationError, match="quota_group"):
+        _parse("""
+        usage_pools:
+          agy:
+            source: agy
+            quota_group: ''
+            caps: {weekly: 70}
+        """)
+    with pytest.raises(ConfigValidationError, match="must be 'gemini' or 'third_party'"):
+        _parse("""
+        usage_pools:
+          agy:
+            source: agy
+            quota_group: gemnii
+            caps: {weekly: 70}
+        """)
+
+
+def test_grouped_usage_only_enforces_selected_group_and_recovers_after_reset() -> None:
+    # Keep the synthetic reset times in the future for format_wait_reason(),
+    # which intentionally compares them with the real wall clock.
+    now = datetime.now(timezone.utc)
+    manager = ProviderUsageManager(clock=lambda: now)
+    snap = ProviderUsageSnapshot("agy", "agy", windows={
+        "gemini_five_hour": UsageWindow(
+            "gemini_five_hour", 50, 50, now + timedelta(hours=1), "gemini", "five_hour"
+        ),
+        "gemini_weekly": UsageWindow(
+            "gemini_weekly", 50, 50, now + timedelta(days=1), "gemini", "weekly"
+        ),
+        "third_party_five_hour": UsageWindow(
+            "third_party_five_hour", 100, 0, now + timedelta(hours=1), "third_party", "five_hour"
+        ),
+    })
+    manager.set_snapshot("agy", snap)
+    gemini = UsagePoolConfig("agy", {"five_hour": 80}, quota_group="gemini")
+    third_party = UsagePoolConfig("agy", {"five_hour": 80}, quota_group="third_party")
+    assert manager.evaluate("agy", gemini) == UsageDecision.READY
+    assert manager.evaluate("agy", third_party) == UsageDecision.WAIT_PROVIDER_USAGE
+    assert "agy third_party five_hour" in format_wait_reason("agy", third_party, snap)
+
+    # A reset window is no longer a blocker on the next scheduler decision.
+    recovered = UsageWindow(
+        "third_party_five_hour", 100, 0, now - timedelta(seconds=1), "third_party", "five_hour"
+    )
+    manager.set_snapshot("agy", ProviderUsageSnapshot("agy", "agy", windows={
+        "third_party_five_hour": recovered,
+    }))
+    assert manager.evaluate("agy", third_party) == UsageDecision.READY
+
+
+def test_wait_reason_skips_expired_cap_and_reports_active_window() -> None:
+    now = datetime.now(timezone.utc)
+    pool = UsagePoolConfig("agy", {"five_hour": 80, "weekly": 70}, "gemini")
+    snap = ProviderUsageSnapshot("agy", "agy", windows={
+        "gemini_five_hour": UsageWindow(
+            "gemini_five_hour", 100, 0, now - timedelta(minutes=1), "gemini", "five_hour"
+        ),
+        "gemini_weekly": UsageWindow(
+            "gemini_weekly", 80, 20, now + timedelta(hours=2), "gemini", "weekly"
+        ),
+    })
+    reason = format_wait_reason("agy", pool, snap)
+    assert "weekly usage cap reached" in reason
+    assert "five_hour usage cap reached" not in reason

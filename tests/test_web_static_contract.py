@@ -267,7 +267,9 @@ def test_web_chat_multi_session_contract() -> None:
     assert "listing.default_agent_kind" in js
     assert "function focusChatSocket(sessionId)" in js
     assert "JSON.stringify({ type: 'focus', session_id: sessionId || null })" in js
-    assert "?session=${encodeURIComponent(chatState.currentId)}" in js
+    # The WS URL builder encodes the focused session; authentication uses a
+    # separate short-lived ticket rather than the long-lived bearer.
+    assert "params.push(`session=${encodeURIComponent(chatState.currentId)}`)" in js
     assert ".chat-session-bar" in css
     assert ".chat-tab.active" in css
     assert ".chat-tab-dot.busy" in css
@@ -297,6 +299,50 @@ def test_web_chat_font_controls_contract() -> None:
     assert "function buildFontControls(view)" in js
     assert ".chat-font-controls" in css
     assert "font-size: inherit" in css
+
+
+def test_web_api_token_prompt_contract() -> None:
+    """M6 — SYMPHONY_API_TOKEN mode must not brick the shipped SPA.
+
+    The central fetch attaches a stored bearer on every request, the chat
+    WebSocket exchanges it for a single-use ticket, and a
+    401 surfaces a dismissible prompt instead of a silently dead board.
+    A rejected stored token is dropped and the prompt re-shown once.
+    """
+    js = _script_bundle()
+    css = (STATIC_ROOT / "style.css").read_text(encoding="utf-8")
+
+    assert "symphony.apiToken" in js
+    assert "function withAuthHeaders(headers)" in js
+    assert "Authorization: `Bearer ${token}`" in js
+    assert "if (res.status === 401) handleApiUnauthorized();" in js
+    # WS URLs carry only the short-lived ticket, never the API token.
+    assert "createWebSocketTicket" in js
+    assert "params.push(`ticket=${encodeURIComponent(ticket.ticket)}`)" in js
+    assert "params.push(`token=${encodeURIComponent(token)}`)" not in js
+    # Dismissible inline prompt: password input + connect, i18n'd both ways.
+    assert "id: 'api-token-banner-root'" in js
+    assert "type: 'password'" in js
+    assert "storeApiToken(null);" in js
+    assert "authBannerState.dismissed" in js
+    assert "'auth.tokenBannerTitle': 'This board requires an API token'" in js
+    assert "'auth.tokenBannerTitle': '이 보드에는 API 토큰이 필요합니다'" in js
+    assert "'auth.tokenSave': 'Connect'" in js
+    assert "'auth.tokenSave': '연결'" in js
+    assert ".api-token-banner" in css
+    assert ".api-token-input" in css
+
+
+def test_web_stale_board_gates_keyboard_activation() -> None:
+    """L4 — while the board is dimmed stale, Enter/Space on focusable
+    cards and commit rows must not act on frozen data (mouse is already
+    blocked via pointer-events)."""
+    js = _script_bundle()
+
+    assert "function boardIsStale()" in js
+    assert "if (boardIsStale()) return;" in js
+    assert "method !== 'GET' && boardIsStale()" in js
+    assert "conn.staleMutationBlocked" in js
 
 
 def test_blocked_recovery_ui_uses_fix_ticket_language() -> None:
@@ -502,12 +548,34 @@ def test_provider_usage_card_exists() -> None:
     assert ".provider-usage-card" in css
     assert ".usage-bar-track" in css
     assert ".usage-bar-fill" in css
+    assert ".settings-body > .provider-usage-card { grid-column: 1 / -1;" in css
+    assert "grid-template-columns: repeat(auto-fit, minmax(min(100%, 24rem), 1fr))" in css
     assert "'usage.providerUsage': 'Provider Usage'" in i18n
     assert "'usage.providerUsage': '공급자 사용량'" in i18n
     assert "'usage.capacityPaused': 'Capacity paused'" in i18n
     assert "'usage.availableAfter': 'Available after'" in i18n
     assert "Capacity paused" in js or "t('usage.capacityPaused')" in js
     assert "Available after" in js or "t('usage.availableAfter')" in js
+    assert "credits.has_credits === true || credits.unlimited === true" in js
+    assert "'usage.capPercent': '{n}%'" in i18n
+    assert "'usage.capPercent': 'Configured cap: {n}%'" not in i18n
+    assert "'usage.capPercent': '설정된 상한: {n}%'" not in i18n
+    assert "usage.groupGemini" in js
+    assert "usage.groupThirdParty" in js
+    assert "'usage.groupGemini': 'Gemini Models'" in i18n
+    assert "'usage.groupThirdParty': 'Claude/GPT Models'" in i18n
+    assert "data-quota-group" in js
+    assert "reportedWindows" in js
+    assert "function formatUsagePercent(value)" in js
+    # AGY may preserve malformed quota metadata; object-valued group/period
+    # fields previously reached appendChild and crashed the settings route.
+    assert "typeof value === 'string' || typeof value === 'number'" in js
+    assert "typeof poolData.windows === 'object' && !Array.isArray(poolData.windows)" in js
+    # Legacy pools remain exact-key only; short period aliases are scoped to a
+    # configured, matching quota group.
+    assert "poolCfg.quota_group != null" in js
+    assert "info.group === poolCfg.quota_group ? poolCfg.caps[info.period] : null" in js
+    assert "poolCfg.caps[winKey]" in js
 
 
 def test_waiting_provider_usage_has_translation() -> None:
@@ -537,4 +605,3 @@ def test_estimated_usage_is_visually_distinguished() -> None:
     assert "'usage.estimated': '추정치'" in i18n
     assert ".chip-estimated" in css or ".usage-bar-fill--estimated" in css
     assert "chip-estimated" in js or "usage-bar-fill--estimated" in js
-

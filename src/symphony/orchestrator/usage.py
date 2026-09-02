@@ -183,6 +183,16 @@ class ProviderUsageManager:
 
         for window_name, cap in pool.caps.items():
             actual = snapshot.windows.get(window_name)
+            if pool.quota_group is not None:
+                actual = next(
+                    (
+                        w
+                        for w in snapshot.windows.values()
+                        if w.group_key == pool.quota_group
+                        and w.period_key == window_name
+                    ),
+                    None,
+                )
             if actual is not None and actual.used_percent is not None:
                 if actual.resets_at is not None and actual.resets_at <= now:
                     # Reset time has passed -> window usage is no longer blocking
@@ -200,6 +210,7 @@ def format_wait_reason(
 ) -> str:
     """Format a human-readable reason for waiting on provider usage."""
     if snapshot is not None:
+        now = datetime.now(timezone.utc)
         if snapshot.hard_limit_reached:
             resets_info = ""
             for w in snapshot.windows.values():
@@ -210,13 +221,26 @@ def format_wait_reason(
 
         for window_name, cap in pool.caps.items():
             actual = snapshot.windows.get(window_name)
+            if pool.quota_group is not None:
+                actual = next(
+                    (
+                        w
+                        for w in snapshot.windows.values()
+                        if w.group_key == pool.quota_group
+                        and w.period_key == window_name
+                    ),
+                    None,
+                )
             if actual is not None and actual.used_percent is not None:
+                if actual.resets_at is not None and actual.resets_at <= now:
+                    continue
                 if actual.used_percent >= cap:
                     resets_info = (
                         f"; resets at {actual.resets_at.isoformat()}"
                         if actual.resets_at is not None
                         else ""
                     )
-                    return f"{pool_id} {window_name} usage cap reached ({actual.used_percent}% >= {cap}%){resets_info}"
+                    group_info = f" {pool.quota_group}" if pool.quota_group else ""
+                    return f"{pool_id}{group_info} {window_name} usage cap reached ({actual.used_percent}% >= {cap}%){resets_info}"
 
     return f"{pool_id} usage cap reached"

@@ -25,7 +25,6 @@ from datetime import datetime, timezone
 import json
 import os
 import shlex
-import time
 from collections import deque
 from typing import Any, Sequence
 
@@ -63,23 +62,18 @@ from .usage import (
     UsageWindow,
     USAGE_PROBES,
 )
+from .per_turn import (
+    MAX_LINE_BYTES,
+    _emit_event,
+    _reap_process,
+    _stderr_tail_blob,
+)
 
 
 
 log = get_logger()
 
 PENDING_SESSION_ID = "pending"
-
-# StreamReader line-buffer limit for the subprocess pipes. The asyncio
-# default of 64 KiB overflows on stream-json events whose `result` text or
-# tool-use payload exceeds that on a single line, raising
-# `LimitOverrunError: Separator is found, but chunk is longer than limit`
-# and dropping the rest of the stream. Matches codex.py.
-MAX_LINE_BYTES = 10 * 1024 * 1024
-
-
-def _utc_iso() -> str:
-    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
 
 
 def _parse_resets_at(val: Any) -> datetime | None:
@@ -656,10 +650,7 @@ class ClaudeCodeBackend(BaseAgentBackend):
 
     def _stderr_blob(self) -> str:
         """Compact stderr tail for failure messages (≤400 chars)."""
-        if not self._stderr_tail:
-            return ""
-        joined = " | ".join(self._stderr_tail)
-        return joined if len(joined) <= 400 else joined[-400:]
+        return _stderr_tail_blob(self._stderr_tail)
 
     async def _observe_session_id(self, session_id: str) -> None:
         expected = self._expected_resume_session_id
@@ -678,9 +669,7 @@ class ClaudeCodeBackend(BaseAgentBackend):
 
     async def _reap(self, proc: asyncio.subprocess.Process) -> None:
         """Tear down a process group or surface ambiguous cleanup."""
-        result = await terminate_process_tree(proc)
-        if result is None and proc.returncode is None:
-            raise RuntimeError("backend process cleanup could not be confirmed")
+        await _reap_process(proc)
 
     def _update_usage_absolute(self, usage: dict[str, Any]) -> None:
         # Each `result` event reports usage for that one turn — accumulate.
@@ -697,24 +686,15 @@ class ClaudeCodeBackend(BaseAgentBackend):
         self._latest_usage["total_tokens"] += in_t + cache_t + out_t
 
     async def _emit(self, event: str, payload: dict[str, Any]) -> None:
-        try:
-            await self._on_event(
-                {
-                    "event": event,
-                    "timestamp": _utc_iso(),
-                    "payload": redact_session_id(
-                        payload if isinstance(payload, dict) else {"data": payload},
-                        None if event == EVENT_SESSION_STARTED else self._session_id,
-                    ),
-                    "usage": dict(self._latest_usage),
-                    "rate_limits": dict(self._latest_rate_limits)
-                    if self._latest_rate_limits
-                    else None,
-                    "agent_pid": self.pid,
-                }
-            )
-        except Exception as exc:
-            log.warning("event_callback_failed", error=str(exc))
+        await _emit_event(
+            self._on_event,
+            event,
+            payload,
+            usage=self._latest_usage,
+            rate_limits=self._latest_rate_limits,
+            agent_pid=self.pid,
+            redact_session=None if event == EVENT_SESSION_STARTED else self._session_id,
+        )
 
 
 def _extract_text(message: dict[str, Any]) -> str:

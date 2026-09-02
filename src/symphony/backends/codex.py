@@ -21,11 +21,11 @@ import asyncio
 import json
 import os
 import shlex
-import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Sequence
 
+from .. import __version__
 from .._shell import resolve_bash, terminate_process_tree
 from ..errors import (
     CodexNotFound,
@@ -63,16 +63,16 @@ from . import (
 )
 from .approval_policy import dangerous_command_reason
 from .usage import (
+    ProviderCreditInfo,
     ProviderUsageSnapshot,
     UsageProbe,
     UsageWindow,
     USAGE_PROBES,
 )
+from .per_turn import MAX_LINE_BYTES, _emit_event
 
 
 log = get_logger()
-
-MAX_LINE_BYTES = 10 * 1024 * 1024  # upstream §10.1 — 10 MB
 
 # Codex app-server protocol (v2 of `codex app-server`, codex-cli ≥ 0.39).
 # Older releases used `v2/initialize`, `v2/threads.start`, `v2/threads.runTurn`
@@ -100,10 +100,6 @@ NOTIF_RATE_LIMITS = "account/rateLimits/updated"
 # Last-message preview is rendered in the dashboard / passed back as
 # `TurnResult.last_message`. 1000 chars matches what the legacy backend used.
 _ASSISTANT_MESSAGE_PREVIEW_CAP = 1000
-
-
-def _utc_iso() -> str:
-    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
 
 
 # v2 turn/start `sandboxPolicy` is a tagged enum object, not a kebab-case
@@ -275,11 +271,29 @@ def _parse_resets_at(val: Any) -> datetime | None:
     return None
 
 
+def _merge_sparse_rate_limit_fields(
+    previous: dict[str, Any] | None,
+    incoming: dict[str, Any],
+) -> dict[str, Any]:
+    """Merge a rolling App Server update without clearing omitted/null fields."""
+    merged = dict(previous or {})
+    for key, value in incoming.items():
+        if value is None:
+            continue
+        old_value = merged.get(key)
+        if isinstance(old_value, dict) and isinstance(value, dict):
+            merged[key] = _merge_sparse_rate_limit_fields(old_value, value)
+        else:
+            merged[key] = value
+    return merged
+
+
 def normalize_codex_rate_limits(
     raw: dict[str, Any],
     *,
     pool_id: str = "codex",
     auth_mode: str | None = None,
+    previous: ProviderUsageSnapshot | None = None,
 ) -> ProviderUsageSnapshot:
     """Normalize raw Codex App Server rate limit responses into ProviderUsageSnapshot."""
     effective_auth = auth_mode
@@ -291,46 +305,80 @@ def normalize_codex_rate_limits(
         )
 
     # API-key auth does not get ChatGPT subscription caps (non-authoritative for caps)
-    authoritative = True
+    authoritative = previous.authoritative if previous is not None else True
     if effective_auth is not None and str(effective_auth).lower() in ("apikey", "api_key"):
         authoritative = False
 
-    # Check hard limit
-    hard_limit_reached = False
-    if isinstance(raw, dict):
-        rl_type = raw.get("rateLimitReachedType") or raw.get("rate_limit_reached_type")
-        if rl_type is not None and str(rl_type).lower() not in ("none", "false", "soft", ""):
-            hard_limit_reached = True
-        elif (
-            raw.get("hardLimitReached") is True
-            or raw.get("hard_limit_reached") is True
-            or raw.get("rateLimitReached") is True
+    limits_dict = raw
+    by_limit_id = raw.get("rateLimitsByLimitId")
+    if isinstance(by_limit_id, dict) and isinstance(by_limit_id.get("codex"), dict):
+        limits_dict = by_limit_id["codex"]
+    elif isinstance(raw.get("rateLimits"), dict):
+        limits_dict = raw["rateLimits"]
+
+    hard_limit_reached = previous.hard_limit_reached if previous is not None else False
+    hard_limit_value_found = False
+    hard_limit_sources = [limits_dict]
+    if limits_dict is not raw:
+        hard_limit_sources.append(raw)
+    for hard_limit_source in hard_limit_sources:
+        rl_type = hard_limit_source.get("rateLimitReachedType")
+        if rl_type is None:
+            rl_type = hard_limit_source.get("rate_limit_reached_type")
+        if rl_type is not None:
+            hard_limit_reached = str(rl_type).lower() not in (
+                "none",
+                "false",
+                "soft",
+                "",
+            )
+            hard_limit_value_found = True
+            break
+        for key in (
+            "hardLimitReached",
+            "hard_limit_reached",
+            "rateLimitReached",
+            "spendControlReached",
         ):
-            hard_limit_reached = True
+            value = hard_limit_source.get(key)
+            if isinstance(value, bool):
+                hard_limit_reached = value
+                hard_limit_value_found = True
+                break
+        if hard_limit_value_found:
+            break
 
-    limits_dict: dict[str, Any] = {}
-    if isinstance(raw, dict):
-        if "rateLimits" in raw and isinstance(raw["rateLimits"], dict):
-            limits_dict = raw["rateLimits"]
-        else:
-            limits_dict = raw
+    windows: dict[str, UsageWindow] = dict(previous.windows) if previous is not None else {}
 
-    windows: dict[str, UsageWindow] = {}
-    non_window_keys = {
-        "rateLimits",
-        "rateLimitReachedType",
-        "rate_limit_reached_type",
-        "authMode",
-        "accountType",
-        "auth_mode",
-        "hardLimitReached",
-        "hard_limit_reached",
-        "rateLimitReached",
-    }
-
-    for key, val in limits_dict.items():
-        if key in non_window_keys or not isinstance(val, dict):
+    for val in limits_dict.values():
+        if not isinstance(val, dict):
             continue
+
+        dur = val.get("windowDurationMins")
+        if dur is None:
+            dur = val.get("window_duration_mins")
+        if dur is None:
+            dur = val.get("durationMins")
+        if dur is None:
+            dur = val.get("duration_mins")
+        if dur is None:
+            continue
+        try:
+            if isinstance(dur, bool):
+                continue
+            dur_mins = int(dur)
+        except (ValueError, TypeError):
+            continue
+        if dur_mins <= 0:
+            continue
+        if dur_mins == 300:
+            window_key = "five_hour"
+        elif dur_mins == 10080:
+            window_key = "weekly"
+        else:
+            window_key = f"{dur_mins}_minutes"
+
+        previous_window = windows.get(window_key)
 
         used_raw = val.get("usedPercent") if "usedPercent" in val else val.get("used_percent")
         used_pct: float | None = None
@@ -339,6 +387,8 @@ def normalize_codex_rate_limits(
                 used_pct = float(used_raw)
             except (ValueError, TypeError):
                 used_pct = None
+        if used_pct is None and previous_window is not None:
+            used_pct = previous_window.used_percent
 
         rem_raw = (
             val.get("remainingPercent")
@@ -353,30 +403,14 @@ def normalize_codex_rate_limits(
                 rem_pct = None
         elif used_pct is not None:
             rem_pct = max(0.0, 100.0 - used_pct)
+        elif previous_window is not None:
+            rem_pct = previous_window.remaining_percent
 
         resets_at = _parse_resets_at(
             val.get("resetsAt") if "resetsAt" in val else val.get("resets_at")
         )
-
-        dur = (
-            val.get("windowDurationMins")
-            if "windowDurationMins" in val
-            else (val.get("window_duration_mins") or val.get("durationMins") or val.get("duration_mins"))
-        )
-
-        if dur is not None:
-            try:
-                dur_mins = int(dur)
-                if dur_mins == 300:
-                    window_key = "five_hour"
-                elif dur_mins == 10080:
-                    window_key = "weekly"
-                else:
-                    window_key = f"{dur_mins}_minutes"
-            except (ValueError, TypeError):
-                window_key = str(key)
-        else:
-            window_key = str(key)
+        if resets_at is None and previous_window is not None:
+            resets_at = previous_window.resets_at
 
         windows[window_key] = UsageWindow(
             key=window_key,
@@ -385,10 +419,39 @@ def normalize_codex_rate_limits(
             resets_at=resets_at,
         )
 
+    credits = previous.credits if previous is not None else None
+    raw_credits = limits_dict.get("credits")
+    if isinstance(raw_credits, dict):
+        raw_has_credits = raw_credits.get("hasCredits")
+        raw_unlimited = raw_credits.get("unlimited")
+        if isinstance(raw_has_credits, bool) or isinstance(raw_unlimited, bool):
+            has_credits = (
+                raw_has_credits
+                if isinstance(raw_has_credits, bool)
+                else (credits.has_credits if credits is not None else False)
+            )
+            unlimited = (
+                raw_unlimited
+                if isinstance(raw_unlimited, bool)
+                else (credits.unlimited if credits is not None else False)
+            )
+            if has_credits or unlimited:
+                balance = raw_credits.get("balance")
+                if balance is None and credits is not None:
+                    balance = credits.balance
+                credits = ProviderCreditInfo(
+                    has_credits=has_credits,
+                    unlimited=unlimited,
+                    balance=str(balance) if balance is not None else None,
+                )
+            else:
+                credits = None
+
     return ProviderUsageSnapshot(
         pool_id=pool_id,
         source="codex",
         windows=windows,
+        credits=credits,
         hard_limit_reached=hard_limit_reached,
         authoritative=authoritative,
         observed_at=datetime.now(timezone.utc),
@@ -761,7 +824,7 @@ class CodexAppServerBackend(BaseAgentBackend):
         # plus optional `capabilities`. Tools are no longer declared at
         # initialize time — they're handled per-thread / per-turn now.
         params = {
-            "clientInfo": {"name": "symphony", "version": "0.2.0"},
+            "clientInfo": {"name": "symphony", "version": __version__},
         }
         return await self._request(METHOD_INITIALIZE, params)
 
@@ -1144,14 +1207,25 @@ class CodexAppServerBackend(BaseAgentBackend):
         if method == NOTIF_RATE_LIMITS or method.endswith("/rateLimits"):
             rl = params.get("rateLimits") if isinstance(params, dict) else None
             if isinstance(rl, dict):
-                self._latest_rate_limits = rl
+                self._latest_rate_limits = _merge_sparse_rate_limit_fields(
+                    self._latest_rate_limits,
+                    rl,
+                )
             elif isinstance(params, dict) and "rateLimits" not in params:
-                self._latest_rate_limits = params
+                self._latest_rate_limits = _merge_sparse_rate_limit_fields(
+                    self._latest_rate_limits,
+                    params,
+                )
             if self._latest_rate_limits is not None:
                 pool_id = self._usage_pool or "codex"
                 snapshot = normalize_codex_rate_limits(
                     self._latest_rate_limits,
                     pool_id=pool_id,
+                    previous=(
+                        self._usage_manager.snapshot(pool_id)
+                        if self._usage_manager is not None
+                        else None
+                    ),
                 )
                 if self._usage_manager is not None:
                     self._usage_manager.set_snapshot(pool_id, snapshot)
@@ -1380,22 +1454,17 @@ class CodexAppServerBackend(BaseAgentBackend):
         )
 
     async def _emit(self, event: str, payload: dict[str, Any]) -> None:
-        ev_payload = payload if isinstance(payload, dict) else {"data": payload}
-        try:
-            await self._on_event(
-                {
-                    "event": event,
-                    "timestamp": _utc_iso(),
-                    "payload": ev_payload,
-                    "usage": dict(self._latest_usage),
-                    "rate_limits": dict(self._latest_rate_limits)
-                    if self._latest_rate_limits
-                    else None,
-                    "agent_pid": self.pid,
-                }
-            )
-        except Exception as exc:
-            log.warning("event_callback_failed", error=str(exc))
+        # No session redaction on the app-server protocol (thread ids are
+        # opaque handles, not secrets carried in evidence) — passing no
+        # `redact_session` is an identity in the shared helper.
+        await _emit_event(
+            self._on_event,
+            event,
+            payload,
+            usage=self._latest_usage,
+            rate_limits=self._latest_rate_limits,
+            agent_pid=self.pid,
+        )
 
 
 def _normalize_event_name(method: str) -> str:

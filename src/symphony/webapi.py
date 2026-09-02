@@ -8,24 +8,19 @@ stay interchangeable.
 Board mutations require `tracker.kind: file`. Read endpoints degrade to
 live-run info only for Linear / Jira boards.
 
-Security model: local operator tool. When the server is bound to loopback
-(the default), every `/api/` request must carry a loopback Host header —
-this blocks DNS-rebinding reads as well as writes. Mutating methods must
-additionally send a JSON content type, which forces a CORS preflight on
-cross-origin HTML/form attempts. Binding to a non-loopback interface is an
-explicit operator opt-in to network exposure and disables the Host check.
-Fronting the board with a reverse proxy or tunnel is the other opt-in: the
-public name goes in `SYMPHONY_TRUSTED_ORIGINS` so project mutations and the
-chat WebSocket accept it.
+Security is enforced by :mod:`symphony.web_policy`. Every API route belongs to
+an explicit capability group, and application construction fails if a route
+is unclassified. The supported modes are authenticated ``token``,
+trusted-network ``disabled``, and deny-by-default ``capabilities``. Exact Host
+and Origin checks protect the browser boundary. Chat WebSockets use a
+single-use 30-second ticket so the long-lived API token never appears in URLs.
 """
 
 from __future__ import annotations
 
 import asyncio
 import heapq
-import ipaddress
 import json
-import os
 import re
 from functools import partial
 from datetime import date, datetime
@@ -97,6 +92,19 @@ from .workflow.mutate import (
 )
 from .workflow.preflight import stage_turn_budget_error
 from .workflow.presets import LANE_PRESETS, get_lane_preset, guess_lane_preset
+from . import web_policy as _web_policy
+from .web_policy import (
+    BIND_HOST_KEY,
+    MUTATING_METHODS,
+    WebSocketTicketStore,
+    policy_middleware,
+    resolve_policy,
+)
+
+API_TOKEN_ENV = _web_policy.API_TOKEN_ENV
+API_TOKEN_FILE_ENV = _web_policy.API_TOKEN_FILE_ENV
+TRUSTED_ORIGINS_ENV = _web_policy.TRUSTED_ORIGINS_ENV
+_request_has_valid_bearer = _web_policy.request_has_valid_bearer
 
 log = get_logger()
 
@@ -112,18 +120,11 @@ _RUN_ID_RE = re.compile(r"^[0-9a-f]{32}$")
 _MAX_TITLE = 300
 _MAX_BODY = 128_000
 _MAX_LABELS = 20
-_ALLOWED_HOSTS = {"localhost", "127.0.0.1", "[::1]"}
-_LOOPBACK_BINDS = {"", "localhost", "127.0.0.1", "::1", "[::1]"}
-# Operators who front the board with a reverse proxy or tunnel (cloudflared,
-# ngrok, ssh -L with a rewritten Host) reach it under a public name the
-# loopback allowlists cannot know. They declare it here, comma separated:
-#   SYMPHONY_TRUSTED_ORIGINS=https://symphony.example.com
-# Entries may be full origins (`https://host:port`), bare hostnames (any
-# scheme/port), or `*` to trust every origin.
-TRUSTED_ORIGINS_ENV = "SYMPHONY_TRUSTED_ORIGINS"
 _CI_EDITABLE_KEYS = {"enabled", "interval_ms", "max_turns", "agent_kind", "modes"}
-BIND_HOST_KEY: web.AppKey[str] = web.AppKey("symphony.bind_host", str)
 CHAT_MANAGER_KEY: web.AppKey[ChatManager] = web.AppKey("symphony.chat", ChatManager)
+WS_TICKETS_KEY: web.AppKey[WebSocketTicketStore] = web.AppKey(
+    "symphony.websocket_tickets", WebSocketTicketStore
+)
 _MAX_CHAT_MESSAGE = 32_000
 
 
@@ -138,117 +139,9 @@ def _json_error(status: int, code: str, message: str) -> web.Response:
 # ---------------------------------------------------------------------------
 
 
-def _request_is_loopback(request: web.Request) -> bool:
-    """Keep sensitive run diagnostics on the operator's local machine."""
-    remote = request.remote
-    if remote is None:
-        bind = str(request.app.get(BIND_HOST_KEY) or "127.0.0.1").lower()
-        return bind in _LOOPBACK_BINDS
-    try:
-        return ipaddress.ip_address(remote).is_loopback
-    except ValueError:
-        return False
-
-
-def _request_host(request: web.Request) -> str:
-    """Host header without the port — bracket-aware for IPv6 literals."""
-    raw = (request.host or "").strip().lower()
-    if raw.startswith("["):
-        return raw.split("]", 1)[0] + "]"
-    return raw.rsplit(":", 1)[0]
-
-
-def _bare_host(host: str) -> str:
-    """Strip IPv6 brackets so Host and Origin hostnames compare equal."""
-    return host.strip().lower().removeprefix("[").removesuffix("]")
-
-
-def _host_is_loopback(host: str) -> bool:
-    bare = _bare_host(host)
-    if bare == "localhost":
-        return True
-    try:
-        return ipaddress.ip_address(bare).is_loopback
-    except ValueError:
-        return False
-
-
-def _trusted_origins() -> set[str]:
-    """Operator-declared origins from `SYMPHONY_TRUSTED_ORIGINS`."""
-    raw = os.environ.get(TRUSTED_ORIGINS_ENV, "")
-    return {
-        entry.strip().lower().rstrip("/")
-        for entry in raw.replace(";", ",").split(",")
-        if entry.strip()
-    }
-
-
-def _host_is_declared_trusted(host: str) -> bool:
-    """Does `SYMPHONY_TRUSTED_ORIGINS` name this Host header?"""
-    trusted = _trusted_origins()
-    if "*" in trusted:
-        return True
-    bare = _bare_host(host)
-    if not bare:
-        return False
-    return any(
-        bare == _bare_host(urlsplit(entry).hostname or entry) for entry in trusted
-    )
-
-
-def _origin_is_trusted(request: web.Request, origin: str) -> bool:
-    """Is this browser Origin allowed to mutate this board?
-
-    A missing Origin is fine — non-browser clients omit it, and browsers
-    always send one on the cross-origin requests we care about. Anything
-    else has to be loopback, the very host the browser addressed, or an
-    origin the operator declared.
-    """
-    if not origin:
-        return True
-    trusted = _trusted_origins()
-    if "*" in trusted:
-        return True
-    normalized = origin.strip().lower().rstrip("/")
-    if normalized in trusted:
-        return True
-    host = _bare_host(urlsplit(origin).hostname or "")
-    if not host:
-        # `Origin: null` — sandboxed iframe, file://, or a redirected form post.
-        return False
-    if host in trusted:
-        return True
-    if _host_is_loopback(host):
-        # Same machine. A TLS-terminating proxy or port forward in front of
-        # the board changes the scheme or port but not the trust boundary.
-        return True
-    return host == _bare_host(_request_host(request))
-
-
 @web.middleware
 async def _api_guard(request: web.Request, handler):
-    if request.path.startswith("/api/"):
-        bind = str(request.app.get(BIND_HOST_KEY) or "127.0.0.1").lower()
-        host = _request_host(request)
-        if (
-            bind in _LOOPBACK_BINDS
-            and host not in _ALLOWED_HOSTS
-            # A proxy that forwards the public Host verbatim is still the
-            # operator's own front door once they have declared it.
-            and not _host_is_declared_trusted(host)
-        ):
-            return _json_error(
-                403, "forbidden_host", f"host {request.host!r} not allowed"
-            )
-        if (
-            request.method in {"POST", "PUT", "PATCH", "DELETE"}
-            and request.body_exists
-            and request.content_type != "application/json"
-        ):
-            return _json_error(
-                415, "unsupported_media_type", "mutations require application/json"
-            )
-    return await handler(request)
+    return await policy_middleware(request, handler)
 
 
 async def _read_json(request: web.Request) -> dict[str, Any]:
@@ -289,7 +182,10 @@ def _wrap(handler: Callable[[web.Request], Awaitable[web.StreamResponse]]):
                 method=request.method,
                 error=str(exc),
             )
-            return _json_error(500, "internal_error", str(exc))
+            # Never echo internal exception text (paths, SQL, library
+            # internals) to HTTP clients — the log line above keeps the
+            # detail for the operator.
+            return _json_error(500, "internal_error", "internal server error")
 
     return wrapped
 
@@ -749,6 +645,7 @@ def _workflow_payload(cfg: ServiceConfig) -> dict[str, Any]:
             name: {
                 "source": pool.source,
                 "caps": dict(pool.caps),
+                **({"quota_group": pool.quota_group} if pool.quota_group is not None else {}),
             }
             for name, pool in cfg.usage_pools.items()
         },
@@ -1068,12 +965,6 @@ def _register_issue_routes(
     app: web.Application, ctx: _Ctx, orchestrator: Orchestrator
 ) -> None:
     async def handle_runs(request: web.Request) -> web.Response:
-        if not _request_is_loopback(request):
-            return _json_error(
-                403,
-                "run_diagnostics_local_only",
-                "run diagnostics are available only from the local machine",
-            )
         raw_limit = request.query.get("limit", "50")
         try:
             limit = clamp_run_history_limit(int(raw_limit))
@@ -1083,7 +974,7 @@ def _register_issue_routes(
         query = (request.query.get("query") or "").strip()[:300] or None
         status = (request.query.get("status") or "").strip()[:100] or None
         agent = (request.query.get("agent") or "").strip()[:100] or None
-        runs, registry_error = orchestrator.recent_runs(
+        runs, registry_error = await orchestrator.recent_runs(
             issue_id=issue_id,
             limit=limit,
             query=query,
@@ -1096,18 +987,12 @@ def _register_issue_routes(
         return web.json_response(payload, headers={"Cache-Control": "no-store"})
 
     async def handle_run_detail(request: web.Request) -> web.Response:
-        if not _request_is_loopback(request):
-            return _json_error(
-                403,
-                "run_diagnostics_local_only",
-                "run diagnostics are available only from the local machine",
-            )
         run_id = request.match_info["run_id"].strip()
         if not _RUN_ID_RE.fullmatch(run_id):
             return _json_error(
                 400, "invalid_run_id", "run_id must be 32 lowercase hex characters"
             )
-        detail, registry_error = orchestrator.run_detail(run_id)
+        detail, registry_error = await orchestrator.run_detail(run_id)
         if registry_error:
             return _json_error(503, "run_registry_unavailable", registry_error)
         if detail is None:
@@ -1115,18 +1000,12 @@ def _register_issue_routes(
         return web.json_response(detail, headers={"Cache-Control": "no-store"})
 
     async def handle_run_diagnostic(request: web.Request) -> web.Response:
-        if not _request_is_loopback(request):
-            return _json_error(
-                403,
-                "run_diagnostics_local_only",
-                "run diagnostics are available only from the local machine",
-            )
         run_id = request.match_info["run_id"].strip()
         if not _RUN_ID_RE.fullmatch(run_id):
             return _json_error(
                 400, "invalid_run_id", "run_id must be 32 lowercase hex characters"
             )
-        diagnostic, registry_error = orchestrator.run_diagnostic(run_id)
+        diagnostic, registry_error = await orchestrator.run_diagnostic(run_id)
         if registry_error:
             return _json_error(503, "run_registry_unavailable", registry_error)
         if diagnostic is None:
@@ -2442,6 +2321,8 @@ def _register_chat_routes(
         ),
     )
     app[CHAT_MANAGER_KEY] = manager
+    tickets = WebSocketTicketStore()
+    app[WS_TICKETS_KEY] = tickets
     websockets: set[web.WebSocketResponse] = set()
 
     # The singular `/chat/session` routes predate multi-session support and
@@ -2494,8 +2375,12 @@ def _register_chat_routes(
     async def _confirm_project_setup(
         request: web.Request, session_id: str | None, action_id: str
     ) -> web.Response:
-        # This crosses from chat into global registry/Git mutation. Preserve the
-        # same loopback + same-origin boundary as the Project management form.
+        # This crosses from chat into global registry/Git mutation. The message
+        # endpoint multiplexes ordinary chat and numeric setup confirmation, so
+        # its route-level chat+board policy is intentionally supplemented here.
+        denied = _web_policy.capability_denial(request, {"projects"})
+        if denied is not None:
+            return denied
         denied = _project_mutation_error(request)
         if denied is not None:
             return denied
@@ -2630,10 +2515,17 @@ def _register_chat_routes(
             return _json_error(409, exc.code, exc.message)
         return web.json_response(snapshot)
 
-    def _origin_allowed(request: web.Request) -> bool:
-        # Browsers do not apply CORS to WebSocket upgrades; without this an
-        # arbitrary web page could stream the operator's transcript.
-        return _origin_is_trusted(request, request.headers.get("Origin") or "")
+    def _ticket_origin(request: web.Request) -> str:
+        return (request.headers.get("Origin") or f"{request.scheme}://{request.host}").lower().rstrip("/")
+
+    async def handle_ws_ticket(request: web.Request) -> web.Response:
+        policy = resolve_policy(str(request.app.get(BIND_HOST_KEY) or "127.0.0.1"))
+        value, expires_in = tickets.issue(
+            origin=_ticket_origin(request),
+            grants=policy.grants_for(request),
+            policy_fingerprint=policy.fingerprint(),
+        )
+        return web.json_response({"ticket": value, "expires_in": expires_in})
 
     async def _pump(
         queue: asyncio.Queue[dict[str, Any] | None], ws: web.WebSocketResponse
@@ -2649,11 +2541,19 @@ def _register_chat_routes(
                 return
 
     async def handle_chat_ws(request: web.Request) -> web.StreamResponse:
-        bind = str(request.app.get(BIND_HOST_KEY) or "127.0.0.1").lower()
-        if bind in _LOOPBACK_BINDS and not _origin_allowed(request):
-            return _json_error(
-                403, "forbidden_origin", "cross-origin websocket rejected"
+        ticket = request.query.get("ticket", "")
+        current = resolve_policy(str(request.app.get(BIND_HOST_KEY) or "127.0.0.1"))
+        required = frozenset({"chat"})
+        if (
+            not required.issubset(current.effective_grants)
+            or not tickets.consume(
+                ticket,
+                origin=_ticket_origin(request),
+                required=required,
+                policy_fingerprint=current.fingerprint(),
             )
+        ):
+            return _json_error(401, "invalid_websocket_ticket", "missing, expired, or used websocket ticket")
         raw_focus = (request.query.get("session") or "").strip()
         focus = _check_chat_session_id(raw_focus) if raw_focus else None
         ws = web.WebSocketResponse(heartbeat=30)
@@ -2740,6 +2640,7 @@ def _register_chat_routes(
         "/api/v1/chat/sessions/{session_id}/reattach",
         _wrap(handle_chat_session_reattach),
     )
+    app.router.add_post("/api/v1/chat/ws-ticket", _wrap(handle_ws_ticket))
     app.router.add_get("/api/v1/chat/ws", handle_chat_ws)
 
 
@@ -2822,13 +2723,6 @@ def _register_preview_routes(
                 "unsupported_media_type",
                 "Product Preview actions require application/json",
             )
-        bind = str(request.app.get(BIND_HOST_KEY) or "127.0.0.1").lower()
-        if bind not in _LOOPBACK_BINDS:
-            return _json_error(
-                403,
-                "preview_loopback_required",
-                "Product Preview process control is available only on loopback",
-            )
         body = await _read_json(request)
         if body:
             return _json_error(
@@ -2874,15 +2768,47 @@ def _status_is_running(status: Any) -> bool:
     return str(getattr(status, "state", "")).lower() == "running"
 
 
-def _project_url(project: Project, status: Any | None = None) -> str:
+def _project_url(
+    project: Project,
+    status: Any | None = None,
+    *,
+    request: web.Request | None = None,
+) -> str:
     record = getattr(status, "record", None) if status is not None else None
     host = str(getattr(record, "host", None) or project.host)
     port = int(getattr(record, "port", None) or project.port)
+    scheme = "http"
+    if request is not None:
+        # Host and (for browser mutations) Origin have already passed the
+        # shared exact-match policy. Keep navigation on that reachable public
+        # host and replace only the destination project's service port.
+        scheme = request.scheme
+        # The middleware validates Origin only for browser mutations and
+        # WebSockets. Ignore it on GETs so an arbitrary read header cannot be
+        # reflected into project navigation metadata.
+        origin = (
+            request.headers.get("Origin", "").strip()
+            if request.method in MUTATING_METHODS
+            else ""
+        )
+        parsed_origin = urlsplit(origin) if origin else None
+        if parsed_origin is not None and parsed_origin.hostname:
+            host = parsed_origin.hostname
+            scheme = parsed_origin.scheme
+        else:
+            request_host = request.host.strip()
+            if request_host.startswith("["):
+                closing = request_host.find("]")
+                host = request_host[1:closing] if closing > 0 else request_host
+            elif request_host.count(":") == 1:
+                host = request_host.rsplit(":", 1)[0]
+            else:
+                host = request_host
     if host in {"", "0.0.0.0", "::", "[::]"}:
         host = "127.0.0.1"
     if ":" in host and not host.startswith("["):
         host = f"[{host}]"
-    return f"http://{host}:{port}/"
+    return f"{scheme}://{host}:{port}/"
 
 
 def _create_or_adopt_registered_project(
@@ -2932,31 +2858,7 @@ def _current_project_payload(ctx: _Ctx, projects: list[Project]) -> dict[str, An
 
 
 def _project_mutation_error(request: web.Request) -> web.Response | None:
-    """Project setup can write arbitrary paths, so it is loopback-only."""
-    bind = str(request.app.get(BIND_HOST_KEY) or "127.0.0.1").lower()
-    if bind not in _LOOPBACK_BINDS:
-        return _json_error(
-            403, "project_mutation_forbidden", "project management is loopback-only"
-        )
-    remote = request.remote
-    try:
-        if remote is None or not ipaddress.ip_address(remote).is_loopback:
-            return _json_error(
-                403, "project_mutation_forbidden", "project management is loopback-only"
-            )
-    except ValueError:
-        return _json_error(
-            403, "project_mutation_forbidden", "project management is loopback-only"
-        )
-    origin = request.headers.get("Origin")
-    if not _origin_is_trusted(request, origin or ""):
-        return _json_error(
-            403,
-            "forbidden_origin",
-            f"origin {origin!r} may not manage projects; set "
-            f"{TRUSTED_ORIGINS_ENV}={origin} if you front this board with a "
-            "reverse proxy or tunnel",
-        )
+    """Apply project-setup request-size limits after shared authorization."""
     if request.content_length is not None and request.content_length > 16_384:
         return _json_error(413, "request_too_large", "project request is too large")
     return None
@@ -2965,7 +2867,7 @@ def _project_mutation_error(request: web.Request) -> web.Response | None:
 def _register_project_routes(app: web.Application, ctx: _Ctx) -> None:
     registry = ProjectRegistry()
 
-    async def handle_projects(_request: web.Request) -> web.Response:
+    async def handle_projects(request: web.Request) -> web.Response:
         try:
             projects = await asyncio.to_thread(registry.list)
             statuses = await asyncio.gather(
@@ -2993,7 +2895,11 @@ def _register_project_routes(app: web.Application, ctx: _Ctx) -> None:
                     "running": running,
                     "status_error": "status unavailable" if status_error else None,
                     "current": project.id == current["id"],
-                    "url": _project_url(project, None if status_error else status),
+                    "url": _project_url(
+                        project,
+                        None if status_error else status,
+                        request=request,
+                    ),
                 }
             )
         return web.json_response({"projects": payload, "current": current})
@@ -3041,7 +2947,7 @@ def _register_project_routes(app: web.Application, ctx: _Ctx) -> None:
                     "name": project.name,
                     "repo_path": str(Path(project.git_repo).expanduser().resolve()),
                     "workflow_path": str(Path(project.workflow).expanduser().resolve()),
-                    "url": _project_url(project),
+                    "url": _project_url(project, request=request),
                 }
             },
             status=201,
@@ -3088,7 +2994,7 @@ def _register_project_routes(app: web.Application, ctx: _Ctx) -> None:
             {
                 "project_id": project.id,
                 "running": True,
-                "url": _project_url(project, status),
+                "url": _project_url(project, status, request=request),
             }
         )
 

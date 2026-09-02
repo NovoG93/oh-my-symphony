@@ -24,9 +24,9 @@ from symphony.utils.auto_merge import AutoMergeResult
 from symphony.utils.git_ops import GitOpResult
 from symphony.webapi import (
     _PUBLIC_SCHEDULE_REASONS,
-    _request_is_loopback,
     TRUSTED_ORIGINS_ENV,
 )
+from symphony.web_policy import AUTH_MODE_ENV, CAPABILITIES_ENV
 from symphony.workflow import WorkflowState
 
 WORKFLOW_TEXT = """---
@@ -172,7 +172,7 @@ class _StubOrchestrator:
             }
         return None
 
-    def recent_runs(
+    async def recent_runs(
         self,
         issue_id: str | None = None,
         limit: int = 50,
@@ -226,7 +226,7 @@ class _StubOrchestrator:
             filtered = [r for r in filtered if r["agent_kind"] == agent]
         return filtered[:limit], None
 
-    def run_detail(self, run_id: str) -> tuple[dict[str, Any] | None, str | None]:
+    async def run_detail(self, run_id: str) -> tuple[dict[str, Any] | None, str | None]:
         if run_id != "a" * 32:
             return None, None
         return {
@@ -243,8 +243,10 @@ class _StubOrchestrator:
             ],
         }, None
 
-    def run_diagnostic(self, run_id: str) -> tuple[dict[str, Any] | None, str | None]:
-        detail, error = self.run_detail(run_id)
+    async def run_diagnostic(
+        self, run_id: str
+    ) -> tuple[dict[str, Any] | None, str | None]:
+        detail, error = await self.run_detail(run_id)
         if detail is None:
             return None, error
         return {"schema_version": 1, **detail}, None
@@ -622,6 +624,21 @@ async def test_runs_endpoint_filters_and_clamps(client: TestClient) -> None:
     assert payload["runs"][0]["identifier"] == "SEED-1"
     assert payload["runs"][0]["attempt_kind"] == "initial"
     assert payload["runs"][0]["workspace_path"] == "/tmp/ws/SEED-1"
+
+
+async def test_runs_capability_works_through_a_trusted_public_host(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv(AUTH_MODE_ENV, "capabilities")
+    monkeypatch.setenv(CAPABILITIES_ENV, "runs")
+    monkeypatch.setenv(TRUSTED_ORIGINS_ENV, "http://symphony.home.arpa:9999")
+
+    response = await client.get(
+        "/api/v1/runs", headers={"Host": "symphony.home.arpa:9999"}
+    )
+
+    assert response.status == 200
+    assert (await response.json())["count"] == 2
 
 
 async def test_runs_endpoint_registry_error_returns_empty_history(
@@ -1995,6 +2012,34 @@ async def test_open_project_starts_only_destination_and_returns_independent_url(
             "running": True,
             "url": "http://127.0.0.1:10001/",
         }
+
+        monkeypatch.setenv(
+            TRUSTED_ORIGINS_ENV,
+            "http://symphony.home.arpa:9999,http://symphony.home.arpa:10001",
+        )
+        listing = await client.get(
+            "/api/v1/projects",
+            headers={
+                "Host": "symphony.home.arpa:9999",
+                "Origin": "http://evil.example",
+            },
+        )
+        assert listing.status == 200
+        listed_other = next(
+            row for row in (await listing.json())["projects"] if row["id"] == "other"
+        )
+        assert listed_other["url"] == "http://symphony.home.arpa:10001/"
+
+        public = await client.post(
+            "/api/v1/projects/other/open",
+            json={},
+            headers={
+                "Host": "symphony.home.arpa:9999",
+                "Origin": "http://symphony.home.arpa:9999",
+            },
+        )
+        assert public.status == 200
+        assert (await public.json())["url"] == "http://symphony.home.arpa:10001/"
         assert registry.started == ["other"]
         assert getattr(client.server, "app", None) is not None
     finally:
@@ -2053,21 +2098,21 @@ async def test_project_mutations_reject_cross_origin(
 async def test_project_mutations_accept_local_and_declared_origins(
     board_dir: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """A TLS-terminating proxy or tunnel must not look like an attacker.
+    """Only exact configured browser origins may mutate projects.
 
     The empty payload stops each request at field validation, so a 400
     proves the origin guard let it through without touching the registry.
     """
     client = await _project_client(board_dir, monkeypatch, _FakeProjectRegistry([]))
     try:
-        # Same machine, different scheme and port than the browser used.
+        # Loopback is not an ambient Origin bypass: scheme and port matter.
         for origin in ("https://127.0.0.1:9999", "http://localhost:1234"):
-            allowed = await client.post(
+            rejected = await client.post(
                 "/api/v1/projects", json={"name": "", "path": ""},
                 headers={"Origin": origin},
             )
-            assert allowed.status == 400, origin
-            assert (await allowed.json())["error"]["code"] == "invalid_project_name"
+            assert rejected.status == 403, origin
+            assert (await rejected.json())["error"]["code"] == "forbidden_origin"
 
         tunnel = "https://symphony.example.com"
         blocked = await client.post(
@@ -2076,7 +2121,7 @@ async def test_project_mutations_accept_local_and_declared_origins(
             headers={"Origin": tunnel},
         )
         assert blocked.status == 403
-        assert TRUSTED_ORIGINS_ENV in (await blocked.json())["error"]["message"]
+        assert (await blocked.json())["error"]["code"] == "forbidden_origin"
 
         monkeypatch.setenv(TRUSTED_ORIGINS_ENV, f"{tunnel} , https://other.example")
         declared = await client.post(
@@ -2166,11 +2211,6 @@ async def test_run_detail_validates_ids_and_returns_not_found(
     missing = await client.get(f"/api/v1/runs/{'b' * 32}")
     assert missing.status == 404
     assert (await missing.json())["error"]["code"] == "run_not_found"
-
-
-def test_run_diagnostics_loopback_guard() -> None:
-    assert _request_is_loopback(SimpleNamespace(remote="127.0.0.1", app={}))  # type: ignore[arg-type]
-    assert not _request_is_loopback(SimpleNamespace(remote="10.0.0.8", app={}))  # type: ignore[arg-type]
 
 
 def test_schedule_reason_taxonomy_covers_every_authoritative_code() -> None:
@@ -2441,7 +2481,11 @@ agent:
 def test_snapshot_exposes_provider_usage(tmp_path: Path) -> None:
     """Stage 5: orchestrator.snapshot() includes provider_usage mapping."""
     from datetime import datetime, timezone
-    from symphony.backends.usage import ProviderUsageSnapshot, UsageWindow
+    from symphony.backends.usage import (
+        ProviderCreditInfo,
+        ProviderUsageSnapshot,
+        UsageWindow,
+    )
     from symphony.orchestrator.core import Orchestrator
     from symphony.orchestrator.usage import ProviderUsageManager
     from symphony.workflow import WorkflowState
@@ -2478,7 +2522,19 @@ agent: { kind: codex }
                 remaining_percent=49.0,
                 resets_at=datetime(2026, 8, 20, 14, 0, tzinfo=timezone.utc),
             ),
+            # A malformed legacy probe value must not become bare NaN in the
+            # JSON response (browsers reject it while parsing API state).
+            "malformed": UsageWindow(
+                key="malformed",
+                used_percent=float("nan"),
+                remaining_percent=float("inf"),
+            ),
         },
+        credits=ProviderCreditInfo(
+            has_credits=True,
+            unlimited=False,
+            balance="42.5",
+        ),
         hard_limit_reached=False,
         authoritative=True,
     )
@@ -2495,6 +2551,13 @@ agent: { kind: codex }
     assert pu["codex"]["windows"]["five_hour"]["used_percent"] == 63.0
     assert pu["codex"]["windows"]["five_hour"]["remaining_percent"] == 37.0
     assert pu["codex"]["windows"]["five_hour"]["resets_at"] == "2026-08-17T23:00:00+00:00"
+    assert pu["codex"]["windows"]["malformed"]["used_percent"] is None
+    assert pu["codex"]["windows"]["malformed"]["remaining_percent"] is None
+    assert pu["codex"]["credits"] == {
+        "has_credits": True,
+        "unlimited": False,
+        "balance": "42.5",
+    }
 
 
 def test_remaining_percent_is_100_minus_used_percent(tmp_path: Path) -> None:
@@ -2535,5 +2598,3 @@ agent: { kind: claude }
     orch = Orchestrator(wf_state, usage_manager=mgr)
     pu = orch.snapshot()["provider_usage"]
     assert pu["claude"]["windows"]["five_hour"]["remaining_percent"] == 58.0
-
-

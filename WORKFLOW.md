@@ -348,8 +348,14 @@ usage_pools:
     source: agy
     quota_group: gemini
     caps:
-      five_hour: 80
-      weekly: 70
+      five_hour: 100
+      weekly: 100
+
+  # A Claude/GPT AGY profile should use quota_group: third_party. If a
+  # workflow dispatches both model families, define separate pools (for
+  # example agy-gemini and agy-third-party) and point each profile's
+  # usage_pool at the matching pool; caps are enforced only within that
+  # selected quota group.
 
   copilot:      # reviewer (Verify) — GitHub Copilot CLI
     source: copilot
@@ -376,11 +382,11 @@ claude:
 
 agy:
   # Antigravity CLI (agy) print mode — the default `kind` (implementer).
-  # Model pinned via `--model` to `gemini-3.7-flash-high` (verified via
-  # `agy models`; the 3.7 generation is "flash"-only, "pro" is still 3.1).
+  # Model pinned via `--model` to `gemini-3.8-flash-high` (verified via
+  # `agy models`; the 3.8 generation is "flash"-only, "pro" is still 3.1).
   # Symphony appends `--dangerously-skip-permissions` (and `--continue` on
   # continuation turns when resume_across_turns is true).
-  command: 'agy --model gemini-3.7-flash-high --print-timeout 45m --print "$(cat)"'
+  command: 'agy --model gemini-3.8-flash-high --print-timeout 45m --print "$(cat)"'
   resume_across_turns: true
   turn_timeout_ms: 3600000
   read_timeout_ms: 20000
@@ -430,7 +436,7 @@ copilot:
   # GitHub Copilot CLI (native subscription, NOT brokered through Agent
   # Vault). Model catalog verified on the host: claude-sonnet-5 (default),
   # claude-sonnet-4.5/4.6, claude-opus-4.8/5, gpt-5.4, gpt-5.1-codex,
-  # gemini-3.7-flash. Quota = premium_interactions 1500/mo (~95% remaining).
+  # gemini-3.8-flash-high. Quota = premium_interactions 1500/mo (~95% remaining).
   # CopilotBackend appends --output-format=json --no-ask-user
   # --allow-all-tools (plus --model/--reasoning-effort/--session-id/--add-dir
   # as configured); writable roots become --add-dir. Buffered stdout, so a

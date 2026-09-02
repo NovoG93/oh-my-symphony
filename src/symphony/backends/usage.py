@@ -17,6 +17,15 @@ class UsageWindow:
     used_percent: float | None
     remaining_percent: float | None
     resets_at: datetime | None = None
+    group_key: str | None = None
+    period_key: str | None = None
+
+
+@dataclass(frozen=True)
+class ProviderCreditInfo:
+    has_credits: bool
+    unlimited: bool
+    balance: str | None = None
 
 
 @dataclass(frozen=True)
@@ -29,6 +38,7 @@ class ProviderUsageSnapshot:
     authoritative: bool = True
     observed_at: datetime | None = None
     stale: bool = False
+    credits: ProviderCreditInfo | None = None
 
 
 @runtime_checkable

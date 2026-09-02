@@ -1,0 +1,4 @@
+interface:
+  display_name: "Symphony Upstream Sync"
+  short_description: "Safely merge upstream/dev into this fork"
+  default_prompt: "Use $symphony-upstream-sync to integrate the latest upstream/dev changes while preserving fork behavior and merge ancestry."

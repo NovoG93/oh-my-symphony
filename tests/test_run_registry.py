@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
+import sys
 import threading
 import time
 from dataclasses import replace
@@ -1124,7 +1125,7 @@ def test_v5_release_completion_without_ticket_token_is_invalidated(
     assert list(tmp_path.glob("state.db.backup-*"))
 
 
-def test_concurrent_v4_to_v6_migration_backfills_once_after_same_version_read(
+def test_concurrent_v4_migration_applies_each_pending_version_once(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -2268,3 +2269,89 @@ def test_run_registry_update_stage_agent_profile(tmp_path: Path) -> None:
     assert updated_rec.model == "claude-3-7-sonnet"
     assert updated_rec.reasoning_effort == "medium"
 
+
+# ---------------------------------------------------------------------------
+# _pid_alive: POSIX mapping + real win32 probe (ITEM 3)
+# ---------------------------------------------------------------------------
+
+
+def test_pid_alive_win32_defaults_alive_without_win32_ctypes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An unavailable Win32 API must never authorize duplicate dispatch."""
+    import ctypes
+
+    monkeypatch.delattr(ctypes, "WinDLL", raising=False)
+    monkeypatch.delattr(ctypes, "get_last_error", raising=False)
+    assert run_registry_mod._pid_alive_win32(1234) is True
+
+
+def test_pid_alive_posix_mapping(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The POSIX branch maps os.kill outcomes: ProcessLookupError -> dead,
+    other OSError -> conservatively alive, clean -> alive."""
+    import sys
+
+    monkeypatch.setattr(sys, "platform", "linux")
+
+    def _with_kill(fake) -> bool:
+        monkeypatch.setattr(run_registry_mod.os, "kill", fake)
+        return run_registry_mod._pid_alive(1234)
+
+    def _raise(exc: BaseException):
+        def _inner(_pid, _sig):
+            raise exc
+
+        return _inner
+
+    def _ok(_pid, _sig):
+        return None
+
+    assert _with_kill(_raise(ProcessLookupError())) is False
+    assert _with_kill(_raise(PermissionError())) is True
+    assert _with_kill(_ok) is True
+
+
+@pytest.mark.skipif(
+    sys.platform != "win32",
+    reason="win32 liveness probe exercises the real Win32 API surface",
+)
+def test_pid_alive_win32_probe_on_real_processes() -> None:
+    """OpenProcess/GetExitCodeProcess probe against real child processes:
+    a live child reads alive; an exited-but-handle-held child and a
+    terminated+reaped child read dead; an unknown pid reads dead."""
+    import subprocess
+
+    live = subprocess.Popen(
+        ["ping", "-n", "30", "127.0.0.1"],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        creationflags=subprocess.CREATE_NO_WINDOW,
+    )
+    try:
+        assert run_registry_mod._pid_alive(live.pid) is True
+    finally:
+        live.kill()
+        live.wait()
+
+    exited = subprocess.Popen(
+        [
+            sys.executable,
+            "-c",
+            "import time; time.sleep(0.2)",
+        ],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        creationflags=subprocess.CREATE_NO_WINDOW,
+    )
+    time.sleep(0.8)  # exited, but the Popen handle keeps the pid resolvable
+    try:
+        assert run_registry_mod._pid_alive(exited.pid) is False
+    finally:
+        exited.wait()
+
+    assert run_registry_mod._pid_alive(live.pid) is False, (
+        "reaped child pid must read dead"
+    )
+    assert run_registry_mod._pid_alive(4_000_000) is False, (
+        "never-existing pid must read dead"
+    )

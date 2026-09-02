@@ -18,7 +18,9 @@ def verify_token(provided: str | None, expected: str | None) -> None:
     token = provided
     if token.lower().startswith("bearer "):
         token = token[7:].strip()
-    if not hmac.compare_digest(token, expected):
+    # Compare bytes so malformed/non-ASCII header values fail closed instead
+    # of making ``compare_digest`` raise a TypeError and leaking a 500.
+    if not hmac.compare_digest(token.encode("utf-8"), expected.encode("utf-8")):
         raise AuthenticationError("invalid bearer token")
 
 

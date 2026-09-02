@@ -23,6 +23,7 @@ from symphony.backends import (
 )
 from symphony.orchestrator import Orchestrator
 from symphony.server import build_app
+from symphony.web_policy import AUTH_MODE_ENV, CAPABILITIES_ENV
 from symphony.workflow import WorkflowState
 
 WORKFLOW_TEXT = """---
@@ -40,6 +41,18 @@ You are working on {{ issue.identifier }}.
 """
 
 CONFIRMATION_TOKEN = "c" * 64
+
+
+async def _connect_chat_ws(
+    client: TestClient, *, session_id: str | None = None
+):
+    response = await client.post("/api/v1/chat/ws-ticket", json={})
+    assert response.status == 200
+    ticket = (await response.json())["ticket"]
+    query = f"ticket={ticket}"
+    if session_id is not None:
+        query += f"&session={session_id}"
+    return await client.ws_connect(f"/api/v1/chat/ws?{query}")
 
 
 class _StubOrchestrator:
@@ -350,12 +363,18 @@ async def test_chat_numeric_project_choice_uses_server_owned_registration(
                     "content": [
                         {
                             "type": "text",
-                            "text": (
-                                "1. Create a separate Todo app.\n"
-                                '<symphony-project-setup>{"choice": 1, '
-                                '"name": "Todo App", '
-                                f'"path": "{target}"}}</symphony-project-setup>'
-                            ),
+                    "text": (
+                        "1. Create a separate Todo app.\n"
+                        "<symphony-project-setup>"
+                        + json.dumps(
+                            {
+                                "choice": 1,
+                                "name": "Todo App",
+                                "path": str(target),
+                            }
+                        )
+                        + "</symphony-project-setup>"
+                    ),
                         }
                     ]
                 },
@@ -391,6 +410,18 @@ async def test_chat_numeric_project_choice_uses_server_owned_registration(
         assert missing_capability.status == 403
         assert calls == []
 
+        monkeypatch.setenv(AUTH_MODE_ENV, "capabilities")
+        monkeypatch.setenv(CAPABILITIES_ENV, "chat,board")
+        missing_capability = await cli.post(
+            f"/api/v1/chat/sessions/{session_id}/message",
+            json={"text": "1"},
+            headers={"X-Symphony-Chat-Confirmation": CONFIRMATION_TOKEN},
+        )
+        assert missing_capability.status == 403
+        assert (await missing_capability.json())["error"]["code"] == "missing_capability"
+        assert calls == []
+
+        monkeypatch.setenv(CAPABILITIES_ENV, "chat,board,projects")
         selected = await cli.post(
             f"/api/v1/chat/sessions/{session_id}/message",
             json={"text": "1"},
@@ -420,10 +451,15 @@ async def test_chat_numeric_project_choice_uses_server_owned_registration(
                         {
                             "type": "text",
                             "text": (
-                                '<symphony-project-setup>{"choice": 2, '
-                                '"name": "Broken", '
-                                f'"path": "{broken_target}"}}'
-                                "</symphony-project-setup>"
+                                "<symphony-project-setup>"
+                                + json.dumps(
+                                    {
+                                        "choice": 2,
+                                        "name": "Broken",
+                                        "path": str(broken_target),
+                                    }
+                                )
+                                + "</symphony-project-setup>"
                             ),
                         }
                     ]
@@ -456,7 +492,7 @@ async def test_chat_numeric_project_choice_uses_server_owned_registration(
 
 
 async def test_chat_ws_streams_turn_events(client: TestClient) -> None:
-    ws = await client.ws_connect("/api/v1/chat/ws")
+    ws = await _connect_chat_ws(client)
     hello = await asyncio.wait_for(ws.receive_json(), timeout=5)
     assert hello["type"] == "hello"
     assert hello["snapshot"]["active"] is False
@@ -523,7 +559,7 @@ async def test_chat_ws_streams_prime_agent_snapshots_and_final_message(
         ],
     }
 
-    ws = await client.ws_connect(f"/api/v1/chat/ws?session={session_id}")
+    ws = await _connect_chat_ws(client, session_id=session_id)
     await asyncio.wait_for(ws.receive_json(), timeout=5)  # hello
     await client.post(
         f"/api/v1/chat/sessions/{session_id}/message", json={"text": "stream"}
@@ -675,7 +711,7 @@ async def test_chat_reattach_restores_a_stopped_session(
 async def test_chat_ws_tags_frames_and_accepts_focus(client: TestClient) -> None:
     resp = await client.post("/api/v1/chat/sessions", json={"mode": "qa"})
     session_id = (await resp.json())["session_id"]
-    ws = await client.ws_connect(f"/api/v1/chat/ws?session={session_id}")
+    ws = await _connect_chat_ws(client, session_id=session_id)
     hello = await asyncio.wait_for(ws.receive_json(), timeout=5)
     assert hello["type"] == "hello"
     assert hello["snapshot"]["session_id"] == session_id
@@ -709,7 +745,7 @@ async def test_shutdown_stops_chat_backend(
     await cli.start_server()
     resp = await cli.post("/api/v1/chat/session", json={"mode": "qa"})
     assert resp.status == 201
-    ws = await cli.ws_connect("/api/v1/chat/ws")
+    ws = await _connect_chat_ws(cli)
     await asyncio.wait_for(ws.receive_json(), timeout=5)  # hello
 
     await cli.close()  # fires app.on_shutdown

@@ -16,12 +16,18 @@ from __future__ import annotations
 
 import asyncio
 import json
+import time
 
 from aiohttp import web
 
 from .logging import get_logger
 from .orchestrator import Orchestrator
 from .webapi import BIND_HOST_KEY, register_web_routes
+from .web_policy import (
+    install_route_policies,
+    policy_discovery_payload,
+    resolve_policy,
+)
 
 
 log = get_logger()
@@ -157,10 +163,13 @@ def build_app(orchestrator: Orchestrator) -> web.Application:
     async def handle_method_not_allowed(request: web.Request) -> web.Response:
         return _error_response(405, "method_not_allowed", request.method)
 
-    async def handle_debug_tasks(_request: web.Request) -> web.Response:
+    async def handle_debug_tasks(request: web.Request) -> web.Response:
         # Dump every live asyncio task with its suspended coroutine stack.
         # `Task.get_stack()` returns the deepest frame the task is parked
         # at — exactly what py-spy can't show us across the await boundary.
+        # Live stacks and coroutine reprs can name local paths and prompt text.
+        # The shared policy requires the explicit `debug` capability in every
+        # mode; no peer-address bypass or second authorization gate applies.
         out = []
         for t in asyncio.all_tasks():
             stack_frames = []
@@ -180,9 +189,41 @@ def build_app(orchestrator: Orchestrator) -> web.Application:
         return web.json_response({"tasks": out})
 
     async def handle_health(_request: web.Request) -> web.Response:
-        return web.json_response(orchestrator.health())
+        full = orchestrator.health()
+        payload = {
+            key: full[key]
+            for key in (
+                "status",
+                "version",
+                "generated_at",
+                "workflow_path",
+                "orchestrator_pid",
+                "counts",
+            )
+            if key in full
+        }
+        tick = full.get("tick")
+        if isinstance(tick, dict):
+            payload["tick"] = {
+                key: tick[key]
+                for key in (
+                    "alive",
+                    "started",
+                    "last_completed_at",
+                    "seconds_since_last",
+                    "consecutive_failures",
+                    "error_count",
+                    "loop_restarts",
+                )
+                if key in tick
+            }
+        return web.json_response(payload)
+
+    async def handle_policy(request: web.Request) -> web.Response:
+        return web.json_response(policy_discovery_payload(request))
 
     app.router.add_get("/api/v1/health", handle_health)
+    app.router.add_get("/api/v1/auth/policy", handle_policy)
     app.router.add_get("/api/v1/state", handle_state)
     app.router.add_get("/api/v1/refresh", handle_method_not_allowed)
     app.router.add_post("/api/v1/refresh", handle_refresh)
@@ -199,12 +240,12 @@ def build_app(orchestrator: Orchestrator) -> web.Application:
     app.router.add_post("/api/v1/{identifier}/skip-learn", handle_skip_document)
     app.router.add_get("/api/v1/{identifier}", handle_issue)
 
+    install_route_policies(app)
+
     return app
 
 
 def _now_iso() -> str:
-    import time
-
     return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
 
 
@@ -213,6 +254,9 @@ async def run_server(
 ) -> tuple[web.AppRunner, int]:
     # The API guard middleware only enforces the loopback Host allowlist
     # when the server itself is loopback-bound; record the bind address.
+    # Resolve once before opening a socket so unsafe or unknown policies fail
+    # startup instead of exposing a half-working service.
+    resolve_policy(host)
     app[BIND_HOST_KEY] = host
     runner = web.AppRunner(app)
     await runner.setup()

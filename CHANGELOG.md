@@ -10,6 +10,15 @@ Versioning: [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Security
+
+- **Web authorization policy supersession.** The current web API policy uses
+  exact trusted origins (scheme, host, and optional port) and rejects wildcard
+  and bare-host entries. This explicitly supersedes the permissive wildcard /
+  bare-host behavior described in the historical 0.20.1 release notes below;
+  that entry remains unchanged as a record of the behavior shipped in that
+  release.
+
 ### Added
 
 - **Usage-aware agent profiles.** Shared usage pools (`usage_pools:`) and the

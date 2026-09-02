@@ -3,7 +3,8 @@ from symphony.mcp.config import load
 
 def test_load_defaults(monkeypatch):
     for k in ("SYMPHONY_MCP_HOST", "SYMPHONY_MCP_PORT", "SYMPHONY_MCP_TOKEN",
-              "SYMPHONY_MCP_ALLOWED_PROJECTS", "SYMPHONY_BASE_URL"):
+              "SYMPHONY_MCP_ALLOWED_PROJECTS", "SYMPHONY_BASE_URL",
+              "SYMPHONY_API_TOKEN", "SYMPHONY_API_TOKEN_FILE"):
         monkeypatch.delenv(k, raising=False)
     s = load()
     assert s.host == "0.0.0.0"
@@ -28,6 +29,22 @@ def test_load_token_from_file(monkeypatch, tmp_path):
     f.write_text("filetoken\n")
     monkeypatch.setenv("SYMPHONY_MCP_TOKEN_FILE", str(f))
     assert load().token == "filetoken"
+
+
+def test_load_api_token_file_fallback(monkeypatch, tmp_path):
+    monkeypatch.delenv("SYMPHONY_API_TOKEN", raising=False)
+    token_file = tmp_path / "api-token"
+    token_file.write_text("file-api-token\n")
+    monkeypatch.setenv("SYMPHONY_API_TOKEN_FILE", str(token_file))
+    assert load().symphony_api_token == "file-api-token"
+
+
+def test_load_api_token_env_takes_precedence(monkeypatch, tmp_path):
+    token_file = tmp_path / "api-token"
+    token_file.write_text("file-api-token\n")
+    monkeypatch.setenv("SYMPHONY_API_TOKEN_FILE", str(token_file))
+    monkeypatch.setenv("SYMPHONY_API_TOKEN", "env-api-token")
+    assert load().symphony_api_token == "env-api-token"
 
 
 def test_load_allow_control_default_off(monkeypatch):
