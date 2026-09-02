@@ -776,7 +776,9 @@ def test_quota_group_config_validates_and_preserves_legacy_defaults() -> None:
 
 
 def test_grouped_usage_only_enforces_selected_group_and_recovers_after_reset() -> None:
-    now = datetime(2026, 8, 30, 20, 0, tzinfo=timezone.utc)
+    # Keep the synthetic reset times in the future for format_wait_reason(),
+    # which intentionally compares them with the real wall clock.
+    now = datetime.now(timezone.utc)
     manager = ProviderUsageManager(clock=lambda: now)
     snap = ProviderUsageSnapshot("agy", "agy", windows={
         "gemini_five_hour": UsageWindow(
