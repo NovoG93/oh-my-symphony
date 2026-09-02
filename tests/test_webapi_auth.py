@@ -14,7 +14,6 @@ import pytest_asyncio
 from aiohttp import web
 from aiohttp.test_utils import TestClient, TestServer
 
-import symphony.server as server_mod
 from symphony.orchestrator import Orchestrator
 from symphony.server import build_app
 from symphony.workflow import WorkflowState
@@ -22,7 +21,6 @@ from symphony.webapi import (
     API_TOKEN_ENV,
     API_TOKEN_FILE_ENV,
     _request_has_valid_bearer,
-    _request_is_loopback,
 )
 from symphony.web_policy import (
     AUTH_MODE_ENV,
@@ -438,25 +436,15 @@ async def test_debug_tasks_allowed_from_loopback_peer(
     assert isinstance(payload["tasks"], list)
 
 
-async def test_debug_tasks_rejects_non_loopback_peer(
+async def test_debug_tasks_requires_explicit_capability(
     client: TestClient, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    monkeypatch.setenv(CAPABILITIES_ENV, "debug")
-    # Simulate a request whose remote peer is off-machine (e.g. served
-    # behind a LAN bind) by forcing the shared loopback predicate off.
-    monkeypatch.setattr(server_mod, "_request_is_loopback", lambda _request: False)
+    monkeypatch.setenv(AUTH_MODE_ENV, "capabilities")
+    monkeypatch.setenv(CAPABILITIES_ENV, "")
     resp = await client.get("/api/v1/_debug/tasks")
     assert resp.status == 403
     payload = await resp.json()
-    assert payload["error"]["code"] == "debug_tasks_local_only"
-
-
-def test_shared_loopback_predicate_rejects_non_loopback_remote() -> None:
-    def req(remote: str) -> Any:
-        return SimpleNamespace(remote=remote, app={})
-
-    assert _request_is_loopback(req("127.0.0.1"))
-    assert not _request_is_loopback(req("203.0.113.9"))
+    assert payload["error"]["code"] == "missing_capability"
 
 
 # ---------------------------------------------------------------------------

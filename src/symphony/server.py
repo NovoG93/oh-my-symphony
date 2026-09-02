@@ -22,7 +22,7 @@ from aiohttp import web
 
 from .logging import get_logger
 from .orchestrator import Orchestrator
-from .webapi import BIND_HOST_KEY, _request_is_loopback, register_web_routes
+from .webapi import BIND_HOST_KEY, register_web_routes
 from .web_policy import (
     install_route_policies,
     policy_discovery_payload,
@@ -167,14 +167,9 @@ def build_app(orchestrator: Orchestrator) -> web.Application:
         # Dump every live asyncio task with its suspended coroutine stack.
         # `Task.get_stack()` returns the deepest frame the task is parked
         # at — exactly what py-spy can't show us across the await boundary.
-        # Live stacks and coroutine reprs can name local paths and prompt
-        # text, so this stays loopback-only like the run diagnostics.
-        if not _request_is_loopback(request):
-            return _error_response(
-                403,
-                "debug_tasks_local_only",
-                "task diagnostics are available only from the local machine",
-            )
+        # Live stacks and coroutine reprs can name local paths and prompt text.
+        # The shared policy requires the explicit `debug` capability in every
+        # mode; no peer-address bypass or second authorization gate applies.
         out = []
         for t in asyncio.all_tasks():
             stack_frames = []

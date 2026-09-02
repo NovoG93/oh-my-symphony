@@ -24,9 +24,9 @@ from symphony.utils.auto_merge import AutoMergeResult
 from symphony.utils.git_ops import GitOpResult
 from symphony.webapi import (
     _PUBLIC_SCHEDULE_REASONS,
-    _request_is_loopback,
     TRUSTED_ORIGINS_ENV,
 )
+from symphony.web_policy import AUTH_MODE_ENV, CAPABILITIES_ENV
 from symphony.workflow import WorkflowState
 
 WORKFLOW_TEXT = """---
@@ -624,6 +624,21 @@ async def test_runs_endpoint_filters_and_clamps(client: TestClient) -> None:
     assert payload["runs"][0]["identifier"] == "SEED-1"
     assert payload["runs"][0]["attempt_kind"] == "initial"
     assert payload["runs"][0]["workspace_path"] == "/tmp/ws/SEED-1"
+
+
+async def test_runs_capability_works_through_a_trusted_public_host(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv(AUTH_MODE_ENV, "capabilities")
+    monkeypatch.setenv(CAPABILITIES_ENV, "runs")
+    monkeypatch.setenv(TRUSTED_ORIGINS_ENV, "http://symphony.home.arpa:9999")
+
+    response = await client.get(
+        "/api/v1/runs", headers={"Host": "symphony.home.arpa:9999"}
+    )
+
+    assert response.status == 200
+    assert (await response.json())["count"] == 2
 
 
 async def test_runs_endpoint_registry_error_returns_empty_history(
@@ -1997,6 +2012,34 @@ async def test_open_project_starts_only_destination_and_returns_independent_url(
             "running": True,
             "url": "http://127.0.0.1:10001/",
         }
+
+        monkeypatch.setenv(
+            TRUSTED_ORIGINS_ENV,
+            "http://symphony.home.arpa:9999,http://symphony.home.arpa:10001",
+        )
+        listing = await client.get(
+            "/api/v1/projects",
+            headers={
+                "Host": "symphony.home.arpa:9999",
+                "Origin": "http://evil.example",
+            },
+        )
+        assert listing.status == 200
+        listed_other = next(
+            row for row in (await listing.json())["projects"] if row["id"] == "other"
+        )
+        assert listed_other["url"] == "http://symphony.home.arpa:10001/"
+
+        public = await client.post(
+            "/api/v1/projects/other/open",
+            json={},
+            headers={
+                "Host": "symphony.home.arpa:9999",
+                "Origin": "http://symphony.home.arpa:9999",
+            },
+        )
+        assert public.status == 200
+        assert (await public.json())["url"] == "http://symphony.home.arpa:10001/"
         assert registry.started == ["other"]
         assert getattr(client.server, "app", None) is not None
     finally:
@@ -2168,11 +2211,6 @@ async def test_run_detail_validates_ids_and_returns_not_found(
     missing = await client.get(f"/api/v1/runs/{'b' * 32}")
     assert missing.status == 404
     assert (await missing.json())["error"]["code"] == "run_not_found"
-
-
-def test_run_diagnostics_loopback_guard() -> None:
-    assert _request_is_loopback(SimpleNamespace(remote="127.0.0.1", app={}))  # type: ignore[arg-type]
-    assert not _request_is_loopback(SimpleNamespace(remote="10.0.0.8", app={}))  # type: ignore[arg-type]
 
 
 def test_schedule_reason_taxonomy_covers_every_authoritative_code() -> None:

@@ -20,14 +20,13 @@ from __future__ import annotations
 
 import asyncio
 import heapq
-import ipaddress
 import json
 import re
 from functools import partial
 from datetime import date, datetime
 from pathlib import Path
 from typing import Any, Awaitable, Callable
-from urllib.parse import quote
+from urllib.parse import quote, urlsplit
 
 from aiohttp import WSCloseCode, WSMsgType, web
 
@@ -96,6 +95,7 @@ from .workflow.presets import LANE_PRESETS, get_lane_preset, guess_lane_preset
 from . import web_policy as _web_policy
 from .web_policy import (
     BIND_HOST_KEY,
+    MUTATING_METHODS,
     WebSocketTicketStore,
     policy_middleware,
     resolve_policy,
@@ -120,7 +120,6 @@ _RUN_ID_RE = re.compile(r"^[0-9a-f]{32}$")
 _MAX_TITLE = 300
 _MAX_BODY = 128_000
 _MAX_LABELS = 20
-_LOOPBACK_BINDS = {"", "localhost", "127.0.0.1", "::1", "[::1]"}
 _CI_EDITABLE_KEYS = {"enabled", "interval_ms", "max_turns", "agent_kind", "modes"}
 CHAT_MANAGER_KEY: web.AppKey[ChatManager] = web.AppKey("symphony.chat", ChatManager)
 WS_TICKETS_KEY: web.AppKey[WebSocketTicketStore] = web.AppKey(
@@ -138,18 +137,6 @@ def _json_error(status: int, code: str, message: str) -> web.Response:
 # ---------------------------------------------------------------------------
 # request plumbing
 # ---------------------------------------------------------------------------
-
-
-def _request_is_loopback(request: web.Request) -> bool:
-    """Keep sensitive run diagnostics on the operator's local machine."""
-    remote = request.remote
-    if remote is None:
-        bind = str(request.app.get(BIND_HOST_KEY) or "127.0.0.1").lower()
-        return bind in _LOOPBACK_BINDS
-    try:
-        return ipaddress.ip_address(remote).is_loopback
-    except ValueError:
-        return False
 
 
 @web.middleware
@@ -978,12 +965,6 @@ def _register_issue_routes(
     app: web.Application, ctx: _Ctx, orchestrator: Orchestrator
 ) -> None:
     async def handle_runs(request: web.Request) -> web.Response:
-        if not _request_is_loopback(request):
-            return _json_error(
-                403,
-                "run_diagnostics_local_only",
-                "run diagnostics are available only from the local machine",
-            )
         raw_limit = request.query.get("limit", "50")
         try:
             limit = clamp_run_history_limit(int(raw_limit))
@@ -1006,12 +987,6 @@ def _register_issue_routes(
         return web.json_response(payload, headers={"Cache-Control": "no-store"})
 
     async def handle_run_detail(request: web.Request) -> web.Response:
-        if not _request_is_loopback(request):
-            return _json_error(
-                403,
-                "run_diagnostics_local_only",
-                "run diagnostics are available only from the local machine",
-            )
         run_id = request.match_info["run_id"].strip()
         if not _RUN_ID_RE.fullmatch(run_id):
             return _json_error(
@@ -1025,12 +1000,6 @@ def _register_issue_routes(
         return web.json_response(detail, headers={"Cache-Control": "no-store"})
 
     async def handle_run_diagnostic(request: web.Request) -> web.Response:
-        if not _request_is_loopback(request):
-            return _json_error(
-                403,
-                "run_diagnostics_local_only",
-                "run diagnostics are available only from the local machine",
-            )
         run_id = request.match_info["run_id"].strip()
         if not _RUN_ID_RE.fullmatch(run_id):
             return _json_error(
@@ -2799,15 +2768,47 @@ def _status_is_running(status: Any) -> bool:
     return str(getattr(status, "state", "")).lower() == "running"
 
 
-def _project_url(project: Project, status: Any | None = None) -> str:
+def _project_url(
+    project: Project,
+    status: Any | None = None,
+    *,
+    request: web.Request | None = None,
+) -> str:
     record = getattr(status, "record", None) if status is not None else None
     host = str(getattr(record, "host", None) or project.host)
     port = int(getattr(record, "port", None) or project.port)
+    scheme = "http"
+    if request is not None:
+        # Host and (for browser mutations) Origin have already passed the
+        # shared exact-match policy. Keep navigation on that reachable public
+        # host and replace only the destination project's service port.
+        scheme = request.scheme
+        # The middleware validates Origin only for browser mutations and
+        # WebSockets. Ignore it on GETs so an arbitrary read header cannot be
+        # reflected into project navigation metadata.
+        origin = (
+            request.headers.get("Origin", "").strip()
+            if request.method in MUTATING_METHODS
+            else ""
+        )
+        parsed_origin = urlsplit(origin) if origin else None
+        if parsed_origin is not None and parsed_origin.hostname:
+            host = parsed_origin.hostname
+            scheme = parsed_origin.scheme
+        else:
+            request_host = request.host.strip()
+            if request_host.startswith("["):
+                closing = request_host.find("]")
+                host = request_host[1:closing] if closing > 0 else request_host
+            elif request_host.count(":") == 1:
+                host = request_host.rsplit(":", 1)[0]
+            else:
+                host = request_host
     if host in {"", "0.0.0.0", "::", "[::]"}:
         host = "127.0.0.1"
     if ":" in host and not host.startswith("["):
         host = f"[{host}]"
-    return f"http://{host}:{port}/"
+    return f"{scheme}://{host}:{port}/"
 
 
 def _create_or_adopt_registered_project(
@@ -2866,7 +2867,7 @@ def _project_mutation_error(request: web.Request) -> web.Response | None:
 def _register_project_routes(app: web.Application, ctx: _Ctx) -> None:
     registry = ProjectRegistry()
 
-    async def handle_projects(_request: web.Request) -> web.Response:
+    async def handle_projects(request: web.Request) -> web.Response:
         try:
             projects = await asyncio.to_thread(registry.list)
             statuses = await asyncio.gather(
@@ -2894,7 +2895,11 @@ def _register_project_routes(app: web.Application, ctx: _Ctx) -> None:
                     "running": running,
                     "status_error": "status unavailable" if status_error else None,
                     "current": project.id == current["id"],
-                    "url": _project_url(project, None if status_error else status),
+                    "url": _project_url(
+                        project,
+                        None if status_error else status,
+                        request=request,
+                    ),
                 }
             )
         return web.json_response({"projects": payload, "current": current})
@@ -2942,7 +2947,7 @@ def _register_project_routes(app: web.Application, ctx: _Ctx) -> None:
                     "name": project.name,
                     "repo_path": str(Path(project.git_repo).expanduser().resolve()),
                     "workflow_path": str(Path(project.workflow).expanduser().resolve()),
-                    "url": _project_url(project),
+                    "url": _project_url(project, request=request),
                 }
             },
             status=201,
@@ -2989,7 +2994,7 @@ def _register_project_routes(app: web.Application, ctx: _Ctx) -> None:
             {
                 "project_id": project.id,
                 "running": True,
-                "url": _project_url(project, status),
+                "url": _project_url(project, status, request=request),
             }
         )
 
