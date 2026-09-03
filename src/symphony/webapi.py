@@ -1392,6 +1392,65 @@ def _register_issue_routes(
             },
         )
 
+    async def handle_issue_confirm_review(request: web.Request) -> web.Response:
+        """Confirm an idle Human Review ticket as the configured Done state."""
+        identifier = _check_identifier(request.match_info["identifier"])
+        cfg = ctx.config()
+        done_state = next(
+            (
+                state
+                for state in cfg.tracker.terminal_states
+                if state.strip().lower() == "done"
+            ),
+            None,
+        )
+        if done_state is None:
+            return _json_error(
+                409,
+                "done_state_missing",
+                "cannot confirm review because no Done state is configured",
+            )
+
+        tracker = ctx.file_tracker()
+        current = await asyncio.to_thread(tracker.fetch_issue_full_by_id, identifier)
+        if current is None:
+            return _json_error(404, "issue_not_found", f"unknown issue {identifier}")
+        if current.state.strip().lower() != "human review":
+            return _json_error(
+                409,
+                "review_confirmation_rejected",
+                f"{identifier} is not in Human Review (state={current.state})",
+            )
+        if orchestrator.find_running_issue_id(identifier) is not None:
+            return _json_error(
+                409,
+                "issue_running",
+                f"{identifier} has a running worker; wait before confirming review",
+            )
+
+        changed = await asyncio.to_thread(
+            tracker.transition_if_current,
+            identifier,
+            "Human Review",
+            done_state,
+        )
+        if not changed:
+            return _json_error(
+                409,
+                "review_confirmation_rejected",
+                f"{identifier} changed before review confirmation could be applied",
+            )
+        await asyncio.to_thread(
+            ctx.stats().record_transition,
+            issue=identifier,
+            from_state="human review",
+            to_state=done_state.lower(),
+        )
+        orchestrator.request_refresh()
+        return web.json_response(
+            {"identifier": identifier, "state": done_state, "confirmed": True}
+        )
+
     async def handle_issue_patch(request: web.Request) -> web.Response:
         identifier = _check_identifier(request.match_info["identifier"])
         body = await _read_json(request)
@@ -1546,6 +1605,10 @@ def _register_issue_routes(
     app.router.add_get(
         "/api/v1/issues/{identifier}/artifacts/{name}",
         _wrap(handle_issue_artifact_file),
+    )
+    app.router.add_post(
+        "/api/v1/issues/{identifier}/confirm-review",
+        _wrap(handle_issue_confirm_review),
     )
     app.router.add_post(
         "/api/v1/issues/{identifier}/recover-blocked",

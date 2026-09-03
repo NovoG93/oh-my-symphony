@@ -802,6 +802,55 @@ async def test_patch_moves_state_and_updates_fields(client: TestClient) -> None:
     assert detail["labels"] == ["a", "b"]
 
 
+async def test_confirm_review_moves_idle_ticket_to_done_and_requests_refresh(
+    client: TestClient, board_dir: Path
+) -> None:
+    ticket = board_dir / "kanban" / "SEED-1.md"
+    ticket.write_text(
+        TICKET.replace("state: Todo", "state: Human Review"), encoding="utf-8"
+    )
+
+    response = await client.post("/api/v1/issues/SEED-1/confirm-review", json={})
+
+    assert response.status == 200
+    assert await response.json() == {
+        "identifier": "SEED-1",
+        "state": "Done",
+        "confirmed": True,
+    }
+    assert "state: Done" in ticket.read_text(encoding="utf-8")
+    assert client.stub.refresh_calls == 1  # type: ignore[attr-defined]
+
+
+async def test_confirm_review_rejects_stale_state_without_mutating(
+    client: TestClient, board_dir: Path
+) -> None:
+    ticket = board_dir / "kanban" / "SEED-1.md"
+    original = ticket.read_text(encoding="utf-8")
+
+    response = await client.post("/api/v1/issues/SEED-1/confirm-review", json={})
+
+    assert response.status == 409
+    assert (await response.json())["error"]["code"] == "review_confirmation_rejected"
+    assert ticket.read_text(encoding="utf-8") == original
+
+
+async def test_confirm_review_rejects_running_ticket(
+    client: TestClient, board_dir: Path
+) -> None:
+    ticket = board_dir / "kanban" / "SEED-1.md"
+    ticket.write_text(
+        TICKET.replace("state: Todo", "state: Human Review"), encoding="utf-8"
+    )
+    client.stub.running_identifiers["SEED-1"] = "iss-1"  # type: ignore[attr-defined]
+
+    response = await client.post("/api/v1/issues/SEED-1/confirm-review", json={})
+
+    assert response.status == 409
+    assert (await response.json())["error"]["code"] == "issue_running"
+    assert "state: Human Review" in ticket.read_text(encoding="utf-8")
+
+
 async def test_patch_rejects_running_state_change_without_mutating_file(
     client: TestClient, board_dir: Path
 ) -> None:

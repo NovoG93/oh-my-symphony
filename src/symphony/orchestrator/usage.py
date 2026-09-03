@@ -98,32 +98,81 @@ class ProviderUsageManager:
         if probe is None:
             # Missing or unsupported probe -> fail open
             self._last_fetched[pool_id] = now_mono
-            return self.snapshots.get(pool_id)
+            previous = self.snapshots.get(pool_id)
+            if previous is None:
+                snapshot = ProviderUsageSnapshot(
+                    pool_id=pool_id,
+                    source=source_name,
+                    status="unavailable",
+                    error_code="probe_failed",
+                    observed_at=self._clock(),
+                )
+                self.snapshots[pool_id] = snapshot
+                return snapshot
+            stale = replace(previous, stale=True, status="unavailable", error_code="probe_failed")
+            self.snapshots[pool_id] = stale
+            return stale
 
         try:
             result = await probe.fetch_usage()
             self._last_fetched[pool_id] = now_mono
             if result is not None:
+                if result.status == "unavailable":
+                    previous = self.snapshots.get(pool_id)
+                    if previous is not None and previous.windows:
+                        result = replace(
+                            result,
+                            pool_id=pool_id,
+                            source=previous.source,
+                            windows=previous.windows,
+                            credits=previous.credits,
+                            hard_limit_reached=False,
+                            authoritative=previous.authoritative,
+                            stale=True,
+                            last_success_at=previous.last_success_at,
+                        )
                 self.snapshots[pool_id] = result
                 return result
             else:
                 # Probe returned None (no telemetry) -> retain last known, mark stale
                 if pool_id in self.snapshots:
                     self.snapshots[pool_id] = replace(
-                        self.snapshots[pool_id], stale=True
+                        self.snapshots[pool_id], stale=True, status="unavailable", error_code="probe_failed"
                     )
-                return self.snapshots.get(pool_id)
+                else:
+                    self.snapshots[pool_id] = ProviderUsageSnapshot(
+                        pool_id=pool_id,
+                        source=source_name,
+                        status="unavailable",
+                        error_code="probe_failed",
+                        observed_at=self._clock(),
+                    )
+                return self.snapshots[pool_id]
         except Exception as exc:
             self._last_fetched[pool_id] = now_mono
             log.warning(
                 "usage_probe_failed",
                 pool_id=pool_id,
                 source=source_name,
-                error=str(exc),
+                code="probe_failed",
             )
+            _ = exc
             if pool_id in self.snapshots:
-                self.snapshots[pool_id] = replace(self.snapshots[pool_id], stale=True)
-            return self.snapshots.get(pool_id)
+                self.snapshots[pool_id] = replace(
+                    self.snapshots[pool_id],
+                    stale=True,
+                    status="unavailable",
+                    error_code="probe_failed",
+                )
+            else:
+                self.snapshots[pool_id] = ProviderUsageSnapshot(
+                    pool_id=pool_id,
+                    source=source_name,
+                    status="unavailable",
+                    error_code="probe_failed",
+                    observed_at=self._clock(),
+                )
+            return self.snapshots[pool_id]
 
     async def refresh_if_needed(
         self, pool_id: str, source: str, *, force: bool = False

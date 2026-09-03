@@ -10,6 +10,7 @@ endpoints below predate the web app and remain for scripts and the TUI:
     POST /api/v1/<id>/pause|resume
     POST /api/v1/<id>/recover-blocked
     POST /api/v1/<id>/skip-document  (deprecated alias: /skip-learn)
+    POST /api/v1/issues/<id>/confirm-review
 """
 
 from __future__ import annotations

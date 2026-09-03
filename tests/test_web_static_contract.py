@@ -596,6 +596,20 @@ def test_usage_unknown_is_rendered_without_error() -> None:
     assert "t('usage.unavailable')" in js
 
 
+def test_review_confirmation_and_artifacts_use_safe_operator_flows() -> None:
+    js = _script_bundle()
+
+    assert "confirm-review" in js
+    assert "issue.confirmReviewConfirm" in js
+    assert "window.open('', '_blank'" in js
+    assert "api.getArtifact(artifact.url" in js
+    assert "src: artifact.url" not in js
+    assert "href: artifact.url" not in js
+    assert "URL.revokeObjectURL" in js
+    assert "usage.codexSignInRequired" in js
+    assert "updateProviderUsage(runtime.provider_usage || {})" in js
+
+
 def test_estimated_usage_is_visually_distinguished() -> None:
     js = _script_bundle()
     css = (STATIC_ROOT / "style.css").read_text(encoding="utf-8")

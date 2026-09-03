@@ -3245,22 +3245,20 @@ class Orchestrator:
                         windows_proj[w_key]["group"] = w.group_key
                     if w.period_key is not None:
                         windows_proj[w_key]["period"] = w.period_key
-            elif (
-                pool_cfg is not None
-                and pool_cfg.caps
-                and pool_cfg.quota_group is None
-            ):
-                for w_key in pool_cfg.caps:
-                    windows_proj[w_key] = {
-                        "used_percent": None,
-                        "remaining_percent": None,
-                        "resets_at": None,
-                    }
-
             if snap is None:
                 status = "unavailable"
             elif snap.hard_limit_reached:
                 status = "capacity_paused"
+            elif snap.status == "unavailable" or not any(
+                window.used_percent is not None
+                or window.remaining_percent is not None
+                or window.resets_at is not None
+                for window in snap.windows.values()
+            ):
+                # A quota card with no actual windows is not an available
+                # snapshot; reporting "available" would contradict the UI's
+                # unavailable telemetry state.
+                status = "unavailable"
             elif (
                 pool_cfg is not None
                 and self._usage_manager is not None
@@ -3278,6 +3276,11 @@ class Orchestrator:
                 "stale": stale,
                 "authoritative": authoritative,
             }
+            if snap is not None:
+                if snap.error_code is not None:
+                    result[pool_id]["error_code"] = snap.error_code
+                if snap.last_success_at is not None:
+                    result[pool_id]["last_success_at"] = snap.last_success_at.isoformat()
             if snap is not None and snap.credits is not None:
                 result[pool_id]["credits"] = {
                     "has_credits": snap.credits.has_credits,
@@ -9388,6 +9391,8 @@ class Orchestrator:
                 hard_limit_reached=True,
                 authoritative=True,
                 observed_at=datetime.now(timezone.utc),
+                status="capacity_paused",
+                last_success_at=datetime.now(timezone.utc),
             )
             self._usage_manager.set_snapshot(pool_id, snap)
             if entry is not None:

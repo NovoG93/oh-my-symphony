@@ -182,6 +182,21 @@
     return data;
   }
 
+  async function apiBlobRequest(path, { signal } = {}) {
+    const url = path.startsWith(API_BASE) ? path : API_BASE + path;
+    const res = await fetch(url, { method: 'GET', headers: withAuthHeaders({}), signal });
+    if (!res.ok) {
+      if (res.status === 401) handleApiUnauthorized();
+      let message = t('api.requestFailed', { status: res.status });
+      try {
+        const payload = await res.json();
+        message = (payload.error && payload.error.message) || message;
+      } catch (_err) { /* keep the status-based message */ }
+      throw new ApiError(message, 'artifact_fetch_failed', res.status);
+    }
+    return res.blob();
+  }
+
   const api = {
     getPolicy: () => apiRequest('/auth/policy'),
     createWebSocketTicket: () => apiRequest('/chat/ws-ticket', { method: 'POST', body: '{}' }),
@@ -198,7 +213,9 @@
     openProject: (id) => apiRequest(`/projects/${encodeURIComponent(id)}/open`, { method: 'POST', body: '{}' }),
     createIssue: (payload) => apiRequest('/issues', { method: 'POST', body: JSON.stringify(payload) }),
     getIssue: (id) => apiRequest(`/issues/${encodeURIComponent(id)}`),
+    getArtifact: (url, options) => apiBlobRequest(url, options),
     patchIssue: (id, fields) => apiRequest(`/issues/${encodeURIComponent(id)}`, { method: 'PATCH', body: JSON.stringify(fields) }),
+    confirmReview: (id) => apiRequest(`/issues/${encodeURIComponent(id)}/confirm-review`, { method: 'POST', body: '{}' }),
     deleteIssue: (id) => apiRequest(`/issues/${encodeURIComponent(id)}`, { method: 'DELETE' }),
     getWorkflow: () => apiRequest('/workflow'),
     getRuns: ({ issue, limit, query, status, agent } = {}) => {
@@ -330,6 +347,7 @@
     projects: [],
     currentProject: null,
     workflow: null,
+    providerUsage: null,
     policy: null,
     branches: [],
     // Remotes + gh availability decide which Git page actions are usable.
@@ -351,6 +369,8 @@
     statsDays: 30,
     selectedRunId: null,
     drawerIssue: null,
+    drawerArtifactUrls: new Set(),
+    drawerArtifactControllers: new Set(),
     workflowDraft: null,
     openModalBackdrop: null,
     openMenu: null,
@@ -781,7 +801,7 @@
     if (firstInput) firstInput.focus();
   }
 
-  function confirmDialog(message) {
+  function confirmDialog(message, confirmLabel = t('common.delete')) {
     return new Promise((resolve) => {
       let resolved = false;
       const finish = (value) => {
@@ -798,7 +818,7 @@
         el('div', { class: 'modal-body' }, el('p', { class: 'confirm-message' }, message)),
         el('div', { class: 'modal-footer' }, [
           el('button', { class: 'btn btn-ghost', onClick: () => finish(false) }, t('common.cancel')),
-          el('button', { class: 'btn btn-danger', onClick: () => finish(true) }, t('common.delete')),
+          el('button', { class: 'btn btn-danger', onClick: () => finish(true) }, confirmLabel),
         ]),
       ]);
       openModal(content);
@@ -858,10 +878,18 @@
   function closeDrawer() {
     const backdrop = document.getElementById('drawer-backdrop');
     if (!backdrop) return;
+    cleanupDrawerArtifacts();
     backdrop.classList.remove('open');
     const drawer = document.getElementById('drawer-panel');
     if (drawer) drawer.classList.remove('open');
     state.drawerIssue = null;
+  }
+
+  function cleanupDrawerArtifacts() {
+    for (const controller of state.drawerArtifactControllers) controller.abort();
+    state.drawerArtifactControllers.clear();
+    for (const url of state.drawerArtifactUrls) URL.revokeObjectURL(url);
+    state.drawerArtifactUrls.clear();
   }
 
   // ------------------------------------------------------------------
@@ -1994,6 +2022,7 @@
 
   async function openDrawer(identifier) {
     closeAnyMenu();
+    cleanupDrawerArtifacts();
     const backdrop = ensureDrawerScaffold();
     const drawer = document.getElementById('drawer-panel');
     clearNode(drawer);
@@ -2148,6 +2177,24 @@
         el('span', null, detail.attention.message || ''),
       ]));
     }
+    if (!detail.live && String(detail.state || '').trim().toLowerCase() === 'human review') {
+      container.appendChild(el('button', {
+        class: 'btn btn-primary review-confirm-button',
+        type: 'button',
+        onClick: async () => {
+          const ok = await confirmDialog(t('issue.confirmReviewConfirm'), t('issue.confirmReview'));
+          if (!ok) return;
+          try {
+            await api.confirmReview(detail.identifier);
+            showToast(t('issue.reviewConfirmed'), 'success');
+            await refreshBoard();
+            if (state.drawerIssue === detail.identifier) openDrawer(detail.identifier);
+          } catch (err) {
+            showToast(err.message, 'error');
+          }
+        },
+      }, t('issue.confirmReview')));
+    }
     if (!detail.live && isDocumentState(detail.state)) {
       container.appendChild(el('button', {
         class: 'btn btn-ghost',
@@ -2244,9 +2291,23 @@
     return `${bytes} B`;
   }
 
-  // Worker deliverables collected off the workspace. Images preview inline;
-  // everything else is a download link — the server already forces
-  // `Content-Disposition: attachment` for types a browser could execute.
+  function trackDrawerBlobUrl(blob) {
+    const url = URL.createObjectURL(blob);
+    state.drawerArtifactUrls.add(url);
+    return url;
+  }
+
+  async function fetchDrawerArtifact(artifact, controller) {
+    try {
+      return await api.getArtifact(artifact.url, { signal: controller.signal });
+    } finally {
+      state.drawerArtifactControllers.delete(controller);
+    }
+  }
+
+  // Worker deliverables are fetched with the board session token. Protected
+  // artifact URLs must never be put in an href/src because the browser would
+  // request them without the Authorization header.
   function buildArtifactsSection(detail) {
     const artifacts = Array.isArray(detail.artifacts) ? detail.artifacts : [];
     const section = el('div', { class: 'drawer-artifacts' });
@@ -2259,19 +2320,50 @@
       return section;
     }
     const list = el('div', { class: 'artifact-list' });
+    const errorBox = el('div', { class: 'drawer-error', role: 'alert', hidden: true });
+    section.appendChild(errorBox);
+    const showArtifactError = (err) => {
+      if (err && err.name === 'AbortError') return;
+      errorBox.textContent = t('artifacts.loadFailed', { error: err.message || t('common.somethingWentWrong') });
+      errorBox.hidden = false;
+    };
     artifacts.forEach((artifact) => {
-      const isImage = artifact.inline && String(artifact.content_type || '').startsWith('image/');
+      const isInline = Boolean(artifact.inline);
+      const isImage = isInline && String(artifact.content_type || '').startsWith('image/');
       // Always show the real file name next to the worker-chosen title: the
       // title is arbitrary text, so "Coverage report" could otherwise save
       // an installer without the reader ever seeing the extension.
       const meta = [artifact.name, formatArtifactBytes(artifact.byte_size)];
       if (artifact.turn) meta.push(t('artifacts.turn', { turn: artifact.turn }));
-      const link = el('a', {
+      const link = el('button', {
         class: 'artifact-name',
-        href: artifact.url,
-        target: '_blank',
-        rel: 'noopener noreferrer',
-        download: artifact.inline ? null : artifact.name,
+        type: 'button',
+        onClick: async () => {
+          // Open synchronously in the user gesture before the authenticated
+          // fetch, otherwise Brave may block the eventual preview window.
+          const popup = isInline ? window.open('', '_blank', 'noopener,noreferrer') : null;
+          const controller = new AbortController();
+          state.drawerArtifactControllers.add(controller);
+          try {
+            const blob = await fetchDrawerArtifact(artifact, controller);
+            const url = trackDrawerBlobUrl(blob);
+            if (isInline && popup) {
+              popup.location.href = url;
+            } else if (!isInline) {
+              const download = document.createElement('a');
+              download.href = url;
+              download.download = artifact.name;
+              document.body.appendChild(download);
+              download.click();
+              download.remove();
+            } else if (!popup) {
+              throw new Error(t('artifacts.popupBlocked'));
+            }
+          } catch (err) {
+            if (popup) popup.close();
+            showArtifactError(err);
+          }
+        },
       }, artifact.title || artifact.name);
       const item = el('div', { class: 'artifact-item' }, [
         el('div', { class: 'artifact-row' }, [
@@ -2285,17 +2377,21 @@
       if (isImage) {
         const thumb = el('img', {
           class: 'artifact-thumb',
-          src: artifact.url,
           alt: artifact.title || artifact.name,
           loading: 'lazy',
         });
-        const preview = el('a', {
-          href: artifact.url,
-          target: '_blank',
-          rel: 'noopener noreferrer',
+        const preview = el('button', {
+          type: 'button',
           class: 'artifact-thumb-link',
         }, [thumb]);
+        preview.addEventListener('click', () => link.click());
         item.appendChild(preview);
+        const controller = new AbortController();
+        state.drawerArtifactControllers.add(controller);
+        fetchDrawerArtifact(artifact, controller).then((blob) => {
+          if (state.drawerIssue !== detail.identifier) return;
+          thumb.src = trackDrawerBlobUrl(blob);
+        }).catch(showArtifactError);
       }
       list.appendChild(item);
     });
@@ -2395,6 +2491,7 @@
     try {
       const board = await api.getBoard();
       state.board = board;
+      updateProviderUsage(board.provider_usage || {});
       state.connected = true;
       state.lastSuccessfulPollAt = Date.now();
       updateConnectionIndicator();
@@ -2867,8 +2964,9 @@
     page.appendChild(body);
     container.appendChild(page);
     try {
-      const wf = await api.getWorkflow();
+      const [wf, runtime] = await Promise.all([api.getWorkflow(), api.getState()]);
       state.workflow = wf;
+      state.providerUsage = runtime.provider_usage || {};
       state.workflowDraft = wf.columns.map((c) => ({ ...c, _originalName: c.name }));
       clearNode(body);
       body.appendChild(buildWorkflowEditor());
@@ -2915,8 +3013,7 @@
     ]);
     wrap.appendChild(saveBar);
     wrap.appendChild(buildAgentPolicyCard(state.workflow.agent));
-    const providerUsage = (state.board && state.board.provider_usage) || (state.status && state.status.provider_usage);
-    wrap.appendChild(buildProviderUsageCard(state.workflow.usage_pools, providerUsage));
+    wrap.appendChild(buildProviderUsageCard(state.workflow.usage_pools, state.providerUsage));
 
     state.wfRerender = () => {
 
@@ -3067,9 +3164,10 @@
       const poolSec = el('div', { class: 'provider-usage-pool', 'data-pool-id': poolId });
 
       const displayName = poolId.charAt(0).toUpperCase() + poolId.slice(1);
-      const status = (poolData && poolData.status) || 'available';
+      const status = (poolData && poolData.status) || (!poolData ? 'unavailable' : 'available');
       const isPaused = status === 'capacity_paused';
       const isStale = Boolean(poolData && poolData.stale);
+      const isUnavailable = status === 'unavailable';
       const isAuthoritative = !poolData || poolData.authoritative !== false;
       const poolSource = (poolData && poolData.source) || (poolCfg && poolCfg.source) || poolId;
 
@@ -3081,7 +3179,7 @@
         el('div', { class: 'usage-pool-badges' }, [
           isPaused
             ? el('span', { class: 'chip-status chip-status--paused badge badge-paused' }, t('usage.capacityPaused'))
-            : (!poolData || (!poolData.windows && (!poolCfg || !poolCfg.caps)))
+            : isUnavailable || (!poolData || (!poolData.windows && (!poolCfg || !poolCfg.caps)))
             ? el('span', { class: 'chip-status badge badge-muted' }, t('usage.unavailable'))
             : el('span', { class: 'chip-status badge badge-success' }, t('usage.available')),
           isStale ? el('span', { class: 'chip-status chip-stale badge badge-stale' }, t('usage.stale')) : null,
@@ -3098,6 +3196,31 @@
             el('p', { class: 'usage-paused-text' }, `${t('usage.tasksPaused', { pool: displayName })} — ${t('usage.waitingForCapacity')}`),
           ])
         );
+      }
+
+      if (isUnavailable) {
+        const authRequired = poolData && poolData.error_code === 'authentication_required';
+        poolSec.appendChild(el('div', { class: 'usage-unavailable-notice' }, [
+          el('strong', null, authRequired ? t('usage.codexSignInRequired') : t('usage.unavailable')),
+          el('span', null, authRequired ? t('usage.codexSignInHint') : t('usage.unavailableHint')),
+        ]));
+        const retry = el('button', {
+          class: 'btn btn-ghost btn-sm',
+          type: 'button',
+          onClick: async (e) => {
+            e.target.disabled = true;
+            try {
+              await api.refresh();
+              const runtime = await api.getState();
+              updateProviderUsage(runtime.provider_usage || {});
+            } catch (err) {
+              showToast(err.message, 'error');
+            } finally {
+              e.target.disabled = false;
+            }
+          },
+        }, t('common.retry'));
+        poolSec.appendChild(retry);
       }
 
       // Collect reported windows only.  Caps are deliberately not allowed to
@@ -3225,6 +3348,14 @@
     }
     card.appendChild(list);
     return card;
+  }
+
+  function updateProviderUsage(providerUsage) {
+    state.providerUsage = providerUsage || {};
+    if (state.route !== 'workflow' && state.route !== 'settings') return;
+    const current = document.getElementById('provider-usage-card');
+    if (!current || !state.workflow) return;
+    current.replaceWith(buildProviderUsageCard(state.workflow.usage_pools, state.providerUsage));
   }
 
 
@@ -5155,14 +5286,16 @@
     page.appendChild(body);
     container.appendChild(page);
     try {
-      const [wf, branchesResp, board] = await Promise.all([
+      const [wf, branchesResp, board, runtime] = await Promise.all([
         api.getWorkflow(),
         api.getBranches(),
         state.board ? Promise.resolve(state.board) : api.getBoard(),
+        api.getState(),
       ]);
       const ciStatus = await api.getContinuousImprovementStatus();
       const lanePresets = await api.getLanePresets();
       state.workflow = wf;
+      state.providerUsage = runtime.provider_usage || {};
       state.branches = branchesResp.branches;
       if (!state.board) state.board = board;
       clearNode(body);
@@ -5173,9 +5306,8 @@
       body.appendChild(settingsSectionHeading(t('settings.workflowSetup'), t('settings.workflowSetupDescription')));
       body.appendChild(buildLanePresetCard(lanePresets, wf));
       body.appendChild(buildBranchPolicyCard(wf));
-      const providerUsage = (board && board.provider_usage) || (state.board && state.board.provider_usage);
-      if (wf.usage_pools || providerUsage) {
-        body.appendChild(buildProviderUsageCard(wf.usage_pools, providerUsage));
+      if (wf.usage_pools || state.providerUsage) {
+        body.appendChild(buildProviderUsageCard(wf.usage_pools, state.providerUsage));
       }
       body.appendChild(settingsSectionHeading(t('settings.automation'), t('settings.automationDescription')));
 
@@ -5216,6 +5348,7 @@
       const board = await api.getBoard();
       state.connected = true;
       state.lastSuccessfulPollAt = Date.now();
+      updateProviderUsage(board.provider_usage || {});
       if (!holdRender) {
         const firstLoad = !state.board;
         state.board = board;

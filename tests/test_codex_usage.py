@@ -225,6 +225,45 @@ def test_codex_weekly_only_initial_snapshot_stays_weekly_only() -> None:
     assert set(result.windows) == {"weekly"}
 
 
+def test_codex_duration_only_window_is_not_successful_telemetry() -> None:
+    result = normalize_codex_rate_limits(
+        {
+            "rateLimits": {
+                "primary": {
+                    "usedPercent": None,
+                    "remainingPercent": None,
+                    "windowDurationMins": 300,
+                    "resetsAt": None,
+                }
+            }
+        }
+    )
+
+    assert result.windows == {}
+    assert result.status == "unavailable"
+    assert result.error_code == "probe_failed"
+
+
+def test_codex_duration_only_update_enriches_existing_window() -> None:
+    initial = normalize_codex_rate_limits(
+        {"primary": {"usedPercent": 25, "windowDurationMins": 300}}
+    )
+    result = normalize_codex_rate_limits(
+        {
+            "primary": {
+                "usedPercent": None,
+                "remainingPercent": None,
+                "windowDurationMins": 300,
+                "resetsAt": None,
+            }
+        },
+        previous=initial,
+    )
+
+    assert result.windows["five_hour"].used_percent == 25
+    assert result.status == "available"
+
+
 @pytest.mark.parametrize(
     ("credits", "expected_unlimited", "expected_balance"),
     [
@@ -525,6 +564,51 @@ async def test_codex_usage_probe_fails_open_on_error() -> None:
     snap = await probe.fetch_usage()
 
     assert snap is None
+
+
+@pytest.mark.asyncio
+async def test_codex_usage_probe_sanitizes_invalid_refresh_token() -> None:
+    class FailingClient:
+        async def request(self, method: str, params: dict) -> dict:
+            raise RuntimeError("invalid_refresh_token: provider response must not escape")
+
+    probe = CodexUsageProbe(client=FailingClient(), pool_id="codex")
+    snap = await probe.fetch_usage()
+
+    assert snap is not None
+    assert snap.windows == {}
+    assert snap.status == "unavailable"
+    assert snap.error_code == "authentication_required"
+    assert "provider response" not in str(snap)
+
+
+@pytest.mark.asyncio
+async def test_failed_refresh_retains_valid_windows_as_stale() -> None:
+    initial = normalize_codex_rate_limits(
+        {"primary": {"usedPercent": 12, "windowDurationMins": 300}}
+    )
+
+    class FailingProbe:
+        async def fetch_usage(self) -> ProviderUsageSnapshot:
+            return ProviderUsageSnapshot(
+                "codex",
+                "codex",
+                status="unavailable",
+                error_code="authentication_required",
+            )
+
+    manager = ProviderUsageManager(probes={"codex": FailingProbe()})
+    manager.set_snapshot("codex", initial)
+    result = await manager.refresh("codex")
+
+    assert result is not None
+    assert result.windows["five_hour"].used_percent == 12
+    assert result.stale is True
+    assert result.status == "unavailable"
+    assert result.error_code == "authentication_required"
+    assert manager.evaluate(
+        "codex", UsagePoolConfig(source="codex", caps={"five_hour": 1})
+    ) == UsageDecision.READY
 
 
 def test_codex_usage_probe_registered_in_usage_probes() -> None:

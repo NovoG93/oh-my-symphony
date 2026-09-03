@@ -39,6 +39,12 @@ class ProviderUsageSnapshot:
     observed_at: datetime | None = None
     stale: bool = False
     credits: ProviderCreditInfo | None = None
+    # Telemetry health is separate from quota eligibility.  A stale or
+    # unavailable snapshot must never block scheduling, but the operator UI
+    # needs to explain why percentages are missing.
+    status: str = "available"
+    error_code: str | None = None
+    last_success_at: datetime | None = None
 
 
 @runtime_checkable

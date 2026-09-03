@@ -100,6 +100,7 @@ NOTIF_RATE_LIMITS = "account/rateLimits/updated"
 # Last-message preview is rendered in the dashboard / passed back as
 # `TurnResult.last_message`. 1000 chars matches what the legacy backend used.
 _ASSISTANT_MESSAGE_PREVIEW_CAP = 1000
+_CODEX_PROBE_TIMEOUT_S = 5.0
 
 
 # v2 turn/start `sandboxPolicy` is a tagged enum object, not a kebab-case
@@ -412,6 +413,18 @@ def normalize_codex_rate_limits(
         if resets_at is None and previous_window is not None:
             resets_at = previous_window.resets_at
 
+        # Codex can briefly emit a shape containing only the duration (or
+        # explicit nulls) while credentials/session state is settling.  That
+        # is not a valid initial quota snapshot.  An existing real window is
+        # still retained through sparse-update merging above.
+        if (
+            previous_window is None
+            and used_pct is None
+            and rem_pct is None
+            and resets_at is None
+        ):
+            continue
+
         windows[window_key] = UsageWindow(
             key=window_key,
             used_percent=used_pct,
@@ -447,6 +460,8 @@ def normalize_codex_rate_limits(
             else:
                 credits = None
 
+    observed_at = datetime.now(timezone.utc)
+    telemetry_status = "available" if windows else "unavailable"
     return ProviderUsageSnapshot(
         pool_id=pool_id,
         source="codex",
@@ -454,7 +469,10 @@ def normalize_codex_rate_limits(
         credits=credits,
         hard_limit_reached=hard_limit_reached,
         authoritative=authoritative,
-        observed_at=datetime.now(timezone.utc),
+        observed_at=observed_at,
+        status="capacity_paused" if hard_limit_reached else telemetry_status,
+        error_code=None if windows else "probe_failed",
+        last_success_at=observed_at if windows else None,
     )
 
 
@@ -491,6 +509,51 @@ def _is_genuine_provider_exhaustion(
     return any(kw in text for kw in exhaustion_keywords)
 
 
+class _CodexProbeFailure(Exception):
+    def __init__(self, code: str) -> None:
+        self.code = code
+        super().__init__(code)
+
+
+def _codex_probe_error_code(error: Any) -> str:
+    """Map provider errors to a deliberately tiny public diagnostic set."""
+    if isinstance(error, dict):
+        text = " ".join(
+            str(error.get(key) or "")
+            for key in ("code", "message", "type", "name")
+        ).lower()
+    else:
+        text = str(error).lower()
+    if any(
+        marker in text
+        for marker in (
+            "invalid_refresh_token",
+            "invalid refresh token",
+            "invalid_grant",
+            "authentication",
+            "unauthorized",
+            "not authenticated",
+            "login required",
+        )
+    ):
+        return "authentication_required"
+    return "probe_failed"
+
+
+async def _drain_stderr(stream: asyncio.StreamReader | None) -> None:
+    """Drain provider stderr without retaining or exposing its contents.
+
+    Keep only one small chunk in memory, but continue until EOF so a noisy
+    provider cannot block while its stderr pipe fills.
+    """
+    if stream is None:
+        return
+    while True:
+        chunk = await stream.read(4096)
+        if not chunk:
+            return
+
+
 class CodexUsageProbe(UsageProbe):
     """Authoritative Codex rate limits probe against Codex App Server."""
 
@@ -513,12 +576,8 @@ class CodexUsageProbe(UsageProbe):
         """Query account/rateLimits/read and return normalized snapshot."""
         try:
             if self.client is not None and hasattr(self.client, "request"):
+                auth_resp = await self.client.request(METHOD_ACCOUNT_READ, {})
                 raw = await self.client.request(METHOD_ACCOUNT_RATE_LIMITS_READ, {})
-                auth_resp = {}
-                try:
-                    auth_resp = await self.client.request(METHOD_ACCOUNT_READ, {})
-                except Exception:
-                    pass
                 auth_mode = (
                     auth_resp.get("authMode")
                     or auth_resp.get("auth_mode")
@@ -533,18 +592,42 @@ class CodexUsageProbe(UsageProbe):
                 )
 
             if self.backend is not None and hasattr(self.backend, "_request"):
+                await self.backend._request(METHOD_ACCOUNT_READ, {})
                 raw = await self.backend._request(METHOD_ACCOUNT_RATE_LIMITS_READ, {})
                 return normalize_codex_rate_limits(raw, pool_id=self.pool_id)
 
             return await self._probe_standalone()
+        except _CodexProbeFailure as exc:
+            log.warning("codex_usage_probe_failed", pool_id=self.pool_id, code=exc.code)
+            return ProviderUsageSnapshot(
+                pool_id=self.pool_id,
+                source="codex",
+                windows={},
+                status="unavailable",
+                error_code=exc.code,
+                observed_at=datetime.now(timezone.utc),
+            )
         except Exception as exc:
-            log.warning("codex_usage_probe_failed", pool_id=self.pool_id, error=str(exc))
-            return None
-
+            code = _codex_probe_error_code(exc)
+            log.warning("codex_usage_probe_failed", pool_id=self.pool_id, code=code)
+            # Keep provider diagnostics bounded and sanitized.  In
+            # particular, never put JSON-RPC error data or command output in
+            # the API payload.
+            if code == "probe_failed" and self.client is not None:
+                return None
+            return ProviderUsageSnapshot(
+                pool_id=self.pool_id,
+                source="codex",
+                windows={},
+                status="unavailable",
+                error_code=code,
+                observed_at=datetime.now(timezone.utc),
+            )
     async def _probe_standalone(self) -> ProviderUsageSnapshot | None:
         cmd = self.command
         cwd = str(self.cwd) if self.cwd else None
         proc = None
+        stderr_task: asyncio.Task[None] | None = None
         try:
             proc = await asyncio.create_subprocess_exec(
                 resolve_bash(),
@@ -557,78 +640,73 @@ class CodexUsageProbe(UsageProbe):
                 limit=MAX_LINE_BYTES,
                 start_new_session=os.name == "posix",
             )
-            if proc.stdin is None or proc.stdout is None:
+            stdin = proc.stdin
+            stdout = proc.stdout
+            if stdin is None or stdout is None:
                 return None
 
-            # 1. initialize
-            proc.stdin.write(
-                (
-                    json.dumps({
-                        "jsonrpc": "2.0",
-                        "id": 1,
-                        "method": METHOD_INITIALIZE,
-                        "params": {"clientInfo": {"name": "symphony", "version": "0.2.0"}},
-                    })
-                    + "\n"
-                ).encode("utf-8")
-            )
-            # 2. account/read (best effort)
-            proc.stdin.write(
-                (
-                    json.dumps({
-                        "jsonrpc": "2.0",
-                        "id": 2,
-                        "method": METHOD_ACCOUNT_READ,
-                        "params": {},
-                    })
-                    + "\n"
-                ).encode("utf-8")
-            )
-            # 3. account/rateLimits/read
-            proc.stdin.write(
-                (
-                    json.dumps({
-                        "jsonrpc": "2.0",
-                        "id": 3,
-                        "method": METHOD_ACCOUNT_RATE_LIMITS_READ,
-                        "params": {},
-                    })
-                    + "\n"
-                ).encode("utf-8")
-            )
-            await proc.stdin.drain()
+            stderr_task = asyncio.create_task(_drain_stderr(proc.stderr))
 
-            auth_mode = None
-            rate_limits_result = None
+            async def request(request_id: int, method: str, params: dict[str, Any]) -> dict[str, Any]:
+                stdin.write((json.dumps({
+                    "jsonrpc": "2.0", "id": request_id, "method": method, "params": params,
+                }) + "\n").encode("utf-8"))
+                await stdin.drain()
+                deadline = asyncio.get_running_loop().time() + _CODEX_PROBE_TIMEOUT_S
+                while True:
+                    remaining = deadline - asyncio.get_running_loop().time()
+                    if remaining <= 0:
+                        raise _CodexProbeFailure("probe_timeout")
+                    try:
+                        line = await asyncio.wait_for(
+                            stdout.readline(), timeout=remaining
+                        )
+                    except asyncio.TimeoutError as exc:
+                        raise _CodexProbeFailure("probe_timeout") from exc
+                    if not line:
+                        raise _CodexProbeFailure("probe_failed")
+                    try:
+                        msg = json.loads(line.decode("utf-8", errors="replace"))
+                    except (TypeError, ValueError):
+                        continue
+                    if not isinstance(msg, dict) or msg.get("id") != request_id:
+                        continue
+                    if isinstance(msg.get("error"), dict):
+                        raise _CodexProbeFailure(_codex_probe_error_code(msg["error"]))
+                    result = msg.get("result")
+                    return result if isinstance(result, dict) else {}
 
-            for _ in range(30):
-                line = await asyncio.wait_for(proc.stdout.readline(), timeout=5.0)
-                if not line:
-                    break
-                text = line.decode("utf-8", errors="replace").strip()
-                if not text:
-                    continue
-                try:
-                    msg = json.loads(text)
-                except Exception:
-                    continue
-                if isinstance(msg, dict):
-                    if msg.get("id") == 2:
-                        res = msg.get("result") or {}
-                        auth_mode = res.get("authMode") or res.get("auth_mode")
-                    elif msg.get("id") == 3:
-                        rate_limits_result = msg.get("result") or {}
-                        break
+            await request(1, METHOD_INITIALIZE, {
+                "clientInfo": {"name": "symphony", "version": "0.2.0"}
+            })
+            stdin.write(b'{"jsonrpc":"2.0","method":"initialized","params":{}}\n')
+            await stdin.drain()
+            auth_resp = await request(2, METHOD_ACCOUNT_READ, {})
+            rate_limits_result = await request(3, METHOD_ACCOUNT_RATE_LIMITS_READ, {})
 
-            if rate_limits_result is not None:
-                return normalize_codex_rate_limits(
-                    rate_limits_result, pool_id=self.pool_id, auth_mode=auth_mode
+            auth_mode = (
+                auth_resp.get("authMode")
+                or auth_resp.get("auth_mode")
+                or (
+                    auth_resp.get("account", {}).get("type")
+                    if isinstance(auth_resp.get("account"), dict)
+                    else None
                 )
-            return None
+            )
+            return normalize_codex_rate_limits(
+                rate_limits_result, pool_id=self.pool_id, auth_mode=auth_mode
+            )
         finally:
             if proc is not None:
                 try:
                     await terminate_process_tree(proc)
+                except Exception:
+                    pass
+            if stderr_task is not None:
+                try:
+                    await asyncio.wait_for(stderr_task, timeout=1.0)
+                except (asyncio.TimeoutError, asyncio.CancelledError):
+                    stderr_task.cancel()
                 except Exception:
                     pass
 

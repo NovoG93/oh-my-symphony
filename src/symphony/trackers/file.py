@@ -858,6 +858,35 @@ class FileBoardTracker:
         assert path is not None
         return path
 
+    def transition_if_current(
+        self, identifier: str, expected_state: str, new_state: str
+    ) -> bool:
+        """Transition only if the persisted state still matches.
+
+        The state comparison and write share the ticket lock, so an operator
+        action cannot overwrite a concurrent worker or operator transition
+        based on an old board snapshot.
+        """
+        changed = False
+
+        def mutate(
+            front: dict[str, Any], body: str
+        ) -> tuple[dict[str, Any], str] | None:
+            nonlocal changed
+            if normalize_state(str(front.get("state") or "")) != normalize_state(
+                expected_state
+            ):
+                return None
+            front["state"] = new_state
+            front["updated_at"] = datetime.now(timezone.utc).strftime(
+                "%Y-%m-%dT%H:%M:%SZ"
+            )
+            changed = True
+            return front, body
+
+        self._mutate_ticket(identifier, mutate)
+        return changed
+
     def update_state(self, issue: Issue, target_state: str) -> None:
         """TrackerClient protocol mutation hook.
 

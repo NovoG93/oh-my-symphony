@@ -1049,10 +1049,18 @@ a { color: inherit; }
   gap: 0.5926rem;
 }
 .artifact-name {
+  appearance: none;
+  border: 0;
+  padding: 0;
+  background: transparent;
+  color: var(--accent);
+  text-align: left;
+  cursor: pointer;
   font-weight: 600;
   font-size: 0.963rem;
   word-break: break-all;
 }
+.artifact-name:hover { text-decoration: underline; }
 .artifact-meta {
   flex: 0 0 auto;
   font-size: 0.8148rem;
@@ -1066,6 +1074,15 @@ a { color: inherit; }
   line-height: 1.5;
 }
 .artifact-thumb-link { display: block; margin-top: 0.5926rem; }
+.artifact-thumb-link {
+  appearance: none;
+  border: 0;
+  padding: 0;
+  background: transparent;
+  cursor: pointer;
+  text-align: left;
+}
+.review-confirm-button { align-self: flex-start; margin: 0.3rem 0; }
 .artifact-thumb {
   display: block;
   max-width: 100%;
