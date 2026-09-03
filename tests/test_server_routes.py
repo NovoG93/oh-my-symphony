@@ -346,7 +346,8 @@ async def test_recover_blocked_route_returns_recovery_payload(
     assert payload["agent_kind"] == "codex"
 
 
-async def test_debug_tasks_route_returns_list(client: TestClient) -> None:
+async def test_debug_tasks_route_returns_list(client: TestClient, monkeypatch) -> None:
+    monkeypatch.setenv("SYMPHONY_REMOTE_OPERATOR_CAPABILITIES", "debug")
     resp = await client.get("/api/v1/_debug/tasks")
     assert resp.status == 200
     payload = await resp.json()

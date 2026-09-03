@@ -12,29 +12,22 @@ Covers:
 from __future__ import annotations
 
 import argparse
-import io
 import shutil
 import sqlite3
-import sys
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any
 
 import pytest
 
 import symphony.orchestrator.migrations as migration_mod
 from symphony.cli.board import cmd_new, cmd_show, cmd_update
-from symphony.cli.doctor import CheckResult, check_agent_profiles, run_checks
-from symphony.errors import ConfigValidationError, SymphonyError
+from symphony.cli.doctor import check_agent_profiles
+from symphony.errors import SymphonyError
 from symphony.issue import Issue
-from symphony.orchestrator.run_registry import RunRecord, RunRegistry
+from symphony.orchestrator.run_registry import RunRegistry
 from symphony.trackers.file import FileBoardTracker, parse_ticket_file
 from symphony.workflow import (
-    AgentConfig,
-    AgentProfileConfig,
-    ClaudeConfig,
-    CodexConfig,
     ServiceConfig,
     TrackerConfig,
     build_service_config,
@@ -548,7 +541,6 @@ def test_doctor_profile_checks_fail_on_bad_model_syntax(tmp_path: Path) -> None:
 
 
 def test_doctor_profile_checks_fail_on_unresolved_stage_profile(tmp_path: Path) -> None:
-    from dataclasses import replace
     base_cfg = _build_cfg(
         tmp_path,
         """
@@ -565,7 +557,6 @@ def test_doctor_profile_checks_fail_on_unresolved_stage_profile(tmp_path: Path) 
 
 
 def test_doctor_profile_checks_fail_on_unresolved_default_profile(tmp_path: Path) -> None:
-    from dataclasses import replace
     base_cfg = _build_cfg(
         tmp_path,
         """
@@ -579,6 +570,4 @@ def test_doctor_profile_checks_fail_on_unresolved_default_profile(tmp_path: Path
     res = next(r for r in results if r.name == "agent.default_profile")
     assert res.status == "fail"
     assert 'unknown profile "missing-default"' in res.message
-
-
 

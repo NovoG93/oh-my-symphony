@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import subprocess
+import sys
 from pathlib import Path
 from typing import Any
 
@@ -24,6 +25,8 @@ from symphony.chat import (
     _claude_command_for_mode,
     _summarize_claude_frame,
     _summarize_codex_frame,
+    _summarize_copilot_frame,
+    _summarize_frame,
     _summarize_pi_frame,
     _terminal_agent_message,
     cfg_for_mode,
@@ -61,6 +64,18 @@ You are working on {{{{ issue.identifier }}}}.
 """
 
 CONFIRMATION_TOKEN = "c" * 64
+
+
+def _setup_marker(payload: dict[str, Any]) -> str:
+    """Render one project-setup marker with a properly encoded payload.
+
+    Native Windows paths contain backslashes that are invalid as raw JSON
+    escapes, so the payload must go through ``json.dumps`` instead of an
+    f-string.
+    """
+    return (
+        "<symphony-project-setup>" + json.dumps(payload) + "</symphony-project-setup>"
+    )
 
 
 def _cfg(tmp_path: Path) -> ServiceConfig:
@@ -1363,8 +1378,7 @@ async def test_project_setup_choice_is_explicit_and_idempotent(
     manager._record_agent_message(
         session,
         "1. Create a separate Todo app.\n"
-        '<symphony-project-setup>{"choice": 1, "name": "Todo App", '
-        f'"path": "{tmp_path / "todo-app"}"}}</symphony-project-setup>',
+        + _setup_marker({"choice": 1, "name": "Todo App", "path": str(tmp_path / "todo-app")}),
     )
 
     action = manager.project_setup_for_choice("1")
@@ -1415,8 +1429,7 @@ async def test_default_project_setup_creates_registered_board(
     assert session is not None
     manager._record_agent_message(
         session,
-        '<symphony-project-setup>{"choice": 1, "name": "Todo App", '
-        f'"path": "{target}"}}</symphony-project-setup>',
+        _setup_marker({"choice": 1, "name": "Todo App", "path": str(target)}),
     )
     action = manager.project_setup_for_choice("1")
     assert action is not None
@@ -1460,15 +1473,13 @@ async def test_project_setup_rejects_duplicate_live_choice_numbers(
     assert session is not None
     manager._record_agent_message(
         session,
-        '<symphony-project-setup>{"choice": 1, "name": "First", '
-        f'"path": "{tmp_path / "first"}"}}</symphony-project-setup>',
+        _setup_marker({"choice": 1, "name": "First", "path": str(tmp_path / "first")}),
     )
     first = manager.project_setup_for_choice("1")
     assert first is not None
     manager._record_agent_message(
         session,
-        '<symphony-project-setup>{"choice": 1, "name": "Second", '
-        f'"path": "{tmp_path / "second"}"}}</symphony-project-setup>',
+        _setup_marker({"choice": 1, "name": "Second", "path": str(tmp_path / "second")}),
     )
 
     assert list(session.project_setup_actions) == [first.action_id]
@@ -1497,8 +1508,7 @@ async def test_project_setup_prunes_terminal_card_before_adding_new_proposal(
 
     manager._record_agent_message(
         session,
-        '<symphony-project-setup>{"choice": 99, "name": "Fresh", '
-        f'"path": "{tmp_path / "fresh"}"}}</symphony-project-setup>',
+        _setup_marker({"choice": 99, "name": "Fresh", "path": str(tmp_path / "fresh")}),
     )
 
     assert len(session.project_setup_actions) == 20
@@ -1529,8 +1539,7 @@ async def test_project_setup_rejects_git_topology_change_after_proposal(
     assert session is not None
     manager._record_agent_message(
         session,
-        '<symphony-project-setup>{"choice": 1, "name": "Nested", '
-        f'"path": "{target}"}}</symphony-project-setup>',
+        _setup_marker({"choice": 1, "name": "Nested", "path": str(target)}),
     )
     action = manager.project_setup_for_choice("1")
     assert action is not None and action.path == str(target)
@@ -1568,8 +1577,7 @@ async def test_project_setup_rejects_git_created_at_same_confirmed_root(
     assert session is not None
     manager._record_agent_message(
         session,
-        '<symphony-project-setup>{"choice": 1, "name": "Target", '
-        f'"path": "{target}"}}</symphony-project-setup>',
+        _setup_marker({"choice": 1, "name": "Target", "path": str(target)}),
     )
     action = manager.project_setup_for_choice("1")
     assert action is not None
@@ -1655,8 +1663,7 @@ async def test_reattach_drops_untrusted_project_action_and_reenrolls_browser(
     assert session is not None
     manager._record_agent_message(
         session,
-        '<symphony-project-setup>{"choice": 1, "name": "Todo App", '
-        f'"path": "{tmp_path / "todo-app"}"}}</symphony-project-setup>',
+        _setup_marker({"choice": 1, "name": "Todo App", "path": str(tmp_path / "todo-app")}),
     )
     await manager.stop_session(session_id)
 
@@ -1700,8 +1707,9 @@ async def test_reattach_drops_untrusted_project_action_and_reenrolls_browser(
     assert reattached is not None
     resumed._record_agent_message(
         reattached,
-        '<symphony-project-setup>{"choice": 2, "name": "Todo Again", '
-        f'"path": "{tmp_path / "todo-again"}"}}</symphony-project-setup>',
+        _setup_marker(
+            {"choice": 2, "name": "Todo Again", "path": str(tmp_path / "todo-again")}
+        ),
     )
     assert resumed.project_setup_for_choice("2", session_id) is not None
     await resumed.stop_session(session_id)
@@ -1742,6 +1750,11 @@ def _cfg_with_states(tmp_path: Path, active_states: str) -> ServiceConfig:
     return cfg
 
 
+@pytest.mark.skipif(
+    sys.platform == "win32",
+    reason="POSIX-only: spawns /bin/sh directly; Windows has no /bin/sh "
+    "(the SYMPHONY_CLI fallback is exercised by resolve_symphony_cli tests)",
+)
 def test_board_cli_fallback_runs_with_stripped_path() -> None:
     """The documented shell expansion must not depend on ambient PATH."""
 
@@ -1785,3 +1798,49 @@ def test_board_preamble_deep_board_files_one_intake_ticket(tmp_path: Path) -> No
     assert "Intake, Research, Plan" in preamble
     # On a deep board the pipeline decomposes; chat does not build the DAG.
     assert "adversarial plan-review" not in preamble
+
+
+def test_summarize_copilot_frame() -> None:
+    msg_frame = {
+        "type": "assistant.message",
+        "data": {"content": "Resolved the bug."},
+    }
+    assert _summarize_copilot_frame(msg_frame) == [
+        ("agent_message", "Resolved the bug.", {})
+    ]
+
+    delta_frame = {
+        "type": "assistant.message_delta",
+        "data": {"deltaContent": "Editing file..."},
+    }
+    assert _summarize_copilot_frame(delta_frame) == [
+        ("agent_delta", "Editing file...", {})
+    ]
+
+    tool_frame = {
+        "type": "tool.call",
+        "data": {"tool": "edit_file", "args": {"path": "src/main.py"}},
+    }
+    tool_summarized = _summarize_copilot_frame(tool_frame)
+    assert len(tool_summarized) == 1
+    assert tool_summarized[0][0] == "tool_activity"
+    assert tool_summarized[0][1] == "edit_file"
+    assert "src/main.py" in tool_summarized[0][2]["detail"]
+
+    error_frame = {
+        "type": "session.error",
+        "data": {"message": "Process failed"},
+    }
+    assert _summarize_copilot_frame(error_frame) == [
+        ("tool_activity", "error", {"detail": "Process failed"})
+    ]
+
+    # Ephemeral/unknown frames ignored
+    assert _summarize_copilot_frame({"type": "session.mcp_servers_loaded"}) == []
+    assert _summarize_copilot_frame({"type": "assistant.turn_start"}) == []
+
+    # _summarize_frame dispatcher
+    assert _summarize_frame("copilot", msg_frame) == [
+        ("agent_message", "Resolved the bug.", {})
+    ]
+

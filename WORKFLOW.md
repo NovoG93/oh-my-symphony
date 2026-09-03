@@ -239,14 +239,17 @@ hooks:
 
 agent:
   kind: agy
-  # Per-state backend routing — precedence per dispatch:
-  #   per-ticket `agent_kind` pin > stage_kinds > kind.
-  # codex plans (Todo), agy implements (In Progress = default kind),
-  # claude reviews (Verify) and documents (Document).
-  stage_kinds:
-    Todo: codex
-    Verify: claude
-    Document: claude
+  # Per-state backend routing via NAMED PROFILES. Precedence per dispatch:
+  #   dispatch profile > dispatch kind > ticket profile > ticket kind >
+  #   stage_profiles > stage_kinds > default_profile > kind.
+  # codex plans (Todo), agy implements (In Progress), claude reviews
+  # (Verify) and documents (Document).
+  default_profile: builder
+  stage_profiles:
+    Todo: planner
+    "In Progress": builder
+    Verify: reviewer
+    Document: documenter
   max_concurrent_agents: 1
   max_turns: 100
   max_retry_backoff_ms: 300000
@@ -305,6 +308,60 @@ agent:
   auto_merge_exclude_paths:
     - kanban
 
+agent_profiles:
+  planner:
+    kind: codex
+    model: gpt-5.6-sol
+    reasoning_effort: high
+
+  builder:
+    kind: agy
+
+  reviewer:
+    kind: copilot
+    model: claude-sonnet-5
+    reasoning_effort: high
+
+  documenter:
+    kind: claude
+    model: deepseek-v4-flash
+
+usage_pools:
+  # A cap is only enforced when the matching provider probe returns
+  # authoritative telemetry;
+  # otherwise the scheduler fails open (normal scheduling). Pools match the
+  # backends currently in use via the named profiles (profile.usage_pool
+  # defaults to profile.kind).
+  codex:        # planner
+    source: codex
+    caps:
+      five_hour: 80
+      weekly: 70
+
+  claude:       # reviewer + documenter
+    source: claude
+    caps:
+      five_hour: 80
+      weekly: 70
+
+  agy:          # builder
+    source: agy
+    quota_group: gemini
+    caps:
+      five_hour: 100
+      weekly: 100
+
+  # A Claude/GPT AGY profile should use quota_group: third_party. If a
+  # workflow dispatches both model families, define separate pools (for
+  # example agy-gemini and agy-third-party) and point each profile's
+  # usage_pool at the matching pool; caps are enforced only within that
+  # selected quota group.
+
+  copilot:      # reviewer (Verify) — GitHub Copilot CLI
+    source: copilot
+    caps:
+      monthly: 80
+
 claude:
   # `--add-dir "$SYMPHONY_WORKFLOW_DIR"` extends Claude Code's scope
   # from the per-ticket worktree cwd up to the host project root so the
@@ -325,11 +382,11 @@ claude:
 
 agy:
   # Antigravity CLI (agy) print mode — the default `kind` (implementer).
-  # Model pinned via `--model` to `gemini-3.7-flash-high` (verified via
-  # `agy models`; the 3.7 generation is "flash"-only, "pro" is still 3.1).
+  # Model pinned via `--model` to `gemini-3.8-flash-high` (verified via
+  # `agy models`; the 3.8 generation is "flash"-only, "pro" is still 3.1).
   # Symphony appends `--dangerously-skip-permissions` (and `--continue` on
   # continuation turns when resume_across_turns is true).
-  command: 'agy --model gemini-3.7-flash-high --print-timeout 45m --print "$(cat)"'
+  command: 'agy --model gemini-3.8-flash-high --print-timeout 45m --print "$(cat)"'
   resume_across_turns: true
   turn_timeout_ms: 3600000
   read_timeout_ms: 20000
@@ -374,6 +431,25 @@ opencode:
 pi:
   command: 'pi --mode json -p ""'
   resume_across_turns: true
+
+copilot:
+  # GitHub Copilot CLI (native subscription, NOT brokered through Agent
+  # Vault). Model catalog verified on the host: claude-sonnet-5 (default),
+  # claude-sonnet-4.5/4.6, claude-opus-4.8/5, gpt-5.4, gpt-5.1-codex,
+  # gemini-3.8-flash-high. Quota = premium_interactions 1500/mo (~95% remaining).
+  # CopilotBackend appends --output-format=json --no-ask-user
+  # --allow-all-tools (plus --model/--reasoning-effort/--session-id/--add-dir
+  # as configured); writable roots become --add-dir. Buffered stdout, so a
+  # generous stall budget (matches agy).
+  # Absolute path required: /etc/profile.d/agent-vault.sh defines
+  # `copilot(){ av copilot "$@"; }`, and agents spawn via `bash -lc` (login
+  # shell). The absolute path bypasses that broker wrapper so the direct
+  # GitHub OAuth login is used, NOT the Agent Vault proxy.
+  command: /usr/local/bin/copilot
+  resume_across_turns: true
+  turn_timeout_ms: 3600000
+  read_timeout_ms: 20000
+  stall_timeout_ms: 2700000
 
 qa:
   # Boot recipe for As-Is/To-Be HTTP runs. The Verify prompt prefers these

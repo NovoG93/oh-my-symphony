@@ -7,9 +7,9 @@
 [![Tests](https://github.com/cskwork/oh-my-symphony/actions/workflows/tests.yml/badge.svg)](https://github.com/cskwork/oh-my-symphony/actions/workflows/tests.yml)
 [![GitHub stars](https://img.shields.io/github/stars/cskwork/oh-my-symphony?style=social)](https://github.com/cskwork/oh-my-symphony/stargazers)
 
-> One control plane. One terminal. Multiple project boards. Eight AI coding agents
-> (**Codex**, **Claude Code**, **Gemini**, **AGY/Antigravity**, **Kiro**,
-> **OpenCode**, **Pi**, **Prime Agent**) — pick per ticket, run in parallel,
+> One control plane. One terminal. Multiple project boards. Multiple AI coding agents
+> (**Codex**, **Claude Code**, **GitHub Copilot**, **Gemini**, **AGY/Antigravity**,
+> **Kiro**, **OpenCode**, **Pi**, **Prime Agent**) — pick per ticket, run in parallel,
 > review Git changes, preview builds, and watch live.
 
 ![Symphony 9999 admin UI screenshot](docs/admin-ui-screenshot.png)
@@ -48,7 +48,7 @@ terminal for.
 
 ## Why Symphony?
 
-- **No vendor lock-in.** Swap Codex ↔ Claude Code ↔ Gemini ↔ AGY ↔ Kiro ↔ OpenCode ↔ Pi ↔ Prime Agent with one
+- **No vendor lock-in.** Swap Codex ↔ Claude Code ↔ GitHub Copilot ↔ Gemini ↔ AGY ↔ Kiro ↔ OpenCode ↔ Pi ↔ Prime Agent with one
   YAML line, or mix backends per ticket. New agents (Ollama, local models,
   anything with a CLI) drop in behind a thin `AgentBackend` Protocol without
   changing the orchestrator.
@@ -66,9 +66,9 @@ terminal for.
   external trackers; you don't need either one to try Symphony.
 - **Battle-tested base, hardened for local operations.** Forked from
   [OpenAI's official Symphony reference implementation](https://github.com/openai/symphony).
-  This fork keeps the file-first orchestration model, then adds eight agent
-  backends, the TUI/web operator surfaces, SQLite run leases, restart-safe
-  issue flags, and locked Markdown ticket writes.
+  This fork keeps the file-first orchestration model, then adds multiple
+  coding-agent backends, the TUI/web operator surfaces, SQLite run leases,
+  restart-safe issue flags, and locked Markdown ticket writes.
 - **A real web app, not just a viewer.** The orchestrator port serves a
   multi-project control plane: issue CRUD, drag-and-drop columns, per-column
   stage prompts, branch policy, pause / resume, lane presets, operator chat,
@@ -87,9 +87,9 @@ terminal for.
   tickets while they sleep.
 - **Teams** parallelizing bug fixes, doc updates, or migration tickets across
   multiple coding agents simultaneously.
-- **Researchers and reviewers** comparing how Codex, Claude Code, Gemini,
-  AGY/Antigravity, Kiro, OpenCode, Pi, and Prime Agent tackle the same task side by side,
-  with identical prompts and workspaces.
+- **Researchers and reviewers** comparing how Codex, Claude Code, GitHub Copilot,
+  Gemini, AGY/Antigravity, Kiro, OpenCode, Pi, and Prime Agent tackle the same task
+  side by side, with identical prompts and workspaces.
 - **Anyone** who hit the "one chat window per agent" ceiling and wants a
   real orchestrator with a Kanban they can read at a glance.
 
@@ -126,10 +126,13 @@ Upstream polls a tracker (Linear or a local Markdown Kanban) and runs a Codex
 session inside a per-issue workspace. This fork keeps that orchestrator and
 adds:
 
-1. A pluggable **AgentBackend** layer with eight concrete adapters:
+1. A pluggable **AgentBackend** layer with multiple concrete adapters:
    - **Codex** — `codex app-server` (JSON-RPC stdio, multi-turn) — original
    - **Claude Code** — `claude -p --output-format stream-json --verbose`
      (NDJSON events, per-turn subprocess with `--resume`)
+   - **GitHub Copilot** — `copilot --output-format=json --no-ask-user --allow-all-tools`
+     (JSONL events, per-turn subprocess with `--session-id` UUID continuity,
+     custom `--model` and `--reasoning-effort`, plus writable roots via `--add-dir`)
    - **Gemini** — `gemini -p ""` (one-shot per turn, stdin prompt → stdout result)
    - **AGY / Antigravity** — `agy --print "$(cat)"` (one-shot per turn, stdin prompt
      -> stdout result; `agent.kind: antigravity` aliases to `agy`)
@@ -170,10 +173,15 @@ Set `agent.kind` in your `WORKFLOW.md`:
 
 ```yaml
 agent:
-  kind: claude          # codex | claude | gemini | agy | kiro | opencode | pi | prime-agent
+  kind: claude          # codex | claude | copilot | gemini | agy | kiro | opencode | pi | prime-agent
 
 claude:
   command: claude -p --output-format stream-json --verbose
+  resume_across_turns: true
+  turn_timeout_ms: 3600000
+
+copilot:
+  command: copilot
   resume_across_turns: true
   turn_timeout_ms: 3600000
 
@@ -188,10 +196,10 @@ prime_agent:
   turn_timeout_ms: 3600000
 ```
 
-Each backend reads its own block (`codex`, `claude`, `gemini`, `agy`, `kiro`,
-`opencode`, `pi`, `prime_agent`); only the one matching `agent.kind` is used at runtime. The
-Codex `linear_graphql`
-client tool is only advertised when `agent.kind=codex`.
+Each backend reads its own block (`codex`, `claude`, `copilot`, `gemini`, `agy`,
+`kiro`, `opencode`, `pi`, `prime_agent`); only the one matching `agent.kind` is
+used at runtime. The Codex `linear_graphql` client tool is only advertised when
+`agent.kind=codex`.
 
 `agent.kind` is the global default. A file-board ticket can opt into a
 different backend by adding ticket frontmatter:
@@ -203,9 +211,8 @@ agent:
 
 The flat alias `agent_kind: codex` is also accepted for hand-edited cards.
 All backend command and timeout settings still come from the matching global
-`codex:`, `claude:`, `gemini:`, `agy:`, `kiro:`, `opencode:`, `pi:`, or
-`prime_agent:` block
-in `WORKFLOW.md`.
+`codex:`, `claude:`, `copilot:`, `gemini:`, `agy:`, `kiro:`, `opencode:`, `pi:`,
+or `prime_agent:` block in `WORKFLOW.md`.
 When creating file-board tickets from the CLI, use
 `symphony board new TASK-2 "title" --agent-kind codex`.
 
@@ -214,14 +221,54 @@ When creating file-board tickets from the CLI, use
 Named agent profiles (`agent_profiles:` in `WORKFLOW.md`) extend stage routing beyond backend kinds so individual workflow stages or tickets can select specific models, reasoning effort levels, and execution settings. Full reference is documented in [docs/features/agent-profiles.md](docs/features/agent-profiles.md).
 
 #### Backend Kinds vs. Profiles
-- **Backend Kind** (`codex`, `claude`, `gemini`, `agy`, `kiro`, `opencode`, `pi`, `prime-agent`): Specifies the binary adapter, protocol, and subprocess lifecycle.
+- **Backend Kind** (`codex`, `claude`, `copilot`, `gemini`, `agy`, `kiro`, `opencode`, `pi`, `prime-agent`): Specifies the binary adapter, protocol, and subprocess lifecycle.
 - **Named Profile**: An overlay configuration specifying a `kind` and optional overrides (model, reasoning effort, command, timeouts). Unset fields inherit from the matching global backend block (`codex:`, `claude:`, etc.).
 
 #### Profile Inheritance & Supported Fields
 Profiles inherit all unset settings from their corresponding global backend block. Only allowlisted, non-null fields override base settings:
-- **`codex`**: `model`, `reasoning_effort`, `command`, `turn_timeout_ms`, `read_timeout_ms`, `stall_timeout_ms`
-- **`claude`**: `model` (injects `--model <name>`), `command`, `resume_across_turns`, `turn_timeout_ms`, `read_timeout_ms`, `stall_timeout_ms`
-- **`gemini`, `agy`, `kiro`, `opencode`, `pi`, `prime_agent`**: `command`, `resume_across_turns`, and timeouts. Unsupported fields (e.g. `reasoning_effort` on `claude` or `agy`) are rejected at config validation. The gemini backend accepts `resume_across_turns` but ignores it (no resume support).
+- **`codex`**: `model`, `reasoning_effort`, `command`, `turn_timeout_ms`, `read_timeout_ms`, `stall_timeout_ms`, `usage_pool`
+- **`claude`**: `model` (injects `--model <name>`), `command`, `resume_across_turns`, `turn_timeout_ms`, `read_timeout_ms`, `stall_timeout_ms`, `usage_pool`
+- **`copilot`**: `model`, `reasoning_effort`, `command`, `resume_across_turns`, `turn_timeout_ms`, `read_timeout_ms`, `stall_timeout_ms`, `usage_pool`
+- **`gemini`, `agy`, `kiro`, `opencode`, `pi`, `prime_agent`**: `command`, `resume_across_turns`, timeouts, and `usage_pool`. Unsupported fields (e.g. `reasoning_effort` on `claude` or `agy`) are rejected at config validation. The gemini backend accepts `resume_across_turns` but ignores it (no resume support).
+
+Every kind also accepts `usage_pool`, the name of a shared usage pool declared under top-level `usage_pools:` in `WORKFLOW.md`. Full reference: [docs/features/agent-profiles.md](docs/features/agent-profiles.md).
+
+#### Usage Pools & Quota Management (`usage_pools`)
+
+Usage is modeled **per shared usage pool/provider quota** (`usage_pools:`), never per named profile.
+
+> **Core Architectural Boundary:**
+> **Agent profiles define HOW an agent runs** (model, reasoning effort, command, timeouts).
+> **Usage pools define WHETHER the provider/account may start new work** (quotas, caps, reset times).
+
+- **Shared Quota:** Multiple profiles (e.g. `codex-builder`, `codex-reviewer`, `pi-codex`) sharing the same subscription bind to one pool and respect a single shared cap.
+- **Defaulting & Delegation:** Dedicated backends (`codex`, `claude`, `copilot`, `gemini`, `agy`, `kiro`) default their pool to their backend kind if omitted. Multiplexing backends (`opencode`, `pi`, `prime-agent`) can explicitly set `usage_pool` (e.g., `usage_pool: codex`) to share another provider's pool.
+- **Global Fail-Open Invariant:** Missing, stale, or non-authoritative telemetry never blocks dispatch across any of the supported backend kinds (`codex`, `claude`, `agy`, `copilot`, `gemini`, `kiro`, `opencode`, `pi`, `prime-agent`).
+- **Worker Non-Interruption:** Configured caps only prevent *new* dispatches; running workers are never cancelled when a cap is crossed.
+- **Capacity Exhaustion:** If a provider signals hard quota exhaustion at runtime (`EVENT_PROVIDER_USAGE_EXHAUSTED`), the attempt halts without burning the retry budget, returning the ticket to `waiting_provider_usage` until capacity returns.
+- **Provider Usage UI Card:** Runtime quota telemetry (used %, remaining %, reset countdown, capacity paused state) is displayed in the built-in web UI next to Agent Policy.
+
+AGY exposes separate quota groups for Gemini Models and Claude/GPT Models. A
+pool can select the group whose account capacity it should enforce:
+
+```yaml
+usage_pools:
+  agy-gemini:
+    source: agy
+    quota_group: gemini
+    caps: { five_hour: 80, weekly: 70 }
+  agy-third-party:
+    source: agy
+    quota_group: third_party
+    caps: { five_hour: 80, weekly: 70 }
+
+agent_profiles:
+  gemini-builder: { kind: agy, usage_pool: agy-gemini }
+  claude-reviewer: { kind: agy, usage_pool: agy-third-party }
+```
+
+Use separate pools when both model families are dispatched: exhaustion in the
+unselected AGY group does not pause a profile using the other group.
 
 #### Resolution Precedence (8 Tiers)
 Symphony resolves the effective agent per dispatch using 8 deterministic tiers:
@@ -353,6 +400,7 @@ Make the relevant CLI available on `$PATH`:
 |--------------|------------------------|
 | `codex`      | `codex` (with `app-server` subcommand) |
 | `claude`     | `claude` (Claude Code) |
+| `copilot`    | `copilot` (GitHub Copilot CLI — install with `npm install -g @github/copilot` or GitHub CLI extension; sign in via `gh auth login` / `copilot auth` or export `COPILOT_GITHUB_TOKEN` / `GH_TOKEN` / `GITHUB_TOKEN`) |
 | `gemini`     | `gemini` (Gemini CLI)  |
 | `agy`        | `agy` (Antigravity CLI — install from Google Antigravity; Symphony appends `--dangerously-skip-permissions`) |
 | `kiro`       | `kiro-cli` (Kiro CLI — install from `https://cli.kiro.dev/install`; run `kiro-cli login` or set `KIRO_API_KEY` for headless runs) |
@@ -1143,8 +1191,8 @@ only). From the browser you can:
   a detached target-branch checkout, with a health check, URL, and bounded logs.
 - **Runs** — search and filter recorded attempts; inspect bounded, redacted
   lifecycle timelines, token usage, workspace/branch/commit references, and
-  download a diagnostic JSON bundle. Because this surface includes local paths
-  and failure excerpts, its API is available only to loopback clients.
+  download a diagnostic JSON bundle. Runs are protected by the `runs`
+  capability and can be used remotely when the selected web policy grants it.
 - **Stats** — tokens per day, throughput, per-column dwell time, per-agent
   totals, average cycle time (from `.symphony/stats.jsonl`).
 - **Settings** — branch policy (feature base / merge target) from a real
@@ -1178,19 +1226,96 @@ JSON API endpoints:
 
 #### Behind a reverse proxy or tunnel
 
-The board trusts loopback. If you front it with cloudflared, ngrok, nginx,
-or any other proxy, the browser arrives under a public name that loopback
-allowlists cannot know, and project creation fails with `forbidden_origin`
-(or `forbidden_host`). Declare the public front door:
+Every API route is assigned one of these capabilities: `board`, `workers`,
+`workflow`, `git`, `chat`, `runs`, `preview`, `projects`, or `debug`. Choose one
+authorization mode:
+
+- `token`: a valid bearer grants all normal capabilities; `debug` remains an
+  explicit capability opt-in.
+- `disabled`: authentication is off and all normal capabilities are granted;
+  use only on a trusted network.
+- `capabilities`: tokens are ignored and only the comma-separated
+  `SYMPHONY_REMOTE_OPERATOR_CAPABILITIES` are granted. This is also a
+  trusted-network mode: every client that reaches the direct bind receives the
+  configured grants.
+
+The mode is resolved as follows when `SYMPHONY_API_AUTH_MODE` is unset: a
+configured `SYMPHONY_API_TOKEN` or `SYMPHONY_API_TOKEN_FILE` infers `token`; a
+tokenless loopback bind infers `disabled`; and a non-loopback bind refuses to
+start until you choose a mode explicitly. The deprecated `global` and
+`operator` values are accepted as aliases for `token` and emit a warning;
+they do not restore passwordless behavior.
+
+In `token` mode, missing or incorrect `Authorization: Bearer <token>` headers
+return `401` on protected routes. In `disabled` mode, normal capabilities are
+available without a bearer, so use it only on a trusted network. In
+`capabilities` mode there is no bearer authentication: the configured
+comma-separated `SYMPHONY_REMOTE_OPERATOR_CAPABILITIES` list is the complete
+grant set, and a bearer cannot expand it. All three modes keep `debug` out of
+the normal grant set unless `debug` is explicitly listed; debug endpoints are
+never an implicit grant.
+
+`GET /api/v1/health` and `GET /api/v1/auth/policy` are the only public API
+endpoints. They return sanitized status/policy information and never disclose
+tokens or service probe credentials. Every other API route is classified by
+capability, including remote Runs (`runs`) and project switching (`projects`).
+
+Reverse proxies and non-loopback binds require every browser front door as an
+exact trusted origin (scheme, host, and optional port). Set
+`SYMPHONY_TRUSTED_ORIGINS` to comma-separated exact `http://` or `https://`
+origins; wildcards, paths, and bare hostnames are rejected. Requests must also
+present an exact matching `Host` (including the port where applicable).
+These Host/Origin checks mitigate DNS rebinding and CSRF but are not
+authentication. A proxy must expose every registered project port, and must
+preserve the public Host/Origin values when forwarding requests; otherwise
+project switching can reach the wrong port or fail its policy checks:
 
 ```bash
-SYMPHONY_TRUSTED_ORIGINS=https://symphony.example.com symphony ./WORKFLOW.md --port 9999
+SYMPHONY_API_AUTH_MODE=token \
+SYMPHONY_TRUSTED_ORIGINS=https://symphony.example.com \
+SYMPHONY_API_TOKEN_FILE="$HOME/.config/symphony/api-token" \
+symphony ./WORKFLOW.md --host 0.0.0.0 --port 9999
 ```
 
-Comma-separate several entries; a bare hostname matches any scheme and
-port, and `*` trusts every origin. Everything the tunnel exposes is
-reachable by whoever can reach the tunnel, so put authentication (for
-example Cloudflare Access) in front of it.
+Comma-separate multiple exact origins. Host and Origin checks mitigate DNS
+rebinding and CSRF; they are not authentication. For agenticOS-style
+capability-only deployment:
+
+```bash
+export SYMPHONY_API_AUTH_MODE=capabilities
+export SYMPHONY_TRUSTED_ORIGINS=https://symphony.example.com
+export SYMPHONY_REMOTE_OPERATOR_CAPABILITIES=board,workers,workflow,git,chat,runs,preview,projects
+symphony ./WORKFLOW.md --host 0.0.0.0 --port 9999
+```
+
+The SPA stores a token only in tab-scoped `sessionStorage`. For Chat, an
+authenticated `POST /api/v1/chat/ws-ticket` exchanges the bearer (in `token`
+mode) or capability grant (in the other modes) for a single-use,
+origin-bound, 30-second WebSocket ticket. The subsequent WebSocket handshake
+must use that ticket; do not put a long-lived API token in a URL query
+parameter.
+Run `symphony doctor` before exposing or switching a service.
+
+#### Minting and storing an API key
+
+For `token` mode, mint a strong whitespace-free secret and store it outside
+the repository. For example:
+
+```bash
+install -d -m 0700 "$HOME/.config/symphony"
+chmod 0700 "$HOME/.config/symphony"
+openssl rand -hex 32 > "$HOME/.config/symphony/api-token"
+chmod 0600 "$HOME/.config/symphony/api-token"
+export SYMPHONY_API_AUTH_MODE=token
+export SYMPHONY_API_TOKEN_FILE="$HOME/.config/symphony/api-token"
+```
+
+Do not commit the token file, put the value in `WORKFLOW.md`, or log/copy the
+credential into shell transcripts, proxy access logs, tickets, or screenshots.
+Use `SYMPHONY_API_TOKEN` only when your process manager can protect its
+environment; `SYMPHONY_API_TOKEN_FILE` is generally safer for deployment.
+The MCP gateway has a separate caller credential and mode-dependent upstream
+setup; see [Deploying `symphony-mcp`](deploy/README.md).
 
 ### CLI Kanban TUI (primary UI)
 
@@ -1364,13 +1489,18 @@ real CLIs are intentionally not in CI — run them locally.
 
 ## Design notes
 
-### Why eight different lifecycles behind one Protocol?
+### Why multiple different lifecycles behind one Protocol?
 
 - **Codex** opens one `app-server` subprocess per issue and speaks the
   current `codex app-server` JSON-RPC protocol; multi-turn within one
   process. Pin to `codex-cli ≥ 0.39` (current upstream).
 - **Claude Code** has no persistent server; each `run_turn` spawns a fresh
   `claude -p` and uses `--resume <session-id>` from turn 2 onward.
+- **GitHub Copilot** spawns a fresh `copilot` subprocess per turn with
+  `--output-format=json --no-ask-user --allow-all-tools`, always supplying
+  `--session-id <uuid>` (reused across turns when `resume_across_turns` is true),
+  forwarding `--model` and `--reasoning-effort` when configured, and adding
+  `--add-dir` for repository roots outside the worktree.
 - **Gemini CLI** is one-shot per invocation with no native session model;
   we synthesize a `gemini-<uuid>` session id for bookkeeping.
 - **AGY / Antigravity CLI** is one-shot per invocation: prompt on stdin via
@@ -1427,8 +1557,8 @@ Fork-specific gaps:
 - Run leases and issue safety flags persist in SQLite, but Symphony still does
   not reattach to an in-process worker after a hard crash. Markdown ticket
   state is the recovery checkpoint.
-- Retry attempts persist, but there is not yet a first-class run-history CLI or
-  API for operators to browse old attempts.
+- Run attempts persist in the local registry and are available through the web
+  Runs API (`/api/v1/runs`) when the `runs` capability is granted.
 - Claude Code's mid-turn streaming usage events are read but not surfaced;
   the terminal `result` event is the source of truth for token totals.
 - OpenCode token usage is parsed best-effort from JSON events; unknown event

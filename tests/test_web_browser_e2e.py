@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 import subprocess
 from pathlib import Path
@@ -58,6 +59,23 @@ tracker:
 agent:
   kind: codex
 
+usage_pools:
+  codex:
+    source: codex
+    caps:
+      five_hour: 80
+      weekly: 90
+  claude:
+    source: claude
+    caps:
+      five_hour: 75
+  agy:
+    source: agy
+    quota_group: gemini
+    caps:
+      five_hour: 80
+      weekly: 70
+
 prompts:
   stages:
     Todo: ./prompts/stages/todo.md
@@ -92,12 +110,89 @@ class _StubOrchestrator:
                 "seconds_running": 0,
             },
             "rate_limits": None,
+            "provider_usage": {
+                "agy": {
+                    "source": "agy",
+                    "windows": {
+                        "gemini_five_hour": {
+                            "group": "gemini",
+                            "period": "five_hour",
+                            "used_percent": 20.123456789,
+                            "remaining_percent": 79.876543211,
+                            "resets_at": "2026-08-30T18:00:00+00:00",
+                        },
+                        "gemini_weekly": {
+                            # A malformed metadata value must not take down
+                            # the whole settings route (the API preserves
+                            # unknown provider fields for diagnostics).
+                            "group": {"unexpected": "object"},
+                            "period": "weekly",
+                            "used_percent": 85,
+                            "remaining_percent": 15,
+                            "resets_at": "2026-09-01T00:00:00+00:00",
+                        },
+                        "third_party_five_hour": {
+                            "group": "third_party",
+                            "period": "five_hour",
+                            "used_percent": 45,
+                            "remaining_percent": 55,
+                            "resets_at": "2026-08-30T19:00:00+00:00",
+                        },
+                        "third_party_weekly": {
+                            "group": "third_party",
+                            "period": "weekly",
+                            "used_percent": 35,
+                            "remaining_percent": 65,
+                            "resets_at": "2026-09-02T00:00:00+00:00",
+                        }
+                    },
+                    "status": "capacity_paused",
+                    "stale": False,
+                    "authoritative": True,
+                },
+                "claude": {
+                    "source": "claude",
+                    "windows": {
+                        "five_hour": {
+                            "used_percent": 25,
+                            "remaining_percent": 75,
+                            "resets_at": None,
+                        }
+                    },
+                    "status": "available",
+                    "stale": True,
+                    "authoritative": False,
+                },
+                "codex": {
+                    "source": "codex",
+                    "windows": {
+                        "five_hour": {
+                            "used_percent": 12,
+                            "remaining_percent": 88,
+                            "resets_at": "2026-08-30T15:00:00+00:00",
+                        },
+                        "weekly": {
+                            "used_percent": 34,
+                            "remaining_percent": 66,
+                            "resets_at": "2026-09-05T00:00:00+00:00",
+                        },
+                    },
+                    "credits": {
+                        "has_credits": True,
+                        "unlimited": False,
+                        "balance": "42.5",
+                    },
+                    "status": "available",
+                    "stale": False,
+                    "authoritative": True,
+                },
+            },
         }
 
     def issue_snapshot(self, _identifier: str) -> dict[str, Any] | None:
         return None
 
-    def recent_runs(
+    async def recent_runs(
         self,
         issue_id: str | None = None,
         limit: int = 50,
@@ -132,7 +227,7 @@ class _StubOrchestrator:
             "failure_message": None,
         }
 
-    def run_detail(self, run_id: str) -> tuple[dict[str, Any] | None, str | None]:
+    async def run_detail(self, run_id: str) -> tuple[dict[str, Any] | None, str | None]:
         if run_id != "a" * 32:
             return None, None
         return {
@@ -153,8 +248,8 @@ class _StubOrchestrator:
             ],
         }, None
 
-    def run_diagnostic(self, run_id: str) -> tuple[dict[str, Any] | None, str | None]:
-        detail, error = self.run_detail(run_id)
+    async def run_diagnostic(self, run_id: str) -> tuple[dict[str, Any] | None, str | None]:
+        detail, error = await self.run_detail(run_id)
         return ({"schema_version": 1, **detail} if detail else None), error
 
     def request_refresh(self) -> bool:
@@ -410,6 +505,8 @@ async def _exercise_settings_layout(page: Any, web_base_url: str) -> None:
         await page.set_viewport_size({"width": width, "height": 900})
         await page.goto(f"{web_base_url}/#/settings", wait_until="networkidle")
         await page.locator(".settings-card").first.wait_for()
+        provider_card = page.locator("#provider-usage-card")
+        await provider_card.wait_for()
         assert await page.locator(".settings-body").get_by_role(
             "heading", level=2
         ).all_text_contents() == [
@@ -418,6 +515,44 @@ async def _exercise_settings_layout(page: Any, web_base_url: str) -> None:
             "Automation",
         ]
         await _assert_no_document_overflow(page, f"settings at {width}px")
+        provider_dims = await provider_card.evaluate(
+            """node => ({
+              scrollWidth: node.scrollWidth,
+              clientWidth: node.clientWidth,
+              gridColumnStart: getComputedStyle(node).gridColumnStart,
+              gridColumnEnd: getComputedStyle(node).gridColumnEnd,
+              rect: node.getBoundingClientRect().toJSON(),
+            })"""
+        )
+        heading_rect = await page.locator(".settings-section-heading").first.evaluate(
+            "node => node.getBoundingClientRect().toJSON()"
+        )
+        assert provider_dims["scrollWidth"] <= provider_dims["clientWidth"] + 2
+        assert provider_dims["gridColumnStart"] == "1"
+        assert provider_dims["gridColumnEnd"] == "-1"
+        assert abs(provider_dims["rect"]["width"] - heading_rect["width"]) <= 2
+        pools = provider_card.locator(".provider-usage-pool")
+        assert await pools.count() == 3
+        pool_rects = await pools.evaluate_all(
+            "nodes => nodes.map(node => node.getBoundingClientRect().toJSON())"
+        )
+        assert min(rect["width"] for rect in pool_rects) >= 220
+        same_row = abs(pool_rects[0]["top"] - pool_rects[1]["top"]) <= 2
+        assert same_row is (width >= 1100), (width, pool_rects)
+        usage_text = await provider_card.inner_text()
+        assert "Configured cap: Configured cap:" not in usage_text
+        assert "Credits\nBalance: 42.5" in usage_text
+        agy_pool = provider_card.locator('[data-pool-id="agy"]')
+        assert await agy_pool.get_by_role("heading", level=5).all_text_contents() == [
+            "Gemini Models",
+            "Claude/GPT Models",
+        ]
+        assert await agy_pool.locator(".usage-window-row").count() == 4
+        assert await agy_pool.locator(".usage-meta-cap").count() == 2
+        assert "Configured cap: 80%" in await agy_pool.inner_text()
+        assert "Configured cap: 70%" in await agy_pool.inner_text()
+        assert "20.12% used" in await agy_pool.inner_text()
+        assert "79.88% remaining" in await agy_pool.inner_text()
         cards = page.locator(".settings-card")
         for index in range(await cards.count()):
             dims = await cards.nth(index).evaluate(
@@ -515,10 +650,16 @@ class _FakeChatBackend:
         answer = _ANSWER
         if "offer a separate project" in prompt:
             target = self.init.cwd.parent / "chat-todo-app"
+            # Native Windows paths contain backslashes that are invalid as
+            # raw JSON escapes; chat's strict parser rejects such payloads,
+            # so the marker must be built with a real JSON encoder.
             answer = (
                 "1. Create and register a separate Todo app.\n"
-                '<symphony-project-setup>{"choice": 1, "name": "Todo App", '
-                f'"path": "{target}"}}</symphony-project-setup>'
+                "<symphony-project-setup>"
+                + json.dumps(
+                    {"choice": 1, "name": "Todo App", "path": str(target)}
+                )
+                + "</symphony-project-setup>"
             )
         await self._emit(EVENT_TURN_STARTED, {})
         if self.init.cfg.agent.kind == "prime-agent":

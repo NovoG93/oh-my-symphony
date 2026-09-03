@@ -15,7 +15,7 @@ from __future__ import annotations
 
 import re
 import tempfile
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any
 
 from ..errors import ConfigValidationError
@@ -39,6 +39,7 @@ from .config import (
     ClaudeConfig,
     CodexConfig,
     ContinuousImprovementConfig,
+    CopilotConfig,
     GeminiConfig,
     HooksConfig,
     KiroConfig,
@@ -54,6 +55,7 @@ from .config import (
     SystemConfig,
     TrackerConfig,
     TuiConfig,
+    UsagePoolConfig,
     WikiConfig,
 )
 from .constants import (
@@ -80,6 +82,7 @@ from .constants import (
     DEFAULT_CODEX_REASONING_EFFORT,
     DEFAULT_CODEX_STALL_TIMEOUT_MS,
     DEFAULT_CODEX_TURN_TIMEOUT_MS,
+    DEFAULT_COPILOT_COMMAND,
     DEFAULT_GEMINI_COMMAND,
     DEFAULT_HOOK_TIMEOUT_MS,
     DEFAULT_KIRO_COMMAND,
@@ -107,6 +110,7 @@ from .constants import (
     SUPPORTED_WORKSPACE_REUSE_POLICIES,
 )
 from .parser import WorkflowDefinition
+from .presets import board_uses_default_contracts
 
 
 def _build_prompt_config(raw: Any, base_dir: Path) -> PromptConfig:
@@ -297,7 +301,10 @@ def build_service_config(workflow: WorkflowDefinition) -> ServiceConfig:
         ),
     )
 
-    agent_profiles = _validated_agent_profiles(cfg.get("agent_profiles"))
+    usage_pools = _validated_usage_pools(cfg.get("usage_pools"))
+    agent_profiles = _validated_agent_profiles(
+        cfg.get("agent_profiles"), usage_pools=usage_pools
+    )
 
     agent_raw = cfg.get("agent") or {}
     if not isinstance(agent_raw, dict):
@@ -599,6 +606,32 @@ def build_service_config(workflow: WorkflowDefinition) -> ServiceConfig:
         resume_across_turns=bool(pa_raw.get("resume_across_turns", True)),
     )
 
+    copilot_raw = cfg.get("copilot")
+    copilot: CopilotConfig | None = None
+    if isinstance(copilot_raw, dict):
+        copilot = CopilotConfig(
+            command=_as_str(copilot_raw.get("command"), DEFAULT_COPILOT_COMMAND)
+            or DEFAULT_COPILOT_COMMAND,
+            turn_timeout_ms=_validated_positive_or_default(
+                copilot_raw.get("turn_timeout_ms"),
+                DEFAULT_BACKEND_TURN_TIMEOUT_MS,
+                name="copilot.turn_timeout_ms",
+            ),
+            read_timeout_ms=_validated_positive_or_default(
+                copilot_raw.get("read_timeout_ms"),
+                DEFAULT_BACKEND_READ_TIMEOUT_MS,
+                name="copilot.read_timeout_ms",
+            ),
+            stall_timeout_ms=_validated_positive_or_default(
+                copilot_raw.get("stall_timeout_ms"),
+                DEFAULT_BACKEND_STALL_TIMEOUT_MS,
+                name="copilot.stall_timeout_ms",
+            ),
+            resume_across_turns=bool(copilot_raw.get("resume_across_turns", True)),
+            model=_as_str(copilot_raw.get("model"), "") or "",
+            reasoning_effort=_as_str(copilot_raw.get("reasoning_effort"), "") or "",
+        )
+
     server_raw = cfg.get("server") or {}
     if not isinstance(server_raw, dict):
         server_raw = {}
@@ -622,8 +655,16 @@ def build_service_config(workflow: WorkflowDefinition) -> ServiceConfig:
         preview_raw.get("enabled"), bool(preview_command), name="preview.enabled"
     )
     preview_cwd = _as_str(preview_raw.get("cwd"), ".").strip() or "."
-    cwd_path = Path(preview_cwd)
-    if cwd_path.is_absolute() or ".." in cwd_path.parts:
+    # Reject escapes under both POSIX and native path semantics. The
+    # workflow config's path space is POSIX-flavored: on Windows a drive-less
+    # `Path("/tmp/outside")` reports `is_absolute() == False`, which would
+    # let a leading-slash escape through, while a drive-absolute Windows path
+    # is only caught by the native check.
+    cwd_posix = PurePosixPath(preview_cwd)
+    cwd_native = Path(preview_cwd)
+    if cwd_posix.is_absolute() or cwd_native.is_absolute() or any(
+        part == ".." for part in (*cwd_posix.parts, *cwd_native.parts)
+    ):
         raise ConfigValidationError(
             "preview.cwd must be a relative path inside the preview checkout",
             value=preview_cwd,
@@ -876,6 +917,8 @@ def build_service_config(workflow: WorkflowDefinition) -> ServiceConfig:
         preview=preview,
         artifacts=artifacts,
         agent_profiles=agent_profiles,
+        usage_pools=usage_pools,
+        copilot=copilot,
     )
 
 
@@ -984,15 +1027,122 @@ _ALL_PROFILE_FIELDS = {
     "read_timeout_ms",
     "stall_timeout_ms",
     "resume_across_turns",
+    "usage_pool",
 }
 
 
-def _validated_agent_profiles(raw: Any) -> dict[str, AgentProfileConfig]:
+def _validated_usage_pools(raw: Any) -> dict[str, UsagePoolConfig]:
+    """Parse and validate top-level `usage_pools:` mapping.
+
+    Enforces non-empty pool names, unique pool names, required string source,
+    and valid caps mapping with numeric values in range (0, 100].
+    """
+    if raw is None:
+        return {}
+    if not isinstance(raw, dict):
+        raise ConfigValidationError(
+            "usage_pools must be a mapping",
+            value=raw,
+        )
+    out: dict[str, UsagePoolConfig] = {}
+    for pool_name, pool_data in raw.items():
+        if not isinstance(pool_name, str) or not pool_name.strip():
+            raise ConfigValidationError(
+                "usage_pools pool name must be a non-empty string",
+                value=pool_name,
+            )
+        name = pool_name.strip()
+        if name in out:
+            raise ConfigValidationError(
+                f"usage_pools has duplicate pool name {name!r}",
+                value=name,
+            )
+        if not isinstance(pool_data, dict):
+            raise ConfigValidationError(
+                f"usage_pools[{name!r}] must be a mapping",
+                value=pool_data,
+            )
+        allowed_keys = {"source", "caps", "quota_group"}
+        for k in pool_data:
+            if k not in allowed_keys:
+                raise ConfigValidationError(
+                    f"usage_pools[{name!r}] has unsupported field '{k}'",
+                    value=k,
+                )
+
+        source_raw = pool_data.get("source")
+        if source_raw is None:
+            raise ConfigValidationError(
+                f"usage_pools[{name!r}].source is required",
+                value=pool_data,
+            )
+        if not isinstance(source_raw, str) or not source_raw.strip():
+            raise ConfigValidationError(
+                f"usage_pools[{name!r}].source must be a non-empty string",
+                value=source_raw,
+            )
+        source = source_raw.strip()
+
+        caps_raw = pool_data.get("caps")
+        if caps_raw is None:
+            raise ConfigValidationError(
+                f"usage_pools[{name!r}].caps is required",
+                value=pool_data,
+            )
+        if not isinstance(caps_raw, dict):
+            raise ConfigValidationError(
+                f"usage_pools[{name!r}].caps must be a mapping",
+                value=caps_raw,
+            )
+        caps: dict[str, float] = {}
+        for window_raw, val_raw in caps_raw.items():
+            if not isinstance(window_raw, str) or not window_raw.strip():
+                raise ConfigValidationError(
+                    f"usage_pools[{name!r}].caps window name must be a non-empty string",
+                    value=window_raw,
+                )
+            window = window_raw.strip()
+            if isinstance(val_raw, bool) or not isinstance(val_raw, (int, float)):
+                raise ConfigValidationError(
+                    f"usage_pools[{name!r}].caps.{window} must be a number between 0 and 100 (exclusive 0, inclusive 100)",
+                    value=val_raw,
+                )
+            num_val = float(val_raw)
+            if not (0.0 < num_val <= 100.0):
+                raise ConfigValidationError(
+                    f"usage_pools[{name!r}].caps.{window} must be between 0 and 100 (exclusive 0, inclusive 100)",
+                    value=val_raw,
+                )
+            caps[window] = num_val
+
+        quota_group_raw = pool_data.get("quota_group")
+        if quota_group_raw is not None and (
+            not isinstance(quota_group_raw, str) or not quota_group_raw.strip()
+        ):
+            raise ConfigValidationError(
+                f"usage_pools[{name!r}].quota_group must be a non-empty string",
+                value=quota_group_raw,
+            )
+        quota_group = quota_group_raw.strip() if isinstance(quota_group_raw, str) else None
+        if quota_group is not None:
+            quota_group = quota_group.lower()
+            if quota_group not in {"gemini", "third_party"}:
+                raise ConfigValidationError(
+                    f"usage_pools[{name!r}].quota_group must be 'gemini' or 'third_party'",
+                    value=quota_group_raw,
+                )
+        out[name] = UsagePoolConfig(source=source, caps=caps, quota_group=quota_group)
+    return out
+
+
+def _validated_agent_profiles(
+    raw: Any, *, usage_pools: dict[str, UsagePoolConfig] | None = None
+) -> dict[str, AgentProfileConfig]:
     """Parse and validate top-level `agent_profiles:` mapping.
 
     Enforces non-empty profile names, supported backend kinds (canonicalizing
     'antigravity' to 'agy'), allowlist checking against PROFILE_FIELDS_BY_KIND,
-    and type checking of individual fields.
+    and type checking of individual fields including usage_pool references.
     """
     if raw is None:
         return {}
@@ -1104,6 +1254,23 @@ def _validated_agent_profiles(raw: Any) -> dict[str, AgentProfileConfig]:
                 value=resume_across_turns,
             )
 
+        usage_pool_raw = profile_data.get("usage_pool")
+        if usage_pool_raw is not None:
+            if not isinstance(usage_pool_raw, str) or not usage_pool_raw.strip():
+                raise ConfigValidationError(
+                    f"agent_profiles[{name!r}].usage_pool must be a non-empty string",
+                    value=usage_pool_raw,
+                )
+            usage_pool_name = usage_pool_raw.strip()
+            if usage_pools is not None and usage_pool_name not in usage_pools:
+                raise ConfigValidationError(
+                    f"agent_profiles[{name!r}].usage_pool references unknown usage pool {usage_pool_name!r}",
+                    value=usage_pool_name,
+                )
+            usage_pool = usage_pool_name
+        else:
+            usage_pool = None
+
         out[name] = AgentProfileConfig(
             name=name,
             kind=kind,
@@ -1114,6 +1281,7 @@ def _validated_agent_profiles(raw: Any) -> dict[str, AgentProfileConfig]:
             read_timeout_ms=read_timeout_ms,
             stall_timeout_ms=stall_timeout_ms,
             resume_across_turns=resume_across_turns,
+            usage_pool=usage_pool,
         )
     return out
 
@@ -1192,8 +1360,6 @@ def _log_stage_contracts_decision(agent: AgentConfig, tracker: TrackerConfig) ->
     customized board, but it must never be invisible — this is the product's
     evidence floor.
     """
-    from ..orchestrator.contracts import board_uses_default_contracts
-
     mode = (agent.stage_contracts or "auto").strip().lower()
     if agent.stage_contracts_enabled(tracker.active_states):
         return

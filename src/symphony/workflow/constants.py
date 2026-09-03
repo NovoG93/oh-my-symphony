@@ -92,7 +92,7 @@ DEFAULT_CI_MODE_INTERVAL_HOURS: dict[str, float] = {
 # from `max_tickets_per_run` so a chatty research turn cannot flood the board.
 DEFAULT_CI_MAX_IMPROVEMENT_TICKETS_PER_RUN = 3
 
-SUPPORTED_AGENT_KINDS = {"agy", "codex", "claude", "gemini", "kiro", "opencode", "pi", "prime-agent"}
+SUPPORTED_AGENT_KINDS = {"agy", "codex", "claude", "copilot", "gemini", "kiro", "opencode", "pi", "prime-agent"}
 DEFAULT_AGENT_KIND = "codex"
 
 PROFILE_FIELDS_BY_KIND: dict[str, set[str]] = {
@@ -103,6 +103,7 @@ PROFILE_FIELDS_BY_KIND: dict[str, set[str]] = {
         "turn_timeout_ms",
         "read_timeout_ms",
         "stall_timeout_ms",
+        "usage_pool",
     },
     "claude": {
         "model",
@@ -111,6 +112,7 @@ PROFILE_FIELDS_BY_KIND: dict[str, set[str]] = {
         "turn_timeout_ms",
         "read_timeout_ms",
         "stall_timeout_ms",
+        "usage_pool",
     },
     "gemini": {
         "command",
@@ -118,6 +120,7 @@ PROFILE_FIELDS_BY_KIND: dict[str, set[str]] = {
         "turn_timeout_ms",
         "read_timeout_ms",
         "stall_timeout_ms",
+        "usage_pool",
     },
     "agy": {
         "command",
@@ -125,6 +128,7 @@ PROFILE_FIELDS_BY_KIND: dict[str, set[str]] = {
         "turn_timeout_ms",
         "read_timeout_ms",
         "stall_timeout_ms",
+        "usage_pool",
     },
     "kiro": {
         "command",
@@ -132,6 +136,7 @@ PROFILE_FIELDS_BY_KIND: dict[str, set[str]] = {
         "turn_timeout_ms",
         "read_timeout_ms",
         "stall_timeout_ms",
+        "usage_pool",
     },
     "opencode": {
         "command",
@@ -139,6 +144,7 @@ PROFILE_FIELDS_BY_KIND: dict[str, set[str]] = {
         "turn_timeout_ms",
         "read_timeout_ms",
         "stall_timeout_ms",
+        "usage_pool",
     },
     "pi": {
         "command",
@@ -146,6 +152,7 @@ PROFILE_FIELDS_BY_KIND: dict[str, set[str]] = {
         "turn_timeout_ms",
         "read_timeout_ms",
         "stall_timeout_ms",
+        "usage_pool",
     },
     "prime-agent": {
         "command",
@@ -153,8 +160,20 @@ PROFILE_FIELDS_BY_KIND: dict[str, set[str]] = {
         "turn_timeout_ms",
         "read_timeout_ms",
         "stall_timeout_ms",
+        "usage_pool",
+    },
+    "copilot": {
+        "model",
+        "reasoning_effort",
+        "command",
+        "resume_across_turns",
+        "turn_timeout_ms",
+        "read_timeout_ms",
+        "stall_timeout_ms",
+        "usage_pool",
     },
 }
+DEFAULT_COPILOT_COMMAND = "copilot"
 DEFAULT_CLAUDE_COMMAND = (
     "claude -p --output-format stream-json --include-partial-messages --verbose"
 )

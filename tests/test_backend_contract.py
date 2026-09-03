@@ -68,6 +68,7 @@ ALL_KINDS = (
     "opencode",
     "pi",
     "prime-agent",
+    "copilot",
 )
 
 # Keys of the normalized event envelope every backend's `_emit` produces.
@@ -392,6 +393,22 @@ class TestPrimeAgentBackendContract(PerTurnBackendContract):
         ]
 
 
+class TestCopilotBackendContract(PerTurnBackendContract):
+    kind = "copilot"
+    module = per_turn_module
+    canonical_message = "done"
+
+    def success_processes(self) -> list[_FakeSubprocess]:
+        return [
+            _FakeSubprocess(
+                stdout_lines=[
+                    b'{"type":"assistant.message","data":{"content":"done"}}\n',
+                    b'{"type":"result","sessionId":"cop-c1","exitCode":0}\n',
+                ]
+            )
+        ]
+
+
 # ---------------------------------------------------------------------------
 # git-root grant — every agent kind, not just the two Symphony can flag-inject
 #
@@ -412,6 +429,7 @@ _SPAWN_MODULES = {
     "opencode": per_turn_module,
     "pi": pi_module,
     "prime-agent": pi_module,
+    "copilot": per_turn_module,
 }
 
 

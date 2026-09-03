@@ -37,7 +37,6 @@ import asyncio
 import json
 import os
 import shlex
-import time
 from collections import deque
 from typing import Any
 
@@ -57,6 +56,7 @@ from . import (
     EVENT_COMPACTION,
     EVENT_MALFORMED,
     EVENT_OTHER_MESSAGE,
+    EVENT_PROVIDER_USAGE_EXHAUSTED,
     EVENT_SESSION_STARTED,
     EVENT_TURN_COMPLETED,
     EVENT_TURN_FAILED,
@@ -65,10 +65,18 @@ from . import (
     POST_STREAM_REAP_TIMEOUT_S,
     BackendInit,
     BaseAgentBackend,
+    ProviderCapacityError,
     TurnResult,
     _is_valid_session_id,
     redact_session_id,
 )
+from .per_turn import (
+    MAX_LINE_BYTES,
+    _emit_event,
+    _reap_process,
+    _stderr_tail_blob,
+)
+
 
 
 log = get_logger()
@@ -82,15 +90,6 @@ PENDING_SESSION_ID = "pending"
 _PROGRESS_EVENT_TYPES = frozenset(
     {"message_start", "message_update", "message_end", "turn_start", "turn_end"}
 )
-
-# StreamReader line-buffer limit for the subprocess pipes. The asyncio
-# default of 64 KiB overflows on JSON-mode events whose `message_update` or
-# tool-result payload exceeds that on a single line. Matches codex.py.
-MAX_LINE_BYTES = 10 * 1024 * 1024
-
-
-def _utc_iso() -> str:
-    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
 
 
 class PiBackend(BaseAgentBackend):
@@ -115,7 +114,13 @@ class PiBackend(BaseAgentBackend):
         self._cwd = init.cwd
         self._on_event = init.on_event
         self._on_process_started = init.on_process_started
+        self._usage_manager = getattr(init, "usage_manager", None)
+        self._usage_pool = getattr(init, "usage_pool", None) or (
+            init.selection.kind if init.selection is not None else self._agent_name
+        )
+
         self._session_id: str | None = None
+
         self._resume_on_next_turn = False
         self._expected_resume_session_id: str | None = None
         self._resume_session_confirmed = False
@@ -307,6 +312,15 @@ class PiBackend(BaseAgentBackend):
                     stderr_blob = self._stderr_blob()
                     if stderr_blob:
                         failure_reason = f"{failure_reason}; stderr: {stderr_blob}"
+                    if _is_genuine_pi_exhaustion(failure_reason):
+                        pool_id = self._usage_pool or self._agent_name
+                        await self._emit(
+                            EVENT_PROVIDER_USAGE_EXHAUSTED,
+                            {"pool_id": pool_id, "reason": failure_reason},
+                        )
+                        raise ProviderCapacityError(
+                            pool_id=pool_id, message=failure_reason
+                        )
                     payload = {
                         "reason": failure_reason,
                         "stderr_tail": list(self._stderr_tail),
@@ -314,6 +328,7 @@ class PiBackend(BaseAgentBackend):
                     }
                     await self._emit(EVENT_TURN_FAILED, payload)
                     raise TurnFailed(failure_reason)
+
 
                 # A clean terminal event is not success if the CLI itself
                 # reports a non-zero process status.
@@ -364,11 +379,19 @@ class PiBackend(BaseAgentBackend):
                 f"{self._agent_name} exited with no agent_end event (rc={rc})"
                 + (f"; stderr: {stderr_blob}" if stderr_blob else "")
             )
+            if _is_genuine_pi_exhaustion(err_msg):
+                pool_id = self._usage_pool or self._agent_name
+                await self._emit(
+                    EVENT_PROVIDER_USAGE_EXHAUSTED,
+                    {"pool_id": pool_id, "reason": err_msg},
+                )
+                raise ProviderCapacityError(pool_id=pool_id, message=err_msg)
             await self._emit(
                 EVENT_TURN_FAILED,
                 {"reason": err_msg, "stderr_tail": list(self._stderr_tail)},
             )
             raise TurnFailed(err_msg)
+
         except asyncio.CancelledError:
             await self._reap(proc)
             raise
@@ -539,10 +562,7 @@ class PiBackend(BaseAgentBackend):
 
     def _stderr_blob(self) -> str:
         """Compact stderr tail for inclusion in failure messages (≤400 chars)."""
-        if not self._stderr_tail:
-            return ""
-        joined = " | ".join(self._stderr_tail)
-        return joined if len(joined) <= 400 else joined[-400:]
+        return _stderr_tail_blob(self._stderr_tail)
 
     async def _raise_nonzero_exit(self, rc: int) -> None:
         """Turn a non-zero CLI status into a backend-specific failure."""
@@ -550,6 +570,13 @@ class PiBackend(BaseAgentBackend):
         err_msg = f"{self._agent_name} exited with code {rc}"
         if stderr_blob:
             err_msg += f"; stderr: {stderr_blob}"
+        if _is_genuine_pi_exhaustion(err_msg):
+            pool_id = self._usage_pool or self._agent_name
+            await self._emit(
+                EVENT_PROVIDER_USAGE_EXHAUSTED,
+                {"pool_id": pool_id, "reason": err_msg},
+            )
+            raise ProviderCapacityError(pool_id=pool_id, message=err_msg)
         await self._emit(
             EVENT_TURN_FAILED,
             {
@@ -560,6 +587,7 @@ class PiBackend(BaseAgentBackend):
             },
         )
         raise TurnFailed(err_msg)
+
 
     async def _require_resume_confirmation(self) -> None:
         if self._expected_resume_session_id is None:
@@ -590,9 +618,7 @@ class PiBackend(BaseAgentBackend):
 
     async def _reap(self, proc: asyncio.subprocess.Process) -> None:
         """Tear down a process group or surface ambiguous cleanup."""
-        result = await terminate_process_tree(proc)
-        if result is None and proc.returncode is None:
-            raise RuntimeError("backend process cleanup could not be confirmed")
+        await _reap_process(proc)
 
     def _update_usage(self, usage: dict[str, Any]) -> None:
         """Accumulate Pi's per-message Usage into the running totals."""
@@ -610,22 +636,14 @@ class PiBackend(BaseAgentBackend):
         self._latest_usage["total_tokens"] += billed_in + out_t
 
     async def _emit(self, event: str, payload: dict[str, Any]) -> None:
-        try:
-            await self._on_event(
-                {
-                    "event": event,
-                    "timestamp": _utc_iso(),
-                    "payload": redact_session_id(
-                        payload if isinstance(payload, dict) else {"data": payload},
-                        None if event == EVENT_SESSION_STARTED else self._session_id,
-                    ),
-                    "usage": dict(self._latest_usage),
-                    "rate_limits": None,
-                    "agent_pid": self.pid,
-                }
-            )
-        except Exception as exc:
-            log.warning("event_callback_failed", error=str(exc))
+        await _emit_event(
+            self._on_event,
+            event,
+            payload,
+            usage=self._latest_usage,
+            agent_pid=self.pid,
+            redact_session=None if event == EVENT_SESSION_STARTED else self._session_id,
+        )
 
 
 def _extract_text(message: dict[str, Any]) -> str:
@@ -685,3 +703,29 @@ def _extract_failure_reason(
             return err
         return f"{agent_name} turn ended with stopReason={stop_reason!r}"
     return None
+
+
+def _is_genuine_pi_exhaustion(text: str) -> bool:
+    """Return True if error text signals provider quota exhaustion rather than RPM."""
+    lowered = text.lower()
+    if (
+        "requests per minute" in lowered
+        or "tokens per minute" in lowered
+        or "rpm" in lowered
+        or "tpm" in lowered
+    ):
+        return False
+    exhaustion_keywords = (
+        "quota exceeded",
+        "quota_exceeded",
+        "usage limit reached",
+        "usage_limit",
+        "insufficient credits",
+        "rate limit reached",
+        "rate_limit_reached",
+        "out of credits",
+        "provider_usage_exhausted",
+        "provider usage exhausted",
+    )
+    return any(kw in lowered for kw in exhaustion_keywords)
+

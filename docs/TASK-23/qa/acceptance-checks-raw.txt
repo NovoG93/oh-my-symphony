@@ -1,0 +1,12 @@
+=== AC check: verify-upstream-smoke.txt exists at repo root with exact content 'all systems go' (single line) ===
+--- File exists ---
+PASS: file exists
+--- Byte count ---
+15
+--- Line count ---
+1
+--- Exact content diff against expected ---
+PASS: content matches exactly 'all systems go' + trailing newline
+--- hexdump ---
+00000000: 616c 6c20 7379 7374 656d 7320 676f 0a    all systems go.
+exit_code_of_checks: 0

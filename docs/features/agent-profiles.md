@@ -12,7 +12,7 @@ Prior to named profiles, Symphony supported stage routing across backend kinds v
 
 ### 1. Backend Kinds vs. Named Profiles
 
-- **Backend Kind** (`codex`, `claude`, `gemini`, `agy`, `kiro`, `opencode`, `pi`, `prime-agent`): Defines the underlying agent CLI adapter, subprocess protocol, tool surface, and process execution lifecycle.
+- **Backend Kind** (`codex`, `claude`, `copilot`, `gemini`, `agy`, `kiro`, `opencode`, `pi`, `prime-agent`): Defines the underlying agent CLI adapter, subprocess protocol, tool surface, and process execution lifecycle.
 - **Named Profile** (`fable-planner`, `sol-reviewer`, `sonnet-builder`, etc.): An overlay configuration applied to a backend kind. A profile specifies a target backend `kind` along with specific settings (e.g., `model`, `reasoning_effort`, `command`, `turn_timeout_ms`).
 
 ### 2. Profile Inheritance & Overlay Model
@@ -84,16 +84,96 @@ To prevent configuration errors, profiles strictly validate allowed fields at co
 
 | Backend Kind | Allowed Profile Fields | Description / Notes |
 |---|---|---|
-| `codex` | `model`, `reasoning_effort`, `command`, `turn_timeout_ms`, `read_timeout_ms`, `stall_timeout_ms` | `model` and `reasoning_effort` are sent directly in turn parameters. |
-| `claude` | `model`, `command`, `resume_across_turns`, `turn_timeout_ms`, `read_timeout_ms`, `stall_timeout_ms` | A non-empty `model` injects `--model <name>` immediately following the `claude` command token. |
-| `gemini` | `command`, `resume_across_turns`, `turn_timeout_ms`, `read_timeout_ms`, `stall_timeout_ms` | `resume_across_turns` is accepted but inert — the gemini backend has no resume support. |
-| `agy` | `command`, `resume_across_turns`, `turn_timeout_ms`, `read_timeout_ms`, `stall_timeout_ms` | |
-| `kiro` | `command`, `resume_across_turns`, `turn_timeout_ms`, `read_timeout_ms`, `stall_timeout_ms` | |
-| `opencode` | `command`, `resume_across_turns`, `turn_timeout_ms`, `read_timeout_ms`, `stall_timeout_ms` | |
-| `pi` | `command`, `resume_across_turns`, `turn_timeout_ms`, `read_timeout_ms`, `stall_timeout_ms` | |
-| `prime_agent` | `command`, `resume_across_turns`, `turn_timeout_ms`, `read_timeout_ms`, `stall_timeout_ms` | |
+| `codex` | `model`, `reasoning_effort`, `command`, `turn_timeout_ms`, `read_timeout_ms`, `stall_timeout_ms`, `usage_pool` | `model` and `reasoning_effort` are sent directly in turn parameters. |
+| `claude` | `model`, `command`, `resume_across_turns`, `turn_timeout_ms`, `read_timeout_ms`, `stall_timeout_ms`, `usage_pool` | A non-empty `model` injects `--model <name>` immediately following the `claude` command token. |
+| `copilot` | `model`, `reasoning_effort`, `command`, `resume_across_turns`, `turn_timeout_ms`, `read_timeout_ms`, `stall_timeout_ms`, `usage_pool` | `model` and `reasoning_effort` are forwarded via CLI flags `--model` and `--reasoning-effort`. |
+| `gemini` | `command`, `resume_across_turns`, `turn_timeout_ms`, `read_timeout_ms`, `stall_timeout_ms`, `usage_pool` | `resume_across_turns` is accepted but inert — the gemini backend has no resume support. |
+| `agy` | `command`, `resume_across_turns`, `turn_timeout_ms`, `read_timeout_ms`, `stall_timeout_ms`, `usage_pool` | |
+| `kiro` | `command`, `resume_across_turns`, `turn_timeout_ms`, `read_timeout_ms`, `stall_timeout_ms`, `usage_pool` | |
+| `opencode` | `command`, `resume_across_turns`, `turn_timeout_ms`, `read_timeout_ms`, `stall_timeout_ms`, `usage_pool` | |
+| `pi` | `command`, `resume_across_turns`, `turn_timeout_ms`, `read_timeout_ms`, `stall_timeout_ms`, `usage_pool` | |
+| `prime_agent` | `command`, `resume_across_turns`, `turn_timeout_ms`, `read_timeout_ms`, `stall_timeout_ms`, `usage_pool` | |
 
 Any unsupported field (e.g., specifying `reasoning_effort` on a `claude` or `agy` profile) is rejected during configuration loading.
+
+#### Usage Pools (usage-aware profiles)
+
+`usage_pool` references a shared usage pool declared under the top-level
+`usage_pools:` mapping in `WORKFLOW.md`. Usage is modeled per shared
+pool/provider quota, not per named profile: a profile binds to a pool by
+name and never carries cap values itself. When omitted, the pool defaults
+to the profile's `kind`.
+
+```yaml
+usage_pools:
+  codex:
+    source: codex
+    caps:
+      five_hour: 80
+      weekly: 70
+
+agent_profiles:
+  builder:
+    kind: codex
+    usage_pool: codex   # explicit; omitted -> defaults to profile kind
+  pi-builder:
+    kind: pi
+    usage_pool: codex   # multiplexing backend sharing the codex pool
+```
+
+Pools are validated at load: `source` is required (non-empty string), and
+`caps` is a required mapping of window name to a percentage with
+`0 < v <= 100`. Window names are arbitrary (e.g. `five_hour`, `weekly`,
+`daily`, `monthly`). Referencing an unknown pool from a profile is
+rejected. **Enforcement (since Stage 3):** the scheduler evaluates the
+pool's usage snapshot in its eligibility chain (`ownership -> contract ->
+usage -> contention`) and holds over-cap dispatches as derived
+`waiting_provider_usage` wait state that clears automatically when
+capacity returns; caps never cancel an already-running worker. Fail open:
+missing, stale, or non-authoritative usage telemetry never blocks
+dispatch. **Provider probes (since Stage 2.1):** an authoritative
+`CodexUsageProbe` polls the Codex App Server (`account/rateLimits/read`),
+and every `account/rateLimits/updated` notification refreshes the shared
+pool snapshot immediately. Codex windows are normalized by duration
+(`windowDurationMins`: 300 -> `five_hour`, 10080 -> `weekly`, other ->
+`<N>_minutes`), never by position, and API-key-authenticated usage is
+non-authoritative so ChatGPT subscription caps never block API-key
+dispatch. **Remaining backend probes (Stage 2.2-2.8):** every other
+backend kind now has a registered probe, all honoring the fail-open
+invariant — AGY (`agy -p /quota --output-format json`, read-only, keeps
+provider/model-specific quota buckets verbatim), Claude (passive/cached
+telemetry; `five_hour` and `weekly` windows; no undocumented endpoints),
+Gemini and Kiro (hard-limit detection and reset extraction from runtime
+errors only — no TTY scraping; Kiro normalizes credits to a `monthly`
+window), and GitHub Copilot (hard-limit detection only). **Delegation:**
+a profile's `kind` never implies a usage pool — OpenCode, Pi, and
+Prime Agent profiles bind an explicit `usage_pool` (e.g. `pi-codex ->
+codex`, `pi-copilot -> copilot` — legacy `github-copilot` still resolves
+via `USAGE_SOURCE_ALIASES`); local usage estimates are
+non-authoritative and can never block scheduling.
+**Capacity exhaustion (Stage 4):** genuine subscription/plan
+quota exhaustion terminates the running attempt without consuming the
+retry budget — the ticket waits as `waiting_provider_usage` until the pool
+resets; transient 429/RPM/TPM errors keep normal retry behaviour.
+**API + UI projection (Stage 5):** the orchestrator snapshot exposes
+per-pool `provider_usage` — `source`, per-window `used_percent` /
+`remaining_percent` / `resets_at`, `status`
+(`available` | `capacity_paused` | `unavailable`), `stale`, and
+`authoritative` (`remaining_percent` defaults to `100 - used_percent`), and
+the workflow payload exposes the configured `usage_pools` (source + caps).
+The web board renders a Provider Usage card next to Agent Policy with usage
+bars, configured caps, remaining %, and reset times; an over-cap pool shows
+a "Capacity paused" / "Available after" notice, and the derived
+`waiting_provider_usage` schedule reason is localized in English and Korean.
+Missing or stale telemetry renders as "Usage unavailable" and never blocks
+the UI.
+**Comprehensive Test Suite & Global Fail-Open Invariant (Stage 6):** the
+feature is covered across 13 test suites (configuration validation, generic
+pool logic, every backend probe, scheduler eligibility, running-worker
+semantics, and web API/UI contracts). A permanent parameterized regression test
+proves the global fail-open invariant across all supported backend kinds (`codex`,
+`claude`, `agy`, `copilot`, `gemini`, `kiro`, `opencode`, `pi`, `prime-agent`): a
+usage-probe failure or exception can NEVER prevent dispatch.
 
 ### 6. Session Scoping & Isolation
 

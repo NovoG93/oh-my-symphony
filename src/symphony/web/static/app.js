@@ -19,6 +19,121 @@
 
   const API_BASE = '/api/v1';
 
+  // ------------------------------------------------------------------
+  // API token (`token` policy mode)
+  //
+  // When the server sets a token, every /api/ fetch needs
+  // `Authorization: Bearer <token>`. WebSockets use a short-lived ticket so
+  // the long-lived token never appears in a URL. The value lives in
+  // sessionStorage — tab-scoped and cleared when the tab closes — and a
+  // dismissed banner stays hidden until a *new* 401 carries information
+  // (a rejected stored token), so the 5s poll cannot resurrect it.
+  // ------------------------------------------------------------------
+
+  const API_TOKEN_STORAGE_KEY = 'symphony.apiToken';
+
+  function storedApiToken() {
+    try {
+      return sessionStorage.getItem(API_TOKEN_STORAGE_KEY) || null;
+    } catch (_err) {
+      return null;
+    }
+  }
+
+  function storeApiToken(token) {
+    try {
+      if (token) sessionStorage.setItem(API_TOKEN_STORAGE_KEY, token);
+      else sessionStorage.removeItem(API_TOKEN_STORAGE_KEY);
+    } catch (_err) {
+      /* storage disabled — token lasts only for this render cycle */
+    }
+  }
+
+  function withAuthHeaders(headers) {
+    const token = storedApiToken();
+    return token ? { ...headers, Authorization: `Bearer ${token}` } : headers;
+  }
+
+  let authBannerState = { open: false, dismissed: false };
+
+  function handleApiUnauthorized() {
+    if (state.policy && state.policy.mode !== 'token') return;
+    closeChatSocket();
+    cancelPreviewPoll();
+    cancelRunsPoll();
+    const hadToken = Boolean(storedApiToken());
+    if (hadToken) {
+      // The stored token was rejected — drop it so the next save is the
+      // only way forward, and un-dismiss: rejection is new information.
+      storeApiToken(null);
+      authBannerState.dismissed = false;
+    }
+    if (!authBannerState.dismissed) showApiTokenBanner(hadToken);
+  }
+
+  function showApiTokenBanner(rejected) {
+    let root = document.getElementById('api-token-banner-root');
+    if (!root) {
+      root = el('div', { id: 'api-token-banner-root' });
+      const main = document.querySelector('.main');
+      if (!main) return;
+      main.insertBefore(root, main.firstChild);
+    }
+    clearNode(root);
+    const input = el('input', {
+      class: 'input api-token-input',
+      type: 'password',
+      autocomplete: 'off',
+      'aria-label': t('auth.tokenPlaceholder'),
+      placeholder: t('auth.tokenPlaceholder'),
+    });
+    const save = el('button', { class: 'btn btn-primary btn-sm', type: 'button' }, t('auth.tokenSave'));
+    save.addEventListener('click', async () => {
+      const token = input.value.trim();
+      if (!token) {
+        input.focus();
+        return;
+      }
+      storeApiToken(token);
+      authBannerState.dismissed = false;
+      hideApiTokenBanner();
+      showToast(t('auth.tokenSaved'), 'success');
+      // Re-run the board fetch immediately; a chat page also needs its
+      // WebSocket rebuilt so it can obtain a ticket with the new bearer.
+      await refreshPolicy();
+      await refreshBoard();
+      if (state.route === 'chat') renderRoute();
+    });
+    input.addEventListener('keydown', (e) => {
+      if (e.key === 'Enter') save.click();
+    });
+    const dismiss = el('button', {
+      class: 'btn-icon',
+      type: 'button',
+      'aria-label': t('common.close'),
+      onClick: () => {
+        authBannerState.dismissed = true;
+        hideApiTokenBanner();
+      },
+    }, '✕');
+    root.appendChild(el('div', { class: 'banner banner-info api-token-banner', role: 'alert' }, [
+      el('div', { class: 'api-token-banner-copy' }, [
+        el('strong', null, t('auth.tokenBannerTitle')),
+        el('span', null, rejected ? t('auth.tokenRejected') : t('auth.tokenBannerHint')),
+      ]),
+      el('div', { class: 'api-token-banner-form' }, [input, save]),
+      dismiss,
+    ]));
+    authBannerState.open = true;
+    input.focus();
+  }
+
+  function hideApiTokenBanner() {
+    authBannerState.open = false;
+    const root = document.getElementById('api-token-banner-root');
+    if (root) root.remove();
+  }
+
   class ApiError extends Error {
     constructor(message, code, status, data = null) {
       super(message);
@@ -29,7 +144,14 @@
   }
 
   async function apiRequest(path, { method = 'GET', body, headers = {} } = {}) {
-    const init = { method, headers: { ...headers } };
+    // A board snapshot can remain visible after polling loses connectivity.
+    // Block every mutation at the shared boundary, including controls in a
+    // drawer that was opened before the board became stale. GETs remain
+    // available so recovery/authentication can proceed.
+    if (method !== 'GET' && boardIsStale()) {
+      throw new ApiError(t('conn.staleMutationBlocked'), 'stale_board', 503);
+    }
+    const init = { method, headers: withAuthHeaders(headers) };
     if (body !== undefined) {
       init.body = body;
       init.headers['Content-Type'] = 'application/json';
@@ -45,7 +167,11 @@
       }
     }
     if (!res.ok) {
+      if (res.status === 401) handleApiUnauthorized();
       const err = data && data.error;
+      if (res.status === 403 && err && err.code === 'missing_capability') {
+        refreshPolicy().then(() => renderRoute());
+      }
       throw new ApiError(
         (err && err.message) || t('api.requestFailed', { status: res.status }),
         (err && err.code) || 'unknown_error',
@@ -56,9 +182,28 @@
     return data;
   }
 
+  async function apiBlobRequest(path, { signal } = {}) {
+    const url = path.startsWith(API_BASE) ? path : API_BASE + path;
+    const res = await fetch(url, { method: 'GET', headers: withAuthHeaders({}), signal });
+    if (!res.ok) {
+      if (res.status === 401) handleApiUnauthorized();
+      let message = t('api.requestFailed', { status: res.status });
+      try {
+        const payload = await res.json();
+        message = (payload.error && payload.error.message) || message;
+      } catch (_err) { /* keep the status-based message */ }
+      throw new ApiError(message, 'artifact_fetch_failed', res.status);
+    }
+    return res.blob();
+  }
+
   const api = {
+    getPolicy: () => apiRequest('/auth/policy'),
+    createWebSocketTicket: () => apiRequest('/chat/ws-ticket', { method: 'POST', body: '{}' }),
+    getState: () => apiRequest('/state'),
     getBoard: () => apiRequest('/board'),
     getRequests: () => apiRequest('/requests'),
+
     getRequestSchedule: (kind, id) => {
       const params = new URLSearchParams({ kind, id });
       return apiRequest(`/requests/schedule?${params.toString()}`);
@@ -68,7 +213,9 @@
     openProject: (id) => apiRequest(`/projects/${encodeURIComponent(id)}/open`, { method: 'POST', body: '{}' }),
     createIssue: (payload) => apiRequest('/issues', { method: 'POST', body: JSON.stringify(payload) }),
     getIssue: (id) => apiRequest(`/issues/${encodeURIComponent(id)}`),
+    getArtifact: (url, options) => apiBlobRequest(url, options),
     patchIssue: (id, fields) => apiRequest(`/issues/${encodeURIComponent(id)}`, { method: 'PATCH', body: JSON.stringify(fields) }),
+    confirmReview: (id) => apiRequest(`/issues/${encodeURIComponent(id)}/confirm-review`, { method: 'POST', body: '{}' }),
     deleteIssue: (id) => apiRequest(`/issues/${encodeURIComponent(id)}`, { method: 'DELETE' }),
     getWorkflow: () => apiRequest('/workflow'),
     getRuns: ({ issue, limit, query, status, agent } = {}) => {
@@ -83,8 +230,11 @@
     },
     getRunDetail: (runId) => apiRequest(`/runs/${encodeURIComponent(runId)}`),
     downloadRunDiagnostic: async (runId) => {
-      const res = await fetch(`${API_BASE}/runs/${encodeURIComponent(runId)}/diagnostic`);
+      const res = await fetch(`${API_BASE}/runs/${encodeURIComponent(runId)}/diagnostic`, {
+        headers: withAuthHeaders({}),
+      });
       if (!res.ok) {
+        if (res.status === 401) handleApiUnauthorized();
         let message = t('api.requestFailed', { status: res.status });
         try {
           const payload = await res.json();
@@ -197,10 +347,16 @@
     projects: [],
     currentProject: null,
     workflow: null,
+    providerUsage: null,
+    policy: null,
     branches: [],
     // Remotes + gh availability decide which Git page actions are usable.
     gitRemote: null,
     connected: false,
+    // Timestamp of the last successful /board fetch. While polls fail,
+    // the age of this stamp drives the "updated Ns ago" label and the
+    // board-stale dimming, so a frozen snapshot never looks current.
+    lastSuccessfulPollAt: null,
     search: '',
     boardScope: 'active',
     boardView: 'lanes',
@@ -213,6 +369,8 @@
     statsDays: 30,
     selectedRunId: null,
     drawerIssue: null,
+    drawerArtifactUrls: new Set(),
+    drawerArtifactControllers: new Set(),
     workflowDraft: null,
     openModalBackdrop: null,
     openMenu: null,
@@ -563,7 +721,8 @@
 
   function showToast(message, type = 'info') {
     const container = document.getElementById('toast-container');
-    const toast = el('div', { class: `toast toast-${type}`, role: 'status' }, message);
+    // Errors are assertive (role=alert); success/info are polite status.
+    const toast = el('div', { class: `toast toast-${type}`, role: type === 'error' ? 'alert' : 'status' }, message);
     const dismiss = () => {
       toast.classList.add('toast-out');
       setTimeout(() => toast.remove(), 160);
@@ -642,7 +801,7 @@
     if (firstInput) firstInput.focus();
   }
 
-  function confirmDialog(message) {
+  function confirmDialog(message, confirmLabel = t('common.delete')) {
     return new Promise((resolve) => {
       let resolved = false;
       const finish = (value) => {
@@ -659,7 +818,7 @@
         el('div', { class: 'modal-body' }, el('p', { class: 'confirm-message' }, message)),
         el('div', { class: 'modal-footer' }, [
           el('button', { class: 'btn btn-ghost', onClick: () => finish(false) }, t('common.cancel')),
-          el('button', { class: 'btn btn-danger', onClick: () => finish(true) }, t('common.delete')),
+          el('button', { class: 'btn btn-danger', onClick: () => finish(true) }, confirmLabel),
         ]),
       ]);
       openModal(content);
@@ -719,10 +878,18 @@
   function closeDrawer() {
     const backdrop = document.getElementById('drawer-backdrop');
     if (!backdrop) return;
+    cleanupDrawerArtifacts();
     backdrop.classList.remove('open');
     const drawer = document.getElementById('drawer-panel');
     if (drawer) drawer.classList.remove('open');
     state.drawerIssue = null;
+  }
+
+  function cleanupDrawerArtifacts() {
+    for (const controller of state.drawerArtifactControllers) controller.abort();
+    state.drawerArtifactControllers.clear();
+    for (const url of state.drawerArtifactUrls) URL.revokeObjectURL(url);
+    state.drawerArtifactUrls.clear();
   }
 
   // ------------------------------------------------------------------
@@ -1026,6 +1193,20 @@
     closeChatSocket();
     cancelPreviewPoll();
     cancelRunsPoll();
+    const pageCapabilities = {
+      board: ['board'], runs: ['runs'], stats: ['workers'], workflow: ['workflow'],
+      git: ['git'], chat: ['chat'], preview: ['preview'],
+      settings: ['board', 'workflow', 'git'],
+    };
+    const required = pageCapabilities[state.route] || [];
+    const grants = new Set((state.policy && state.policy.effective_grants) || []);
+    if (state.policy && required.some((capability) => !grants.has(capability))) {
+      view.appendChild(el('section', { class: 'empty-state policy-locked', role: 'status' }, [
+        el('h2', null, t('auth.lockedTitle')),
+        el('p', null, t('auth.lockedHint', { capabilities: required.join(', ') })),
+      ]));
+      return;
+    }
     switch (state.route) {
       case 'board':
         renderBoardPage(view);
@@ -1065,16 +1246,25 @@
   window.addEventListener('hashchange', handleRouteChange);
 
   // ------------------------------------------------------------------
-  // Sidebar connection indicator
+  // Sidebar connection indicator + board staleness
   // ------------------------------------------------------------------
+
+  // Past this age without a successful poll the board is treated as
+  // stale: content dims and stops taking pointer events so nobody acts
+  // on a frozen snapshot believing it is live.
+  const BOARD_STALE_MS = 15000;
 
   function updateConnectionIndicator() {
     const dot = document.getElementById('conn-dot');
     const text = document.getElementById('conn-text');
     dot.classList.toggle('online', state.connected);
     dot.classList.toggle('offline', !state.connected);
+    updateBoardStaleness();
     if (!state.connected) {
-      text.textContent = t('conn.unreachable');
+      const age = secondsSinceLastPoll();
+      text.textContent = age == null
+        ? t('conn.unreachable')
+        : `${t('conn.unreachable')} · ${t('conn.staleAgo', { n: age })}`;
       return;
     }
     const live = (state.board && state.board.live) || {};
@@ -1085,6 +1275,30 @@
       else if (live[key].status === 'retrying') retrying++;
     }
     text.textContent = t('conn.summary', { running, retrying });
+  }
+
+  function secondsSinceLastPoll() {
+    if (state.lastSuccessfulPollAt == null) return null;
+    return Math.max(0, Math.round((Date.now() - state.lastSuccessfulPollAt) / 1000));
+  }
+
+  function updateBoardStaleness() {
+    const main = document.querySelector('.main');
+    if (!main) return;
+    // Never dim before the first successful load — that state already
+    // shows skeletons, and dimming them adds no information.
+    const stale = !state.connected
+      && state.lastSuccessfulPollAt != null
+      && (Date.now() - state.lastSuccessfulPollAt) > BOARD_STALE_MS;
+    main.classList.toggle('board-stale', stale);
+  }
+
+  // Pointer events on a stale board are already blocked via CSS; keyboard
+  // activation must check the same flag or Enter/Space would act on data
+  // the operator has been told is frozen.
+  function boardIsStale() {
+    const main = document.querySelector('.main');
+    return Boolean(main && main.classList.contains('board-stale'));
   }
 
   // ------------------------------------------------------------------
@@ -1154,6 +1368,7 @@
       type: 'text',
       id: 'board-search',
       class: 'input search-input',
+      'aria-label': t('board.searchAria'),
       placeholder: t('board.searchPlaceholder'),
       value: state.search,
       oninput: (e) => {
@@ -1331,7 +1546,9 @@
       waiting_dependency: t('schedule.reasonDependency'),
       waiting_global_capacity: t('schedule.reasonCapacity'),
       waiting_state_capacity: t('schedule.reasonStateCapacity'),
+      waiting_provider_usage: t('schedule.reasonProviderUsage'),
       refused_conflict: t('schedule.reasonConflict'),
+
       refused_dispatch_authority: t('schedule.reasonAuthority'),
       terminal_success: t('schedule.reasonComplete'),
       terminal_needs_action: t('schedule.reasonTerminal'),
@@ -1545,6 +1762,16 @@
         .filter((row) => row.issues.length > 0);
       if (terminalGroups.length) layout.appendChild(buildTerminalSectionEl(terminalGroups, live, board.read_only));
     }
+    // First-run affordance: when every rendered lane is empty (and no
+    // search filter is hiding cards), teach the two ways to add work.
+    // Skipped while filtering — an empty result there is the filter's doing.
+    if (!query) {
+      const renderedCounts = columnsToRender.map((col) => (byColumn.get(col.name) || []).length);
+      if (renderedCounts.length && renderedCounts.every((n) => n === 0)) {
+        layout.appendChild(el('div', { class: 'board-empty-hint' },
+          board.read_only ? t('board.emptyBoardReadonly') : t('board.emptyBoardHint')));
+      }
+    }
     scrollEl.appendChild(layout);
   }
 
@@ -1584,14 +1811,15 @@
     const dot = el('span', { class: 'state-dot', style: `background:${hashColor(col.name)}` });
     const actions = [];
     if (!readOnly) {
-      actions.push(el('button', { class: 'btn-icon', title: t('board.newIssue'), 'aria-label': `New issue in ${col.name}`, onClick: () => openIssueModal({ state: col.name }) }, '+'));
-      actions.push(el('button', { class: 'btn-icon', title: t('board.columnMenu'), 'aria-label': `${col.name} column menu`, onClick: (e) => { e.stopPropagation(); openColumnMenu(col, e.currentTarget); } }, '⋯'));
+      actions.push(el('button', { class: 'btn-icon', title: t('board.newIssue'), 'aria-label': t('board.newIssueInColumn', { name: col.name }), onClick: () => openIssueModal({ state: col.name }) }, '+'));
+      actions.push(el('button', { class: 'btn-icon', title: t('board.columnMenu'), 'aria-label': t('board.columnMenuAria', { name: col.name }), onClick: (e) => { e.stopPropagation(); openColumnMenu(col, e.currentTarget); } }, '⋯'));
     }
     const header = el('div', { class: 'column-header' }, [
       el('div', { class: 'column-title-wrap' }, [dot, el('span', { class: 'column-title' }, col.name), el('span', { class: 'column-count' }, String(issues.length))]),
       el('div', { class: 'column-actions' }, actions),
     ]);
     const body = el('div', { class: 'column-body' });
+    if (!issues.length) body.appendChild(el('div', { class: 'column-empty' }, t('board.noTickets')));
     for (const issue of issues) body.appendChild(buildCardEl(issue, live[issue.identifier], readOnly));
     const column = el('div', { class: `column${col.terminal ? ' terminal' : ''}` }, [header, body]);
     // Drop zone is the whole column (header + empty space included) — an
@@ -1648,7 +1876,19 @@
     const card = el('div', {
       class: `card${liveEntry && liveEntry.paused ? ' paused' : ''}`,
       draggable: !readOnly,
+      // Keyboard path to the drawer: the card is a real tab stop. The
+      // whole card stays a div (it nests the skip/recover buttons, which
+      // cannot live inside a <button>), so role+key handling stand in.
+      tabindex: '0',
+      role: 'button',
+      'aria-label': t('board.openTicketAria', { id: issue.identifier, title: issue.title }),
       onClick: () => openDrawer(issue.identifier),
+      onKeydown: (e) => {
+        if (boardIsStale()) return;
+        if (e.target !== card || (e.key !== 'Enter' && e.key !== ' ')) return;
+        e.preventDefault();
+        openDrawer(issue.identifier);
+      },
     });
     if (!readOnly) {
       card.addEventListener('dragstart', (e) => {
@@ -1713,7 +1953,17 @@
     const statusLine = el('div', { class: 'live-status-line' });
     if (liveEntry.status === 'retrying') {
       statusLine.appendChild(el('span', { class: 'live-icon retry' }, '↻'));
-      statusLine.appendChild(el('span', null, 'retrying'));
+      // Say why it is retrying — the bare ↻ hid the error the API sends.
+      statusLine.appendChild(el('span', null,
+        liveEntry.attempt != null
+          ? t('issue.retryingAttempt', { n: liveEntry.attempt })
+          : t('common.retrying')));
+      if (liveEntry.error) {
+        statusLine.appendChild(el('span', {
+          class: 'live-error',
+          title: liveEntry.error,
+        }, truncate(liveEntry.error, 80)));
+      }
     } else {
       statusLine.appendChild(el('span', { class: 'live-dot' }));
       statusLine.appendChild(el('span', null, t('issue.turnCount', { n: liveEntry.turn_count ?? 0 })));
@@ -1772,6 +2022,7 @@
 
   async function openDrawer(identifier) {
     closeAnyMenu();
+    cleanupDrawerArtifacts();
     const backdrop = ensureDrawerScaffold();
     const drawer = document.getElementById('drawer-panel');
     clearNode(drawer);
@@ -1926,6 +2177,24 @@
         el('span', null, detail.attention.message || ''),
       ]));
     }
+    if (!detail.live && String(detail.state || '').trim().toLowerCase() === 'human review') {
+      container.appendChild(el('button', {
+        class: 'btn btn-primary review-confirm-button',
+        type: 'button',
+        onClick: async () => {
+          const ok = await confirmDialog(t('issue.confirmReviewConfirm'), t('issue.confirmReview'));
+          if (!ok) return;
+          try {
+            await api.confirmReview(detail.identifier);
+            showToast(t('issue.reviewConfirmed'), 'success');
+            await refreshBoard();
+            if (state.drawerIssue === detail.identifier) openDrawer(detail.identifier);
+          } catch (err) {
+            showToast(err.message, 'error');
+          }
+        },
+      }, t('issue.confirmReview')));
+    }
     if (!detail.live && isDocumentState(detail.state)) {
       container.appendChild(el('button', {
         class: 'btn btn-ghost',
@@ -2022,9 +2291,23 @@
     return `${bytes} B`;
   }
 
-  // Worker deliverables collected off the workspace. Images preview inline;
-  // everything else is a download link — the server already forces
-  // `Content-Disposition: attachment` for types a browser could execute.
+  function trackDrawerBlobUrl(blob) {
+    const url = URL.createObjectURL(blob);
+    state.drawerArtifactUrls.add(url);
+    return url;
+  }
+
+  async function fetchDrawerArtifact(artifact, controller) {
+    try {
+      return await api.getArtifact(artifact.url, { signal: controller.signal });
+    } finally {
+      state.drawerArtifactControllers.delete(controller);
+    }
+  }
+
+  // Worker deliverables are fetched with the board session token. Protected
+  // artifact URLs must never be put in an href/src because the browser would
+  // request them without the Authorization header.
   function buildArtifactsSection(detail) {
     const artifacts = Array.isArray(detail.artifacts) ? detail.artifacts : [];
     const section = el('div', { class: 'drawer-artifacts' });
@@ -2037,19 +2320,50 @@
       return section;
     }
     const list = el('div', { class: 'artifact-list' });
+    const errorBox = el('div', { class: 'drawer-error', role: 'alert', hidden: true });
+    section.appendChild(errorBox);
+    const showArtifactError = (err) => {
+      if (err && err.name === 'AbortError') return;
+      errorBox.textContent = t('artifacts.loadFailed', { error: err.message || t('common.somethingWentWrong') });
+      errorBox.hidden = false;
+    };
     artifacts.forEach((artifact) => {
-      const isImage = artifact.inline && String(artifact.content_type || '').startsWith('image/');
+      const isInline = Boolean(artifact.inline);
+      const isImage = isInline && String(artifact.content_type || '').startsWith('image/');
       // Always show the real file name next to the worker-chosen title: the
       // title is arbitrary text, so "Coverage report" could otherwise save
       // an installer without the reader ever seeing the extension.
       const meta = [artifact.name, formatArtifactBytes(artifact.byte_size)];
       if (artifact.turn) meta.push(t('artifacts.turn', { turn: artifact.turn }));
-      const link = el('a', {
+      const link = el('button', {
         class: 'artifact-name',
-        href: artifact.url,
-        target: '_blank',
-        rel: 'noopener noreferrer',
-        download: artifact.inline ? null : artifact.name,
+        type: 'button',
+        onClick: async () => {
+          // Open synchronously in the user gesture before the authenticated
+          // fetch, otherwise Brave may block the eventual preview window.
+          const popup = isInline ? window.open('', '_blank', 'noopener,noreferrer') : null;
+          const controller = new AbortController();
+          state.drawerArtifactControllers.add(controller);
+          try {
+            const blob = await fetchDrawerArtifact(artifact, controller);
+            const url = trackDrawerBlobUrl(blob);
+            if (isInline && popup) {
+              popup.location.href = url;
+            } else if (!isInline) {
+              const download = document.createElement('a');
+              download.href = url;
+              download.download = artifact.name;
+              document.body.appendChild(download);
+              download.click();
+              download.remove();
+            } else if (!popup) {
+              throw new Error(t('artifacts.popupBlocked'));
+            }
+          } catch (err) {
+            if (popup) popup.close();
+            showArtifactError(err);
+          }
+        },
       }, artifact.title || artifact.name);
       const item = el('div', { class: 'artifact-item' }, [
         el('div', { class: 'artifact-row' }, [
@@ -2063,17 +2377,21 @@
       if (isImage) {
         const thumb = el('img', {
           class: 'artifact-thumb',
-          src: artifact.url,
           alt: artifact.title || artifact.name,
           loading: 'lazy',
         });
-        const preview = el('a', {
-          href: artifact.url,
-          target: '_blank',
-          rel: 'noopener noreferrer',
+        const preview = el('button', {
+          type: 'button',
           class: 'artifact-thumb-link',
         }, [thumb]);
+        preview.addEventListener('click', () => link.click());
         item.appendChild(preview);
+        const controller = new AbortController();
+        state.drawerArtifactControllers.add(controller);
+        fetchDrawerArtifact(artifact, controller).then((blob) => {
+          if (state.drawerIssue !== detail.identifier) return;
+          thumb.src = trackDrawerBlobUrl(blob);
+        }).catch(showArtifactError);
       }
       list.appendChild(item);
     });
@@ -2173,7 +2491,9 @@
     try {
       const board = await api.getBoard();
       state.board = board;
+      updateProviderUsage(board.provider_usage || {});
       state.connected = true;
+      state.lastSuccessfulPollAt = Date.now();
       updateConnectionIndicator();
       if (state.route === 'board') renderBoardSurface(document.getElementById('board-scroll'));
     } catch (_err) {
@@ -2211,6 +2531,7 @@
       id: 'runs-search',
       class: 'input runs-search',
       type: 'search',
+      'aria-label': t('runs.searchAria'),
       placeholder: t('runs.searchPlaceholder'),
       onInput: () => applyRunFilters(page, { debounce: true }),
     });
@@ -2643,8 +2964,9 @@
     page.appendChild(body);
     container.appendChild(page);
     try {
-      const wf = await api.getWorkflow();
+      const [wf, runtime] = await Promise.all([api.getWorkflow(), api.getState()]);
       state.workflow = wf;
+      state.providerUsage = runtime.provider_usage || {};
       state.workflowDraft = wf.columns.map((c) => ({ ...c, _originalName: c.name }));
       clearNode(body);
       body.appendChild(buildWorkflowEditor());
@@ -2691,8 +3013,10 @@
     ]);
     wrap.appendChild(saveBar);
     wrap.appendChild(buildAgentPolicyCard(state.workflow.agent));
+    wrap.appendChild(buildProviderUsageCard(state.workflow.usage_pools, state.providerUsage));
 
     state.wfRerender = () => {
+
       clearNode(list);
       state.workflowDraft.forEach((row) => list.appendChild(buildWfRow(row)));
       updateSaveBarVisibility();
@@ -2793,6 +3117,248 @@
     ]);
   }
 
+  function formatIsoTime(isoStr) {
+    if (!isoStr) return '';
+    try {
+      const dt = new Date(isoStr);
+      if (isNaN(dt.getTime())) return String(isoStr);
+      return dt.toLocaleDateString([], { weekday: 'short', hour: '2-digit', minute: '2-digit' });
+    } catch (_e) {
+      return String(isoStr);
+    }
+  }
+
+  // Keep quota decisions on the raw numeric values, but avoid exposing the
+  // long floating-point tails produced when AGY reports remaining_fraction.
+  function formatUsagePercent(value) {
+    if (value == null || !Number.isFinite(Number(value))) return value;
+    return Math.round(Number(value) * 100) / 100;
+  }
+
+  function buildProviderUsageCard(usagePools, providerUsage) {
+    const card = el('div', { class: 'card-panel provider-usage-card', id: 'provider-usage-card' });
+    card.appendChild(el('h3', null, t('usage.providerUsage')));
+
+    const poolMap = {};
+    if (usagePools) {
+      for (const [k, v] of Object.entries(usagePools)) {
+        poolMap[k] = { cfg: v, data: null };
+      }
+    }
+    if (providerUsage) {
+      for (const [k, v] of Object.entries(providerUsage)) {
+        if (!poolMap[k]) poolMap[k] = { cfg: null, data: v };
+        else poolMap[k].data = v;
+      }
+    }
+
+    const poolIds = Object.keys(poolMap).sort();
+    if (poolIds.length === 0) {
+      card.appendChild(el('div', { class: 'history-muted usage-empty' }, t('usage.unavailable')));
+      return card;
+    }
+
+    const list = el('div', { class: 'provider-usage-list' });
+    for (const poolId of poolIds) {
+      const { cfg: poolCfg, data: poolData } = poolMap[poolId];
+      const poolSec = el('div', { class: 'provider-usage-pool', 'data-pool-id': poolId });
+
+      const displayName = poolId.charAt(0).toUpperCase() + poolId.slice(1);
+      const status = (poolData && poolData.status) || (!poolData ? 'unavailable' : 'available');
+      const isPaused = status === 'capacity_paused';
+      const isStale = Boolean(poolData && poolData.stale);
+      const isUnavailable = status === 'unavailable';
+      const isAuthoritative = !poolData || poolData.authoritative !== false;
+      const poolSource = (poolData && poolData.source) || (poolCfg && poolCfg.source) || poolId;
+
+      const header = el('div', { class: 'usage-pool-header' }, [
+        el('div', { class: 'usage-pool-title-group' }, [
+          el('h4', { class: 'usage-pool-name' }, displayName),
+          el('span', { class: 'usage-pool-source' }, `${t('usage.pool')}: ${poolSource}`),
+        ]),
+        el('div', { class: 'usage-pool-badges' }, [
+          isPaused
+            ? el('span', { class: 'chip-status chip-status--paused badge badge-paused' }, t('usage.capacityPaused'))
+            : isUnavailable || (!poolData || (!poolData.windows && (!poolCfg || !poolCfg.caps)))
+            ? el('span', { class: 'chip-status badge badge-muted' }, t('usage.unavailable'))
+            : el('span', { class: 'chip-status badge badge-success' }, t('usage.available')),
+          isStale ? el('span', { class: 'chip-status chip-stale badge badge-stale' }, t('usage.stale')) : null,
+          !isAuthoritative
+            ? el('span', { class: 'chip-status chip-estimated badge badge-estimated' }, t('usage.estimated'))
+            : el('span', { class: 'chip-status chip-authoritative badge badge-authoritative' }, t('usage.authoritative')),
+        ].filter(Boolean)),
+      ]);
+      poolSec.appendChild(header);
+
+      if (isPaused) {
+        poolSec.appendChild(
+          el('div', { class: 'usage-paused-notice' }, [
+            el('p', { class: 'usage-paused-text' }, `${t('usage.tasksPaused', { pool: displayName })} — ${t('usage.waitingForCapacity')}`),
+          ])
+        );
+      }
+
+      if (isUnavailable) {
+        const authRequired = poolData && poolData.error_code === 'authentication_required';
+        poolSec.appendChild(el('div', { class: 'usage-unavailable-notice' }, [
+          el('strong', null, authRequired ? t('usage.codexSignInRequired') : t('usage.unavailable')),
+          el('span', null, authRequired ? t('usage.codexSignInHint') : t('usage.unavailableHint')),
+        ]));
+        const retry = el('button', {
+          class: 'btn btn-ghost btn-sm',
+          type: 'button',
+          onClick: async (e) => {
+            e.target.disabled = true;
+            try {
+              await api.refresh();
+              const runtime = await api.getState();
+              updateProviderUsage(runtime.provider_usage || {});
+            } catch (err) {
+              showToast(err.message, 'error');
+            } finally {
+              e.target.disabled = false;
+            }
+          },
+        }, t('common.retry'));
+        poolSec.appendChild(retry);
+      }
+
+      // Collect reported windows only.  Caps are deliberately not allowed to
+      // manufacture empty rows (a provider may omit a window while logging in
+      // or while its quota endpoint is unavailable).
+      const reportedWindows = poolData && poolData.windows && typeof poolData.windows === 'object' && !Array.isArray(poolData.windows)
+        ? poolData.windows : {};
+      const windowKeys = new Set(Object.keys(reportedWindows));
+
+      if (windowKeys.size === 0) {
+        poolSec.appendChild(el('div', { class: 'history-muted usage-empty-pool' }, t('usage.unavailable')));
+      } else {
+        const winLabels = {
+          five_hour: t('usage.fiveHour'),
+          weekly: t('usage.weekly'),
+          daily: t('usage.daily'),
+          monthly: t('usage.monthly'),
+        };
+        const windowsList = el('div', { class: 'usage-windows-list' });
+        const grouped = poolSource === 'agy' || (poolCfg && poolCfg.quota_group);
+        const windowPart = (value) => {
+          // The API keeps malformed/unknown quota metadata for diagnostics.
+          // Never pass an object through as a DOM child: el() expects a
+          // Node/string/number and appendChild would otherwise crash the SPA.
+          return (typeof value === 'string' || typeof value === 'number') && String(value) !== ''
+            ? String(value) : null;
+        };
+        const windowInfo = (winKey, winData) => {
+          const rawGroup = windowPart(winData && (winData.group || winData.group_key));
+          const rawPeriod = windowPart(winData && (winData.period || winData.period_key));
+          const keyParts = String(winKey).match(/^(gemini|third_party)_(five_hour|weekly)$/);
+          return {
+            group: rawGroup || (keyParts && keyParts[1]) || null,
+            period: rawPeriod || (keyParts && keyParts[2]) || winKey,
+          };
+        };
+        const sortedKeys = Array.from(windowKeys).sort((a, b) => {
+          const ia = windowInfo(a, reportedWindows[a]);
+          const ib = windowInfo(b, reportedWindows[b]);
+          return String(ia.group || '').localeCompare(String(ib.group || '')) || String(ia.period).localeCompare(String(ib.period));
+        });
+        let lastGroup = null;
+        for (const winKey of sortedKeys) {
+          const winData = reportedWindows[winKey] || {};
+          const info = windowInfo(winKey, winData);
+          if (grouped && info.group && info.group !== lastGroup) {
+            const groupLabel = info.group === 'gemini' ? t('usage.groupGemini')
+              : info.group === 'third_party' ? t('usage.groupThirdParty') : info.group;
+            windowsList.appendChild(el('h5', { class: 'usage-window-group', 'data-quota-group': info.group }, groupLabel));
+            lastGroup = info.group;
+          }
+          // Grouped pools use the short cap names (five_hour/weekly), but
+          // only for the configured quota group. Flat pools retain exact-key
+          // behavior for backwards compatibility.
+          const cap = poolCfg && poolCfg.caps
+            ? poolCfg.quota_group != null
+              ? (info.group === poolCfg.quota_group ? poolCfg.caps[info.period] : null)
+              : poolCfg.caps[winKey]
+            : null;
+          const used = winData.used_percent;
+          let remaining = winData.remaining_percent;
+          if (remaining == null && used != null) {
+            remaining = Math.round((100 - used) * 100) / 100;
+          }
+          const resetsAt = winData.resets_at;
+          const winTitle = winLabels[info.period] || winLabels[winKey] || winKey.replace(/_/g, ' ');
+          const displayUsed = formatUsagePercent(used);
+          const displayRemaining = formatUsagePercent(remaining);
+
+          const row = el('div', { class: 'usage-window-row' });
+          const winHeader = el('div', { class: 'usage-window-header' }, [
+            el('span', { class: 'usage-window-title' }, winTitle),
+            el('span', { class: 'usage-window-used-label' }, used != null ? t('usage.usedPercent', { n: displayUsed }) : t('usage.unavailable')),
+          ]);
+          row.appendChild(winHeader);
+
+          // Progress bar
+          const pct = used != null ? Math.min(100, Math.max(0, used)) : 0;
+          const isOverCap = cap != null && used != null && used >= cap;
+          let fillClass = 'usage-bar-fill';
+          if (isPaused || isOverCap) fillClass += ' usage-bar-fill--paused';
+          if (!isAuthoritative) fillClass += ' usage-bar-fill--estimated';
+
+          const barTrack = el('div', { class: 'usage-bar-track' }, [
+            el('div', { class: fillClass, style: `width: ${pct}%` }),
+          ]);
+          row.appendChild(barTrack);
+
+          // Meta row: remaining, cap, reset time
+          const metaItems = [];
+          if (remaining != null) {
+            metaItems.push(el('span', { class: 'usage-meta-item usage-meta-remaining' }, `${t('usage.remaining')}: ${t('usage.remainingPercent', { n: displayRemaining })}`));
+          }
+          if (cap != null) {
+            metaItems.push(el('span', { class: 'usage-meta-item usage-meta-cap' }, `${t('usage.configuredCap')}: ${t('usage.capPercent', { n: cap })}`));
+          }
+          if (resetsAt) {
+            const resetPrefix = isPaused ? t('usage.availableAfter') : t('usage.resetsAt');
+            metaItems.push(el('span', { class: 'usage-meta-item usage-meta-reset' }, `${resetPrefix}: ${formatIsoTime(resetsAt)}`));
+          }
+          if (metaItems.length > 0) {
+            row.appendChild(el('div', { class: 'usage-window-meta' }, metaItems));
+          }
+
+          windowsList.appendChild(row);
+        }
+        poolSec.appendChild(windowsList);
+      }
+
+      const credits = poolData && poolData.credits;
+      if (credits && (credits.has_credits === true || credits.unlimited === true)) {
+        let creditsValue = t('usage.creditsAvailable');
+        if (credits.unlimited === true) {
+          creditsValue = t('usage.unlimitedCredits');
+        } else if (credits.balance != null) {
+          creditsValue = t('usage.creditBalance', { n: credits.balance });
+        }
+        poolSec.appendChild(el('div', { class: 'usage-credits' }, [
+          el('span', { class: 'usage-credits-label' }, t('usage.credits')),
+          el('span', { class: 'usage-credits-value' }, creditsValue),
+        ]));
+      }
+
+      list.appendChild(poolSec);
+    }
+    card.appendChild(list);
+    return card;
+  }
+
+  function updateProviderUsage(providerUsage) {
+    state.providerUsage = providerUsage || {};
+    if (state.route !== 'workflow' && state.route !== 'settings') return;
+    const current = document.getElementById('provider-usage-card');
+    if (!current || !state.workflow) return;
+    current.replaceWith(buildProviderUsageCard(state.workflow.usage_pools, state.providerUsage));
+  }
+
+
   // ------------------------------------------------------------------
   // Page: Git
   // ------------------------------------------------------------------
@@ -2874,9 +3440,9 @@
 
   function buildTaskBranchRow(row, data, compareCard) {
     const badges = [];
-    if (row.merged) badges.push(el('span', { class: 'badge-merged' }, 'merged'));
+    if (row.merged) badges.push(el('span', { class: 'badge-merged' }, t('git.badgeMerged')));
     else if (row.ahead != null) badges.push(el('span', { class: 'ahead-behind' }, `↑${row.ahead} ↓${row.behind}`));
-    if (row.running) badges.push(el('span', { class: 'badge-running' }, 'running'));
+    if (row.running) badges.push(el('span', { class: 'badge-running' }, t('git.badgeRunning')));
     const compareBtn = el('button', {
       class: 'btn btn-ghost btn-sm',
       onClick: () => compareCard.load(row.branch),
@@ -3062,7 +3628,17 @@
     if (diffPanel) {
       attrs.class += ' clickable';
       attrs.title = t('git.showFileChanges');
+      // Keyboard parity with the click — a real tab stop so the commit's
+      // diff is reachable without a mouse.
+      attrs.tabindex = '0';
+      attrs.role = 'button';
       attrs.onClick = () => diffPanel.showCommit(commit);
+      attrs.onKeydown = (e) => {
+        if (boardIsStale()) return;
+        if (e.key !== 'Enter' && e.key !== ' ') return;
+        e.preventDefault();
+        diffPanel.showCommit(commit);
+      };
     }
     return el('div', attrs, [
       el('span', { class: 'git-mono commit-sha' }, commit.short_sha),
@@ -3101,7 +3677,7 @@
         resultBox.appendChild(el('div', { class: 'git-target-line' }, [
           el('span', { class: 'git-mono' }, `${cmp.branch} → ${cmp.target}`),
           el('span', { class: 'ahead-behind' }, `↑${cmp.ahead == null ? '?' : cmp.ahead} ↓${cmp.behind == null ? '?' : cmp.behind}`),
-          cmp.merged ? el('span', { class: 'badge-merged' }, 'merged') : null,
+          cmp.merged ? el('span', { class: 'badge-merged' }, t('git.badgeMerged')) : null,
         ]));
         const commits = cmp.commits || [];
         for (const commit of commits) resultBox.appendChild(buildCommitRow(commit, diffPanel));
@@ -3282,6 +3858,7 @@
     agy: 'AGY',
     claude: 'Claude Code',
     codex: 'Codex',
+    copilot: 'GitHub Copilot',
     gemini: 'Gemini CLI',
     kiro: 'Kiro',
     opencode: 'OpenCode',
@@ -4086,10 +4663,19 @@
     socket.send(JSON.stringify({ type: 'focus', session_id: sessionId || null }));
   }
 
-  function connectChatSocket(view) {
+  async function connectChatSocket(view) {
     closeChatSocket();
     const proto = location.protocol === 'https:' ? 'wss' : 'ws';
-    const query = chatState.currentId ? `?session=${encodeURIComponent(chatState.currentId)}` : '';
+    const params = [];
+    if (chatState.currentId) params.push(`session=${encodeURIComponent(chatState.currentId)}`);
+    let ticket;
+    try {
+      ticket = await api.createWebSocketTicket();
+    } catch (_err) {
+      return;
+    }
+    params.push(`ticket=${encodeURIComponent(ticket.ticket)}`);
+    const query = params.length ? `?${params.join('&')}` : '';
     const socket = new WebSocket(`${proto}://${location.host}/api/v1/chat/ws${query}`);
     chatState.socket = socket;
     socket.onopen = () => {
@@ -4700,14 +5286,16 @@
     page.appendChild(body);
     container.appendChild(page);
     try {
-      const [wf, branchesResp, board] = await Promise.all([
+      const [wf, branchesResp, board, runtime] = await Promise.all([
         api.getWorkflow(),
         api.getBranches(),
         state.board ? Promise.resolve(state.board) : api.getBoard(),
+        api.getState(),
       ]);
       const ciStatus = await api.getContinuousImprovementStatus();
       const lanePresets = await api.getLanePresets();
       state.workflow = wf;
+      state.providerUsage = runtime.provider_usage || {};
       state.branches = branchesResp.branches;
       if (!state.board) state.board = board;
       clearNode(body);
@@ -4718,7 +5306,11 @@
       body.appendChild(settingsSectionHeading(t('settings.workflowSetup'), t('settings.workflowSetupDescription')));
       body.appendChild(buildLanePresetCard(lanePresets, wf));
       body.appendChild(buildBranchPolicyCard(wf));
+      if (wf.usage_pools || state.providerUsage) {
+        body.appendChild(buildProviderUsageCard(wf.usage_pools, state.providerUsage));
+      }
       body.appendChild(settingsSectionHeading(t('settings.automation'), t('settings.automationDescription')));
+
       body.appendChild(buildContinuousImprovementCard(wf, ciStatus));
     } catch (err) {
       clearNode(body);
@@ -4755,6 +5347,8 @@
     try {
       const board = await api.getBoard();
       state.connected = true;
+      state.lastSuccessfulPollAt = Date.now();
+      updateProviderUsage(board.provider_usage || {});
       if (!holdRender) {
         const firstLoad = !state.board;
         state.board = board;
@@ -4809,7 +5403,35 @@
     });
   }
 
-  function boot() {
+  function renderPolicyStatus() {
+    let badge = document.getElementById('auth-policy-status');
+    if (!badge) {
+      badge = el('span', { id: 'auth-policy-status', class: 'auth-policy-status badge' });
+      const footer = document.querySelector('.sidebar-footer');
+      if (footer) footer.prepend(badge);
+    }
+    if (!state.policy) {
+      badge.textContent = '';
+      badge.hidden = true;
+      return;
+    }
+    badge.hidden = false;
+    badge.textContent = state.policy.mode === 'disabled'
+      ? t('auth.disabledBadge')
+      : t('auth.modeBadge', { mode: state.policy.mode });
+  }
+
+  async function refreshPolicy() {
+    try {
+      state.policy = await api.getPolicy();
+      if (state.policy.mode !== 'token') hideApiTokenBanner();
+    } catch (_err) {
+      state.policy = null;
+    }
+    renderPolicyStatus();
+  }
+
+  async function boot() {
     // Static markup in index.html is translated once here, then again on every
     // language change; the SPA views are rebuilt wholesale by renderRoute().
     window.i18n.applyStaticNodes();
@@ -4818,6 +5440,7 @@
       updateConnectionIndicator();
     });
     wireGlobalShortcuts();
+    await refreshPolicy();
     const selector = document.getElementById('project-selector');
     if (selector) selector.addEventListener('change', () => switchProject(selector.value));
     const manageButton = document.getElementById('manage-projects');

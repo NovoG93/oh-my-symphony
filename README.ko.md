@@ -7,8 +7,8 @@
 [![Tests](https://github.com/cskwork/oh-my-symphony/actions/workflows/tests.yml/badge.svg)](https://github.com/cskwork/oh-my-symphony/actions/workflows/tests.yml)
 [![GitHub stars](https://img.shields.io/github/stars/cskwork/oh-my-symphony?style=social)](https://github.com/cskwork/oh-my-symphony/stargazers)
 
-> 하나의 컨트롤 플레인, 하나의 터미널, 여러 프로젝트 보드, 여덟 개의 AI 코딩 에이전트
-> (**Codex**, **Claude Code**, **Gemini**, **AGY/Antigravity**, **Kiro**,
+> 하나의 컨트롤 플레인, 하나의 터미널, 여러 프로젝트 보드, 여러 AI 코딩 에이전트
+> (**Codex**, **Claude Code**, **GitHub Copilot**, **Gemini**, **AGY/Antigravity**, **Kiro**,
 > **OpenCode**, **Pi**, **Prime Agent**) — 티켓마다 골라 쓰고, 병렬로 실행하며,
 > Git 변경을 검토하고 빌드를 미리 보면서 실시간으로 지켜본다.
 
@@ -46,7 +46,7 @@
 
 ## Why Symphony?
 
-- **벤더 종속 없음.** Codex ↔ Claude Code ↔ Gemini ↔ AGY ↔ Kiro ↔ OpenCode ↔ Pi ↔ Prime Agent를 YAML 한 줄로
+- **벤더 종속 없음.** Codex ↔ Claude Code ↔ GitHub Copilot ↔ Gemini ↔ AGY ↔ Kiro ↔ OpenCode ↔ Pi ↔ Prime Agent를 YAML 한 줄로
   바꾸거나, 티켓마다 백엔드를 섞어 쓴다. 새 에이전트(Ollama, 로컬 모델,
   CLI가 있는 무엇이든)는 오케스트레이터를 바꾸지 않고 얇은
   `AgentBackend` Protocol 뒤에 끼워 넣으면 된다.
@@ -64,7 +64,7 @@
   Symphony를 체험하는 데는 둘 다 필요하지 않다.
 - **검증된 기반 위에 로컬 운영 안정성을 더했다.**
   [OpenAI의 공식 Symphony 레퍼런스 구현](https://github.com/openai/symphony)에서
-  포크했다. 이 포크는 파일 우선 오케스트레이션 모델을 유지하면서 여덟 개의
+  포크했다. 이 포크는 파일 우선 오케스트레이션 모델을 유지하면서 여러 코딩 에이전트
   백엔드, TUI / 웹 운영 화면, SQLite 실행 lease, 재시작에도 보존되는 이슈
   플래그, 잠금 기반 Markdown 티켓 쓰기를 더한다.
 - **뷰어가 아니라 진짜 웹 앱.** 오케스트레이터 포트가 멀티 프로젝트 컨트롤
@@ -82,7 +82,7 @@
 - 자는 동안 수십 개 티켓에 걸쳐 무인 야간 리팩터링을 돌리는 **1인 개발자**.
 - 버그 수정, 문서 갱신, 마이그레이션 티켓을 여러 코딩 에이전트에 걸쳐 동시에
   병렬화하는 **팀**.
-- 동일한 프롬프트와 워크스페이스로 Codex, Claude Code, Gemini,
+- 동일한 프롬프트와 워크스페이스로 Codex, Claude Code, GitHub Copilot, Gemini,
   AGY/Antigravity, Kiro, OpenCode, Pi, Prime Agent가 같은 작업을 어떻게 처리하는지 나란히
   비교하는 **연구자와 리뷰어**.
 - "에이전트당 채팅 창 하나"의 한계에 부딪혀, 한눈에 읽히는 칸반을 갖춘 진짜
@@ -121,10 +121,13 @@ q quit · r refresh · enter details · n new · e edit · s stats · S skip Doc
 안에서 Codex 세션을 실행한다. 이 포크는 그 오케스트레이터를 유지하면서 다음을
 더한다:
 
-1. 여덟 개의 구체 어댑터를 가진 플러그형 **AgentBackend** 레이어:
+1. 여러 구체 어댑터를 가진 플러그형 **AgentBackend** 레이어:
    - **Codex** — `codex app-server` (JSON-RPC stdio, 멀티턴) — 원본
    - **Claude Code** — `claude -p --output-format stream-json --verbose`
      (NDJSON 이벤트, `--resume`를 쓰는 턴별 서브프로세스)
+   - **GitHub Copilot** — `copilot --output-format=json --no-ask-user --allow-all-tools`
+     (JSONL 이벤트, `--session-id` UUID 연속성을 쓰는 턴별 서브프로세스,
+     `--model` 및 `--reasoning-effort` 전달, `--add-dir` 외부 루트 전달)
    - **Gemini** — `gemini -p ""` (턴당 1회 호출, stdin 프롬프트 → stdout 결과)
    - **AGY / Antigravity** — `agy --print "$(cat)"` (턴당 1회 호출, stdin 프롬프트
      -> stdout 결과; `agent.kind: antigravity`는 `agy`로 처리)
@@ -161,10 +164,15 @@ q quit · r refresh · enter details · n new · e edit · s stats · S skip Doc
 
 ```yaml
 agent:
-  kind: claude          # codex | claude | gemini | agy | kiro | opencode | pi | prime-agent
+  kind: claude          # codex | claude | copilot | gemini | agy | kiro | opencode | pi | prime-agent
 
 claude:
   command: claude -p --output-format stream-json --verbose
+  resume_across_turns: true
+  turn_timeout_ms: 3600000
+
+copilot:
+  command: copilot
   resume_across_turns: true
   turn_timeout_ms: 3600000
 
@@ -179,7 +187,7 @@ prime_agent:
   turn_timeout_ms: 3600000
 ```
 
-각 백엔드는 자기 블록(`codex`, `claude`, `gemini`, `agy`, `kiro`,
+각 백엔드는 자기 블록(`codex`, `claude`, `copilot`, `gemini`, `agy`, `kiro`,
 `opencode`, `pi`, `prime_agent`)을 읽으며, 런타임에는
 `agent.kind`에 맞는 것만 사용된다. Codex `linear_graphql` 클라이언트 도구는
 `agent.kind=codex`일 때만 노출된다.
@@ -194,7 +202,7 @@ agent:
 
 손으로 편집한 카드에는 플랫 별칭 `agent_kind: codex`도 허용된다.
 모든 백엔드 명령과 타임아웃 설정은 여전히 `WORKFLOW.md`의 해당 전역
-`codex:`, `claude:`, `gemini:`, `agy:`, `kiro:`, `opencode:`, `pi:`,
+`codex:`, `claude:`, `copilot:`, `gemini:`, `agy:`, `kiro:`, `opencode:`, `pi:`,
 `prime_agent:` 블록에서 가져온다.
 CLI에서 파일 보드 티켓을 만들 때는
 `symphony board new TASK-2 "title" --agent-kind codex`를 쓴다.
@@ -205,9 +213,12 @@ CLI에서 파일 보드 티켓을 만들 때는
 
 #### 프로필 상속 및 지원 필드
 프로필은 전역 백엔드 설정 블록(`codex:`, `claude:` 등)의 설정을 상속하며, 명시적으로 설정된 필드만 오버레이한다:
-- **`codex`**: `model`, `reasoning_effort`, `command`, `turn_timeout_ms`, `read_timeout_ms`, `stall_timeout_ms`
-- **`claude`**: `model` (`--model <name>` 자동 주입), `command`, `resume_across_turns`, `turn_timeout_ms`, `read_timeout_ms`, `stall_timeout_ms`
-- **`gemini`, `agy`, `kiro`, `opencode`, `pi`, `prime_agent`**: `command`, `resume_across_turns`, 타임아웃. 지원되지 않는 필드는 설정 빌드 시 검증 실패한다. gemini 백엔드는 `resume_across_turns`를 허용하지만 재개(resume)를 지원하지 않아 무시된다.
+- **`codex`**: `model`, `reasoning_effort`, `command`, `turn_timeout_ms`, `read_timeout_ms`, `stall_timeout_ms`, `usage_pool`
+- **`claude`**: `model` (`--model <name>` 자동 주입), `command`, `resume_across_turns`, `turn_timeout_ms`, `read_timeout_ms`, `stall_timeout_ms`, `usage_pool`
+- **`copilot`**: `model`, `reasoning_effort`, `command`, `resume_across_turns`, `turn_timeout_ms`, `read_timeout_ms`, `stall_timeout_ms`, `usage_pool`
+- **`gemini`, `agy`, `kiro`, `opencode`, `pi`, `prime_agent`**: `command`, `resume_across_turns`, 타임아웃, `usage_pool`. 지원되지 않는 필드는 설정 빌드 시 검증 실패한다. gemini 백엔드는 `resume_across_turns`를 허용하지만 재개(resume)를 지원하지 않아 무시된다.
+
+모든 종류가 `usage_pool`도 허용한다. 이는 `WORKFLOW.md`의 최상위 `usage_pools:`에 선언된 공유 사용 풀의 이름이며 로드 시 검증된다. 사용량은 이름 붙은 프로필이 아니라 공유 풀/공급자 할당량 단위로 모델링된다 — **에이전트 프로필은 에이전트가 HOW 실행되는지(모델, reasoning effort, 명령, 타임아웃)를 정의하고, 사용 풀은 공급자가 새 작업을 시작할 수 있는지(WHETHER)를 정의한다.** 전용 백엔드(`codex`, `claude`, `copilot`, `gemini`, `agy`, `kiro`)는 풀을 생략하면 자신의 백엔드 종류로 기본 설정되고, 멀티플렉싱 백엔드(`opencode`, `pi`, `prime-agent`)는 `usage_pool:`로 다른 공급자의 풀을 명시적으로 공유할 수 있다(예: `usage_pool: codex`). 풀 캡은 디스패치 자격 검사에서만 적용되며, 원격 측정이 없거나 오래되었거나 비신뢰(non-authoritative)여도 어떤 백엔드에서도 디스패치를 막지 않는다(전역 fail-open 불변식, 모든 지원 백엔드). 캡은 실행 중인 워커를 취소하지 않으며, 공급자가 런타임에 할당량을 소진하면(`EVENT_PROVIDER_USAGE_EXHAUSTED`) 재시도 예산을 소모하지 않고 `waiting_provider_usage`로 용량이 돌아올 때까지 대기한다. 상세 내용은 [docs/features/agent-profiles.md](docs/features/agent-profiles.md)를 참조한다.
 
 #### 8단계 결정 우선순위
 1. `dispatch_profile` (명시적 CLI / 런타임 디스패치 프로필)
@@ -290,6 +301,7 @@ python -m pip install -e ".[dev]"
 |--------------|------------------------|
 | `codex`      | `codex` (with `app-server` subcommand) |
 | `claude`     | `claude` (Claude Code) |
+| `copilot`    | `copilot` (GitHub Copilot CLI — `npm install -g @github/copilot` 또는 GitHub CLI 확장으로 설치; `gh auth login` / `copilot auth` 또는 `COPILOT_GITHUB_TOKEN` / `GH_TOKEN` / `GITHUB_TOKEN` 환경 변수 사용) |
 | `gemini`     | `gemini` (Gemini CLI)  |
 | `agy`        | `agy` (Antigravity CLI — Google Antigravity에서 설치; Symphony가 `--dangerously-skip-permissions`를 붙임) |
 | `kiro`       | `kiro-cli` (Kiro CLI — `https://cli.kiro.dev/install`에서 설치; headless 실행에는 `kiro-cli login` 또는 `KIRO_API_KEY` 필요) |
@@ -796,6 +808,9 @@ symphony ./WORKFLOW.md --port 9999
   ([Chat intake](#chat-intake--채팅에-요청하면-보드가-배달한다) 참고).
 - **Preview** — 분리된 대상 브랜치 체크아웃에서 루프백 전용 제품 미리보기를
   시작·재시작·중지하고, 상태 확인·URL·제한된 로그를 본다.
+- **Runs** — 기록된 시도를 검색·필터링하고, 제한된 민감정보 제거 타임라인과
+  토큰·워크스페이스·브랜치·커밋 정보를 확인하며 진단 JSON을 내려받는다.
+  `runs` capability가 허용된 웹 정책에서는 원격에서도 사용할 수 있다.
 - **Stats** — 일별 토큰, 처리량, 컬럼별 체류 시간, 에이전트별 합계, 평균
   사이클 타임 (`.symphony/stats.jsonl` 기반).
 - **Settings** — 실제 로컬 브랜치 드롭다운으로 브랜치 정책을 설정하고,
@@ -824,6 +839,70 @@ JSON API 엔드포인트:
 | POST   | `/api/v1/refresh`                 | poll + reconcile 즉시 트리거                  |
 | POST   | `/api/v1/{id}/pause` `/resume`    | 실행 중 워커 보류 / 재개                      |
 | POST   | `/api/v1/issues/{id}/skip-document` | idle Document 티켓을 Human Review로 이동 (구 별칭: `/skip-learn`) |
+
+#### 리버스 프록시·터널 보안
+
+HTTP 인증 모드는 `token`, `disabled`, `capabilities` 세 가지다. `token`은
+유효한 bearer에 일반 capability를 모두 부여하지만 `debug`는 별도 허용이 필요하다.
+`disabled`는 인증을 끄고 일반 capability를 모두 부여하므로 신뢰 네트워크에서만
+사용한다. `capabilities`는 bearer를 무시하고
+`SYMPHONY_REMOTE_OPERATOR_CAPABILITIES`에 나열된 capability만 부여한다.
+세 모드 모두 `debug`를 명시적으로 나열하지 않으면 허용하지 않는다.
+
+`SYMPHONY_API_AUTH_MODE`가 설정되지 않았을 때 `SYMPHONY_API_TOKEN` 또는
+`SYMPHONY_API_TOKEN_FILE`이 설정되어 있으면 `token`으로 추론한다. 토큰이 없는
+루프백 bind는 `disabled`로 추론하고, 비루프백 bind는 명시적인 모드가 없으면
+시작을 거부한다. 폐기 예정인 `global`과 `operator` 값은 `token` 별칭으로
+허용되며 경고를 출력하지만 passwordless 동작을 되살리지 않는다.
+
+`token` 모드의 보호된 경로에서 bearer가 없거나 틀리면 `401`이다. `capabilities`
+모드에서 bearer는 권한을 늘릴 수 없으며, 각 경로에 필요한 capability가 없으면
+`403`이 반환된다. `GET /api/v1/health`와 `GET /api/v1/auth/policy`만 공개 API
+엔드포인트이며, 응답은 정제된 상태·정책 정보만 반환하고 토큰이나 service probe
+credential을 노출하지 않는다. Runs API(`/api/v1/runs`)도 `runs` capability로
+보호되므로 원격 접근이 가능하다.
+
+리버스 프록시와 비루프백 bind에는 모든 브라우저 진입점의 정확한 trusted origin이
+필요하다. `SYMPHONY_TRUSTED_ORIGINS`에는 스킴(scheme), 호스트(host), 필요하면
+포트를 포함한 정확한 `http://` 또는 `https://` origin을 쉼표로 나열한다.
+와일드카드, 경로, bare hostname은 거부된다. 요청의 `Host`도 포트를 포함해
+정확히 일치해야 한다. Host/Origin 검사는 DNS rebinding과 CSRF를 줄이는 장치이지
+인증 자체는 아니다. 프록시는 등록된 모든 프로젝트 포트를 외부에 노출하고,
+외부 호스트명과 Host/Origin을 보존해야 프로젝트 전환 시 올바른 포트에 도달한다.
+
+```bash
+export SYMPHONY_API_AUTH_MODE=capabilities
+export SYMPHONY_TRUSTED_ORIGINS=https://symphony.example.com
+export SYMPHONY_REMOTE_OPERATOR_CAPABILITIES=board,workers,workflow,git,chat,runs,preview,projects
+symphony ./WORKFLOW.md --host 0.0.0.0 --port 9999
+```
+
+`token` 모드의 토큰은 탭 범위 `sessionStorage`에만 저장된다. Chat은 인증된
+`POST /api/v1/chat/ws-ticket`를 통해 bearer(또는 다른 모드의 capability 허용)를
+origin에 묶인 30초짜리 일회용 WebSocket ticket으로 교환한다. 이후 WebSocket
+handshake에는 이 ticket만 사용하며 장기 토큰을 URL query parameter에 넣지 않는다.
+공개 또는 모드 전환 전 `symphony doctor`를 실행한다.
+
+#### API 키 생성·보관
+
+`token` 모드에서는 강력하고 공백이 없는 비밀 값을 저장소 밖에 생성한다:
+
+```bash
+install -d -m 0700 "$HOME/.config/symphony"
+chmod 0700 "$HOME/.config/symphony"
+openssl rand -hex 32 > "$HOME/.config/symphony/api-token"
+chmod 0600 "$HOME/.config/symphony/api-token"
+export SYMPHONY_API_AUTH_MODE=token
+export SYMPHONY_API_TOKEN_FILE="$HOME/.config/symphony/api-token"
+```
+
+토큰 파일이나 값을 commit하지 말고, `WORKFLOW.md`에 넣거나 셸 기록·프록시
+access log·티켓·스크린샷에 출력/복사하지 않는다. 프로세스 관리자가 환경 변수를
+안전하게 보호할 때만 `SYMPHONY_API_TOKEN`을 사용하고, 배포에서는 보통
+`SYMPHONY_API_TOKEN_FILE`이 더 안전하다. MCP를 배포한다면 MCP 자체의
+`SYMPHONY_MCP_TOKEN(_FILE)`과 MCP→Symphony용 `SYMPHONY_API_TOKEN(_FILE)`은
+서로 독립된 credential이다. 생성·systemd drop-in·Codex 설정은
+[`deploy/README.md`](deploy/README.md)를 참고한다.
 
 ### CLI Kanban TUI (primary UI)
 
@@ -1004,7 +1083,7 @@ CI에 포함하지 않았다 — 로컬에서 실행한다.
 
 ## Design notes
 
-### Why eight different lifecycles behind one Protocol?
+### Why multiple different lifecycles behind one Protocol?
 
 - **Codex**는 이슈당 하나의 `app-server` 서브프로세스를 열고 현재의
   `codex app-server` JSON-RPC 프로토콜(`initialize` + `thread/start`
@@ -1014,6 +1093,10 @@ CI에 포함하지 않았다 — 로컬에서 실행한다.
 - **Claude Code**는 영속 서버가 없고, 세션은 ID로 추적된다. 각
   `run_turn`은 새 `claude -p`를 스폰하고 턴 2부터 `--resume <session-id>`를
   사용한다.
+- **GitHub Copilot**은 턴마다 `--output-format=json --no-ask-user --allow-all-tools`를
+  사용하는 새 `copilot` 서브프로세스를 스폰하고, `--session-id <uuid>`를 항상 전달하며
+  (`resume_across_turns`가 true일 때 재사용), 설정된 `--model` 및 `--reasoning-effort`를
+  전달하고 워크스페이스 외부 루트를 `--add-dir`로 전달한다.
 - **Gemini CLI**는 호출당 1회로, 네이티브 세션 모델이 없다.
   각 턴은 독립적이며, 오케스트레이터의 기록이 일관되게 유지되도록
   `gemini-<uuid>` 세션 id를 합성한다.
@@ -1082,8 +1165,8 @@ detail 확인을 할 수 있다.
 
 - Run lease와 이슈 safety flag는 SQLite에 저장되지만, hard crash 뒤 실행 중이던
   in-process worker에 다시 붙지는 않는다. Markdown 티켓 상태가 recovery checkpoint다.
-- Retry attempt는 보존되지만, 과거 attempt를 운영자가 훑어볼 first-class run
-  history CLI/API는 아직 없다.
+- Run attempt는 로컬 registry에 보존되며 `runs` capability가 허용되면 웹 Runs
+  API(`/api/v1/runs`)에서 조회할 수 있다.
 - Claude Code의 턴 중간 스트리밍 사용량 이벤트는 읽지만 노출하지 않는다 —
   토큰 합계의 진실의 원천은 종료 `result` 이벤트다.
 - OpenCode 토큰 사용량은 JSON 이벤트에서 best-effort로 파싱한다. 알 수 없는

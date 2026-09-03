@@ -10,6 +10,32 @@ Versioning: [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Security
+
+- **Web authorization policy supersession.** The current web API policy uses
+  exact trusted origins (scheme, host, and optional port) and rejects wildcard
+  and bare-host entries. This explicitly supersedes the permissive wildcard /
+  bare-host behavior described in the historical 0.20.1 release notes below;
+  that entry remains unchanged as a record of the behavior shipped in that
+  release.
+
+### Added
+
+- **Usage-aware agent profiles.** Shared usage pools (`usage_pools:`) and the
+  per-profile `usage_pool` reference — usage is modeled per pool/provider
+  quota, never per named profile: profiles define HOW an agent runs, pools
+  define WHETHER the provider may start new work. Pool caps are enforced at
+  dispatch eligibility with a permanent global fail-open invariant —
+  missing, stale, or non-authoritative telemetry never blocks dispatch
+  across all 8 backend kinds (`codex`, `claude`, `agy`, `gemini`, `kiro`,
+  `opencode`, `pi`, `prime-agent`) — and caps never cancel running workers.
+  Genuine provider quota exhaustion (`EVENT_PROVIDER_USAGE_EXHAUSTED` /
+  `ProviderCapacityError`) waits for capacity without burning the retry
+  budget. Per-pool `provider_usage` telemetry (used %, remaining %, reset
+  countdown, capacity-paused state) is projected through the orchestrator
+  snapshot and the workflow API payload, and rendered as a Provider Usage
+  card in the web UI.
+
 ## [0.21.0] - 2026-08-16 - Named agent profiles and MCP gateway
 
 ### Added

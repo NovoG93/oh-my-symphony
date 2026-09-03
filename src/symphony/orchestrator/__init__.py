@@ -53,6 +53,13 @@ from .helpers import (
     _utc_iso_z,
 )
 from .parsing import _parse_findings_rows, _parse_touched_files
+from .usage import (
+    ProviderUsageManager,
+    UsageDecision,
+    READY,
+    WAIT_PROVIDER_USAGE,
+    format_wait_reason,
+)
 from .core import Orchestrator
 
 __all__ = [
@@ -88,4 +95,10 @@ __all__ = [
     "auto_merge_on_done_best_effort",
     "build_backend",
     "commit_workspace_on_done",
+    # usage management
+    "ProviderUsageManager",
+    "UsageDecision",
+    "READY",
+    "WAIT_PROVIDER_USAGE",
+    "format_wait_reason",
 ]

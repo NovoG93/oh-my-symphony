@@ -51,11 +51,42 @@ checks. 18 new tests; recorded full-suite session 2,371 collected,
   the doctor: Phase-1 config-build validation rejects them, and the doctor
   surfaces the load failure as `FAIL workflow load failed` (exit 2).
 
+**Per-stage observability (TASK-10, 2026-08-17):**
+- `dispatch` log (`core.py:6437-6440`) now emits `agent_profile`, `model`,
+  `reasoning_effort` alongside `agent_kind` on every dispatch (including
+  reacquired attempts, `attempt_kind="reacquired"`).
+- The lease-reacquire `acquire_run` call (`core.py:2434-2440`) now passes
+  the same three fields — a reacquired run row keeps profile/model/effort
+  (closes LOW-2 below).
+- `stage_backend_rerouted` (`core.py:7075-7098`) now fires when kind,
+  profile, model, OR reasoning effort differs between stages — a
+  same-backend profile change (claude reviewer -> claude documenter) is no
+  longer silent — and logs `from_profile`/`to_profile`/`from_model`/
+  `to_model`/`to_reasoning_effort` next to `from_kind`/`to_kind`/
+  `from_state`/`to_state`.
+- `RunRegistry.update_stage_agent_profile` (`run_registry.py:605-644`)
+  updates the active owned run row (`status='active'` + `owner_pid` +
+  `owner_boot_id` fence) with the new `state` and profile/model/effort on
+  every stage transition; `_registry_guard` fails open.
+- No precedence/routing change: the transition block reuses the dispatch
+  resolution (`selection_for_state` + `resolve_agent_config`), and with no
+  profiles the new fields resolve to empty/equal values, so the expanded
+  reroute condition degenerates to the old kind-change check.
+- 4 new tests: `test_dispatch_logs_profile_model_reasoning_effort`,
+  `test_stage_backend_rerouted_logs_same_kind_different_profile`,
+  `test_orchestrator_stage_transition_persists_profile_to_run_record`
+  (`tests/test_workflow_agent_profiles_runtime.py`),
+  `test_run_registry_update_stage_agent_profile`
+  (`tests/test_run_registry.py`).
+
 **Known gaps (follow-up material):**
-- Lease-reacquire path (`core.py:2431`) passes only `agent_kind` — a
-  reacquired run row drops profile/model/reasoning_effort (LOW-2).
-- `graphify-out` symlink committed on the branch (LOW-1); recommend
-  excluding it at merge.
+- ~~Lease-reacquire path passes only `agent_kind` — reacquired run row drops
+  profile/model/reasoning_effort (LOW-2)~~ — **resolved 2026-08-17 by
+  TASK-10** (reacquire `acquire_run` call, `core.py:2434-2440`).
+- ~~`graphify-out` symlink committed on the branch (LOW-1)~~ — resolved
+  2026-08-17 by develop commit `94a532b` (untracked before the TASK-10
+  merge; `.gitignore` entry broadened to match symlinks, trailing slash
+  only matched directories).
 - Stall-reconciler timeout lookup still ignores profile-overlaid timeouts
   (TASK-5 carry-over, see [[agent-profile-resolution]]).
 
@@ -85,4 +116,20 @@ show/rejections, 7 doctor checks). QA artefacts under `docs/TASK-7/qa/`
   web UI — see [[agent-profiles-validation-and-docs]]. Web UI surfacing of
   profiles and run-record fields remains deferred post-feature (plan §16).
 
-**Last updated:** 2026-08-16 by TASK-8 Document.
+- 2026-08-17 | TASK-10 | Per-stage observability reuses the dispatch
+  resolution (`selection_for_state` + `resolve_agent_config`) inside the
+  transition block instead of adding a second resolution path — the reroute
+  log and run-record UPDATE only *read* resolution output, so precedence
+  and backend construction are untouched.
+- 2026-08-17 | TASK-10 | Legacy mode stays silent: with no profiles the
+  resolved `to_profile`/`to_model`/`to_reasoning_effort` equal the `from_*`
+  values, so the expanded reroute condition reduces to the old kind-change
+  check — no new log lines or DB writes for `agent.kind`/`stage_kinds`
+  workflows.
+- 2026-08-17 | TASK-10 | LOW-1 (`graphify-out` symlink) was resolved
+  upstream by `94a532b` before the TASK-10 merge, so the merge delivers a
+  tree without the symlink; future "known gaps" entries should record
+  upstream resolution commits as soon as they appear, not wait for the
+  merge.
+
+**Last updated:** 2026-08-17 by TASK-10 Document.

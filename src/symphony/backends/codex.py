@@ -21,10 +21,11 @@ import asyncio
 import json
 import os
 import shlex
-import time
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Sequence
 
+from .. import __version__
 from .._shell import resolve_bash, terminate_process_tree
 from ..errors import (
     CodexNotFound,
@@ -45,6 +46,7 @@ from . import (
     EVENT_MALFORMED,
     EVENT_NOTIFICATION,
     EVENT_OTHER_MESSAGE,
+    EVENT_PROVIDER_USAGE_EXHAUSTED,
     EVENT_SESSION_STARTED,
     EVENT_TURN_CANCELLED,
     EVENT_TURN_COMPLETED,
@@ -54,16 +56,23 @@ from . import (
     MALFORMED_LINE_LIMIT,
     BackendInit,
     BaseAgentBackend,
+    ProviderCapacityError,
     ToolDescriptor,
     TurnResult,
     _is_valid_session_id,
 )
 from .approval_policy import dangerous_command_reason
+from .usage import (
+    ProviderCreditInfo,
+    ProviderUsageSnapshot,
+    UsageProbe,
+    UsageWindow,
+    USAGE_PROBES,
+)
+from .per_turn import MAX_LINE_BYTES, _emit_event
 
 
 log = get_logger()
-
-MAX_LINE_BYTES = 10 * 1024 * 1024  # upstream §10.1 — 10 MB
 
 # Codex app-server protocol (v2 of `codex app-server`, codex-cli ≥ 0.39).
 # Older releases used `v2/initialize`, `v2/threads.start`, `v2/threads.runTurn`
@@ -73,9 +82,12 @@ METHOD_THREAD_START = "thread/start"
 METHOD_THREAD_RESUME = "thread/resume"
 METHOD_TURN_START = "turn/start"
 METHOD_THREAD_ARCHIVE = "thread/archive"
+METHOD_ACCOUNT_READ = "account/read"
+METHOD_ACCOUNT_RATE_LIMITS_READ = "account/rateLimits/read"
 # `thread/approveGuardianDeniedAction` is the rough equivalent of the legacy
 # respondToApproval; symphony auto-approves so this is rarely used.
 METHOD_APPROVAL_RESPOND = "thread/approveGuardianDeniedAction"
+
 
 # Notifications we react to.
 NOTIF_TURN_COMPLETED = "turn/completed"
@@ -88,10 +100,7 @@ NOTIF_RATE_LIMITS = "account/rateLimits/updated"
 # Last-message preview is rendered in the dashboard / passed back as
 # `TurnResult.last_message`. 1000 chars matches what the legacy backend used.
 _ASSISTANT_MESSAGE_PREVIEW_CAP = 1000
-
-
-def _utc_iso() -> str:
-    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+_CODEX_PROBE_TIMEOUT_S = 5.0
 
 
 # v2 turn/start `sandboxPolicy` is a tagged enum object, not a kebab-case
@@ -234,6 +243,477 @@ def _inject_writable_roots(command: str, writable_roots: Sequence[str]) -> str:
     )
 
 
+def _parse_resets_at(val: Any) -> datetime | None:
+    if val is None:
+        return None
+    if isinstance(val, datetime):
+        return val if val.tzinfo is not None else val.replace(tzinfo=timezone.utc)
+    if isinstance(val, (int, float)):
+        ts = val / 1000.0 if val > 1e11 else float(val)
+        try:
+            return datetime.fromtimestamp(ts, tz=timezone.utc)
+        except (ValueError, OSError, OverflowError):
+            return None
+    if isinstance(val, str):
+        val = val.strip()
+        if not val:
+            return None
+        try:
+            num = float(val)
+            ts = num / 1000.0 if num > 1e11 else num
+            return datetime.fromtimestamp(ts, tz=timezone.utc)
+        except ValueError:
+            pass
+        try:
+            dt = datetime.fromisoformat(val.replace("Z", "+00:00"))
+            return dt if dt.tzinfo is not None else dt.replace(tzinfo=timezone.utc)
+        except ValueError:
+            return None
+    return None
+
+
+def _merge_sparse_rate_limit_fields(
+    previous: dict[str, Any] | None,
+    incoming: dict[str, Any],
+) -> dict[str, Any]:
+    """Merge a rolling App Server update without clearing omitted/null fields."""
+    merged = dict(previous or {})
+    for key, value in incoming.items():
+        if value is None:
+            continue
+        old_value = merged.get(key)
+        if isinstance(old_value, dict) and isinstance(value, dict):
+            merged[key] = _merge_sparse_rate_limit_fields(old_value, value)
+        else:
+            merged[key] = value
+    return merged
+
+
+def normalize_codex_rate_limits(
+    raw: dict[str, Any],
+    *,
+    pool_id: str = "codex",
+    auth_mode: str | None = None,
+    previous: ProviderUsageSnapshot | None = None,
+) -> ProviderUsageSnapshot:
+    """Normalize raw Codex App Server rate limit responses into ProviderUsageSnapshot."""
+    effective_auth = auth_mode
+    if effective_auth is None and isinstance(raw, dict):
+        effective_auth = (
+            raw.get("authMode")
+            or raw.get("accountType")
+            or raw.get("auth_mode")
+        )
+
+    # API-key auth does not get ChatGPT subscription caps (non-authoritative for caps)
+    authoritative = previous.authoritative if previous is not None else True
+    if effective_auth is not None and str(effective_auth).lower() in ("apikey", "api_key"):
+        authoritative = False
+
+    limits_dict = raw
+    by_limit_id = raw.get("rateLimitsByLimitId")
+    if isinstance(by_limit_id, dict) and isinstance(by_limit_id.get("codex"), dict):
+        limits_dict = by_limit_id["codex"]
+    elif isinstance(raw.get("rateLimits"), dict):
+        limits_dict = raw["rateLimits"]
+
+    hard_limit_reached = previous.hard_limit_reached if previous is not None else False
+    hard_limit_value_found = False
+    hard_limit_sources = [limits_dict]
+    if limits_dict is not raw:
+        hard_limit_sources.append(raw)
+    for hard_limit_source in hard_limit_sources:
+        rl_type = hard_limit_source.get("rateLimitReachedType")
+        if rl_type is None:
+            rl_type = hard_limit_source.get("rate_limit_reached_type")
+        if rl_type is not None:
+            hard_limit_reached = str(rl_type).lower() not in (
+                "none",
+                "false",
+                "soft",
+                "",
+            )
+            hard_limit_value_found = True
+            break
+        for key in (
+            "hardLimitReached",
+            "hard_limit_reached",
+            "rateLimitReached",
+            "spendControlReached",
+        ):
+            value = hard_limit_source.get(key)
+            if isinstance(value, bool):
+                hard_limit_reached = value
+                hard_limit_value_found = True
+                break
+        if hard_limit_value_found:
+            break
+
+    windows: dict[str, UsageWindow] = dict(previous.windows) if previous is not None else {}
+
+    for val in limits_dict.values():
+        if not isinstance(val, dict):
+            continue
+
+        dur = val.get("windowDurationMins")
+        if dur is None:
+            dur = val.get("window_duration_mins")
+        if dur is None:
+            dur = val.get("durationMins")
+        if dur is None:
+            dur = val.get("duration_mins")
+        if dur is None:
+            continue
+        try:
+            if isinstance(dur, bool):
+                continue
+            dur_mins = int(dur)
+        except (ValueError, TypeError):
+            continue
+        if dur_mins <= 0:
+            continue
+        if dur_mins == 300:
+            window_key = "five_hour"
+        elif dur_mins == 10080:
+            window_key = "weekly"
+        else:
+            window_key = f"{dur_mins}_minutes"
+
+        previous_window = windows.get(window_key)
+
+        used_raw = val.get("usedPercent") if "usedPercent" in val else val.get("used_percent")
+        used_pct: float | None = None
+        if used_raw is not None:
+            try:
+                used_pct = float(used_raw)
+            except (ValueError, TypeError):
+                used_pct = None
+        if used_pct is None and previous_window is not None:
+            used_pct = previous_window.used_percent
+
+        rem_raw = (
+            val.get("remainingPercent")
+            if "remainingPercent" in val
+            else val.get("remaining_percent")
+        )
+        rem_pct: float | None = None
+        if rem_raw is not None:
+            try:
+                rem_pct = float(rem_raw)
+            except (ValueError, TypeError):
+                rem_pct = None
+        elif used_pct is not None:
+            rem_pct = max(0.0, 100.0 - used_pct)
+        elif previous_window is not None:
+            rem_pct = previous_window.remaining_percent
+
+        resets_at = _parse_resets_at(
+            val.get("resetsAt") if "resetsAt" in val else val.get("resets_at")
+        )
+        if resets_at is None and previous_window is not None:
+            resets_at = previous_window.resets_at
+
+        # Codex can briefly emit a shape containing only the duration (or
+        # explicit nulls) while credentials/session state is settling.  That
+        # is not a valid initial quota snapshot.  An existing real window is
+        # still retained through sparse-update merging above.
+        if (
+            previous_window is None
+            and used_pct is None
+            and rem_pct is None
+            and resets_at is None
+        ):
+            continue
+
+        windows[window_key] = UsageWindow(
+            key=window_key,
+            used_percent=used_pct,
+            remaining_percent=rem_pct,
+            resets_at=resets_at,
+        )
+
+    credits = previous.credits if previous is not None else None
+    raw_credits = limits_dict.get("credits")
+    if isinstance(raw_credits, dict):
+        raw_has_credits = raw_credits.get("hasCredits")
+        raw_unlimited = raw_credits.get("unlimited")
+        if isinstance(raw_has_credits, bool) or isinstance(raw_unlimited, bool):
+            has_credits = (
+                raw_has_credits
+                if isinstance(raw_has_credits, bool)
+                else (credits.has_credits if credits is not None else False)
+            )
+            unlimited = (
+                raw_unlimited
+                if isinstance(raw_unlimited, bool)
+                else (credits.unlimited if credits is not None else False)
+            )
+            if has_credits or unlimited:
+                balance = raw_credits.get("balance")
+                if balance is None and credits is not None:
+                    balance = credits.balance
+                credits = ProviderCreditInfo(
+                    has_credits=has_credits,
+                    unlimited=unlimited,
+                    balance=str(balance) if balance is not None else None,
+                )
+            else:
+                credits = None
+
+    observed_at = datetime.now(timezone.utc)
+    telemetry_status = "available" if windows else "unavailable"
+    return ProviderUsageSnapshot(
+        pool_id=pool_id,
+        source="codex",
+        windows=windows,
+        credits=credits,
+        hard_limit_reached=hard_limit_reached,
+        authoritative=authoritative,
+        observed_at=observed_at,
+        status="capacity_paused" if hard_limit_reached else telemetry_status,
+        error_code=None if windows else "probe_failed",
+        last_success_at=observed_at if windows else None,
+    )
+
+
+def _is_genuine_provider_exhaustion(
+    msg: str, err_type: str = "", err_code: str = ""
+) -> bool:
+    """Return True if an error signals subscription/plan quota exhaustion rather than RPM/429."""
+    text = f"{msg} {err_type} {err_code}".lower()
+    if (
+        "requests per minute" in text
+        or "tokens per minute" in text
+        or "rpm" in text
+        or "tpm" in text
+    ):
+        return False
+
+    exhaustion_keywords = (
+        "usage limit",
+        "usage_limit",
+        "quota exceeded",
+        "quota_exceeded",
+        "insufficient_quota",
+        "rate_limit_reached",
+        "plan limit",
+        "plan_limit",
+        "capacity exceeded",
+        "hit your limit",
+        "reached your limit",
+        "monthly credit",
+        "credits exhausted",
+        "provider_usage_exhausted",
+        "provider usage exhausted",
+    )
+    return any(kw in text for kw in exhaustion_keywords)
+
+
+class _CodexProbeFailure(Exception):
+    def __init__(self, code: str) -> None:
+        self.code = code
+        super().__init__(code)
+
+
+def _codex_probe_error_code(error: Any) -> str:
+    """Map provider errors to a deliberately tiny public diagnostic set."""
+    if isinstance(error, dict):
+        text = " ".join(
+            str(error.get(key) or "")
+            for key in ("code", "message", "type", "name")
+        ).lower()
+    else:
+        text = str(error).lower()
+    if any(
+        marker in text
+        for marker in (
+            "invalid_refresh_token",
+            "invalid refresh token",
+            "invalid_grant",
+            "authentication",
+            "unauthorized",
+            "not authenticated",
+            "login required",
+        )
+    ):
+        return "authentication_required"
+    return "probe_failed"
+
+
+async def _drain_stderr(stream: asyncio.StreamReader | None) -> None:
+    """Drain provider stderr without retaining or exposing its contents.
+
+    Keep only one small chunk in memory, but continue until EOF so a noisy
+    provider cannot block while its stderr pipe fills.
+    """
+    if stream is None:
+        return
+    while True:
+        chunk = await stream.read(4096)
+        if not chunk:
+            return
+
+
+class CodexUsageProbe(UsageProbe):
+    """Authoritative Codex rate limits probe against Codex App Server."""
+
+    def __init__(
+        self,
+        *,
+        command: str = "codex app-server",
+        cwd: Path | None = None,
+        client: Any | None = None,
+        backend: Any | None = None,
+        pool_id: str = "codex",
+    ) -> None:
+        self.command = command
+        self.cwd = cwd
+        self.client = client
+        self.backend = backend
+        self.pool_id = pool_id
+
+    async def fetch_usage(self) -> ProviderUsageSnapshot | None:
+        """Query account/rateLimits/read and return normalized snapshot."""
+        try:
+            if self.client is not None and hasattr(self.client, "request"):
+                auth_resp = await self.client.request(METHOD_ACCOUNT_READ, {})
+                raw = await self.client.request(METHOD_ACCOUNT_RATE_LIMITS_READ, {})
+                auth_mode = (
+                    auth_resp.get("authMode")
+                    or auth_resp.get("auth_mode")
+                    or (
+                        auth_resp.get("account", {}).get("type")
+                        if isinstance(auth_resp.get("account"), dict)
+                        else None
+                    )
+                )
+                return normalize_codex_rate_limits(
+                    raw, pool_id=self.pool_id, auth_mode=auth_mode
+                )
+
+            if self.backend is not None and hasattr(self.backend, "_request"):
+                await self.backend._request(METHOD_ACCOUNT_READ, {})
+                raw = await self.backend._request(METHOD_ACCOUNT_RATE_LIMITS_READ, {})
+                return normalize_codex_rate_limits(raw, pool_id=self.pool_id)
+
+            return await self._probe_standalone()
+        except _CodexProbeFailure as exc:
+            log.warning("codex_usage_probe_failed", pool_id=self.pool_id, code=exc.code)
+            return ProviderUsageSnapshot(
+                pool_id=self.pool_id,
+                source="codex",
+                windows={},
+                status="unavailable",
+                error_code=exc.code,
+                observed_at=datetime.now(timezone.utc),
+            )
+        except Exception as exc:
+            code = _codex_probe_error_code(exc)
+            log.warning("codex_usage_probe_failed", pool_id=self.pool_id, code=code)
+            # Keep provider diagnostics bounded and sanitized.  In
+            # particular, never put JSON-RPC error data or command output in
+            # the API payload.
+            if code == "probe_failed" and self.client is not None:
+                return None
+            return ProviderUsageSnapshot(
+                pool_id=self.pool_id,
+                source="codex",
+                windows={},
+                status="unavailable",
+                error_code=code,
+                observed_at=datetime.now(timezone.utc),
+            )
+    async def _probe_standalone(self) -> ProviderUsageSnapshot | None:
+        cmd = self.command
+        cwd = str(self.cwd) if self.cwd else None
+        proc = None
+        stderr_task: asyncio.Task[None] | None = None
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                resolve_bash(),
+                "-lc",
+                cmd,
+                cwd=cwd,
+                stdin=asyncio.subprocess.PIPE,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+                limit=MAX_LINE_BYTES,
+                start_new_session=os.name == "posix",
+            )
+            stdin = proc.stdin
+            stdout = proc.stdout
+            if stdin is None or stdout is None:
+                return None
+
+            stderr_task = asyncio.create_task(_drain_stderr(proc.stderr))
+
+            async def request(request_id: int, method: str, params: dict[str, Any]) -> dict[str, Any]:
+                stdin.write((json.dumps({
+                    "jsonrpc": "2.0", "id": request_id, "method": method, "params": params,
+                }) + "\n").encode("utf-8"))
+                await stdin.drain()
+                deadline = asyncio.get_running_loop().time() + _CODEX_PROBE_TIMEOUT_S
+                while True:
+                    remaining = deadline - asyncio.get_running_loop().time()
+                    if remaining <= 0:
+                        raise _CodexProbeFailure("probe_timeout")
+                    try:
+                        line = await asyncio.wait_for(
+                            stdout.readline(), timeout=remaining
+                        )
+                    except asyncio.TimeoutError as exc:
+                        raise _CodexProbeFailure("probe_timeout") from exc
+                    if not line:
+                        raise _CodexProbeFailure("probe_failed")
+                    try:
+                        msg = json.loads(line.decode("utf-8", errors="replace"))
+                    except (TypeError, ValueError):
+                        continue
+                    if not isinstance(msg, dict) or msg.get("id") != request_id:
+                        continue
+                    if isinstance(msg.get("error"), dict):
+                        raise _CodexProbeFailure(_codex_probe_error_code(msg["error"]))
+                    result = msg.get("result")
+                    return result if isinstance(result, dict) else {}
+
+            await request(1, METHOD_INITIALIZE, {
+                "clientInfo": {"name": "symphony", "version": "0.2.0"}
+            })
+            stdin.write(b'{"jsonrpc":"2.0","method":"initialized","params":{}}\n')
+            await stdin.drain()
+            auth_resp = await request(2, METHOD_ACCOUNT_READ, {})
+            rate_limits_result = await request(3, METHOD_ACCOUNT_RATE_LIMITS_READ, {})
+
+            auth_mode = (
+                auth_resp.get("authMode")
+                or auth_resp.get("auth_mode")
+                or (
+                    auth_resp.get("account", {}).get("type")
+                    if isinstance(auth_resp.get("account"), dict)
+                    else None
+                )
+            )
+            return normalize_codex_rate_limits(
+                rate_limits_result, pool_id=self.pool_id, auth_mode=auth_mode
+            )
+        finally:
+            if proc is not None:
+                try:
+                    await terminate_process_tree(proc)
+                except Exception:
+                    pass
+            if stderr_task is not None:
+                try:
+                    await asyncio.wait_for(stderr_task, timeout=1.0)
+                except (asyncio.TimeoutError, asyncio.CancelledError):
+                    stderr_task.cancel()
+                except Exception:
+                    pass
+
+
+USAGE_PROBES["codex"] = CodexUsageProbe
+
+
 def _coerce_turn(result: Any) -> dict[str, Any]:
     """Extract the ``turn`` sub-object from a v2 result/notification payload.
 
@@ -247,6 +727,7 @@ def _coerce_turn(result: Any) -> dict[str, Any]:
 
 
 class CodexAppServerBackend(BaseAgentBackend):
+
     """One subprocess instance per worker run; speaks Codex JSON-RPC."""
 
     def is_progress_event(self, event: dict[str, Any]) -> bool:
@@ -298,6 +779,9 @@ class CodexAppServerBackend(BaseAgentBackend):
             "total_tokens": 0,
         }
         self._latest_rate_limits: dict[str, Any] | None = None
+        self._usage_manager = init.usage_manager
+        self._usage_pool = init.usage_pool
+
 
     # ------------------------------------------------------------------
     # AgentBackend lifecycle
@@ -418,7 +902,7 @@ class CodexAppServerBackend(BaseAgentBackend):
         # plus optional `capabilities`. Tools are no longer declared at
         # initialize time — they're handled per-thread / per-turn now.
         params = {
-            "clientInfo": {"name": "symphony", "version": "0.2.0"},
+            "clientInfo": {"name": "symphony", "version": __version__},
         }
         return await self._request(METHOD_INITIALIZE, params)
 
@@ -592,15 +1076,46 @@ class CodexAppServerBackend(BaseAgentBackend):
             raise TurnCancelled("turn interrupted")
         if status == "failed":
             err = turn.get("error") or {}
-            await self._emit(EVENT_TURN_FAILED, turn)
             if isinstance(err, dict):
                 msg = err.get("message") or err.get("type") or "turn failed"
+                err_type = str(err.get("type") or "")
+                err_code = str(err.get("code") or "")
             else:
                 msg = str(err)
+                err_type = ""
+                err_code = ""
+
+            if _is_genuine_provider_exhaustion(msg, err_type, err_code):
+                resets_at = None
+                rl = turn.get("rateLimits") or turn.get("rate_limits")
+                if isinstance(rl, dict):
+                    snap = normalize_codex_rate_limits(
+                        rl, pool_id=self._usage_pool or "codex"
+                    )
+                    for w in snap.windows.values():
+                        if w.resets_at:
+                            resets_at = w.resets_at
+                            break
+                await self._emit(
+                    EVENT_PROVIDER_USAGE_EXHAUSTED,
+                    {
+                        "reason": msg,
+                        "pool_id": self._usage_pool or "codex",
+                        "resets_at": resets_at.isoformat() if resets_at else None,
+                    },
+                )
+                raise ProviderCapacityError(
+                    pool_id=self._usage_pool or "codex",
+                    resets_at=resets_at,
+                    message=msg,
+                )
+
+            await self._emit(EVENT_TURN_FAILED, turn)
             raise TurnFailed(msg)
         # Unknown status — don't silently coerce to success.
         await self._emit(EVENT_TURN_FAILED, turn)
         raise TurnFailed(f"unexpected turn status {status!r}")
+
 
     # ------------------------------------------------------------------
     # JSON-RPC line protocol over stdio
@@ -770,10 +1285,38 @@ class CodexAppServerBackend(BaseAgentBackend):
         if method == NOTIF_RATE_LIMITS or method.endswith("/rateLimits"):
             rl = params.get("rateLimits") if isinstance(params, dict) else None
             if isinstance(rl, dict):
-                self._latest_rate_limits = rl
+                self._latest_rate_limits = _merge_sparse_rate_limit_fields(
+                    self._latest_rate_limits,
+                    rl,
+                )
             elif isinstance(params, dict) and "rateLimits" not in params:
-                self._latest_rate_limits = params
+                self._latest_rate_limits = _merge_sparse_rate_limit_fields(
+                    self._latest_rate_limits,
+                    params,
+                )
+            if self._latest_rate_limits is not None:
+                pool_id = self._usage_pool or "codex"
+                snapshot = normalize_codex_rate_limits(
+                    self._latest_rate_limits,
+                    pool_id=pool_id,
+                    previous=(
+                        self._usage_manager.snapshot(pool_id)
+                        if self._usage_manager is not None
+                        else None
+                    ),
+                )
+                if self._usage_manager is not None:
+                    self._usage_manager.set_snapshot(pool_id, snapshot)
+            await self._emit(
+                EVENT_NOTIFICATION,
+                {
+                    "method": method,
+                    "params": params,
+                    "rate_limits": self._latest_rate_limits,
+                },
+            )
             return
+
         # ----- turn lifecycle -----
         if method == NOTIF_TURN_COMPLETED:
             waiter = self._turn_completion_waiter
@@ -989,22 +1532,17 @@ class CodexAppServerBackend(BaseAgentBackend):
         )
 
     async def _emit(self, event: str, payload: dict[str, Any]) -> None:
-        ev_payload = payload if isinstance(payload, dict) else {"data": payload}
-        try:
-            await self._on_event(
-                {
-                    "event": event,
-                    "timestamp": _utc_iso(),
-                    "payload": ev_payload,
-                    "usage": dict(self._latest_usage),
-                    "rate_limits": dict(self._latest_rate_limits)
-                    if self._latest_rate_limits
-                    else None,
-                    "agent_pid": self.pid,
-                }
-            )
-        except Exception as exc:
-            log.warning("event_callback_failed", error=str(exc))
+        # No session redaction on the app-server protocol (thread ids are
+        # opaque handles, not secrets carried in evidence) — passing no
+        # `redact_session` is an identity in the shared helper.
+        await _emit_event(
+            self._on_event,
+            event,
+            payload,
+            usage=self._latest_usage,
+            rate_limits=self._latest_rate_limits,
+            agent_pid=self.pid,
+        )
 
 
 def _normalize_event_name(method: str) -> str:

@@ -21,10 +21,10 @@ indicating the failure mode (e.g. `error_max_turns`).
 from __future__ import annotations
 
 import asyncio
+from datetime import datetime, timezone
 import json
 import os
 import shlex
-import time
 from collections import deque
 from typing import Any, Sequence
 
@@ -42,6 +42,7 @@ from ..workspace import validate_agent_cwd
 from . import (
     EVENT_MALFORMED,
     EVENT_OTHER_MESSAGE,
+    EVENT_PROVIDER_USAGE_EXHAUSTED,
     EVENT_SESSION_STARTED,
     EVENT_TURN_COMPLETED,
     EVENT_TURN_FAILED,
@@ -50,26 +51,204 @@ from . import (
     POST_STREAM_REAP_TIMEOUT_S,
     BackendInit,
     BaseAgentBackend,
+    ProviderCapacityError,
     TurnResult,
     _is_valid_session_id,
     redact_session_id,
 )
+from .usage import (
+    ProviderUsageSnapshot,
+    UsageProbe,
+    UsageWindow,
+    USAGE_PROBES,
+)
+from .per_turn import (
+    MAX_LINE_BYTES,
+    _emit_event,
+    _reap_process,
+    _stderr_tail_blob,
+)
+
 
 
 log = get_logger()
 
 PENDING_SESSION_ID = "pending"
 
-# StreamReader line-buffer limit for the subprocess pipes. The asyncio
-# default of 64 KiB overflows on stream-json events whose `result` text or
-# tool-use payload exceeds that on a single line, raising
-# `LimitOverrunError: Separator is found, but chunk is longer than limit`
-# and dropping the rest of the stream. Matches codex.py.
-MAX_LINE_BYTES = 10 * 1024 * 1024
+
+def _parse_resets_at(val: Any) -> datetime | None:
+    if val is None:
+        return None
+    if isinstance(val, (int, float)):
+        try:
+            ts = float(val)
+            if ts > 1e11:  # milliseconds
+                ts /= 1000.0
+            return datetime.fromtimestamp(ts, tz=timezone.utc)
+        except (ValueError, OSError):
+            return None
+    if isinstance(val, str):
+        try:
+            dt = datetime.fromisoformat(val.replace("Z", "+00:00"))
+            return dt if dt.tzinfo is not None else dt.replace(tzinfo=timezone.utc)
+        except ValueError:
+            return None
+    return None
 
 
-def _utc_iso() -> str:
-    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+def _is_genuine_claude_exhaustion(text: str) -> bool:
+    """Return True if an error signals subscription/plan quota exhaustion rather than RPM/429."""
+    lowered = text.lower()
+    if (
+        "requests per minute" in lowered
+        or "tokens per minute" in lowered
+        or "rpm" in lowered
+        or "tpm" in lowered
+    ):
+        return False
+
+    exhaustion_keywords = (
+        "usage limit",
+        "usage_limit",
+        "quota exceeded",
+        "quota_exceeded",
+        "credit balance is too low",
+        "insufficient_quota",
+        "rate_limit_reached",
+        "rate limit reached",
+        "reached your usage limit",
+        "plan limit",
+        "plan_limit",
+        "capacity exceeded",
+        "hit your limit",
+        "provider_usage_exhausted",
+        "provider usage exhausted",
+    )
+    return any(kw in lowered for kw in exhaustion_keywords)
+
+
+def normalize_claude_usage(
+    raw: dict[str, Any],
+    *,
+    pool_id: str = "claude",
+) -> ProviderUsageSnapshot:
+    """Normalize raw Claude rate limits dictionary into ProviderUsageSnapshot."""
+    hard_limit_reached = False
+    if isinstance(raw, dict):
+        if (
+            raw.get("hard_limit_reached") is True
+            or raw.get("hardLimitReached") is True
+            or raw.get("rateLimitReached") is True
+        ):
+            hard_limit_reached = True
+        err = str(raw.get("error") or raw.get("message") or "")
+        if err and _is_genuine_claude_exhaustion(err):
+            hard_limit_reached = True
+
+    limits_dict: dict[str, Any] = {}
+    if isinstance(raw, dict):
+        if "rate_limits" in raw and isinstance(raw["rate_limits"], dict):
+            limits_dict = raw["rate_limits"]
+        elif "rateLimits" in raw and isinstance(raw["rateLimits"], dict):
+            limits_dict = raw["rateLimits"]
+        else:
+            limits_dict = raw
+
+    non_window_keys = {
+        "rate_limits",
+        "rateLimits",
+        "hard_limit_reached",
+        "hardLimitReached",
+        "rateLimitReached",
+        "error",
+        "message",
+        "pool_id",
+        "source",
+    }
+
+    windows: dict[str, UsageWindow] = {}
+    for raw_key, val in limits_dict.items():
+        if raw_key in non_window_keys or not isinstance(val, dict):
+            continue
+
+        k_low = str(raw_key).lower()
+        if k_low in ("five_hour", "fivehour", "5h", "5_hour"):
+            window_key = "five_hour"
+        elif k_low in ("seven_day", "sevenday", "7d", "7_day", "weekly"):
+            window_key = "weekly"
+        else:
+            window_key = str(raw_key)
+
+        used_raw = (
+            val.get("used_percentage")
+            if "used_percentage" in val
+            else val.get("used_percent")
+            if "used_percent" in val
+            else val.get("usedPercent")
+        )
+        used_pct: float | None = None
+        if used_raw is not None:
+            try:
+                used_pct = float(used_raw)
+            except (ValueError, TypeError):
+                used_pct = None
+
+        rem_raw = (
+            val.get("remaining_percentage")
+            if "remaining_percentage" in val
+            else val.get("remaining_percent")
+            if "remaining_percent" in val
+            else val.get("remainingPercent")
+        )
+        rem_pct: float | None = None
+        if rem_raw is not None:
+            try:
+                rem_pct = float(rem_raw)
+            except (ValueError, TypeError):
+                rem_pct = None
+        elif used_pct is not None:
+            rem_pct = max(0.0, 100.0 - used_pct)
+
+        resets_at = _parse_resets_at(
+            val.get("resets_at") if "resets_at" in val else val.get("resetsAt")
+        )
+
+        windows[window_key] = UsageWindow(
+            key=window_key,
+            used_percent=used_pct,
+            remaining_percent=rem_pct,
+            resets_at=resets_at,
+        )
+
+    return ProviderUsageSnapshot(
+        pool_id=pool_id,
+        source="claude",
+        windows=windows,
+        hard_limit_reached=hard_limit_reached,
+        authoritative=True,
+        observed_at=datetime.now(timezone.utc),
+    )
+
+
+class ClaudeUsageProbe(UsageProbe):
+    """Passive/cached usage probe for Claude Code (fails open on cold start)."""
+
+    def __init__(
+        self,
+        *,
+        pool_id: str = "claude",
+        cached_snapshot: ProviderUsageSnapshot | None = None,
+    ) -> None:
+        self.pool_id = pool_id
+        self.cached_snapshot = cached_snapshot
+
+    async def fetch_usage(self) -> ProviderUsageSnapshot | None:
+        """Return cached subscription telemetry snapshot or None (fail open)."""
+        return self.cached_snapshot
+
+
+USAGE_PROBES["claude"] = ClaudeUsageProbe
+
 
 
 def _inject_model(command: str, model: str) -> str:
@@ -127,7 +306,13 @@ class ClaudeCodeBackend(BaseAgentBackend):
             log.info("claude_git_roots_granted", roots=self._git_roots)
         self._on_event = init.on_event
         self._on_process_started = init.on_process_started
+        self._usage_manager = getattr(init, "usage_manager", None)
+        self._usage_pool = getattr(init, "usage_pool", None) or (
+            init.selection.kind if init.selection is not None else "claude"
+        )
         self._session_id: str | None = None
+
+
         self._resume_on_next_turn = False
         self._expected_resume_session_id: str | None = None
         self._resume_session_confirmed = False
@@ -303,6 +488,13 @@ class ClaudeCodeBackend(BaseAgentBackend):
                     f"claude exited with no result event (rc={proc.returncode})"
                     + (f"; stderr: {stderr_blob}" if stderr_blob else "")
                 )
+                if _is_genuine_claude_exhaustion(err_msg):
+                    pool_id = self._usage_pool or "claude"
+                    await self._emit(
+                        EVENT_PROVIDER_USAGE_EXHAUSTED,
+                        {"pool_id": pool_id, "reason": err_msg},
+                    )
+                    raise ProviderCapacityError(pool_id=pool_id, message=err_msg)
                 await self._emit(
                     EVENT_TURN_FAILED,
                     {"reason": err_msg, "stderr_tail": list(self._stderr_tail)},
@@ -311,6 +503,13 @@ class ClaudeCodeBackend(BaseAgentBackend):
 
             if _is_error_result(terminal):
                 reason = _error_result_message(terminal)
+                if _is_genuine_claude_exhaustion(reason):
+                    pool_id = self._usage_pool or "claude"
+                    await self._emit(
+                        EVENT_PROVIDER_USAGE_EXHAUSTED,
+                        {"pool_id": pool_id, "reason": reason},
+                    )
+                    raise ProviderCapacityError(pool_id=pool_id, message=reason)
                 payload = {
                     **terminal,
                     "reason": reason,
@@ -326,6 +525,15 @@ class ClaudeCodeBackend(BaseAgentBackend):
                     raise TurnFailed(reason)
                 self._expected_resume_session_id = None
                 self._resume_session_confirmed = False
+
+            if "rate_limits" in terminal and isinstance(terminal["rate_limits"], dict):
+                self._latest_rate_limits = terminal["rate_limits"]
+                if self._usage_manager is not None:
+                    snap = normalize_claude_usage(
+                        terminal, pool_id=self._usage_pool or "claude"
+                    )
+                    self._usage_manager.set_snapshot(self._usage_pool or "claude", snap)
+
 
             message = str(terminal.get("result") or "").strip() or self._last_message
             self._last_message = message[:400]
@@ -389,6 +597,16 @@ class ClaudeCodeBackend(BaseAgentBackend):
                     sid = msg.get("session_id")
                     if isinstance(sid, str) and sid:
                         await self._observe_session_id(sid)
+                    if "rate_limits" in msg and isinstance(msg["rate_limits"], dict):
+                        self._latest_rate_limits = msg["rate_limits"]
+                        if self._usage_manager is not None:
+                            snap = normalize_claude_usage(
+                                msg, pool_id=self._usage_pool or "claude"
+                            )
+                            self._usage_manager.set_snapshot(
+                                self._usage_pool or "claude", snap
+                            )
+
                 elif kind == "assistant":
                     # Mid-stream `usage` deltas are ignored; the terminal
                     # `result` event is the source of truth for accumulation.
@@ -432,10 +650,7 @@ class ClaudeCodeBackend(BaseAgentBackend):
 
     def _stderr_blob(self) -> str:
         """Compact stderr tail for failure messages (≤400 chars)."""
-        if not self._stderr_tail:
-            return ""
-        joined = " | ".join(self._stderr_tail)
-        return joined if len(joined) <= 400 else joined[-400:]
+        return _stderr_tail_blob(self._stderr_tail)
 
     async def _observe_session_id(self, session_id: str) -> None:
         expected = self._expected_resume_session_id
@@ -454,9 +669,7 @@ class ClaudeCodeBackend(BaseAgentBackend):
 
     async def _reap(self, proc: asyncio.subprocess.Process) -> None:
         """Tear down a process group or surface ambiguous cleanup."""
-        result = await terminate_process_tree(proc)
-        if result is None and proc.returncode is None:
-            raise RuntimeError("backend process cleanup could not be confirmed")
+        await _reap_process(proc)
 
     def _update_usage_absolute(self, usage: dict[str, Any]) -> None:
         # Each `result` event reports usage for that one turn — accumulate.
@@ -473,24 +686,15 @@ class ClaudeCodeBackend(BaseAgentBackend):
         self._latest_usage["total_tokens"] += in_t + cache_t + out_t
 
     async def _emit(self, event: str, payload: dict[str, Any]) -> None:
-        try:
-            await self._on_event(
-                {
-                    "event": event,
-                    "timestamp": _utc_iso(),
-                    "payload": redact_session_id(
-                        payload if isinstance(payload, dict) else {"data": payload},
-                        None if event == EVENT_SESSION_STARTED else self._session_id,
-                    ),
-                    "usage": dict(self._latest_usage),
-                    "rate_limits": dict(self._latest_rate_limits)
-                    if self._latest_rate_limits
-                    else None,
-                    "agent_pid": self.pid,
-                }
-            )
-        except Exception as exc:
-            log.warning("event_callback_failed", error=str(exc))
+        await _emit_event(
+            self._on_event,
+            event,
+            payload,
+            usage=self._latest_usage,
+            rate_limits=self._latest_rate_limits,
+            agent_pid=self.pid,
+            redact_session=None if event == EVENT_SESSION_STARTED else self._session_id,
+        )
 
 
 def _extract_text(message: dict[str, Any]) -> str:

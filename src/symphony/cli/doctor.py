@@ -43,6 +43,15 @@ from ..runtime_safety import (
     workflow_uses_protected_source_repo,
 )
 from ..orchestrator.release_contracts import inspect_release_contract
+from ..web_policy import (
+    API_TOKEN_FILE_ENV,
+    AUTH_MODE_ENV,
+    CAPABILITIES_ENV,
+    LOOPBACK_BINDS,
+    PolicyConfigurationError,
+    configured_api_token,
+    resolve_policy,
+)
 from ..orchestrator.release_cycle import (
     has_release_finalizer_lane,
     has_release_success_terminal,
@@ -51,6 +60,7 @@ from ..trackers.file import FileBoardTracker
 from ..utils.git_sandbox import resolve_git_common_dir, writable_git_roots
 from ..service import ProcessRunningPredicate, port_owner_hint
 from ..workflow import (
+    DEFAULT_COPILOT_COMMAND,
     SUPPORTED_AGENT_KINDS,
     ServiceConfig,
     build_service_config,
@@ -129,6 +139,58 @@ def check_port(
     )
 
 
+def check_api_token_env(
+    cfg: ServiceConfig, *, host: str = "127.0.0.1"
+) -> CheckResult:
+    """Validate the complete HTTP authorization environment."""
+    name = "server.api_token"
+    del cfg  # the security contract is environment/bind scoped
+    try:
+        policy = resolve_policy(host)
+    except PolicyConfigurationError as exc:
+        return CheckResult(name, "fail", str(exc))
+    if policy.token and any(ch.isspace() for ch in policy.token):
+        return CheckResult(
+            name,
+            "fail",
+            "configured API token contains internal whitespace and cannot be used as one bearer word",
+        )
+
+    token_file = os.environ.get(API_TOKEN_FILE_ENV, "").strip()
+    if token_file:
+        try:
+            mode = Path(token_file).expanduser().stat().st_mode & 0o777
+        except OSError as exc:
+            return CheckResult(name, "fail", f"cannot read API token file: {exc}")
+        if os.name != "nt" and mode & 0o077:
+            return CheckResult(
+                name, "fail", f"API token file permissions are {mode:o}; require 600 or stricter"
+            )
+
+    requested = os.environ.get(AUTH_MODE_ENV, "").strip().lower()
+    warnings: list[str] = []
+    if requested in {"global", "operator"}:
+        warnings.append(f"{requested!r} is deprecated and safely aliases 'token'")
+    if policy.mode in {"disabled", "capabilities"}:
+        warnings.append(
+            f"{policy.mode} is a trusted-network mode: every reachable client receives its grants"
+        )
+    if policy.mode == "capabilities" and configured_api_token() is not None:
+        warnings.append("configured API token is ignored in capabilities mode")
+    if policy.mode in {"token", "disabled"} and os.environ.get(CAPABILITIES_ENV, "").strip():
+        normal = policy.configured_grants - {"debug"}
+        if normal:
+            warnings.append("normal capability entries are ignored in this mode")
+    if policy.mode == "token" and host.lower() not in LOOPBACK_BINDS:
+        warnings.append("direct HTTP bearer tokens are plaintext unless protected by TLS")
+    if host.lower() not in LOOPBACK_BINDS and not policy.trusted_origins:
+        return CheckResult(name, "fail", "non-loopback services require exact trusted origins/hosts")
+    message = f"mode={policy.mode}; grants={','.join(sorted(policy.effective_grants)) or 'none'}"
+    if warnings:
+        return CheckResult(name, "warn", message + "; " + "; ".join(warnings))
+    return CheckResult(name, "pass", message)
+
+
 def check_agent_cli(cfg: ServiceConfig) -> CheckResult:
     kind = cfg.agent.kind
     if kind == "codex":
@@ -147,12 +209,25 @@ def check_agent_cli(cfg: ServiceConfig) -> CheckResult:
         command = cfg.pi.command
     elif kind == "prime-agent":
         command = cfg.prime_agent.command
+    elif kind == "copilot":
+        command = cfg.copilot.command if cfg.copilot is not None else DEFAULT_COPILOT_COMMAND
     else:
         return CheckResult(f"agent.kind={kind}", "fail", f"unsupported agent kind {kind!r}")
 
     name = f"agent.kind={kind}"
     try:
-        argv = shlex.split(command)
+        if _IS_WIN32:
+            # POSIX-mode shlex eats backslashes: `D:\tools\python.exe`
+            # would reach shutil.which as `D:toolspython.exe` and the
+            # preflight bogus-fails with "not on $PATH". Whitespace mode
+            # keeps backslashes (and the quotes shlex leaves attached to
+            # a quoted token), so strip those surrounding quotes from the
+            # binary before resolving it.
+            argv = shlex.split(command, posix=False)
+            if argv:
+                argv[0] = argv[0].strip("\"'")
+        else:
+            argv = shlex.split(command)
     except ValueError as exc:
         return CheckResult(name, "fail", f"command not parseable: {exc}")
     if not argv:
@@ -402,6 +477,32 @@ def check_prime_agent_auth(cfg: ServiceConfig) -> CheckResult:
 # Keep the shorter name available for callers that refer to the backend as
 # ``prime`` rather than by its configured ``prime-agent`` kind.
 check_prime_auth = check_prime_agent_auth
+
+
+def check_copilot_auth(cfg: ServiceConfig) -> CheckResult:
+    """When agent.kind=copilot, verify authentication environment or cached token."""
+    name = "agent.kind=copilot.auth"
+    if cfg.agent.kind != "copilot":
+        return CheckResult(name, "pass", "not copilot (skipped)")
+
+    for env_var in ("COPILOT_GITHUB_TOKEN", "GH_TOKEN", "GITHUB_TOKEN"):
+        if os.environ.get(env_var):
+            return CheckResult(name, "pass", f"{env_var} present")
+
+    copilot_hosts = Path.home() / ".config" / "github-copilot" / "hosts.json"
+    gh_hosts = Path.home() / ".config" / "gh" / "hosts.yml"
+    if copilot_hosts.exists():
+        return CheckResult(name, "pass", f"{copilot_hosts} present")
+    if gh_hosts.exists():
+        return CheckResult(name, "pass", f"{gh_hosts} present")
+
+    return CheckResult(
+        name,
+        "warn",
+        "No GitHub Copilot auth token detected (checked COPILOT_GITHUB_TOKEN, "
+        "GH_TOKEN, GITHUB_TOKEN, and config files) — run `copilot auth` / `gh auth login` "
+        "or export a token before dispatch.",
+    )
 
 
 def check_gemini_auth(cfg: ServiceConfig) -> CheckResult:
@@ -877,6 +978,7 @@ def _agent_commands(cfg: ServiceConfig) -> dict[str, str]:
         "opencode": cfg.opencode.command,
         "pi": cfg.pi.command,
         "prime-agent": cfg.prime_agent.command,
+        "copilot": cfg.copilot.command if cfg.copilot is not None else DEFAULT_COPILOT_COMMAND,
     }
 
 # CLIs Symphony can widen on the command line. Every other kind gets the grant
@@ -1142,12 +1244,14 @@ def run_checks(cfg: ServiceConfig, host: str = "127.0.0.1") -> list[CheckResult]
     return [
         check_source_repository(cfg),
         check_port(cfg, host=host),
+        check_api_token_env(cfg, host=host),
         check_shell(),
         check_stage_turn_budget(cfg),
         check_agent_cli(cfg),
         *check_agent_profiles(cfg),
         check_pi_auth(cfg),
         check_prime_agent_auth(cfg),
+        check_copilot_auth(cfg),
         check_gemini_auth(cfg),
         check_agy_state_dir(cfg),
         check_kiro_auth(cfg),

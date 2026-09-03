@@ -32,24 +32,87 @@ from ..logging import get_logger
 from ..utils.git_sandbox import git_roots_env
 from ..workspace import validate_agent_cwd
 from . import (
+    EVENT_PROVIDER_USAGE_EXHAUSTED,
     EVENT_SESSION_STARTED,
     EVENT_TURN_FAILED,
     EVENT_TURN_STARTED,
     BackendInit,
     BaseAgentBackend,
+    ProviderCapacityError,
+    EventCallback,
     TurnResult,
     redact_session_id,
 )
 
 
+
 log = get_logger()
 
-# StreamReader buffer limit for the subprocess pipes; matches codex.py.
+# StreamReader line-buffer limit for the subprocess pipes; shared by the
+# per-turn family, claude, pi, and codex. The asyncio default of 64 KiB
+# overflows on stream-json / JSON-mode events whose `result` text,
+# `message_update`, or tool-result payload exceeds that on a single line,
+# raising `LimitOverrunError: Separator is found, but chunk is longer
+# than limit` and dropping the rest of the stream. Codex upstream §10.1
+# caps lines at 10 MB; matches the former per-file copies.
 MAX_LINE_BYTES = 10 * 1024 * 1024
 
 
 def _utc_iso() -> str:
     return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+
+
+def _stderr_tail_blob(tail: "deque[str]") -> str:
+    """Compact stderr tail for failure messages (≤400 chars, keeps the end)."""
+    if not tail:
+        return ""
+    joined = " | ".join(tail)
+    return joined if len(joined) <= 400 else joined[-400:]
+
+
+async def _reap_process(proc: asyncio.subprocess.Process) -> None:
+    """Tear down a process group or surface ambiguous cleanup."""
+    result = await terminate_process_tree(proc)
+    if result is None and proc.returncode is None:
+        raise RuntimeError("backend process cleanup could not be confirmed")
+
+
+async def _emit_event(
+    on_event: EventCallback,
+    event: str,
+    payload: dict[str, Any],
+    *,
+    usage: dict[str, int],
+    rate_limits: dict[str, Any] | None = None,
+    agent_pid: int | None = None,
+    redact_session: str | None = None,
+) -> None:
+    """Deliver the normalized backend-event envelope; never raises.
+
+    The per-turn family, claude, pi, and codex backends each carried a
+    near-identical copy of this; the envelope shape (event / timestamp /
+    payload / usage / rate_limits / agent_pid, plus the swallow-exception
+    contract) is pinned here once. ``redact_session=None`` disables
+    session redaction — an identity in ``redact_session_id`` — which is
+    how the codex backend (no session redaction) uses it.
+    """
+    ev_payload = redact_session_id(
+        payload if isinstance(payload, dict) else {"data": payload},
+        redact_session,
+    )
+    try:
+        await on_event(
+            {
+                "event": event,
+                "timestamp": _utc_iso(),
+                "payload": ev_payload,
+                "usage": dict(usage),
+                "rate_limits": dict(rate_limits) if rate_limits else None,
+                "agent_pid": agent_pid,
+            }
+        )
+    except Exception as exc:
+        log.warning("event_callback_failed", error=str(exc))
 
 
 def _has_shell_flag(command: str, *flags: str) -> bool:
@@ -87,6 +150,11 @@ class PerTurnCliBackend(BaseAgentBackend):
         self._cwd = init.cwd
         self._on_event = init.on_event
         self._on_process_started = init.on_process_started
+        self._usage_manager = getattr(init, "usage_manager", None)
+        self._usage_pool = getattr(init, "usage_pool", None) or (
+            init.selection.kind if init.selection is not None else agent_name
+        )
+
         self._session_id: str | None = None
         self._closed = False
         self._active_proc: asyncio.subprocess.Process | None = None
@@ -100,6 +168,13 @@ class PerTurnCliBackend(BaseAgentBackend):
     # ------------------------------------------------------------------
     # subclass hooks
     # ------------------------------------------------------------------
+
+    def _check_provider_exhaustion(
+        self, text: str
+    ) -> tuple[bool, Any | None]:
+        del text
+        return False, None
+
 
     def _command_for_turn(self, *, prompt: str, is_continuation: bool) -> str:
         raise NotImplementedError
@@ -285,6 +360,20 @@ class PerTurnCliBackend(BaseAgentBackend):
 
     async def _fail_turn(self, rc: int) -> None:
         err_msg = self._stderr_blob()
+        is_exhausted, resets_at = self._check_provider_exhaustion(err_msg)
+        if is_exhausted:
+            pool_id = self._usage_pool or self._agent_name
+            await self._emit(
+                EVENT_PROVIDER_USAGE_EXHAUSTED,
+                {
+                    "pool_id": pool_id,
+                    "reason": err_msg,
+                    "resets_at": resets_at.isoformat() if resets_at else None,
+                },
+            )
+            raise ProviderCapacityError(
+                pool_id=pool_id, resets_at=resets_at, message=err_msg
+            )
         payload = {
             "reason": f"{self._agent_name} exit {rc}"
             + (f"; stderr: {err_msg}" if err_msg else ""),
@@ -293,6 +382,7 @@ class PerTurnCliBackend(BaseAgentBackend):
         }
         await self._emit(EVENT_TURN_FAILED, payload)
         raise TurnFailed(err_msg or f"{self._agent_name} failed with exit {rc}")
+
 
     def _capture_stderr(self, stderr: bytes) -> None:
         text = stderr.decode("utf-8", errors="replace")
@@ -303,33 +393,20 @@ class PerTurnCliBackend(BaseAgentBackend):
                 self._stderr_tail.append(line)
 
     def _stderr_blob(self) -> str:
-        if not self._stderr_tail:
-            return ""
-        joined = " | ".join(self._stderr_tail)
-        return joined if len(joined) <= 400 else joined[-400:]
+        return _stderr_tail_blob(self._stderr_tail)
 
     async def _reap(self, proc: asyncio.subprocess.Process) -> None:
         """Tear down a process group or surface ambiguous cleanup."""
-        result = await terminate_process_tree(proc)
-        if result is None and proc.returncode is None:
-            raise RuntimeError("backend process cleanup could not be confirmed")
+        await _reap_process(proc)
 
     async def _emit(self, event: str, payload: dict[str, Any]) -> None:
-        try:
-            await self._on_event(
-                {
-                    "event": event,
-                    "timestamp": _utc_iso(),
-                    "payload": redact_session_id(
-                        payload if isinstance(payload, dict) else {"data": payload},
-                        None
-                        if event == EVENT_SESSION_STARTED
-                        else getattr(self, "_opencode_session_id", None),
-                    ),
-                    "usage": dict(self._latest_usage),
-                    "rate_limits": None,
-                    "agent_pid": self.pid,
-                }
-            )
-        except Exception as exc:
-            log.warning("event_callback_failed", error=str(exc))
+        await _emit_event(
+            self._on_event,
+            event,
+            payload,
+            usage=self._latest_usage,
+            agent_pid=self.pid,
+            redact_session=None
+            if event == EVENT_SESSION_STARTED
+            else getattr(self, "_opencode_session_id", None),
+        )

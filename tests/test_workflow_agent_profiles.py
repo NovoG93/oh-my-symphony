@@ -32,6 +32,7 @@ def test_agent_profile_config_dataclass_fields() -> None:
         read_timeout_ms=5000,
         stall_timeout_ms=20000,
         resume_across_turns=False,
+        usage_pool="codex-shared",
     )
     assert profile.name == "test-profile"
     assert profile.kind == "codex"
@@ -42,6 +43,7 @@ def test_agent_profile_config_dataclass_fields() -> None:
     assert profile.read_timeout_ms == 5000
     assert profile.stall_timeout_ms == 20000
     assert profile.resume_across_turns is False
+    assert profile.usage_pool == "codex-shared"
 
     # Defaults for optional fields are None
     minimal = AgentProfileConfig(name="min", kind="claude")
@@ -54,6 +56,7 @@ def test_agent_profile_config_dataclass_fields() -> None:
     assert minimal.read_timeout_ms is None
     assert minimal.stall_timeout_ms is None
     assert minimal.resume_across_turns is None
+    assert minimal.usage_pool is None
 
     # Frozen
     with pytest.raises(FrozenInstanceError):
@@ -136,6 +139,7 @@ def test_profile_fields_by_kind_allowlist_structure() -> None:
         assert "turn_timeout_ms" in allowed
         assert "read_timeout_ms" in allowed
         assert "stall_timeout_ms" in allowed
+        assert "usage_pool" in allowed
 
     assert "model" in PROFILE_FIELDS_BY_KIND["codex"]
     assert "reasoning_effort" in PROFILE_FIELDS_BY_KIND["codex"]

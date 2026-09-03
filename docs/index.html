@@ -3,13 +3,13 @@
 <head>
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-<meta name="description" content="oh-my-symphony — one terminal, one Kanban board, eight AI coding agents. Codex, Claude Code, Gemini, AGY/Antigravity, Kiro, OpenCode, Pi, and Prime Agent running in parallel git worktrees, watched live in a Jira-style TUI and web board." />
+<meta name="description" content="oh-my-symphony — one terminal, one Kanban board, multiple AI coding agents. Codex, Claude Code, GitHub Copilot, Gemini, AGY/Antigravity, Kiro, OpenCode, Pi, and Prime Agent running in parallel git worktrees, watched live in a Jira-style TUI and web board." />
 <meta name="theme-color" content="#0B0E14" />
 
-<title>oh-my-symphony — One terminal. One Kanban board. Eight AI coding agents.</title>
+<title>oh-my-symphony — One terminal. One Kanban board. Multiple AI coding agents.</title>
 
 <meta property="og:title" content="oh-my-symphony — multi-agent Kanban TUI" />
-<meta property="og:description" content="Codex · Claude Code · Gemini · AGY · Kiro · OpenCode · Pi · Prime Agent — pick per ticket, run in parallel, watch live." />
+<meta property="og:description" content="Codex · Claude Code · GitHub Copilot · Gemini · AGY · Kiro · OpenCode · Pi · Prime Agent — pick per ticket, run in parallel, watch live." />
 <meta property="og:type" content="website" />
 <meta property="og:url" content="https://cskwork.github.io/oh-my-symphony/" />
 <meta property="og:image" content="https://cskwork.github.io/oh-my-symphony/tui-screenshot.svg" />
@@ -163,7 +163,7 @@
     <a href="#top" class="flex items-center gap-3 font-mono text-on-surface">
       <span class="text-primary text-[18px] leading-none">▲</span>
       <span class="text-[15px] font-semibold tracking-tight">oh-my-symphony</span>
-      <span class="hidden md:inline text-[11px] font-mono text-on-surface-variant border border-outline px-2 py-[2px] rounded">v0.20.1</span>
+      <span class="hidden md:inline text-[11px] font-mono text-on-surface-variant border border-outline px-2 py-[2px] rounded">v0.21.0</span>
     </a>
     <div class="flex items-center gap-2 md:gap-6">
       <a href="#features" data-i18n="nav.features" class="hidden md:inline font-mono text-[13px] text-on-surface-variant hover:text-primary">features</a>
@@ -195,12 +195,13 @@
       <h1 data-i18n="hero.h1" class="font-mono text-[34px] md:text-headline-xl text-on-surface mb-6">
         One terminal.<br/>
         One Kanban board.<br/>
-        <span class="text-primary">Eight AI coding agents.</span>
+        <span class="text-primary">Multiple AI coding agents.</span>
       </h1>
 
       <p data-i18n="hero.sub" class="font-sans text-body-lg text-on-background max-w-2xl mb-8">
         <span class="font-mono text-secondary">Codex</span> ·
         <span class="font-mono text-secondary">Claude&nbsp;Code</span> ·
+        <span class="font-mono text-secondary">GitHub&nbsp;Copilot</span> ·
         <span class="font-mono text-secondary">Gemini</span> ·
         <span class="font-mono text-secondary">AGY</span> ·
         <span class="font-mono text-secondary">Kiro</span> ·
@@ -258,7 +259,7 @@
         <span class="text-secondary">&gt;</span> <span data-i18n="feat.title">Why Symphony</span>
       </h2>
       <p data-i18n="feat.sub" class="font-sans text-body-md text-on-surface-variant mt-2 max-w-2xl">
-        A file-first orchestrator fork with eight agents, a Jira-style TUI, a built-in web board, and local reliability guardrails.
+        A file-first orchestrator fork with multiple agents, a Jira-style TUI, a built-in web board, and local reliability guardrails.
       </p>
     </div>
 
@@ -268,7 +269,7 @@
         <div class="font-mono text-[11px] text-on-surface-variant feature-prompt mb-3">[01] vendor</div>
         <h3 data-i18n="feat.c1.h" class="font-mono text-headline-md text-on-surface mb-2">No vendor lock-in</h3>
         <p data-i18n="feat.c1.b" class="font-sans text-body-md text-on-background">
-          Swap Codex ↔ Claude Code ↔ Gemini ↔ AGY ↔ Kiro ↔ OpenCode ↔ Pi ↔ Prime Agent with one YAML line. New agents drop in behind a thin <code class="font-mono text-primary text-[13px]">AgentBackend</code> Protocol.
+          Swap Codex ↔ Claude Code ↔ GitHub Copilot ↔ Gemini ↔ AGY ↔ Kiro ↔ OpenCode ↔ Pi ↔ Prime Agent with one YAML line. New agents drop in behind a thin <code class="font-mono text-primary text-[13px]">AgentBackend</code> Protocol.
         </p>
       </div>
 
@@ -431,6 +432,13 @@
               <td data-i18n="am.r2.transport" class="px-5 py-4 text-on-background">NDJSON events · per-turn subprocess</td>
               <td class="px-5 py-4 text-secondary">--resume</td>
               <td data-i18n="am.r2.bestfor" class="px-5 py-4 font-sans text-on-background">Complex multi-file refactors · long planning</td>
+            </tr>
+            <tr>
+              <td class="px-5 py-4 text-primary">GitHub Copilot</td>
+              <td class="px-5 py-4 text-on-surface">copilot --output-format=json</td>
+              <td class="px-5 py-4 text-on-background">JSONL events · per-turn subprocess</td>
+              <td class="px-5 py-4 text-secondary">--session-id</td>
+              <td class="px-5 py-4 font-sans text-on-background">GitHub Copilot CLI with model &amp; reasoning flags</td>
             </tr>
             <tr>
               <td class="px-5 py-4 text-primary">Gemini</td>
@@ -623,15 +631,15 @@
       "nav.quickstart": `quickstart`,
       "nav.agents": `agents`,
       "nav.cta": `Get Started →`,
-      "hero.h1": `One terminal.<br/>One Kanban board.<br/><span class="text-primary">Eight AI coding agents.</span>`,
-      "hero.sub": `<span class="font-mono text-secondary">Codex</span> · <span class="font-mono text-secondary">Claude&nbsp;Code</span> · <span class="font-mono text-secondary">Gemini</span> · <span class="font-mono text-secondary">AGY</span> · <span class="font-mono text-secondary">Kiro</span> · <span class="font-mono text-secondary">OpenCode</span> · <span class="font-mono text-secondary">Pi</span> · <span class="font-mono text-secondary">Prime&nbsp;Agent</span> — pick per ticket, run in parallel inside isolated <span class="font-mono text-primary">git&nbsp;worktree</span>s, watch live in a Jira-style TUI you never have to leave your terminal for.`,
+      "hero.h1": `One terminal.<br/>One Kanban board.<br/><span class="text-primary">Multiple AI coding agents.</span>`,
+      "hero.sub": `<span class="font-mono text-secondary">Codex</span> · <span class="font-mono text-secondary">Claude&nbsp;Code</span> · <span class="font-mono text-secondary">GitHub&nbsp;Copilot</span> · <span class="font-mono text-secondary">Gemini</span> · <span class="font-mono text-secondary">AGY</span> · <span class="font-mono text-secondary">Kiro</span> · <span class="font-mono text-secondary">OpenCode</span> · <span class="font-mono text-secondary">Pi</span> · <span class="font-mono text-secondary">Prime&nbsp;Agent</span> — pick per ticket, run in parallel inside isolated <span class="font-mono text-primary">git&nbsp;worktree</span>s, watch live in a Jira-style TUI you never have to leave your terminal for.`,
       "hero.cta1": `Try it in 60 seconds <span>→</span>`,
       "hero.cta2": `View on GitHub`,
       "hero.caption": `<span class="text-primary">›</span> columns are your tracker's states · cards show active agent, turn count, last event, accumulated tokens · ● running, ↻ retry queued, ✓ done.`,
       "feat.title": `Why Symphony`,
-      "feat.sub": `A file-first orchestrator fork with eight agents, a Jira-style TUI, a built-in web board, and local reliability guardrails.`,
+      "feat.sub": `A file-first orchestrator fork with multiple agents, a Jira-style TUI, a built-in web board, and local reliability guardrails.`,
       "feat.c1.h": `No vendor lock-in`,
-      "feat.c1.b": `Swap Codex ↔ Claude Code ↔ Gemini ↔ AGY ↔ Kiro ↔ OpenCode ↔ Pi ↔ Prime Agent with one YAML line. New agents drop in behind a thin <code class="font-mono text-primary text-[13px]">AgentBackend</code> Protocol.`,
+      "feat.c1.b": `Swap Codex ↔ Claude Code ↔ GitHub Copilot ↔ Gemini ↔ AGY ↔ Kiro ↔ OpenCode ↔ Pi ↔ Prime Agent with one YAML line. New agents drop in behind a thin <code class="font-mono text-primary text-[13px]">AgentBackend</code> Protocol.`,
       "feat.c2.h": `Live progress`,
       "feat.c2.b": `Turn count, last event, accumulated tokens, and rate-limit headroom for every running card. No more "is it stuck or just thinking?" — and no SaaS dashboard to log into.`,
       "feat.c3.h": `Parallel by default`,
@@ -679,9 +687,9 @@
       "who.c2.h": `Teams`,
       "who.c2.b": `Parallelizing bug fixes, doc updates, or migration tickets across multiple coding agents simultaneously — without juggling five chat windows.`,
       "who.c3.h": `Researchers & reviewers`,
-      "who.c3.b": `Comparing how Codex, Claude Code, Gemini, AGY/Antigravity, Kiro, OpenCode, Pi, and Prime Agent tackle the same task side by side — identical prompts, identical workspaces.`,
+      "who.c3.b": `Comparing how Codex, Claude Code, GitHub Copilot, Gemini, AGY/Antigravity, Kiro, OpenCode, Pi, and Prime Agent tackle the same task side by side — identical prompts, identical workspaces.`,
       "cta.title": `Stop juggling AI coding CLIs.`,
-      "cta.sub": `One terminal. One Kanban. Eight agents working in parallel — visible, isolated, and yours.`,
+      "cta.sub": `One terminal. One Kanban. Multiple agents working in parallel — visible, isolated, and yours.`,
       "cta.b1": `Get started <span>→</span>`,
       "cta.b2": `Read the docs`,
       "cta.meta1": `Forked from <a class="text-secondary hover:underline" href="https://github.com/openai/symphony">openai/symphony</a>`,
@@ -696,15 +704,15 @@
       "nav.quickstart": `빠른 시작`,
       "nav.agents": `에이전트`,
       "nav.cta": `시작하기 →`,
-      "hero.h1": `터미널 하나.<br/>칸반 보드 하나.<br/><span class="text-primary">AI 코딩 에이전트 여덟.</span>`,
-      "hero.sub": `<span class="font-mono text-secondary">Codex</span> · <span class="font-mono text-secondary">Claude&nbsp;Code</span> · <span class="font-mono text-secondary">Gemini</span> · <span class="font-mono text-secondary">AGY</span> · <span class="font-mono text-secondary">Kiro</span> · <span class="font-mono text-secondary">OpenCode</span> · <span class="font-mono text-secondary">Pi</span> · <span class="font-mono text-secondary">Prime&nbsp;Agent</span> · <span class="font-mono text-secondary">Prime&nbsp;Agent</span> — 티켓마다 골라, 격리된 <span class="font-mono text-primary">git&nbsp;worktree</span> 안에서 병렬로 실행하고, 터미널을 벗어날 필요 없는 Jira 스타일 TUI에서 실시간으로 지켜본다.`,
+      "hero.h1": `터미널 하나.<br/>칸반 보드 하나.<br/><span class="text-primary">여러 AI 코딩 에이전트.</span>`,
+      "hero.sub": `<span class="font-mono text-secondary">Codex</span> · <span class="font-mono text-secondary">Claude&nbsp;Code</span> · <span class="font-mono text-secondary">GitHub&nbsp;Copilot</span> · <span class="font-mono text-secondary">Gemini</span> · <span class="font-mono text-secondary">AGY</span> · <span class="font-mono text-secondary">Kiro</span> · <span class="font-mono text-secondary">OpenCode</span> · <span class="font-mono text-secondary">Pi</span> · <span class="font-mono text-secondary">Prime&nbsp;Agent</span> — 티켓마다 골라, 격리된 <span class="font-mono text-primary">git&nbsp;worktree</span> 안에서 병렬로 실행하고, 터미널을 벗어날 필요 없는 Jira 스타일 TUI에서 실시간으로 지켜본다.`,
       "hero.cta1": `60초 만에 체험하기 <span>→</span>`,
       "hero.cta2": `GitHub에서 보기`,
       "hero.caption": `<span class="text-primary">›</span> 컬럼은 트래커의 상태 · 카드는 실행 중 에이전트·턴 수·마지막 이벤트·누적 토큰을 표시 · ● 실행 중, ↻ 재시도 대기, ✓ 완료.`,
       "feat.title": `Symphony를 쓰는 이유`,
-      "feat.sub": `파일 우선 오케스트레이터 포크 — 여덟 가지 에이전트, Jira 스타일 TUI, 내장 웹 보드, 로컬 신뢰성 guardrail을 더했다.`,
+      "feat.sub": `파일 우선 오케스트레이터 포크 — 여러 에이전트, Jira 스타일 TUI, 내장 웹 보드, 로컬 신뢰성 guardrail을 더했다.`,
       "feat.c1.h": `벤더 종속 없음`,
-      "feat.c1.b": `YAML 한 줄로 Codex ↔ Claude Code ↔ Gemini ↔ AGY ↔ Kiro ↔ OpenCode ↔ Pi ↔ Prime Agent 교체. 새 에이전트는 얇은 <code class="font-mono text-primary text-[13px]">AgentBackend</code> Protocol 뒤에 끼워 넣으면 된다.`,
+      "feat.c1.b": `YAML 한 줄로 Codex ↔ Claude Code ↔ GitHub Copilot ↔ Gemini ↔ AGY ↔ Kiro ↔ OpenCode ↔ Pi ↔ Prime Agent 교체. 새 에이전트는 얇은 <code class="font-mono text-primary text-[13px]">AgentBackend</code> Protocol 뒤에 끼워 넣으면 된다.`,
       "feat.c2.h": `실시간 진행 상황`,
       "feat.c2.b": `실행 중인 모든 카드의 턴 수, 마지막 이벤트, 누적 토큰, 레이트 리밋 여유분 표시. "멈춘 건가, 생각 중인가?"는 이제 끝 — 로그인할 SaaS 대시보드도 없다.`,
       "feat.c3.h": `기본이 병렬`,
@@ -752,9 +760,9 @@
       "who.c2.h": `팀`,
       "who.c2.b": `버그 수정, 문서 갱신, 마이그레이션 티켓을 여러 코딩 에이전트에 걸쳐 동시에 병렬화한다 — 여러 채팅 창을 저글링하지 않고.`,
       "who.c3.h": `연구자 & 리뷰어`,
-      "who.c3.b": `Codex, Claude Code, Gemini, AGY/Antigravity, Kiro, OpenCode, Pi와 Prime Agent가 같은 작업을 어떻게 푸는지 나란히 비교한다 — 동일한 프롬프트, 동일한 워크스페이스.`,
+      "who.c3.b": `Codex, Claude Code, GitHub Copilot, Gemini, AGY/Antigravity, Kiro, OpenCode, Pi와 Prime Agent가 같은 작업을 어떻게 푸는지 나란히 비교한다 — 동일한 프롬프트, 동일한 워크스페이스.`,
       "cta.title": `AI 코딩 CLI 저글링은 그만.`,
-      "cta.sub": `터미널 하나. 칸반 하나. 병렬로 일하는 에이전트 여덟 — 보이고, 격리되고, 당신의 것.`,
+      "cta.sub": `터미널 하나. 칸반 하나. 병렬로 일하는 여러 에이전트 — 보이고, 격리되고, 당신의 것.`,
       "cta.b1": `시작하기 <span>→</span>`,
       "cta.b2": `문서 읽기`,
       "cta.meta1": `<a class="text-secondary hover:underline" href="https://github.com/openai/symphony">openai/symphony</a>에서 포크`,

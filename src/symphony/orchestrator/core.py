@@ -20,10 +20,12 @@ from __future__ import annotations
 
 import asyncio
 import copy
+import math
 import json
 import os
 import re
 import subprocess
+import threading
 import time
 import traceback
 from dataclasses import dataclass, replace
@@ -31,7 +33,7 @@ from datetime import datetime, timedelta, timezone
 from enum import Enum
 from functools import partial
 from pathlib import Path, PurePosixPath
-from typing import Any, Awaitable, Callable, Coroutine, cast
+from typing import Any, Awaitable, Callable, Coroutine, TypeVar, cast
 
 from .. import __version__
 from .._shell import kill_process_group, process_group_exists, process_identity
@@ -41,13 +43,16 @@ from ..backends import (
     EVENT_APPROVAL_DENIED,
     EVENT_COMPACTION,
     EVENT_OTHER_MESSAGE,
+    EVENT_PROVIDER_USAGE_EXHAUSTED,
     EVENT_TURN_FAILED,
     EVENT_SESSION_STARTED,
     EVENT_TURN_COMPLETED,
     AgentBackend,
     BackendInit,
+    ProviderCapacityError,
     redact_session_id,
 )
+
 from ..backends import build_backend
 from ..chat import cfg_for_mode
 from ..utils import git_inspect
@@ -74,9 +79,10 @@ from ..issue import BlockerRef, Issue, normalize_state
 from ..logging import get_logger
 from ..prompt import build_continuation_prompt, build_first_turn_prompt
 from ..runtime_safety import ensure_workflow_repo_is_safe
+from ..service_identity import SERVICE_INSTANCE_ENV, normalize_service_instance_id
 from ..skills import render_skill_block
 from ..stats import StatsStore, stats_store_for
-from ..trackers import build_tracker_client
+from ..trackers import TrackerClient, build_tracker_client
 from ..utils.wiki_sweep import sweep as _wiki_sweep_run
 from ..workflow import (
     DEFAULT_TERMINAL_STATES,
@@ -173,6 +179,11 @@ from .run_registry import (
     RunRegistry,
     registry_path_for_workflow,
 )
+from .usage import (
+    ProviderUsageManager,
+    UsageDecision,
+    format_wait_reason,
+)
 
 
 # Initiative D — the former ``_pkg.<name>`` parent-package indirection is
@@ -255,6 +266,33 @@ class _ReleaseDispatchAuthority:
 
 class _ReleaseTransitionAuthorityLost(SymphonyError):
     """A stale release worker must exit without mutating its replacement."""
+
+
+_T = TypeVar("_T")
+
+
+class _TrackerClientUnavailable(SymphonyError):
+    """The shared tracker client is closed or closing (stop() raced a poll).
+
+    Raised by `_checkout_shared_tracker_client` and by bridge invocations
+    that observe the pool closing mid-call. Callers already treat tracker
+    bridge failures as retryable (next tick rebuilds or skips), so this is
+    a clean, loggable dead-end rather than a thread-killing RuntimeError.
+    """
+
+
+# httpx raises a bare RuntimeError with this message from `Client.send`
+# once `close()` has run — the exact text is its only stable contract.
+_HTTPX_CLIENT_CLOSED_MARKERS = (
+    "client has been closed",
+    "client has already been closed",
+)
+
+
+def _is_closed_client_runtime_error(exc: BaseException) -> bool:
+    return isinstance(exc, RuntimeError) and any(
+        marker in str(exc) for marker in _HTTPX_CLIENT_CLOSED_MARKERS
+    )
 
 
 # The one path a continuous-improvement agent turn may write in the host
@@ -350,6 +388,103 @@ def _normalize_agent_pid(value: object) -> int | None:
     return None
 
 
+def _reclaim_kill_confirm(record: RunRecord) -> str | None:
+    """Prove-and-kill one reclaimed run's recorded backend process.
+
+    Pure OS work — identity probe, process-group kill, and the bounded
+    gone-confirm poll — with no registry access, so callers can run it
+    inside ``asyncio.to_thread`` without breaking the registry's
+    thread-affine SQLite connection. Returns the outcome label
+    ("killed" / "not_found" / "identity_mismatch"), or ``None`` when the
+    incarnation could not be proven and the caller must NOT finalize.
+    """
+    pid = record.backend_agent_pid
+    if pid is not None and pid <= 0:
+        log.warning(
+            "reclaim_invalid_orphan_agent_pid",
+            issue_id=record.issue_id,
+            identifier=record.identifier,
+            pid=pid,
+        )
+        return None
+    if pid is None:
+        return "no_backend_pid"
+    expected_identity = record.backend_process_identity
+    current_identity = process_identity(pid)
+    group_exists = process_group_exists(pid)
+    if current_identity is None:
+        if group_exists is not False:
+            log.warning(
+                "reclaim_backend_identity_ambiguous",
+                issue_id=record.issue_id,
+                identifier=record.identifier,
+                pid=pid,
+            )
+            return None
+        outcome = "not_found"
+    elif expected_identity is None:
+        # Pre-v8 or failed identity capture: never signal a reusable
+        # numeric pid without proving it is the recorded incarnation.
+        log.warning(
+            "reclaim_backend_identity_missing",
+            issue_id=record.issue_id,
+            identifier=record.identifier,
+            pid=pid,
+        )
+        return None
+    elif current_identity != expected_identity:
+        # The recorded process incarnation is gone and this pid was
+        # reused. Do not signal the unrelated replacement.
+        outcome = "identity_mismatch"
+    else:
+        try:
+            killed = kill_process_group(pid)
+        except Exception as exc:
+            log.warning(
+                "reclaim_killed_orphan_agent",
+                issue_id=record.issue_id,
+                identifier=record.identifier,
+                pid=pid,
+                outcome=f"error: {type(exc).__name__}",
+            )
+            return None
+        if killed:
+            deadline = time.monotonic() + 1.0
+            confirmed_gone = process_group_exists(pid) is False
+            while not confirmed_gone and time.monotonic() < deadline:
+                time.sleep(0.05)
+                confirmed_gone = process_group_exists(pid) is False
+            if not confirmed_gone:
+                log.warning(
+                    "reclaim_killed_orphan_agent",
+                    issue_id=record.issue_id,
+                    identifier=record.identifier,
+                    pid=pid,
+                    outcome="unconfirmed",
+                )
+                return None
+            outcome = "killed"
+        elif process_group_exists(pid) is False:
+            outcome = "not_found"
+        else:
+            log.warning(
+                "reclaim_killed_orphan_agent",
+                issue_id=record.issue_id,
+                identifier=record.identifier,
+                pid=pid,
+                outcome="ambiguous",
+            )
+            return None
+    log.warning(
+        "reclaim_killed_orphan_agent",
+        issue_id=record.issue_id,
+        identifier=record.identifier,
+        pid=pid,
+        outcome=outcome,
+    )
+    return outcome
+
+
 def _backend_agent_pid(backend: AgentBackend) -> int | None:
     return _normalize_agent_pid(getattr(backend, "pid", None))
 
@@ -397,9 +532,12 @@ def _run_record_payload(record: RunRecord) -> dict[str, Any]:
         "status": record.status,
         "started_at": record.started_at.isoformat() if record.started_at else None,
         "updated_at": record.updated_at.isoformat() if record.updated_at else None,
-        "completed_at": record.completed_at.isoformat() if record.completed_at else None,
+        "completed_at": record.completed_at.isoformat()
+        if record.completed_at
+        else None,
         "workspace_path": str(record.workspace_path) if record.workspace_path else None,
-        "branch_name": record.branch_name or f"{SYMPHONY_BRANCH_PREFIX}{record.identifier}",
+        "branch_name": record.branch_name
+        or f"{SYMPHONY_BRANCH_PREFIX}{record.identifier}",
         "commit_sha": record.commit_sha,
         "continued_from_run_id": record.continued_from_run_id,
         "checkpoint": (
@@ -743,7 +881,11 @@ class Orchestrator:
         build_backend: Callable[[BackendInit], AgentBackend] | None = None,
         improvement_runner: ImprovementRunner | None = None,
         improvement_lease: Lease | None = None,
+        usage_manager: ProviderUsageManager | None = None,
     ) -> None:
+        self._service_instance_id = normalize_service_instance_id(
+            os.environ.pop(SERVICE_INSTANCE_ENV, None)
+        )
         self._workflow_state = workflow_state
         # Initiative D — backend factory via constructor injection. None
         # falls back to the module-level `build_backend`, looked up at call
@@ -755,6 +897,10 @@ class Orchestrator:
         # read-only properties below keep the many legacy read sites (and
         # tests) working; mutations should go through its methods.
         self._dispatch_state = DispatchState()
+        # Shared provider usage manager for evaluating quota caps across profiles
+        self._usage_manager: ProviderUsageManager = (
+            usage_manager or ProviderUsageManager()
+        )
         # C5 — `Done`-transition counter for the periodic wiki sweep. Lives
         # in-process; restart resets it (acceptable — the sweep is a
         # housekeeping nudge, not a correctness gate). Wraparound at
@@ -809,8 +955,26 @@ class Orchestrator:
         self._tick_task: asyncio.Task[None] | None = None
         self._tick_event = asyncio.Event()
         self._stopping = False
+        # One cached tracker client per orchestrator lifetime for the
+        # `_tracker_call_*` bridge helpers below — the Jira/Linear adapters
+        # wrap an httpx connection pool per client, so building one per
+        # call threw away connection reuse on every poll tick. Built
+        # lazily on first use, closed in `stop()`. Guarded by a lock
+        # because the bridges run on `asyncio.to_thread` worker threads.
+        # The lock is reentrant: checkout delegates may re-enter guarded
+        # helpers on the same thread.
+        self._tracker_client: TrackerClient | None = None
+        self._tracker_client_cfg: ServiceConfig | None = None
+        self._tracker_client_closed = False
+        # `closing` covers the window while stop() is closing the pool:
+        # new checkouts fail fast instead of rebuilding into a pool that
+        # is about to disappear (or leaking a fresh client past stop()).
+        self._tracker_client_closing = False
+        self._tracker_client_close_race_logged = False
+        self._tracker_client_lock = threading.RLock()
         self._refresh_pending = False
         self._observers: list[Callable[[], Awaitable[None]]] = []
+
         # Operator-driven pause is split into two pieces:
         #   * `_paused_issue_ids` — the authoritative "this ticket is held"
         #     flag. Set on pause_worker, cleared only on resume_worker (or
@@ -911,6 +1075,10 @@ class Orchestrator:
     def _turn_budget_exhausted(self) -> set[str]:
         return self._dispatch_state.turn_budget_exhausted
 
+    @property
+    def usage_manager(self) -> ProviderUsageManager:
+        return self._usage_manager
+
     def _build_agent_backend(self, init: BackendInit) -> AgentBackend:
         """Resolve the backend factory: injected > module global (patchable)."""
         factory = self._build_backend_override
@@ -998,7 +1166,15 @@ class Orchestrator:
             agent_pgid = _normalize_agent_pid(entry.agent_pgid)
             if agent_pgid is not None:
                 try:
-                    killed = kill_process_group(agent_pgid)
+                    # win32 kill_process_group shells out to `taskkill /T`;
+                    # keep that subprocess off the event loop so stop()
+                    # drains never stall the service on a slow kill. The
+                    # recorded identity fingerprint gates pid reuse.
+                    killed = await asyncio.to_thread(
+                        kill_process_group,
+                        agent_pgid,
+                        identity=self._agent_pid_identity(entry),
+                    )
                 except Exception as exc:
                     log.warning(
                         "worker_process_kill_failed_on_stop",
@@ -1026,6 +1202,11 @@ class Orchestrator:
         return self._workflow_state
 
     @property
+    def service_instance_id(self) -> str | None:
+        """Per-launch managed-service capability, absent for foreground runs."""
+        return self._service_instance_id
+
+    @property
     def stats(self) -> StatsStore | None:
         return self._stats
 
@@ -1046,11 +1227,20 @@ class Orchestrator:
         self._last_registry_error = None
         return result
 
-    def _ensure_run_registry(self, cfg: ServiceConfig) -> None:
+    def _open_run_registry(self, cfg: ServiceConfig) -> tuple[RunRegistry | None, bool]:
+        """Open (or reuse) the run registry connection.
+
+        Returns ``(registry, fresh)``. ``fresh`` is True only when a NEW
+        connection was opened (callers run reclaim + open-maintenance
+        then); an existing path-matched registry returns ``(registry,
+        False)`` so maintenance is skipped, mirroring the historical
+        early return. Open failures log, bump the error counters, and
+        return ``(None, False)``.
+        """
         self._run_registry_initialized = True
         path = registry_path_for_workflow(cfg.workflow_path)
         if self._run_registry is not None and self._run_registry.path == path:
-            return
+            return self._run_registry, False
         if self._run_registry is not None:
             self._run_registry.close()
         try:
@@ -1060,14 +1250,62 @@ class Orchestrator:
             self._registry_error_count += 1
             self._last_registry_error = f"open: {exc}"
             log.error("run_registry_open_failed", path=str(path), error=str(exc))
-            return
-        registry = self._run_registry
-        self._reclaim_dead_owner_runs(registry, path=path)
+            return None, False
+        return self._run_registry, True
+
+    def _finish_run_registry_open(
+        self, registry: RunRegistry, cfg: ServiceConfig, path: Path
+    ) -> None:
+        """Post-open maintenance: expire stale leases, rehydrate flags."""
         expired = self._registry_guard("expire_stale", registry.expire_stale, 0)
         if expired:
             log.info("run_leases_expired_on_start", count=expired, path=str(path))
         flags = self._registry_guard("list_issue_flags", registry.list_issue_flags, [])
         self._rehydrate_issue_flags(flags, cfg=cfg, registry=registry)
+
+    def _ensure_run_registry(self, cfg: ServiceConfig) -> None:
+        """Open the registry and reclaim dead-owner leases (blocking form).
+
+        The per-record kill+confirm (taskkill / SIGKILL plus the bounded
+        gone-confirm poll) runs inline on the calling thread, completing
+        before this returns. Event-loop callers must use
+        `_ensure_run_registry_async` instead so the OS kill never stalls
+        the tick loop.
+        """
+        registry, fresh = self._open_run_registry(cfg)
+        if not fresh or registry is None:
+            return
+        self._reclaim_dead_owner_runs(registry, path=registry.path)
+        self._finish_run_registry_open(registry, cfg, registry.path)
+
+    async def _ensure_run_registry_async(self, cfg: ServiceConfig) -> None:
+        """Event-loop form of `_ensure_run_registry`.
+
+        Identical semantics — open, reclaim dead owners (kill+confirm
+        completed before return, 'reclaiming' fence observable mid-kill),
+        expire, rehydrate — except each record's blocking kill+confirm
+        runs in a worker thread, so the tick loop keeps servicing ticks
+        while a slow taskkill drains.
+        """
+        registry, fresh = self._open_run_registry(cfg)
+        if not fresh or registry is None:
+            return
+        await self._reclaim_dead_owner_runs_async(registry, path=registry.path)
+        self._finish_run_registry_open(registry, cfg, registry.path)
+
+    def _ensure_run_registry_open_only(self, cfg: ServiceConfig) -> None:
+        """Open + maintenance for sync callers that must never block.
+
+        Same as `_ensure_run_registry` minus the OS-level dead-owner
+        reclaim: the release-gate fallback runs on the event loop and a
+        taskkill there would stall ticks. Dead-owner leases are still
+        honored (they block acquisition) and reclaimed by the next tick's
+        off-loop pass, so correctness never depends on this side effect.
+        """
+        registry, fresh = self._open_run_registry(cfg)
+        if not fresh or registry is None:
+            return
+        self._finish_run_registry_open(registry, cfg, registry.path)
 
     def _reclaim_dead_owner_runs(
         self, registry: RunRegistry, *, path: Path | None = None
@@ -1090,14 +1328,40 @@ class Orchestrator:
             path=str(path or registry.path),
         )
 
+    async def _reclaim_dead_owner_runs_async(
+        self, registry: RunRegistry, *, path: Path | None = None
+    ) -> None:
+        """`_reclaim_dead_owner_runs` with each kill+confirm off the loop."""
+        reclaimed = self._registry_guard(
+            "reclaim_dead_owner", registry.reclaim_dead_owner_leases, []
+        )
+        if not reclaimed:
+            return
+        finalized = []
+        for record in reclaimed:
+            if await self._reap_and_finalize_reclaimed_run_async(registry, record):
+                finalized.append(record)
+        log.info(
+            "run_leases_reclaimed_dead_owner",
+            count=len(finalized),
+            pending_count=len(reclaimed) - len(finalized),
+            identifiers=[record.identifier for record in finalized],
+            path=str(path or registry.path),
+        )
+
     def _release_registry_required(self, cfg: ServiceConfig) -> RunRegistry:
         """Return the release authority store or fail closed.
 
         Ordinary lease bookkeeping intentionally degrades when SQLite is
         unavailable. Application release authority cannot: a missing read
         must never turn a pending verifier or finalizer into a normal ticket.
+
+        Opens without the OS-level reclaim (see
+        `_ensure_run_registry_open_only`) — this fallback can run on the
+        event loop, and dead-owner cleanup is covered by the per-tick
+        off-loop reclaim pass.
         """
-        self._ensure_run_registry(cfg)
+        self._ensure_run_registry_open_only(cfg)
         registry = self._run_registry
         if registry is None:
             raise SymphonyError(
@@ -1961,90 +2225,16 @@ class Orchestrator:
     def _reap_and_finalize_reclaimed_run(
         self, registry: RunRegistry, record: RunRecord
     ) -> bool:
-        """Verify process incarnation, reap it, then release the SQLite fence."""
-        pid = record.backend_agent_pid
-        if pid is not None and pid <= 0:
-            log.warning(
-                "reclaim_invalid_orphan_agent_pid",
-                issue_id=record.issue_id,
-                identifier=record.identifier,
-                pid=pid,
-            )
+        """Verify process incarnation, reap it, then release the SQLite fence.
+
+        Blocking form for synchronous callers (tests, the sync ensure
+        fallback): the OS-level kill+confirm runs inline on this thread.
+        The registry finalize below stays on the caller's thread so the
+        SQLite connection never crosses threads.
+        """
+        outcome = _reclaim_kill_confirm(record)
+        if outcome is None:
             return False
-        if pid is not None:
-            expected_identity = record.backend_process_identity
-            current_identity = process_identity(pid)
-            group_exists = process_group_exists(pid)
-            if current_identity is None:
-                if group_exists is not False:
-                    log.warning(
-                        "reclaim_backend_identity_ambiguous",
-                        issue_id=record.issue_id,
-                        identifier=record.identifier,
-                        pid=pid,
-                    )
-                    return False
-                outcome = "not_found"
-            elif expected_identity is None:
-                # Pre-v8 or failed identity capture: never signal a reusable
-                # numeric pid without proving it is the recorded incarnation.
-                log.warning(
-                    "reclaim_backend_identity_missing",
-                    issue_id=record.issue_id,
-                    identifier=record.identifier,
-                    pid=pid,
-                )
-                return False
-            elif current_identity != expected_identity:
-                # The recorded process incarnation is gone and this pid was
-                # reused. Do not signal the unrelated replacement.
-                outcome = "identity_mismatch"
-            else:
-                try:
-                    killed = kill_process_group(pid)
-                except Exception as exc:
-                    log.warning(
-                        "reclaim_killed_orphan_agent",
-                        issue_id=record.issue_id,
-                        identifier=record.identifier,
-                        pid=pid,
-                        outcome=f"error: {type(exc).__name__}",
-                    )
-                    return False
-                if killed:
-                    deadline = time.monotonic() + 1.0
-                    confirmed_gone = process_group_exists(pid) is False
-                    while not confirmed_gone and time.monotonic() < deadline:
-                        time.sleep(0.05)
-                        confirmed_gone = process_group_exists(pid) is False
-                    if not confirmed_gone:
-                        log.warning(
-                            "reclaim_killed_orphan_agent",
-                            issue_id=record.issue_id,
-                            identifier=record.identifier,
-                            pid=pid,
-                            outcome="unconfirmed",
-                        )
-                        return False
-                    outcome = "killed"
-                elif process_group_exists(pid) is False:
-                    outcome = "not_found"
-                else:
-                    log.warning(
-                        "reclaim_killed_orphan_agent",
-                        issue_id=record.issue_id,
-                        identifier=record.identifier,
-                        pid=pid,
-                        outcome="ambiguous",
-                    )
-                    return False
-            log.warning(
-                "reclaim_killed_orphan_agent",
-                issue_id=record.issue_id,
-                identifier=record.identifier,
-                pid=pid,
-                outcome=outcome,
-            )
         return bool(
             self._registry_guard(
                 "finalize_reclaimed_lease",
@@ -2053,8 +2243,30 @@ class Orchestrator:
             )
         )
 
+    async def _reap_and_finalize_reclaimed_run_async(
+        self, registry: RunRegistry, record: RunRecord
+    ) -> bool:
+        """Off-event-loop form of `_reap_and_finalize_reclaimed_run`.
 
-    def recent_runs(
+        The blocking kill+confirm (taskkill + bounded gone-confirm poll)
+        runs in a worker thread; the SQLite claim state and the finalize
+        below stay on the event-loop thread, preserving the registry's
+        thread-affine connection. The kill still completes before this
+        coroutine returns, so the 'reclaiming' fence is observable
+        mid-kill and finalized only afterwards.
+        """
+        outcome = await asyncio.to_thread(_reclaim_kill_confirm, record)
+        if outcome is None:
+            return False
+        return bool(
+            self._registry_guard(
+                "finalize_reclaimed_lease",
+                lambda: registry.finalize_reclaimed_lease(record.run_id),
+                False,
+            )
+        )
+
+    async def recent_runs(
         self,
         issue_id: str | None = None,
         limit: int = 50,
@@ -2067,7 +2279,9 @@ class Orchestrator:
         if registry is None:
             cfg = self._workflow_state.current()
             if cfg is not None:
-                self._ensure_run_registry(cfg)
+                # Async: the fallback open's dead-owner reclaim (taskkill)
+                # must not block the web loop this handler runs on.
+                await self._ensure_run_registry_async(cfg)
                 registry = self._run_registry
         if registry is None:
             return [], "run registry unavailable"
@@ -2087,7 +2301,72 @@ class Orchestrator:
             return [], self._last_registry_error
         return [_run_record_payload(row) for row in rows], None
 
-    def run_detail(self, run_id: str) -> tuple[dict[str, Any] | None, str | None]:
+    def recent_runs_sync(
+        self,
+        issue_id: str | None = None,
+        limit: int = 50,
+        *,
+        query: str | None = None,
+        status: str | None = None,
+        agent: str | None = None,
+    ) -> tuple[list[dict[str, Any]], str | None]:
+        """Synchronous registry view for CLI/non-event-loop callers."""
+        registry = self._run_registry
+        if registry is None:
+            cfg = self._workflow_state.current()
+            if cfg is not None:
+                self._ensure_run_registry(cfg)
+                registry = self._run_registry
+        if registry is None:
+            return [], "run registry unavailable"
+        rows = self._registry_guard(
+            "recent_runs",
+            lambda: registry.recent_runs(
+                issue_id=issue_id, limit=limit, query=query, status=status, agent=agent
+            ),
+            None,
+        )
+        if rows is None:
+            return [], self._last_registry_error
+        return [_run_record_payload(row) for row in rows], None
+
+    async def run_detail(self, run_id: str) -> tuple[dict[str, Any] | None, str | None]:
+        registry = self._run_registry
+        if registry is None:
+            cfg = self._workflow_state.current()
+            if cfg is not None:
+                await self._ensure_run_registry_async(cfg)
+                registry = self._run_registry
+        if registry is None:
+            return None, "run registry unavailable"
+        try:
+            return registry.run_detail(run_id), None
+        except KeyError:
+            return None, None
+        except Exception as exc:
+            self._registry_error_count += 1
+            self._last_registry_error = f"run_detail: {exc}"
+            return None, self._last_registry_error
+
+    async def run_diagnostic(self, run_id: str) -> tuple[dict[str, Any] | None, str | None]:
+        registry = self._run_registry
+        if registry is None:
+            cfg = self._workflow_state.current()
+            if cfg is not None:
+                await self._ensure_run_registry_async(cfg)
+                registry = self._run_registry
+        if registry is None:
+            return None, "run registry unavailable"
+        try:
+            return registry.diagnostic_json(run_id), None
+        except KeyError:
+            return None, None
+        except Exception as exc:
+            self._registry_error_count += 1
+            self._last_registry_error = f"run_diagnostic: {exc}"
+            return None, self._last_registry_error
+
+    def run_detail_sync(self, run_id: str) -> tuple[dict[str, Any] | None, str | None]:
         registry = self._run_registry
         if registry is None:
             cfg = self._workflow_state.current()
@@ -2105,7 +2384,7 @@ class Orchestrator:
             self._last_registry_error = f"run_detail: {exc}"
             return None, self._last_registry_error
 
-    def run_diagnostic(self, run_id: str) -> tuple[dict[str, Any] | None, str | None]:
+    def run_diagnostic_sync(self, run_id: str) -> tuple[dict[str, Any] | None, str | None]:
         registry = self._run_registry
         if registry is None:
             cfg = self._workflow_state.current()
@@ -2434,6 +2713,9 @@ class Orchestrator:
                 attempt=entry.retry_attempt,
                 attempt_kind="reacquired",
                 agent_kind=entry.agent_kind,
+                agent_profile=entry.agent_profile,
+                model=entry.model,
+                reasoning_effort=entry.reasoning_effort,
             ),
             "",
         )
@@ -2457,6 +2739,29 @@ class Orchestrator:
             issue_identifier=entry.issue.identifier,
         )
         return False
+
+    def _agent_pid_identity(self, entry: RunningEntry) -> str | None:
+        """Return the identity fingerprint recorded with this entry's pid.
+
+        The registry's heartbeat persists ``process_identity(pid)`` as
+        ``backend_process_identity`` at the moment `_sync_backend_agent_pid`
+        first records the pid, so the fingerprint survives restarts. None
+        when no registry/run row backs the entry, or when the platform
+        cannot prove identity (win32) — callers pass ``identity=None``
+        through, which keeps the ungated kill-with-warn-once behavior.
+        Lookup failures degrade to None rather than blocking a legitimate
+        kill: the fingerprint is hardening, not authority.
+        """
+        registry = self._run_registry
+        if registry is None or not entry.run_id:
+            return None
+        try:
+            record = registry.get_run(entry.run_id)
+        except KeyError:
+            return None
+        except Exception:
+            return None
+        return record.backend_process_identity
 
     def _sync_backend_agent_pid(
         self, issue_id: str, backend_agent_pid: int | None
@@ -2692,13 +2997,11 @@ class Orchestrator:
         # authors can then reference it from `claude.command` etc., e.g.
         # `--add-dir "$SYMPHONY_WORKFLOW_DIR/kanban"` so Claude Code accepts
         # writes through the host-board junction installed by after_create.
-        import os as _os
-
-        _os.environ["SYMPHONY_WORKFLOW_DIR"] = str(cfg.workflow_path.parent)
+        os.environ["SYMPHONY_WORKFLOW_DIR"] = str(cfg.workflow_path.parent)
         # The board-tool protocol in the stage prompts and the chat preamble
         # requires the `symphony` CLI; a venv install is not necessarily on
         # the worker's PATH. Prompts reference `${SYMPHONY_CLI:-symphony}`.
-        _os.environ["SYMPHONY_CLI"] = resolve_symphony_cli()
+        os.environ["SYMPHONY_CLI"] = resolve_symphony_cli()
         self._workspace_manager = WorkspaceManager(
             cfg.workspace_root,
             cfg.hooks,
@@ -2719,7 +3022,7 @@ class Orchestrator:
                 max_ticket_bytes=cfg.artifacts.max_ticket_mb * 1024 * 1024,
             )
             self._ensure_artifact_dir_git_excluded(cfg)
-        self._ensure_run_registry(cfg)
+        await self._ensure_run_registry_async(cfg)
         await self._startup_terminal_cleanup(cfg)
         self._spawn_tick_loop()
 
@@ -2801,6 +3104,20 @@ class Orchestrator:
         if self._run_registry is not None:
             self._run_registry.close()
             self._run_registry = None
+        # Close the per-lifetime tracker client AFTER the drains above so
+        # in-flight `asyncio.to_thread` bridges finish first. Bridges that
+        # still slip through afterwards raise a clean retryable
+        # `TrackerClientUnavailable` (see `_invoke_shared_tracker_client`)
+        # instead of touching the closed pool or rebuilding past shutdown.
+        with self._tracker_client_lock:
+            # New checkouts must fail fast while the pool is closing; a
+            # rebuild here would race the close and leak a fresh client.
+            self._tracker_client_closing = True
+            if self._tracker_client is not None:
+                self._tracker_client.close()
+                self._tracker_client = None
+                self._tracker_client_cfg = None
+                self._tracker_client_closed = True
 
     # ------------------------------------------------------------------
     # observers (§13)
@@ -2857,12 +3174,126 @@ class Orchestrator:
                 ),
             },
             "rate_limits": self._latest_rate_limits,
+            "provider_usage": self._provider_usage_projection(),
             "workflow": {
                 "default_agent_kind": cfg.agent.kind if cfg is not None else "",
                 "branch_policy": self._branch_policy_snapshot(cfg),
             },
             "health": self._health_summary(),
         }
+
+    def _provider_usage_projection(self) -> dict[str, Any]:
+        """Project usage-pool-aware runtime data for all configured and known pools."""
+        cfg = self._workflow_state.current()
+        pool_ids: set[str] = set()
+        if cfg is not None and cfg.usage_pools:
+            pool_ids.update(cfg.usage_pools.keys())
+        if self._usage_manager is not None:
+            pool_ids.update(self._usage_manager.snapshots.keys())
+
+        result: dict[str, Any] = {}
+        for pool_id in sorted(pool_ids):
+            pool_cfg = (
+                cfg.usage_pools.get(pool_id)
+                if (cfg is not None and cfg.usage_pools)
+                else None
+            )
+            snap = (
+                self._usage_manager.snapshot(pool_id)
+                if self._usage_manager is not None
+                else None
+            )
+
+            source = (
+                snap.source
+                if snap is not None
+                else (pool_cfg.source if pool_cfg is not None else pool_id)
+            )
+            stale = snap.stale if snap is not None else False
+            authoritative = snap.authoritative if snap is not None else True
+
+            windows_proj: dict[str, Any] = {}
+            if snap is not None and snap.windows:
+                for w_key, w in snap.windows.items():
+                    used = w.used_percent
+                    if isinstance(used, (int, float)) and not isinstance(used, bool):
+                        used = float(used) if math.isfinite(float(used)) else None
+                    remaining = w.remaining_percent
+                    if isinstance(remaining, (int, float)) and not isinstance(remaining, bool):
+                        remaining = (
+                            float(remaining)
+                            if math.isfinite(float(remaining))
+                            else None
+                        )
+                    if remaining is None and used is not None:
+                        remaining = (
+                            round(100.0 - float(used), 2)
+                            if isinstance(used, float)
+                            else 100 - used
+                        )
+                    resets = (
+                        w.resets_at.isoformat()
+                        if isinstance(w.resets_at, datetime)
+                        else w.resets_at
+                    )
+                    windows_proj[w_key] = {
+                        "used_percent": used,
+                        "remaining_percent": remaining,
+                        "resets_at": resets,
+                    }
+                    if w.group_key is not None:
+                        windows_proj[w_key]["group"] = w.group_key
+                    if w.period_key is not None:
+                        windows_proj[w_key]["period"] = w.period_key
+            if snap is None:
+                status = "unavailable"
+            elif snap.hard_limit_reached:
+                status = "capacity_paused"
+            elif snap.status == "unavailable" or not any(
+                window.used_percent is not None
+                or window.remaining_percent is not None
+                or window.resets_at is not None
+                for window in snap.windows.values()
+            ):
+                # A quota card with no actual windows is not an available
+                # snapshot; reporting "available" would contradict the UI's
+                # unavailable telemetry state.
+                status = "unavailable"
+            elif (
+                pool_cfg is not None
+                and self._usage_manager is not None
+                and self._usage_manager.evaluate(pool_id, pool_cfg)
+                == UsageDecision.WAIT_PROVIDER_USAGE
+            ):
+                status = "capacity_paused"
+            else:
+                status = "available"
+
+            result[pool_id] = {
+                "source": source,
+                "windows": windows_proj,
+                "status": status,
+                "stale": stale,
+                "authoritative": authoritative,
+            }
+            if snap is not None:
+                if snap.error_code is not None:
+                    result[pool_id]["error_code"] = snap.error_code
+                if snap.last_success_at is not None:
+                    result[pool_id]["last_success_at"] = snap.last_success_at.isoformat()
+            if snap is not None and snap.credits is not None:
+                result[pool_id]["credits"] = {
+                    "has_credits": snap.credits.has_credits,
+                    "unlimited": snap.credits.unlimited,
+                    "balance": snap.credits.balance,
+                }
+
+        return result
+
+    def provider_usage_snapshot(self) -> dict[str, Any]:
+        """Project usage-pool-aware runtime metrics across all pools."""
+        return self._provider_usage_projection()
+
 
     def schedule_snapshot(self) -> dict[str, Any]:
         """Immutable projection authored by the last completed scheduler pass."""
@@ -2907,6 +3338,8 @@ class Orchestrator:
             "version": __version__,
             "generated_at": _utc_iso_z(),
             "workflow_path": str(self._workflow_state.path),
+            "service_instance_id": self._service_instance_id,
+            "orchestrator_pid": os.getpid(),
             "tick": {
                 "alive": tick_alive,
                 "started": tick_started,
@@ -3406,16 +3839,18 @@ class Orchestrator:
         except OSError as exc:
             log.warning("done_count_persist_failed", path=str(path), error=str(exc))
 
-    def _maybe_run_wiki_sweep(self, cfg: ServiceConfig, *, identifier: str) -> None:
+    async def _maybe_run_wiki_sweep(self, cfg: ServiceConfig, *, identifier: str) -> None:
         """C5 — bump the Done counter and run wiki-sweep every Nth time.
 
-        Called from the two Done-transition sites (`_on_worker_exit` and
-        the reconcile-driven path). `sweep_every_n: 0` disables the
-        auto-sweep entirely. The sweep is intentionally synchronous and
-        best-effort: it runs in-process for simplicity (the typical wiki
-        is small), failures only log a warning, and never block the
-        Done transition. The counter is persisted after every Done so
-        sweep cadence survives orchestrator restarts.
+        Called (awaited) from the two Done-transition sites
+        (`_on_worker_exit` and the reconcile-driven path). `sweep_every_n:
+        0` disables the auto-sweep entirely. The sweep is best-effort and
+        runs in-process for simplicity (the typical wiki is small), but
+        off the event loop via `asyncio.to_thread` so a slow filesystem
+        scan cannot stall ticks or delay shutdown. Failures only log a
+        warning and never block the Done transition. The counter is
+        persisted after every Done so sweep cadence survives
+        orchestrator restarts.
         """
         every = cfg.wiki.sweep_every_n
         if every <= 0:
@@ -3428,7 +3863,7 @@ class Orchestrator:
         if root is None:
             return
         try:
-            report = _wiki_sweep_run(root, dry_run=False)
+            report = await asyncio.to_thread(_wiki_sweep_run, root, dry_run=False)
         except Exception as exc:
             log.warning(
                 "wiki_sweep_failed",
@@ -3656,11 +4091,11 @@ class Orchestrator:
             )
             self._workspace_manager.update_reuse_policy(cfg.workspace_reuse_policy)
             self._workspace_manager.update_hook_env(_branch_hook_env(cfg))
-        self._ensure_run_registry(cfg)
+        await self._ensure_run_registry_async(cfg)
         self._heartbeat_running_leases()
         if self._run_registry is not None:
             registry = self._run_registry
-            self._reclaim_dead_owner_runs(registry)
+            await self._reclaim_dead_owner_runs_async(registry)
             expired = self._registry_guard("expire_stale", registry.expire_stale, 0)
             if expired:
                 log.info("run_leases_expired", count=expired)
@@ -3707,6 +4142,20 @@ class Orchestrator:
             log.warning("blocked_fix_safety_sweep_failed", error=str(exc))
             await self._notify_observers()
             return
+
+        # Refresh usage pool snapshots if needed.
+        if cfg.usage_pools:
+            for pool_id, pool_cfg in cfg.usage_pools.items():
+                try:
+                    await self._usage_manager.refresh_if_needed(
+                        pool_id, pool_cfg.source
+                    )
+                except Exception as exc:
+                    log.warning(
+                        "usage_pool_refresh_failed",
+                        pool_id=pool_id,
+                        error=str(exc),
+                    )
 
         # Fetch candidates.
         try:
@@ -3757,10 +4206,7 @@ class Orchestrator:
                 }
                 await self._notify_observers()
                 return
-        if (
-            not dependency_graph_within_bounds
-            and cfg.agent.scheduling_policy == "fifo"
-        ):
+        if not dependency_graph_within_bounds and cfg.agent.scheduling_policy == "fifo":
             slots_before = self._available_slots(cfg)
             await self._dispatch_fifo_without_schedule_projection(candidates, cfg)
             self._schedule_snapshot = {
@@ -3803,10 +4249,7 @@ class Orchestrator:
         dependency_analysis = (
             await asyncio.to_thread(analyze_dependencies, candidates)
             if dependency_graph_within_bounds
-            and (
-                cfg.agent.scheduling_policy == "dag"
-                or cfg.tracker.kind == "file"
-            )
+            and (cfg.agent.scheduling_policy == "dag" or cfg.tracker.kind == "file")
             else DependencyAnalysis({}, {})
         )
         ordered_candidates = self._sort_with_wait_age_bump(
@@ -4057,9 +4500,7 @@ class Orchestrator:
                 issue,
                 cfg,
                 attempt=persisted_attempt,
-                attempt_kind=(
-                    "retry" if persisted_attempt is not None else None
-                ),
+                attempt_kind=("retry" if persisted_attempt is not None else None),
             )
 
     def _sort_with_wait_age_bump(
@@ -4242,7 +4683,9 @@ class Orchestrator:
         if store is None or cfg.artifacts.ttl_days <= 0:
             return
         try:
-            known = await asyncio.to_thread(self._tracker_call_retained_identifiers, cfg)
+            known = await asyncio.to_thread(
+                self._tracker_call_retained_identifiers, cfg
+            )
         except Exception as exc:
             log.warning("artifact_sweep_fetch_failed", error=str(exc))
             return
@@ -5497,6 +5940,40 @@ class Orchestrator:
             )
         return None
 
+    def _eligibility_usage_decision(
+        self, issue: Issue, cfg: ServiceConfig
+    ) -> _EligibilityDecision | None:
+        try:
+            selection = cfg.selection_for_state(
+                issue.state,
+                ticket_profile=_requested_agent_profile(issue),
+                ticket_kind=_requested_agent_kind(issue),
+            )
+        except ConfigValidationError:
+            return None
+
+        profile_cfg = (
+            cfg.agent_profiles.get(selection.profile) if selection.profile else None
+        )
+        pool_id = (
+            profile_cfg.usage_pool if profile_cfg and profile_cfg.usage_pool else None
+        ) or selection.kind
+
+        pool = cfg.usage_pools.get(pool_id)
+        if pool is None:
+            return None
+
+        decision = self._usage_manager.evaluate(pool_id, pool)
+        if decision is UsageDecision.WAIT_PROVIDER_USAGE:
+            snapshot = self._usage_manager.snapshot(pool_id)
+            reason = format_wait_reason(pool_id, pool, snapshot)
+            return _EligibilityDecision(
+                _EligibilityDisposition.WAIT_NON_SLOT,
+                "waiting_provider_usage",
+                reason,
+            )
+        return None
+
     def _eligibility_decision(
         self,
         issue: Issue,
@@ -5510,6 +5987,8 @@ class Orchestrator:
         )
         if decision is None:
             decision = self._eligibility_contract_decision(issue, cfg)
+        if decision is None:
+            decision = self._eligibility_usage_decision(issue, cfg)
         if decision is None:
             decision = self._eligibility_contention_decision(
                 issue, cfg, include_global_slots=include_global_slots
@@ -6212,7 +6691,9 @@ class Orchestrator:
         agent_profile = dispatch_selection.profile or ""
         resolved_agent = resolve_agent_config(cfg, dispatch_selection)
         model = getattr(resolved_agent.active_config, "model", "") or ""
-        reasoning_effort = getattr(resolved_agent.active_config, "reasoning_effort", "") or ""
+        reasoning_effort = (
+            getattr(resolved_agent.active_config, "reasoning_effort", "") or ""
+        )
         acquisition = self._try_acquire_run_lease(
             cfg=cfg,
             issue=issue,
@@ -6434,6 +6915,9 @@ class Orchestrator:
             issue_identifier=issue.identifier,
             attempt=attempt,
             agent_kind=entry.agent_kind,
+            agent_profile=entry.agent_profile,
+            model=entry.model,
+            reasoning_effort=entry.reasoning_effort,
         )
         # Persist the resolved backend onto the ticket so downstream
         # consumers (board UIs, audits, Done-state history) can see who
@@ -6677,6 +7161,13 @@ class Orchestrator:
             )
             resolved_cfg = resolve_agent_config(cfg, selection)
 
+            pool_id = "codex"
+            if selection.profile and selection.profile in cfg.agent_profiles:
+                prof = cfg.agent_profiles[selection.profile]
+                pool_id = prof.usage_pool or prof.kind or cfg.agent.kind
+            else:
+                pool_id = selection.kind or cfg.agent.kind
+
             client = self._build_agent_backend(
                 BackendInit(
                     cfg=cfg,
@@ -6691,8 +7182,11 @@ class Orchestrator:
                     client_tools=tools,
                     selection=selection,
                     resolved_backend_config=resolved_cfg.active_config,
+                    usage_manager=self._usage_manager,
+                    usage_pool=pool_id,
                 )
             )
+
             # Expose the live backend to `_on_codex_event` so the stall-progress
             # predicate routes through `client.is_progress_event(...)`.
             running.client = client
@@ -7033,19 +7527,96 @@ class Orchestrator:
                             # kind must be re-resolved from the unrouted config
                             # here — not reused from the lane we started in.
                             phase_cfg = _config_for_issue_agent(base_cfg, issue)
-                            if phase_cfg.agent.kind != cfg.agent.kind:
+                            phase_selection = phase_cfg.selection_for_state(
+                                issue.state,
+                                ticket_profile=_requested_agent_profile(issue),
+                                ticket_kind=_requested_agent_kind(issue),
+                            )
+                            phase_resolved_agent = resolve_agent_config(
+                                phase_cfg, phase_selection
+                            )
+                            to_kind = phase_selection.kind
+                            to_profile = phase_selection.profile or ""
+                            to_model = (
+                                getattr(phase_resolved_agent.active_config, "model", "")
+                                or ""
+                            )
+                            to_reasoning_effort = (
+                                getattr(
+                                    phase_resolved_agent.active_config,
+                                    "reasoning_effort",
+                                    "",
+                                )
+                                or ""
+                            )
+                            from_kind = (
+                                running_entry.agent_kind
+                                if running_entry is not None
+                                and running_entry.agent_kind
+                                else cfg.agent.kind
+                            )
+                            from_profile = (
+                                running_entry.agent_profile
+                                if running_entry is not None
+                                else ""
+                            )
+                            from_model = (
+                                running_entry.model if running_entry is not None else ""
+                            )
+                            from_reasoning_effort = (
+                                running_entry.reasoning_effort
+                                if running_entry is not None
+                                else ""
+                            )
+                            if (
+                                from_kind != to_kind
+                                or from_profile != to_profile
+                                or from_model != to_model
+                                or from_reasoning_effort != to_reasoning_effort
+                            ):
                                 log.info(
                                     "stage_backend_rerouted",
                                     issue_id=issue.id,
                                     identifier=issue.identifier,
                                     from_state=prev_phase_state,
                                     to_state=current_state,
-                                    from_kind=cfg.agent.kind,
-                                    to_kind=phase_cfg.agent.kind,
+                                    from_kind=from_kind,
+                                    to_kind=to_kind,
+                                    from_profile=from_profile,
+                                    to_profile=to_profile,
+                                    from_model=from_model,
+                                    to_model=to_model,
+                                    to_reasoning_effort=to_reasoning_effort,
                                 )
                             cfg = phase_cfg
                             if running_entry is not None:
-                                running_entry.agent_kind = cfg.agent.kind
+                                running_entry.agent_kind = to_kind
+                                running_entry.agent_profile = to_profile
+                                running_entry.model = to_model
+                                running_entry.reasoning_effort = to_reasoning_effort
+                                if (
+                                    running_entry.run_id
+                                    and self._run_registry is not None
+                                ):
+                                    stage_registry = cast(
+                                        RunRegistry, self._run_registry
+                                    )
+                                    stage_run_id = running_entry.run_id
+                                    self._registry_guard(
+                                        "update_stage_agent_profile",
+                                        lambda: (
+                                            stage_registry.update_stage_agent_profile(
+                                                issue_id=running_issue_id,
+                                                run_id=stage_run_id,
+                                                state=current_state,
+                                                agent_kind=to_kind,
+                                                agent_profile=to_profile,
+                                                model=to_model,
+                                                reasoning_effort=to_reasoning_effort,
+                                            )
+                                        ),
+                                        False,
+                                    )
                             (
                                 client,
                                 first_prompt,
@@ -7062,25 +7633,12 @@ class Orchestrator:
                             )
                             running_entry = self._running.get(running_issue_id)
                             if running_entry is not None:
-                                # New backend instance — refresh the
-                                # `_on_codex_event` reference so the stall
-                                # predicate keeps routing to the live driver.
                                 running_entry.client = client
                                 running_entry.thread_id = None
                                 running_entry.session_id = None
                                 running_entry.turn_id = None
                                 running_entry.resume_session_id = None
                                 running_entry.last_completed_turn_event = 0
-                                # New backend session reports absolute token
-                                # totals from 0; the high-water marks below
-                                # MUST reset or `_apply_token_totals` computes
-                                # `max(new - old_high, 0) = 0` and silently
-                                # drops every token from the new phase until
-                                # the cumulative count overtakes the old mark.
-                                # Cumulative `codex_*_tokens` are NOT reset;
-                                # state-local totals reset so
-                                # max_total_tokens_by_state is measured per
-                                # stage, not against ticket lifetime usage.
                                 running_entry.last_reported_input_tokens = 0
                                 running_entry.last_reported_cache_input_tokens = 0
                                 running_entry.last_reported_output_tokens = 0
@@ -7089,10 +7647,6 @@ class Orchestrator:
                                 running_entry.codex_state_cache_input_tokens = 0
                                 running_entry.codex_state_output_tokens = 0
                                 running_entry.codex_state_total_tokens = 0
-                                # Per-stage EMA window restarts with the
-                                # new state so first-turn cost in the new
-                                # stage isn't inflated by the prior
-                                # stage's cumulative total.
                                 running_entry.last_ema_state_total_tokens = 0
                                 running_entry.hit_token_budget = False
                                 running_entry.token_budget_cap = 0
@@ -7143,9 +7697,8 @@ class Orchestrator:
                         break
 
                     is_continuation = (
-                        (running.recovery_session_resumed and turn_number == 1)
-                        or (turn_number > 1 and not is_phase_transition)
-                    )
+                        running.recovery_session_resumed and turn_number == 1
+                    ) or (turn_number > 1 and not is_phase_transition)
                     if is_continuation:
                         debug = self._issue_debug.setdefault(
                             running_issue_id, _IssueDebug()
@@ -7231,6 +7784,29 @@ class Orchestrator:
                         await client.run_turn(
                             prompt=prompt, is_continuation=is_continuation
                         )
+                    except ProviderCapacityError as exc:
+                        outcome = "provider_usage_exhausted"
+                        error = str(exc)
+                        from ..backends.usage import ProviderUsageSnapshot, UsageWindow
+
+                        windows = {}
+                        if exc.resets_at:
+                            windows["default"] = UsageWindow(
+                                key="default",
+                                used_percent=100.0,
+                                remaining_percent=0.0,
+                                resets_at=exc.resets_at,
+                            )
+                        snap = ProviderUsageSnapshot(
+                            pool_id=exc.pool_id,
+                            source=exc.pool_id,
+                            windows=windows,
+                            hard_limit_reached=True,
+                            authoritative=True,
+                            observed_at=datetime.now(timezone.utc),
+                        )
+                        self._usage_manager.set_snapshot(exc.pool_id, snap)
+                        return
                     except (
                         TurnTimeout,
                         TurnFailed,
@@ -7242,6 +7818,7 @@ class Orchestrator:
                             redact_session_id(str(exc), running.resume_session_id)
                         )
                         return
+
                     finally:
                         self._sync_backend_agent_pid(
                             running_issue_id, _backend_agent_pid(client)
@@ -7363,14 +7940,16 @@ class Orchestrator:
                         and state != prev_phase_state
                     ):
                         try:
+                            finalizer_identifier = (
+                                running.release_gate_finalizer or issue.identifier
+                            )
                             finalizer_gate = cast(
                                 ReleaseGate | None,
                                 self._release_registry_call(
                                     cfg,
                                     "read_finalizer_gate_after_turn",
                                     lambda registry: registry.get_release_gate(
-                                        running.release_gate_finalizer
-                                        or issue.identifier
+                                        finalizer_identifier
                                     ),
                                 ),
                             )
@@ -7562,12 +8141,16 @@ class Orchestrator:
         except SymphonyError as exc:
             outcome = "error"
             running = self._running.get(running_issue_id)
-            private_session_id = running.resume_session_id if running is not None else None
+            private_session_id = (
+                running.resume_session_id if running is not None else None
+            )
             error = str(redact_session_id(str(exc), private_session_id))
         except Exception as exc:
             outcome = "error"
             running = self._running.get(running_issue_id)
-            private_session_id = running.resume_session_id if running is not None else None
+            private_session_id = (
+                running.resume_session_id if running is not None else None
+            )
             error = str(redact_session_id(str(exc), private_session_id))
             log.error(
                 "worker_unhandled_error",
@@ -7669,6 +8252,13 @@ class Orchestrator:
             ticket_kind=_requested_agent_kind(issue),
         )
         resolved_cfg = resolve_agent_config(cfg, selection)
+        pool_id = "codex"
+        if selection.profile and selection.profile in cfg.agent_profiles:
+            prof = cfg.agent_profiles[selection.profile]
+            pool_id = prof.usage_pool or prof.kind or cfg.agent.kind
+        else:
+            pool_id = selection.kind or cfg.agent.kind
+
 
         new_client = self._build_agent_backend(
             BackendInit(
@@ -7684,8 +8274,11 @@ class Orchestrator:
                 client_tools=tools,
                 selection=selection,
                 resolved_backend_config=resolved_cfg.active_config,
+                usage_manager=self._usage_manager,
+                usage_pool=pool_id,
             )
         )
+
         # Reset per-dispatch env BEFORE the new backend's subprocess spawns.
         # Forward phase transitions unset SYMPHONY_REWIND_SCOPE; rewinds
         # set it to the JSON of the latest finding rows.
@@ -8654,9 +9247,7 @@ class Orchestrator:
                     debug.last_error = f"approval denied: {reason} ({command})"
                 else:
                     debug.last_error = f"approval denied: {reason}"
-                self._append_run_event(
-                    entry, "approval_denied", {"reason": reason}
-                )
+                self._append_run_event(entry, "approval_denied", {"reason": reason})
                 log.warning(
                     "approval_denied",
                     issue_id=issue_id,
@@ -8750,8 +9341,70 @@ class Orchestrator:
         # Rate limits.
         rl = event.get("rate_limits")
         if isinstance(rl, dict):
-            self._latest_rate_limits = rl
+            from ..backends.codex import (
+                _merge_sparse_rate_limit_fields,
+                normalize_codex_rate_limits,
+            )
+
+            self._latest_rate_limits = _merge_sparse_rate_limit_fields(
+                self._latest_rate_limits,
+                rl,
+            )
+
+            pool_id = "codex"
+            if entry is not None and entry.agent_profile:
+                prof = cfg.agent_profiles.get(entry.agent_profile) if cfg else None
+                if prof and prof.usage_pool:
+                    pool_id = prof.usage_pool
+            elif entry is not None and entry.agent_kind:
+                pool_id = entry.agent_kind
+            snap = normalize_codex_rate_limits(
+                self._latest_rate_limits,
+                pool_id=pool_id,
+                previous=self._usage_manager.snapshot(pool_id),
+            )
+            self._usage_manager.set_snapshot(pool_id, snap)
+
+        # Provider quota / capacity exhaustion event.
+        if ev_name == EVENT_PROVIDER_USAGE_EXHAUSTED:
+            pool_id = str(payload.get("pool_id") or "codex")
+            resets_at_str = payload.get("resets_at")
+            resets_at = None
+            if resets_at_str:
+                from ..backends.codex import _parse_resets_at
+
+                resets_at = _parse_resets_at(resets_at_str)
+            from ..backends.usage import ProviderUsageSnapshot, UsageWindow
+
+            windows = {}
+            if resets_at:
+                windows["default"] = UsageWindow(
+                    key="default",
+                    used_percent=100.0,
+                    remaining_percent=0.0,
+                    resets_at=resets_at,
+                )
+            snap = ProviderUsageSnapshot(
+                pool_id=pool_id,
+                source=pool_id,
+                windows=windows,
+                hard_limit_reached=True,
+                authoritative=True,
+                observed_at=datetime.now(timezone.utc),
+                status="capacity_paused",
+                last_success_at=datetime.now(timezone.utc),
+            )
+            self._usage_manager.set_snapshot(pool_id, snap)
+            if entry is not None:
+                entry.hit_provider_usage_exhausted = True
+                entry.provider_usage_exhausted_pool_id = pool_id
+                entry.provider_usage_exhausted_resets_at = resets_at
+                if entry.worker_task is not None and not entry.worker_task.done():
+                    entry.worker_task.cancel()
+                entry.cancelled_at = datetime.now(timezone.utc)
+
         # Update session id when known. The backend reports a single session
+
         # identifier; this orchestrator stores it as `thread_id` for legacy
         # snapshot-shape stability and mirrors it as `session_id`. Codex
         # additionally exposes per-turn ids; when present they suffix the
@@ -8906,7 +9559,9 @@ class Orchestrator:
             )
         if ev_name == EVENT_AGENT_RETRY:
             phase = payload.get("phase") if isinstance(payload, dict) else None
-            retry_attempt = payload.get("attempt") if isinstance(payload, dict) else None
+            retry_attempt = (
+                payload.get("attempt") if isinstance(payload, dict) else None
+            )
             retry_error = (
                 payload.get("error") or payload.get("final_error")
                 if isinstance(payload, dict)
@@ -9577,7 +10232,9 @@ class Orchestrator:
                     # configured by `wiki.sweep_every_n` is up. Failures are
                     # absorbed inside the helper so we never block the
                     # Done transition on a wiki housekeeping nudge.
-                    self._maybe_run_wiki_sweep(cfg, identifier=entry.issue.identifier)
+                    await self._maybe_run_wiki_sweep(
+                        cfg, identifier=entry.issue.identifier
+                    )
                 # Don't schedule a continuation — a Done ticket has nothing
                 # to continue. Skip straight to the worker_exit emit below.
             elif not is_terminal and not entry.hit_max_turns:
@@ -9626,7 +10283,25 @@ class Orchestrator:
                 issue_id=issue_id,
                 issue_identifier=entry.issue.identifier,
             )
+        elif (
+            reason == "provider_usage_exhausted"
+            or (entry is not None and entry.hit_provider_usage_exhausted)
+        ):
+            # Provider capacity / quota exhaustion: do NOT consume retry budget.
+            # Ticket returns to waiting_provider_usage on next scheduler tick.
+            self._persisted_retry_attempts.pop(issue_id, None)
+            self._clear_issue_flags(issue_id, retry_attempt=True)
+            self._claimed.discard(issue_id)
+            debug.last_error = error or "provider usage exhausted"
+            log.info(
+                "worker_provider_usage_exhausted",
+                issue_id=issue_id,
+                issue_identifier=entry.issue.identifier,
+                reason=reason,
+                error=error,
+            )
         else:
+
             failure_reason = f"{reason}: {error}" if error else reason
             cleaned_failure = _clean_board_error_message(failure_reason)
             if _is_retryable_worker_error(self._entry_agent_kind(entry), reason, error):
@@ -9678,7 +10353,12 @@ class Orchestrator:
         await self._notify_observers()
 
     def _force_eject_zombie(
-        self, issue_id: str, entry: RunningEntry, cfg: ServiceConfig
+        self,
+        issue_id: str,
+        entry: RunningEntry,
+        cfg: ServiceConfig,
+        *,
+        skip_kill: bool = False,
     ) -> None:
         """Forcibly free a worker slot when cancellation didn't propagate.
 
@@ -9692,6 +10372,11 @@ class Orchestrator:
         own `finally` and `_on_worker_exit_impl` both gate on task identity
         (`entry_foreign_to`) before touching `_running`, so a foreign exit
         skips the live replacement entry instead of ejecting it.
+
+        `skip_kill=True` marks that the caller already performed (and
+        logged) the process-group kill for this entry — used by the async
+        reconcile path, which runs the kill off the event loop via
+        `asyncio.to_thread` (M1) before dropping bookkeeping here.
         """
         removed_entry = self._running.pop(issue_id, None)
         owned_transition = self._app_release_transition_locks.get(issue_id)
@@ -9705,8 +10390,10 @@ class Orchestrator:
         try:
             try:
                 agent_pgid = _normalize_agent_pid(entry.agent_pgid)
-                if agent_pgid is not None:
-                    killed = kill_process_group(agent_pgid)
+                if agent_pgid is not None and not skip_kill:
+                    killed = kill_process_group(
+                        agent_pgid, identity=self._agent_pid_identity(entry)
+                    )
                     log.warning(
                         "force_eject_killed_process_group",
                         issue_id=issue_id,
@@ -10097,7 +10784,7 @@ class Orchestrator:
     # reconciliation (§16.3)
     # ------------------------------------------------------------------
 
-    def _reconcile_stall_state(
+    async def _reconcile_stall_state(
         self,
         issue_id: str,
         entry: RunningEntry,
@@ -10116,7 +10803,37 @@ class Orchestrator:
                     identifier=entry.issue.identifier,
                     elapsed_since_cancel_s=round(since_cancel, 1),
                 )
-                self._force_eject_zombie(issue_id, entry, cfg)
+                # M1: win32 kill_process_group shells out to `taskkill /T`.
+                # This coroutine runs on the tick loop, so the kill must go
+                # through a worker thread before the (synchronous) eject
+                # bookkeeping drops the entry. A kill failure still lets
+                # the eject's finallies release the lease and schedule the
+                # retry, then surfaces to the per-issue reconcile guard —
+                # exactly the pre-M1 containment (AF-07).
+                agent_pgid = _normalize_agent_pid(entry.agent_pgid)
+                kill_failure: Exception | None = None
+                if agent_pgid is not None:
+                    try:
+                        killed = await asyncio.to_thread(
+                            kill_process_group,
+                            agent_pgid,
+                            identity=self._agent_pid_identity(entry),
+                        )
+                        log.warning(
+                            "force_eject_killed_process_group",
+                            issue_id=issue_id,
+                            identifier=entry.issue.identifier,
+                            agent_kind=self._entry_agent_kind(entry),
+                            pid=agent_pgid,
+                            killed=killed,
+                        )
+                    except Exception as exc:
+                        kill_failure = exc
+                self._force_eject_zombie(
+                    issue_id, entry, cfg, skip_kill=True
+                )
+                if kill_failure is not None:
+                    raise kill_failure
             return
         if self.is_paused(issue_id):
             return
@@ -10168,7 +10885,7 @@ class Orchestrator:
                 self._heartbeat_run_lease(issue_id, entry)
                 stall_timeout_ms = self._stall_timeout_ms_for_entry(cfg, entry)
                 if stall_timeout_ms > 0:
-                    self._reconcile_stall_state(
+                    await self._reconcile_stall_state(
                         issue_id,
                         entry,
                         cfg,
@@ -10530,7 +11247,7 @@ class Orchestrator:
                                 debug_target=self._issue_debug.get(issue.id),
                             )
                             # C5 — see _on_worker_exit for the rationale.
-                            self._maybe_run_wiki_sweep(
+                            await self._maybe_run_wiki_sweep(
                                 cfg, identifier=entry.issue.identifier
                             )
                     else:
@@ -10619,74 +11336,137 @@ class Orchestrator:
         if debug is not None:
             debug.tracker_error = None
 
-    @staticmethod
-    def _tracker_call_candidates(cfg: ServiceConfig) -> list[Issue]:
-        client = build_tracker_client(cfg)
-        try:
-            return client.fetch_candidate_issues()
-        finally:
-            client.close()
+    def _shared_tracker_client(self, cfg: ServiceConfig) -> TrackerClient:
+        """Lazily built, per-lifetime tracker client for the poll bridges.
 
-    @staticmethod
-    def _tracker_call_states_by_ids(cfg: ServiceConfig, ids: list[str]) -> list[Issue]:
-        client = build_tracker_client(cfg)
-        try:
-            return client.fetch_issue_states_by_ids(ids)
-        finally:
-            client.close()
+        The `_tracker_call_*` helpers below used to open (and close) a
+        fresh client per call — for Jira/Linear that meant a new httpx
+        connection pool on every poll tick. One client is built on first
+        use and reused across calls; `stop()` closes it. It is rebuilt
+        when the live config object changes (hot reload swaps the
+        `ServiceConfig` instance). Once `stop()` starts closing the pool
+        (or has finished closing it) checkouts raise
+        `_TrackerClientUnavailable` instead of rebuilding — a rebuild
+        would race the close, leak a client past shutdown, or hand the
+        caller a pool that is about to be closed under it.
+        """
+        with self._tracker_client_lock:
+            if self._tracker_client_closing or self._tracker_client_closed:
+                raise _TrackerClientUnavailable(
+                    "tracker client is closed for this orchestrator lifetime"
+                )
+            client = self._tracker_client
+            if client is None or cfg is not self._tracker_client_cfg:
+                client = build_tracker_client(cfg)
+                self._tracker_client = client
+                self._tracker_client_cfg = cfg
+                self._tracker_client_closed = False
+            return client
 
-    @staticmethod
-    def _tracker_call_full_by_id(cfg: ServiceConfig, issue_id: str) -> Issue | None:
+    def _invoke_shared_tracker_client(
+        self, cfg: ServiceConfig, op: Callable[[TrackerClient], _T]
+    ) -> _T:
+        """Run one tracker call on the shared client, closing-race safe.
+
+        A `stop()` racing this call on another thread can close the httpx
+        pool between checkout and use; httpx then raises a bare
+        `RuntimeError`. Convert it (logged once) into the retryable
+        `_TrackerClientUnavailable` so the `asyncio.to_thread` bridge
+        surfaces a clean failure the next tick can retry instead of an
+        opaque RuntimeError from a dying context.
+        """
+        try:
+            client = self._shared_tracker_client(cfg)
+        except _TrackerClientUnavailable:
+            self._log_tracker_close_race()
+            raise
+        try:
+            return op(client)
+        except _TrackerClientUnavailable:
+            raise
+        except Exception as exc:
+            if not _is_closed_client_runtime_error(exc):
+                raise
+            self._log_tracker_close_race()
+            raise _TrackerClientUnavailable(
+                "tracker client closed during call"
+            ) from exc
+
+    def _log_tracker_close_race(self) -> None:
+        if self._tracker_client_close_race_logged:
+            return
+        self._tracker_client_close_race_logged = True
+        log.warning(
+            "tracker_client_close_race",
+            detail=(
+                "shared tracker client closed while a bridge call was in "
+                "flight; failing this poll retryably"
+            ),
+        )
+
+    def _tracker_call_candidates(self, cfg: ServiceConfig) -> list[Issue]:
+        return self._invoke_shared_tracker_client(
+            cfg, lambda client: client.fetch_candidate_issues()
+        )
+
+    def _tracker_call_states_by_ids(self, cfg: ServiceConfig, ids: list[str]) -> list[Issue]:
+        return self._invoke_shared_tracker_client(
+            cfg, lambda client: client.fetch_issue_states_by_ids(ids)
+        )
+
+    def _tracker_call_full_by_id(self, cfg: ServiceConfig, issue_id: str) -> Issue | None:
         """Single-issue fetch with full body — used by contract validation."""
-        client = build_tracker_client(cfg)
-        try:
-            return client.fetch_issue_full_by_id(issue_id)
-        finally:
-            client.close()
+        return self._invoke_shared_tracker_client(
+            cfg, lambda client: client.fetch_issue_full_by_id(issue_id)
+        )
 
-    @staticmethod
-    def _tracker_call_terminal_issues(cfg: ServiceConfig) -> list[Issue]:
-        client = build_tracker_client(cfg)
-        try:
-            return client.fetch_issues_by_states(cfg.tracker.terminal_states)
-        finally:
-            client.close()
+    def _tracker_call_terminal_issues(self, cfg: ServiceConfig) -> list[Issue]:
+        return self._invoke_shared_tracker_client(
+            cfg,
+            lambda client: client.fetch_issues_by_states(
+                cfg.tracker.terminal_states
+            ),
+        )
 
-    @staticmethod
     def _tracker_call_record_agent_kind(
-        cfg: ServiceConfig, identifier: str, agent_kind: str
+        self, cfg: ServiceConfig, identifier: str, agent_kind: str
     ) -> None:
         """Best-effort: persist the resolved backend onto the ticket.
 
         Adapters that don't implement ``record_agent_kind`` (e.g. Linear,
-        where the field has no remote analogue) are silently skipped.
+        where the field has no remote analogue) are silently skipped, and
+        so is a call that races `stop()` closing the shared client.
         """
-        client = build_tracker_client(cfg)
-        try:
-            record = getattr(client, "record_agent_kind", None)
-            if record is None:
-                return
-            record(identifier, agent_kind)
-        finally:
-            client.close()
 
-    @staticmethod
+        def _record(client: TrackerClient) -> None:
+            record = getattr(client, "record_agent_kind", None)
+            if record is not None:
+                record(identifier, agent_kind)
+
+        try:
+            self._invoke_shared_tracker_client(cfg, _record)
+        except _TrackerClientUnavailable:
+            return
+
     def _tracker_call_record_last_agent_kind(
-        cfg: ServiceConfig, identifier: str, agent_kind: str
+        self, cfg: ServiceConfig, identifier: str, agent_kind: str
     ) -> None:
         """Best-effort: persist the audit-only `last_agent_kind` stamp.
 
         Used instead of the pin on `stage_kinds`-routed boards, where writing
         the pin would freeze the first lane's backend for the whole ticket.
+        Races with `stop()` closing the shared client are silently skipped.
         """
-        client = build_tracker_client(cfg)
-        try:
+
+        def _record(client: TrackerClient) -> None:
             record = getattr(client, "record_last_agent_kind", None)
-            if record is None:
-                return
-            record(identifier, agent_kind)
-        finally:
-            client.close()
+            if record is not None:
+                record(identifier, agent_kind)
+
+        try:
+            self._invoke_shared_tracker_client(cfg, _record)
+        except _TrackerClientUnavailable:
+            return
 
     # ------------------------------------------------------------------
     # startup cleanup (§8.6)

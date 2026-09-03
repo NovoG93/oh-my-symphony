@@ -12,8 +12,6 @@ import asyncio
 import inspect
 import signal
 import sys
-from ipaddress import ip_address
-from urllib.parse import urlsplit
 from pathlib import Path
 from typing import Any, Callable, Mapping, Protocol, cast
 
@@ -24,56 +22,26 @@ from .projects import Project as ProjectRecord
 from .projects import ProjectRegistry, canonical_project_repo
 from .workflow.builder import build_service_config
 from .workflow.parser import load_workflow
+from .web_policy import (
+    BIND_HOST_KEY,
+    install_route_policies,
+    policy_discovery_payload,
+    policy_middleware,
+    resolve_policy,
+)
 
 
-_ALLOWED_HOSTS = {"localhost", "127.0.0.1", "[::1]"}
-_HUB_BIND_HOST: web.AppKey[str] = web.AppKey("symphony.hub.bind_host", str)
+_HUB_BIND_HOST = BIND_HOST_KEY
 
 
 @web.middleware
 async def _hub_guard(request: web.Request, handler):
-    """Block DNS-rebinding and cross-origin mutations on the local hub."""
-    bind = str(request.app.get(_HUB_BIND_HOST) or "127.0.0.1").lower()
-    raw_host = (request.host or "").strip().lower()
-    host = (
-        raw_host.split("]", 1)[0] + "]"
-        if raw_host.startswith("[")
-        else raw_host.rsplit(":", 1)[0]
-    )
-    if (
-        bind in {"", "localhost", "127.0.0.1", "::1", "[::1]"}
-        and host not in _ALLOWED_HOSTS
-    ):
-        return _json_error(403, "forbidden_host", f"host {request.host!r} not allowed")
-    if request.method in {"POST", "PUT", "PATCH", "DELETE"}:
-        if bind not in {"localhost", "127.0.0.1", "::1", "[::1]"}:
-            return _json_error(
-                403, "forbidden_bind", "mutations require a loopback-bound hub"
-            )
-        peer = (
-            request.transport.get_extra_info("peername") if request.transport else None
+    """Apply the same authorization boundary as project board services."""
+    if request.method in {"POST", "PUT", "PATCH", "DELETE"} and request.content_type != "application/json":
+        return _json_error(
+            415, "unsupported_media_type", "mutations require application/json"
         )
-        peer_host = str(peer[0]).split("%", 1)[0] if peer else ""
-        try:
-            peer_is_loopback = ip_address(peer_host).is_loopback
-        except ValueError:
-            peer_is_loopback = False
-        if not peer_is_loopback:
-            return _json_error(
-                403, "forbidden_peer", "mutations require a loopback client"
-            )
-        origin = request.headers.get("Origin")
-        if origin:
-            parsed = urlsplit(origin)
-            if parsed.scheme != request.scheme or parsed.netloc.lower() != raw_host:
-                return _json_error(
-                    403, "forbidden_origin", "cross-origin mutations are not allowed"
-                )
-        if request.content_type != "application/json":
-            return _json_error(
-                415, "unsupported_media_type", "mutations require application/json"
-            )
-    return await handler(request)
+    return await policy_middleware(request, handler)
 
 
 class HubRegistry(Protocol):
@@ -98,17 +66,18 @@ _HUB_HTML = """<!doctype html>
 :root{color-scheme:light dark;font-family:system-ui,sans-serif}body{max-width:900px;margin:3rem auto;padding:0 1rem}header{display:flex;align-items:baseline;justify-content:space-between}.grid{display:grid;gap:1rem}.card,form{border:1px solid #8886;border-radius:10px;padding:1rem}.row{display:flex;gap:.6rem;align-items:center;flex-wrap:wrap}.status{font-size:.85rem;font-weight:700}.running{color:#299447}.stopped{color:#777}button,a.open{padding:.45rem .7rem;border-radius:6px;border:1px solid #8888;background:transparent;color:inherit;text-decoration:none;cursor:pointer}code{overflow-wrap:anywhere}label{display:grid;gap:.25rem;flex:1;min-width:12rem}input{padding:.5rem}#error,.diagnostic{color:#c33}</style>
 </head>
 <body>
-<header><div><h1>Symphony Hub</h1><p>Manage local Symphony projects</p></div><button id="refresh" type="button">Refresh</button></header>
+<header><div><h1>Symphony Hub</h1><p>Manage local Symphony projects</p><strong id="security"></strong></div><button id="refresh" type="button">Refresh</button></header>
 <section aria-labelledby="add-heading"><h2 id="add-heading">Add project</h2><form id="add-project"><div class="row"><label>Project name<input name="name" required autocomplete="off"></label><label>Project path<input name="path" required autocomplete="off" placeholder="/path/to/project"></label></div><div class="row"><label>Project ID (optional)<input name="id" autocomplete="off"></label><label>Workflow (optional)<input name="workflow" autocomplete="off" placeholder="WORKFLOW.md"></label><button type="submit">Add project</button></div></form></section>
 <h2>Projects</h2><p id="error" role="alert"></p><main id="projects" class="grid" aria-live="polite"></main>
 <script>
-const root=document.querySelector('#projects'), error=document.querySelector('#error');
+const root=document.querySelector('#projects'), error=document.querySelector('#error'), security=document.querySelector('#security');
 function el(tag,text,cls){const n=document.createElement(tag);if(text!==undefined)n.textContent=text;if(cls)n.className=cls;return n}
-async function request(path,options){const r=await fetch(path,options);const body=await r.json();if(!r.ok)throw new Error(body.error?.message||`Request failed (${r.status})`);return body}
+function token(){try{return sessionStorage.getItem('symphony.apiToken')||''}catch(_e){return ''}}
+async function request(path,options={},retry=true){const headers={...(options.headers||{})};if(token())headers.Authorization=`Bearer ${token()}`;const r=await fetch(path,{...options,headers});const body=await r.json();if(r.status===401&&retry){const value=window.prompt('Symphony API token');if(value){try{sessionStorage.setItem('symphony.apiToken',value.trim())}catch(_e){}return request(path,options,false)}}if(!r.ok)throw new Error(body.error?.message||`Request failed (${r.status})`);return body}
 function pathLine(label,value){const p=el('p');p.append(`${label}: `,el('code',value||'Unavailable'));return p}
 function card(p){const article=el('article',undefined,'card'), title=el('h3',p.name), state=el('span',p.running?'Running':'Stopped',`status ${p.running?'running':'stopped'}`), row=el('div',undefined,'row');row.append(state);const open=el('button',p.running?'Open project':'Start and open');open.onclick=async()=>{open.disabled=true;error.textContent='';try{const result=await request(`/api/v1/projects/${encodeURIComponent(p.id)}/open`,{method:'POST',headers:{'Content-Type':'application/json'},body:'{}'});window.location.assign(result.url)}catch(e){error.textContent=e.message}finally{open.disabled=false}};row.append(open);article.append(title,pathLine('Repository',p.repo),pathLine('Workflow',p.workflow),pathLine('Issues are stored here',p.board),row);for(const message of p.diagnostics||[])article.append(el('p',message,'diagnostic'));return article}
 async function load(){error.textContent='';try{const body=await request('/api/v1/projects');root.replaceChildren(...body.projects.map(card))}catch(e){error.textContent=e.message}}
-document.querySelector('#refresh').onclick=load;document.querySelector('#add-project').onsubmit=async event=>{event.preventDefault();const form=event.currentTarget,data=Object.fromEntries(new FormData(form));for(const key of ['id','workflow'])if(!data[key])delete data[key];error.textContent='';try{await request('/api/v1/projects',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(data)});form.reset();await load()}catch(e){error.textContent=e.message}};load();
+document.querySelector('#refresh').onclick=load;document.querySelector('#add-project').onsubmit=async event=>{event.preventDefault();const form=event.currentTarget,data=Object.fromEntries(new FormData(form));for(const key of ['id','workflow'])if(!data[key])delete data[key];error.textContent='';try{await request('/api/v1/projects',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(data)});form.reset();await load()}catch(e){error.textContent=e.message}};(async()=>{try{const p=await request('/api/v1/auth/policy',{},false);security.textContent=p.mode==='disabled'?'Authentication disabled':`Security: ${p.mode}`}catch(_e){}await load()})();
 </script>
 </body></html>
 """
@@ -216,6 +185,9 @@ def build_hub_app(
 
     async def index(_request: web.Request) -> web.Response:
         return web.Response(text=_HUB_HTML, content_type="text/html")
+
+    async def policy(request: web.Request) -> web.Response:
+        return web.json_response(policy_discovery_payload(request))
 
     async def projects(_request: web.Request) -> web.Response:
         records = await _invoke(registry.list)
@@ -395,10 +367,12 @@ def build_hub_app(
         )
 
     app.router.add_get("/", index)
+    app.router.add_get("/api/v1/auth/policy", policy)
     app.router.add_get("/api/v1/projects", projects)
     app.router.add_post("/api/v1/projects", add_project)
     app.router.add_post("/api/v1/projects/{project_id}/open", open_project)
     app.router.add_post("/api/v1/projects/{project_id}/{action:start|stop}", mutate)
+    install_route_policies(app)
     return app
 
 
@@ -407,6 +381,7 @@ async def run_hub(
 ) -> tuple[web.AppRunner, int]:
     """Start a hub application and return its runner and actual bound port."""
 
+    resolve_policy(host)
     app[_HUB_BIND_HOST] = host
     runner = web.AppRunner(app)
     await runner.setup()
