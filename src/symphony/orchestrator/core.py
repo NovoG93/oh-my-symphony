@@ -6196,6 +6196,7 @@ class Orchestrator:
                 cwd=task.cwd,
                 workspace_root=task.cwd,
                 on_event=_ignore_event,
+                env={},
             )
         )
         before = await asyncio.to_thread(_worktree_status_snapshot, task.cwd)
@@ -6585,13 +6586,13 @@ class Orchestrator:
     # A2-orch + C3 — backend subprocess env injection
     # ------------------------------------------------------------------
 
-    def _apply_dispatch_env(
+    def _dispatch_env(
         self,
         *,
         issue: Issue,
         cfg: ServiceConfig,
         is_rewind: bool,
-    ) -> None:
+    ) -> dict[str, str]:
         """Set per-dispatch env vars consumed by the backend subprocess.
 
         Always sets:
@@ -6610,24 +6611,24 @@ class Orchestrator:
         On forward dispatches the rewind scope env var is UNSET so a
         previous-turn value can't bleed across.
 
-        Backends inherit `os.environ`, so this mutates process-global
-        state. Concurrent dispatches in the same tick are serialised by
-        the orchestrator's single event loop, and each backend spawns
-        its subprocess before the next dispatch lands.
+        The returned mapping is passed only to the selected backend. It is
+        merged into that child environment at spawn time and never mutates
+        process-global ``os.environ``.
         """
         ema_value = self._token_ema_for_state(issue.state)
         budget_value = self._token_budget_for_state(cfg, issue.state)
-        os.environ["SYMPHONY_TOKEN_EMA"] = str(ema_value)
-        os.environ["SYMPHONY_TOKEN_BUDGET"] = str(budget_value)
+        overlay = {
+            "SYMPHONY_TOKEN_EMA": str(ema_value),
+            "SYMPHONY_TOKEN_BUDGET": str(budget_value),
+        }
         if is_rewind:
             rows = _parse_findings_rows(issue.description)
             try:
                 payload = json.dumps(rows, ensure_ascii=False)
             except (TypeError, ValueError):
                 payload = "[]"
-            os.environ["SYMPHONY_REWIND_SCOPE"] = payload
-        else:
-            os.environ.pop("SYMPHONY_REWIND_SCOPE", None)
+            overlay["SYMPHONY_REWIND_SCOPE"] = payload
+        return overlay
 
     # ------------------------------------------------------------------
     # dispatch (§16.4)
@@ -7178,6 +7179,7 @@ class Orchestrator:
                     resolved_backend_config=resolved_cfg.active_config,
                     usage_manager=self._usage_manager,
                     usage_pool=pool_id,
+                    env=self._dispatch_env(issue=issue, cfg=cfg, is_rewind=False),
                 )
             )
 
@@ -7185,10 +7187,6 @@ class Orchestrator:
             # predicate routes through `client.is_progress_event(...)`.
             running.client = client
             after_run_pending = False
-            # Initial dispatch is always forward (no rewind); the env
-            # mutation MUST land before `client.start()` because the
-            # backend subprocess inherits os.environ at fork time.
-            self._apply_dispatch_env(issue=issue, cfg=cfg, is_rewind=False)
             try:
                 self._sync_backend_agent_pid(
                     running_issue_id, _backend_agent_pid(client)
@@ -8270,13 +8268,10 @@ class Orchestrator:
                 resolved_backend_config=resolved_cfg.active_config,
                 usage_manager=self._usage_manager,
                 usage_pool=pool_id,
+                env=self._dispatch_env(issue=issue, cfg=cfg, is_rewind=is_rewind),
             )
         )
 
-        # Reset per-dispatch env BEFORE the new backend's subprocess spawns.
-        # Forward phase transitions unset SYMPHONY_REWIND_SCOPE; rewinds
-        # set it to the JSON of the latest finding rows.
-        self._apply_dispatch_env(issue=issue, cfg=cfg, is_rewind=is_rewind)
         try:
             self._sync_backend_agent_pid(
                 running_issue_id, _backend_agent_pid(new_client)

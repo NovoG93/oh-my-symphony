@@ -301,6 +301,7 @@ def _install_fake_backend(monkeypatch: pytest.MonkeyPatch) -> list[_FakeBackend]
 
     def _factory(init: Any) -> _FakeBackend:
         backend = _FakeBackend(init_id=len(instances))
+        backend.backend_init = init
         backend.calls.append(("factory", {"agent_kind": init.cfg.agent.kind}))
         instances.append(backend)
         return backend
@@ -391,6 +392,14 @@ def test_phase_transition_rebuilds_backend_with_fresh_first_prompt(
     # The freshly-rendered prompt reflects the new state.
     assert "state=In Progress" in first_prompts[1]
     assert "state=Todo" in first_prompts[0]
+    # Each phase owns a fresh overlay while selection/config/usage wiring is
+    # preserved on both backend constructions.
+    assert instances[0].backend_init.env["SYMPHONY_TOKEN_EMA"] == "0"
+    assert instances[1].backend_init.env["SYMPHONY_TOKEN_EMA"] == "0"
+    for inst in instances:
+        assert inst.backend_init.selection.kind == "codex"
+        assert inst.backend_init.resolved_backend_config is not None
+        assert inst.backend_init.usage_manager is o._usage_manager
 
     # Post-transition run_turn must NOT be flagged as a continuation —
     # the backend has no prior context, this is its true first turn.

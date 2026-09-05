@@ -9762,8 +9762,8 @@ def test_token_budget_for_state_falls_back_to_default():
 # ---------------------------------------------------------------------------
 
 
-def test_apply_dispatch_env_sets_rewind_scope_on_rewind(monkeypatch):
-    """Rewind dispatch must export SYMPHONY_REWIND_SCOPE as JSON."""
+def test_dispatch_env_sets_rewind_scope_on_rewind(monkeypatch):
+    """Rewind metadata is returned without mutating the parent process."""
     monkeypatch.delenv("SYMPHONY_REWIND_SCOPE", raising=False)
     cfg = _make_config()
     orch = _orch()
@@ -9778,12 +9778,13 @@ def test_apply_dispatch_env_sets_rewind_scope_on_rewind(monkeypatch):
         ),
     )
 
-    orch._apply_dispatch_env(issue=issue, cfg=cfg, is_rewind=True)
-
     import os
     import json as _json
 
-    raw = os.environ.get("SYMPHONY_REWIND_SCOPE")
+    before = dict(os.environ)
+    overlay = orch._dispatch_env(issue=issue, cfg=cfg, is_rewind=True)
+    assert dict(os.environ) == before
+    raw = overlay.get("SYMPHONY_REWIND_SCOPE")
     assert raw is not None, "SYMPHONY_REWIND_SCOPE must be set on rewind"
     rows = _json.loads(raw)
     assert isinstance(rows, list) and rows, "rewind scope must parse to list"
@@ -9792,15 +9793,12 @@ def test_apply_dispatch_env_sets_rewind_scope_on_rewind(monkeypatch):
     files = {row["file"] for row in rows}
     assert "src/foo.py" in files
     # Env vars for budget always present, regardless of rewind.
-    assert os.environ.get("SYMPHONY_TOKEN_BUDGET") is not None
-    assert os.environ.get("SYMPHONY_TOKEN_EMA") is not None
-
-    # Clean up so the env var doesn't leak to other tests.
-    monkeypatch.delenv("SYMPHONY_REWIND_SCOPE", raising=False)
+    assert overlay.get("SYMPHONY_TOKEN_BUDGET") is not None
+    assert overlay.get("SYMPHONY_TOKEN_EMA") is not None
 
 
-def test_apply_dispatch_env_unsets_rewind_scope_on_forward(monkeypatch):
-    """Forward dispatch must NOT carry a stale SYMPHONY_REWIND_SCOPE."""
+def test_dispatch_env_excludes_stale_rewind_scope_on_forward(monkeypatch):
+    """Forward overlays must not carry a stale rewind scope."""
     import os
 
     cfg = _make_config()
@@ -9813,19 +9811,15 @@ def test_apply_dispatch_env_unsets_rewind_scope_on_forward(monkeypatch):
 
     # Simulate a prior rewind dispatch leaving the env var set.
     monkeypatch.setenv("SYMPHONY_REWIND_SCOPE", '[{"severity": "HIGH"}]')
-    orch._apply_dispatch_env(issue=issue, cfg=cfg, is_rewind=False)
-
-    assert os.environ.get("SYMPHONY_REWIND_SCOPE") is None, (
-        "forward dispatch must unset SYMPHONY_REWIND_SCOPE so a prior "
-        "rewind value cannot bleed across turns"
-    )
+    before = dict(os.environ)
+    overlay = orch._dispatch_env(issue=issue, cfg=cfg, is_rewind=False)
+    assert "SYMPHONY_REWIND_SCOPE" not in overlay
+    assert dict(os.environ) == before
 
 
-def test_apply_dispatch_env_empty_list_when_findings_missing(monkeypatch):
-    """Rewind without parseable findings still sets the env (as `[]`)."""
+def test_dispatch_env_empty_list_when_findings_missing(monkeypatch):
+    """Rewind without parseable findings still returns `[]`."""
     import json as _json
-    import os
-
     monkeypatch.delenv("SYMPHONY_REWIND_SCOPE", raising=False)
     cfg = _make_config()
     orch = _orch()
@@ -9835,22 +9829,18 @@ def test_apply_dispatch_env_empty_list_when_findings_missing(monkeypatch):
         description="## Plan only, no review findings here",
     )
 
-    orch._apply_dispatch_env(issue=issue, cfg=cfg, is_rewind=True)
-
-    raw = os.environ.get("SYMPHONY_REWIND_SCOPE")
+    overlay = orch._dispatch_env(issue=issue, cfg=cfg, is_rewind=True)
+    raw = overlay.get("SYMPHONY_REWIND_SCOPE")
     assert raw is not None
     assert _json.loads(raw) == [], (
         "missing Review Findings / QA Failure must produce an empty list, "
         "not omit the env var entirely"
     )
-    monkeypatch.delenv("SYMPHONY_REWIND_SCOPE", raising=False)
 
 
-def test_apply_dispatch_env_uses_latest_contract_failure_scope(monkeypatch):
+def test_dispatch_env_uses_latest_contract_failure_scope(monkeypatch):
     """Contract Failure rows must become first-class rewind scope."""
     import json as _json
-    import os
-
     monkeypatch.delenv("SYMPHONY_REWIND_SCOPE", raising=False)
     cfg = _make_config()
     orch = _orch()
@@ -9870,9 +9860,8 @@ def test_apply_dispatch_env_uses_latest_contract_failure_scope(monkeypatch):
         ),
     )
 
-    orch._apply_dispatch_env(issue=issue, cfg=cfg, is_rewind=True)
-
-    raw = os.environ.get("SYMPHONY_REWIND_SCOPE")
+    overlay = orch._dispatch_env(issue=issue, cfg=cfg, is_rewind=True)
+    raw = overlay.get("SYMPHONY_REWIND_SCOPE")
     assert raw is not None
     rows = _json.loads(raw)
     assert rows == [
@@ -9895,7 +9884,26 @@ def test_apply_dispatch_env_uses_latest_contract_failure_scope(monkeypatch):
             ),
         }
     ]
-    monkeypatch.delenv("SYMPHONY_REWIND_SCOPE", raising=False)
+
+
+@pytest.mark.asyncio
+async def test_concurrent_dispatch_envs_are_isolated(monkeypatch):
+    """Concurrent overlay construction cannot leak rewind metadata."""
+    cfg = _make_config()
+    orch = _orch()
+    first = _issue(
+        "MT-CONCURRENT-A", state="In Progress", description="## Review Findings\n- HIGH: src/a.py:1 — fix A"
+    )
+    second = _issue(
+        "MT-CONCURRENT-B", state="Review", description="## QA Failure\n- LOW: src/b.py:2 — fix B"
+    )
+    before = dict(os.environ)
+    overlays = await asyncio.gather(
+        asyncio.to_thread(orch._dispatch_env, issue=first, cfg=cfg, is_rewind=True),
+        asyncio.to_thread(orch._dispatch_env, issue=second, cfg=cfg, is_rewind=True),
+    )
+    assert overlays[0]["SYMPHONY_REWIND_SCOPE"] != overlays[1]["SYMPHONY_REWIND_SCOPE"]
+    assert dict(os.environ) == before
 
 
 def test_sort_for_dispatch_ties_by_identifier():

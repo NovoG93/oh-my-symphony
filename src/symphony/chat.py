@@ -7,11 +7,9 @@ working tree. Chat runs outside the orchestrator's `DispatchState` slot
 accounting on purpose: one chat session must never starve ticket workers
 (`max_concurrent_agents` is often 1).
 
-Known benign interaction: `Orchestrator._apply_dispatch_env` mutates
-process-global ``os.environ`` (informational ``SYMPHONY_TOKEN_*`` values)
-right before it spawns a worker. A chat turn spawning concurrently may
-inherit those values; they only inform prompts and budgets, so no isolation
-is attempted here.
+Worker dispatch metadata is passed through each backend's private child
+environment overlay. Chat backends intentionally receive no worker-local
+rewind or token metadata.
 
 Modes:
 - ``qa``   — question answering; read-only where the backend supports it

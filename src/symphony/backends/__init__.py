@@ -145,8 +145,12 @@ class BackendInit:
     resolved_backend_config: Any | None = None
     usage_manager: Any | None = None
     usage_pool: str | None = None
+    # Per-dispatch environment overlay.  Keep this isolated from the process
+    # environment so concurrent workers cannot leak metadata into one another.
+    env: dict[str, str] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
+        self.env = dict(self.env)
         if self.selection is None:
             self.selection = AgentSelection(kind=self.cfg.agent.kind)
         if self.resolved_backend_config is None:
