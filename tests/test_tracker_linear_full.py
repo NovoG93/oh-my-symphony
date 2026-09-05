@@ -112,7 +112,16 @@ def test_fetch_candidate_issues_paginates_through_cursor_and_normalizes() -> Non
                                         "nodes": [{"name": "backend"}, {"name": "p1"}]
                                     },
                                     "inverseRelations": {
+                                        "pageInfo": {"hasNextPage": False},
                                         "nodes": [
+                                            {
+                                                "type": "related",
+                                                "issue": {
+                                                    "id": "u-related",
+                                                    "identifier": "TEAM-RELATED",
+                                                    "state": {"name": "Todo"},
+                                                },
+                                            },
                                             {
                                                 "type": "blocks",
                                                 "issue": {
@@ -146,7 +155,10 @@ def test_fetch_candidate_issues_paginates_through_cursor_and_normalizes() -> Non
                                 "priority": None,
                                 "state": {"name": "In Progress"},
                                 "labels": {"nodes": []},
-                                "inverseRelations": {"nodes": []},
+                                "inverseRelations": {
+                                    "pageInfo": {"hasNextPage": False},
+                                    "nodes": [],
+                                },
                             }
                         ],
                         "pageInfo": {"hasNextPage": False},
@@ -184,6 +196,80 @@ def test_fetch_candidate_issues_paginates_through_cursor_and_normalizes() -> Non
     assert second.identifier == "TEAM-3"
     assert second.labels == ()
     assert second.blocked_by == ()
+
+
+def test_blocker_queries_use_bounded_unfiltered_inverse_relation_connection() -> None:
+    queries: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content)
+        queries.append(body["query"])
+        if "Candidates" in body["query"]:
+            return httpx.Response(
+                200,
+                json={
+                    "data": {
+                        "issues": {
+                            "nodes": [],
+                            "pageInfo": {"hasNextPage": False},
+                        }
+                    }
+                },
+            )
+        return httpx.Response(
+            200,
+            json={
+                "data": {
+                    "issue": {
+                        "id": "u-1",
+                        "inverseRelations": {
+                            "nodes": [],
+                            "pageInfo": {"hasNextPage": False},
+                        },
+                    }
+                }
+            },
+        )
+
+    client = _client(handler)
+    client.fetch_candidate_issues()
+    client.fetch_issue_full_by_id("u-1")
+
+    assert len(queries) == 2
+    for query in queries:
+        assert "inverseRelations(first: 50)" in query
+        assert "pageInfo { hasNextPage }" in query
+        assert 'filter: { type: { eq: "blocks" } }' not in query
+
+
+@pytest.mark.parametrize(
+    "connection",
+    [
+        {"nodes": []},
+        {"pageInfo": {"hasNextPage": False}, "nodes": None},
+        {
+            "pageInfo": {"hasNextPage": True},
+            "nodes": [],
+        },
+        {
+            "pageInfo": {"hasNextPage": False},
+            "nodes": [{"type": "blocks", "issue": None}],
+        },
+    ],
+)
+def test_normalize_node_rejects_malformed_or_truncated_inverse_relations(
+    connection: dict,
+) -> None:
+    node = {
+        "id": "u-1",
+        "identifier": "TEAM-1",
+        "title": "issue",
+        "state": {"name": "Todo"},
+        "labels": {"nodes": []},
+        "inverseRelations": connection,
+    }
+    with pytest.raises(LinearUnknownPayload):
+        linear_module._normalize_node(node)
 
 
 def test_fetch_candidate_issues_stops_at_max_pages(
@@ -335,7 +421,10 @@ def test_fetch_issue_full_by_id_normalizes_full_body() -> None:
                         "priority": 1,
                         "state": {"name": "Review"},
                         "labels": {"nodes": [{"name": "qa"}]},
-                        "inverseRelations": {"nodes": []},
+                        "inverseRelations": {
+                            "pageInfo": {"hasNextPage": False},
+                            "nodes": [],
+                        },
                     }
                 }
             },
