@@ -6325,17 +6325,12 @@ class Orchestrator:
             if overlap:
                 return entry.issue.identifier, overlap
         for other_id, retry_entry in self._retry.items():
-            if other_id == candidate.id:
+            if other_id == candidate.id or other_id in self._running:
                 continue
-            # Retry entries don't carry the full Issue. Look up the
-            # last-known body via running history when present; the
-            # common case (retry of an exited ticket) leaves no body to
-            # inspect, and the retry path re-evaluates on its own tick.
-            running_entry = self._running.get(other_id)
-            if running_entry is None:
-                continue
-            other_files = self._touched_files_for(running_entry.issue)
-            overlap = candidate_files & other_files
+            # A retry may outlive the worker that produced it, so use the
+            # immutable snapshot captured at exit. A live entry is checked
+            # first above and remains authoritative when both are present.
+            overlap = candidate_files & retry_entry.touched_files
             if overlap:
                 return retry_entry.identifier, overlap
         return None
@@ -10244,6 +10239,7 @@ class Orchestrator:
                     delay_ms=CONTINUATION_RETRY_DELAY_MS,
                     error=None,
                     kind="continuation",
+                    touched_files=frozenset(self._touched_files_for(entry.issue)),
                 )
             elif entry.hit_max_turns:
                 # `max_turns` exhausted without a terminal transition: stop
@@ -10341,6 +10337,7 @@ class Orchestrator:
                 delay_ms=delay_ms,
                 error=cleaned_failure,
                 kind="retry",
+                touched_files=frozenset(self._touched_files_for(entry.issue)),
             )
         log.info(
             "worker_exit",
@@ -10416,6 +10413,7 @@ class Orchestrator:
                 attempt=next_attempt,
                 delay_ms=delay_ms,
                 error="force_ejected_zombie",
+                touched_files=frozenset(self._touched_files_for(entry.issue)),
             )
             debug = self._issue_debug.setdefault(issue_id, _IssueDebug())
             debug.last_workspace = entry.workspace_path
@@ -10435,12 +10433,22 @@ class Orchestrator:
         error: str | None,
         kind: str | None = None,
         holds_slot: bool = True,
+        touched_files: frozenset[str] | None = None,
     ) -> None:
         if self._loop is None:
             return
         retry_kind = kind or ("continuation" if error is None else "retry")
         if self._retry_cap_exceeded(issue_id, identifier, attempt, error, retry_kind):
             return
+        existing_retry = self._retry.get(issue_id)
+        if touched_files is not None:
+            owned_files = touched_files
+        elif issue_id in self._running:
+            owned_files = frozenset(self._touched_files_for(self._running[issue_id].issue))
+        elif existing_retry is not None:
+            owned_files = existing_retry.touched_files
+        else:
+            owned_files = frozenset()
         self._install_retry(
             issue_id=issue_id,
             identifier=identifier,
@@ -10449,6 +10457,7 @@ class Orchestrator:
             error=error,
             kind=retry_kind,
             holds_slot=holds_slot,
+            touched_files=owned_files,
         )
 
     def _retry_cap_exceeded(
@@ -10499,6 +10508,7 @@ class Orchestrator:
         error: str | None,
         kind: str,
         holds_slot: bool,
+        touched_files: frozenset[str],
     ) -> None:
         assert self._loop is not None
         due = self._loop.time() + delay_ms / 1000.0
@@ -10520,6 +10530,7 @@ class Orchestrator:
                 error=error,
                 kind=kind,
                 holds_slot=holds_slot,
+                touched_files=touched_files,
             ),
         )
         debug = self._issue_debug.setdefault(issue_id, _IssueDebug())
@@ -10683,6 +10694,7 @@ class Orchestrator:
             error=error,
             kind=retry.kind,
             holds_slot=True,
+            touched_files=retry.touched_files,
         )
 
     async def _process_retry(self, retry: RetryEntry, cfg: ServiceConfig) -> None:
@@ -10753,6 +10765,7 @@ class Orchestrator:
             error=_clean_board_error_message(reason)[:300],
             kind=retry.kind,
             holds_slot=holds_slot,
+            touched_files=retry.touched_files,
         )
 
     def _release_retry_ownership(

@@ -26,7 +26,9 @@ from symphony.issue import BlockerRef, Issue, sort_for_dispatch
 from symphony.orchestrator import (
     STALL_FORCE_EJECT_GRACE_S,
     Orchestrator,
+    RetryEntry,
     RunningEntry,
+    UsageDecision,
     _is_auto_triage_todo_candidate,
     _IssueDebug,
     _sort_for_dispatch_fifo,
@@ -52,6 +54,7 @@ from symphony.workflow import (
     ServerConfig,
     ServiceConfig,
     TrackerConfig,
+    UsagePoolConfig,
     WorkflowState,
 )
 
@@ -7897,6 +7900,152 @@ def test_conflict_pre_check_no_overlap_dispatches_normally(monkeypatch):
     assert dispatched == ["MT-2"], (
         "non-overlapping touched files must not block dispatch"
     )
+
+
+class _RetryTimer:
+    def cancel(self) -> None:
+        return None
+
+
+def _pending_retry(
+    issue_id: str, identifier: str, touched_files: frozenset[str], *, holds_slot: bool = True
+) -> RetryEntry:
+    return RetryEntry(
+        issue_id=issue_id,
+        identifier=identifier,
+        attempt=1,
+        due_at_ms=0.0,
+        timer_handle=_RetryTimer(),  # type: ignore[arg-type]
+        holds_slot=holds_slot,
+        touched_files=touched_files,
+    )
+
+
+def test_conflict_pre_check_blocks_overlap_with_exited_retry():
+    orch = _orch()
+    candidate = _issue(
+        "MT-CANDIDATE",
+        description="## Touched Files\n- src/shared.py\n- src/new.py\n",
+    )
+    orch._retry["id-MT-RETRY"] = _pending_retry(
+        "id-MT-RETRY", "MT-RETRY", frozenset({"src/shared.py"})
+    )
+
+    assert orch._conflict_blocker(candidate) == (
+        "MT-RETRY",
+        {"src/shared.py"},
+    )
+
+
+def test_conflict_pre_check_allows_non_overlapping_exited_retry():
+    orch = _orch()
+    candidate = _issue(
+        "MT-CANDIDATE",
+        description="## Touched Files\n- src/other.py\n",
+    )
+    orch._retry["id-MT-RETRY"] = _pending_retry(
+        "id-MT-RETRY", "MT-RETRY", frozenset({"src/shared.py"})
+    )
+
+    assert orch._conflict_blocker(candidate) is None
+
+
+def test_conflict_pre_check_ignores_candidate_own_retry_snapshot():
+    orch = _orch()
+    candidate = _issue(
+        "MT-CANDIDATE",
+        description="## Touched Files\n- src/shared.py\n",
+    )
+    orch._retry[candidate.id] = _pending_retry(
+        candidate.id, candidate.identifier, frozenset({"src/shared.py"})
+    )
+
+    assert orch._conflict_blocker(candidate) is None
+
+
+def test_conflict_pre_check_preserves_retry_ownership_when_reparked():
+    orch = _orch()
+    orch._loop = asyncio.new_event_loop()
+    retry = _pending_retry("id-MT-RETRY", "MT-RETRY", frozenset({"src/shared.py"}))
+    orch._retry[retry.issue_id] = retry
+    try:
+        orch._repark_retry(
+            retry,
+            _make_config(),
+            identifier=retry.identifier,
+            reason="provider usage wait",
+            holds_slot=False,
+        )
+        assert orch._retry[retry.issue_id].touched_files == retry.touched_files
+    finally:
+        for pending in orch._retry.values():
+            pending.timer_handle.cancel()
+        orch._loop.close()
+
+
+def test_provider_usage_wait_reparks_retry_without_releasing_file_ownership(
+    monkeypatch,
+):
+    cfg = replace(
+        _make_config(),
+        usage_pools={
+            "codex": UsagePoolConfig(source="codex", caps={"weekly": 80})
+        },
+    )
+    orch = _orch()
+    orch._loop = asyncio.new_event_loop()
+    issue = _issue(
+        "MT-PROVIDER-WAIT",
+        description="## Touched Files\n- src/provider-owned.py\n",
+    )
+    retry = _pending_retry(
+        issue.id, issue.identifier, frozenset({"src/provider-owned.py"})
+    )
+    monkeypatch.setattr(
+        orch._usage_manager,
+        "evaluate",
+        lambda _pool_id, _pool: UsageDecision.WAIT_PROVIDER_USAGE,
+    )
+
+    async def _fetch_candidates(_cfg):
+        return [issue]
+
+    monkeypatch.setattr(orch, "_fetch_candidates", _fetch_candidates)
+    try:
+        asyncio.run(orch._process_retry(retry, cfg))
+        reparks = orch._retry
+        assert reparks[issue.id].touched_files == retry.touched_files
+        assert reparks[issue.id].holds_slot is False
+    finally:
+        for pending in orch._retry.values():
+            pending.timer_handle.cancel()
+        orch._loop.close()
+
+
+def test_conflict_pre_check_live_entry_takes_precedence_over_retry_snapshot():
+    orch = _orch()
+    live = _issue(
+        "MT-LIVE",
+        state="In Progress",
+        description="## Touched Files\n- src/live.py\n",
+    )
+    candidate = _issue(
+        "MT-CANDIDATE",
+        description="## Touched Files\n- src/retry.py\n",
+    )
+    orch._running[live.id] = RunningEntry(
+        issue=live,
+        started_at=datetime.now(timezone.utc),
+        retry_attempt=None,
+        worker_task=None,  # type: ignore[arg-type]
+        workspace_path=Path("/tmp"),
+    )
+    # A stale retry snapshot must not make the live entry appear to own files.
+    orch._retry[live.id] = _pending_retry(
+        live.id, live.identifier, frozenset({"src/retry.py"})
+    )
+
+    assert orch._conflict_blocker(candidate) is None
 
 
 def test_g1_stale_claimed_pruned_after_conflict_resolves(monkeypatch):
