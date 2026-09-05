@@ -57,6 +57,7 @@ from ..backends import build_backend
 from ..chat import cfg_for_mode
 from ..utils import git_inspect
 from ..utils.archive import select_archivable
+from ..utils.atomic_json import state_file_name, write_json_atomic
 from ..backends.codex import linear_graphql_tool
 from ..errors import (
     ConfigValidationError,
@@ -3802,7 +3803,11 @@ class Orchestrator:
 
     def _done_count_path(self, cfg: ServiceConfig) -> Path:
         """On-disk location for the persisted Done counter."""
-        return cfg.workflow_path.parent / ".symphony" / "done_count.json"
+        return (
+            cfg.workflow_path.parent
+            / ".symphony"
+            / state_file_name(cfg.workflow_path, "done_count")
+        )
 
     def _load_done_count(self, cfg: ServiceConfig) -> None:
         """Restore the Done counter across orchestrator restarts.
@@ -3830,12 +3835,7 @@ class Orchestrator:
         path = self._done_count_path(cfg)
         try:
             path.parent.mkdir(parents=True, exist_ok=True)
-            tmp = path.with_suffix(".json.tmp")
-            tmp.write_text(
-                json.dumps({"done_count": self._done_count}, indent=2),
-                encoding="utf-8",
-            )
-            tmp.replace(path)
+            write_json_atomic(path, {"done_count": self._done_count})
         except OSError as exc:
             log.warning("done_count_persist_failed", path=str(path), error=str(exc))
 
@@ -6409,7 +6409,11 @@ class Orchestrator:
 
     def _token_ema_path(self, cfg: ServiceConfig) -> Path:
         """Return the on-disk location for the persisted EMA snapshot."""
-        return cfg.workflow_path.parent / ".symphony" / "token_ema.json"
+        return (
+            cfg.workflow_path.parent
+            / ".symphony"
+            / state_file_name(cfg.workflow_path, "token_ema")
+        )
 
     def _load_token_ema(self, cfg: ServiceConfig) -> None:
         """Load `_token_ema` from disk on `start()`. Missing file = empty.
@@ -6451,12 +6455,7 @@ class Orchestrator:
         path = self._token_ema_path(cfg)
         try:
             path.parent.mkdir(parents=True, exist_ok=True)
-            tmp = path.with_suffix(".json.tmp")
-            tmp.write_text(
-                json.dumps(self._token_ema, sort_keys=True, indent=2),
-                encoding="utf-8",
-            )
-            tmp.replace(path)
+            write_json_atomic(path, self._token_ema)
         except OSError as exc:
             log.warning(
                 "token_ema_persist_failed",

@@ -9575,6 +9575,24 @@ def test_token_ema_persists_and_reloads(tmp_path):
     assert fresh._token_ema_for_state("Review") == 0
 
 
+def test_persisted_state_paths_namespace_sibling_workflows(tmp_path):
+    base = _make_config()
+    canonical = replace(base, workflow_path=tmp_path / "WORKFLOW.md")
+    sibling = replace(base, workflow_path=tmp_path / "WORKFLOW.claude.md")
+    orch = _orch()
+
+    assert orch._token_ema_path(canonical) == tmp_path / ".symphony" / "token_ema.json"
+    assert orch._done_count_path(canonical) == tmp_path / ".symphony" / "done_count.json"
+    assert (
+        orch._token_ema_path(sibling)
+        == tmp_path / ".symphony" / "token_ema.WORKFLOW.claude.json"
+    )
+    assert (
+        orch._done_count_path(sibling)
+        == tmp_path / ".symphony" / "done_count.WORKFLOW.claude.json"
+    )
+
+
 def test_token_budget_for_state_falls_back_to_default():
     """`max_total_tokens_by_state` overrides; absent state uses the
     global `max_total_tokens` cap.
