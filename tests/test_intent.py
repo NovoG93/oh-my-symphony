@@ -4,6 +4,7 @@ from pathlib import Path
 
 import pytest
 
+import symphony.intent as intent_module
 from symphony.errors import ChatIntentActionError
 from symphony.intent import (
     IntentAction,
@@ -13,6 +14,7 @@ from symphony.intent import (
     parse_intent_marker,
 )
 from symphony.workflow.config import TrackerConfig
+from symphony.trackers.file import FileBoardTracker
 
 
 def _proposal(**overrides: object) -> dict[str, object]:
@@ -234,3 +236,57 @@ def test_file_filer_rejects_symlinked_artifact_root(tmp_path: Path) -> None:
         IntentFiler(tmp_path, tracker).file(action)
     assert not (tmp_path / "kanban" / "REQ-1.md").exists()
     assert not (outside / "repair-widget" / "intent.md").exists()
+
+
+def _file_tracker(tmp_path: Path) -> TrackerConfig:
+    return TrackerConfig(
+        kind="file",
+        endpoint="",
+        api_key="",
+        project_slug="",
+        active_states=("Todo",),
+        terminal_states=("Done",),
+        board_root=tmp_path / "kanban",
+    )
+
+
+def test_artifact_write_failure_creates_no_request_ticket(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    action = IntentAction.from_proposal(IntentProposal(**_proposal()))
+
+    def fail_write(_path: Path, _content: str) -> None:
+        raise OSError("simulated artifact replacement failure")
+
+    monkeypatch.setattr(intent_module, "_write_text_atomic", fail_write)
+    with pytest.raises(OSError):
+        IntentFiler(tmp_path, _file_tracker(tmp_path)).file(action)
+    assert not (tmp_path / "kanban" / "REQ-1.md").exists()
+
+
+def test_ticket_failure_leaves_retryable_artifact_and_retry_allocates_once(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    action = IntentAction.from_proposal(IntentProposal(**_proposal()))
+    original = FileBoardTracker.create_validated
+    calls = 0
+
+    def fail_once(self: FileBoardTracker, **kwargs: object) -> tuple[str, Path]:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise OSError("simulated ticket allocation failure")
+        return original(self, **kwargs)
+
+    monkeypatch.setattr(FileBoardTracker, "create_validated", fail_once)
+    filer = IntentFiler(tmp_path, _file_tracker(tmp_path))
+    with pytest.raises(OSError):
+        filer.file(action, session_id="session")
+    artifact = tmp_path / ".sdlc" / "work" / "repair-widget" / "intent.md"
+    assert artifact.is_file()
+    assert not (tmp_path / "kanban" / "REQ-1.md").exists()
+
+    ticket = filer.file(action, session_id="session")
+    assert ticket["identifier"] == "REQ-1"
+    assert len(list((tmp_path / "kanban").glob("REQ-*.md"))) == 1
+    assert "action=intent-" in artifact.read_text(encoding="utf-8")

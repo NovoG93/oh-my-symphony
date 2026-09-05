@@ -214,6 +214,14 @@ def _write_text_atomic(path: Path, content: str) -> None:
         raise
 
 
+def _provenance_value(value: str | None) -> str:
+    """Keep host-owned provenance bounded and single-line safe."""
+    if not value:
+        return ""
+    clean = "".join(character if ord(character) >= 32 else " " for character in value)
+    return clean[:128]
+
+
 class IntentFiler:
     """File-board-only filing service used by the Chat approval boundary."""
 
@@ -256,8 +264,24 @@ class IntentFiler:
         artifact = (root / action.slug / "intent.md").resolve()
         if root != artifact and root not in artifact.parents:
             raise ChatIntentActionError("intent artifact path escaped project root")
+        approval_time = datetime.now(timezone.utc).isoformat()
+        provenance = (
+            "\n\n<!-- Approved by Symphony"
+            f" action={_provenance_value(action.action_id)}"
+            f" session={_provenance_value(session_id)}"
+            f" at={approval_time} -->\n"
+        )
+        artifact_content = action.intent.rstrip() + provenance
+        # The artifact is deterministic for the action (apart from the
+        # host-owned approval timestamp), and is deliberately the first
+        # mutation.  A failed write therefore cannot leave a board ticket
+        # without its supporting intent document.
+        _write_text_atomic(artifact, artifact_content)
+        if artifact.read_text(encoding="utf-8") != artifact_content:
+            raise ChatIntentActionError("intent artifact verification failed")
+
         board = FileBoardTracker(self.tracker_config)
-        state = self.tracker_config.active_states[0] if self.tracker_config.active_states else "Todo"
+        state = self.tracker_config.active_states[0]
         ticket_id, ticket_path = board.create_validated(
             identifier=None,
             prefix="REQ",
@@ -266,8 +290,6 @@ class IntentFiler:
             description=action.intent,
             request=action.slug,
         )
-        provenance = f"\n\n<!-- Approved by Symphony{f' session {session_id}' if session_id else ''}. -->\n"
-        _write_text_atomic(artifact, action.intent.rstrip() + provenance)
         return {"id": ticket_id, "identifier": ticket_id, "title": action.title, "path": str(ticket_path), "request": action.slug}
 
 
