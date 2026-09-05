@@ -303,6 +303,14 @@
         headers: { 'X-Symphony-Chat-Confirmation': confirmationToken },
       }
     ),
+    approveChatIntent: (sessionId, actionId, confirmationToken) => apiRequest(
+      `/chat/sessions/${encodeURIComponent(sessionId)}/intent/${encodeURIComponent(actionId)}/approve`,
+      {
+        method: 'POST',
+        body: '{}',
+        headers: { 'X-Symphony-Chat-Confirmation': confirmationToken },
+      }
+    ),
     reattachChatSession: (id, confirmationToken) => apiRequest(
       `/chat/sessions/${encodeURIComponent(id)}/reattach`,
       {
@@ -3851,7 +3859,7 @@
     // Several sessions can run at once; the page shows one at a time and
     // tells the socket which one so only its deltas are streamed.
     currentId: null, sessions: null, autoCreatePromise: null, projectSetupActions: {},
-    projectSetupExpiryTimers: {}, confirmationTokens: {}, lifecycleBusy: false,
+    projectSetupExpiryTimers: {}, intentExpiryTimers: {}, intentActions: {}, confirmationTokens: {}, lifecycleBusy: false,
   };
 
   const CHAT_AGENT_LABELS = {
@@ -4037,6 +4045,139 @@
       if (!actions[node.dataset.projectSetupId]) node.remove();
     }
     for (const action of Object.values(actions)) renderChatProjectSetupAction(view, action);
+  }
+
+  function chatIntentExpired(action) {
+    const expiresAt = Date.parse(action.expires_at || '');
+    return Number.isFinite(expiresAt) && expiresAt <= Date.now();
+  }
+
+  function chatIntentStatus(action) {
+    const statuses = {
+      pending: t('chat.intentPending'), running: t('chat.intentRunning'),
+      approved: t('chat.intentApproved'), failed: t('chat.intentFailed'),
+      expired: t('chat.intentExpired'), superseded: t('chat.intentSuperseded'),
+    };
+    return statuses[action.status] || action.status || t('common.unknown');
+  }
+
+  function rememberChatIntent(action) {
+    if (!action || !action.action_id) return;
+    chatState.intentActions[action.action_id] = action;
+  }
+
+  function forgetChatIntent(actionId) {
+    if (!actionId) return;
+    const timer = chatState.intentExpiryTimers[actionId];
+    if (timer) clearTimeout(timer);
+    delete chatState.intentExpiryTimers[actionId];
+    delete chatState.intentActions[actionId];
+    const node = document.querySelector(`[data-intent-action-id="${actionId}"]`);
+    if (node) node.remove();
+  }
+
+  async function approveChatIntent(view, action) {
+    const sessionId = chatState.currentId;
+    const token = chatConfirmationToken(sessionId);
+    if (!sessionId || !token) throw new ApiError(t('chat.intentConfirmationUnavailable'), 'chat_intent_confirmation_forbidden', 403);
+    const result = await api.approveChatIntent(sessionId, action.action_id, token);
+    const updated = result && result.action;
+    if (updated) {
+      rememberChatIntent(updated);
+      renderChatIntentAction(view, updated);
+    }
+    return updated || action;
+  }
+
+  function reconcileChatIntentActions(view, snapshot) {
+    const actions = {};
+    for (const action of (snapshot && snapshot.intent_actions) || []) {
+      if (action && action.action_id) actions[action.action_id] = action;
+    }
+    chatState.intentActions = actions;
+    for (const actionId of Object.keys(chatState.intentExpiryTimers)) {
+      if (!actions[actionId]) {
+        clearTimeout(chatState.intentExpiryTimers[actionId]);
+        delete chatState.intentExpiryTimers[actionId];
+      }
+    }
+    for (const node of view.transcript.querySelectorAll('[data-intent-action-id]')) {
+      if (!actions[node.dataset.intentActionId]) node.remove();
+    }
+    for (const action of Object.values(actions)) renderChatIntentAction(view, action);
+  }
+
+  function renderChatIntentAction(view, action) {
+    if (!action || !action.action_id) return;
+    const expired = chatIntentExpired(action);
+    const status = expired && (action.status === 'pending' || action.status === 'failed') ? 'expired' : (action.status || 'pending');
+    const canApprove = (status === 'pending' || status === 'failed') && !expired && Boolean(chatConfirmationToken(chatState.currentId));
+    const existing = view.transcript.querySelector(`[data-intent-action-id="${action.action_id}"]`);
+    const approve = canApprove ? el('button', {
+      class: 'btn btn-primary btn-sm chat-intent-approve', type: 'button',
+      'aria-label': t('chat.intentApproveAria', { title: action.title }),
+      onClick: async (event) => {
+        const button = event.currentTarget;
+        button.disabled = true;
+        try {
+          const updated = await approveChatIntent(view, action);
+          if (updated.status === 'approved') showToast(t('chat.intentApprovedToast'), 'success');
+        } catch (err) {
+          showToast(err.message, 'error');
+          renderChatIntentAction(view, { ...action, status: 'failed', error: err.message });
+        }
+      },
+    }, status === 'failed' ? t('common.retry') : t('chat.intentApprove')) : null;
+    const ticket = action.ticket && (action.ticket.identifier || action.ticket.id);
+    const node = el('section', {
+      class: `chat-intent-action ${status}`,
+      'data-intent-action-id': action.action_id,
+      'aria-live': 'polite',
+    }, [
+      el('div', { class: 'chat-intent-heading' }, [
+        el('h2', { class: 'chat-intent-title' }, action.title),
+        el('span', { class: `chat-intent-status ${status}` }, chatIntentStatus({ ...action, status })),
+      ]),
+      el('div', { class: 'chat-intent-meta' }, [
+        el('span', { class: 'chip-label' }, t('chat.intentTrack', { track: action.track })),
+        el('code', { class: 'chat-intent-slug' }, action.slug),
+      ]),
+      el('div', { class: 'chat-intent-markdown' }, renderMarkdown(action.intent || '')),
+      action.error ? el('p', { class: 'chat-intent-error', role: 'alert' }, truncate(String(action.error), 800)) : null,
+      ticket ? el('p', { class: 'chat-intent-ticket' }, t('chat.intentTicket', { id: ticket, title: action.ticket.title || '' })) : null,
+      approve,
+    ]);
+    if (existing) existing.replaceWith(node);
+    else view.transcript.appendChild(node);
+    scheduleChatIntentExpiry(view, { ...action, status });
+  }
+
+  function scheduleChatIntentExpiry(view, action) {
+    if (!action || !action.action_id) return;
+    const oldTimer = chatState.intentExpiryTimers[action.action_id];
+    if (oldTimer) clearTimeout(oldTimer);
+    delete chatState.intentExpiryTimers[action.action_id];
+    if (action.status !== 'pending' && action.status !== 'failed') return;
+    const expiresAt = Date.parse(action.expires_at || '');
+    const delay = expiresAt - Date.now();
+    if (!Number.isFinite(delay)) return;
+    if (delay <= 0) {
+      const current = chatState.intentActions[action.action_id];
+      if (current) {
+        current.status = 'expired';
+        renderChatIntentAction(view, current);
+      }
+      return;
+    }
+    if (delay > 2_147_000_000) return;
+    chatState.intentExpiryTimers[action.action_id] = setTimeout(() => {
+      delete chatState.intentExpiryTimers[action.action_id];
+      const current = chatState.intentActions[action.action_id];
+      if (current && (current.status === 'pending' || current.status === 'failed')) {
+        current.status = 'expired';
+        renderChatIntentAction(view, current);
+      }
+    }, delay + 1);
   }
 
   function chatProjectSetupForChoice(text) {
@@ -4375,11 +4516,15 @@
       chatState.snapshot = snapshot;
       chatState.busy = Boolean(snapshot.busy);
       reconcileChatProjectSetupActions(view, snapshot);
+      reconcileChatIntentActions(view, snapshot);
     } catch (_err) {
       if (chatState.currentId !== sessionId) return;
       chatState.snapshot = { active: false };
       chatState.busy = false;
       clearChatProjectSetupActions(view);
+      for (const timer of Object.values(chatState.intentExpiryTimers)) clearTimeout(timer);
+      chatState.intentExpiryTimers = {};
+      chatState.intentActions = {};
     }
     renderChatControls(view);
     updateChatComposer(view);
@@ -4390,6 +4535,9 @@
     for (const timer of Object.values(chatState.projectSetupExpiryTimers)) clearTimeout(timer);
     chatState.projectSetupExpiryTimers = {};
     chatState.projectSetupActions = {};
+    for (const timer of Object.values(chatState.intentExpiryTimers)) clearTimeout(timer);
+    chatState.intentExpiryTimers = {};
+    chatState.intentActions = {};
     for (const action of snapshot.project_setup_actions || []) rememberChatProjectSetup(action);
     if (snapshot.session_id) chatState.currentId = snapshot.session_id;
     chatState.busy = Boolean(snapshot.busy);
@@ -4403,6 +4551,7 @@
     for (const action of Object.values(chatState.projectSetupActions)) {
       renderChatProjectSetupAction(view, action);
     }
+    reconcileChatIntentActions(view, snapshot);
     if (!snapshot.active && !tail.length) {
       view.transcript.appendChild(el('div', { class: 'empty-state' }, t('chat.startHint')));
     }
@@ -4487,6 +4636,20 @@
           forgetChatProjectSetup(actionId);
           view.transcript.querySelector(`[data-project-setup-id="${actionId}"]`)?.remove();
         }
+      }
+      return;
+    }
+    if (msg.type === 'intent_removed') {
+      const actionId = msg.meta && msg.meta.intent_action_id;
+      if (actionId) forgetChatIntent(actionId);
+      return;
+    }
+    if (msg.type === 'intent_action' || msg.type === 'intent_status') {
+      const action = msg.meta && msg.meta.intent;
+      if (action) {
+        rememberChatIntent(action);
+        renderChatIntentAction(view, action);
+        view.transcript.scrollTop = view.transcript.scrollHeight;
       }
       return;
     }

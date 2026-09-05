@@ -4,6 +4,7 @@ import asyncio
 import json
 import os
 import subprocess
+from datetime import timedelta
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, AsyncIterator, cast
@@ -13,6 +14,7 @@ import pytest_asyncio
 from aiohttp.test_utils import TestClient, TestServer
 
 from symphony import chat as chat_module
+from symphony import intent as intent_module
 from symphony import webapi as webapi_module
 from symphony.backends import (
     EVENT_OTHER_MESSAGE,
@@ -660,6 +662,24 @@ class _FakeChatBackend:
                     {"choice": 1, "name": "Todo App", "path": str(target)}
                 )
                 + "</symphony-project-setup>"
+            )
+        elif "expiring intent" in prompt or "propose an intent" in prompt:
+            answer = (
+                "Here is the implementation proposal for your review.\n"
+                "<symphony-intent>"
+                + json.dumps(
+                    {
+                        "slug": "browser-intent",
+                        "title": "Browser intent proposal",
+                        "track": "micro",
+                        "intent": (
+                            "## Problem\nThe browser needs a safe proposal.\n\n"
+                            "## Success criteria\n- [ ] The proposal is filed\n\n"
+                            "## Out of scope\nNothing else."
+                        ),
+                    }
+                )
+                + "</symphony-intent>"
             )
         await self._emit(EVENT_TURN_STARTED, {})
         if self.init.cfg.agent.kind == "prime-agent":
@@ -1326,6 +1346,89 @@ async def test_chat_pending_project_setup_card_disappears_after_stop(
                 backend.turns and backend.turns[-1].endswith("offer a separate project")
                 for backend in chat_backends
             )
+        finally:
+            await browser.close()
+
+
+async def test_chat_intent_browser_approval_and_safe_rendering(
+    git_web_base_url: str, git_board_dir: Path, chat_backends: list[_FakeChatBackend]
+) -> None:
+    assert async_playwright is not None
+    async with async_playwright() as p:
+        try:
+            browser = await p.chromium.launch()
+        except Exception as exc:
+            pytest.skip(f"Playwright Chromium unavailable: {exc}")
+        page = await browser.new_page(viewport={"width": 1440, "height": 960})
+        page_errors: list[str] = []
+        page.on("pageerror", lambda exc: page_errors.append(str(exc)))
+        try:
+            await page.goto(f"{git_web_base_url}/#/chat", wait_until="networkidle")
+            await page.locator(".chat-session-bar").wait_for()
+            await page.locator(".chat-mode-toggle").get_by_role(
+                "button", name="Edit", exact=True
+            ).click()
+            await page.locator(".chat-mode-btn.active", has_text="Edit").wait_for()
+            await page.locator(".chat-input").fill("propose an intent")
+            await page.get_by_role("button", name="Send", exact=True).click()
+
+            card = page.locator(".chat-intent-action")
+            await card.wait_for()
+            transcript = await page.locator(".chat-transcript").inner_text()
+            assert transcript.index("Here is the implementation proposal") < transcript.index("Browser intent proposal")
+            assert "symphony-intent" not in transcript
+            assert "Browser intent proposal" in await card.locator(".chat-intent-title").inner_text()
+            assert "micro track" in await card.locator(".chat-intent-meta").inner_text()
+            assert "The browser needs a safe proposal." in await card.locator(".chat-intent-markdown").inner_text()
+            assert "Ready for approval" in await card.locator(".chat-intent-status").inner_text()
+
+            approve_request = None
+            async with page.expect_request(
+                lambda request: "/intent/" in request.url and request.url.endswith("/approve")
+            ) as request_info:
+                await card.get_by_role("button", name="Approve intent").click()
+            approve_request = await request_info.value
+            confirmation = approve_request.headers.get("x-symphony-chat-confirmation")
+            assert confirmation
+            assert confirmation not in approve_request.url
+            assert confirmation not in await page.locator(".chat-transcript").inner_text()
+            await card.locator(".chat-intent-status", has_text="Approved").wait_for()
+            assert "REQ-" in await card.locator(".chat-intent-ticket").inner_text()
+            assert await card.get_by_role("button", name="Approve intent").count() == 0
+            assert len(list((git_board_dir / "kanban").glob("REQ-*.md"))) == 1
+            assert (git_board_dir / ".sdlc" / "work" / "browser-intent" / "intent.md").is_file()
+            assert page_errors == []
+        finally:
+            await browser.close()
+
+
+async def test_chat_intent_browser_expiry_disables_approval(
+    git_web_base_url: str,
+    chat_backends: list[_FakeChatBackend],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    assert async_playwright is not None
+    async with async_playwright() as p:
+        try:
+            browser = await p.chromium.launch()
+        except Exception as exc:
+            pytest.skip(f"Playwright Chromium unavailable: {exc}")
+        page = await browser.new_page(viewport={"width": 1440, "height": 960})
+        try:
+            await page.goto(f"{git_web_base_url}/#/chat", wait_until="networkidle")
+            await page.locator(".chat-session-bar").wait_for()
+            await page.locator(".chat-mode-toggle").get_by_role(
+                "button", name="Edit", exact=True
+            ).click()
+            await page.locator(".chat-mode-btn.active", has_text="Edit").wait_for()
+            del chat_backends
+            monkeypatch.setattr(intent_module, "INTENT_ACTION_TTL", timedelta(seconds=0.25))
+            await page.locator(".chat-input").fill("expiring intent")
+            await page.get_by_role("button", name="Send", exact=True).click()
+            card = page.locator(".chat-intent-action")
+            await card.wait_for()
+            await card.locator(".chat-intent-status", has_text="Expired").wait_for(timeout=3000)
+            assert await card.get_by_role("button", name="Approve intent").count() == 0
         finally:
             await browser.close()
 
