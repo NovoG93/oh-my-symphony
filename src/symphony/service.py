@@ -25,6 +25,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Literal, Mapping
 
+from . import systemd
 from ._shell import _taskkill_tree
 from .errors import SymphonyError
 from .orchestrator.run_registry import RunRegistry, registry_path_for_workflow
@@ -1039,6 +1040,78 @@ def _logs(args: argparse.Namespace) -> int:
     return 0
 
 
+def _install_port(raw_port: int | None, workflow: Path) -> int:
+    """Explicit port, else the workflow's configured port, else the default."""
+    if raw_port is not None:
+        return int(raw_port)
+    try:
+        return _resolve_port(None, _load_cfg(workflow))
+    except SymphonyError:
+        return DEFAULT_SERVICE_PORT
+
+
+def _install(args: argparse.Namespace) -> int:
+    workflow = resolve_workflow_path(args.workflow)
+    port = _install_port(args.port, workflow)
+    if args.dry_run:
+        print(
+            systemd.render_unit(
+                workflow, host=args.host, port=port, python=sys.executable
+            )
+        )
+        return 0
+    if not workflow.exists():
+        print(f"FAIL workflow file not found: {workflow}", file=sys.stderr)
+        return 2
+    if not systemd.is_available():
+        print(
+            "systemd user manager not available; falling back to "
+            "`symphony service start` (detached)",
+            file=sys.stderr,
+        )
+        return 1
+    try:
+        result = systemd.ensure_unit(
+            workflow,
+            host=args.host,
+            port=port,
+            python=sys.executable,
+            enable=not args.no_enable,
+        )
+    except systemd.SystemdError as exc:
+        print(f"service install failed: {exc}", file=sys.stderr)
+        return 1
+    print(f"{result.action} {result.unit_name} at {result.unit_path}")
+    return 0
+
+
+def _uninstall(args: argparse.Namespace) -> int:
+    workflow = resolve_workflow_path(args.workflow)
+    try:
+        result = systemd.uninstall_unit(workflow)
+    except systemd.SystemdError as exc:
+        print(f"service uninstall failed: {exc}", file=sys.stderr)
+        return 1
+    if result.disable_error:
+        print(f"warning: {result.disable_error}", file=sys.stderr)
+    if result.removed_unit:
+        print(f"uninstalled {result.unit_name}")
+    elif result.drop_in_removed:
+        print(
+            f"removed drop-in override for {result.unit_name}; "
+            "hand-made unit left in place"
+        )
+    else:
+        print(f"no unit installed for {workflow}")
+    return 0
+
+
+def _unit_path(args: argparse.Namespace) -> int:
+    workflow = resolve_workflow_path(args.workflow)
+    print(str(systemd.unit_path_for(workflow)))
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="symphony service",
@@ -1088,6 +1161,28 @@ def build_parser() -> argparse.ArgumentParser:
     add_workflow(p_logs)
     p_logs.add_argument("--lines", type=int, default=80)
     p_logs.set_defaults(func=_logs)
+
+    p_install = sub.add_parser(
+        "install", help="install/enable a systemd user unit for this workflow"
+    )
+    add_workflow(p_install)
+    p_install.add_argument("--host", default="0.0.0.0")
+    p_install.add_argument("--port", type=int, default=None)
+    p_install.add_argument("--no-enable", action="store_true")
+    p_install.add_argument(
+        "--dry-run", action="store_true", help="print the unit text and exit"
+    )
+    p_install.set_defaults(func=_install)
+
+    p_uninstall = sub.add_parser(
+        "uninstall", help="disable and remove the managed unit"
+    )
+    add_workflow(p_uninstall)
+    p_uninstall.set_defaults(func=_uninstall)
+
+    p_unit_path = sub.add_parser("unit-path", help="print the unit path for a workflow")
+    add_workflow(p_unit_path)
+    p_unit_path.set_defaults(func=_unit_path)
 
     return parser
 

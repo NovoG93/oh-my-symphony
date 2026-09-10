@@ -218,3 +218,60 @@ def ensure_unit(
         if enable:
             run_systemctl("enable", target.name)
     return EnsureResult(action=action, unit_path=target, unit_name=target.name)
+
+
+def unit_path_for(workflow_path: str | Path) -> Path:
+    """The unit that serves this workflow: an adopted one, else the managed path."""
+    adopted = find_unit_for_workflow(workflow_path)
+    if adopted is not None:
+        return adopted
+    return unit_dir() / unit_name_for(workflow_path)
+
+
+@dataclass(frozen=True)
+class UninstallResult:
+    unit_path: Path
+    unit_name: str
+    removed_unit: bool
+    drop_in_removed: bool
+    disable_error: str | None = None
+
+
+def uninstall_unit(workflow_path: str | Path) -> UninstallResult:
+    """Disable and remove the unit serving a workflow, plus its drop-ins.
+
+    A unit installed by :func:`ensure_unit` is removed entirely.  A hand-made
+    unit adopted via drop-in keeps its base file: only the managed override is
+    removed so operator customizations survive an uninstall.
+    """
+    target = unit_path_for(workflow_path)
+    disable_error: str | None = None
+    if target.exists() or target.is_symlink():
+        try:
+            run_systemctl("disable", "--now", target.name, check=False)
+        except SystemdError as exc:
+            disable_error = str(exc)
+    managed = False
+    if target.is_file():
+        try:
+            managed = UNIT_MARKER in target.read_text(
+                encoding="utf-8", errors="replace"
+            )
+        except OSError:
+            managed = False
+    drop_in_dir = override_path_for(target).parent
+    drop_in_removed = drop_in_dir.is_dir()
+    if drop_in_removed:
+        shutil.rmtree(drop_in_dir)
+    if managed:
+        try:
+            target.unlink()
+        except FileNotFoundError:
+            pass
+    return UninstallResult(
+        unit_path=target,
+        unit_name=target.name,
+        removed_unit=managed,
+        drop_in_removed=drop_in_removed,
+        disable_error=disable_error,
+    )
