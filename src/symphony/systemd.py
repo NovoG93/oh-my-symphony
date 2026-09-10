@@ -164,6 +164,27 @@ def _write_override(unit_path: Path, unit_text: str) -> str:
     return "overridden"
 
 
+def find_unit_for_workflow(workflow_path: str | Path) -> Path | None:
+    """The installed unit, if any, whose ``ExecStart`` serves this workflow.
+
+    Hand-made units (e.g. ``workmate-orchestrator.service``) count: adoption
+    layers a drop-in over them instead of creating a competing unit.
+    """
+    needle = str(Path(workflow_path).resolve())
+    directory = unit_dir()
+    if not directory.is_dir():
+        return None
+    for unit in sorted(directory.glob("*.service")):
+        try:
+            text = unit.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        for line in text.splitlines():
+            if line.strip().startswith("ExecStart=") and needle in line:
+                return unit
+    return None
+
+
 def ensure_unit(
     workflow_path: str | Path,
     *,
@@ -173,11 +194,17 @@ def ensure_unit(
     enable: bool = True,
 ) -> EnsureResult:
     """Idempotently install (updating via a drop-in) the unit for a workflow."""
-    target = unit_dir() / unit_name_for(workflow_path)
+    managed_name = unit_name_for(workflow_path)
+    target = unit_dir() / managed_name
     text = render_unit(workflow_path, host=host, port=port, python=python)
-    action = "unchanged"
-    if target.exists() and target.read_text(encoding="utf-8") == text:
-        pass
+    adopted = find_unit_for_workflow(workflow_path)
+    if adopted is not None and adopted.name != managed_name:
+        # A unit that already serves this workflow exists under another name:
+        # extend it via a drop-in instead of creating a second, competing unit.
+        target = adopted
+        action = _write_override(target, text)
+    elif target.exists() and target.read_text(encoding="utf-8") == text:
+        action = "unchanged"
     elif target.exists():
         # The managed unit exists but settings changed: layer a drop-in so
         # operator edits in the base file survive the update.

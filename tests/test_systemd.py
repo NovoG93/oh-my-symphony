@@ -85,3 +85,38 @@ def test_ensure_unit_is_a_noop_when_unchanged(monkeypatch, tmp_path: Path) -> No
     result = systemd.ensure_unit(wf, host="0.0.0.0", port=10000, python="/p/python")
     assert result.action == "unchanged"
     assert (tmp_path / "symphony-proj.service").stat().st_mtime_ns == before
+
+
+def test_find_existing_unit_for_workflow(monkeypatch, tmp_path: Path) -> None:
+    monkeypatch.setenv("SYMPHONY_SYSTEMD_UNIT_DIR", str(tmp_path))
+    wf = tmp_path / "proj" / "WORKFLOW.md"
+    (tmp_path / "workmate-orchestrator.service").write_text(
+        "[Service]\nExecStart=/p/python -m symphony.cli %s --host 0.0.0.0 --port 10000\n"
+        % wf.resolve()
+    )
+    found = systemd.find_unit_for_workflow(wf)
+    assert found is not None and found.name == "workmate-orchestrator.service"
+
+
+def test_find_unit_for_workflow_returns_none_when_absent(monkeypatch, tmp_path: Path) -> None:
+    monkeypatch.setenv("SYMPHONY_SYSTEMD_UNIT_DIR", str(tmp_path))
+    assert systemd.find_unit_for_workflow(tmp_path / "x" / "WORKFLOW.md") is None
+
+
+def test_ensure_unit_adopts_hand_made_unit_via_drop_in(monkeypatch, tmp_path: Path) -> None:
+    monkeypatch.setenv("SYMPHONY_SYSTEMD_UNIT_DIR", str(tmp_path))
+    monkeypatch.setattr(systemd.subprocess, "run", lambda *a, **k: _ok())
+    wf = tmp_path / "proj" / "WORKFLOW.md"
+    hand_made = tmp_path / "workmate-orchestrator.service"
+    hand_made.write_text(
+        "[Service]\nExecStart=/p/python -m symphony.cli %s --host 0.0.0.0 --port 9999\n"
+        % wf.resolve()
+    )
+
+    result = systemd.ensure_unit(wf, host="0.0.0.0", port=10000, python="/p/python")
+
+    assert result.action == "overridden"
+    assert result.unit_name == "workmate-orchestrator.service"
+    assert not (tmp_path / "symphony-proj.service").exists()
+    override = tmp_path / "workmate-orchestrator.service.d" / "override.conf"
+    assert override.exists() and "--port 10000" in override.read_text()
