@@ -54,3 +54,34 @@ def test_unit_dir_default_is_user_config(monkeypatch) -> None:
 def test_is_available_false_when_systemctl_missing(monkeypatch) -> None:
     monkeypatch.setattr(systemd.shutil, "which", lambda _name: None)
     assert systemd.is_available() is False
+
+
+def _ok() -> subprocess.CompletedProcess[str]:
+    return subprocess.CompletedProcess([], 0, "", "")
+
+
+def test_ensure_unit_writes_and_enables(monkeypatch, tmp_path: Path) -> None:
+    monkeypatch.setenv("SYMPHONY_SYSTEMD_UNIT_DIR", str(tmp_path))
+    calls: list[list[str]] = []
+    monkeypatch.setattr(
+        systemd.subprocess, "run", lambda cmd, **kw: calls.append(cmd) or _ok()
+    )
+    result = systemd.ensure_unit(
+        tmp_path / "proj" / "WORKFLOW.md", host="0.0.0.0", port=10000, python="/p/python"
+    )
+    assert result.action == "installed"
+    unit = tmp_path / "symphony-proj.service"
+    assert unit.exists() and "Restart=always" in unit.read_text()
+    assert ["systemctl", "--user", "daemon-reload"] in calls
+    assert ["systemctl", "--user", "enable", "symphony-proj.service"] in calls
+
+
+def test_ensure_unit_is_a_noop_when_unchanged(monkeypatch, tmp_path: Path) -> None:
+    monkeypatch.setenv("SYMPHONY_SYSTEMD_UNIT_DIR", str(tmp_path))
+    monkeypatch.setattr(systemd.subprocess, "run", lambda *a, **k: _ok())
+    wf = tmp_path / "proj" / "WORKFLOW.md"
+    systemd.ensure_unit(wf, host="0.0.0.0", port=10000, python="/p/python")
+    before = (tmp_path / "symphony-proj.service").stat().st_mtime_ns
+    result = systemd.ensure_unit(wf, host="0.0.0.0", port=10000, python="/p/python")
+    assert result.action == "unchanged"
+    assert (tmp_path / "symphony-proj.service").stat().st_mtime_ns == before
