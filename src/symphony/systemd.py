@@ -23,3 +23,56 @@ def _slug(text: str) -> str:
 def unit_name_for(workflow_path: str | Path) -> str:
     """Deterministic unit name for a workflow file (parent directory based)."""
     return f"symphony-{_slug(Path(workflow_path).resolve().parent.name)}.service"
+
+
+def _systemd_quote(value: str) -> str:
+    if re.fullmatch(r"[A-Za-z0-9_@./:+-]+", value):
+        return value
+    return '"' + value.replace("\\", "\\\\").replace('"', '\\"') + '"'
+
+
+def render_unit(
+    workflow_path: str | Path,
+    *,
+    host: str,
+    port: int,
+    python: str,
+    description: str | None = None,
+) -> str:
+    """Full unit text. ExecStart mirrors service.build_orchestrator_command()."""
+    wf = Path(workflow_path).resolve()
+    desc = description or f"Symphony orchestrator ({wf.parent.name})"
+    return "\n".join(
+        [
+            UNIT_MARKER,
+            "[Unit]",
+            f"Description={desc}",
+            "After=network-online.target",
+            "Wants=network-online.target",
+            "",
+            "[Service]",
+            "Type=simple",
+            f"WorkingDirectory={_systemd_quote(str(wf.parent))}",
+            "ExecStart="
+            + " ".join(
+                [
+                    _systemd_quote(python),
+                    "-m",
+                    "symphony.cli",
+                    _systemd_quote(str(wf)),
+                    "--host",
+                    _systemd_quote(host),
+                    "--port",
+                    str(port),
+                ]
+            ),
+            "Restart=always",
+            "RestartSec=3",
+            "KillMode=mixed",
+            "Environment=PYTHONUNBUFFERED=1",
+            "",
+            "[Install]",
+            "WantedBy=default.target",
+            "",
+        ]
+    )
