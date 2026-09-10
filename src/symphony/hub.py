@@ -97,7 +97,24 @@ def _status_running(status: Any) -> bool:
     return str(getattr(status, "state", "")).lower() == "running"
 
 
-def _service_url(project: ProjectRecord, status: Any) -> str:
+def _public_host(request: web.Request) -> str | None:
+    """Host (without port) the client used to reach the hub.
+
+    A wildcard bind is reachable on every host the machine answers to, so the
+    only host that is guaranteed to work in the *client's* browser is the one
+    the client already used. Falls back to None when the header is unusable.
+    """
+    raw = (request.host or "").strip()
+    if not raw:
+        return None
+    if raw.startswith("["):
+        return raw.split("]", 1)[0] + "]"
+    return raw.rsplit(":", 1)[0] or None
+
+
+def _service_url(
+    project: ProjectRecord, status: Any, public_host: str | None = None
+) -> str:
     explicit_url = (
         status.get("url")
         if isinstance(status, Mapping)
@@ -118,7 +135,10 @@ def _service_url(project: ProjectRecord, status: Any) -> str:
     else:
         host = str(getattr(source, "host", project.host))
         port = int(getattr(source, "port", project.port))
-    host = "127.0.0.1" if host in {"", "0.0.0.0", "::", "[::]"} else host
+    if host in {"", "0.0.0.0", "::", "[::]"}:
+        # Never hand the wildcard (or loopback) to a remote browser: reuse the
+        # host the client reached the hub on, else assume a local client.
+        host = public_host or "127.0.0.1"
     if ":" in host and not host.startswith("["):
         host = f"[{host}]"
     return f"http://{host}:{port}/"
@@ -227,7 +247,7 @@ def build_hub_app(
             service_url = None
             if running:
                 try:
-                    service_url = _service_url(project, status)
+                    service_url = _service_url(project, status, _public_host(_request))
                 except (TypeError, ValueError) as exc:
                     diagnostics.append(f"Service URL unavailable: {exc}")
             payload.append(
@@ -362,7 +382,7 @@ def build_hub_app(
             {
                 "project_id": project_id,
                 "running": True,
-                "url": _service_url(project, status),
+                "url": _service_url(project, status, _public_host(request)),
             }
         )
 

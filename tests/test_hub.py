@@ -6,11 +6,13 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import AsyncIterator
 
+import pytest
 import pytest_asyncio
 from aiohttp.test_utils import TestClient, TestServer
 
 from symphony.hub import build_hub_app, run_hub
 from symphony.projects import Project, ProjectRegistry
+from symphony.web_policy import BIND_HOST_KEY
 
 
 @dataclass
@@ -100,6 +102,95 @@ async def test_index_is_standalone_hub_ui(client: TestClient) -> None:
     assert "Symphony Hub" in text
     assert "/api/v1/projects" in text
     assert "Open project" in text
+
+
+async def _policy_test_client(registry: _Registry, host_header: str) -> TestClient:
+    """A hub client whose request Host is a non-loopback origin.
+
+    The hub applies the same web policy as an orchestrator, so a non-loopback
+    request host must be listed in SYMPHONY_TRUSTED_ORIGINS (set by the test).
+    """
+    app = build_hub_app(registry)
+    app[BIND_HOST_KEY] = "0.0.0.0"
+    test_client = TestClient(TestServer(app), headers={"Host": host_header})
+    await test_client.start_server()
+    return test_client
+
+
+async def test_wildcard_bound_project_url_uses_request_host(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A wildcard bind is reachable on whatever host the client used.
+
+    Regression: normalising 0.0.0.0 to 127.0.0.1 made the hub hand out
+    loopback links, so clicking a project in a browser opened the *client's*
+    own machine instead of the board.
+    """
+    monkeypatch.setenv("SYMPHONY_API_AUTH_MODE", "disabled")
+    monkeypatch.setenv("SYMPHONY_TRUSTED_ORIGINS", "http://symphony.home.arpa:1000")
+    repo = tmp_path / "gamma"
+    repo.mkdir()
+    workflow = repo / "WORKFLOW.md"
+    workflow.write_text("---\ntracker:\n  kind: file\n---\nWork on {{ issue.title }}\n")
+    registry = _Registry(
+        [
+            Project(
+                id="gamma",
+                name="Gamma board",
+                git_repo=str(repo),
+                workflow=str(workflow),
+                host="0.0.0.0",
+                port=9103,
+            )
+        ],
+        running={"gamma"},
+    )
+    test_client = await _policy_test_client(registry, "symphony.home.arpa:1000")
+    try:
+        response = await test_client.get("/api/v1/projects")
+        body = await response.json()
+        assert body["projects"][0]["url"] == "http://symphony.home.arpa:9103/"
+
+        started = await test_client.post(
+            "/api/v1/projects/gamma/open",
+            json={},
+            headers={"Content-Type": "application/json"},
+        )
+        opened = await started.json()
+        assert opened["url"] == "http://symphony.home.arpa:9103/"
+    finally:
+        await test_client.close()
+
+
+async def test_explicit_host_is_never_overridden_by_request_host(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("SYMPHONY_API_AUTH_MODE", "disabled")
+    monkeypatch.setenv("SYMPHONY_TRUSTED_ORIGINS", "http://symphony.home.arpa:1000")
+    repo = tmp_path / "delta"
+    repo.mkdir()
+    workflow = repo / "WORKFLOW.md"
+    workflow.write_text("---\ntracker:\n  kind: file\n---\nWork on {{ issue.title }}\n")
+    registry = _Registry(
+        [
+            Project(
+                id="delta",
+                name="Delta board",
+                git_repo=str(repo),
+                workflow=str(workflow),
+                host="board.internal",
+                port=9104,
+            )
+        ],
+        running={"delta"},
+    )
+    test_client = await _policy_test_client(registry, "symphony.home.arpa:1000")
+    try:
+        response = await test_client.get("/api/v1/projects")
+        body = await response.json()
+        assert body["projects"][0]["url"] == "http://board.internal:9104/"
+    finally:
+        await test_client.close()
 
 
 async def test_projects_reports_independent_service_urls(
