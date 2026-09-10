@@ -309,3 +309,17 @@ def test_install_all_reports_failure_and_exits_1(monkeypatch, tmp_path: Path, ca
     assert rc == 1
     assert "systemctl exploded" in captured.err
     assert "alpha" in captured.err
+
+
+def test_start_reports_unit_when_already_running(monkeypatch, tmp_path: Path, capsys) -> None:
+    monkeypatch.setattr(systemd_module, "is_available", lambda: True)
+    monkeypatch.setattr(systemd_module, "is_unit_active", lambda name: True)
+    monkeypatch.setattr(systemd_module, "run_systemctl", lambda *a, **k: _ok())
+    wf = _workflow(tmp_path)
+    service_module.save_record(_systemd_record(wf, "symphony-proj.service"))
+
+    rc = service_main(["start", str(wf), "--port", "10000"])
+
+    captured = capsys.readouterr()
+    assert rc == 0
+    assert "already running unit=symphony-proj.service" in captured.out

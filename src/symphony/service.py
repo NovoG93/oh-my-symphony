@@ -883,12 +883,22 @@ def _start_locked(args: argparse.Namespace, *, workflow: Path, cfg: Any) -> int:
             if stop_rc != 0:
                 return stop_rc
         else:
-            print(
-                "already running "
-                f"pid={current.record.orchestrator_pid} "
-                f"port={current.record.port} "
-                f"workflow={current.record.workflow_path}"
-            )
+            if current.record.backend == "systemd":
+                unit_name = current.record.unit_name or systemd.unit_name_for(
+                    workflow
+                )
+                print(
+                    f"already running unit={unit_name} "
+                    f"port={current.record.port} "
+                    f"workflow={current.record.workflow_path}"
+                )
+            else:
+                print(
+                    "already running "
+                    f"pid={current.record.orchestrator_pid} "
+                    f"port={current.record.port} "
+                    f"workflow={current.record.workflow_path}"
+                )
             if current.record.port != port:
                 print(
                     f"requested port {port} ignored; this workflow is already "
