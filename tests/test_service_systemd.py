@@ -121,3 +121,125 @@ def test_service_unit_path_prints_managed_path(monkeypatch, tmp_path: Path, caps
     captured = capsys.readouterr()
     assert rc == 0
     assert captured.out.strip() == str(units / "symphony-proj.service")
+
+
+def _systemd_record(workflow: Path, unit_name: str):
+    return service_module.ServiceRecord(
+        workflow_path=workflow.resolve(),
+        workflow_dir=workflow.parent.resolve(),
+        host="127.0.0.1",
+        port=10000,
+        orchestrator_pid=None,
+        log_path=workflow.parent / "log" / "symphony.log",
+        started_at="2026-09-10T00:00:00Z",
+        orchestrator_command=[],
+        service_instance_id=None,
+        backend="systemd",
+        unit_name=unit_name,
+    )
+
+
+def test_start_uses_systemd_backend_when_available(monkeypatch, tmp_path: Path, capsys) -> None:
+    units = tmp_path / "units"
+    monkeypatch.setenv("SYMPHONY_SYSTEMD_UNIT_DIR", str(units))
+    monkeypatch.setattr(systemd_module, "is_available", lambda: True)
+    calls: list[list[str]] = []
+    monkeypatch.setattr(
+        systemd_module.subprocess, "run", lambda cmd, **kw: calls.append(cmd) or _ok()
+    )
+    monkeypatch.setattr(service_module, "_run_doctor_or_print", lambda *a, **k: True)
+    wf = _workflow(tmp_path)
+
+    rc = service_main(["start", str(wf), "--host", "0.0.0.0", "--port", "10000"])
+
+    captured = capsys.readouterr()
+    unit_name = systemd_module.unit_name_for(wf)
+    assert rc == 0
+    assert ["systemctl", "--user", "restart", unit_name] in calls
+    record = service_module.load_record(wf)
+    assert record is not None
+    assert record.backend == "systemd"
+    assert record.unit_name == unit_name
+    assert f"unit={unit_name}" in captured.out
+
+
+def test_start_falls_back_to_detached_without_systemd(
+    monkeypatch, tmp_path: Path
+) -> None:
+    units = tmp_path / "units"
+    monkeypatch.setenv("SYMPHONY_SYSTEMD_UNIT_DIR", str(units))
+    monkeypatch.setattr(systemd_module, "is_available", lambda: False)
+    spawned: list[list[str]] = []
+    monkeypatch.setattr(
+        service_module, "_popen_detached", lambda cmd, **kw: spawned.append(cmd) or 4242
+    )
+    monkeypatch.setattr(service_module, "_wait_until", lambda *a, **k: True)
+    monkeypatch.setattr(service_module, "_run_doctor_or_print", lambda *a, **k: True)
+    wf = _workflow(tmp_path)
+
+    rc = service_main(["start", str(wf), "--port", "10000"])
+
+    assert rc == 0
+    assert len(spawned) == 1
+    record = service_module.load_record(wf)
+    assert record is not None
+    assert record.backend == "detached"
+    assert record.orchestrator_pid == 4242
+    assert not units.exists()
+
+
+def test_start_no_systemd_flag_forces_detached_backend(
+    monkeypatch, tmp_path: Path
+) -> None:
+    monkeypatch.setattr(systemd_module, "is_available", lambda: True)
+    spawned: list[list[str]] = []
+    monkeypatch.setattr(
+        service_module, "_popen_detached", lambda cmd, **kw: spawned.append(cmd) or 4242
+    )
+    monkeypatch.setattr(service_module, "_wait_until", lambda *a, **k: True)
+    monkeypatch.setattr(service_module, "_run_doctor_or_print", lambda *a, **k: True)
+    wf = _workflow(tmp_path)
+
+    rc = service_main(["start", str(wf), "--port", "10000", "--no-systemd"])
+
+    assert rc == 0
+    assert len(spawned) == 1
+    record = service_module.load_record(wf)
+    assert record is not None and record.backend == "detached"
+
+
+def test_stop_stops_systemd_unit_from_record(monkeypatch, tmp_path: Path, capsys) -> None:
+    units = tmp_path / "units"
+    monkeypatch.setenv("SYMPHONY_SYSTEMD_UNIT_DIR", str(units))
+    monkeypatch.setattr(systemd_module, "is_available", lambda: True)
+    calls: list[list[str]] = []
+    monkeypatch.setattr(
+        systemd_module.subprocess, "run", lambda cmd, **kw: calls.append(cmd) or _ok()
+    )
+    wf = _workflow(tmp_path)
+    service_module.save_record(_systemd_record(wf, "symphony-proj.service"))
+
+    rc = service_main(["stop", str(wf)])
+
+    captured = capsys.readouterr()
+    assert rc == 0
+    assert ["systemctl", "--user", "stop", "symphony-proj.service"] in calls
+    assert service_module.load_record(wf) is None
+    assert "unit=symphony-proj.service" in captured.out
+
+
+def test_status_reports_systemd_unit_state(monkeypatch, tmp_path: Path, capsys) -> None:
+    monkeypatch.setattr(systemd_module, "is_unit_active", lambda name: True)
+    monkeypatch.setattr(
+        service_module, "is_symphony_workflow_reachable", lambda *a, **k: False
+    )
+    monkeypatch.setattr(service_module, "is_process_running", lambda pid: False)
+    wf = _workflow(tmp_path)
+    service_module.save_record(_systemd_record(wf, "symphony-proj.service"))
+
+    rc = service_main(["status", str(wf)])
+
+    captured = capsys.readouterr()
+    assert rc == 0
+    assert "unit=symphony-proj.service" in captured.out
+    assert "state=active (running)" in captured.out

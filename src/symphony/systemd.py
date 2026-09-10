@@ -275,3 +275,19 @@ def uninstall_unit(workflow_path: str | Path) -> UninstallResult:
         drop_in_removed=drop_in_removed,
         disable_error=disable_error,
     )
+
+
+def is_unit_active(unit_name: str) -> bool | None:
+    """True/False from ``systemctl --user is-active``; None when unavailable."""
+    if not shutil.which("systemctl"):
+        return None
+    try:
+        proc = subprocess.run(
+            ["systemctl", "--user", "is-active", unit_name],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return proc.stdout.strip() == "active"

@@ -133,6 +133,8 @@ class ServiceRecord:
     started_at: str
     orchestrator_command: list[str] = field(default_factory=list)
     service_instance_id: str | None = None
+    backend: str = "detached"
+    unit_name: str | None = None
 
 
 @dataclass(frozen=True)
@@ -148,6 +150,8 @@ class ServiceStatus:
     recorded_port: int | None = None
     pid_running: bool = False
     api_reachable: bool = False
+    unit_name: str | None = None
+    unit_active: bool = False
 
 
 def _resolved(path: str | Path) -> Path:
@@ -198,10 +202,16 @@ def _record_to_json(record: ServiceRecord) -> dict[str, Any]:
         "started_at": record.started_at,
         "orchestrator_command": list(record.orchestrator_command),
         "service_instance_id": record.service_instance_id,
+        "backend": record.backend,
+        "unit_name": record.unit_name,
     }
 
 
 def _record_from_json(data: dict[str, Any]) -> ServiceRecord:
+    backend = data.get("backend")
+    if not isinstance(backend, str) or not backend.strip():
+        backend = "detached"
+    unit_name = data.get("unit_name")
     return ServiceRecord(
         workflow_path=Path(str(data["workflow_path"])),
         workflow_dir=Path(str(data["workflow_dir"])),
@@ -220,6 +230,8 @@ def _record_from_json(data: dict[str, Any]) -> ServiceRecord:
         service_instance_id=normalize_service_instance_id(
             data.get("service_instance_id")
         ),
+        backend=str(backend),
+        unit_name=str(unit_name) if isinstance(unit_name, str) and unit_name else None,
     )
 
 
@@ -426,12 +438,14 @@ def service_status(
     port: int | None = None,
     is_running: ProcessRunningPredicate | None = None,
     is_api_reachable: ServiceApiProbe | None = None,
+    is_unit_active: Callable[[str], bool | None] | None = None,
 ) -> ServiceStatus:
     """Report persisted service state for a workflow.
 
     The saved workflow record wins over the requested port. A live recorded PID
-    is trusted directly. When the PID is stale, the recorded endpoint must
-    identify the exact requested workflow before callers treat it as running.
+    (or, for systemd-owned records, an active user unit) is trusted directly.
+    When both are stale, the recorded endpoint must identify the exact
+    requested workflow before callers treat it as running.
     """
     record = load_record(workflow_path)
     if record is None:
@@ -446,7 +460,13 @@ def service_status(
         is_running = is_process_running
 
     pid_running = is_running(record.orchestrator_pid)
-    if pid_running:
+    unit_name: str | None = None
+    unit_active = False
+    if record.backend == "systemd":
+        unit_name = record.unit_name or systemd.unit_name_for(workflow_path)
+        probe_unit = is_unit_active or systemd.is_unit_active
+        unit_active = probe_unit(unit_name) is True
+    if pid_running or unit_active:
         api_reachable = False
     elif is_api_reachable is None:
         probe_kwargs = (
@@ -462,7 +482,9 @@ def service_status(
         )
     else:
         api_reachable = is_api_reachable(record.host, record.port)
-    state: ServiceState = "running" if pid_running or api_reachable else "stopped"
+    state: ServiceState = (
+        "running" if pid_running or unit_active or api_reachable else "stopped"
+    )
     return ServiceStatus(
         state=state,
         record=record,
@@ -470,6 +492,8 @@ def service_status(
         recorded_port=record.port,
         pid_running=pid_running,
         api_reachable=api_reachable,
+        unit_name=unit_name,
+        unit_active=unit_active,
     )
 
 
@@ -800,6 +824,50 @@ def _start(args: argparse.Namespace) -> int:
         return 1
 
 
+def _prefer_systemd(args: argparse.Namespace) -> bool:
+    """The systemd user-unit backend takes precedence when usable."""
+    return not getattr(args, "no_systemd", False) and systemd.is_available()
+
+
+def _start_systemd(args: argparse.Namespace, *, workflow: Path, port: int) -> int:
+    """Start (or restart) the managed user unit for a workflow."""
+    workflow_dir = workflow.parent
+    try:
+        result = systemd.ensure_unit(
+            workflow, host=args.host, port=port, python=sys.executable
+        )
+        systemd.run_systemctl("restart", result.unit_name)
+    except systemd.SystemdError as exc:
+        print(f"service start failed: {exc}", file=sys.stderr)
+        return 1
+
+    record = ServiceRecord(
+        workflow_path=workflow.resolve(),
+        workflow_dir=workflow_dir.resolve(),
+        host=args.host,
+        port=port,
+        orchestrator_pid=None,
+        log_path=(workflow_dir / "log" / "symphony.log").resolve(),
+        started_at=_utc_now(),
+        orchestrator_command=build_orchestrator_command(
+            workflow, host=args.host, port=port
+        ),
+        service_instance_id=None,
+        backend="systemd",
+        unit_name=result.unit_name,
+    )
+    try:
+        save_record(record)
+    except Exception as exc:
+        print(f"failed to save service record: {exc}", file=sys.stderr)
+        return 1
+    print(
+        f"started symphony service unit={result.unit_name} "
+        f"url=http://{args.host}:{port}/"
+    )
+    return 0
+
+
 def _start_locked(args: argparse.Namespace, *, workflow: Path, cfg: Any) -> int:
     port = _resolve_port(args.port, cfg)
     current = service_status(workflow, port=port)
@@ -843,6 +911,9 @@ def _start_locked(args: argparse.Namespace, *, workflow: Path, cfg: Any) -> int:
     ):
         print("service start aborted: doctor reported FAIL", file=sys.stderr)
         return 1
+
+    if _prefer_systemd(args):
+        return _start_systemd(args, workflow=workflow, port=port)
 
     workflow_dir = workflow.parent
     log_path = workflow_dir / "log" / "symphony.log"
@@ -898,12 +969,35 @@ def _start_locked(args: argparse.Namespace, *, workflow: Path, cfg: Any) -> int:
     return 0
 
 
+def _stop_systemd(args: argparse.Namespace, *, workflow: Path, record: ServiceRecord) -> int:
+    """Stop a unit-owned service (the record names the exact unit)."""
+    unit_name = record.unit_name or systemd.unit_name_for(workflow)
+    if systemd.is_available():
+        try:
+            systemd.run_systemctl("stop", unit_name)
+        except systemd.SystemdError as exc:
+            print(f"service stop failed: {exc}", file=sys.stderr)
+            return 1
+    if args.force and not _terminate_active_backend_processes(record):
+        print(
+            f"service record kept because workflow is still running: {record.workflow_path}",
+            file=sys.stderr,
+        )
+        return 1
+    clear_record(workflow)
+    print(f"stopped workflow={record.workflow_path} unit={unit_name}")
+    return 0
+
+
 def _stop(args: argparse.Namespace) -> int:
     workflow = resolve_workflow_path(args.workflow)
     record = load_record(workflow)
     if record is None:
         print(f"stopped workflow={workflow} (no service record)")
         return 0
+
+    if record.backend == "systemd":
+        return _stop_systemd(args, workflow=workflow, record=record)
 
     all_stopped = True
     for label, pid in (("orchestrator", record.orchestrator_pid),):
@@ -976,6 +1070,11 @@ def _status(args: argparse.Namespace) -> int:
     if status.state == "stopped":
         if status.record is None:
             print(f"stopped workflow={workflow}")
+        elif status.record.backend == "systemd":
+            unit_name = status.unit_name or status.record.unit_name or (
+                systemd.unit_name_for(workflow)
+            )
+            print(f"stopped workflow={status.record.workflow_path} unit={unit_name}")
         else:
             print(
                 f"stopped workflow={status.record.workflow_path} "
@@ -985,7 +1084,17 @@ def _status(args: argparse.Namespace) -> int:
 
     assert status.record is not None
     record = status.record
-    if status.pid_running:
+    if record.backend == "systemd":
+        unit_name = status.unit_name or record.unit_name or systemd.unit_name_for(
+            workflow
+        )
+        detail = "active (running)" if status.unit_active else "inactive (api alive)"
+        print(
+            f"running workflow={record.workflow_path} "
+            f"unit={unit_name} state={detail} "
+            f"port={record.port} url=http://{record.host}:{record.port}/"
+        )
+    elif status.pid_running:
         print(
             f"running workflow={record.workflow_path} "
             f"pid={record.orchestrator_pid} port={record.port} "
@@ -1020,6 +1129,7 @@ def _restart(args: argparse.Namespace) -> int:
         port=args.port,
         replace=False,
         skip_doctor=args.skip_doctor,
+        no_systemd=getattr(args, "no_systemd", False),
     )
     return _start(start_args)
 
@@ -1135,6 +1245,11 @@ def build_parser() -> argparse.ArgumentParser:
     p_start.add_argument("--port", type=int, default=None)
     p_start.add_argument("--replace", action="store_true")
     p_start.add_argument("--skip-doctor", action="store_true")
+    p_start.add_argument(
+        "--no-systemd",
+        action="store_true",
+        help="force the detached subprocess backend even when a user systemd manager exists",
+    )
     p_start.set_defaults(func=_start)
 
     p_stop = sub.add_parser("stop", help="stop a managed service")
@@ -1150,6 +1265,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_restart.add_argument("--skip-doctor", action="store_true")
     p_restart.add_argument("--timeout", type=float, default=10.0)
     p_restart.add_argument("--force", action="store_true")
+    p_restart.add_argument("--no-systemd", action="store_true")
     p_restart.set_defaults(func=_restart)
 
     p_status = sub.add_parser("status", help="show managed service status")
