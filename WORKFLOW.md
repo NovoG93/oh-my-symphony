@@ -318,9 +318,8 @@ agent_profiles:
     kind: agy
 
   reviewer:
-    kind: copilot
-    model: claude-sonnet-5
-    reasoning_effort: high
+    kind: agy
+    command: 'agy --model gemini-3.1-pro-high --print-timeout 45m --print "$(cat)"'
 
   documenter:
     kind: claude
