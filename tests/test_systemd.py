@@ -39,3 +39,18 @@ def test_render_unit_escapes_spaces_in_paths(tmp_path: Path) -> None:
     wf = tmp_path / "my proj" / "WORKFLOW.md"
     text = systemd.render_unit(wf, host="127.0.0.1", port=1234, python="/p/python")
     assert 'ExecStart=/p/python -m symphony.cli "' in text  # systemd quoting for spaces
+
+
+def test_unit_dir_honours_env_override(monkeypatch, tmp_path: Path) -> None:
+    monkeypatch.setenv("SYMPHONY_SYSTEMD_UNIT_DIR", str(tmp_path / "units"))
+    assert systemd.unit_dir() == (tmp_path / "units")
+
+
+def test_unit_dir_default_is_user_config(monkeypatch) -> None:
+    monkeypatch.delenv("SYMPHONY_SYSTEMD_UNIT_DIR", raising=False)
+    assert str(systemd.unit_dir()).endswith("/.config/systemd/user")
+
+
+def test_is_available_false_when_systemctl_missing(monkeypatch) -> None:
+    monkeypatch.setattr(systemd.shutil, "which", lambda _name: None)
+    assert systemd.is_available() is False

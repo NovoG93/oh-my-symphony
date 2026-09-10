@@ -9,7 +9,10 @@ sandboxes never touch the operator's real ``~/.config/systemd/user``.
 
 from __future__ import annotations
 
+import os
 import re
+import shutil
+import subprocess
 from pathlib import Path
 
 UNIT_MARKER = "# Managed by `symphony service install` — customize via drop-in overrides, not by editing this file."
@@ -76,3 +79,28 @@ def render_unit(
             "",
         ]
     )
+
+
+def unit_dir() -> Path:
+    """Directory holding user units (``SYMPHONY_SYSTEMD_UNIT_DIR`` overrides)."""
+    override = os.environ.get("SYMPHONY_SYSTEMD_UNIT_DIR")
+    if override:
+        return Path(override).expanduser()
+    return Path.home() / ".config" / "systemd" / "user"
+
+
+def is_available() -> bool:
+    """True when a usable *user* systemd manager exists on this host."""
+    if not shutil.which("systemctl"):
+        return False
+    try:
+        proc = subprocess.run(
+            ["systemctl", "--user", "is-system-running"],
+            capture_output=True,
+            text=True,
+            timeout=10,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return proc.stdout.strip() in {"running", "degraded"}
