@@ -8,6 +8,7 @@ import sys
 from pathlib import Path
 
 from .. import service
+from .. import systemd
 from ..projects import (
     Project,
     ProjectError,
@@ -48,10 +49,40 @@ def _setup_from_args(args: argparse.Namespace, target: Path, *, name: str) -> Pr
     )
 
 
+def _install_service_unit(project: Project, args: argparse.Namespace) -> None:
+    """Install the orchestrator unit for a freshly registered project.
+
+    Default ON (operator decision 2026-09-10): a registered project must
+    survive reboots, so the systemd user unit is installed automatically.
+    ``--no-service`` opts out; hosts without a user systemd manager fall back
+    to the detached path untouched.
+    """
+    if getattr(args, "no_service", False) or not systemd.is_available():
+        return
+    workflow_path = Path(project.workflow)
+    if not workflow_path.is_absolute():
+        workflow_path = Path(project.git_repo) / workflow_path
+    if not workflow_path.exists():
+        return
+    try:
+        result = systemd.ensure_unit(
+            workflow_path,
+            host=project.host,
+            port=project.port,
+            python=sys.executable,
+            enable=not getattr(args, "no_enable", False),
+        )
+    except systemd.SystemdError as exc:
+        print(f"service unit install failed: {exc}", file=sys.stderr)
+        return
+    print(f"service unit: {result.action} {result.unit_path}")
+
+
 def cmd_add(args: argparse.Namespace) -> int:
     target = Path(args.repo).expanduser().resolve()
     project = _setup_from_args(args, target, name=args.name or target.name)
     print(f"added project {project.id} ({project.git_repo}) at {project.host}:{project.port}")
+    _install_service_unit(project, args)
     return 0
 
 
@@ -81,6 +112,7 @@ def cmd_create(args: argparse.Namespace) -> int:
         registry=ProjectRegistry(),
     )
     print(f"created project {project.id} at {project.git_repo} ({project.host}:{project.port})")
+    _install_service_unit(project, args)
     return 0
 
 
@@ -148,6 +180,16 @@ def build_parser() -> argparse.ArgumentParser:
         command.add_argument("--workflow", default="WORKFLOW.md", help="workflow path relative to repository")
         command.add_argument("--host", default=DEFAULT_HOST)
         command.add_argument("--port", type=int, default=None, help="service port (default: next unused from 9999)")
+        command.add_argument(
+            "--no-service",
+            action="store_true",
+            help="do not install a systemd user unit for this project",
+        )
+        command.add_argument(
+            "--no-enable",
+            action="store_true",
+            help="install the unit but do not enable it at boot",
+        )
 
     add = sub.add_parser("add", help="register an existing git repository")
     add.add_argument("repo", help="path inside the existing repository")
