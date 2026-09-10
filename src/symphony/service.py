@@ -1222,6 +1222,49 @@ def _unit_path(args: argparse.Namespace) -> int:
     return 0
 
 
+def _install_all(args: argparse.Namespace) -> int:
+    """Install (or extend) a unit for every project in the registry."""
+    from .projects import ProjectError, ProjectRegistry
+
+    try:
+        projects = ProjectRegistry().load()
+    except ProjectError as exc:
+        print(f"FAIL {exc}", file=sys.stderr)
+        return 1
+    if not projects:
+        print(
+            "no registered projects; run `symphony project add|create` first",
+            file=sys.stderr,
+        )
+        return 1
+
+    failures: list[str] = []
+    for project in projects:
+        workflow_path = Path(project.workflow)
+        if not workflow_path.is_absolute():
+            workflow_path = Path(project.git_repo) / workflow_path
+        try:
+            result = systemd.ensure_unit(
+                workflow_path,
+                host=project.host,
+                port=project.port,
+                python=sys.executable,
+                enable=not args.no_enable,
+            )
+        except systemd.SystemdError as exc:
+            failures.append(f"{project.id}: {exc}")
+            print(f"FAIL {project.id}: {exc}", file=sys.stderr)
+            continue
+        print(f"{project.id}: {result.action} {result.unit_path}")
+    if failures:
+        print(
+            f"install-all failed for {len(failures)} project(s); see errors above",
+            file=sys.stderr,
+        )
+        return 1
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="symphony service",
@@ -1299,6 +1342,12 @@ def build_parser() -> argparse.ArgumentParser:
     p_unit_path = sub.add_parser("unit-path", help="print the unit path for a workflow")
     add_workflow(p_unit_path)
     p_unit_path.set_defaults(func=_unit_path)
+
+    p_install_all = sub.add_parser(
+        "install-all", help="install units for every registered project"
+    )
+    p_install_all.add_argument("--no-enable", action="store_true")
+    p_install_all.set_defaults(func=_install_all)
 
     return parser
 

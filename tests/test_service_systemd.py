@@ -243,3 +243,69 @@ def test_status_reports_systemd_unit_state(monkeypatch, tmp_path: Path, capsys) 
     assert rc == 0
     assert "unit=symphony-proj.service" in captured.out
     assert "state=active (running)" in captured.out
+
+
+def _register(registry, tmp_path: Path, project_id: str, port: int):
+    from symphony.projects import Project
+
+    repo = tmp_path / project_id
+    repo.mkdir()
+    (repo / "WORKFLOW.md").write_text(
+        "---\ntracker: {kind: file}\n---\nbody\n", encoding="utf-8"
+    )
+    registry.add(
+        Project(
+            id=project_id,
+            name=project_id.title(),
+            git_repo=str(repo),
+            workflow=str(repo / "WORKFLOW.md"),
+            host="0.0.0.0",
+            port=port,
+        )
+    )
+
+
+def test_install_all_installs_units_for_every_registered_project(
+    monkeypatch, tmp_path: Path, capsys
+) -> None:
+    from symphony.projects import ProjectRegistry
+
+    units = tmp_path / "units"
+    monkeypatch.setenv("SYMPHONY_SYSTEMD_UNIT_DIR", str(units))
+    monkeypatch.setenv("SYMPHONY_PROJECTS_FILE", str(tmp_path / "projects.json"))
+    monkeypatch.setattr(systemd_module, "is_available", lambda: True)
+    monkeypatch.setattr(systemd_module, "run_systemctl", lambda *a, **k: _ok())
+    registry = ProjectRegistry()
+    _register(registry, tmp_path, "alpha", 10001)
+    _register(registry, tmp_path, "beta", 10002)
+
+    rc = service_main(["install-all"])
+
+    captured = capsys.readouterr()
+    assert rc == 0
+    assert (units / "symphony-alpha.service").exists()
+    assert (units / "symphony-beta.service").exists()
+    assert "alpha: installed" in captured.out
+    assert "beta: installed" in captured.out
+
+
+def test_install_all_reports_failure_and_exits_1(monkeypatch, tmp_path: Path, capsys) -> None:
+    from symphony.projects import ProjectRegistry
+
+    units = tmp_path / "units"
+    monkeypatch.setenv("SYMPHONY_SYSTEMD_UNIT_DIR", str(units))
+    monkeypatch.setenv("SYMPHONY_PROJECTS_FILE", str(tmp_path / "projects.json"))
+    monkeypatch.setattr(systemd_module, "is_available", lambda: True)
+    _register(ProjectRegistry(), tmp_path, "alpha", 10001)
+
+    def _boom(*a, **k):
+        raise systemd_module.SystemdError("systemctl exploded")
+
+    monkeypatch.setattr(systemd_module, "ensure_unit", _boom)
+
+    rc = service_main(["install-all"])
+
+    captured = capsys.readouterr()
+    assert rc == 1
+    assert "systemctl exploded" in captured.err
+    assert "alpha" in captured.err
