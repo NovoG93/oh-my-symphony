@@ -188,6 +188,20 @@ per-workflow run state under `.symphony/run/` and refuses duplicate starts for
 the same `WORKFLOW.md`, preventing two orchestrators from dispatching the same
 board.
 
+### Deploying a project so it survives reboot
+
+On a Linux host with a systemd user manager, prefer the managed user unit over
+a detached subprocess: `symphony project add|create` installs (and enables) it
+automatically, `symphony service install ./WORKFLOW.md --host H --port P`
+(re-run it idempotently) manages one workflow explicitly, and `symphony
+service install-all` re-declares every registered project after an infra
+re-apply. A hand-written unit for the same workflow is adopted — the engine
+writes a drop-in override over it instead of a competing unit — but treat
+that as migration debt: once the project is re-declared, delete the hand-made
+unit and let `symphony service install` own it. `symphony doctor` warns when
+the unit is missing/not enabled or linger is off; full details in
+`docs/service-systemd.md`.
+
 For smoke demos without an installed agent CLI, set `codex.command: python -m
 symphony.mock_codex`; see `reference/operations.md`.
 
