@@ -58,6 +58,7 @@ from ..orchestrator.release_cycle import (
 )
 from ..trackers.file import FileBoardTracker
 from ..utils.git_sandbox import resolve_git_common_dir, writable_git_roots
+from .. import systemd
 from ..service import ProcessRunningPredicate, port_owner_hint
 from ..workflow import (
     DEFAULT_COPILOT_COMMAND,
@@ -1240,6 +1241,63 @@ def _has_app_release_label(labels: Iterable[str]) -> bool:
     return any(label.strip().lower() == "app-release" for label in labels)
 
 
+def check_service_unit(cfg: ServiceConfig) -> CheckResult:
+    """Whether a managed user unit serves this workflow and starts at boot."""
+    name = "service.unit"
+    unit = systemd.find_unit_for_workflow(cfg.workflow_path)
+    if unit is None:
+        return CheckResult(name, "warn", "unit missing — run `symphony service install`")
+    enabled = systemd.is_unit_enabled(unit.name)
+    if enabled is False:
+        return CheckResult(
+            name,
+            "warn",
+            f"unit installed but not enabled ({unit.name}) — run "
+            f"`systemctl --user enable {unit.name}`",
+        )
+    if enabled is None:
+        return CheckResult(
+            name, "warn", f"unit installed; cannot verify enable state ({unit.name})"
+        )
+    return CheckResult(name, "pass", f"unit installed and enabled ({unit.name})")
+
+
+def check_service_linger() -> CheckResult:
+    """Without linger a user unit dies with the last session — warn loudly."""
+    name = "service.linger"
+    user = os.environ.get("USER") or os.environ.get("LOGNAME")
+    if not user or not shutil.which("loginctl"):
+        return CheckResult(
+            name, "warn", "cannot verify linger — run `loginctl enable-linger $USER`"
+        )
+    try:
+        proc = subprocess.run(
+            ["loginctl", "show-user", user, "-p", "Linger"],
+            capture_output=True,
+            text=True,
+            timeout=10,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        return CheckResult(
+            name,
+            "warn",
+            f"cannot verify linger ({exc}); run `loginctl enable-linger $USER`",
+        )
+    if proc.returncode == 0 and proc.stdout.strip().lower() == "linger=yes":
+        return CheckResult(name, "pass", f"linger enabled for {user}")
+    return CheckResult(
+        name, "warn", "linger disabled — run `loginctl enable-linger $USER`"
+    )
+
+
+def service_unit_checks(cfg: ServiceConfig) -> list[CheckResult]:
+    """User-unit checks, emitted only where a user systemd manager exists."""
+    if not systemd.is_available():
+        return []
+    return [check_service_unit(cfg), check_service_linger()]
+
+
 def run_checks(cfg: ServiceConfig, host: str = "127.0.0.1") -> list[CheckResult]:
     return [
         check_source_repository(cfg),
@@ -1268,6 +1326,7 @@ def run_checks(cfg: ServiceConfig, host: str = "127.0.0.1") -> list[CheckResult]
         check_symphony_cli_reachable(cfg),
         check_board_dependencies(cfg),
         check_workflow_registry(cfg),
+        *service_unit_checks(cfg),
     ]
 
 

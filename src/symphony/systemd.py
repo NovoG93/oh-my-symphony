@@ -291,3 +291,25 @@ def is_unit_active(unit_name: str) -> bool | None:
     except (OSError, subprocess.SubprocessError):
         return None
     return proc.stdout.strip() == "active"
+
+
+def is_unit_enabled(unit_name: str) -> bool | None:
+    """True/False from ``systemctl --user is-enabled``; None when unavailable."""
+    if not shutil.which("systemctl"):
+        return None
+    try:
+        proc = subprocess.run(
+            ["systemctl", "--user", "is-enabled", unit_name],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return proc.stdout.strip() in {
+        "enabled",
+        "enabled-runtime",
+        "static",
+        "indirect",
+        "alias",
+    }
