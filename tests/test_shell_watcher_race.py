@@ -33,6 +33,7 @@ from typing import Iterator
 
 import pytest
 
+import symphony._shell as shell
 from symphony._shell import safe_proc_wait, terminate_process_tree
 
 REDACT_FRAGMENT = "will report returncode 255"
@@ -197,6 +198,48 @@ async def test_terminate_process_tree_reports_true_exit_code(
     assert rc is not None and rc != 255
     assert proc.returncode == rc
     assert not [m for m in asyncio_warning_log if REDACT_FRAGMENT in m]
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX waitpid semantics")
+async def test_terminate_prefers_authoritative_rc_over_late_watcher_255(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """terminate must trust safe_proc_wait's rc over a late watcher's 255.
+
+    Deterministic seam for the μs-window the review identified: the take-over
+    reap wins (watcher stalled), and the watcher's late "will report
+    returncode 255" flip lands on ``proc.returncode`` synchronously at the
+    reap — before ``terminate_process_tree``'s final line reads it. The
+    final line must still report the authoritative rc, not the corrupted
+    attribute.
+    """
+    loop = asyncio.get_running_loop()
+    watcher = getattr(loop, "_watcher", None)
+    if watcher is None:
+        pytest.skip("no per-loop child watcher on this platform")
+    monkeypatch.setattr(watcher, "add_child_handler", lambda *a, **k: None)
+
+    proc = await _spawn("exit 7")
+
+    real_reap = shell._reap_blocking
+
+    def reap_then_flip(pid: int) -> int | None:
+        rc = real_reap(pid)
+        # The late watcher verdict, delivered post-reap. This mirrors the
+        # exact write BaseSubprocessTransport._process_exited performs when
+        # the watcher's waitpid loses the race to our take-over reap:
+        # transport._returncode = 255 (Process.returncode is a read-only
+        # property that reads it back; the transport itself is private too).
+        setattr(getattr(proc, "_transport"), "_returncode", 255)
+        return rc
+
+    monkeypatch.setattr(shell, "_reap_blocking", reap_then_flip)
+    monkeypatch.setattr(shell, "_signal_process_group", lambda *a, **k: True)
+
+    rc = await terminate_process_tree(proc, term_timeout=0.4, kill_timeout=1.0)
+
+    assert proc.returncode == 255  # the corruption really was present at the read
+    assert rc == 7  # the authoritative rc survived it
 
 
 @pytest.mark.skipif(sys.platform == "win32", reason="POSIX waitpid semantics")

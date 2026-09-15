@@ -530,8 +530,12 @@ async def terminate_process_tree(
     Backends spawn ``bash -lc <agent cli>``; signalling only the bash
     wrapper (``proc.terminate()``) orphans the actual agent CLI and its
     children, which keep running and burning tokens. Both waits are bounded
-    so a caller can never hang on an unreapable child; returns the exit
-    code, or ``None`` if the process could not be reaped in time.
+    so a caller can never hang on an unreapable child (each may overshoot
+    its nominal timeout by ``safe_proc_wait``'s small documented grace);
+    returns the exit code, or ``None`` if the process could not be reaped
+    in time. The exit code is the one ``safe_proc_wait`` reaped or observed
+    — never a watcher's fabricated 255 for a race it lost to the take-over
+    reap.
 
     On Windows there are no process groups or signals; the tree is taken
     down with ``taskkill /T /F`` first (itself bounded at
@@ -561,7 +565,10 @@ async def terminate_process_tree(
             except OSError:
                 pass
             rc = await safe_proc_wait(proc, timeout=kill_timeout)
-        return proc.returncode if proc.returncode is not None else rc
+        # Prefer the rc safe_proc_wait reaped/observed: a watcher that lost
+        # the race to our take-over reap can still flip proc.returncode to
+        # its fabricated 255 after the true code was returned.
+        return rc if rc is not None else proc.returncode
 
     if pid is None:
         # No pid to signal — single-process ladder.
@@ -576,11 +583,15 @@ async def terminate_process_tree(
             except ProcessLookupError:
                 pass
             rc = await safe_proc_wait(proc, timeout=kill_timeout)
-        return proc.returncode if proc.returncode is not None else rc
+        # Prefer the rc safe_proc_wait reaped/observed (see the win32 branch).
+        return rc if rc is not None else proc.returncode
 
     _signal_process_group(pid, signal.SIGTERM)
     rc = await safe_proc_wait(proc, timeout=term_timeout)
     if rc is None and proc.returncode is None:
         _signal_process_group(pid, signal.SIGKILL)
         rc = await safe_proc_wait(proc, timeout=kill_timeout)
-    return proc.returncode if proc.returncode is not None else rc
+    # Prefer the rc safe_proc_wait reaped/observed: a watcher that lost the
+    # race to our take-over reap can still flip proc.returncode to its
+    # fabricated 255 after the true code was returned.
+    return rc if rc is not None else proc.returncode
