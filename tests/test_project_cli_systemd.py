@@ -5,8 +5,6 @@ from __future__ import annotations
 import subprocess
 from pathlib import Path
 
-import pytest
-
 from symphony import systemd as systemd_module
 from symphony.cli import project as project_cli
 

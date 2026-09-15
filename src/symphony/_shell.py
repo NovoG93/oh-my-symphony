@@ -279,7 +279,14 @@ def process_group_exists(pid: int) -> bool | None:
         os.killpg(pid, 0)
     except ProcessLookupError:
         return False
-    except (PermissionError, OSError):
+    except PermissionError:
+        # macOS: once a SIGKILLed process turns into a zombie, killpg(pid, 0)
+        # raises EPERM even though the (unreaped) process group still exists.
+        # The ps probe below filters zombies authoritatively, so fall through
+        # instead of reporting an ambiguous "unknown" that can never confirm
+        # a successful kill.
+        pass
+    except OSError:
         return None
     try:
         group_flag = "--pgroup" if sys.platform.startswith("linux") else "-g"

@@ -2052,6 +2052,87 @@ def test_startup_reclaim_terminates_live_recorded_orphan_agent_group(
             restarted._run_registry.close()
 
 
+@pytest.mark.skipif(sys.platform == "win32", reason="process groups are POSIX-only")
+def test_startup_reclaim_finalizes_orphan_when_kill_probe_eperms_on_zombie(
+    tmp_path, monkeypatch
+):
+    """AF-10 — macOS zombie semantics must not strand a reclaimed run.
+
+    On macOS, `killpg(pid, 0)` raises EPERM once a SIGKILLed process turns
+    into a zombie (its parent cannot reap it while it is inside the confirm
+    poll), so `process_group_exists` must fall back to the `ps` listing,
+    which filters zombies authoritatively. Without the fallback the probe
+    reports "unknown" (None), the confirm poll never observes `False`, and
+    the run is left in `reclaiming` even though the recorded process group
+    is provably dead — the flake observed as `status == 'reclaiming'` after
+    a successful kill.
+    """
+    import symphony._shell as shell_module
+    import symphony.orchestrator.run_registry as run_registry_module
+
+    real_killpg = shell_module.os.killpg
+
+    def killpg_eperm_on_zombie(pid: int, sig: int) -> None:
+        if sig == 0:
+            # macOS: a zombie process group exists but is un-signalable.
+            raise PermissionError("EPERM on zombie process group")
+        real_killpg(pid, sig)
+
+    # `process_group_exists` probes with `os.killpg(pid, 0)`; the actual
+    # SIGKILL goes through the `_killpg` binding captured at import time,
+    # so this intercepts only the gone-confirm probe, exactly like the
+    # macOS zombie state does.
+    monkeypatch.setattr(shell_module.os, "killpg", killpg_eperm_on_zombie)
+
+    sleeper = subprocess.Popen(
+        [sys.executable, "-c", "import time; time.sleep(60)"],
+        start_new_session=True,
+    )
+    restarted = _orch()
+    try:
+        cfg = _make_config(
+            workflow_path=tmp_path / "WORKFLOW.md",
+            workspace_root=tmp_path / "ws",
+        )
+        issue = _issue("MT-EPERM-ORPHAN", state="Todo")
+        now = datetime.now(timezone.utc)
+        crashed = RunRegistry(
+            tmp_path / ".symphony" / "state.db",
+            lease_ttl=timedelta(minutes=5),
+            owner_pid=4242,
+            boot_id="crashed",
+        )
+        run_id = crashed.acquire_run(
+            issue,
+            workspace_path=tmp_path / "ws" / issue.identifier,
+            attempt=None,
+            attempt_kind="initial",
+            agent_kind="codex",
+            now=now,
+        )
+        assert run_id
+        assert crashed.heartbeat(
+            issue_id=issue.id,
+            run_id=run_id,
+            now=now + timedelta(seconds=1),
+            backend_agent_pid=sleeper.pid,
+        )
+        crashed.close()
+        monkeypatch.setattr(run_registry_module, "_pid_alive", lambda _pid: False)
+
+        restarted._ensure_run_registry(cfg)
+
+        assert sleeper.wait(timeout=5) < 0
+        assert restarted._run_registry is not None
+        assert restarted._run_registry.get_run(run_id).status == "orphaned"
+    finally:
+        if sleeper.poll() is None:
+            sleeper.kill()
+            sleeper.wait(timeout=5)
+        if restarted._run_registry is not None:
+            restarted._run_registry.close()
+
+
 def test_retryable_persisted_pause_restarts_as_retry(tmp_path, monkeypatch):
     cfg = _make_config(
         workflow_path=tmp_path / "WORKFLOW.md",
