@@ -52,6 +52,7 @@ from symphony.backends import (
 from symphony.errors import ResponseError, TurnFailed
 from symphony.orchestrator import Orchestrator
 from symphony.utils.git_sandbox import GIT_ROOTS_ENV_VAR
+from symphony.workflow import SUPPORTED_AGENT_KINDS
 from tests.test_backends import (
     _BlockingStream,
     _FakeSubprocess,
@@ -91,6 +92,62 @@ def test_every_backend_kind_satisfies_protocol(kind: str, tmp_path: Path) -> Non
         BackendInit(cfg=cfg, cwd=cwd, workspace_root=tmp_path, on_event=_async_noop)
     )
     assert isinstance(backend, AgentBackend)
+
+
+def test_backend_init_defensively_copies_dispatch_env(tmp_path: Path) -> None:
+    cfg = _make_cfg("agy", workspace_root=tmp_path)
+    source = {"SYMPHONY_TOKEN_EMA": "7"}
+    init = BackendInit(
+        cfg=cfg, cwd=tmp_path, workspace_root=tmp_path, on_event=_async_noop, env=source
+    )
+    source["SYMPHONY_TOKEN_EMA"] = "changed"
+    init.env["SYMPHONY_TOKEN_BUDGET"] = "99"
+    assert init.env == {"SYMPHONY_TOKEN_EMA": "7", "SYMPHONY_TOKEN_BUDGET": "99"}
+
+
+@pytest.mark.parametrize("kind", sorted(SUPPORTED_AGENT_KINDS))
+@pytest.mark.asyncio
+async def test_every_registered_backend_dispatch_overlay_wins(
+    kind: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Each worker subprocess receives its own overlay with final precedence."""
+    if shutil.which("git") is None:
+        pytest.skip("git CLI required")
+    host, workspace_root, cwd = _worktree_workspace(tmp_path)
+    del host
+    captured: dict[str, dict[str, str]] = {}
+    module = _SPAWN_MODULES[kind]
+
+    async def fake_create_subprocess_exec(*args: Any, **kwargs: Any):
+        del args
+        captured["env"] = dict(kwargs.get("env") or {})
+        return _FakeSubprocess(stdout_blob=b"", stderr_blob=b"", returncode=0)
+
+    async def fake_safe_proc_wait(proc: Any, *, timeout: Any = None) -> Any:
+        del timeout
+        return proc.returncode
+
+    monkeypatch.setattr(module.asyncio, "create_subprocess_exec", fake_create_subprocess_exec)
+    monkeypatch.setattr(module, "safe_proc_wait", fake_safe_proc_wait, raising=False)
+    monkeypatch.setenv("SYMPHONY_DISPATCH_TEST", "inherited")
+    cfg = _make_cfg(kind, workspace_root=workspace_root)
+    backend = build_backend(
+        BackendInit(
+            cfg=cfg,
+            cwd=cwd,
+            workspace_root=workspace_root,
+            on_event=_async_noop,
+            env={"SYMPHONY_DISPATCH_TEST": "dispatch", GIT_ROOTS_ENV_VAR: "dispatch"},
+        )
+    )
+    await backend.start()
+    if kind != "codex":
+        with contextlib.suppress(Exception):
+            await backend.run_turn(prompt="test", is_continuation=False)
+    with contextlib.suppress(Exception):
+        await backend.stop()
+    assert captured["env"]["SYMPHONY_DISPATCH_TEST"] == "dispatch"
+    assert captured["env"][GIT_ROOTS_ENV_VAR] == "dispatch"
 
 
 async def _async_noop(event: dict[str, Any]) -> None:

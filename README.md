@@ -1571,7 +1571,7 @@ Fork-specific gaps:
 
 ## Contributing
 
-PRs welcome. External contributions should target `dev` by default; see
+PRs welcome. External contributions should target `develop` by default; see
 [CONTRIBUTING.md](CONTRIBUTING.md) and the PR template for the full review
 checklist. Before opening one:
 

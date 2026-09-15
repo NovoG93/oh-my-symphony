@@ -755,6 +755,7 @@ class CodexAppServerBackend(BaseAgentBackend):
         self._workspace_root = init.workspace_root
         self._on_event = init.on_event
         self._on_process_started = init.on_process_started
+        self._env = dict(init.env)
         self._client_tools = init.client_tools
         self._approval_policy = codex.approval_policy
         self._sandbox_policy = codex.turn_sandbox_policy
@@ -835,13 +836,16 @@ class CodexAppServerBackend(BaseAgentBackend):
         command = self._codex.command
         if not _sandbox_uses_workspace_write(self._thread_sandbox, self._sandbox_policy):
             self._writable_roots = []
+            env.update(self._env)
             return command, env
         roots = _scan_workspace_symlinks(self._cwd, self._workspace_root)
         if not roots:
             self._writable_roots = []
+            env.update(self._env)
             return command, env
         self._writable_roots = roots
         env["SYMPHONY_CODEX_WRITABLE_ROOTS"] = os.pathsep.join(roots)
+        env.update(self._env)
         new_command = _inject_writable_roots(command, roots)
         if new_command != command:
             log.info(

@@ -114,6 +114,7 @@ class PiBackend(BaseAgentBackend):
         self._cwd = init.cwd
         self._on_event = init.on_event
         self._on_process_started = init.on_process_started
+        self._env = dict(init.env)
         self._usage_manager = getattr(init, "usage_manager", None)
         self._usage_pool = getattr(init, "usage_pool", None) or (
             init.selection.kind if init.selection is not None else self._agent_name
@@ -223,7 +224,7 @@ class PiBackend(BaseAgentBackend):
                 stdin=asyncio.subprocess.PIPE,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
-                env={**os.environ, **git_roots_env(self._cwd)},
+                env={**os.environ, **git_roots_env(self._cwd), **self._env},
                 limit=MAX_LINE_BYTES,
                 # Own process group so terminate/kill reaches the agent CLI
                 # behind the bash wrapper (POSIX only).
@@ -728,4 +729,3 @@ def _is_genuine_pi_exhaustion(text: str) -> bool:
         "provider usage exhausted",
     )
     return any(kw in lowered for kw in exhaustion_keywords)
-

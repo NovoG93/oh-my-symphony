@@ -23,6 +23,8 @@ from symphony.backends import (
 )
 from symphony.orchestrator import Orchestrator
 from symphony.server import build_app
+from symphony import webapi
+from symphony.intent import IntentAction, IntentProposal
 from symphony.web_policy import AUTH_MODE_ENV, CAPABILITIES_ENV
 from symphony.workflow import WorkflowState
 
@@ -251,6 +253,45 @@ async def test_chat_session_crud(client: TestClient) -> None:
 
     resp = await client.post("/api/v1/chat/session", json={"mode": "nope"})
     assert resp.status == 400
+
+
+async def test_intent_approval_endpoint_authorizes_idempotently_and_rejects_body(
+    client: TestClient,
+) -> None:
+    started = await client.post(
+        "/api/v1/chat/sessions", json={"mode": "edit", "confirmation_token": CONFIRMATION_TOKEN}
+    )
+    assert started.status == 201
+    session_id = (await started.json())["session_id"]
+    # The manager is exposed by the application, while the action remains
+    # process-local and is never reconstructed from the transcript.
+    manager = client.app[webapi.CHAT_MANAGER_KEY]
+    session = manager.session(session_id)
+    assert session is not None
+    action = IntentAction.from_proposal(
+        IntentProposal("api-test", "API test", "micro", "## Problem\nX\n## Success criteria\n- [ ] Y\n## Out of scope\nZ")
+    )
+    session.intent_actions[action.action_id] = action
+
+    async def approve(_session: object, current: IntentAction) -> None:
+        current.status = "approved"
+        current.ticket = {"id": "REQ-API"}
+        current.task = None
+
+    manager._run_intent = approve
+    url = f"/api/v1/chat/sessions/{session_id}/intent/{action.action_id}/approve"
+    denied = await client.post(url)
+    assert denied.status == 403
+    denied = await client.post(url, headers={"X-Symphony-Chat-Confirmation": "x" * 64})
+    assert denied.status == 403
+    bad_body = await client.post(url, json={"unexpected": True}, headers={"X-Symphony-Chat-Confirmation": CONFIRMATION_TOKEN})
+    assert bad_body.status == 400
+    first = await client.post(url, headers={"X-Symphony-Chat-Confirmation": CONFIRMATION_TOKEN})
+    assert first.status == 200
+    second = await client.post(url, headers={"X-Symphony-Chat-Confirmation": CONFIRMATION_TOKEN})
+    assert second.status == 200
+    malformed = await client.post(f"/api/v1/chat/sessions/{session_id}/intent/not-an-id/approve", headers={"X-Symphony-Chat-Confirmation": CONFIRMATION_TOKEN})
+    assert malformed.status == 400
 
 
 async def test_chat_message_validation_and_busy(

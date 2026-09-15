@@ -5,8 +5,6 @@ from __future__ import annotations
 import subprocess
 from pathlib import Path
 
-import pytest
-
 from symphony import systemd as systemd_module
 from symphony.cli import doctor
 from symphony.workflow import ServiceConfig, build_service_config, load_workflow
@@ -112,3 +110,22 @@ def test_service_unit_checks_omitted_without_systemd(monkeypatch, tmp_path: Path
     monkeypatch.setattr(doctor.systemd, "is_available", lambda: True)
     names = [r.name for r in doctor.service_unit_checks(cfg)]
     assert names == ["service.unit", "service.linger"]
+
+
+def test_run_checks_includes_service_unit_checks_when_systemd_available(
+    monkeypatch, tmp_path: Path
+) -> None:
+    """`run_checks` adds exactly the two managed-unit rows on systemd hosts.
+
+    Mirrors the base-count contract in test_doctor.py::test_run_checks_returns_
+    one_result_per_check, which pins the seam in the other direction. Hermetic:
+    `SYMPHONY_SYSTEMD_UNIT_DIR` redirects the unit lookup away from the real
+    user unit dir.
+    """
+    monkeypatch.setenv("SYMPHONY_SYSTEMD_UNIT_DIR", str(tmp_path / "units"))
+    cfg = _cfg(tmp_path)
+    monkeypatch.setattr(doctor.systemd, "is_available", lambda: True)
+
+    names = {r.name for r in doctor.run_checks(cfg)}
+
+    assert {"service.unit", "service.linger"} <= names

@@ -217,6 +217,32 @@ def test_web_chat_project_setup_action_contract() -> None:
     assert ".chat-project-setup-select" in css
 
 
+def test_web_chat_intent_action_contract() -> None:
+    js = _script_bundle()
+    css = (STATIC_ROOT / "style.css").read_text(encoding="utf-8")
+    i18n = (STATIC_ROOT / "i18n.js").read_text(encoding="utf-8")
+
+    assert "approveChatIntent: (sessionId, actionId, confirmationToken)" in js
+    assert "/intent/${encodeURIComponent(actionId)}/approve" in js
+    assert "X-Symphony-Chat-Confirmation" in js
+    assert "intent_actions" in js
+    assert "intent_action" in js
+    assert "intent_status" in js
+    assert "intent_removed" in js
+    assert "function renderChatIntentAction(view, action)" in js
+    assert "function reconcileChatIntentActions(view, snapshot)" in js
+    assert "function scheduleChatIntentExpiry(view, action)" in js
+    assert "intentExpiryTimers" in js
+    assert "chat-intent-approve" in js
+    assert "role: 'alert'" in js
+    assert "truncate(String(action.error), 800)" in js
+    assert "chat.intentApproveAria" in js
+    assert "'chat.intentApprove': 'Approve intent'" in i18n
+    assert "'chat.intentApprove': '의도 승인'" in i18n
+    assert ".chat-intent-action" in css
+    assert ".chat-intent-markdown" in css
+
+
 def test_web_chat_token_streaming_contract() -> None:
     js = _script_bundle()
     css = (STATIC_ROOT / "style.css").read_text(encoding="utf-8")

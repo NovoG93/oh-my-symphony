@@ -1494,6 +1494,9 @@ def test_popen_detached_overwrites_instance_only_in_child_environment(
 def test_start_generates_and_persists_one_service_instance_id(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    # Legacy detached-process contract: `--no-systemd` pins the detached
+    # backend even on hosts with a live user systemd manager. The managed-unit
+    # path is covered separately in tests/test_service_systemd.py.
     workflow = _workflow(tmp_path)
     token_sizes: list[int] = []
     child_environments: list[dict[str, str]] = []
@@ -1510,7 +1513,7 @@ def test_start_generates_and_persists_one_service_instance_id(
     monkeypatch.setattr(service_module, "_popen_detached", _spawn)
     monkeypatch.setattr(service_module, "_wait_until", lambda *_args, **_kwargs: True)
 
-    rc = service_main(["start", "--skip-doctor", str(workflow)])
+    rc = service_main(["start", "--no-systemd", "--skip-doctor", str(workflow)])
 
     assert rc == 0
     assert token_sizes == [32]
@@ -1552,6 +1555,10 @@ def test_start_clears_stale_record_before_doctor(
 def test_start_cleans_spawned_process_if_record_save_fails(
     tmp_path: Path, monkeypatch, capsys
 ) -> None:
+    # Legacy detached-process contract: `--no-systemd` keeps this on the
+    # detached backend even on hosts with a live user systemd manager, so the
+    # spawned-process cleanup below is exercised (managed-unit path covered in
+    # tests/test_service_systemd.py).
     workflow = _workflow(tmp_path)
     stopped: list[int | None] = []
     monkeypatch.setattr(
@@ -1570,7 +1577,7 @@ def test_start_cleans_spawned_process_if_record_save_fails(
         lambda pid, *args, **kwargs: stopped.append(pid) or True,
     )
 
-    rc = service_main(["start", "--skip-doctor", str(workflow)])
+    rc = service_main(["start", "--no-systemd", "--skip-doctor", str(workflow)])
 
     captured = capsys.readouterr()
     assert rc == 1

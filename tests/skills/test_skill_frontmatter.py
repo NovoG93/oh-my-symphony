@@ -38,7 +38,27 @@ def test_skills_dir_has_skill_files() -> None:
 
 
 def test_symphony_skill_is_the_single_operator_router() -> None:
-    assert [path.parent.name for path in SKILL_MD_FILES] == ["symphony-skill"]
+    """The bundled skill set has exactly one general operator router.
+
+    ``symphony-skill`` is the single general operator router; every other
+    bundled skill must be purpose-specific (currently only
+    ``symphony-upstream-sync``, the upstream-integration playbook).  The set
+    is pinned exactly so that adding, removing, or renaming a bundled skill
+    is a deliberate, reviewed change — a second general router can never
+    ship unnoticed.
+    """
+    names = sorted(path.parent.name for path in SKILL_MD_FILES)
+    assert names == ["symphony-skill", "symphony-upstream-sync"], (
+        "the bundled skill set changed without review: symphony-skill must "
+        "remain the only general operator router and any other skill must "
+        "be purpose-specific (currently symphony-upstream-sync)"
+    )
+
+    router = (SKILLS_DIR / "symphony-skill" / "SKILL.md").read_text(encoding="utf-8")
+    assert "single operator router" in router, (
+        "symphony-skill must keep declaring itself the single general "
+        "operator router"
+    )
 
 
 def test_claude_skill_symlinks_resolve() -> None:

@@ -112,25 +112,176 @@ def resolve_bash() -> str:
     return "bash"
 
 
+# Grace given to the child watcher before ``safe_proc_wait`` concludes the
+# watcher has stalled on a dead child (a healthy watcher reaps within
+# milliseconds of the child exiting).
+_WATCHER_GRACE_S = 0.25
+# Poll cadence of the untimed wait path: how often it checks whether the
+# child is dead-but-unreaped while the watcher has not delivered a
+# returncode. /proc reads are cheap on Linux; other platforms fork a ``ps``,
+# so they poll less aggressively.
+_WATCHER_POLL_INTERVAL_S = 0.5 if sys.platform.startswith("linux") else 2.0
+
+
+def _child_is_zombie(pid: int) -> bool:
+    """Return True when *pid* is an exited-but-unreaped child (a zombie).
+
+    A zombie means the process is dead and nobody has reaped it yet. On a
+    healthy event loop the child watcher reaps within milliseconds, so a
+    zombie observed while ``proc.wait()`` is still pending means the
+    watcher has stalled for this child — the exact failure mode the
+    thread-based fallback was written for.
+    """
+    if pid <= 0:
+        return False
+    if sys.platform.startswith("linux"):
+        try:
+            raw = Path(f"/proc/{pid}/stat").read_text(encoding="utf-8")
+        except OSError:
+            return False
+        try:
+            state = raw.rsplit(")", 1)[1].split()[0]
+        except IndexError:
+            return False
+        return state == "Z"
+    try:
+        result = subprocess.run(
+            ["ps", "-o", "stat=", "-p", str(pid)],
+            capture_output=True,
+            check=False,
+            text=True,
+            timeout=1,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return result.stdout.strip().upper().startswith("Z")
+
+
+def _child_is_absent(pid: int) -> bool:
+    """Return True when *pid* no longer exists at all (reaped and gone).
+
+    Distinct from ``_child_is_zombie``: an absent pid has no process-table
+    entry left. Observed while ``wait()`` is still pending it means the
+    child was already reaped outside the watcher (a prior take-over) — the
+    watcher can never deliver a returncode for it, so polling is futile.
+    """
+    if pid <= 0:
+        return True
+    if sys.platform.startswith("linux"):
+        return not Path(f"/proc/{pid}/stat").exists()
+    try:
+        result = subprocess.run(
+            ["ps", "-o", "stat=", "-p", str(pid)],
+            capture_output=True,
+            check=False,
+            text=True,
+            timeout=1,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return result.returncode == 1 and not result.stdout.strip()
+
+
+def _reap_blocking(pid: int) -> int | None:
+    """Reap *pid* with a blocking ``waitpid``; None when already reaped."""
+    try:
+        _, status = os.waitpid(pid, 0)
+    except ChildProcessError:
+        # Already reaped elsewhere (the asyncio child watcher won the race).
+        # The status lives in the watcher now; callers recover it through
+        # ``proc.wait()``.
+        return None
+    except OSError as exc:
+        if exc.errno == errno.ECHILD:
+            return None
+        raise
+    if os.WIFEXITED(status):
+        return os.WEXITSTATUS(status)
+    if os.WIFSIGNALED(status):
+        return -os.WTERMSIG(status)
+    return None
+
+
+async def _recover_via_wait(proc: Any, wait: Callable[..., Any]) -> int | None:
+    """Pick up the exit code the child watcher reaped (race recovery)."""
+    try:
+        return await asyncio.wait_for(wait(), timeout=_WATCHER_GRACE_S)
+    except asyncio.TimeoutError:
+        return proc.returncode
+
+
+async def _wait_watcher_or_take_over(
+    proc: Any, wait: Callable[..., Any], pid: int
+) -> int | None:
+    """Untimed wait: rely on the watcher, take over only on a proven stall.
+
+    The historic macOS/Textual failure mode is a child watcher that never
+    delivers the returncode. To preserve that workaround without racing a
+    healthy watcher, we poll for a zombie child (dead, unreaped) and only
+    then bypass the watcher. A healthy watcher reaps a dead child in
+    milliseconds, so the bypass never fires on healthy systems.
+    """
+    while True:
+        try:
+            return await asyncio.wait_for(wait(), timeout=_WATCHER_POLL_INTERVAL_S)
+        except asyncio.TimeoutError:
+            pass
+        if proc.returncode is not None:
+            return proc.returncode
+        if not _child_is_zombie(pid):
+            if _child_is_absent(pid):
+                # The pid is gone and the watcher has not delivered a
+                # returncode: this child was already reaped (typically by a
+                # prior take-over of this same wait) and can never come back.
+                # One blocking reap settles it — ECHILD on an already-reaped
+                # pid — and returns None promptly instead of polling forever.
+                return await asyncio.to_thread(_reap_blocking, pid)
+            continue  # still running (or watcher about to deliver) — keep waiting
+        # Dead but unreaped: the watcher stalled. One grace round in case it
+        # is merely slow, then take over the reap.
+        try:
+            return await asyncio.wait_for(wait(), timeout=_WATCHER_GRACE_S)
+        except asyncio.TimeoutError:
+            pass
+        if proc.returncode is not None:
+            return proc.returncode
+        rc = await asyncio.to_thread(_reap_blocking, pid)
+        if rc is not None:
+            return rc
+        return await _recover_via_wait(proc, wait)
+
+
 async def safe_proc_wait(proc: Any, *, timeout: float | None = None) -> int | None:
-    """Reap an asyncio subprocess without depending on the child watcher.
+    """Wait for an asyncio subprocess to exit — watcher-first, race-free.
 
     Background: Python 3.12 + asyncio + Textual on macOS sometimes leaves the
-    child watcher unable to observe SIGCHLD for processes spawned via
-    ``asyncio.create_subprocess_exec``. The visible symptom is a zombie
-    ``<defunct>`` child plus an ``await proc.wait()`` that never returns.
+    child watcher unable to deliver the returncode for processes spawned via
+    ``asyncio.create_subprocess_exec`` — ``await proc.wait()`` then never
+    returns. The original workaround reaped with a raw ``os.waitpid`` in a
+    worker thread, but that races the child watcher: when the thread wins,
+    asyncio logs "… exit status already read: will report returncode 255"
+    and corrupts ``proc.returncode`` to 255 — one line per spawned process
+    in the journal (the engine spam) and a wrong exit code for callers.
 
-    Workaround: do the wait in a worker thread via ``os.waitpid``. The thread
-    blocks in the kernel until the child exits — independent of any asyncio
-    watcher state — and yields back to the loop the moment the kernel hands
-    over the exit status.
+    The watcher owns the reap. This helper waits on ``proc.wait()`` and only
+    bypasses the watcher when the child is demonstrably dead-but-unreaped
+    (a zombie) while no returncode was delivered — i.e. the watcher has
+    provably stalled. On a healthy loop the raw ``waitpid`` never runs.
 
     `timeout` is in seconds. Returns the exit code, or ``None`` on timeout
-    (caller is responsible for sending SIGKILL and retrying).
+    while the child is still running (caller is responsible for sending
+    SIGKILL and retrying). The timed path may overshoot `timeout` by a
+    small bounded grace (``_WATCHER_GRACE_S`` plus one wait/re-check round)
+    used to tell a still-running child from a stalled watcher; it never
+    waits for the child itself past that. With ``timeout=None`` the wait is
+    unbounded but still takes over the reap when the watcher stalls on a
+    dead child; if the child was already reaped by a prior take-over (or
+    elsewhere), a later untimed wait returns ``None`` promptly instead of
+    polling a pid that no longer exists.
 
     Windows note: ``os.waitpid`` and the ``WIF*`` helpers are POSIX-only, so
     on Windows we delegate to the asyncio child transport's own ``wait()``
-    — the SIGCHLD race the workaround targets does not exist there.
+    — the SIGCHLD race the fallback targets does not exist there.
     """
     if proc.returncode is not None:
         return proc.returncode
@@ -147,46 +298,47 @@ async def safe_proc_wait(proc: Any, *, timeout: float | None = None) -> int | No
     if pid is None:
         return None
 
-    async def _asyncio_returncode_fallback() -> int | None:
-        if proc.returncode is not None:
-            return proc.returncode
-        wait = getattr(proc, "wait", None)
-        if wait is None:
-            return None
+    wait = getattr(proc, "wait", None)
+    if wait is None:
+        # Not spawned through asyncio (plain Popen): no watcher tracks the
+        # child, so a worker-thread waitpid is the only reaper and cannot
+        # race anything.
+        if timeout is None:
+            return await asyncio.to_thread(_reap_blocking, pid)
         try:
-            return await asyncio.wait_for(wait(), timeout=0.05)
+            return await asyncio.wait_for(
+                asyncio.to_thread(_reap_blocking, pid), timeout=timeout
+            )
         except asyncio.TimeoutError:
-            return proc.returncode
-
-    def _blocking_wait() -> int | None:
-        try:
-            _, status = os.waitpid(pid, 0)
-        except ChildProcessError:
-            # Already reaped (asyncio watcher won the race, or never
-            # registered). Either way, nothing more to do.
             return None
-        except OSError as exc:
-            if exc.errno == errno.ECHILD:
-                return None
-            raise
-        if os.WIFEXITED(status):
-            return os.WEXITSTATUS(status)
-        if os.WIFSIGNALED(status):
-            return -os.WTERMSIG(status)
-        return None
 
     if timeout is None:
-        rc = await asyncio.to_thread(_blocking_wait)
-        if rc is not None:
-            return rc
-        return await _asyncio_returncode_fallback()
+        return await _wait_watcher_or_take_over(proc, wait, pid)
+
     try:
-        rc = await asyncio.wait_for(asyncio.to_thread(_blocking_wait), timeout=timeout)
+        return await asyncio.wait_for(wait(), timeout=timeout)
     except asyncio.TimeoutError:
+        pass
+
+    # The watcher did not deliver within `timeout`. Give it a short grace
+    # (the child may have exited just at the deadline), then distinguish:
+    # still running -> keep the timeout contract; dead-but-unreaped -> the
+    # watcher stalled, take over the reap.
+    await asyncio.sleep(_WATCHER_GRACE_S)
+    if proc.returncode is not None:
+        return proc.returncode
+    if not _child_is_zombie(pid):
         return None
+    try:
+        return await asyncio.wait_for(wait(), timeout=_WATCHER_GRACE_S)
+    except asyncio.TimeoutError:
+        pass
+    if proc.returncode is not None:
+        return proc.returncode
+    rc = await asyncio.to_thread(_reap_blocking, pid)
     if rc is not None:
         return rc
-    return await _asyncio_returncode_fallback()
+    return await _recover_via_wait(proc, wait)
 
 
 def _signal_process_group(pid: int, sig: int) -> bool:
@@ -279,7 +431,14 @@ def process_group_exists(pid: int) -> bool | None:
         os.killpg(pid, 0)
     except ProcessLookupError:
         return False
-    except (PermissionError, OSError):
+    except PermissionError:
+        # macOS: once a SIGKILLed process turns into a zombie, killpg(pid, 0)
+        # raises EPERM even though the (unreaped) process group still exists.
+        # The ps probe below filters zombies authoritatively, so fall through
+        # instead of reporting an ambiguous "unknown" that can never confirm
+        # a successful kill.
+        pass
+    except OSError:
         return None
     try:
         group_flag = "--pgroup" if sys.platform.startswith("linux") else "-g"
@@ -371,8 +530,12 @@ async def terminate_process_tree(
     Backends spawn ``bash -lc <agent cli>``; signalling only the bash
     wrapper (``proc.terminate()``) orphans the actual agent CLI and its
     children, which keep running and burning tokens. Both waits are bounded
-    so a caller can never hang on an unreapable child; returns the exit
-    code, or ``None`` if the process could not be reaped in time.
+    so a caller can never hang on an unreapable child (each may overshoot
+    its nominal timeout by ``safe_proc_wait``'s small documented grace);
+    returns the exit code, or ``None`` if the process could not be reaped
+    in time. The exit code is the one ``safe_proc_wait`` reaped or observed
+    — never a watcher's fabricated 255 for a race it lost to the take-over
+    reap.
 
     On Windows there are no process groups or signals; the tree is taken
     down with ``taskkill /T /F`` first (itself bounded at
@@ -402,7 +565,10 @@ async def terminate_process_tree(
             except OSError:
                 pass
             rc = await safe_proc_wait(proc, timeout=kill_timeout)
-        return proc.returncode if proc.returncode is not None else rc
+        # Prefer the rc safe_proc_wait reaped/observed: a watcher that lost
+        # the race to our take-over reap can still flip proc.returncode to
+        # its fabricated 255 after the true code was returned.
+        return rc if rc is not None else proc.returncode
 
     if pid is None:
         # No pid to signal — single-process ladder.
@@ -417,11 +583,15 @@ async def terminate_process_tree(
             except ProcessLookupError:
                 pass
             rc = await safe_proc_wait(proc, timeout=kill_timeout)
-        return proc.returncode if proc.returncode is not None else rc
+        # Prefer the rc safe_proc_wait reaped/observed (see the win32 branch).
+        return rc if rc is not None else proc.returncode
 
     _signal_process_group(pid, signal.SIGTERM)
     rc = await safe_proc_wait(proc, timeout=term_timeout)
     if rc is None and proc.returncode is None:
         _signal_process_group(pid, signal.SIGKILL)
         rc = await safe_proc_wait(proc, timeout=kill_timeout)
-    return proc.returncode if proc.returncode is not None else rc
+    # Prefer the rc safe_proc_wait reaped/observed: a watcher that lost the
+    # race to our take-over reap can still flip proc.returncode to its
+    # fabricated 255 after the true code was returned.
+    return rc if rc is not None else proc.returncode

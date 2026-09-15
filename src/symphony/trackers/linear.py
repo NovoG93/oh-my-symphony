@@ -53,7 +53,8 @@ query Candidates($projectSlug: String!, $states: [String!], $first: Int!, $after
       updatedAt
       state { name }
       labels { nodes { name } }
-      inverseRelations(filter: { type: { eq: "blocks" } }) {
+      inverseRelations(first: 50) {
+        pageInfo { hasNextPage }
         nodes {
           type
           issue { id identifier state { name } }
@@ -117,7 +118,8 @@ query ByIdFull($id: String!) {
     updatedAt
     state { name }
     labels { nodes { name } }
-    inverseRelations(filter: { type: { eq: "blocks" } }) {
+    inverseRelations(first: 50) {
+      pageInfo { hasNextPage }
       nodes {
         type
         issue { id identifier state { name } }
@@ -171,15 +173,58 @@ def _normalize_node(node: dict[str, Any], minimal: bool = False) -> Issue:
         )
     label_nodes = ((node.get("labels") or {}).get("nodes")) or []
     labels = normalize_labels([n.get("name") for n in label_nodes if isinstance(n, dict)])
-    inverse_nodes = ((node.get("inverseRelations") or {}).get("nodes")) or []
+    inverse_relations = node.get("inverseRelations")
+    if not isinstance(inverse_relations, dict):
+        raise LinearUnknownPayload(
+            "issue.inverseRelations is not an object",
+            issue_id=node.get("id"),
+        )
+    inverse_nodes = inverse_relations.get("nodes")
+    page_info = inverse_relations.get("pageInfo")
+    if not isinstance(inverse_nodes, list) or not isinstance(page_info, dict):
+        raise LinearUnknownPayload(
+            "malformed issue.inverseRelations connection",
+            issue_id=node.get("id"),
+        )
+    has_next_page = page_info.get("hasNextPage")
+    if not isinstance(has_next_page, bool):
+        raise LinearUnknownPayload(
+            "issue.inverseRelations.pageInfo.hasNextPage is not a boolean",
+            issue_id=node.get("id"),
+        )
+    if has_next_page:
+        raise LinearUnknownPayload(
+            "issue.inverseRelations connection is truncated",
+            issue_id=node.get("id"),
+        )
     blockers: list[BlockerRef] = []
     for rel in inverse_nodes:
         if not isinstance(rel, dict):
+            raise LinearUnknownPayload(
+                "issue.inverseRelations.nodes contains a non-object",
+                issue_id=node.get("id"),
+            )
+        relation_type = rel.get("type")
+        if not isinstance(relation_type, str):
+            raise LinearUnknownPayload(
+                "issue.inverseRelations node has no relation type",
+                issue_id=node.get("id"),
+            )
+        if relation_type != "blocks":
             continue
-        if rel.get("type") != "blocks":
-            continue
-        b_issue = rel.get("issue") or {}
-        b_state = (b_issue.get("state") or {}).get("name")
+        b_issue = rel.get("issue")
+        if not isinstance(b_issue, dict):
+            raise LinearUnknownPayload(
+                "blocking inverse relation has no issue",
+                issue_id=node.get("id"),
+            )
+        b_state_obj = b_issue.get("state")
+        if b_state_obj is not None and not isinstance(b_state_obj, dict):
+            raise LinearUnknownPayload(
+                "blocking inverse relation issue has malformed state",
+                issue_id=node.get("id"),
+            )
+        b_state = (b_state_obj or {}).get("name")
         blockers.append(
             BlockerRef(
                 id=b_issue.get("id"),

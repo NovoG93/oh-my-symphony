@@ -408,6 +408,13 @@ def _origin_allowed(request: web.Request, policy: EffectivePolicy) -> bool:
 async def policy_middleware(request: web.Request, handler):
     if not request.path.startswith("/api/"):
         return await handler(request)
+    route = request.match_info.route
+    if route.resource is None:
+        # aiohttp resolved no application route for this path/method and
+        # parked HTTPNotFound/HTTPMethodNotAllowed on the handler
+        # (MatchInfoError/SystemRoute). Defer so the framework's own 404/405
+        # is returned; there is no application handler to authorize here.
+        return await handler(request)
     metadata = route_policy(request)
     if metadata is None:
         return _json_error(500, "unclassified_route", "API route has no policy metadata")

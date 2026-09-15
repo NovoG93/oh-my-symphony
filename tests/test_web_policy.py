@@ -17,6 +17,7 @@ from symphony.web_policy import (
     PolicyConfigurationError,
     WebSocketTicketStore,
     install_route_policies,
+    ROUTE_POLICIES_KEY,
     resolve_policy,
 )
 
@@ -108,6 +109,53 @@ def test_non_loopback_requires_exact_origin_and_rejects_wildcards(monkeypatch) -
     }
 
 
+async def test_unmatched_api_path_defers_to_framework_404() -> None:
+    from aiohttp.test_utils import TestClient, TestServer
+
+    from symphony.web_policy import add_api_route, policy_middleware
+
+    app = web.Application(middlewares=[policy_middleware])
+
+    async def board(_request: web.Request) -> web.Response:
+        return web.json_response({"ok": True})
+
+    add_api_route(app, "GET", "/api/v1/board", board, capabilities=["board"])
+    install_route_policies(app)
+    client = TestClient(TestServer(app))
+    await client.start_server()
+    try:
+        response = await client.get("/api/v1/not-a-route")
+        assert response.status == 404
+    finally:
+        await client.close()
+
+
+async def test_matched_route_without_policy_metadata_still_fails_closed() -> None:
+    """Deferral must never bypass a real handler: an unclassified route is a
+    server misconfiguration and keeps its controlled 500."""
+    from aiohttp.test_utils import TestClient, TestServer
+
+    from symphony.web_policy import policy_middleware
+
+    app = web.Application(middlewares=[policy_middleware])
+
+    async def rogue(_request: web.Request) -> web.Response:
+        return web.json_response({"rogue": True})
+
+    install_route_policies(app)
+    # Registered outside add_api_route/install_route_policies: matched by the
+    # router but without authorization metadata.
+    app.router.add_get("/api/v1/rogue", rogue)
+    client = TestClient(TestServer(app))
+    await client.start_server()
+    try:
+        response = await client.get("/api/v1/rogue")
+        assert response.status == 500
+        assert (await response.json())["error"]["code"] == "unclassified_route"
+    finally:
+        await client.close()
+
+
 def test_unclassified_route_fails_registration() -> None:
     app = web.Application()
 
@@ -117,6 +165,20 @@ def test_unclassified_route_fails_registration() -> None:
     app.router.add_get("/api/v1/unclassified", handler)
     with pytest.raises(PolicyConfigurationError, match="lacks authorization"):
         install_route_policies(app)
+
+
+def test_intent_approval_route_is_explicit_chat_board_only() -> None:
+    app = web.Application()
+
+    async def handler(_request):
+        return web.Response()
+
+    path = "/api/v1/chat/sessions/{session_id}/intent/{action_id}/approve"
+    app.router.add_post(path, handler)
+    install_route_policies(app)
+    policy = app[ROUTE_POLICIES_KEY][("POST", path)]
+    assert policy.capabilities == frozenset({"chat", "board"})
+    assert "projects" not in policy.capabilities
 
 
 def test_websocket_ticket_is_origin_bound_single_use_and_expires(monkeypatch) -> None:

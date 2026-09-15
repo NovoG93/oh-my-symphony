@@ -407,3 +407,21 @@ async def test_hub_mutations_require_json(client: TestClient) -> None:
     )
     assert response.status == 415
     assert (await response.json())["error"]["code"] == "unsupported_media_type"
+
+
+async def test_board_api_path_is_not_owned_by_hub_and_answers_404(
+    client: TestClient,
+) -> None:
+    """Project board APIs live on each project service, not the hub.
+
+    Asking the hub for one must be a controlled 404 — never a 500.
+    """
+    response = await client.get("/api/v1/board")
+    assert response.status == 404
+
+
+async def test_unsupported_method_on_hub_route_answers_405(client: TestClient) -> None:
+    """`open` is POST-only; a GET must yield a controlled 405 with Allow."""
+    response = await client.get("/api/v1/projects/alpha/open")
+    assert response.status == 405
+    assert "POST" in response.headers.get("Allow", "")
