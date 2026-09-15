@@ -27,8 +27,9 @@ Versioning: [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   define WHETHER the provider may start new work. Pool caps are enforced at
   dispatch eligibility with a permanent global fail-open invariant —
   missing, stale, or non-authoritative telemetry never blocks dispatch
-  across all 8 backend kinds (`codex`, `claude`, `agy`, `gemini`, `kiro`,
-  `opencode`, `pi`, `prime-agent`) — and caps never cancel running workers.
+  across all 9 backend kinds (`codex`, `claude`, `agy`, `gemini`, `kiro`,
+  `opencode`, `pi`, `prime-agent`, `copilot`) — and caps never cancel running
+  workers.
   Genuine provider quota exhaustion (`EVENT_PROVIDER_USAGE_EXHAUSTED` /
   `ProviderCapacityError`) waits for capacity without burning the retry
   budget. Per-pool `provider_usage` telemetry (used %, remaining %, reset
