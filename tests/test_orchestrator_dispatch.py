@@ -8064,9 +8064,19 @@ def test_conflict_pre_check_preserves_retry_ownership_when_reparked():
         orch._loop.close()
 
 
-def test_provider_usage_wait_reparks_retry_without_releasing_file_ownership(
-    monkeypatch,
-):
+def test_provider_usage_exhaustion_releases_retry_ownership(monkeypatch):
+    """Characterization: on provider exhaustion a pending retry must RELEASE
+    ownership, not merely re-park.
+
+    Review rule for the selective port (missing coverage): quota exhaustion
+    is a scheduler-level condition, not a per-ticket failure. When a retry
+    fires into ``waiting_provider_usage`` the retry must stop owning the
+    ticket — no re-parked ``_retry`` entry, no lingering claim, no persisted
+    retry attempt — so the ordinary tick dispatch loop can pick the ticket
+    up when the quota resets. This mirrors the worker-exit rule
+    (``worker_provider_usage_exhausted``: "do NOT consume retry budget,
+    ticket returns to waiting_provider_usage on next scheduler tick").
+    """
     cfg = replace(
         _make_config(),
         usage_pools={
@@ -8082,6 +8092,10 @@ def test_provider_usage_wait_reparks_retry_without_releasing_file_ownership(
     retry = _pending_retry(
         issue.id, issue.identifier, frozenset({"src/provider-owned.py"})
     )
+    orch._retry[issue.id] = retry
+    orch._claimed.add(issue.id)
+    orch._persisted_retry_attempts[issue.id] = 1
+    monkeypatch.setattr(orch._workflow_state, "current", lambda: cfg)
     monkeypatch.setattr(
         orch._usage_manager,
         "evaluate",
@@ -8093,10 +8107,11 @@ def test_provider_usage_wait_reparks_retry_without_releasing_file_ownership(
 
     monkeypatch.setattr(orch, "_fetch_candidates", _fetch_candidates)
     try:
-        asyncio.run(orch._process_retry(retry, cfg))
-        reparks = orch._retry
-        assert reparks[issue.id].touched_files == retry.touched_files
-        assert reparks[issue.id].holds_slot is False
+        asyncio.run(orch._on_retry_timer(issue.id))
+        # Ownership released, not re-parked:
+        assert issue.id not in orch._retry
+        assert issue.id not in orch._claimed
+        assert issue.id not in orch._persisted_retry_attempts
     finally:
         for pending in orch._retry.values():
             pending.timer_handle.cancel()
