@@ -36,6 +36,15 @@ Versioning: [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   snapshot and the workflow API payload, and rendered as a Provider Usage
   card in the web UI.
 
+### Fixed
+
+- **Controlled 404/405 for unsupported API routes.** Requests to API paths
+  the service does not own (e.g. the per-project board API aimed at the hub)
+  no longer crash the shared web-policy middleware with an internal 500 +
+  traceback; the framework's own 404/405 answers are returned instead. A
+  matched route without authorization metadata still fails closed with
+  `unclassified_route`.
+
 ## [0.21.0] - 2026-08-16 - Named agent profiles and MCP gateway
 
 ### Added
