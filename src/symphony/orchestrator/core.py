@@ -27,7 +27,6 @@ import re
 import subprocess
 import threading
 import time
-import traceback
 from dataclasses import dataclass, replace
 from datetime import datetime, timedelta, timezone
 from enum import Enum
@@ -49,7 +48,7 @@ from ..backends import (
     EVENT_TURN_COMPLETED,
     AgentBackend,
     BackendInit,
-    ProviderCapacityError,
+    ProviderCapacityError,  # noqa: F401 - attempt runner seam
     redact_session_id,
 )
 
@@ -57,14 +56,15 @@ from ..backends import build_backend
 from ..chat import cfg_for_mode
 from ..utils import git_inspect
 from ..utils.archive import select_archivable
+from ..utils.atomic_json import state_file_name, write_json_atomic
 from ..backends.codex import linear_graphql_tool
 from ..errors import (
     ConfigValidationError,
     SymphonyError,
-    TurnFailed,
-    TurnInputRequired,
-    TurnTimeout,
-    TurnCancelled,
+    TurnFailed,  # noqa: F401 - attempt runner seam
+    TurnInputRequired,  # noqa: F401 - attempt runner seam
+    TurnTimeout,  # noqa: F401 - attempt runner seam
+    TurnCancelled,  # noqa: F401 - attempt runner seam
 )
 from ..continuous_improvement import (
     AgentTask,
@@ -77,7 +77,10 @@ from ..continuous_improvement import (
 )
 from ..issue import BlockerRef, Issue, normalize_state
 from ..logging import get_logger
-from ..prompt import build_continuation_prompt, build_first_turn_prompt
+from ..prompt import (
+    build_continuation_prompt,  # noqa: F401 - attempt runner seam
+    build_first_turn_prompt,
+)
 from ..runtime_safety import ensure_workflow_repo_is_safe
 from ..service_identity import SERVICE_INSTANCE_ENV, normalize_service_instance_id
 from ..skills import render_skill_block
@@ -121,7 +124,7 @@ from .constants import (
     WAIT_AGE_BUMP_MIN,
     _TOKEN_EMA_ALPHA,
 )
-from .contracts import evaluate_contract
+from .contracts import evaluate_contract  # noqa: F401 - attempt runner seam
 from .release_contracts import (
     ReleaseValidationResult,
     release_workspace_target_errors,
@@ -137,7 +140,7 @@ from .release_cycle import (
     is_release_success_state as _is_release_success_state,
     is_release_evidence_issue as _is_release_evidence_issue,
     is_release_finalizer as _is_release_finalizer,
-    release_failure_target_state as _release_failure_target_state,
+    release_failure_target_state as _release_failure_target_state,  # noqa: F401
     release_ticket_version_token as _release_ticket_version_token,
     release_verifier_state as _release_verifier_state,
 )
@@ -151,10 +154,10 @@ from .helpers import (
     resolve_symphony_cli,
     _from_monotonic_to_iso,
     _is_auto_triage_todo_candidate,
-    _is_rewind_transition,
     _human_review_target_state,
     _max_turns_exhausted_target_state,
-    _rewind_budget_target_state,
+    _is_rewind_transition,  # noqa: F401 - attempt runner seam
+    _rewind_budget_target_state,  # noqa: F401 - attempt runner seam
     _notify_state_transition,
     _requested_agent_kind,
     _requested_agent_profile,
@@ -3802,7 +3805,11 @@ class Orchestrator:
 
     def _done_count_path(self, cfg: ServiceConfig) -> Path:
         """On-disk location for the persisted Done counter."""
-        return cfg.workflow_path.parent / ".symphony" / "done_count.json"
+        return (
+            cfg.workflow_path.parent
+            / ".symphony"
+            / state_file_name(cfg.workflow_path, "done_count")
+        )
 
     def _load_done_count(self, cfg: ServiceConfig) -> None:
         """Restore the Done counter across orchestrator restarts.
@@ -3830,12 +3837,7 @@ class Orchestrator:
         path = self._done_count_path(cfg)
         try:
             path.parent.mkdir(parents=True, exist_ok=True)
-            tmp = path.with_suffix(".json.tmp")
-            tmp.write_text(
-                json.dumps({"done_count": self._done_count}, indent=2),
-                encoding="utf-8",
-            )
-            tmp.replace(path)
+            write_json_atomic(path, {"done_count": self._done_count})
         except OSError as exc:
             log.warning("done_count_persist_failed", path=str(path), error=str(exc))
 
@@ -6196,6 +6198,7 @@ class Orchestrator:
                 cwd=task.cwd,
                 workspace_root=task.cwd,
                 on_event=_ignore_event,
+                env={},
             )
         )
         before = await asyncio.to_thread(_worktree_status_snapshot, task.cwd)
@@ -6325,17 +6328,12 @@ class Orchestrator:
             if overlap:
                 return entry.issue.identifier, overlap
         for other_id, retry_entry in self._retry.items():
-            if other_id == candidate.id:
+            if other_id == candidate.id or other_id in self._running:
                 continue
-            # Retry entries don't carry the full Issue. Look up the
-            # last-known body via running history when present; the
-            # common case (retry of an exited ticket) leaves no body to
-            # inspect, and the retry path re-evaluates on its own tick.
-            running_entry = self._running.get(other_id)
-            if running_entry is None:
-                continue
-            other_files = self._touched_files_for(running_entry.issue)
-            overlap = candidate_files & other_files
+            # A retry may outlive the worker that produced it, so use the
+            # immutable snapshot captured at exit. A live entry is checked
+            # first above and remains authoritative when both are present.
+            overlap = candidate_files & retry_entry.touched_files
             if overlap:
                 return retry_entry.identifier, overlap
         return None
@@ -6409,7 +6407,11 @@ class Orchestrator:
 
     def _token_ema_path(self, cfg: ServiceConfig) -> Path:
         """Return the on-disk location for the persisted EMA snapshot."""
-        return cfg.workflow_path.parent / ".symphony" / "token_ema.json"
+        return (
+            cfg.workflow_path.parent
+            / ".symphony"
+            / state_file_name(cfg.workflow_path, "token_ema")
+        )
 
     def _load_token_ema(self, cfg: ServiceConfig) -> None:
         """Load `_token_ema` from disk on `start()`. Missing file = empty.
@@ -6451,12 +6453,7 @@ class Orchestrator:
         path = self._token_ema_path(cfg)
         try:
             path.parent.mkdir(parents=True, exist_ok=True)
-            tmp = path.with_suffix(".json.tmp")
-            tmp.write_text(
-                json.dumps(self._token_ema, sort_keys=True, indent=2),
-                encoding="utf-8",
-            )
-            tmp.replace(path)
+            write_json_atomic(path, self._token_ema)
         except OSError as exc:
             log.warning(
                 "token_ema_persist_failed",
@@ -6591,13 +6588,13 @@ class Orchestrator:
     # A2-orch + C3 — backend subprocess env injection
     # ------------------------------------------------------------------
 
-    def _apply_dispatch_env(
+    def _dispatch_env(
         self,
         *,
         issue: Issue,
         cfg: ServiceConfig,
         is_rewind: bool,
-    ) -> None:
+    ) -> dict[str, str]:
         """Set per-dispatch env vars consumed by the backend subprocess.
 
         Always sets:
@@ -6616,24 +6613,24 @@ class Orchestrator:
         On forward dispatches the rewind scope env var is UNSET so a
         previous-turn value can't bleed across.
 
-        Backends inherit `os.environ`, so this mutates process-global
-        state. Concurrent dispatches in the same tick are serialised by
-        the orchestrator's single event loop, and each backend spawns
-        its subprocess before the next dispatch lands.
+        The returned mapping is passed only to the selected backend. It is
+        merged into that child environment at spawn time and never mutates
+        process-global ``os.environ``.
         """
         ema_value = self._token_ema_for_state(issue.state)
         budget_value = self._token_budget_for_state(cfg, issue.state)
-        os.environ["SYMPHONY_TOKEN_EMA"] = str(ema_value)
-        os.environ["SYMPHONY_TOKEN_BUDGET"] = str(budget_value)
+        overlay = {
+            "SYMPHONY_TOKEN_EMA": str(ema_value),
+            "SYMPHONY_TOKEN_BUDGET": str(budget_value),
+        }
         if is_rewind:
             rows = _parse_findings_rows(issue.description)
             try:
                 payload = json.dumps(rows, ensure_ascii=False)
             except (TypeError, ValueError):
                 payload = "[]"
-            os.environ["SYMPHONY_REWIND_SCOPE"] = payload
-        else:
-            os.environ.pop("SYMPHONY_REWIND_SCOPE", None)
+            overlay["SYMPHONY_REWIND_SCOPE"] = payload
+        return overlay
 
     # ------------------------------------------------------------------
     # dispatch (§16.4)
@@ -7054,1158 +7051,12 @@ class Orchestrator:
         reach into a private method across modules.
         """
         await self._run_agent_attempt(issue, attempt, cfg)
-
     async def _run_agent_attempt(
         self, issue: Issue, attempt: int | None, cfg: ServiceConfig
     ) -> None:
-        running_issue_id = issue.id
-        outcome: str = "normal"
-        error: str | None = None
-        try:
-            running = self._running.get(running_issue_id)
-            if running is not None and not running.release_authority_resolved:
-                try:
-                    release_authority = self._prepare_release_dispatch(issue, cfg)
-                except SymphonyError as exc:
-                    outcome = "error"
-                    error = str(exc)
-                    log.error(
-                        "release_execution_refused",
-                        issue_id=issue.id,
-                        identifier=issue.identifier,
-                        tracker_kind=cfg.tracker.kind,
-                        error=error,
-                    )
-                    return
-                issue = release_authority.issue
-                running.issue = issue
-                running.known_app_release = release_authority.app_release
-                running.known_release_cycle_verifier = release_authority.cycle_verifier
-                running.known_app_release_finalizer = release_authority.finalizer
-                if release_authority.gate is not None:
-                    running.release_gate_finalizer = (
-                        release_authority.gate.finalizer_identifier
-                    )
-                    running.release_gate_expected_contract_sha256 = (
-                        release_authority.gate.expected_contract_sha256
-                    )
-                    running.release_gate_cycle_fingerprint = (
-                        release_authority.gate.cycle_fingerprint
-                    )
-                    running.release_gate_generation = release_authority.gate.generation
-                if release_authority.finalizer:
-                    running.release_finalizer_rewind_state = issue.state
-                running.release_authority_resolved = True
-            # Keep the *unrouted* workflow config: `agent.stage_kinds` must be
-            # re-resolved at every in-run phase transition, and re-resolving
-            # against an already-routed cfg would pin the first lane's backend
-            # for the whole dispatch (the normal Todo→…→Document path).
-            base_cfg = cfg
-            cfg = _config_for_issue_agent(base_cfg, issue)
-            running = self._running.get(running_issue_id)
-            if running is not None:
-                running.agent_kind = cfg.agent.kind
-            assert self._workspace_manager is not None
-            workspace = await self._workspace_manager.create_or_reuse(issue.identifier)
-            running = self._running.get(running_issue_id)
-            if running is None:
-                # Slot was reclaimed externally between dispatch and the
-                # first await completing. Surface the orphan path instead
-                # of crashing on `KeyError(running_issue_id)` — that crash
-                # was the source of the worker_task_finished_without_cleanup
-                # cascade observed on OLV-002.
-                outcome = "orphaned"
-                error = "running entry vanished before workspace bind"
-                log.warning(
-                    "worker_running_entry_vanished",
-                    issue_id=running_issue_id,
-                    site="workspace_bind",
-                )
-                return
-            running.workspace_path = workspace.path
-            if (
-                running.known_app_release
-                or running.known_release_cycle_verifier
-                or running.known_app_release_finalizer
-            ):
-                if not self._heartbeat_run_lease(running_issue_id, running):
-                    outcome = "release_authority_error"
-                    error = "application release lease was lost before workspace use"
-                    return
-                try:
-                    running.issue = self._require_running_release_authority(
-                        cfg=cfg,
-                        entry=running,
-                        workspace_path=workspace.path,
-                    )
-                    issue = running.issue
-                except Exception as exc:
-                    outcome = "release_authority_error"
-                    error = str(exc)
-                    return
-            try:
-                await self._workspace_manager.before_run(workspace.path)
-            except Exception as exc:
-                outcome = "before_run_error"
-                error = str(exc)
-                return
+        from . import attempt as agent_attempt
 
-            tools = []
-            if cfg.tracker.kind == "linear" and cfg.agent.kind == "codex":
-                tools.append(linear_graphql_tool())
-
-            selection = cfg.selection_for_state(
-                issue.state,
-                ticket_profile=_requested_agent_profile(issue),
-                ticket_kind=_requested_agent_kind(issue),
-            )
-            resolved_cfg = resolve_agent_config(cfg, selection)
-
-            pool_id = "codex"
-            if selection.profile and selection.profile in cfg.agent_profiles:
-                prof = cfg.agent_profiles[selection.profile]
-                pool_id = prof.usage_pool or prof.kind or cfg.agent.kind
-            else:
-                pool_id = selection.kind or cfg.agent.kind
-
-            client = self._build_agent_backend(
-                BackendInit(
-                    cfg=cfg,
-                    cwd=workspace.path,
-                    workspace_root=cfg.workspace_root,
-                    on_event=lambda ev, issue_id=running_issue_id: self._on_codex_event(
-                        issue_id, ev
-                    ),
-                    on_process_started=lambda pid, issue_id=running_issue_id: (
-                        self._sync_backend_agent_pid(issue_id, pid)
-                    ),
-                    client_tools=tools,
-                    selection=selection,
-                    resolved_backend_config=resolved_cfg.active_config,
-                    usage_manager=self._usage_manager,
-                    usage_pool=pool_id,
-                )
-            )
-
-            # Expose the live backend to `_on_codex_event` so the stall-progress
-            # predicate routes through `client.is_progress_event(...)`.
-            running.client = client
-            after_run_pending = False
-            # Initial dispatch is always forward (no rewind); the env
-            # mutation MUST land before `client.start()` because the
-            # backend subprocess inherits os.environ at fork time.
-            self._apply_dispatch_env(issue=issue, cfg=cfg, is_rewind=False)
-            try:
-                self._sync_backend_agent_pid(
-                    running_issue_id, _backend_agent_pid(client)
-                )
-                try:
-                    await client.start()
-                finally:
-                    self._sync_backend_agent_pid(
-                        running_issue_id, _backend_agent_pid(client)
-                    )
-                await client.initialize()
-
-                turn_number = 1
-                debug = self._issue_debug.setdefault(running_issue_id, _IssueDebug())
-                # `cfg.tui.language` is the operator-chosen language for
-                # both TUI chrome AND artefact docs. Resolution already
-                # honours `SYMPHONY_LANG` (build_service_config call).
-                doc_language = cfg.tui.language
-                # Skill files are read off-loop; dispatch shares the event
-                # loop with every other running worker.
-                skill_context = await asyncio.to_thread(
-                    render_skill_block, cfg.workflow_path.parent, issue.skills
-                )
-                first_prompt, _ = build_first_turn_prompt(
-                    prompt_template=cfg.prompt_template_for_state(issue.state),
-                    issue=issue,
-                    attempt=attempt,
-                    language=doc_language,
-                    turn_number=debug.completed_turn_count + turn_number,
-                    max_turns=cfg.agent.max_total_turns,
-                    max_attempts=cfg.agent.max_attempts,
-                    auto_merge_on_done=cfg.agent.auto_merge_on_done,
-                    token_ema=self._token_ema_for_state(issue.state),
-                    token_budget=self._token_budget_for_state(cfg, issue.state),
-                    rewind_scope=None,
-                    compact_issue_context=cfg.agent.compact_issue_context,
-                    full_ticket_path=self._ticket_prompt_path(cfg, issue),
-                    artifacts_dir=self._prompt_artifacts_dir(cfg),
-                    extra_context=skill_context,
-                )
-                resumed_checkpoint = False
-                checkpoint = running.continuation_checkpoint
-                if checkpoint is not None:
-                    try:
-                        resumed_checkpoint = await client.resume_session(
-                            checkpoint.resume_session_id
-                        )
-                    except Exception as exc:
-                        log.error(
-                            "session_continuation_resume_error",
-                            issue_id=running_issue_id,
-                            issue_identifier=issue.identifier,
-                            agent_kind=cfg.agent.kind,
-                            error_type=type(exc).__name__,
-                        )
-                        raise SymphonyError(
-                            "exact session continuation failed before turn start"
-                        ) from None
-                    running.recovery_session_resumed = resumed_checkpoint
-                    if resumed_checkpoint:
-                        running.resume_session_id = checkpoint.resume_session_id
-                        self._append_run_event(running, "session_started", {})
-                        log.info(
-                            "session_continuation_resumed",
-                            issue_id=running_issue_id,
-                            issue_identifier=issue.identifier,
-                            checkpoint_turn=checkpoint.turn,
-                        )
-                    else:
-                        log.info(
-                            "session_continuation_fresh_fallback",
-                            issue_id=running_issue_id,
-                            issue_identifier=issue.identifier,
-                            checkpoint_turn=checkpoint.turn,
-                            agent_kind=cfg.agent.kind,
-                        )
-                if not resumed_checkpoint:
-                    await client.start_session(
-                        initial_prompt=first_prompt,
-                        issue_title=f"{issue.identifier}: {issue.title}",
-                    )
-
-                # Track which kanban state the backend is currently
-                # operating on. When the issue moves to a new state mid-run
-                # we tear the backend down and rebuild it so the next phase
-                # starts with a fresh context — shared knowledge flows only
-                # through the markdown artefacts under
-                # `docs/<identifier>/<stage>/` plus the ticket body.
-                prev_phase_state = normalize_state(issue.state)
-                # Canonical-cased mirror of `prev_phase_state`. Trackers
-                # like Linear and Jira match state names case-sensitively
-                # on writes, so a contract-failure rewind needs the
-                # original casing rather than the lowercased form.
-                prev_phase_state_raw = issue.state or ""
-                # Minimal state refreshes intentionally omit labels. Retain
-                # the last full-body app-release signal until the next full
-                # refresh so stage-contracts=off cannot erase the machine gate.
-                running_entry = self._running.get(running_issue_id)
-                known_app_release = (
-                    running_entry.known_app_release
-                    if running_entry is not None
-                    else False
-                ) or _has_app_release_label(issue)
-
-                while True:
-                    # Operator pause gate — `pause_worker` clears the event,
-                    # `resume_worker` sets it. Honoured at the turn boundary
-                    # so we never tear down a turn the model is mid-way
-                    # through. On resume, re-fetch issue state because the
-                    # operator may have moved the ticket while it was held.
-                    pause_event = self._pause_events.get(running_issue_id)
-                    if pause_event is not None and not pause_event.is_set():
-                        log.info(
-                            "worker_paused",
-                            issue_id=running_issue_id,
-                            identifier=issue.identifier,
-                            turn=turn_number,
-                        )
-                        await pause_event.wait()
-                        log.info(
-                            "worker_resumed",
-                            issue_id=running_issue_id,
-                            identifier=issue.identifier,
-                            turn=turn_number,
-                        )
-                        refreshed = await self._refresh_issue_state(
-                            cfg, running_issue_id
-                        )
-                        if refreshed is not None:
-                            issue = refreshed
-                            running_entry = self._running.get(running_issue_id)
-                            if running_entry is not None:
-                                running_entry.issue = issue
-
-                    current_state = normalize_state(issue.state)
-                    debug = self._issue_debug.setdefault(
-                        running_issue_id, _IssueDebug()
-                    )
-                    if (
-                        cfg.agent.max_total_turns > 0
-                        and debug.completed_turn_count + turn_number
-                        > cfg.agent.max_total_turns
-                    ):
-                        log.warning(
-                            "worker_total_turn_budget_boundary",
-                            issue_id=running_issue_id,
-                            issue_identifier=issue.identifier,
-                            completed_turns=debug.completed_turn_count,
-                            next_turn=turn_number,
-                            max_total_turns=cfg.agent.max_total_turns,
-                        )
-                        break
-                    is_phase_transition = (
-                        turn_number > 1 and current_state != prev_phase_state
-                    )
-
-                    if is_phase_transition:
-                        try:
-                            is_rewind = _is_rewind_transition(
-                                prev_phase_state,
-                                current_state,
-                                cfg.tracker.active_states,
-                            )
-                            # v0.6.7 — contract validator. When the agent
-                            # moved forward (not a rewind), check that
-                            # the producing stage actually wrote the
-                            # sections its prompt promised. On failure:
-                            # write the tracker state back to the
-                            # producing stage, append a ## Contract
-                            # Failure note, and treat the situation as
-                            # a forced rewind so the rebuild + budget
-                            # bookkeeping below still apply.
-                            if not is_rewind and cfg.agent.stage_contracts_enabled(
-                                cfg.tracker.active_states
-                            ):
-                                if prev_phase_state in {
-                                    "in progress",
-                                    "verify",
-                                    "document",
-                                    # legacy lane name (pre-rename boards)
-                                    "learn",
-                                    "done",
-                                }:
-                                    # IMPORTANT: contract eval reads
-                                    # `issue.description`, so we MUST use
-                                    # the full-body refresh — not the
-                                    # minimal `_refresh_issue_state`, which
-                                    # returns description=None for every
-                                    # tracker adapter and would falsely
-                                    # fail every forward transition. See
-                                    # tests/test_orchestrator_contract_
-                                    # integration.py for the regression
-                                    # the v0.6.7 release surfaced.
-                                    refreshed_for_contract = (
-                                        await self._refresh_issue_full(
-                                            cfg, running_issue_id
-                                        )
-                                    )
-                                    if refreshed_for_contract is not None:
-                                        issue = refreshed_for_contract
-                                        known_app_release = (
-                                            known_app_release
-                                            or _has_app_release_label(issue)
-                                        )
-                                        running_entry = self._running.get(
-                                            running_issue_id
-                                        )
-                                        if running_entry is not None:
-                                            running_entry.issue = issue
-                                        current_state = normalize_state(issue.state)
-                                contract = evaluate_contract(
-                                    producing_state=prev_phase_state,
-                                    ticket_body=issue.description or "",
-                                    identifier=issue.identifier,
-                                    docs_root=workspace.path / "docs",
-                                    artifact_store_root=(
-                                        self._artifact_store.root
-                                        if (
-                                            cfg.artifacts.require_for_done
-                                            and self._artifact_store is not None
-                                        )
-                                        else None
-                                    ),
-                                )
-                                if not contract.passed:
-                                    log.warning(
-                                        "stage_contract_failed",
-                                        issue_id=issue.id,
-                                        identifier=issue.identifier,
-                                        producing_state=prev_phase_state,
-                                        advanced_to=current_state,
-                                        missing=contract.missing,
-                                    )
-                                    await asyncio.to_thread(
-                                        self._tracker_call_append_note,
-                                        cfg,
-                                        issue,
-                                        contract.note_heading,
-                                        contract.note_body,
-                                    )
-                                    await asyncio.to_thread(
-                                        self._tracker_call_update_state,
-                                        cfg,
-                                        issue,
-                                        prev_phase_state_raw or prev_phase_state,
-                                    )
-                                    # Pull the freshly-rewound body so the
-                                    # next backend rebuild's first prompt
-                                    # sees the ## Contract Failure note we
-                                    # just appended (full-body fetch — see
-                                    # the comment above the preflight
-                                    # refresh for why minimal would erase
-                                    # description).
-                                    refreshed = await self._refresh_issue_full(
-                                        cfg, running_issue_id
-                                    )
-                                    if refreshed is not None:
-                                        issue = refreshed
-                                    issue = replace(
-                                        issue,
-                                        state=(
-                                            prev_phase_state_raw or prev_phase_state
-                                        ),
-                                    )
-                                    running_entry = self._running.get(running_issue_id)
-                                    if running_entry is not None:
-                                        running_entry.issue = issue
-                                    current_state = normalize_state(issue.state)
-                                    is_rewind = True
-                                elif contract.warnings:
-                                    # Soft S2 advisories (e.g. a non-passing AC
-                                    # Scorecard row): surface as a ticket note
-                                    # without rewinding so the pipeline proceeds.
-                                    log.warning(
-                                        "stage_contract_warn",
-                                        issue_id=issue.id,
-                                        identifier=issue.identifier,
-                                        producing_state=prev_phase_state,
-                                        advanced_to=current_state,
-                                        warnings=contract.warnings,
-                                    )
-                                    await asyncio.to_thread(
-                                        self._tracker_call_append_note,
-                                        cfg,
-                                        issue,
-                                        "Contract Warning",
-                                        contract.warning_note.split("\n", 1)[1],
-                                    )
-                            if is_rewind:
-                                debug = self._issue_debug.setdefault(
-                                    running_issue_id, _IssueDebug()
-                                )
-                                debug.rewind_count += 1
-                                if (
-                                    cfg.agent.max_attempts > 0
-                                    and debug.rewind_count > cfg.agent.max_attempts
-                                ):
-                                    rewind_target = _rewind_budget_target_state(cfg)
-                                    if rewind_target:
-                                        await asyncio.to_thread(
-                                            self._tracker_call_update_state,
-                                            cfg,
-                                            issue,
-                                            rewind_target,
-                                        )
-                                        issue = replace(issue, state=rewind_target)
-                                    running_entry = self._running.get(running_issue_id)
-                                    if running_entry is not None:
-                                        running_entry.issue = issue
-                                    log.warning(
-                                        "rewind_budget_exceeded",
-                                        issue_id=issue.id,
-                                        identifier=issue.identifier,
-                                        from_state=prev_phase_state,
-                                        to_state=current_state,
-                                        rewind_count=debug.rewind_count,
-                                        max_attempts=cfg.agent.max_attempts,
-                                        # F-32: a board with no block/human
-                                        # terminal lane keeps its state; the
-                                        # worker still stops.
-                                        target_state=rewind_target or "(none)",
-                                    )
-                                    break
-                            running_entry = self._running.get(running_issue_id)
-                            if running_entry is not None:
-                                running_entry.consecutive_empty_turns = 0
-                                running_entry.hit_empty_response_loop = False
-                            # F-01: route the *new* lane's backend. The ticket
-                            # walks several states inside one dispatch, so the
-                            # kind must be re-resolved from the unrouted config
-                            # here — not reused from the lane we started in.
-                            phase_cfg = _config_for_issue_agent(base_cfg, issue)
-                            phase_selection = phase_cfg.selection_for_state(
-                                issue.state,
-                                ticket_profile=_requested_agent_profile(issue),
-                                ticket_kind=_requested_agent_kind(issue),
-                            )
-                            phase_resolved_agent = resolve_agent_config(
-                                phase_cfg, phase_selection
-                            )
-                            to_kind = phase_selection.kind
-                            to_profile = phase_selection.profile or ""
-                            to_model = (
-                                getattr(phase_resolved_agent.active_config, "model", "")
-                                or ""
-                            )
-                            to_reasoning_effort = (
-                                getattr(
-                                    phase_resolved_agent.active_config,
-                                    "reasoning_effort",
-                                    "",
-                                )
-                                or ""
-                            )
-                            from_kind = (
-                                running_entry.agent_kind
-                                if running_entry is not None
-                                and running_entry.agent_kind
-                                else cfg.agent.kind
-                            )
-                            from_profile = (
-                                running_entry.agent_profile
-                                if running_entry is not None
-                                else ""
-                            )
-                            from_model = (
-                                running_entry.model if running_entry is not None else ""
-                            )
-                            from_reasoning_effort = (
-                                running_entry.reasoning_effort
-                                if running_entry is not None
-                                else ""
-                            )
-                            if (
-                                from_kind != to_kind
-                                or from_profile != to_profile
-                                or from_model != to_model
-                                or from_reasoning_effort != to_reasoning_effort
-                            ):
-                                log.info(
-                                    "stage_backend_rerouted",
-                                    issue_id=issue.id,
-                                    identifier=issue.identifier,
-                                    from_state=prev_phase_state,
-                                    to_state=current_state,
-                                    from_kind=from_kind,
-                                    to_kind=to_kind,
-                                    from_profile=from_profile,
-                                    to_profile=to_profile,
-                                    from_model=from_model,
-                                    to_model=to_model,
-                                    to_reasoning_effort=to_reasoning_effort,
-                                )
-                            cfg = phase_cfg
-                            if running_entry is not None:
-                                running_entry.agent_kind = to_kind
-                                running_entry.agent_profile = to_profile
-                                running_entry.model = to_model
-                                running_entry.reasoning_effort = to_reasoning_effort
-                                if (
-                                    running_entry.run_id
-                                    and self._run_registry is not None
-                                ):
-                                    stage_registry = cast(
-                                        RunRegistry, self._run_registry
-                                    )
-                                    stage_run_id = running_entry.run_id
-                                    self._registry_guard(
-                                        "update_stage_agent_profile",
-                                        lambda: (
-                                            stage_registry.update_stage_agent_profile(
-                                                issue_id=running_issue_id,
-                                                run_id=stage_run_id,
-                                                state=current_state,
-                                                agent_kind=to_kind,
-                                                agent_profile=to_profile,
-                                                model=to_model,
-                                                reasoning_effort=to_reasoning_effort,
-                                            )
-                                        ),
-                                        False,
-                                    )
-                            (
-                                client,
-                                first_prompt,
-                            ) = await self._rebuild_backend_for_phase(
-                                issue=issue,
-                                running_issue_id=running_issue_id,
-                                cfg=cfg,
-                                workspace_path=workspace.path,
-                                attempt=attempt,
-                                doc_language=doc_language,
-                                old_client=client,
-                                is_rewind=is_rewind,
-                                turn_number=debug.completed_turn_count + turn_number,
-                            )
-                            running_entry = self._running.get(running_issue_id)
-                            if running_entry is not None:
-                                running_entry.client = client
-                                running_entry.thread_id = None
-                                running_entry.session_id = None
-                                running_entry.turn_id = None
-                                running_entry.resume_session_id = None
-                                running_entry.last_completed_turn_event = 0
-                                running_entry.last_reported_input_tokens = 0
-                                running_entry.last_reported_cache_input_tokens = 0
-                                running_entry.last_reported_output_tokens = 0
-                                running_entry.last_reported_total_tokens = 0
-                                running_entry.codex_state_input_tokens = 0
-                                running_entry.codex_state_cache_input_tokens = 0
-                                running_entry.codex_state_output_tokens = 0
-                                running_entry.codex_state_total_tokens = 0
-                                running_entry.last_ema_state_total_tokens = 0
-                                running_entry.hit_token_budget = False
-                                running_entry.token_budget_cap = 0
-                                debug.state_turn_state = current_state
-                                debug.state_turn_count = 0
-                            log.info(
-                                "worker_phase_transition",
-                                issue_id=issue.id,
-                                identifier=issue.identifier,
-                                from_state=prev_phase_state,
-                                to_state=current_state,
-                                turn=turn_number,
-                                attempt=attempt,
-                                is_rewind=is_rewind,
-                                workspace=str(workspace.path),
-                            )
-                            if running_entry is not None:
-                                self._append_run_event(
-                                    running_entry,
-                                    "phase_transition",
-                                    {
-                                        "from_state": prev_phase_state,
-                                        "to_state": current_state,
-                                        "turn": turn_number,
-                                        "attempt": attempt,
-                                        "is_rewind": is_rewind,
-                                    },
-                                )
-                            self._record_stats_transition(
-                                issue.identifier, prev_phase_state, current_state
-                            )
-                        except Exception as exc:
-                            outcome = "phase_transition_error"
-                            error = str(exc)
-                            return
-
-                    running_entry = self._running.get(running_issue_id)
-                    if (
-                        running_entry is not None
-                        and running_entry.hit_empty_response_loop
-                    ):
-                        await self._escalate_empty_response_loop(
-                            cfg=cfg,
-                            entry=running_entry,
-                            issue_id=running_issue_id,
-                            cancel_worker=False,
-                        )
-                        break
-
-                    is_continuation = (
-                        running.recovery_session_resumed and turn_number == 1
-                    ) or (turn_number > 1 and not is_phase_transition)
-                    if is_continuation:
-                        debug = self._issue_debug.setdefault(
-                            running_issue_id, _IssueDebug()
-                        )
-                        prompt = build_continuation_prompt(
-                            language=doc_language,
-                            turn_number=debug.completed_turn_count + turn_number,
-                            max_turns=cfg.agent.max_total_turns,
-                        )
-                    else:
-                        prompt = first_prompt
-
-                    running = self._running.get(running_issue_id)
-                    if running is None:
-                        outcome = "orphaned"
-                        error = "running entry vanished before turn start"
-                        log.warning(
-                            "worker_running_entry_vanished",
-                            issue_id=running_issue_id,
-                            site="turn_start",
-                        )
-                        return
-                    running.turn_count = turn_number
-                    if (
-                        running.known_app_release
-                        or running.known_release_cycle_verifier
-                        or running.known_app_release_finalizer
-                    ):
-                        if not self._heartbeat_run_lease(running_issue_id, running):
-                            outcome = "release_authority_error"
-                            error = (
-                                "application release lease was lost before agent turn"
-                            )
-                            return
-                        try:
-                            running.issue = self._require_running_release_authority(
-                                cfg=cfg,
-                                entry=running,
-                            )
-                            issue = running.issue
-                        except Exception as exc:
-                            outcome = "release_authority_error"
-                            error = str(exc)
-                            return
-                    # Capture the state THIS turn is starting in. C3 EMA
-                    # samples need the source state, not the destination
-                    # the agent flips to mid-turn — without this, every
-                    # stage's tokens get attributed to the next stage.
-                    running.state_at_turn_start = (running.issue.state or "").lower()
-                    # Symmetry with worker_turn_completed — a single line per
-                    # turn-start so multi-turn runs (especially slow ones
-                    # like gemini -p where a single turn can take 60-90s)
-                    # don't look stuck between turns.
-                    log.info(
-                        "worker_turn_started",
-                        issue_id=running_issue_id,
-                        identifier=running.issue.identifier,
-                        turn=turn_number,
-                        max_turns=cfg.agent.max_turns,
-                        is_continuation=is_continuation,
-                    )
-                    self._append_run_event(
-                        running,
-                        "turn_started",
-                        {
-                            "turn": turn_number,
-                            "state": running.issue.state,
-                            "continuation": is_continuation,
-                        },
-                    )
-                    if turn_number > 1:
-                        try:
-                            await self._workspace_manager.before_run(workspace.path)
-                        except Exception as exc:
-                            outcome = "before_run_error"
-                            error = str(exc)
-                            return
-                    self._sync_backend_agent_pid(
-                        running_issue_id, _backend_agent_pid(client)
-                    )
-                    after_run_pending = True
-                    try:
-                        await client.run_turn(
-                            prompt=prompt, is_continuation=is_continuation
-                        )
-                    except ProviderCapacityError as exc:
-                        outcome = "provider_usage_exhausted"
-                        error = str(exc)
-                        from ..backends.usage import ProviderUsageSnapshot, UsageWindow
-
-                        windows = {}
-                        if exc.resets_at:
-                            windows["default"] = UsageWindow(
-                                key="default",
-                                used_percent=100.0,
-                                remaining_percent=0.0,
-                                resets_at=exc.resets_at,
-                            )
-                        snap = ProviderUsageSnapshot(
-                            pool_id=exc.pool_id,
-                            source=exc.pool_id,
-                            windows=windows,
-                            hard_limit_reached=True,
-                            authoritative=True,
-                            observed_at=datetime.now(timezone.utc),
-                        )
-                        self._usage_manager.set_snapshot(exc.pool_id, snap)
-                        return
-                    except (
-                        TurnTimeout,
-                        TurnFailed,
-                        TurnCancelled,
-                        TurnInputRequired,
-                    ) as exc:
-                        outcome = "turn_error"
-                        error = str(
-                            redact_session_id(str(exc), running.resume_session_id)
-                        )
-                        return
-
-                    finally:
-                        self._sync_backend_agent_pid(
-                            running_issue_id, _backend_agent_pid(client)
-                        )
-
-                    # Synchronous log on the worker's hot path — the
-                    # listener-side `agent_turn_completed` log fires from
-                    # `_on_codex_event` via the EVENT_TURN_COMPLETED emit,
-                    # but reconcile can cancel the worker between the emit
-                    # and the listener running, swallowing the visibility
-                    # signal. Logging here guarantees one line per
-                    # successful turn even when reconcile races us.
-                    running_entry = self._running.get(running_issue_id)
-                    if running_entry is not None:
-                        log.info(
-                            "worker_turn_completed",
-                            issue_id=running_issue_id,
-                            identifier=running_entry.issue.identifier,
-                            turn=turn_number,
-                            input_tokens=running_entry.codex_input_tokens,
-                            cache_input_tokens=running_entry.codex_cache_input_tokens,
-                            output_tokens=running_entry.codex_output_tokens,
-                            total_tokens=running_entry.codex_total_tokens,
-                        )
-
-                    await self._workspace_manager.after_run_best_effort(workspace.path)
-                    after_run_pending = False
-                    # Collect before the next loop iteration evaluates the
-                    # stage contract, so `artifacts.require_for_done` sees
-                    # this turn's deliverables, and before Done removes the
-                    # workspace they live in.
-                    await self._collect_ticket_artifacts(
-                        cfg,
-                        identifier=issue.identifier,
-                        workspace_path=workspace.path,
-                        run_id=(
-                            running_entry.run_id if running_entry is not None else ""
-                        ),
-                        turn=turn_number,
-                    )
-                    # The hook may commit or amend the turn's changes. Resolve
-                    # HEAD only after it finishes so the explorer never reports
-                    # the base/prior-turn commit as this turn's result.
-                    commit_sha = None
-                    if (workspace.path / ".git").exists():
-                        commit_sha = await asyncio.to_thread(
-                            git_inspect.resolve_commit, workspace.path, "HEAD"
-                        )
-                    if commit_sha:
-                        running_entry = self._running.get(running_issue_id)
-                        if running_entry is not None:
-                            self._append_run_event(
-                                running_entry,
-                                "workspace_updated",
-                                {"turn": turn_number, "commit_sha": commit_sha},
-                            )
-
-                    running_entry = self._running.get(running_issue_id)
-                    registry = self._run_registry
-                    if (
-                        cfg.agent.crash_continuation
-                        and registry is not None
-                        and running_entry is not None
-                        and running_entry.run_id
-                        and running_entry.resume_session_id
-                        and running_entry.last_completed_turn_event == turn_number
-                        and not running_entry.known_app_release
-                        and not running_entry.known_release_cycle_verifier
-                        and not running_entry.known_app_release_finalizer
-                    ):
-                        checkpoint_turn = debug.completed_turn_count + turn_number
-                        checkpoint_registry = cast(RunRegistry, registry)
-                        checkpoint_run_id = running_entry.run_id
-                        checkpoint_session_id = running_entry.resume_session_id
-                        checkpoint_state = running_entry.issue.state
-                        self._registry_guard(
-                            "checkpoint_completed_turn",
-                            lambda: checkpoint_registry.checkpoint_completed_turn(
-                                issue_id=running_issue_id,
-                                run_id=checkpoint_run_id,
-                                resume_session_id=checkpoint_session_id,
-                                state=checkpoint_state,
-                                turn=checkpoint_turn,
-                            ),
-                            False,
-                        )
-
-                    # Record the state the backend just operated on so the
-                    # next iteration can detect a phase transition against
-                    # the freshly refreshed state below.
-                    prev_phase_state = current_state
-                    prev_phase_state_raw = (
-                        running.issue.state if running is not None else issue.state
-                    ) or ""
-
-                    # Refresh issue state.
-                    refreshed = await self._refresh_issue_state(cfg, running_issue_id)
-                    if refreshed is None:
-                        outcome = "issue_state_refresh_failed"
-                        error = "could not refresh issue state"
-                        return
-                    issue = refreshed
-                    running = self._running.get(running_issue_id)
-                    if running is None:
-                        outcome = "orphaned"
-                        error = "running entry vanished after issue refresh"
-                        log.warning(
-                            "worker_running_entry_vanished",
-                            issue_id=running_issue_id,
-                            site="post_refresh",
-                        )
-                        return
-                    running.issue = issue
-                    state = normalize_state(issue.state)
-                    active = {s.lower() for s in cfg.tracker.active_states}
-                    release_rewound = False
-                    if (
-                        running.known_app_release_finalizer
-                        and state != prev_phase_state
-                    ):
-                        try:
-                            finalizer_identifier = (
-                                running.release_gate_finalizer or issue.identifier
-                            )
-                            finalizer_gate = cast(
-                                ReleaseGate | None,
-                                self._release_registry_call(
-                                    cfg,
-                                    "read_finalizer_gate_after_turn",
-                                    lambda registry: registry.get_release_gate(
-                                        finalizer_identifier
-                                    ),
-                                ),
-                            )
-                            if finalizer_gate is None:
-                                raise SymphonyError(
-                                    "application release finalizer authority disappeared",
-                                    finalizer=issue.identifier,
-                                )
-                            issue = self._guard_release_finalizer(
-                                cfg=cfg,
-                                issue=issue,
-                                gate=finalizer_gate,
-                                rewind_state=(prev_phase_state_raw or prev_phase_state),
-                                expected_run_id=running.run_id,
-                                require_run_authority=True,
-                            )
-                        except Exception as exc:
-                            try:
-                                issue = await self._rewind_app_release_transition(
-                                    cfg=cfg,
-                                    issue=issue,
-                                    producing_state=(
-                                        prev_phase_state_raw or prev_phase_state
-                                    ),
-                                    note_body=(
-                                        "Final delivery was stopped because the "
-                                        f"host-owned release approval is invalid: {exc}"
-                                    ),
-                                )
-                                running.issue = issue
-                            except Exception as rewind_exc:
-                                log.error(
-                                    "release_finalizer_rewind_failed",
-                                    issue_id=issue.id,
-                                    identifier=issue.identifier,
-                                    gate_error=str(exc),
-                                    rewind_error=str(rewind_exc),
-                                )
-                            outcome = "phase_transition_error"
-                            error = str(exc)
-                            return
-                        if state in active:
-                            running.release_finalizer_rewind_state = issue.state
-                    if (
-                        state != prev_phase_state
-                        and prev_phase_state == "verify"
-                        and not _is_rewind_transition(
-                            prev_phase_state,
-                            state,
-                            cfg.tracker.active_states,
-                        )
-                    ):
-                        try:
-                            (
-                                issue,
-                                release_rewound,
-                            ) = await self._enforce_app_release_transition(
-                                cfg=cfg,
-                                issue=issue,
-                                workspace_path=workspace.path,
-                                producing_state=(
-                                    prev_phase_state_raw or prev_phase_state
-                                ),
-                                known_app_release=known_app_release,
-                                running_entry=running,
-                            )
-                        except Exception as exc:
-                            outcome = "phase_transition_error"
-                            error = str(exc)
-                            return
-                        known_app_release = known_app_release or _has_app_release_label(
-                            issue
-                        )
-                        running.issue = issue
-                        state = normalize_state(issue.state)
-                    if running.release_verifier_handoff_complete:
-                        break
-                    if release_rewound:
-                        debug.rewind_count += 1
-                        if (
-                            cfg.agent.max_attempts > 0
-                            and debug.rewind_count > cfg.agent.max_attempts
-                        ):
-                            rewind_target = _release_failure_target_state(cfg)
-                            if rewind_target:
-                                await asyncio.to_thread(
-                                    self._tracker_call_update_state,
-                                    cfg,
-                                    issue,
-                                    rewind_target,
-                                )
-                                issue = replace(issue, state=rewind_target)
-                                running.issue = issue
-                            else:
-                                running.release_gate_exhausted = True
-                            log.warning(
-                                "rewind_budget_exceeded",
-                                issue_id=issue.id,
-                                identifier=issue.identifier,
-                                from_state=prev_phase_state,
-                                to_state=state,
-                                rewind_count=debug.rewind_count,
-                                max_attempts=cfg.agent.max_attempts,
-                                target_state=rewind_target or "(none)",
-                            )
-                        break
-                    if state not in active:
-                        break
-                    state_turn_count = _update_state_turn_counter(debug, state)
-                    max_state_turns = self._max_state_turns_for_state(cfg, state)
-                    if max_state_turns > 0 and state_turn_count >= max_state_turns:
-                        running.hit_no_stage_change = True
-                        log.warning(
-                            "no_stage_change_watchdog",
-                            issue_id=running_issue_id,
-                            issue_identifier=running.issue.identifier,
-                            state=running.issue.state,
-                            state_turn_count=state_turn_count,
-                            effective_max_state_turns=max_state_turns,
-                            global_max_state_turns=cfg.agent.max_state_turns,
-                        )
-                        break
-                    if turn_number >= cfg.agent.max_turns:
-                        # Per-attempt ceiling reached without a terminal
-                        # transition. Mark explicitly so `_on_worker_exit`
-                        # doesn't auto-schedule a continuation — the ticket
-                        # waits for operator action instead of looping
-                        # silently against the ceiling.
-                        running.hit_max_turns = True
-                        log.warning(
-                            "worker_max_turns_exhausted",
-                            issue_id=running_issue_id,
-                            issue_identifier=running.issue.identifier,
-                            turns=turn_number,
-                            max_turns=cfg.agent.max_turns,
-                        )
-                        break
-                    turn_number += 1
-            finally:
-                # Defensive: a phase transition may have left `client`
-                # pointing to a half-initialized backend, or to one whose
-                # earlier `stop()` already failed. Either way, exiting the
-                # worker without after_run_best_effort would leak workspace
-                # state, so swallow stop() errors here too.
-                try:
-                    await client.stop()
-                except Exception as stop_exc:
-                    running = self._running.get(running_issue_id)
-                    if running is not None:
-                        running.backend_cleanup_unconfirmed = True
-                    log.warning(
-                        "worker_final_stop_failed",
-                        issue_id=issue.id,
-                        identifier=issue.identifier,
-                        error=str(stop_exc),
-                    )
-                else:
-                    running = self._running.get(running_issue_id)
-                    if running is not None and running.backend_cleanup_unconfirmed:
-                        log.warning(
-                            "worker_final_stop_cleanup_unconfirmed",
-                            issue_id=issue.id,
-                            identifier=issue.identifier,
-                            pid=running.agent_pgid,
-                        )
-                    else:
-                        self._sync_backend_agent_pid(running_issue_id, None)
-                if after_run_pending:
-                    await self._workspace_manager.after_run_best_effort(workspace.path)
-                # Salvage deliverables written before an abnormal exit (turn
-                # timeout, TurnFailed, stall eviction). The per-turn call runs
-                # only on the success path, and the workspace is torn down at
-                # Done, so without this the file is gone for good — worst
-                # under `artifacts.require_for_done`, where the deliverable
-                # turn is the long, timeout-prone one. Unshielded and
-                # best-effort, exactly like the `after_run` hook above.
-                entry_for_run = self._running.get(running_issue_id)
-                await self._collect_ticket_artifacts(
-                    cfg,
-                    identifier=issue.identifier,
-                    workspace_path=workspace.path,
-                    run_id=entry_for_run.run_id if entry_for_run else "",
-                    turn=None,  # salvage pass: the turn it came from is unknown
-                )
-        except asyncio.CancelledError:
-            outcome = "shutdown_interrupted" if self._stopping else "cancelled"
-            error = None
-            raise
-        except SymphonyError as exc:
-            outcome = "error"
-            running = self._running.get(running_issue_id)
-            private_session_id = (
-                running.resume_session_id if running is not None else None
-            )
-            error = str(redact_session_id(str(exc), private_session_id))
-        except Exception as exc:
-            outcome = "error"
-            running = self._running.get(running_issue_id)
-            private_session_id = (
-                running.resume_session_id if running is not None else None
-            )
-            error = str(redact_session_id(str(exc), private_session_id))
-            log.error(
-                "worker_unhandled_error",
-                issue_id=running_issue_id,
-                error=error,
-                exc_type=type(exc).__name__,
-                traceback=str(
-                    redact_session_id(traceback.format_exc(), private_session_id)
-                ),
-            )
-        finally:
-            # Diagnostic marker — pairs with `worker_task_done_without_cleanup`
-            # to localize the path that leaves entries in `_running`. If
-            # this line is missing from the log right before that error,
-            # the outer finally never ran (Python contract violation =
-            # interpreter shutdown / OS-level kill). If it IS present,
-            # the bypass is inside `_on_worker_exit` itself.
-            log.info(
-                "worker_finally_entered",
-                issue_id=running_issue_id,
-                outcome=outcome,
-                error=error,
-            )
-            # AF-01 — a force-ejected zombie's `finally` can run after a
-            # retry already installed a fresh entry under this issue id
-            # (the zombie task is never cancelled by force-eject, only its
-            # bookkeeping is dropped). Only the task that actually owns the
-            # current entry may stamp `exit_started_at` or enter
-            # `_on_worker_exit`; a foreign owner must not touch either.
-            # The handler keeps its own identity check as the single guard
-            # around the eventual pop.
-            # `entry.worker_task is None` counts as owned — many existing
-            # tests drive this coroutine directly against a hand-installed
-            # entry that never went through `_dispatch`.
-            owning_task = asyncio.current_task()
-            entry = self._running.get(running_issue_id)
-            stale_entry = (
-                entry is not None
-                and owning_task is not None
-                and self._dispatch_state.entry_foreign_to(running_issue_id, owning_task)
-            )
-            if stale_entry:
-                log.warning(
-                    "worker_finally_stale_entry",
-                    issue_id=running_issue_id,
-                    reason=outcome,
-                )
-            elif entry is not None:
-                entry.exit_started_at = datetime.now(timezone.utc)
-                await asyncio.shield(
-                    self._on_worker_exit(
-                        running_issue_id, outcome, error, owning_task=owning_task
-                    )
-                )
-
+        return await agent_attempt.run_agent_attempt(self, issue, attempt, cfg)
     async def _rebuild_backend_for_phase(
         self,
         *,
@@ -8276,13 +7127,10 @@ class Orchestrator:
                 resolved_backend_config=resolved_cfg.active_config,
                 usage_manager=self._usage_manager,
                 usage_pool=pool_id,
+                env=self._dispatch_env(issue=issue, cfg=cfg, is_rewind=is_rewind),
             )
         )
 
-        # Reset per-dispatch env BEFORE the new backend's subprocess spawns.
-        # Forward phase transitions unset SYMPHONY_REWIND_SCOPE; rewinds
-        # set it to the JSON of the latest finding rows.
-        self._apply_dispatch_env(issue=issue, cfg=cfg, is_rewind=is_rewind)
         try:
             self._sync_backend_agent_pid(
                 running_issue_id, _backend_agent_pid(new_client)
@@ -10245,6 +9093,7 @@ class Orchestrator:
                     delay_ms=CONTINUATION_RETRY_DELAY_MS,
                     error=None,
                     kind="continuation",
+                    touched_files=frozenset(self._touched_files_for(entry.issue)),
                 )
             elif entry.hit_max_turns:
                 # `max_turns` exhausted without a terminal transition: stop
@@ -10342,6 +9191,7 @@ class Orchestrator:
                 delay_ms=delay_ms,
                 error=cleaned_failure,
                 kind="retry",
+                touched_files=frozenset(self._touched_files_for(entry.issue)),
             )
         log.info(
             "worker_exit",
@@ -10417,6 +9267,7 @@ class Orchestrator:
                 attempt=next_attempt,
                 delay_ms=delay_ms,
                 error="force_ejected_zombie",
+                touched_files=frozenset(self._touched_files_for(entry.issue)),
             )
             debug = self._issue_debug.setdefault(issue_id, _IssueDebug())
             debug.last_workspace = entry.workspace_path
@@ -10436,12 +9287,22 @@ class Orchestrator:
         error: str | None,
         kind: str | None = None,
         holds_slot: bool = True,
+        touched_files: frozenset[str] | None = None,
     ) -> None:
         if self._loop is None:
             return
         retry_kind = kind or ("continuation" if error is None else "retry")
         if self._retry_cap_exceeded(issue_id, identifier, attempt, error, retry_kind):
             return
+        existing_retry = self._retry.get(issue_id)
+        if touched_files is not None:
+            owned_files = touched_files
+        elif issue_id in self._running:
+            owned_files = frozenset(self._touched_files_for(self._running[issue_id].issue))
+        elif existing_retry is not None:
+            owned_files = existing_retry.touched_files
+        else:
+            owned_files = frozenset()
         self._install_retry(
             issue_id=issue_id,
             identifier=identifier,
@@ -10450,6 +9311,7 @@ class Orchestrator:
             error=error,
             kind=retry_kind,
             holds_slot=holds_slot,
+            touched_files=owned_files,
         )
 
     def _retry_cap_exceeded(
@@ -10500,6 +9362,7 @@ class Orchestrator:
         error: str | None,
         kind: str,
         holds_slot: bool,
+        touched_files: frozenset[str],
     ) -> None:
         assert self._loop is not None
         due = self._loop.time() + delay_ms / 1000.0
@@ -10521,6 +9384,7 @@ class Orchestrator:
                 error=error,
                 kind=kind,
                 holds_slot=holds_slot,
+                touched_files=touched_files,
             ),
         )
         debug = self._issue_debug.setdefault(issue_id, _IssueDebug())
@@ -10684,6 +9548,7 @@ class Orchestrator:
             error=error,
             kind=retry.kind,
             holds_slot=True,
+            touched_files=retry.touched_files,
         )
 
     async def _process_retry(self, retry: RetryEntry, cfg: ServiceConfig) -> None:
@@ -10754,6 +9619,7 @@ class Orchestrator:
             error=_clean_board_error_message(reason)[:300],
             kind=retry.kind,
             holds_slot=holds_slot,
+            touched_files=retry.touched_files,
         )
 
     def _release_retry_ownership(

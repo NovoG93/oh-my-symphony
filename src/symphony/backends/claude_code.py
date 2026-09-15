@@ -306,6 +306,7 @@ class ClaudeCodeBackend(BaseAgentBackend):
             log.info("claude_git_roots_granted", roots=self._git_roots)
         self._on_event = init.on_event
         self._on_process_started = init.on_process_started
+        self._env = dict(init.env)
         self._usage_manager = getattr(init, "usage_manager", None)
         self._usage_pool = getattr(init, "usage_pool", None) or (
             init.selection.kind if init.selection is not None else "claude"
@@ -416,6 +417,7 @@ class ClaudeCodeBackend(BaseAgentBackend):
         env = os.environ.copy()
         if self._git_roots:
             env[GIT_ROOTS_ENV_VAR] = os.pathsep.join(self._git_roots)
+        env.update(self._env)
 
         try:
             proc = await asyncio.create_subprocess_exec(

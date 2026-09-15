@@ -17,6 +17,7 @@ from symphony.web_policy import (
     PolicyConfigurationError,
     WebSocketTicketStore,
     install_route_policies,
+    ROUTE_POLICIES_KEY,
     resolve_policy,
 )
 
@@ -117,6 +118,20 @@ def test_unclassified_route_fails_registration() -> None:
     app.router.add_get("/api/v1/unclassified", handler)
     with pytest.raises(PolicyConfigurationError, match="lacks authorization"):
         install_route_policies(app)
+
+
+def test_intent_approval_route_is_explicit_chat_board_only() -> None:
+    app = web.Application()
+
+    async def handler(_request):
+        return web.Response()
+
+    path = "/api/v1/chat/sessions/{session_id}/intent/{action_id}/approve"
+    app.router.add_post(path, handler)
+    install_route_policies(app)
+    policy = app[ROUTE_POLICIES_KEY][("POST", path)]
+    assert policy.capabilities == frozenset({"chat", "board"})
+    assert "projects" not in policy.capabilities
 
 
 def test_websocket_ticket_is_origin_bound_single_use_and_expires(monkeypatch) -> None:

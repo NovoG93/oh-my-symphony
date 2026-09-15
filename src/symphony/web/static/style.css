@@ -1849,6 +1849,36 @@ a { color: inherit; }
 .chat-project-setup-path { overflow-wrap: anywhere; color: var(--text-muted); }
 .chat-project-setup-select { justify-self: start; }
 .chat-status { text-align: center; color: var(--text-muted); font-size: 0.78em; }
+.chat-intent-action {
+  align-self: flex-start;
+  max-width: min(88%, 48rem);
+  display: grid;
+  gap: 0.5926rem;
+  padding: 0.8889rem 1.037rem;
+  border: 1px solid var(--accent);
+  border-left-width: 0.2963rem;
+  border-radius: var(--radius);
+  background: var(--surface-2);
+}
+.chat-intent-heading { display: flex; align-items: center; gap: 0.5926rem; justify-content: space-between; }
+.chat-intent-title { margin: 0; font-size: 1.037rem; }
+.chat-intent-status { color: var(--text-muted); font-size: 0.8148rem; }
+.chat-intent-action.approved { border-color: var(--success); }
+.chat-intent-action.approved .chat-intent-status { color: var(--success); }
+.chat-intent-action.failed,
+.chat-intent-action.expired,
+.chat-intent-action.superseded { border-color: var(--danger); }
+.chat-intent-action.failed .chat-intent-status,
+.chat-intent-action.expired .chat-intent-status,
+.chat-intent-action.superseded .chat-intent-status,
+.chat-intent-error { color: var(--danger); }
+.chat-intent-meta { display: flex; gap: 0.5926rem; align-items: center; flex-wrap: wrap; }
+.chat-intent-slug { color: var(--text-muted); overflow-wrap: anywhere; }
+.chat-intent-markdown { line-height: 1.45; overflow-wrap: anywhere; }
+.chat-intent-markdown p:first-child { margin-top: 0; }
+.chat-intent-markdown p:last-child { margin-bottom: 0; }
+.chat-intent-error, .chat-intent-ticket { margin: 0; }
+.chat-intent-approve { justify-self: start; }
 .chat-top-actions { display: flex; gap: 0.5926rem; align-items: center; }
 .chat-session-bar {
   display: flex;

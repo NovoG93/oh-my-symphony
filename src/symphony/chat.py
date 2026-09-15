@@ -7,11 +7,9 @@ working tree. Chat runs outside the orchestrator's `DispatchState` slot
 accounting on purpose: one chat session must never starve ticket workers
 (`max_concurrent_agents` is often 1).
 
-Known benign interaction: `Orchestrator._apply_dispatch_env` mutates
-process-global ``os.environ`` (informational ``SYMPHONY_TOKEN_*`` values)
-right before it spawns a worker. A chat turn spawning concurrently may
-inherit those values; they only inform prompts and budgets, so no isolation
-is attempted here.
+Worker dispatch metadata is passed through each backend's private child
+environment overlay. Chat backends intentionally receive no worker-local
+rewind or token metadata.
 
 Modes:
 - ``qa``   — question answering; read-only where the backend supports it
@@ -62,8 +60,18 @@ from .errors import (
     ChatNoSessionError,
     ChatProjectActionError,
     ChatProjectAuthorizationError,
+    ChatIntentActionError,
+    ChatIntentAuthorizationError,
     ChatSessionExistsError,
     SymphonyError,
+)
+from .intent import (
+    INTENT_ACTION_ID_RE,
+    MAX_INTENT_ACTIONS,
+    IntentAction,
+    IntentParseError,
+    file_intent_request,
+    parse_intent_marker,
 )
 from .logging import get_logger
 from .projects import ProjectTargetExpectation, project_target_expectation
@@ -135,6 +143,20 @@ EDIT_PREAMBLE = (
     "{project_setup}\n\n"
 )
 
+_INTENT_PREAMBLE = (
+    "Software build/fix/feature/refactor requests must pass through one human "
+    "approval gate. Investigate enough to state the problem and evidence, ask "
+    "at most two short clarification rounds, then explain your proposal in "
+    "normal prose followed by exactly one strict marker. Do not create the "
+    "request ticket directly. Use track `micro` for tightly scoped work and "
+    "`full` for larger work; success criteria must be verifiable. The marker "
+    "must be JSON with exactly these keys: slug, title, track, intent, where "
+    "intent is Markdown containing ## Problem, ## Success criteria (with at "
+    "least one unchecked `- [ ]` criterion), and ## Out of scope. Format: "
+    '<symphony-intent>{"slug":"example","title":"...","track":"micro",'
+    '"intent":"## Problem\\n..."}</symphony-intent>\n'
+)
+
 # A separate Project changes the global registry and may bootstrap a Git
 # repository. It is therefore a server-owned, explicitly confirmed action,
 # not an ambient shell capability granted to the chat backend.
@@ -163,6 +185,7 @@ _PROJECT_SETUP_TTL = timedelta(minutes=15)
 # same-UID process; that threat requires OS/network/process isolation.
 _CHAT_CONFIRMATION_TOKEN_RE = re.compile(r"^[A-Za-z0-9_-]{32,256}$")
 _MAX_PROJECT_ACTIONS_PER_SESSION = 20
+_INTENT_APPROVAL_UNAVAILABLE = "Intent approval is unavailable for this session."
 
 
 # Build-request protocol taught to the chat agent. Rendered with the
@@ -532,6 +555,7 @@ class ChatSession:
     # edit-mode response. They are process-local: restart/reattach intentionally
     # drops them rather than trusting the agent-writable transcript/index.
     project_setup_actions: dict[str, ProjectSetupAction] = field(default_factory=dict)
+    intent_actions: dict[str, IntentAction] = field(default_factory=dict)
 
     def budget(self) -> dict[str, Any]:
         return {
@@ -928,10 +952,13 @@ class ChatManager:
         preamble = QA_PREAMBLE if session.mode == "qa" else EDIT_PREAMBLE
         prompt = text
         if session.turn_count == 0 or session.pending_preamble:
+            board_prompt = _board_preamble(cfg)
+            if session.mode == "edit" and cfg.tracker.kind == "file":
+                board_prompt += _INTENT_PREAMBLE
             prompt = (
                 preamble.format(
                     path=cfg.workflow_path.parent,
-                    board=_board_preamble(cfg),
+                    board=board_prompt,
                     project_setup=(
                         _PROJECT_SETUP_PREAMBLE if session.mode == "edit" else ""
                     ),
@@ -1009,6 +1036,7 @@ class ChatManager:
         if session is None:
             return {"active": False}
         self._prune_project_setup_actions(session)
+        self._expire_intent_actions(session)
         return {
             **_session_meta(session),
             "active": True,
@@ -1018,6 +1046,7 @@ class ChatManager:
             "project_setup_actions": [
                 action.as_dict() for action in session.project_setup_actions.values()
             ],
+            "intent_actions": [action.snapshot() for action in session.intent_actions.values()],
         }
 
     def list_sessions(self) -> dict[str, Any]:
@@ -1041,6 +1070,85 @@ class ChatManager:
     # ------------------------------------------------------------------
     # server-owned project setup choices
     # ------------------------------------------------------------------
+
+    def _expire_intent_actions(self, session: ChatSession) -> None:
+        for action in session.intent_actions.values():
+            if action.expire_if_needed():
+                self._broadcast(session, "intent_status", "intent expired", meta={"intent": action.snapshot()})
+
+    def _prune_intent_actions(self, session: ChatSession) -> list[str]:
+        self._expire_intent_actions(session)
+        removed: list[str] = []
+        while len(session.intent_actions) >= MAX_INTENT_ACTIONS:
+            stale = next((key for key, value in session.intent_actions.items() if value.status in {"approved", "expired", "superseded"}), None)
+            if stale is None:
+                break
+            del session.intent_actions[stale]
+            removed.append(stale)
+        return removed
+
+    def intent_for_reply(self, text: str, session_id: str | None = None) -> IntentAction | None:
+        session = self._resolve(session_id)
+        self._expire_intent_actions(session)
+        parts = text.strip().split(None, 1)
+        if not parts or parts[0].lower() != "approve":
+            return None
+        matches = [a for a in session.intent_actions.values() if a.status in {"pending", "failed"} and not a.is_expired()]
+        if len(parts) == 2:
+            matches = [a for a in matches if a.slug == parts[1].strip()]
+        return matches[0] if len(matches) == 1 else None
+
+    async def confirm_intent(self, action_id: str, session_id: str | None = None, confirmation_token: str | None = None) -> dict[str, Any]:
+        session = self._resolve(session_id)
+        if INTENT_ACTION_ID_RE.fullmatch(action_id) is None:
+            raise ChatIntentActionError("invalid intent action id")
+        action = session.intent_actions.get(action_id)
+        if action is None:
+            raise ChatIntentActionError(f"unknown intent action {action_id!r}")
+        token_hash = _confirmation_token_hash(confirmation_token)
+        if session.confirmation_token_hash is None or token_hash is None or not hmac.compare_digest(session.confirmation_token_hash, token_hash):
+            raise ChatIntentAuthorizationError("intent approval requires confirmation from its originating browser")
+        if action.status == "approved":
+            return action.snapshot()
+        if action.task is not None:
+            await asyncio.shield(action.task)
+            if action.status == "failed":
+                raise ChatIntentActionError(action.error or "intent filing failed")
+            return action.snapshot()
+        if action.status == "superseded":
+            raise ChatIntentActionError("intent action has been superseded")
+        if action.status == "expired" or action.is_expired():
+            action.status = "expired"
+            self._broadcast(session, "intent_status", "intent expired", meta={"intent": action.snapshot()})
+            raise ChatIntentActionError("intent action has expired")
+        action.status = "running"
+        self._broadcast(session, "intent_status", "filing approved intent", meta={"intent": action.snapshot()})
+        action.task = asyncio.create_task(self._run_intent(session, action), name=f"symphony-chat-intent-{action.action_id}")
+        await asyncio.shield(action.task)
+        if action.status == "failed":
+            raise ChatIntentActionError(action.error or "intent filing failed")
+        return action.snapshot()
+
+    async def _run_intent(self, session: ChatSession, action: IntentAction) -> None:
+        try:
+            cfg = self._config_provider()
+            ticket = await asyncio.to_thread(file_intent_request, action, project_root=cfg.workflow_path.parent, tracker=cfg.tracker, session_id=session.session_id)
+        except Exception as exc:
+            from .orchestrator.diagnostics import redact_text
+            action.status = "failed"
+            action.error = redact_text(exc, maximum=800) or "intent filing failed"
+            self._broadcast(session, "intent_status", "intent filing failed", meta={"intent": action.snapshot()})
+        else:
+            action.ticket = ticket
+            action.status = "approved"
+            self._broadcast(session, "intent_status", "intent approved", meta={"intent": action.snapshot()})
+            if self._request_refresh is not None:
+                try:
+                    self._request_refresh()
+                except Exception:
+                    pass
+        finally:
+            action.task = None
 
     def _close_project_setup_choice_windows(
         self, session: ChatSession, *, reason: str
@@ -1265,6 +1373,8 @@ class ChatManager:
 
         visible = text
         proposal: ProjectSetupAction | None = None
+        intent: IntentAction | None = None
+        intent_removed: list[str] = []
         if session.mode == "edit":
             visible, proposal = _project_setup_spec(text)
         removed: list[str] = []
@@ -1300,6 +1410,24 @@ class ChatManager:
                     proposal = None
                     unavailable = "Project setup could not be safely prepared."
                     visible = f"{visible}\n\n{unavailable}".strip()
+        if session.mode == "edit" and self._config_provider().tracker.kind == "file":
+            try:
+                visible, intent_proposal = parse_intent_marker(visible)
+            except IntentParseError:
+                visible = f"{visible}\n\n{_INTENT_APPROVAL_UNAVAILABLE}".strip()
+                intent_proposal = None
+            if intent_proposal is not None:
+                intent = IntentAction.from_proposal(intent_proposal)
+                for older in session.intent_actions.values():
+                    if older.status == "pending":
+                        older.status = "superseded"
+                        self._broadcast(session, "intent_status", "intent superseded", meta={"intent": older.snapshot()})
+                intent_removed = self._prune_intent_actions(session)
+                if session.confirmation_token_hash is None or len(session.intent_actions) >= MAX_INTENT_ACTIONS:
+                    visible = f"{visible}\n\n{_INTENT_APPROVAL_UNAVAILABLE}".strip()
+                    intent = None
+                else:
+                    session.intent_actions[intent.action_id] = intent
         # The explanation must precede its control in the live stream just as
         # it does in the model response and accessibility reading order.
         if visible:
@@ -1311,6 +1439,8 @@ class ChatManager:
                 "",
                 meta={"project_setup_action_id": action_id},
             )
+        for action_id in intent_removed:
+            self._broadcast(session, "intent_removed", "", meta={"intent_action_id": action_id})
         if proposal is not None:
             self._broadcast(
                 session,
@@ -1318,6 +1448,8 @@ class ChatManager:
                 "",
                 meta={"project_setup": proposal.as_dict()},
             )
+        if intent is not None:
+            self._broadcast(session, "intent_action", "", meta={"intent": intent.snapshot()})
         # Keep the raw backend message for terminal-event de-duplication. The
         # visible string intentionally has the protocol marker removed.
         session.last_agent_text = text

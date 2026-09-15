@@ -208,6 +208,7 @@ async def test_start_session_caps_at_max_and_stop_clears(
     cfg = _cfg(tmp_path)
     manager = ChatManager(lambda: cfg)
     snapshot = await manager.start_session("qa")
+    assert fake_backends[0].init.env == {}
     assert snapshot["active"] is True
     assert snapshot["mode"] == "qa"
     assert snapshot["agent_kind"] == "claude"
@@ -1843,4 +1844,3 @@ def test_summarize_copilot_frame() -> None:
     assert _summarize_frame("copilot", msg_frame) == [
         ("agent_message", "Resolved the bug.", {})
     ]
-

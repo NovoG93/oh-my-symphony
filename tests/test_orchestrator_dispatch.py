@@ -26,7 +26,9 @@ from symphony.issue import BlockerRef, Issue, sort_for_dispatch
 from symphony.orchestrator import (
     STALL_FORCE_EJECT_GRACE_S,
     Orchestrator,
+    RetryEntry,
     RunningEntry,
+    UsageDecision,
     _is_auto_triage_todo_candidate,
     _IssueDebug,
     _sort_for_dispatch_fifo,
@@ -52,6 +54,7 @@ from symphony.workflow import (
     ServerConfig,
     ServiceConfig,
     TrackerConfig,
+    UsagePoolConfig,
     WorkflowState,
 )
 
@@ -7899,6 +7902,152 @@ def test_conflict_pre_check_no_overlap_dispatches_normally(monkeypatch):
     )
 
 
+class _RetryTimer:
+    def cancel(self) -> None:
+        return None
+
+
+def _pending_retry(
+    issue_id: str, identifier: str, touched_files: frozenset[str], *, holds_slot: bool = True
+) -> RetryEntry:
+    return RetryEntry(
+        issue_id=issue_id,
+        identifier=identifier,
+        attempt=1,
+        due_at_ms=0.0,
+        timer_handle=_RetryTimer(),  # type: ignore[arg-type]
+        holds_slot=holds_slot,
+        touched_files=touched_files,
+    )
+
+
+def test_conflict_pre_check_blocks_overlap_with_exited_retry():
+    orch = _orch()
+    candidate = _issue(
+        "MT-CANDIDATE",
+        description="## Touched Files\n- src/shared.py\n- src/new.py\n",
+    )
+    orch._retry["id-MT-RETRY"] = _pending_retry(
+        "id-MT-RETRY", "MT-RETRY", frozenset({"src/shared.py"})
+    )
+
+    assert orch._conflict_blocker(candidate) == (
+        "MT-RETRY",
+        {"src/shared.py"},
+    )
+
+
+def test_conflict_pre_check_allows_non_overlapping_exited_retry():
+    orch = _orch()
+    candidate = _issue(
+        "MT-CANDIDATE",
+        description="## Touched Files\n- src/other.py\n",
+    )
+    orch._retry["id-MT-RETRY"] = _pending_retry(
+        "id-MT-RETRY", "MT-RETRY", frozenset({"src/shared.py"})
+    )
+
+    assert orch._conflict_blocker(candidate) is None
+
+
+def test_conflict_pre_check_ignores_candidate_own_retry_snapshot():
+    orch = _orch()
+    candidate = _issue(
+        "MT-CANDIDATE",
+        description="## Touched Files\n- src/shared.py\n",
+    )
+    orch._retry[candidate.id] = _pending_retry(
+        candidate.id, candidate.identifier, frozenset({"src/shared.py"})
+    )
+
+    assert orch._conflict_blocker(candidate) is None
+
+
+def test_conflict_pre_check_preserves_retry_ownership_when_reparked():
+    orch = _orch()
+    orch._loop = asyncio.new_event_loop()
+    retry = _pending_retry("id-MT-RETRY", "MT-RETRY", frozenset({"src/shared.py"}))
+    orch._retry[retry.issue_id] = retry
+    try:
+        orch._repark_retry(
+            retry,
+            _make_config(),
+            identifier=retry.identifier,
+            reason="provider usage wait",
+            holds_slot=False,
+        )
+        assert orch._retry[retry.issue_id].touched_files == retry.touched_files
+    finally:
+        for pending in orch._retry.values():
+            pending.timer_handle.cancel()
+        orch._loop.close()
+
+
+def test_provider_usage_wait_reparks_retry_without_releasing_file_ownership(
+    monkeypatch,
+):
+    cfg = replace(
+        _make_config(),
+        usage_pools={
+            "codex": UsagePoolConfig(source="codex", caps={"weekly": 80})
+        },
+    )
+    orch = _orch()
+    orch._loop = asyncio.new_event_loop()
+    issue = _issue(
+        "MT-PROVIDER-WAIT",
+        description="## Touched Files\n- src/provider-owned.py\n",
+    )
+    retry = _pending_retry(
+        issue.id, issue.identifier, frozenset({"src/provider-owned.py"})
+    )
+    monkeypatch.setattr(
+        orch._usage_manager,
+        "evaluate",
+        lambda _pool_id, _pool: UsageDecision.WAIT_PROVIDER_USAGE,
+    )
+
+    async def _fetch_candidates(_cfg):
+        return [issue]
+
+    monkeypatch.setattr(orch, "_fetch_candidates", _fetch_candidates)
+    try:
+        asyncio.run(orch._process_retry(retry, cfg))
+        reparks = orch._retry
+        assert reparks[issue.id].touched_files == retry.touched_files
+        assert reparks[issue.id].holds_slot is False
+    finally:
+        for pending in orch._retry.values():
+            pending.timer_handle.cancel()
+        orch._loop.close()
+
+
+def test_conflict_pre_check_live_entry_takes_precedence_over_retry_snapshot():
+    orch = _orch()
+    live = _issue(
+        "MT-LIVE",
+        state="In Progress",
+        description="## Touched Files\n- src/live.py\n",
+    )
+    candidate = _issue(
+        "MT-CANDIDATE",
+        description="## Touched Files\n- src/retry.py\n",
+    )
+    orch._running[live.id] = RunningEntry(
+        issue=live,
+        started_at=datetime.now(timezone.utc),
+        retry_attempt=None,
+        worker_task=None,  # type: ignore[arg-type]
+        workspace_path=Path("/tmp"),
+    )
+    # A stale retry snapshot must not make the live entry appear to own files.
+    orch._retry[live.id] = _pending_retry(
+        live.id, live.identifier, frozenset({"src/retry.py"})
+    )
+
+    assert orch._conflict_blocker(candidate) is None
+
+
 def test_g1_stale_claimed_pruned_after_conflict_resolves(monkeypatch):
     """G1 — `_claimed` must release a conflict_blocked id once the worker
     that triggered the block is gone. Without this prune, the candidate
@@ -9575,6 +9724,24 @@ def test_token_ema_persists_and_reloads(tmp_path):
     assert fresh._token_ema_for_state("Review") == 0
 
 
+def test_persisted_state_paths_namespace_sibling_workflows(tmp_path):
+    base = _make_config()
+    canonical = replace(base, workflow_path=tmp_path / "WORKFLOW.md")
+    sibling = replace(base, workflow_path=tmp_path / "WORKFLOW.claude.md")
+    orch = _orch()
+
+    assert orch._token_ema_path(canonical) == tmp_path / ".symphony" / "token_ema.json"
+    assert orch._done_count_path(canonical) == tmp_path / ".symphony" / "done_count.json"
+    assert (
+        orch._token_ema_path(sibling)
+        == tmp_path / ".symphony" / "token_ema.WORKFLOW.claude.json"
+    )
+    assert (
+        orch._done_count_path(sibling)
+        == tmp_path / ".symphony" / "done_count.WORKFLOW.claude.json"
+    )
+
+
 def test_token_budget_for_state_falls_back_to_default():
     """`max_total_tokens_by_state` overrides; absent state uses the
     global `max_total_tokens` cap.
@@ -9595,8 +9762,8 @@ def test_token_budget_for_state_falls_back_to_default():
 # ---------------------------------------------------------------------------
 
 
-def test_apply_dispatch_env_sets_rewind_scope_on_rewind(monkeypatch):
-    """Rewind dispatch must export SYMPHONY_REWIND_SCOPE as JSON."""
+def test_dispatch_env_sets_rewind_scope_on_rewind(monkeypatch):
+    """Rewind metadata is returned without mutating the parent process."""
     monkeypatch.delenv("SYMPHONY_REWIND_SCOPE", raising=False)
     cfg = _make_config()
     orch = _orch()
@@ -9611,12 +9778,13 @@ def test_apply_dispatch_env_sets_rewind_scope_on_rewind(monkeypatch):
         ),
     )
 
-    orch._apply_dispatch_env(issue=issue, cfg=cfg, is_rewind=True)
-
     import os
     import json as _json
 
-    raw = os.environ.get("SYMPHONY_REWIND_SCOPE")
+    before = dict(os.environ)
+    overlay = orch._dispatch_env(issue=issue, cfg=cfg, is_rewind=True)
+    assert dict(os.environ) == before
+    raw = overlay.get("SYMPHONY_REWIND_SCOPE")
     assert raw is not None, "SYMPHONY_REWIND_SCOPE must be set on rewind"
     rows = _json.loads(raw)
     assert isinstance(rows, list) and rows, "rewind scope must parse to list"
@@ -9625,15 +9793,12 @@ def test_apply_dispatch_env_sets_rewind_scope_on_rewind(monkeypatch):
     files = {row["file"] for row in rows}
     assert "src/foo.py" in files
     # Env vars for budget always present, regardless of rewind.
-    assert os.environ.get("SYMPHONY_TOKEN_BUDGET") is not None
-    assert os.environ.get("SYMPHONY_TOKEN_EMA") is not None
-
-    # Clean up so the env var doesn't leak to other tests.
-    monkeypatch.delenv("SYMPHONY_REWIND_SCOPE", raising=False)
+    assert overlay.get("SYMPHONY_TOKEN_BUDGET") is not None
+    assert overlay.get("SYMPHONY_TOKEN_EMA") is not None
 
 
-def test_apply_dispatch_env_unsets_rewind_scope_on_forward(monkeypatch):
-    """Forward dispatch must NOT carry a stale SYMPHONY_REWIND_SCOPE."""
+def test_dispatch_env_excludes_stale_rewind_scope_on_forward(monkeypatch):
+    """Forward overlays must not carry a stale rewind scope."""
     import os
 
     cfg = _make_config()
@@ -9646,19 +9811,15 @@ def test_apply_dispatch_env_unsets_rewind_scope_on_forward(monkeypatch):
 
     # Simulate a prior rewind dispatch leaving the env var set.
     monkeypatch.setenv("SYMPHONY_REWIND_SCOPE", '[{"severity": "HIGH"}]')
-    orch._apply_dispatch_env(issue=issue, cfg=cfg, is_rewind=False)
-
-    assert os.environ.get("SYMPHONY_REWIND_SCOPE") is None, (
-        "forward dispatch must unset SYMPHONY_REWIND_SCOPE so a prior "
-        "rewind value cannot bleed across turns"
-    )
+    before = dict(os.environ)
+    overlay = orch._dispatch_env(issue=issue, cfg=cfg, is_rewind=False)
+    assert "SYMPHONY_REWIND_SCOPE" not in overlay
+    assert dict(os.environ) == before
 
 
-def test_apply_dispatch_env_empty_list_when_findings_missing(monkeypatch):
-    """Rewind without parseable findings still sets the env (as `[]`)."""
+def test_dispatch_env_empty_list_when_findings_missing(monkeypatch):
+    """Rewind without parseable findings still returns `[]`."""
     import json as _json
-    import os
-
     monkeypatch.delenv("SYMPHONY_REWIND_SCOPE", raising=False)
     cfg = _make_config()
     orch = _orch()
@@ -9668,22 +9829,18 @@ def test_apply_dispatch_env_empty_list_when_findings_missing(monkeypatch):
         description="## Plan only, no review findings here",
     )
 
-    orch._apply_dispatch_env(issue=issue, cfg=cfg, is_rewind=True)
-
-    raw = os.environ.get("SYMPHONY_REWIND_SCOPE")
+    overlay = orch._dispatch_env(issue=issue, cfg=cfg, is_rewind=True)
+    raw = overlay.get("SYMPHONY_REWIND_SCOPE")
     assert raw is not None
     assert _json.loads(raw) == [], (
         "missing Review Findings / QA Failure must produce an empty list, "
         "not omit the env var entirely"
     )
-    monkeypatch.delenv("SYMPHONY_REWIND_SCOPE", raising=False)
 
 
-def test_apply_dispatch_env_uses_latest_contract_failure_scope(monkeypatch):
+def test_dispatch_env_uses_latest_contract_failure_scope(monkeypatch):
     """Contract Failure rows must become first-class rewind scope."""
     import json as _json
-    import os
-
     monkeypatch.delenv("SYMPHONY_REWIND_SCOPE", raising=False)
     cfg = _make_config()
     orch = _orch()
@@ -9703,9 +9860,8 @@ def test_apply_dispatch_env_uses_latest_contract_failure_scope(monkeypatch):
         ),
     )
 
-    orch._apply_dispatch_env(issue=issue, cfg=cfg, is_rewind=True)
-
-    raw = os.environ.get("SYMPHONY_REWIND_SCOPE")
+    overlay = orch._dispatch_env(issue=issue, cfg=cfg, is_rewind=True)
+    raw = overlay.get("SYMPHONY_REWIND_SCOPE")
     assert raw is not None
     rows = _json.loads(raw)
     assert rows == [
@@ -9728,7 +9884,26 @@ def test_apply_dispatch_env_uses_latest_contract_failure_scope(monkeypatch):
             ),
         }
     ]
-    monkeypatch.delenv("SYMPHONY_REWIND_SCOPE", raising=False)
+
+
+@pytest.mark.asyncio
+async def test_concurrent_dispatch_envs_are_isolated(monkeypatch):
+    """Concurrent overlay construction cannot leak rewind metadata."""
+    cfg = _make_config()
+    orch = _orch()
+    first = _issue(
+        "MT-CONCURRENT-A", state="In Progress", description="## Review Findings\n- HIGH: src/a.py:1 — fix A"
+    )
+    second = _issue(
+        "MT-CONCURRENT-B", state="Review", description="## QA Failure\n- LOW: src/b.py:2 — fix B"
+    )
+    before = dict(os.environ)
+    overlays = await asyncio.gather(
+        asyncio.to_thread(orch._dispatch_env, issue=first, cfg=cfg, is_rewind=True),
+        asyncio.to_thread(orch._dispatch_env, issue=second, cfg=cfg, is_rewind=True),
+    )
+    assert overlays[0]["SYMPHONY_REWIND_SCOPE"] != overlays[1]["SYMPHONY_REWIND_SCOPE"]
+    assert dict(os.environ) == before
 
 
 def test_sort_for_dispatch_ties_by_identifier():

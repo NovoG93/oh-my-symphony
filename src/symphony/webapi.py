@@ -37,6 +37,8 @@ from .errors import (
     ChatNoSessionError,
     ChatProjectActionError,
     ChatProjectAuthorizationError,
+    ChatIntentActionError,
+    ChatIntentAuthorizationError,
     ChatSessionExistsError,
     ConfigValidationError,
     SymphonyError,
@@ -115,6 +117,7 @@ _COMMIT_RE = re.compile(r"^[0-9a-fA-F]{4,64}$")
 # `ChatManager` mints these as <UTC date>-<UTC time>-<6 hex>.
 _CHAT_SESSION_RE = re.compile(r"^\d{8}-\d{6}-[0-9a-f]{6}$")
 _PROJECT_SETUP_ACTION_RE = re.compile(r"^project-[0-9a-f]{32}$")
+_INTENT_ACTION_RE = re.compile(r"^intent-[0-9a-f]{32}$")
 _CHAT_CONFIRMATION_TOKEN_RE = re.compile(r"^[A-Za-z0-9_-]{32,256}$")
 _RUN_ID_RE = re.compile(r"^[0-9a-f]{32}$")
 _MAX_TITLE = 300
@@ -854,6 +857,13 @@ def _check_project_setup_action_id(raw: Any) -> str:
     action_id = raw.strip() if isinstance(raw, str) else ""
     if not _PROJECT_SETUP_ACTION_RE.fullmatch(action_id):
         raise WorkflowMutationError(f"invalid project setup action id {action_id!r}")
+    return action_id
+
+
+def _check_intent_action_id(raw: Any) -> str:
+    action_id = raw.strip() if isinstance(raw, str) else ""
+    if not _INTENT_ACTION_RE.fullmatch(action_id):
+        raise WorkflowMutationError(f"invalid intent action id {action_id!r}")
     return action_id
 
 
@@ -2475,6 +2485,17 @@ def _register_chat_routes(
             )
         return web.json_response({"action": action})
 
+    async def _confirm_intent(request: web.Request, session_id: str | None, action_id: str) -> web.Response:
+        try:
+            action = await manager.confirm_intent(action_id, session_id, confirmation_token=request.headers.get("X-Symphony-Chat-Confirmation"))
+        except ChatNoSessionError as exc:
+            return _json_error(404, exc.code, exc.message)
+        except ChatIntentAuthorizationError as exc:
+            return _json_error(403, exc.code, exc.message)
+        except ChatIntentActionError as exc:
+            return _json_error(404 if exc.message.startswith("unknown intent action") else 409, exc.code, exc.message)
+        return web.json_response({"action": action})
+
     async def _send(
         request: web.Request, body: dict[str, Any], session_id: str | None
     ) -> web.Response:
@@ -2493,6 +2514,9 @@ def _register_chat_routes(
         # server-issued choice. All other text remains ordinary conversation.
         if selected is not None:
             return await _confirm_project_setup(request, session_id, selected.action_id)
+        selected_intent = manager.intent_for_reply(text, session_id)
+        if selected_intent is not None:
+            return await _confirm_intent(request, session_id, selected_intent.action_id)
         try:
             snapshot = await manager.send_message(text, session_id)
         except ChatNoSessionError as exc:
@@ -2563,6 +2587,14 @@ def _register_chat_routes(
                 400, "invalid_body", "project setup selection takes no fields"
             )
         return await _confirm_project_setup(request, session_id, action_id)
+
+    async def handle_chat_intent_approve(request: web.Request) -> web.Response:
+        session_id = _check_chat_session_id(request.match_info["session_id"])
+        action_id = _check_intent_action_id(request.match_info["action_id"])
+        body = await _read_json(request)
+        if body:
+            return _json_error(400, "invalid_body", "intent approval takes no fields")
+        return await _confirm_intent(request, session_id, action_id)
 
     async def handle_chat_session_reattach(request: web.Request) -> web.Response:
         session_id = _check_chat_session_id(request.match_info["session_id"])
@@ -2698,6 +2730,10 @@ def _register_chat_routes(
     app.router.add_post(
         "/api/v1/chat/sessions/{session_id}/project-setup/{action_id}/select",
         _wrap(handle_chat_project_setup_select),
+    )
+    app.router.add_post(
+        "/api/v1/chat/sessions/{session_id}/intent/{action_id}/approve",
+        _wrap(handle_chat_intent_approve),
     )
     app.router.add_post(
         "/api/v1/chat/sessions/{session_id}/reattach",

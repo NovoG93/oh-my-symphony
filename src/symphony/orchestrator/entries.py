@@ -191,6 +191,10 @@ class RetryEntry:
     error: str | None = None
     kind: str = "retry"
     holds_slot: bool = True
+    # Snapshot of the files owned by the attempt that produced this retry.
+    # Keep this immutable: retry reparking must not accidentally lose or
+    # mutate ownership while the worker is no longer present in `_running`.
+    touched_files: frozenset[str] = frozenset()
 
 
 @dataclass
