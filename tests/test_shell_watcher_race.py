@@ -147,6 +147,35 @@ async def test_safe_proc_wait_takes_over_when_watcher_never_registers(
 
 
 @pytest.mark.skipif(sys.platform == "win32", reason="POSIX waitpid semantics")
+async def test_second_untimed_wait_after_takeover_returns_promptly(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A second untimed wait after a take-over reap must not hang forever.
+
+    The first call reaps the child itself (watcher stalled); the pid is then
+    fully gone — not a zombie, not running — and the watcher will never
+    deliver a returncode. A second untimed call must therefore not poll a
+    pid that can never come back: it returns promptly (None is acceptable
+    for an already-reaped child).
+    """
+    loop = asyncio.get_running_loop()
+    watcher = getattr(loop, "_watcher", None)
+    if watcher is None:
+        pytest.skip("no per-loop child watcher on this platform")
+    monkeypatch.setattr(watcher, "add_child_handler", lambda *a, **k: None)
+
+    proc = await _spawn("exit 7")
+
+    rc1 = await safe_proc_wait(proc)
+    assert rc1 == 7  # first call took over the reap and returned the true code
+
+    started = time.monotonic()
+    rc2 = await asyncio.wait_for(safe_proc_wait(proc), timeout=6.0)
+    assert time.monotonic() - started < 5.0
+    assert rc2 is None  # already reaped: nothing left to report
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX waitpid semantics")
 async def test_terminate_process_tree_reports_true_exit_code(
     monkeypatch: pytest.MonkeyPatch, asyncio_warning_log: list[str]
 ) -> None:

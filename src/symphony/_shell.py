@@ -157,6 +157,31 @@ def _child_is_zombie(pid: int) -> bool:
     return result.stdout.strip().upper().startswith("Z")
 
 
+def _child_is_absent(pid: int) -> bool:
+    """Return True when *pid* no longer exists at all (reaped and gone).
+
+    Distinct from ``_child_is_zombie``: an absent pid has no process-table
+    entry left. Observed while ``wait()`` is still pending it means the
+    child was already reaped outside the watcher (a prior take-over) — the
+    watcher can never deliver a returncode for it, so polling is futile.
+    """
+    if pid <= 0:
+        return True
+    if sys.platform.startswith("linux"):
+        return not Path(f"/proc/{pid}/stat").exists()
+    try:
+        result = subprocess.run(
+            ["ps", "-o", "stat=", "-p", str(pid)],
+            capture_output=True,
+            check=False,
+            text=True,
+            timeout=1,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return result.returncode == 1 and not result.stdout.strip()
+
+
 def _reap_blocking(pid: int) -> int | None:
     """Reap *pid* with a blocking ``waitpid``; None when already reaped."""
     try:
@@ -204,6 +229,13 @@ async def _wait_watcher_or_take_over(
         if proc.returncode is not None:
             return proc.returncode
         if not _child_is_zombie(pid):
+            if _child_is_absent(pid):
+                # The pid is gone and the watcher has not delivered a
+                # returncode: this child was already reaped (typically by a
+                # prior take-over of this same wait) and can never come back.
+                # One blocking reap settles it — ECHILD on an already-reaped
+                # pid — and returns None promptly instead of polling forever.
+                return await asyncio.to_thread(_reap_blocking, pid)
             continue  # still running (or watcher about to deliver) — keep waiting
         # Dead but unreaped: the watcher stalled. One grace round in case it
         # is merely slow, then take over the reap.
@@ -238,8 +270,14 @@ async def safe_proc_wait(proc: Any, *, timeout: float | None = None) -> int | No
 
     `timeout` is in seconds. Returns the exit code, or ``None`` on timeout
     while the child is still running (caller is responsible for sending
-    SIGKILL and retrying). With ``timeout=None`` the wait is unbounded but
-    still takes over the reap when the watcher stalls on a dead child.
+    SIGKILL and retrying). The timed path may overshoot `timeout` by a
+    small bounded grace (``_WATCHER_GRACE_S`` plus one wait/re-check round)
+    used to tell a still-running child from a stalled watcher; it never
+    waits for the child itself past that. With ``timeout=None`` the wait is
+    unbounded but still takes over the reap when the watcher stalls on a
+    dead child; if the child was already reaped by a prior take-over (or
+    elsewhere), a later untimed wait returns ``None`` promptly instead of
+    polling a pid that no longer exists.
 
     Windows note: ``os.waitpid`` and the ``WIF*`` helpers are POSIX-only, so
     on Windows we delegate to the asyncio child transport's own ``wait()``
