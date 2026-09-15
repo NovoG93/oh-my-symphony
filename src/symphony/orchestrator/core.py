@@ -9590,6 +9590,18 @@ class Orchestrator:
                 retry, clear_pause=False, reason=decision.reason
             )
             return True
+        if decision.code == "waiting_provider_usage":
+            # Provider capacity/quota exhaustion is a scheduler-level
+            # condition, not a per-ticket failure: release the retry's
+            # ownership instead of re-parking it. The ticket returns to the
+            # ordinary tick dispatch loop, which re-evaluates usage every
+            # tick and dispatches when the quota resets (mirrors the
+            # worker-exit ``worker_provider_usage_exhausted`` rule: do not
+            # consume retry budget).
+            self._release_retry_ownership(
+                retry, clear_pause=False, reason=decision.reason
+            )
+            return True
         self._repark_retry(
             retry,
             cfg,
