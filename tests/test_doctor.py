@@ -14,6 +14,7 @@ import pytest
 import yaml
 
 from symphony import service as service_module
+from symphony import systemd as systemd_module
 from symphony.service import ServiceRecord, save_record
 from symphony.cli.doctor import (
     check_after_create_hook,
@@ -639,7 +640,9 @@ def test_tracker_file_passes_with_tickets(tmp_path: Path) -> None:
     assert "1 ticket" in result.message
 
 
-def test_run_checks_returns_one_result_per_check(tmp_path: Path) -> None:
+def test_run_checks_returns_one_result_per_check(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     cfg = _build_cfg(
         tmp_path,
         """
@@ -648,6 +651,12 @@ def test_run_checks_returns_one_result_per_check(tmp_path: Path) -> None:
         codex: { command: codex app-server }
         """,
     )
+    # Pin the base check set: on hosts with a live user systemd manager
+    # `run_checks` appends the two managed-unit checks (service.unit,
+    # service.linger), which are covered separately in
+    # tests/test_doctor_service_unit.py. Forcing the seam keeps this count
+    # contract stable on every host.
+    monkeypatch.setattr(systemd_module, "is_available", lambda: False)
     results = run_checks(cfg)
     # protected repository + port + api_token + shell + max_turns + agent + pi_auth
     # + prime_agent_auth + copilot_auth + gemini_auth + agy_state + kiro_auth + prompts
