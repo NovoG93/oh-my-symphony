@@ -36,6 +36,35 @@ Versioning: [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   snapshot and the workflow API payload, and rendered as a Provider Usage
   card in the web UI.
 
+- **Chat Intent Gate.** Chat agents can propose software work but no longer
+  file it directly: the agent investigates, clarifies, and emits a
+  structured intent proposal; the server validates and owns it; and a human
+  approves it in the web UI (with the browser-held confirmation token used
+  for project setup) before the server files the board ticket and writes a
+  `.sdlc/work/<slug>/intent.md` artifact. Proposals expire after ~30
+  minutes, a fresh proposal supersedes older pending ones, `approve` /
+  `approve <slug>` chat replies work when unambiguous, and concurrent
+  approvals file exactly one ticket. Approval is supported for file-tracker
+  boards; the approved ticket then flows through the normal profile, usage,
+  and scheduling machinery.
+
+### Changed
+
+- **Sibling workflows get independent state files.** Non-canonical
+  workflows (e.g. `WORKFLOW.claude.md`) now persist token EMA and
+  done-count state to deterministic per-workflow files
+  (`token_ema.WORKFLOW.claude.json`, `done_count.WORKFLOW.claude.json`)
+  instead of sharing the canonical files, so sibling workflows in one repo
+  can no longer read or overwrite each other's state. `WORKFLOW.md` keeps
+  the legacy filenames; newly namespaced siblings start with clean state.
+
+- **Provider-quota waits release retry ownership.** When a ticket enters
+  `waiting_provider_usage`, its retry ownership is released instead of
+  re-parked (mirroring the worker-exit rule): the ticket returns to the
+  ordinary dispatch loop and is re-dispatched when the quota resets,
+  without consuming retry budget. Its touched files become re-disputable
+  while it waits, and the conflict gate applies again at re-dispatch.
+
 ### Fixed
 
 - **Controlled 404/405 for unsupported API routes.** Requests to API paths
@@ -44,6 +73,42 @@ Versioning: [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   traceback; the framework's own 404/405 answers are returned instead. A
   matched route without authorization metadata still fails closed with
   `unclassified_route`.
+
+- **Linear blocker data uses the current schema and fails closed on
+  truncation.** Blocker relations are fetched as a bounded connection
+  (`inverseRelations(first: 50)`) and filtered locally, and an incomplete
+  or truncated relation page is rejected instead of being read as "no
+  blockers", so a ticket can no longer dispatch based on incomplete
+  blocker data.
+
+- **Retry-pending tickets keep their file reservations.** A ticket that
+  failed and is waiting for retry still reserves the files it touched, so
+  an overlapping ticket can no longer dispatch into the same files before
+  the retry runs.
+
+- **Per-dispatch subprocess environment isolation.** Token EMA, token
+  budget, and rewind scope are passed to each worker as a dispatch-local
+  environment overlay instead of mutating the parent process environment,
+  so concurrent dispatches can no longer leak values into each other —
+  e.g. a rewind scope bleeding into a later forward run.
+
+- **Atomic workflow-state writes.** Token EMA and done-count JSON are
+  written through a same-directory temp file and `os.replace`, with bounded
+  retry on transient replacement contention, so a torn write can no longer
+  corrupt state files.
+
+- **Child-watcher race no longer corrupts exit codes.** `safe_proc_wait`
+  reaped asyncio-tracked children in a worker thread, racing the event
+  loop's child watcher; the loser logged "will report returncode 255" and
+  could overwrite the true exit code. The watcher now owns the reap (with
+  a dead-but-unreaped zombie fallback), and termination prefers the reaped
+  or observed exit code, so genuine failures are no longer masked as 255.
+
+- **Startup reclaim no longer stalls on macOS zombies.**
+  `process_group_exists` treated the EPERM raised by a killed-but-unreaped
+  process group as unknown, so proven-dead runs could stay stuck in
+  "reclaiming" at startup; the zombie-filter probe now confirms them and
+  reclaim proceeds.
 
 ## [0.21.0] - 2026-08-16 - Named agent profiles and MCP gateway
 

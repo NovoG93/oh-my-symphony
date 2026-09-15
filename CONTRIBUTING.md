@@ -5,10 +5,10 @@ requests are welcome.
 
 ## Branch And PR Target
 
-- Open pull requests against `dev` unless a maintainer asks for a different
-  target.
+- Open pull requests against `develop` unless a maintainer asks for a
+  different target.
 - Keep `main` release-ready; it receives changes after they have been verified
-  on `dev`.
+  on `develop`.
 - Prefer small, focused PRs. Separate backend behavior, UI, docs, and release
   metadata when they are not part of the same user-visible change.
 
@@ -80,5 +80,5 @@ Before requesting review, make sure the PR includes:
 - Screenshots or terminal output for TUI or browser-visible changes.
 - Notes about compatibility, migration, or follow-up work if applicable.
 
-Maintainers merge after the PR targets `dev`, CI is green, and the verification
+Maintainers merge after the PR targets `develop`, CI is green, and the verification
 evidence is sufficient for the risk of the change.

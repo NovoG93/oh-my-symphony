@@ -1179,7 +1179,7 @@ detail 확인을 할 수 있다.
 
 ## Contributing
 
-PR을 환영한다. 외부 기여는 기본적으로 `dev`를 대상으로 한다 — 전체 리뷰
+PR을 환영한다. 외부 기여는 기본적으로 `develop`를 대상으로 한다 — 전체 리뷰
 체크리스트는 [CONTRIBUTING.md](CONTRIBUTING.md)와 PR 템플릿을 참고한다. PR을 열기
 전에:
 

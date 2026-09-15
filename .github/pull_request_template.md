@@ -30,7 +30,7 @@ symphony doctor ./WORKFLOW.md
 
 ## Checklist
 
-- [ ] This PR targets `dev`.
+- [ ] This PR targets `develop`.
 - [ ] I added or updated tests for behavior changes.
 - [ ] I updated docs/examples for user-facing changes.
 - [ ] I did not commit secrets, logs, local run state, virtualenvs, or generated artifacts.
