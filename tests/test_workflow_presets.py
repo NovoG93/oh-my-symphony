@@ -94,6 +94,8 @@ def test_deep_prompts_are_succinct_and_carry_the_gates() -> None:
     # F-19: the CLI may live in a venv the worker's PATH does not carry.
     assert "${SYMPHONY_CLI:-symphony} board new" in plan
     assert "--blocked-by" in plan
+    assert "--blocked-by BUILD-1 --blocked-by BUILD-2" in plan
+    assert "--blocked-by BUILD-1,BUILD-2" not in plan
     assert "--request" in plan
     assert "release-contract.yaml" in plan
     assert "app-release-finalizer" in plan
@@ -133,3 +135,14 @@ def test_deep_prompts_are_succinct_and_carry_the_gates() -> None:
     assert "exact target SHA" in qa
     assert "desktop, tablet, and mobile" in qa
     assert "release-evidence.json" in qa
+
+
+def test_deep_plan_prompt_multi_blocker_syntax() -> None:
+    from pathlib import Path
+
+    repo_root = Path(__file__).resolve().parent.parent
+    plan = (
+        repo_root / "docs" / "symphony-prompts" / "file" / "deep" / "plan.md"
+    ).read_text(encoding="utf-8")
+    assert "--blocked-by BUILD-1 --blocked-by BUILD-2" in plan
+    assert "--blocked-by BUILD-1,BUILD-2" not in plan
