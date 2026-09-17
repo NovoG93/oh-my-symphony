@@ -44,6 +44,15 @@ agent:
   stage_kinds:
     Todo: gemini
     Doing: codex
+  stage_profiles:
+    Todo: todo-profile
+    Doing: build-profile
+
+agent_profiles:
+  todo-profile:
+    kind: gemini
+  build-profile:
+    kind: codex
 
 prompts:
   base: ./prompts/base.md
@@ -441,6 +450,56 @@ def test_stage_kinds_survive_states_update_and_follow_renames(workflow: Path) ->
     )
     cfg = build_service_config(load_workflow(workflow))
     assert cfg.agent.stage_kinds == {"todo": "gemini"}
+
+
+def test_stage_profiles_survive_states_update_and_follow_renames(workflow: Path) -> None:
+    """`agent.stage_profiles` entries for untouched lanes survive a states
+    update verbatim, renamed lanes carry their mapping, and removed lanes
+    drop theirs — the reloaded config still parses cleanly."""
+    apply_states_update(
+        workflow,
+        [
+            StateSpec(name="Todo"),
+            StateSpec(name="Building", description="build", previous_name="Doing"),
+            StateSpec(name="Done", terminal=True),
+            StateSpec(name="Archive", terminal=True),
+        ],
+    )
+    text = workflow.read_text(encoding="utf-8")
+    assert "Todo: todo-profile" in text
+    assert "Building: build-profile" in text
+
+    cfg = build_service_config(load_workflow(workflow))
+    assert cfg.agent.stage_profiles == {"todo": "todo-profile", "building": "build-profile"}
+
+    # Removing the renamed lane drops its stage_profiles entry too while preserving Todo.
+    apply_states_update(
+        workflow,
+        [
+            StateSpec(name="Todo"),
+            StateSpec(name="Done", terminal=True),
+            StateSpec(name="Archive", terminal=True),
+        ],
+    )
+    text_after_remove = workflow.read_text(encoding="utf-8")
+    assert "Building: build-profile" not in text_after_remove
+    assert "Todo: todo-profile" in text_after_remove
+    cfg = build_service_config(load_workflow(workflow))
+    assert cfg.agent.stage_profiles == {"todo": "todo-profile"}
+
+
+def test_apply_lane_preset_clears_obsolete_stage_profiles(workflow: Path) -> None:
+    """Applying the deep preset removes obsolete Todo and Doing profile routes
+    and produces a reloadable config with an empty stage_profiles map until
+    explicitly configured."""
+    plan = apply_lane_preset(workflow, "deep")
+    assert plan.removed == ["Todo", "Doing"]
+    text = workflow.read_text(encoding="utf-8")
+    assert "Doing: build-profile" not in text
+    assert "Todo: todo-profile" not in text
+
+    cfg = build_service_config(load_workflow(workflow))
+    assert cfg.agent.stage_profiles == {}
 
 
 # ---------------------------------------------------------------------------

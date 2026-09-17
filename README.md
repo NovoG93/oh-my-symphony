@@ -355,6 +355,44 @@ agent_profiles:
     reasoning_effort: medium
 ```
 
+#### Example 3: Tiered Planner-Driven Deep Pipeline (OpenCode + AGY)
+In deep pipelines, the Plan stage decomposes implementation work and routes Build slices according to size and complexity:
+
+```yaml
+agent:
+  kind: claude
+  stage_profiles:
+    Intake: claude-fast
+    Research: claude-fast
+    Plan: claude-deep
+    Review: claude-deep
+    Build: agy-builder
+    QA: claude-fast
+    Verify: claude-deep
+    Document: claude-fast
+
+agent_profiles:
+  opencode-free-small:
+    kind: opencode
+    command: opencode run --format json --auto --model free-model-id
+  agy-builder:
+    kind: agy
+  claude-fast:
+    kind: claude
+    model: haiku
+  claude-deep:
+    kind: claude
+    model: sonnet
+```
+
+Key rules and operational boundaries:
+- **OpenCode Model Specification**: OpenCode has no profile-level `model:` field; put `--model <verified-id>` in the profile command (e.g. `opencode run --format json --auto --model <verified-id>`).
+- **Resolution Precedence**: Ticket profile selection outranks stage selection (Tier 3 vs. Tier 5 in the 8-tier precedence). Build cards pinned by the Plan lane with `--agent-profile` override the `Build` lane's default profile.
+- **Build Ticket Scope**: Only Build tickets get planner-selected ticket profiles. Downstream QA, Verify, and Document tickets must not have pinned profiles; stage routing owns those tickets.
+- **Policy vs. Enforcement**: Prompt bounds (e.g. `<= 3 files / <= 200 net lines`, single behavior, max 8 Build tickets) are policy, not scheduler enforcement; the Plan agent follows these guidelines during decomposition.
+- **Fallback Classification**: Unknown/uncertain classification defaults to AGY (`--agent-profile agy-builder`) to prevent fragile or undersized models from failing on complex slices.
+- **Dynamic Model Availability**: Free model IDs are live deployment facts, not stable Symphony constants; operators must configure current valid IDs in their environment and profile definitions.
+
 #### Backward Compatibility & Migration Guidance
 Existing workflows using only `agent.kind` and `agent.stage_kinds` continue to work unchanged. To migrate:
 1. Define reusable profiles under `agent_profiles:` in `WORKFLOW.md`.
