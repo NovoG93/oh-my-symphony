@@ -16,7 +16,7 @@ Plan is the sole decomposition point: Max 8 Build tickets per request; Build wor
    ```bash
    ${SYMPHONY_CLI:-symphony} board new BUILD-1 "<title>" --state Build --agent-profile opencode-free-small --blocked-by {{ issue.identifier }} --request "{{ issue.request }}" --description "..."
    ${SYMPHONY_CLI:-symphony} board new BUILD-2 "<title>" --state Build --agent-profile agy-builder --blocked-by {{ issue.identifier }} --request "{{ issue.request }}" --description "..."
-   ${SYMPHONY_CLI:-symphony} board new VERIFY-1 "Re-prove all claims" --state Verify --blocked-by BUILD-1,BUILD-2 --request "{{ issue.request }}" --description "..."
+   ${SYMPHONY_CLI:-symphony} board new VERIFY-1 "Re-prove all claims" --state Verify --blocked-by BUILD-1 --blocked-by BUILD-2 --request "{{ issue.request }}" --description "..."
    ${SYMPHONY_CLI:-symphony} board new DOCUMENT-1 "Docs + wiki write-back" --state Document --blocked-by VERIFY-1 --request "{{ issue.request }}" --description "..."
    ```
 

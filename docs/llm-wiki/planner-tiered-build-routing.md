@@ -89,5 +89,10 @@ budget. Ticket artefacts under `docs/TIER-001/qa/`.
   as a new section to stay inside the succinctness gate.
 - 2026-09-17 | TIER-001 | `README.ko.md` was not updated — it is outside the
   ticket's allowed files and still lacks the tiered-routing subsection.
+- 2026-09-17 | TIER-002 | Multi-parent blocker CLI syntax: `symphony board new`
+  uses `action="append"` for `--blocked-by` and validates each item against
+  `^[A-Za-z][A-Za-z0-9_-]{0,63}$`. Comma-separated lists fail with
+  `BoardDependencyError`. Prompt examples and regression tests require repeated
+  flags (`--blocked-by BUILD-1 --blocked-by BUILD-2`).
 
-**Last updated:** 2026-09-17 by TIER-001 Document.
+**Last updated:** 2026-09-17 by TIER-002 Document.
