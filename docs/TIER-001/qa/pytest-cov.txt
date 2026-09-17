@@ -1,0 +1,1428 @@
+................s....................................................... [  2%]
+........................................................................ [  4%]
+..................s.....s.....s......................................... [  7%]
+........................................................................ [  9%]
+........................................................................ [ 12%]
+........................................................................ [ 14%]
+........................................................................ [ 17%]
+........................................................................ [ 19%]
+........................................................................ [ 22%]
+........................................................................ [ 24%]
+........................................................................ [ 26%]
+....................................s................................... [ 29%]
+........................................................................ [ 31%]
+........................................................................ [ 34%]
+........................................................................ [ 36%]
+........................................................................ [ 39%]
+........................................................................ [ 41%]
+........................................................................ [ 44%]
+........................................................................ [ 46%]
+........................................................................ [ 48%]
+........................................................................ [ 51%]
+........................................................................ [ 53%]
+...................................................s.................... [ 56%]
+........................................................................ [ 58%]
+........................................................................ [ 61%]
+........................s............................................... [ 63%]
+........................................................................ [ 66%]
+........................................................................ [ 68%]
+........................................................................ [ 71%]
+........................................................................ [ 73%]
+........................................................................ [ 75%]
+...........................................sssssss...................... [ 78%]
+........................................................................ [ 80%]
+........................................................................ [ 83%]
+........................................................................ [ 85%]
+........................................................................ [ 88%]
+........................................................................ [ 90%]
+........................................................................ [ 93%]
+........................................................................ [ 95%]
+........................................................................ [ 97%]
+............................................................             [100%]
+=============================== warnings summary ===============================
+tests/test_backend_contract.py::TestKiroBackendContract::test_productive_completion_exposes_canonical_message
+  /home/symphony/symphony_workspaces/TIER-001/tests/test_backends.py:228: ResourceWarning: unclosed database in <sqlite3.Connection object at 0x77cf2fd64130>
+    self._lines = (blob or b"").splitlines(keepends=True)
+  Enable tracemalloc to get traceback where the object was allocated.
+  See https://docs.pytest.org/en/stable/how-to/capture-warnings.html#resource-warnings for more info.
+
+tests/test_backend_contract.py::TestKiroBackendContract::test_productive_completion_exposes_canonical_message
+  /home/symphony/symphony_workspaces/TIER-001/tests/test_backends.py:228: ResourceWarning: unclosed database in <sqlite3.Connection object at 0x77cf2fd644f0>
+    self._lines = (blob or b"").splitlines(keepends=True)
+  Enable tracemalloc to get traceback where the object was allocated.
+  See https://docs.pytest.org/en/stable/how-to/capture-warnings.html#resource-warnings for more info.
+
+tests/test_backend_contract.py::TestKiroBackendContract::test_productive_completion_exposes_canonical_message
+  /home/symphony/symphony_workspaces/TIER-001/tests/test_backends.py:228: ResourceWarning: unclosed database in <sqlite3.Connection object at 0x77cf2fd648b0>
+    self._lines = (blob or b"").splitlines(keepends=True)
+  Enable tracemalloc to get traceback where the object was allocated.
+  See https://docs.pytest.org/en/stable/how-to/capture-warnings.html#resource-warnings for more info.
+
+tests/test_backend_contract.py::TestKiroBackendContract::test_productive_completion_exposes_canonical_message
+  /home/symphony/symphony_workspaces/TIER-001/tests/test_backends.py:228: ResourceWarning: unclosed database in <sqlite3.Connection object at 0x77cf2fd649a0>
+    self._lines = (blob or b"").splitlines(keepends=True)
+  Enable tracemalloc to get traceback where the object was allocated.
+  See https://docs.pytest.org/en/stable/how-to/capture-warnings.html#resource-warnings for more info.
+
+tests/test_backend_contract.py::TestKiroBackendContract::test_productive_completion_exposes_canonical_message
+  /home/symphony/symphony_workspaces/TIER-001/tests/test_backends.py:228: ResourceWarning: unclosed database in <sqlite3.Connection object at 0x77cf2fd65030>
+    self._lines = (blob or b"").splitlines(keepends=True)
+  Enable tracemalloc to get traceback where the object was allocated.
+  See https://docs.pytest.org/en/stable/how-to/capture-warnings.html#resource-warnings for more info.
+
+tests/test_server_routes.py::test_refresh_post_returns_202_with_queued_envelope
+  /usr/lib/python3.14/pathlib/__init__.py:636: ResourceWarning: unclosed database in <sqlite3.Connection object at 0x77cf2ecd89a0>
+    return object.__new__(cls)
+  Enable tracemalloc to get traceback where the object was allocated.
+  See https://docs.pytest.org/en/stable/how-to/capture-warnings.html#resource-warnings for more info.
+
+tests/test_server_routes.py::test_refresh_post_returns_202_with_queued_envelope
+  /usr/lib/python3.14/pathlib/__init__.py:636: ResourceWarning: unclosed database in <sqlite3.Connection object at 0x77cf2fb87880>
+    return object.__new__(cls)
+  Enable tracemalloc to get traceback where the object was allocated.
+  See https://docs.pytest.org/en/stable/how-to/capture-warnings.html#resource-warnings for more info.
+
+tests/test_server_routes.py::test_refresh_post_returns_202_with_queued_envelope
+  /usr/lib/python3.14/pathlib/__init__.py:636: ResourceWarning: unclosed database in <sqlite3.Connection object at 0x77cf2f855990>
+    return object.__new__(cls)
+  Enable tracemalloc to get traceback where the object was allocated.
+  See https://docs.pytest.org/en/stable/how-to/capture-warnings.html#resource-warnings for more info.
+
+tests/test_server_routes.py::test_refresh_post_returns_202_with_queued_envelope
+  /usr/lib/python3.14/pathlib/__init__.py:636: ResourceWarning: unclosed database in <sqlite3.Connection object at 0x77cf2f82a020>
+    return object.__new__(cls)
+  Enable tracemalloc to get traceback where the object was allocated.
+  See https://docs.pytest.org/en/stable/how-to/capture-warnings.html#resource-warnings for more info.
+
+tests/test_server_routes.py::test_refresh_post_returns_202_with_queued_envelope
+  /usr/lib/python3.14/pathlib/__init__.py:636: ResourceWarning: unclosed database in <sqlite3.Connection object at 0x77cf2f8294e0>
+    return object.__new__(cls)
+  Enable tracemalloc to get traceback where the object was allocated.
+  See https://docs.pytest.org/en/stable/how-to/capture-warnings.html#resource-warnings for more info.
+
+tests/test_server_routes.py::test_refresh_post_returns_202_with_queued_envelope
+  /usr/lib/python3.14/pathlib/__init__.py:636: ResourceWarning: unclosed database in <sqlite3.Connection object at 0x77cf2f82a7a0>
+    return object.__new__(cls)
+  Enable tracemalloc to get traceback where the object was allocated.
+  See https://docs.pytest.org/en/stable/how-to/capture-warnings.html#resource-warnings for more info.
+
+tests/test_server_routes.py::test_refresh_post_returns_202_with_queued_envelope
+  /usr/lib/python3.14/pathlib/__init__.py:636: ResourceWarning: unclosed database in <sqlite3.Connection object at 0x77cf2f82a890>
+    return object.__new__(cls)
+  Enable tracemalloc to get traceback where the object was allocated.
+  See https://docs.pytest.org/en/stable/how-to/capture-warnings.html#resource-warnings for more info.
+
+tests/test_server_routes.py::test_refresh_post_returns_202_with_queued_envelope
+  /usr/lib/python3.14/pathlib/__init__.py:636: ResourceWarning: unclosed database in <sqlite3.Connection object at 0x77cf2f82b010>
+    return object.__new__(cls)
+  Enable tracemalloc to get traceback where the object was allocated.
+  See https://docs.pytest.org/en/stable/how-to/capture-warnings.html#resource-warnings for more info.
+
+tests/test_server_routes.py::test_refresh_post_returns_202_with_queued_envelope
+  /usr/lib/python3.14/pathlib/__init__.py:636: ResourceWarning: unclosed database in <sqlite3.Connection object at 0x77cf2f82b100>
+    return object.__new__(cls)
+  Enable tracemalloc to get traceback where the object was allocated.
+  See https://docs.pytest.org/en/stable/how-to/capture-warnings.html#resource-warnings for more info.
+
+tests/test_server_routes.py::test_refresh_post_returns_202_with_queued_envelope
+  /usr/lib/python3.14/pathlib/__init__.py:636: ResourceWarning: unclosed database in <sqlite3.Connection object at 0x77cf2f82b2e0>
+    return object.__new__(cls)
+  Enable tracemalloc to get traceback where the object was allocated.
+  See https://docs.pytest.org/en/stable/how-to/capture-warnings.html#resource-warnings for more info.
+
+tests/test_server_routes.py::test_refresh_post_returns_202_with_queued_envelope
+  /usr/lib/python3.14/pathlib/__init__.py:636: ResourceWarning: unclosed database in <sqlite3.Connection object at 0x77cf2f82bd30>
+    return object.__new__(cls)
+  Enable tracemalloc to get traceback where the object was allocated.
+  See https://docs.pytest.org/en/stable/how-to/capture-warnings.html#resource-warnings for more info.
+
+tests/test_server_routes.py::test_refresh_post_returns_202_with_queued_envelope
+  /usr/lib/python3.14/pathlib/__init__.py:636: ResourceWarning: unclosed database in <sqlite3.Connection object at 0x77cf2f82be20>
+    return object.__new__(cls)
+  Enable tracemalloc to get traceback where the object was allocated.
+  See https://docs.pytest.org/en/stable/how-to/capture-warnings.html#resource-warnings for more info.
+
+tests/test_server_routes.py::test_refresh_post_returns_202_with_queued_envelope
+  /usr/lib/python3.14/pathlib/__init__.py:636: ResourceWarning: unclosed database in <sqlite3.Connection object at 0x77cf2f728040>
+    return object.__new__(cls)
+  Enable tracemalloc to get traceback where the object was allocated.
+  See https://docs.pytest.org/en/stable/how-to/capture-warnings.html#resource-warnings for more info.
+
+tests/test_server_routes.py::test_refresh_post_returns_202_with_queued_envelope
+  /usr/lib/python3.14/pathlib/__init__.py:636: ResourceWarning: unclosed database in <sqlite3.Connection object at 0x77cf2f728400>
+    return object.__new__(cls)
+  Enable tracemalloc to get traceback where the object was allocated.
+  See https://docs.pytest.org/en/stable/how-to/capture-warnings.html#resource-warnings for more info.
+
+tests/test_server_routes.py::test_refresh_post_returns_202_with_queued_envelope
+  /usr/lib/python3.14/pathlib/__init__.py:636: ResourceWarning: unclosed database in <sqlite3.Connection object at 0x77cf2f45c310>
+    return object.__new__(cls)
+  Enable tracemalloc to get traceback where the object was allocated.
+  See https://docs.pytest.org/en/stable/how-to/capture-warnings.html#resource-warnings for more info.
+
+tests/test_server_routes.py::test_refresh_post_returns_202_with_queued_envelope
+  /usr/lib/python3.14/pathlib/__init__.py:636: ResourceWarning: unclosed database in <sqlite3.Connection object at 0x77cf2f45c4f0>
+    return object.__new__(cls)
+  Enable tracemalloc to get traceback where the object was allocated.
+  See https://docs.pytest.org/en/stable/how-to/capture-warnings.html#resource-warnings for more info.
+
+tests/test_server_routes.py::test_refresh_post_returns_202_with_queued_envelope
+  /usr/lib/python3.14/pathlib/__init__.py:636: ResourceWarning: unclosed database in <sqlite3.Connection object at 0x77cf2f45c400>
+    return object.__new__(cls)
+  Enable tracemalloc to get traceback where the object was allocated.
+  See https://docs.pytest.org/en/stable/how-to/capture-warnings.html#resource-warnings for more info.
+
+tests/test_server_routes.py::test_refresh_post_returns_202_with_queued_envelope
+  /usr/lib/python3.14/pathlib/__init__.py:636: ResourceWarning: unclosed database in <sqlite3.Connection object at 0x77cf2f45c7c0>
+    return object.__new__(cls)
+  Enable tracemalloc to get traceback where the object was allocated.
+  See https://docs.pytest.org/en/stable/how-to/capture-warnings.html#resource-warnings for more info.
+
+tests/test_server_routes.py::test_refresh_post_returns_202_with_queued_envelope
+  /usr/lib/python3.14/pathlib/__init__.py:636: ResourceWarning: unclosed database in <sqlite3.Connection object at 0x77cf2f45cb80>
+    return object.__new__(cls)
+  Enable tracemalloc to get traceback where the object was allocated.
+  See https://docs.pytest.org/en/stable/how-to/capture-warnings.html#resource-warnings for more info.
+
+tests/test_server_routes.py::test_refresh_post_returns_202_with_queued_envelope
+  /usr/lib/python3.14/pathlib/__init__.py:636: ResourceWarning: unclosed database in <sqlite3.Connection object at 0x77cf2f45cd60>
+    return object.__new__(cls)
+  Enable tracemalloc to get traceback where the object was allocated.
+  See https://docs.pytest.org/en/stable/how-to/capture-warnings.html#resource-warnings for more info.
+
+tests/test_server_routes.py::test_refresh_post_returns_202_with_queued_envelope
+  /usr/lib/python3.14/pathlib/__init__.py:636: ResourceWarning: unclosed database in <sqlite3.Connection object at 0x77cf2f45d030>
+    return object.__new__(cls)
+  Enable tracemalloc to get traceback where the object was allocated.
+  See https://docs.pytest.org/en/stable/how-to/capture-warnings.html#resource-warnings for more info.
+
+tests/test_server_routes.py::test_refresh_post_returns_202_with_queued_envelope
+  /usr/lib/python3.14/pathlib/__init__.py:636: ResourceWarning: unclosed database in <sqlite3.Connection object at 0x77cf2f45d300>
+    return object.__new__(cls)
+  Enable tracemalloc to get traceback where the object was allocated.
+  See https://docs.pytest.org/en/stable/how-to/capture-warnings.html#resource-warnings for more info.
+
+tests/test_server_routes.py::test_refresh_post_returns_202_with_queued_envelope
+  /usr/lib/python3.14/pathlib/__init__.py:636: ResourceWarning: unclosed database in <sqlite3.Connection object at 0x77cf2f45d990>
+    return object.__new__(cls)
+  Enable tracemalloc to get traceback where the object was allocated.
+  See https://docs.pytest.org/en/stable/how-to/capture-warnings.html#resource-warnings for more info.
+
+tests/test_server_routes.py::test_refresh_post_returns_202_with_queued_envelope
+  /usr/lib/python3.14/pathlib/__init__.py:636: ResourceWarning: unclosed database in <sqlite3.Connection object at 0x77cf2f45d6c0>
+    return object.__new__(cls)
+  Enable tracemalloc to get traceback where the object was allocated.
+  See https://docs.pytest.org/en/stable/how-to/capture-warnings.html#resource-warnings for more info.
+
+tests/test_server_routes.py::test_refresh_post_returns_202_with_queued_envelope
+  /usr/lib/python3.14/pathlib/__init__.py:636: ResourceWarning: unclosed database in <sqlite3.Connection object at 0x77cf2f45da80>
+    return object.__new__(cls)
+  Enable tracemalloc to get traceback where the object was allocated.
+  See https://docs.pytest.org/en/stable/how-to/capture-warnings.html#resource-warnings for more info.
+
+tests/test_server_routes.py::test_refresh_post_returns_202_with_queued_envelope
+  /usr/lib/python3.14/pathlib/__init__.py:636: ResourceWarning: unclosed database in <sqlite3.Connection object at 0x77cf2f45df30>
+    return object.__new__(cls)
+  Enable tracemalloc to get traceback where the object was allocated.
+  See https://docs.pytest.org/en/stable/how-to/capture-warnings.html#resource-warnings for more info.
+
+tests/test_server_routes.py::test_refresh_post_returns_202_with_queued_envelope
+  /usr/lib/python3.14/pathlib/__init__.py:636: ResourceWarning: unclosed database in <sqlite3.Connection object at 0x77cf2f45e5c0>
+    return object.__new__(cls)
+  Enable tracemalloc to get traceback where the object was allocated.
+  See https://docs.pytest.org/en/stable/how-to/capture-warnings.html#resource-warnings for more info.
+
+tests/test_server_routes.py::test_refresh_post_returns_202_with_queued_envelope
+  /usr/lib/python3.14/pathlib/__init__.py:636: ResourceWarning: unclosed database in <sqlite3.Connection object at 0x77cf2f45e7a0>
+    return object.__new__(cls)
+  Enable tracemalloc to get traceback where the object was allocated.
+  See https://docs.pytest.org/en/stable/how-to/capture-warnings.html#resource-warnings for more info.
+
+tests/test_server_routes.py::test_refresh_post_returns_202_with_queued_envelope
+  /usr/lib/python3.14/pathlib/__init__.py:636: ResourceWarning: unclosed database in <sqlite3.Connection object at 0x77cf2f45f100>
+    return object.__new__(cls)
+  Enable tracemalloc to get traceback where the object was allocated.
+  See https://docs.pytest.org/en/stable/how-to/capture-warnings.html#resource-warnings for more info.
+
+tests/test_server_routes.py::test_refresh_post_returns_202_with_queued_envelope
+  /usr/lib/python3.14/pathlib/__init__.py:636: ResourceWarning: unclosed database in <sqlite3.Connection object at 0x77cf2f45ee30>
+    return object.__new__(cls)
+  Enable tracemalloc to get traceback where the object was allocated.
+  See https://docs.pytest.org/en/stable/how-to/capture-warnings.html#resource-warnings for more info.
+
+tests/test_server_routes.py::test_refresh_post_returns_202_with_queued_envelope
+  /usr/lib/python3.14/pathlib/__init__.py:636: ResourceWarning: unclosed database in <sqlite3.Connection object at 0x77cf2f45f5b0>
+    return object.__new__(cls)
+  Enable tracemalloc to get traceback where the object was allocated.
+  See https://docs.pytest.org/en/stable/how-to/capture-warnings.html#resource-warnings for more info.
+
+tests/test_server_routes.py::test_refresh_post_returns_202_with_queued_envelope
+  /usr/lib/python3.14/pathlib/__init__.py:636: ResourceWarning: unclosed database in <sqlite3.Connection object at 0x77cf2f3bf790>
+    return object.__new__(cls)
+  Enable tracemalloc to get traceback where the object was allocated.
+  See https://docs.pytest.org/en/stable/how-to/capture-warnings.html#resource-warnings for more info.
+
+tests/test_server_routes.py::test_refresh_post_returns_202_with_queued_envelope
+  /usr/lib/python3.14/pathlib/__init__.py:636: ResourceWarning: unclosed database in <sqlite3.Connection object at 0x77cf2f3bfc40>
+    return object.__new__(cls)
+  Enable tracemalloc to get traceback where the object was allocated.
+  See https://docs.pytest.org/en/stable/how-to/capture-warnings.html#resource-warnings for more info.
+
+tests/test_server_routes.py::test_refresh_post_returns_202_with_queued_envelope
+  /usr/lib/python3.14/pathlib/__init__.py:636: ResourceWarning: unclosed database in <sqlite3.Connection object at 0x77cf2f3bff10>
+    return object.__new__(cls)
+  Enable tracemalloc to get traceback where the object was allocated.
+  See https://docs.pytest.org/en/stable/how-to/capture-warnings.html#resource-warnings for more info.
+
+tests/test_server_routes.py::test_refresh_post_returns_202_with_queued_envelope
+  /usr/lib/python3.14/pathlib/__init__.py:636: ResourceWarning: unclosed database in <sqlite3.Connection object at 0x77cf2f410220>
+    return object.__new__(cls)
+  Enable tracemalloc to get traceback where the object was allocated.
+  See https://docs.pytest.org/en/stable/how-to/capture-warnings.html#resource-warnings for more info.
+
+tests/test_server_routes.py::test_refresh_post_returns_202_with_queued_envelope
+  /usr/lib/python3.14/pathlib/__init__.py:636: ResourceWarning: unclosed database in <sqlite3.Connection object at 0x77cf2f410c70>
+    return object.__new__(cls)
+  Enable tracemalloc to get traceback where the object was allocated.
+  See https://docs.pytest.org/en/stable/how-to/capture-warnings.html#resource-warnings for more info.
+
+tests/test_server_routes.py::test_refresh_post_returns_202_with_queued_envelope
+  /usr/lib/python3.14/pathlib/__init__.py:636: ResourceWarning: unclosed database in <sqlite3.Connection object at 0x77cf2f288f40>
+    return object.__new__(cls)
+  Enable tracemalloc to get traceback where the object was allocated.
+  See https://docs.pytest.org/en/stable/how-to/capture-warnings.html#resource-warnings for more info.
+
+tests/test_server_routes.py::test_refresh_post_returns_202_with_queued_envelope
+  /usr/lib/python3.14/pathlib/__init__.py:636: ResourceWarning: unclosed database in <sqlite3.Connection object at 0x77cf2f289030>
+    return object.__new__(cls)
+  Enable tracemalloc to get traceback where the object was allocated.
+  See https://docs.pytest.org/en/stable/how-to/capture-warnings.html#resource-warnings for more info.
+
+tests/test_server_routes.py::test_refresh_post_returns_202_with_queued_envelope
+  /usr/lib/python3.14/pathlib/__init__.py:636: ResourceWarning: unclosed database in <sqlite3.Connection object at 0x77cf2f2894e0>
+    return object.__new__(cls)
+  Enable tracemalloc to get traceback where the object was allocated.
+  See https://docs.pytest.org/en/stable/how-to/capture-warnings.html#resource-warnings for more info.
+
+tests/test_server_routes.py::test_refresh_post_returns_202_with_queued_envelope
+  /usr/lib/python3.14/pathlib/__init__.py:636: ResourceWarning: unclosed database in <sqlite3.Connection object at 0x77cf2f2896c0>
+    return object.__new__(cls)
+  Enable tracemalloc to get traceback where the object was allocated.
+  See https://docs.pytest.org/en/stable/how-to/capture-warnings.html#resource-warnings for more info.
+
+tests/test_server_routes.py::test_refresh_post_returns_202_with_queued_envelope
+  /usr/lib/python3.14/pathlib/__init__.py:636: ResourceWarning: unclosed database in <sqlite3.Connection object at 0x77cf2f2898a0>
+    return object.__new__(cls)
+  Enable tracemalloc to get traceback where the object was allocated.
+  See https://docs.pytest.org/en/stable/how-to/capture-warnings.html#resource-warnings for more info.
+
+tests/test_server_routes.py::test_refresh_post_returns_202_with_queued_envelope
+  /usr/lib/python3.14/pathlib/__init__.py:636: ResourceWarning: unclosed database in <sqlite3.Connection object at 0x77cf2f289a80>
+    return object.__new__(cls)
+  Enable tracemalloc to get traceback where the object was allocated.
+  See https://docs.pytest.org/en/stable/how-to/capture-warnings.html#resource-warnings for more info.
+
+tests/test_server_routes.py::test_refresh_post_returns_202_with_queued_envelope
+  /usr/lib/python3.14/pathlib/__init__.py:636: ResourceWarning: unclosed database in <sqlite3.Connection object at 0x77cf2f289c60>
+    return object.__new__(cls)
+  Enable tracemalloc to get traceback where the object was allocated.
+  See https://docs.pytest.org/en/stable/how-to/capture-warnings.html#resource-warnings for more info.
+
+tests/test_server_routes.py::test_refresh_post_returns_202_with_queued_envelope
+  /usr/lib/python3.14/pathlib/__init__.py:636: ResourceWarning: unclosed database in <sqlite3.Connection object at 0x77cf2f28a020>
+    return object.__new__(cls)
+  Enable tracemalloc to get traceback where the object was allocated.
+  See https://docs.pytest.org/en/stable/how-to/capture-warnings.html#resource-warnings for more info.
+
+tests/test_server_routes.py::test_refresh_post_returns_202_with_queued_envelope
+  /usr/lib/python3.14/pathlib/__init__.py:636: ResourceWarning: unclosed database in <sqlite3.Connection object at 0x77cf2f289e40>
+    return object.__new__(cls)
+  Enable tracemalloc to get traceback where the object was allocated.
+  See https://docs.pytest.org/en/stable/how-to/capture-warnings.html#resource-warnings for more info.
+
+tests/test_server_routes.py::test_refresh_post_returns_202_with_queued_envelope
+  /usr/lib/python3.14/pathlib/__init__.py:636: ResourceWarning: unclosed database in <sqlite3.Connection object at 0x77cf2f28a200>
+    return object.__new__(cls)
+  Enable tracemalloc to get traceback where the object was allocated.
+  See https://docs.pytest.org/en/stable/how-to/capture-warnings.html#resource-warnings for more info.
+
+tests/test_server_routes.py::test_refresh_post_returns_202_with_queued_envelope
+  /usr/lib/python3.14/pathlib/__init__.py:636: ResourceWarning: unclosed database in <sqlite3.Connection object at 0x77cf2f28a110>
+    return object.__new__(cls)
+  Enable tracemalloc to get traceback where the object was allocated.
+  See https://docs.pytest.org/en/stable/how-to/capture-warnings.html#resource-warnings for more info.
+
+tests/test_server_routes.py::test_refresh_post_returns_202_with_queued_envelope
+  /usr/lib/python3.14/pathlib/__init__.py:636: ResourceWarning: unclosed database in <sqlite3.Connection object at 0x77cf2f28a5c0>
+    return object.__new__(cls)
+  Enable tracemalloc to get traceback where the object was allocated.
+  See https://docs.pytest.org/en/stable/how-to/capture-warnings.html#resource-warnings for more info.
+
+tests/test_server_routes.py::test_refresh_post_returns_202_with_queued_envelope
+  /usr/lib/python3.14/pathlib/__init__.py:636: ResourceWarning: unclosed database in <sqlite3.Connection object at 0x77cf2f28a3e0>
+    return object.__new__(cls)
+  Enable tracemalloc to get traceback where the object was allocated.
+  See https://docs.pytest.org/en/stable/how-to/capture-warnings.html#resource-warnings for more info.
+
+tests/test_server_routes.py::test_refresh_post_returns_202_with_queued_envelope
+  /usr/lib/python3.14/pathlib/__init__.py:636: ResourceWarning: unclosed database in <sqlite3.Connection object at 0x77cf2f28aa70>
+    return object.__new__(cls)
+  Enable tracemalloc to get traceback where the object was allocated.
+  See https://docs.pytest.org/en/stable/how-to/capture-warnings.html#resource-warnings for more info.
+
+tests/test_server_routes.py::test_refresh_post_returns_202_with_queued_envelope
+  /usr/lib/python3.14/pathlib/__init__.py:636: ResourceWarning: unclosed database in <sqlite3.Connection object at 0x77cf2f28a7a0>
+    return object.__new__(cls)
+  Enable tracemalloc to get traceback where the object was allocated.
+  See https://docs.pytest.org/en/stable/how-to/capture-warnings.html#resource-warnings for more info.
+
+tests/test_server_routes.py::test_refresh_post_returns_202_with_queued_envelope
+  /usr/lib/python3.14/pathlib/__init__.py:636: ResourceWarning: unclosed database in <sqlite3.Connection object at 0x77cf2f28ad40>
+    return object.__new__(cls)
+  Enable tracemalloc to get traceback where the object was allocated.
+  See https://docs.pytest.org/en/stable/how-to/capture-warnings.html#resource-warnings for more info.
+
+tests/test_server_routes.py::test_refresh_post_returns_202_with_queued_envelope
+  /usr/lib/python3.14/pathlib/__init__.py:636: ResourceWarning: unclosed database in <sqlite3.Connection object at 0x77cf2f28af20>
+    return object.__new__(cls)
+  Enable tracemalloc to get traceback where the object was allocated.
+  See https://docs.pytest.org/en/stable/how-to/capture-warnings.html#resource-warnings for more info.
+
+tests/test_server_routes.py::test_refresh_post_returns_202_with_queued_envelope
+  /usr/lib/python3.14/pathlib/__init__.py:636: ResourceWarning: unclosed database in <sqlite3.Connection object at 0x77cf2f3147c0>
+    return object.__new__(cls)
+  Enable tracemalloc to get traceback where the object was allocated.
+  See https://docs.pytest.org/en/stable/how-to/capture-warnings.html#resource-warnings for more info.
+
+tests/test_server_routes.py::test_refresh_post_returns_202_with_queued_envelope
+  /usr/lib/python3.14/pathlib/__init__.py:636: ResourceWarning: unclosed database in <sqlite3.Connection object at 0x77cf2f3144f0>
+    return object.__new__(cls)
+  Enable tracemalloc to get traceback where the object was allocated.
+  See https://docs.pytest.org/en/stable/how-to/capture-warnings.html#resource-warnings for more info.
+
+tests/test_server_routes.py::test_refresh_post_returns_202_with_queued_envelope
+  /usr/lib/python3.14/pathlib/__init__.py:636: ResourceWarning: unclosed database in <sqlite3.Connection object at 0x77cf2f3153f0>
+    return object.__new__(cls)
+  Enable tracemalloc to get traceback where the object was allocated.
+  See https://docs.pytest.org/en/stable/how-to/capture-warnings.html#resource-warnings for more info.
+
+tests/test_server_routes.py::test_refresh_post_returns_202_with_queued_envelope
+  /usr/lib/python3.14/pathlib/__init__.py:636: ResourceWarning: unclosed database in <sqlite3.Connection object at 0x77cf2f317100>
+    return object.__new__(cls)
+  Enable tracemalloc to get traceback where the object was allocated.
+  See https://docs.pytest.org/en/stable/how-to/capture-warnings.html#resource-warnings for more info.
+
+tests/test_server_routes.py::test_refresh_post_returns_202_with_queued_envelope
+  /usr/lib/python3.14/pathlib/__init__.py:636: ResourceWarning: unclosed database in <sqlite3.Connection object at 0x77cf2f3173d0>
+    return object.__new__(cls)
+  Enable tracemalloc to get traceback where the object was allocated.
+  See https://docs.pytest.org/en/stable/how-to/capture-warnings.html#resource-warnings for more info.
+
+tests/test_server_routes.py::test_refresh_post_returns_202_with_queued_envelope
+  /usr/lib/python3.14/pathlib/__init__.py:636: ResourceWarning: unclosed database in <sqlite3.Connection object at 0x77cf2f198040>
+    return object.__new__(cls)
+  Enable tracemalloc to get traceback where the object was allocated.
+  See https://docs.pytest.org/en/stable/how-to/capture-warnings.html#resource-warnings for more info.
+
+tests/test_server_routes.py::test_refresh_post_returns_202_with_queued_envelope
+  /usr/lib/python3.14/pathlib/__init__.py:636: ResourceWarning: unclosed database in <sqlite3.Connection object at 0x77cf2f198a90>
+    return object.__new__(cls)
+  Enable tracemalloc to get traceback where the object was allocated.
+  See https://docs.pytest.org/en/stable/how-to/capture-warnings.html#resource-warnings for more info.
+
+tests/test_server_routes.py::test_refresh_post_returns_202_with_queued_envelope
+  /usr/lib/python3.14/pathlib/__init__.py:636: ResourceWarning: unclosed database in <sqlite3.Connection object at 0x77cf2f198b80>
+    return object.__new__(cls)
+  Enable tracemalloc to get traceback where the object was allocated.
+  See https://docs.pytest.org/en/stable/how-to/capture-warnings.html#resource-warnings for more info.
+
+tests/test_server_routes.py::test_refresh_post_returns_202_with_queued_envelope
+  /usr/lib/python3.14/pathlib/__init__.py:636: ResourceWarning: unclosed database in <sqlite3.Connection object at 0x77cf2f198d60>
+    return object.__new__(cls)
+  Enable tracemalloc to get traceback where the object was allocated.
+  See https://docs.pytest.org/en/stable/how-to/capture-warnings.html#resource-warnings for more info.
+
+tests/test_server_routes.py::test_refresh_post_returns_202_with_queued_envelope
+  /usr/lib/python3.14/pathlib/__init__.py:636: ResourceWarning: unclosed database in <sqlite3.Connection object at 0x77cf2f199120>
+    return object.__new__(cls)
+  Enable tracemalloc to get traceback where the object was allocated.
+  See https://docs.pytest.org/en/stable/how-to/capture-warnings.html#resource-warnings for more info.
+
+tests/test_server_routes.py::test_refresh_post_returns_202_with_queued_envelope
+  /usr/lib/python3.14/pathlib/__init__.py:636: ResourceWarning: unclosed database in <sqlite3.Connection object at 0x77cf2f1993f0>
+    return object.__new__(cls)
+  Enable tracemalloc to get traceback where the object was allocated.
+  See https://docs.pytest.org/en/stable/how-to/capture-warnings.html#resource-warnings for more info.
+
+tests/test_server_routes.py::test_refresh_post_returns_202_with_queued_envelope
+  /usr/lib/python3.14/pathlib/__init__.py:636: ResourceWarning: unclosed database in <sqlite3.Connection object at 0x77cf2f1994e0>
+    return object.__new__(cls)
+  Enable tracemalloc to get traceback where the object was allocated.
+  See https://docs.pytest.org/en/stable/how-to/capture-warnings.html#resource-warnings for more info.
+
+tests/test_server_routes.py::test_refresh_post_returns_202_with_queued_envelope
+  /usr/lib/python3.14/pathlib/__init__.py:636: ResourceWarning: unclosed database in <sqlite3.Connection object at 0x77cf2f1998a0>
+    return object.__new__(cls)
+  Enable tracemalloc to get traceback where the object was allocated.
+  See https://docs.pytest.org/en/stable/how-to/capture-warnings.html#resource-warnings for more info.
+
+tests/test_server_routes.py::test_refresh_post_returns_202_with_queued_envelope
+  /usr/lib/python3.14/pathlib/__init__.py:636: ResourceWarning: unclosed database in <sqlite3.Connection object at 0x77cf2f199990>
+    return object.__new__(cls)
+  Enable tracemalloc to get traceback where the object was allocated.
+  See https://docs.pytest.org/en/stable/how-to/capture-warnings.html#resource-warnings for more info.
+
+tests/test_server_routes.py::test_refresh_post_returns_202_with_queued_envelope
+  /usr/lib/python3.14/pathlib/__init__.py:636: ResourceWarning: unclosed database in <sqlite3.Connection object at 0x77cf2f199b70>
+    return object.__new__(cls)
+  Enable tracemalloc to get traceback where the object was allocated.
+  See https://docs.pytest.org/en/stable/how-to/capture-warnings.html#resource-warnings for more info.
+
+tests/test_server_routes.py::test_refresh_post_returns_202_with_queued_envelope
+  /usr/lib/python3.14/pathlib/__init__.py:636: ResourceWarning: unclosed database in <sqlite3.Connection object at 0x77cf2f199d50>
+    return object.__new__(cls)
+  Enable tracemalloc to get traceback where the object was allocated.
+  See https://docs.pytest.org/en/stable/how-to/capture-warnings.html#resource-warnings for more info.
+
+tests/test_server_routes.py::test_refresh_post_returns_202_with_queued_envelope
+  /usr/lib/python3.14/pathlib/__init__.py:636: ResourceWarning: unclosed database in <sqlite3.Connection object at 0x77cf2f19a110>
+    return object.__new__(cls)
+  Enable tracemalloc to get traceback where the object was allocated.
+  See https://docs.pytest.org/en/stable/how-to/capture-warnings.html#resource-warnings for more info.
+
+tests/test_server_routes.py::test_refresh_post_returns_202_with_queued_envelope
+  /usr/lib/python3.14/pathlib/__init__.py:636: ResourceWarning: unclosed database in <sqlite3.Connection object at 0x77cf2f19a5c0>
+    return object.__new__(cls)
+  Enable tracemalloc to get traceback where the object was allocated.
+  See https://docs.pytest.org/en/stable/how-to/capture-warnings.html#resource-warnings for more info.
+
+tests/test_server_routes.py::test_refresh_post_returns_202_with_queued_envelope
+  /usr/lib/python3.14/pathlib/__init__.py:636: ResourceWarning: unclosed database in <sqlite3.Connection object at 0x77cf2f19a3e0>
+    return object.__new__(cls)
+  Enable tracemalloc to get traceback where the object was allocated.
+  See https://docs.pytest.org/en/stable/how-to/capture-warnings.html#resource-warnings for more info.
+
+tests/test_server_routes.py::test_refresh_post_returns_202_with_queued_envelope
+  /usr/lib/python3.14/pathlib/__init__.py:636: ResourceWarning: unclosed database in <sqlite3.Connection object at 0x77cf2f19aa70>
+    return object.__new__(cls)
+  Enable tracemalloc to get traceback where the object was allocated.
+  See https://docs.pytest.org/en/stable/how-to/capture-warnings.html#resource-warnings for more info.
+
+tests/test_server_routes.py::test_refresh_post_returns_202_with_queued_envelope
+  /usr/lib/python3.14/pathlib/__init__.py:636: ResourceWarning: unclosed database in <sqlite3.Connection object at 0x77cf2f19bd30>
+    return object.__new__(cls)
+  Enable tracemalloc to get traceback where the object was allocated.
+  See https://docs.pytest.org/en/stable/how-to/capture-warnings.html#resource-warnings for more info.
+
+tests/test_server_routes.py::test_refresh_post_returns_202_with_queued_envelope
+  /usr/lib/python3.14/pathlib/__init__.py:636: ResourceWarning: unclosed database in <sqlite3.Connection object at 0x77cf2f240040>
+    return object.__new__(cls)
+  Enable tracemalloc to get traceback where the object was allocated.
+  See https://docs.pytest.org/en/stable/how-to/capture-warnings.html#resource-warnings for more info.
+
+tests/test_server_routes.py::test_refresh_post_returns_202_with_queued_envelope
+  /usr/lib/python3.14/pathlib/__init__.py:636: ResourceWarning: unclosed database in <sqlite3.Connection object at 0x77cf2f241990>
+    return object.__new__(cls)
+  Enable tracemalloc to get traceback where the object was allocated.
+  See https://docs.pytest.org/en/stable/how-to/capture-warnings.html#resource-warnings for more info.
+
+tests/test_server_routes.py::test_refresh_post_returns_202_with_queued_envelope
+  /usr/lib/python3.14/pathlib/__init__.py:636: ResourceWarning: unclosed database in <sqlite3.Connection object at 0x77cf2f2417b0>
+    return object.__new__(cls)
+  Enable tracemalloc to get traceback where the object was allocated.
+  See https://docs.pytest.org/en/stable/how-to/capture-warnings.html#resource-warnings for more info.
+
+tests/test_server_routes.py::test_refresh_post_returns_202_with_queued_envelope
+  /usr/lib/python3.14/pathlib/__init__.py:636: ResourceWarning: unclosed database in <sqlite3.Connection object at 0x77cf2f242890>
+    return object.__new__(cls)
+  Enable tracemalloc to get traceback where the object was allocated.
+  See https://docs.pytest.org/en/stable/how-to/capture-warnings.html#resource-warnings for more info.
+
+tests/test_server_routes.py::test_refresh_post_returns_202_with_queued_envelope
+  /usr/lib/python3.14/pathlib/__init__.py:636: ResourceWarning: unclosed database in <sqlite3.Connection object at 0x77cf2f2424d0>
+    return object.__new__(cls)
+  Enable tracemalloc to get traceback where the object was allocated.
+  See https://docs.pytest.org/en/stable/how-to/capture-warnings.html#resource-warnings for more info.
+
+tests/test_server_routes.py::test_refresh_post_returns_202_with_queued_envelope
+  /usr/lib/python3.14/pathlib/__init__.py:636: ResourceWarning: unclosed database in <sqlite3.Connection object at 0x77cf2f2425c0>
+    return object.__new__(cls)
+  Enable tracemalloc to get traceback where the object was allocated.
+  See https://docs.pytest.org/en/stable/how-to/capture-warnings.html#resource-warnings for more info.
+
+tests/test_server_routes.py::test_refresh_post_returns_202_with_queued_envelope
+  /usr/lib/python3.14/pathlib/__init__.py:636: ResourceWarning: unclosed database in <sqlite3.Connection object at 0x77cf2f242c50>
+    return object.__new__(cls)
+  Enable tracemalloc to get traceback where the object was allocated.
+  See https://docs.pytest.org/en/stable/how-to/capture-warnings.html#resource-warnings for more info.
+
+tests/test_server_routes.py::test_refresh_post_returns_202_with_queued_envelope
+  /usr/lib/python3.14/pathlib/__init__.py:636: ResourceWarning: unclosed database in <sqlite3.Connection object at 0x77cf2f242f20>
+    return object.__new__(cls)
+  Enable tracemalloc to get traceback where the object was allocated.
+  See https://docs.pytest.org/en/stable/how-to/capture-warnings.html#resource-warnings for more info.
+
+tests/test_server_routes.py::test_refresh_post_returns_202_with_queued_envelope
+  /usr/lib/python3.14/pathlib/__init__.py:636: ResourceWarning: unclosed database in <sqlite3.Connection object at 0x77cf2f243100>
+    return object.__new__(cls)
+  Enable tracemalloc to get traceback where the object was allocated.
+  See https://docs.pytest.org/en/stable/how-to/capture-warnings.html#resource-warnings for more info.
+
+tests/test_server_routes.py::test_refresh_post_returns_202_with_queued_envelope
+  /usr/lib/python3.14/pathlib/__init__.py:636: ResourceWarning: unclosed database in <sqlite3.Connection object at 0x77cf2f2422f0>
+    return object.__new__(cls)
+  Enable tracemalloc to get traceback where the object was allocated.
+  See https://docs.pytest.org/en/stable/how-to/capture-warnings.html#resource-warnings for more info.
+
+tests/test_server_routes.py::test_refresh_post_returns_202_with_queued_envelope
+  /usr/lib/python3.14/pathlib/__init__.py:636: ResourceWarning: unclosed database in <sqlite3.Connection object at 0x77cf2f243a60>
+    return object.__new__(cls)
+  Enable tracemalloc to get traceback where the object was allocated.
+  See https://docs.pytest.org/en/stable/how-to/capture-warnings.html#resource-warnings for more info.
+
+tests/test_server_routes.py::test_refresh_post_returns_202_with_queued_envelope
+  /usr/lib/python3.14/pathlib/__init__.py:636: ResourceWarning: unclosed database in <sqlite3.Connection object at 0x77cf2f243790>
+    return object.__new__(cls)
+  Enable tracemalloc to get traceback where the object was allocated.
+  See https://docs.pytest.org/en/stable/how-to/capture-warnings.html#resource-warnings for more info.
+
+tests/test_server_routes.py::test_refresh_post_returns_202_with_queued_envelope
+  /usr/lib/python3.14/pathlib/__init__.py:636: ResourceWarning: unclosed database in <sqlite3.Connection object at 0x77cf2f2433d0>
+    return object.__new__(cls)
+  Enable tracemalloc to get traceback where the object was allocated.
+  See https://docs.pytest.org/en/stable/how-to/capture-warnings.html#resource-warnings for more info.
+
+tests/test_server_routes.py::test_refresh_post_returns_202_with_queued_envelope
+  /usr/lib/python3.14/pathlib/__init__.py:636: ResourceWarning: unclosed database in <sqlite3.Connection object at 0x77cf2f243d30>
+    return object.__new__(cls)
+  Enable tracemalloc to get traceback where the object was allocated.
+  See https://docs.pytest.org/en/stable/how-to/capture-warnings.html#resource-warnings for more info.
+
+tests/test_server_routes.py::test_refresh_post_returns_202_with_queued_envelope
+  /usr/lib/python3.14/pathlib/__init__.py:636: ResourceWarning: unclosed database in <sqlite3.Connection object at 0x77cf2f243c40>
+    return object.__new__(cls)
+  Enable tracemalloc to get traceback where the object was allocated.
+  See https://docs.pytest.org/en/stable/how-to/capture-warnings.html#resource-warnings for more info.
+
+tests/test_server_routes.py::test_refresh_post_returns_202_with_queued_envelope
+  /usr/lib/python3.14/pathlib/__init__.py:636: ResourceWarning: unclosed database in <sqlite3.Connection object at 0x77cf2f110a90>
+    return object.__new__(cls)
+  Enable tracemalloc to get traceback where the object was allocated.
+  See https://docs.pytest.org/en/stable/how-to/capture-warnings.html#resource-warnings for more info.
+
+tests/test_server_routes.py::test_refresh_post_returns_202_with_queued_envelope
+  /usr/lib/python3.14/pathlib/__init__.py:636: ResourceWarning: unclosed database in <sqlite3.Connection object at 0x77cf2f110c70>
+    return object.__new__(cls)
+  Enable tracemalloc to get traceback where the object was allocated.
+  See https://docs.pytest.org/en/stable/how-to/capture-warnings.html#resource-warnings for more info.
+
+tests/test_server_routes.py::test_refresh_post_returns_202_with_queued_envelope
+  /usr/lib/python3.14/pathlib/__init__.py:636: ResourceWarning: unclosed database in <sqlite3.Connection object at 0x77cf2f110e50>
+    return object.__new__(cls)
+  Enable tracemalloc to get traceback where the object was allocated.
+  See https://docs.pytest.org/en/stable/how-to/capture-warnings.html#resource-warnings for more info.
+
+tests/test_server_routes.py::test_refresh_post_returns_202_with_queued_envelope
+  /usr/lib/python3.14/pathlib/__init__.py:636: ResourceWarning: unclosed database in <sqlite3.Connection object at 0x77cf2f113970>
+    return object.__new__(cls)
+  Enable tracemalloc to get traceback where the object was allocated.
+  See https://docs.pytest.org/en/stable/how-to/capture-warnings.html#resource-warnings for more info.
+
+tests/test_server_routes.py::test_refresh_post_returns_202_with_queued_envelope
+  /usr/lib/python3.14/pathlib/__init__.py:636: ResourceWarning: unclosed database in <sqlite3.Connection object at 0x77cf2f113100>
+    return object.__new__(cls)
+  Enable tracemalloc to get traceback where the object was allocated.
+  See https://docs.pytest.org/en/stable/how-to/capture-warnings.html#resource-warnings for more info.
+
+tests/test_server_routes.py::test_refresh_post_returns_202_with_queued_envelope
+  /usr/lib/python3.14/pathlib/__init__.py:636: ResourceWarning: unclosed database in <sqlite3.Connection object at 0x77cf2ef60040>
+    return object.__new__(cls)
+  Enable tracemalloc to get traceback where the object was allocated.
+  See https://docs.pytest.org/en/stable/how-to/capture-warnings.html#resource-warnings for more info.
+
+tests/test_server_routes.py::test_refresh_post_returns_202_with_queued_envelope
+  /usr/lib/python3.14/pathlib/__init__.py:636: ResourceWarning: unclosed database in <sqlite3.Connection object at 0x77cf2ef60400>
+    return object.__new__(cls)
+  Enable tracemalloc to get traceback where the object was allocated.
+  See https://docs.pytest.org/en/stable/how-to/capture-warnings.html#resource-warnings for more info.
+
+tests/test_server_routes.py::test_refresh_post_returns_202_with_queued_envelope
+  /usr/lib/python3.14/pathlib/__init__.py:636: ResourceWarning: unclosed database in <sqlite3.Connection object at 0x77cf2ef60310>
+    return object.__new__(cls)
+  Enable tracemalloc to get traceback where the object was allocated.
+  See https://docs.pytest.org/en/stable/how-to/capture-warnings.html#resource-warnings for more info.
+
+tests/test_server_routes.py::test_refresh_post_returns_202_with_queued_envelope
+  /usr/lib/python3.14/pathlib/__init__.py:636: ResourceWarning: unclosed database in <sqlite3.Connection object at 0x77cf2ef61c60>
+    return object.__new__(cls)
+  Enable tracemalloc to get traceback where the object was allocated.
+  See https://docs.pytest.org/en/stable/how-to/capture-warnings.html#resource-warnings for more info.
+
+tests/test_server_routes.py::test_refresh_post_returns_202_with_queued_envelope
+  /usr/lib/python3.14/pathlib/__init__.py:636: ResourceWarning: unclosed database in <sqlite3.Connection object at 0x77cf2ef63c40>
+    return object.__new__(cls)
+  Enable tracemalloc to get traceback where the object was allocated.
+  See https://docs.pytest.org/en/stable/how-to/capture-warnings.html#resource-warnings for more info.
+
+tests/test_server_routes.py::test_refresh_post_returns_202_with_queued_envelope
+  /usr/lib/python3.14/pathlib/__init__.py:636: ResourceWarning: unclosed database in <sqlite3.Connection object at 0x77cf2ee14040>
+    return object.__new__(cls)
+  Enable tracemalloc to get traceback where the object was allocated.
+  See https://docs.pytest.org/en/stable/how-to/capture-warnings.html#resource-warnings for more info.
+
+tests/test_server_routes.py::test_refresh_post_returns_202_with_queued_envelope
+  /usr/lib/python3.14/pathlib/__init__.py:636: ResourceWarning: unclosed database in <sqlite3.Connection object at 0x77cf2ee14130>
+    return object.__new__(cls)
+  Enable tracemalloc to get traceback where the object was allocated.
+  See https://docs.pytest.org/en/stable/how-to/capture-warnings.html#resource-warnings for more info.
+
+tests/test_server_routes.py::test_refresh_post_returns_202_with_queued_envelope
+  /usr/lib/python3.14/pathlib/__init__.py:636: ResourceWarning: unclosed database in <sqlite3.Connection object at 0x77cf2ee149a0>
+    return object.__new__(cls)
+  Enable tracemalloc to get traceback where the object was allocated.
+  See https://docs.pytest.org/en/stable/how-to/capture-warnings.html#resource-warnings for more info.
+
+tests/test_server_routes.py::test_refresh_post_returns_202_with_queued_envelope
+  /usr/lib/python3.14/pathlib/__init__.py:636: ResourceWarning: unclosed database in <sqlite3.Connection object at 0x77cf2ee14a90>
+    return object.__new__(cls)
+  Enable tracemalloc to get traceback where the object was allocated.
+  See https://docs.pytest.org/en/stable/how-to/capture-warnings.html#resource-warnings for more info.
+
+tests/test_server_routes.py::test_refresh_post_returns_202_with_queued_envelope
+  /usr/lib/python3.14/pathlib/__init__.py:636: ResourceWarning: unclosed database in <sqlite3.Connection object at 0x77cf2ee14b80>
+    return object.__new__(cls)
+  Enable tracemalloc to get traceback where the object was allocated.
+  See https://docs.pytest.org/en/stable/how-to/capture-warnings.html#resource-warnings for more info.
+
+tests/test_server_routes.py::test_refresh_post_returns_202_with_queued_envelope
+  /usr/lib/python3.14/pathlib/__init__.py:636: ResourceWarning: unclosed database in <sqlite3.Connection object at 0x77cf2ee15030>
+    return object.__new__(cls)
+  Enable tracemalloc to get traceback where the object was allocated.
+  See https://docs.pytest.org/en/stable/how-to/capture-warnings.html#resource-warnings for more info.
+
+tests/test_server_routes.py::test_refresh_post_returns_202_with_queued_envelope
+  /usr/lib/python3.14/pathlib/__init__.py:636: ResourceWarning: unclosed database in <sqlite3.Connection object at 0x77cf2ee14f40>
+    return object.__new__(cls)
+  Enable tracemalloc to get traceback where the object was allocated.
+  See https://docs.pytest.org/en/stable/how-to/capture-warnings.html#resource-warnings for more info.
+
+tests/test_server_routes.py::test_refresh_post_returns_202_with_queued_envelope
+  /usr/lib/python3.14/pathlib/__init__.py:636: ResourceWarning: unclosed database in <sqlite3.Connection object at 0x77cf2ee15b70>
+    return object.__new__(cls)
+  Enable tracemalloc to get traceback where the object was allocated.
+  See https://docs.pytest.org/en/stable/how-to/capture-warnings.html#resource-warnings for more info.
+
+tests/test_server_routes.py::test_refresh_post_returns_202_with_queued_envelope
+  /usr/lib/python3.14/pathlib/__init__.py:636: ResourceWarning: unclosed database in <sqlite3.Connection object at 0x77cf2ee167a0>
+    return object.__new__(cls)
+  Enable tracemalloc to get traceback where the object was allocated.
+  See https://docs.pytest.org/en/stable/how-to/capture-warnings.html#resource-warnings for more info.
+
+tests/test_server_routes.py::test_refresh_post_returns_202_with_queued_envelope
+  /usr/lib/python3.14/pathlib/__init__.py:636: ResourceWarning: unclosed database in <sqlite3.Connection object at 0x77cf2ee16c50>
+    return object.__new__(cls)
+  Enable tracemalloc to get traceback where the object was allocated.
+  See https://docs.pytest.org/en/stable/how-to/capture-warnings.html#resource-warnings for more info.
+
+tests/test_server_routes.py::test_refresh_post_returns_202_with_queued_envelope
+  /usr/lib/python3.14/pathlib/__init__.py:636: ResourceWarning: unclosed database in <sqlite3.Connection object at 0x77cf2ee165c0>
+    return object.__new__(cls)
+  Enable tracemalloc to get traceback where the object was allocated.
+  See https://docs.pytest.org/en/stable/how-to/capture-warnings.html#resource-warnings for more info.
+
+tests/test_server_routes.py::test_refresh_post_returns_202_with_queued_envelope
+  /usr/lib/python3.14/pathlib/__init__.py:636: ResourceWarning: unclosed database in <sqlite3.Connection object at 0x77cf2ee16e30>
+    return object.__new__(cls)
+  Enable tracemalloc to get traceback where the object was allocated.
+  See https://docs.pytest.org/en/stable/how-to/capture-warnings.html#resource-warnings for more info.
+
+tests/test_server_routes.py::test_refresh_post_returns_202_with_queued_envelope
+  /usr/lib/python3.14/pathlib/__init__.py:636: ResourceWarning: unclosed database in <sqlite3.Connection object at 0x77cf2ee16a70>
+    return object.__new__(cls)
+  Enable tracemalloc to get traceback where the object was allocated.
+  See https://docs.pytest.org/en/stable/how-to/capture-warnings.html#resource-warnings for more info.
+
+tests/test_server_routes.py::test_refresh_post_returns_202_with_queued_envelope
+  /usr/lib/python3.14/pathlib/__init__.py:636: ResourceWarning: unclosed database in <sqlite3.Connection object at 0x77cf2ee16b60>
+    return object.__new__(cls)
+  Enable tracemalloc to get traceback where the object was allocated.
+  See https://docs.pytest.org/en/stable/how-to/capture-warnings.html#resource-warnings for more info.
+
+tests/test_server_routes.py::test_refresh_post_returns_202_with_queued_envelope
+  /usr/lib/python3.14/pathlib/__init__.py:636: ResourceWarning: unclosed database in <sqlite3.Connection object at 0x77cf2ee17100>
+    return object.__new__(cls)
+  Enable tracemalloc to get traceback where the object was allocated.
+  See https://docs.pytest.org/en/stable/how-to/capture-warnings.html#resource-warnings for more info.
+
+tests/test_server_routes.py::test_refresh_post_returns_202_with_queued_envelope
+  /usr/lib/python3.14/pathlib/__init__.py:636: ResourceWarning: unclosed database in <sqlite3.Connection object at 0x77cf2ee172e0>
+    return object.__new__(cls)
+  Enable tracemalloc to get traceback where the object was allocated.
+  See https://docs.pytest.org/en/stable/how-to/capture-warnings.html#resource-warnings for more info.
+
+tests/test_server_routes.py::test_refresh_post_returns_202_with_queued_envelope
+  /usr/lib/python3.14/pathlib/__init__.py:636: ResourceWarning: unclosed database in <sqlite3.Connection object at 0x77cf2ee17b50>
+    return object.__new__(cls)
+  Enable tracemalloc to get traceback where the object was allocated.
+  See https://docs.pytest.org/en/stable/how-to/capture-warnings.html#resource-warnings for more info.
+
+tests/test_server_routes.py::test_refresh_post_returns_202_with_queued_envelope
+  /usr/lib/python3.14/pathlib/__init__.py:636: ResourceWarning: unclosed database in <sqlite3.Connection object at 0x77cf2ee17c40>
+    return object.__new__(cls)
+  Enable tracemalloc to get traceback where the object was allocated.
+  See https://docs.pytest.org/en/stable/how-to/capture-warnings.html#resource-warnings for more info.
+
+tests/test_server_routes.py::test_refresh_post_returns_202_with_queued_envelope
+  /usr/lib/python3.14/pathlib/__init__.py:636: ResourceWarning: unclosed database in <sqlite3.Connection object at 0x77cf2ee17d30>
+    return object.__new__(cls)
+  Enable tracemalloc to get traceback where the object was allocated.
+  See https://docs.pytest.org/en/stable/how-to/capture-warnings.html#resource-warnings for more info.
+
+tests/test_server_routes.py::test_refresh_post_returns_202_with_queued_envelope
+  /usr/lib/python3.14/pathlib/__init__.py:636: ResourceWarning: unclosed database in <sqlite3.Connection object at 0x77cf2e5f8130>
+    return object.__new__(cls)
+  Enable tracemalloc to get traceback where the object was allocated.
+  See https://docs.pytest.org/en/stable/how-to/capture-warnings.html#resource-warnings for more info.
+
+tests/test_server_routes.py::test_refresh_post_returns_202_with_queued_envelope
+  /usr/lib/python3.14/pathlib/__init__.py:636: ResourceWarning: unclosed database in <sqlite3.Connection object at 0x77cf2e5f8310>
+    return object.__new__(cls)
+  Enable tracemalloc to get traceback where the object was allocated.
+  See https://docs.pytest.org/en/stable/how-to/capture-warnings.html#resource-warnings for more info.
+
+tests/test_server_routes.py::test_refresh_post_returns_202_with_queued_envelope
+  /usr/lib/python3.14/pathlib/__init__.py:636: ResourceWarning: unclosed database in <sqlite3.Connection object at 0x77cf2e5f84f0>
+    return object.__new__(cls)
+  Enable tracemalloc to get traceback where the object was allocated.
+  See https://docs.pytest.org/en/stable/how-to/capture-warnings.html#resource-warnings for more info.
+
+tests/test_server_routes.py::test_refresh_post_returns_202_with_queued_envelope
+  /usr/lib/python3.14/pathlib/__init__.py:636: ResourceWarning: unclosed database in <sqlite3.Connection object at 0x77cf2e5f88b0>
+    return object.__new__(cls)
+  Enable tracemalloc to get traceback where the object was allocated.
+  See https://docs.pytest.org/en/stable/how-to/capture-warnings.html#resource-warnings for more info.
+
+tests/test_server_routes.py::test_refresh_post_returns_202_with_queued_envelope
+  /usr/lib/python3.14/pathlib/__init__.py:636: ResourceWarning: unclosed database in <sqlite3.Connection object at 0x77cf2e5f8c70>
+    return object.__new__(cls)
+  Enable tracemalloc to get traceback where the object was allocated.
+  See https://docs.pytest.org/en/stable/how-to/capture-warnings.html#resource-warnings for more info.
+
+tests/test_server_routes.py::test_refresh_post_returns_202_with_queued_envelope
+  /usr/lib/python3.14/pathlib/__init__.py:636: ResourceWarning: unclosed database in <sqlite3.Connection object at 0x77cf2e5f8a90>
+    return object.__new__(cls)
+  Enable tracemalloc to get traceback where the object was allocated.
+  See https://docs.pytest.org/en/stable/how-to/capture-warnings.html#resource-warnings for more info.
+
+tests/test_server_routes.py::test_refresh_post_returns_202_with_queued_envelope
+  /usr/lib/python3.14/pathlib/__init__.py:636: ResourceWarning: unclosed database in <sqlite3.Connection object at 0x77cf2e5f89a0>
+    return object.__new__(cls)
+  Enable tracemalloc to get traceback where the object was allocated.
+  See https://docs.pytest.org/en/stable/how-to/capture-warnings.html#resource-warnings for more info.
+
+tests/test_server_routes.py::test_refresh_post_returns_202_with_queued_envelope
+  /usr/lib/python3.14/pathlib/__init__.py:636: ResourceWarning: unclosed database in <sqlite3.Connection object at 0x77cf2e5f9120>
+    return object.__new__(cls)
+  Enable tracemalloc to get traceback where the object was allocated.
+  See https://docs.pytest.org/en/stable/how-to/capture-warnings.html#resource-warnings for more info.
+
+tests/test_server_routes.py::test_refresh_post_returns_202_with_queued_envelope
+  /usr/lib/python3.14/pathlib/__init__.py:636: ResourceWarning: unclosed database in <sqlite3.Connection object at 0x77cf2e5f93f0>
+    return object.__new__(cls)
+  Enable tracemalloc to get traceback where the object was allocated.
+  See https://docs.pytest.org/en/stable/how-to/capture-warnings.html#resource-warnings for more info.
+
+tests/test_server_routes.py::test_refresh_post_returns_202_with_queued_envelope
+  /usr/lib/python3.14/pathlib/__init__.py:636: ResourceWarning: unclosed database in <sqlite3.Connection object at 0x77cf2e5f95d0>
+    return object.__new__(cls)
+  Enable tracemalloc to get traceback where the object was allocated.
+  See https://docs.pytest.org/en/stable/how-to/capture-warnings.html#resource-warnings for more info.
+
+tests/test_server_routes.py::test_refresh_post_returns_202_with_queued_envelope
+  /usr/lib/python3.14/pathlib/__init__.py:636: ResourceWarning: unclosed database in <sqlite3.Connection object at 0x77cf2e5f9210>
+    return object.__new__(cls)
+  Enable tracemalloc to get traceback where the object was allocated.
+  See https://docs.pytest.org/en/stable/how-to/capture-warnings.html#resource-warnings for more info.
+
+tests/test_server_routes.py::test_refresh_post_returns_202_with_queued_envelope
+  /usr/lib/python3.14/pathlib/__init__.py:636: ResourceWarning: unclosed database in <sqlite3.Connection object at 0x77cf2e5f9990>
+    return object.__new__(cls)
+  Enable tracemalloc to get traceback where the object was allocated.
+  See https://docs.pytest.org/en/stable/how-to/capture-warnings.html#resource-warnings for more info.
+
+tests/test_server_routes.py::test_refresh_post_returns_202_with_queued_envelope
+  /usr/lib/python3.14/pathlib/__init__.py:636: ResourceWarning: unclosed database in <sqlite3.Connection object at 0x77cf2e5f9b70>
+    return object.__new__(cls)
+  Enable tracemalloc to get traceback where the object was allocated.
+  See https://docs.pytest.org/en/stable/how-to/capture-warnings.html#resource-warnings for more info.
+
+tests/test_server_routes.py::test_refresh_post_returns_202_with_queued_envelope
+  /usr/lib/python3.14/pathlib/__init__.py:636: ResourceWarning: unclosed database in <sqlite3.Connection object at 0x77cf2e5f9030>
+    return object.__new__(cls)
+  Enable tracemalloc to get traceback where the object was allocated.
+  See https://docs.pytest.org/en/stable/how-to/capture-warnings.html#resource-warnings for more info.
+
+tests/test_server_routes.py::test_refresh_post_returns_202_with_queued_envelope
+  /usr/lib/python3.14/pathlib/__init__.py:636: ResourceWarning: unclosed database in <sqlite3.Connection object at 0x77cf2e5f98a0>
+    return object.__new__(cls)
+  Enable tracemalloc to get traceback where the object was allocated.
+  See https://docs.pytest.org/en/stable/how-to/capture-warnings.html#resource-warnings for more info.
+
+tests/test_server_routes.py::test_refresh_post_returns_202_with_queued_envelope
+  /usr/lib/python3.14/pathlib/__init__.py:636: ResourceWarning: unclosed database in <sqlite3.Connection object at 0x77cf2e5f9c60>
+    return object.__new__(cls)
+  Enable tracemalloc to get traceback where the object was allocated.
+  See https://docs.pytest.org/en/stable/how-to/capture-warnings.html#resource-warnings for more info.
+
+tests/test_server_routes.py::test_refresh_post_returns_202_with_queued_envelope
+  /usr/lib/python3.14/pathlib/__init__.py:636: ResourceWarning: unclosed database in <sqlite3.Connection object at 0x77cf2e5fa020>
+    return object.__new__(cls)
+  Enable tracemalloc to get traceback where the object was allocated.
+  See https://docs.pytest.org/en/stable/how-to/capture-warnings.html#resource-warnings for more info.
+
+tests/test_server_routes.py::test_refresh_post_returns_202_with_queued_envelope
+  /usr/lib/python3.14/pathlib/__init__.py:636: ResourceWarning: unclosed database in <sqlite3.Connection object at 0x77cf2e5fa4d0>
+    return object.__new__(cls)
+  Enable tracemalloc to get traceback where the object was allocated.
+  See https://docs.pytest.org/en/stable/how-to/capture-warnings.html#resource-warnings for more info.
+
+tests/test_server_routes.py::test_refresh_post_returns_202_with_queued_envelope
+  /usr/lib/python3.14/pathlib/__init__.py:636: ResourceWarning: unclosed database in <sqlite3.Connection object at 0x77cf2e5fa890>
+    return object.__new__(cls)
+  Enable tracemalloc to get traceback where the object was allocated.
+  See https://docs.pytest.org/en/stable/how-to/capture-warnings.html#resource-warnings for more info.
+
+tests/test_server_routes.py::test_refresh_post_returns_202_with_queued_envelope
+  /usr/lib/python3.14/pathlib/__init__.py:636: ResourceWarning: unclosed database in <sqlite3.Connection object at 0x77cf2e5f9e40>
+    return object.__new__(cls)
+  Enable tracemalloc to get traceback where the object was allocated.
+  See https://docs.pytest.org/en/stable/how-to/capture-warnings.html#resource-warnings for more info.
+
+tests/test_server_routes.py::test_refresh_post_returns_202_with_queued_envelope
+  /usr/lib/python3.14/pathlib/__init__.py:636: ResourceWarning: unclosed database in <sqlite3.Connection object at 0x77cf2e5fa3e0>
+    return object.__new__(cls)
+  Enable tracemalloc to get traceback where the object was allocated.
+  See https://docs.pytest.org/en/stable/how-to/capture-warnings.html#resource-warnings for more info.
+
+tests/test_server_routes.py::test_refresh_post_returns_202_with_queued_envelope
+  /usr/lib/python3.14/pathlib/__init__.py:636: ResourceWarning: unclosed database in <sqlite3.Connection object at 0x77cf2e5fb1f0>
+    return object.__new__(cls)
+  Enable tracemalloc to get traceback where the object was allocated.
+  See https://docs.pytest.org/en/stable/how-to/capture-warnings.html#resource-warnings for more info.
+
+tests/test_server_routes.py::test_refresh_post_returns_202_with_queued_envelope
+  /usr/lib/python3.14/pathlib/__init__.py:636: ResourceWarning: unclosed database in <sqlite3.Connection object at 0x77cf2e5fab60>
+    return object.__new__(cls)
+  Enable tracemalloc to get traceback where the object was allocated.
+  See https://docs.pytest.org/en/stable/how-to/capture-warnings.html#resource-warnings for more info.
+
+tests/test_server_routes.py::test_refresh_post_returns_202_with_queued_envelope
+  /usr/lib/python3.14/pathlib/__init__.py:636: ResourceWarning: unclosed database in <sqlite3.Connection object at 0x77cf2e5faf20>
+    return object.__new__(cls)
+  Enable tracemalloc to get traceback where the object was allocated.
+  See https://docs.pytest.org/en/stable/how-to/capture-warnings.html#resource-warnings for more info.
+
+tests/test_server_routes.py::test_refresh_post_returns_202_with_queued_envelope
+  /usr/lib/python3.14/pathlib/__init__.py:636: ResourceWarning: unclosed database in <sqlite3.Connection object at 0x77cf2e5fb4c0>
+    return object.__new__(cls)
+  Enable tracemalloc to get traceback where the object was allocated.
+  See https://docs.pytest.org/en/stable/how-to/capture-warnings.html#resource-warnings for more info.
+
+tests/test_server_routes.py::test_refresh_post_returns_202_with_queued_envelope
+  /usr/lib/python3.14/pathlib/__init__.py:636: ResourceWarning: unclosed database in <sqlite3.Connection object at 0x77cf2e5fb970>
+    return object.__new__(cls)
+  Enable tracemalloc to get traceback where the object was allocated.
+  See https://docs.pytest.org/en/stable/how-to/capture-warnings.html#resource-warnings for more info.
+
+tests/test_server_routes.py::test_refresh_post_returns_202_with_queued_envelope
+  /usr/lib/python3.14/pathlib/__init__.py:636: ResourceWarning: unclosed database in <sqlite3.Connection object at 0x77cf2e5fb6a0>
+    return object.__new__(cls)
+  Enable tracemalloc to get traceback where the object was allocated.
+  See https://docs.pytest.org/en/stable/how-to/capture-warnings.html#resource-warnings for more info.
+
+tests/test_server_routes.py::test_refresh_post_returns_202_with_queued_envelope
+  /usr/lib/python3.14/pathlib/__init__.py:636: ResourceWarning: unclosed database in <sqlite3.Connection object at 0x77cf2e5fbc40>
+    return object.__new__(cls)
+  Enable tracemalloc to get traceback where the object was allocated.
+  See https://docs.pytest.org/en/stable/how-to/capture-warnings.html#resource-warnings for more info.
+
+tests/test_server_routes.py::test_refresh_post_returns_202_with_queued_envelope
+  /usr/lib/python3.14/pathlib/__init__.py:636: ResourceWarning: unclosed database in <sqlite3.Connection object at 0x77cf2e5fbd30>
+    return object.__new__(cls)
+  Enable tracemalloc to get traceback where the object was allocated.
+  See https://docs.pytest.org/en/stable/how-to/capture-warnings.html#resource-warnings for more info.
+
+tests/test_server_routes.py::test_refresh_post_returns_202_with_queued_envelope
+  /usr/lib/python3.14/pathlib/__init__.py:636: ResourceWarning: unclosed database in <sqlite3.Connection object at 0x77cf2e5fbf10>
+    return object.__new__(cls)
+  Enable tracemalloc to get traceback where the object was allocated.
+  See https://docs.pytest.org/en/stable/how-to/capture-warnings.html#resource-warnings for more info.
+
+tests/test_server_routes.py::test_refresh_post_returns_202_with_queued_envelope
+  /usr/lib/python3.14/pathlib/__init__.py:636: ResourceWarning: unclosed database in <sqlite3.Connection object at 0x77cf2e5fba60>
+    return object.__new__(cls)
+  Enable tracemalloc to get traceback where the object was allocated.
+  See https://docs.pytest.org/en/stable/how-to/capture-warnings.html#resource-warnings for more info.
+
+tests/test_server_routes.py::test_refresh_post_returns_202_with_queued_envelope
+  /usr/lib/python3.14/pathlib/__init__.py:636: ResourceWarning: unclosed database in <sqlite3.Connection object at 0x77cf2e4c0130>
+    return object.__new__(cls)
+  Enable tracemalloc to get traceback where the object was allocated.
+  See https://docs.pytest.org/en/stable/how-to/capture-warnings.html#resource-warnings for more info.
+
+tests/test_server_routes.py::test_refresh_post_returns_202_with_queued_envelope
+  /usr/lib/python3.14/pathlib/__init__.py:636: ResourceWarning: unclosed database in <sqlite3.Connection object at 0x77cf2e4c0310>
+    return object.__new__(cls)
+  Enable tracemalloc to get traceback where the object was allocated.
+  See https://docs.pytest.org/en/stable/how-to/capture-warnings.html#resource-warnings for more info.
+
+tests/test_server_routes.py::test_refresh_post_returns_202_with_queued_envelope
+  /usr/lib/python3.14/pathlib/__init__.py:636: ResourceWarning: unclosed database in <sqlite3.Connection object at 0x77cf2e4c0400>
+    return object.__new__(cls)
+  Enable tracemalloc to get traceback where the object was allocated.
+  See https://docs.pytest.org/en/stable/how-to/capture-warnings.html#resource-warnings for more info.
+
+tests/test_server_routes.py::test_refresh_post_returns_202_with_queued_envelope
+  /usr/lib/python3.14/pathlib/__init__.py:636: ResourceWarning: unclosed database in <sqlite3.Connection object at 0x77cf2e4c1030>
+    return object.__new__(cls)
+  Enable tracemalloc to get traceback where the object was allocated.
+  See https://docs.pytest.org/en/stable/how-to/capture-warnings.html#resource-warnings for more info.
+
+tests/test_server_routes.py::test_refresh_post_returns_202_with_queued_envelope
+  /usr/lib/python3.14/pathlib/__init__.py:636: ResourceWarning: unclosed database in <sqlite3.Connection object at 0x77cf2e1e98a0>
+    return object.__new__(cls)
+  Enable tracemalloc to get traceback where the object was allocated.
+  See https://docs.pytest.org/en/stable/how-to/capture-warnings.html#resource-warnings for more info.
+
+tests/test_server_routes.py::test_refresh_post_returns_202_with_queued_envelope
+  /usr/lib/python3.14/pathlib/__init__.py:636: ResourceWarning: unclosed database in <sqlite3.Connection object at 0x77cf2e1ea3e0>
+    return object.__new__(cls)
+  Enable tracemalloc to get traceback where the object was allocated.
+  See https://docs.pytest.org/en/stable/how-to/capture-warnings.html#resource-warnings for more info.
+
+tests/test_server_routes.py::test_refresh_post_returns_202_with_queued_envelope
+  /usr/lib/python3.14/pathlib/__init__.py:636: ResourceWarning: unclosed database in <sqlite3.Connection object at 0x77cf2e1ea2f0>
+    return object.__new__(cls)
+  Enable tracemalloc to get traceback where the object was allocated.
+  See https://docs.pytest.org/en/stable/how-to/capture-warnings.html#resource-warnings for more info.
+
+tests/test_server_routes.py::test_refresh_post_returns_202_with_queued_envelope
+  /usr/lib/python3.14/pathlib/__init__.py:636: ResourceWarning: unclosed database in <sqlite3.Connection object at 0x77cf2e1ea890>
+    return object.__new__(cls)
+  Enable tracemalloc to get traceback where the object was allocated.
+  See https://docs.pytest.org/en/stable/how-to/capture-warnings.html#resource-warnings for more info.
+
+tests/test_server_routes.py::test_refresh_post_returns_202_with_queued_envelope
+  /usr/lib/python3.14/pathlib/__init__.py:636: ResourceWarning: unclosed database in <sqlite3.Connection object at 0x77cf2e1eab60>
+    return object.__new__(cls)
+  Enable tracemalloc to get traceback where the object was allocated.
+  See https://docs.pytest.org/en/stable/how-to/capture-warnings.html#resource-warnings for more info.
+
+tests/test_server_routes.py::test_refresh_post_returns_202_with_queued_envelope
+  /usr/lib/python3.14/pathlib/__init__.py:636: ResourceWarning: unclosed database in <sqlite3.Connection object at 0x77cf2e1ea980>
+    return object.__new__(cls)
+  Enable tracemalloc to get traceback where the object was allocated.
+  See https://docs.pytest.org/en/stable/how-to/capture-warnings.html#resource-warnings for more info.
+
+tests/test_server_routes.py::test_refresh_post_returns_202_with_queued_envelope
+  /usr/lib/python3.14/pathlib/__init__.py:636: ResourceWarning: unclosed database in <sqlite3.Connection object at 0x77cf2e1ea7a0>
+    return object.__new__(cls)
+  Enable tracemalloc to get traceback where the object was allocated.
+  See https://docs.pytest.org/en/stable/how-to/capture-warnings.html#resource-warnings for more info.
+
+tests/test_server_routes.py::test_refresh_post_returns_202_with_queued_envelope
+  /usr/lib/python3.14/pathlib/__init__.py:636: ResourceWarning: unclosed database in <sqlite3.Connection object at 0x77cf2e1eac50>
+    return object.__new__(cls)
+  Enable tracemalloc to get traceback where the object was allocated.
+  See https://docs.pytest.org/en/stable/how-to/capture-warnings.html#resource-warnings for more info.
+
+tests/test_server_routes.py::test_refresh_post_returns_202_with_queued_envelope
+  /usr/lib/python3.14/pathlib/__init__.py:636: ResourceWarning: unclosed database in <sqlite3.Connection object at 0x77cf2e1ead40>
+    return object.__new__(cls)
+  Enable tracemalloc to get traceback where the object was allocated.
+  See https://docs.pytest.org/en/stable/how-to/capture-warnings.html#resource-warnings for more info.
+
+tests/test_server_routes.py::test_refresh_post_returns_202_with_queued_envelope
+  /usr/lib/python3.14/pathlib/__init__.py:636: ResourceWarning: unclosed database in <sqlite3.Connection object at 0x77cf2e1eae30>
+    return object.__new__(cls)
+  Enable tracemalloc to get traceback where the object was allocated.
+  See https://docs.pytest.org/en/stable/how-to/capture-warnings.html#resource-warnings for more info.
+
+tests/test_server_routes.py::test_refresh_post_returns_202_with_queued_envelope
+  /usr/lib/python3.14/pathlib/__init__.py:636: ResourceWarning: unclosed database in <sqlite3.Connection object at 0x77cf2e1eaf20>
+    return object.__new__(cls)
+  Enable tracemalloc to get traceback where the object was allocated.
+  See https://docs.pytest.org/en/stable/how-to/capture-warnings.html#resource-warnings for more info.
+
+tests/test_server_routes.py::test_refresh_post_returns_202_with_queued_envelope
+  /usr/lib/python3.14/pathlib/__init__.py:636: ResourceWarning: unclosed database in <sqlite3.Connection object at 0x77cf2e1eb010>
+    return object.__new__(cls)
+  Enable tracemalloc to get traceback where the object was allocated.
+  See https://docs.pytest.org/en/stable/how-to/capture-warnings.html#resource-warnings for more info.
+
+tests/test_server_routes.py::test_refresh_post_returns_202_with_queued_envelope
+  /usr/lib/python3.14/pathlib/__init__.py:636: ResourceWarning: unclosed database in <sqlite3.Connection object at 0x77cf2e1eb100>
+    return object.__new__(cls)
+  Enable tracemalloc to get traceback where the object was allocated.
+  See https://docs.pytest.org/en/stable/how-to/capture-warnings.html#resource-warnings for more info.
+
+tests/test_server_routes.py::test_refresh_post_returns_202_with_queued_envelope
+  /usr/lib/python3.14/pathlib/__init__.py:636: ResourceWarning: unclosed database in <sqlite3.Connection object at 0x77cf2e1eb1f0>
+    return object.__new__(cls)
+  Enable tracemalloc to get traceback where the object was allocated.
+  See https://docs.pytest.org/en/stable/how-to/capture-warnings.html#resource-warnings for more info.
+
+tests/test_server_routes.py::test_refresh_post_returns_202_with_queued_envelope
+  /usr/lib/python3.14/pathlib/__init__.py:636: ResourceWarning: unclosed database in <sqlite3.Connection object at 0x77cf2e1eb2e0>
+    return object.__new__(cls)
+  Enable tracemalloc to get traceback where the object was allocated.
+  See https://docs.pytest.org/en/stable/how-to/capture-warnings.html#resource-warnings for more info.
+
+tests/test_server_routes.py::test_refresh_post_returns_202_with_queued_envelope
+  /usr/lib/python3.14/pathlib/__init__.py:636: ResourceWarning: unclosed database in <sqlite3.Connection object at 0x77cf2e1eb3d0>
+    return object.__new__(cls)
+  Enable tracemalloc to get traceback where the object was allocated.
+  See https://docs.pytest.org/en/stable/how-to/capture-warnings.html#resource-warnings for more info.
+
+tests/test_server_routes.py::test_refresh_post_returns_202_with_queued_envelope
+  /usr/lib/python3.14/pathlib/__init__.py:636: ResourceWarning: unclosed database in <sqlite3.Connection object at 0x77cf2e1eb4c0>
+    return object.__new__(cls)
+  Enable tracemalloc to get traceback where the object was allocated.
+  See https://docs.pytest.org/en/stable/how-to/capture-warnings.html#resource-warnings for more info.
+
+tests/test_server_routes.py::test_refresh_post_returns_202_with_queued_envelope
+  /usr/lib/python3.14/pathlib/__init__.py:636: ResourceWarning: unclosed database in <sqlite3.Connection object at 0x77cf2e1eb5b0>
+    return object.__new__(cls)
+  Enable tracemalloc to get traceback where the object was allocated.
+  See https://docs.pytest.org/en/stable/how-to/capture-warnings.html#resource-warnings for more info.
+
+tests/test_server_routes.py::test_refresh_post_returns_202_with_queued_envelope
+  /usr/lib/python3.14/pathlib/__init__.py:636: ResourceWarning: unclosed database in <sqlite3.Connection object at 0x77cf2e1eb6a0>
+    return object.__new__(cls)
+  Enable tracemalloc to get traceback where the object was allocated.
+  See https://docs.pytest.org/en/stable/how-to/capture-warnings.html#resource-warnings for more info.
+
+tests/test_server_routes.py::test_refresh_post_returns_202_with_queued_envelope
+  /usr/lib/python3.14/pathlib/__init__.py:636: ResourceWarning: unclosed database in <sqlite3.Connection object at 0x77cf2e1eb790>
+    return object.__new__(cls)
+  Enable tracemalloc to get traceback where the object was allocated.
+  See https://docs.pytest.org/en/stable/how-to/capture-warnings.html#resource-warnings for more info.
+
+tests/test_server_routes.py::test_refresh_post_returns_202_with_queued_envelope
+  /usr/lib/python3.14/pathlib/__init__.py:636: ResourceWarning: unclosed database in <sqlite3.Connection object at 0x77cf2e1eb880>
+    return object.__new__(cls)
+  Enable tracemalloc to get traceback where the object was allocated.
+  See https://docs.pytest.org/en/stable/how-to/capture-warnings.html#resource-warnings for more info.
+
+tests/test_server_routes.py::test_refresh_post_returns_202_with_queued_envelope
+  /usr/lib/python3.14/pathlib/__init__.py:636: ResourceWarning: unclosed database in <sqlite3.Connection object at 0x77cf2e1eb970>
+    return object.__new__(cls)
+  Enable tracemalloc to get traceback where the object was allocated.
+  See https://docs.pytest.org/en/stable/how-to/capture-warnings.html#resource-warnings for more info.
+
+tests/test_server_routes.py::test_refresh_post_returns_202_with_queued_envelope
+  /usr/lib/python3.14/pathlib/__init__.py:636: ResourceWarning: unclosed database in <sqlite3.Connection object at 0x77cf2e1ebb50>
+    return object.__new__(cls)
+  Enable tracemalloc to get traceback where the object was allocated.
+  See https://docs.pytest.org/en/stable/how-to/capture-warnings.html#resource-warnings for more info.
+
+tests/test_server_routes.py::test_refresh_post_returns_202_with_queued_envelope
+  /usr/lib/python3.14/pathlib/__init__.py:636: ResourceWarning: unclosed database in <sqlite3.Connection object at 0x77cf2e1ebc40>
+    return object.__new__(cls)
+  Enable tracemalloc to get traceback where the object was allocated.
+  See https://docs.pytest.org/en/stable/how-to/capture-warnings.html#resource-warnings for more info.
+
+tests/test_server_routes.py::test_refresh_post_returns_202_with_queued_envelope
+  /usr/lib/python3.14/pathlib/__init__.py:636: ResourceWarning: unclosed database in <sqlite3.Connection object at 0x77cf2e1ebd30>
+    return object.__new__(cls)
+  Enable tracemalloc to get traceback where the object was allocated.
+  See https://docs.pytest.org/en/stable/how-to/capture-warnings.html#resource-warnings for more info.
+
+tests/test_server_routes.py::test_refresh_post_returns_202_with_queued_envelope
+  /usr/lib/python3.14/pathlib/__init__.py:636: ResourceWarning: unclosed database in <sqlite3.Connection object at 0x77cf2e1eaa70>
+    return object.__new__(cls)
+  Enable tracemalloc to get traceback where the object was allocated.
+  See https://docs.pytest.org/en/stable/how-to/capture-warnings.html#resource-warnings for more info.
+
+tests/test_server_routes.py::test_refresh_post_returns_202_with_queued_envelope
+  /usr/lib/python3.14/pathlib/__init__.py:636: ResourceWarning: unclosed database in <sqlite3.Connection object at 0x77cf2e1ebf10>
+    return object.__new__(cls)
+  Enable tracemalloc to get traceback where the object was allocated.
+  See https://docs.pytest.org/en/stable/how-to/capture-warnings.html#resource-warnings for more info.
+
+tests/test_server_routes.py::test_refresh_post_returns_202_with_queued_envelope
+  /usr/lib/python3.14/pathlib/__init__.py:636: ResourceWarning: unclosed database in <sqlite3.Connection object at 0x77cf2e1eba60>
+    return object.__new__(cls)
+  Enable tracemalloc to get traceback where the object was allocated.
+  See https://docs.pytest.org/en/stable/how-to/capture-warnings.html#resource-warnings for more info.
+
+tests/test_server_routes.py::test_refresh_post_returns_202_with_queued_envelope
+  /usr/lib/python3.14/pathlib/__init__.py:636: ResourceWarning: unclosed database in <sqlite3.Connection object at 0x77cf2d948040>
+    return object.__new__(cls)
+  Enable tracemalloc to get traceback where the object was allocated.
+  See https://docs.pytest.org/en/stable/how-to/capture-warnings.html#resource-warnings for more info.
+
+tests/test_server_routes.py::test_refresh_post_returns_202_with_queued_envelope
+  /usr/lib/python3.14/pathlib/__init__.py:636: ResourceWarning: unclosed database in <sqlite3.Connection object at 0x77cf2d948130>
+    return object.__new__(cls)
+  Enable tracemalloc to get traceback where the object was allocated.
+  See https://docs.pytest.org/en/stable/how-to/capture-warnings.html#resource-warnings for more info.
+
+tests/test_server_routes.py::test_refresh_post_returns_202_with_queued_envelope
+  /usr/lib/python3.14/pathlib/__init__.py:636: ResourceWarning: unclosed database in <sqlite3.Connection object at 0x77cf2d948220>
+    return object.__new__(cls)
+  Enable tracemalloc to get traceback where the object was allocated.
+  See https://docs.pytest.org/en/stable/how-to/capture-warnings.html#resource-warnings for more info.
+
+tests/test_server_routes.py::test_refresh_post_returns_202_with_queued_envelope
+  /usr/lib/python3.14/pathlib/__init__.py:636: ResourceWarning: unclosed database in <sqlite3.Connection object at 0x77cf2d948310>
+    return object.__new__(cls)
+  Enable tracemalloc to get traceback where the object was allocated.
+  See https://docs.pytest.org/en/stable/how-to/capture-warnings.html#resource-warnings for more info.
+
+tests/test_server_routes.py::test_refresh_post_returns_202_with_queued_envelope
+  /usr/lib/python3.14/pathlib/__init__.py:636: ResourceWarning: unclosed database in <sqlite3.Connection object at 0x77cf2d948400>
+    return object.__new__(cls)
+  Enable tracemalloc to get traceback where the object was allocated.
+  See https://docs.pytest.org/en/stable/how-to/capture-warnings.html#resource-warnings for more info.
+
+tests/test_server_routes.py::test_refresh_post_returns_202_with_queued_envelope
+  /usr/lib/python3.14/pathlib/__init__.py:636: ResourceWarning: unclosed database in <sqlite3.Connection object at 0x77cf2d9484f0>
+    return object.__new__(cls)
+  Enable tracemalloc to get traceback where the object was allocated.
+  See https://docs.pytest.org/en/stable/how-to/capture-warnings.html#resource-warnings for more info.
+
+tests/test_server_routes.py::test_refresh_post_returns_202_with_queued_envelope
+  /usr/lib/python3.14/pathlib/__init__.py:636: ResourceWarning: unclosed database in <sqlite3.Connection object at 0x77cf2d9485e0>
+    return object.__new__(cls)
+  Enable tracemalloc to get traceback where the object was allocated.
+  See https://docs.pytest.org/en/stable/how-to/capture-warnings.html#resource-warnings for more info.
+
+tests/test_server_routes.py::test_refresh_post_returns_202_with_queued_envelope
+  /usr/lib/python3.14/pathlib/__init__.py:636: ResourceWarning: unclosed database in <sqlite3.Connection object at 0x77cf2d9486d0>
+    return object.__new__(cls)
+  Enable tracemalloc to get traceback where the object was allocated.
+  See https://docs.pytest.org/en/stable/how-to/capture-warnings.html#resource-warnings for more info.
+
+tests/test_server_routes.py::test_refresh_post_returns_202_with_queued_envelope
+  /usr/lib/python3.14/pathlib/__init__.py:636: ResourceWarning: unclosed database in <sqlite3.Connection object at 0x77cf2d9487c0>
+    return object.__new__(cls)
+  Enable tracemalloc to get traceback where the object was allocated.
+  See https://docs.pytest.org/en/stable/how-to/capture-warnings.html#resource-warnings for more info.
+
+tests/test_server_routes.py::test_refresh_post_returns_202_with_queued_envelope
+  /usr/lib/python3.14/pathlib/__init__.py:636: ResourceWarning: unclosed database in <sqlite3.Connection object at 0x77cf2d9488b0>
+    return object.__new__(cls)
+  Enable tracemalloc to get traceback where the object was allocated.
+  See https://docs.pytest.org/en/stable/how-to/capture-warnings.html#resource-warnings for more info.
+
+tests/test_server_routes.py::test_refresh_post_returns_202_with_queued_envelope
+  /usr/lib/python3.14/pathlib/__init__.py:636: ResourceWarning: unclosed database in <sqlite3.Connection object at 0x77cf2d9489a0>
+    return object.__new__(cls)
+  Enable tracemalloc to get traceback where the object was allocated.
+  See https://docs.pytest.org/en/stable/how-to/capture-warnings.html#resource-warnings for more info.
+
+tests/test_server_routes.py::test_refresh_post_returns_202_with_queued_envelope
+  /usr/lib/python3.14/pathlib/__init__.py:636: ResourceWarning: unclosed database in <sqlite3.Connection object at 0x77cf2d948b80>
+    return object.__new__(cls)
+  Enable tracemalloc to get traceback where the object was allocated.
+  See https://docs.pytest.org/en/stable/how-to/capture-warnings.html#resource-warnings for more info.
+
+tests/test_server_routes.py::test_refresh_post_returns_202_with_queued_envelope
+  /usr/lib/python3.14/pathlib/__init__.py:636: ResourceWarning: unclosed database in <sqlite3.Connection object at 0x77cf2d948c70>
+    return object.__new__(cls)
+  Enable tracemalloc to get traceback where the object was allocated.
+  See https://docs.pytest.org/en/stable/how-to/capture-warnings.html#resource-warnings for more info.
+
+tests/test_server_routes.py::test_refresh_post_returns_202_with_queued_envelope
+  /usr/lib/python3.14/pathlib/__init__.py:636: ResourceWarning: unclosed database in <sqlite3.Connection object at 0x77cf2d948e50>
+    return object.__new__(cls)
+  Enable tracemalloc to get traceback where the object was allocated.
+  See https://docs.pytest.org/en/stable/how-to/capture-warnings.html#resource-warnings for more info.
+
+tests/test_server_routes.py::test_refresh_post_returns_202_with_queued_envelope
+  /usr/lib/python3.14/pathlib/__init__.py:636: ResourceWarning: unclosed database in <sqlite3.Connection object at 0x77cf2d948d60>
+    return object.__new__(cls)
+  Enable tracemalloc to get traceback where the object was allocated.
+  See https://docs.pytest.org/en/stable/how-to/capture-warnings.html#resource-warnings for more info.
+
+tests/test_server_routes.py::test_refresh_post_returns_202_with_queued_envelope
+  /usr/lib/python3.14/pathlib/__init__.py:636: ResourceWarning: unclosed database in <sqlite3.Connection object at 0x77cf2d948f40>
+    return object.__new__(cls)
+  Enable tracemalloc to get traceback where the object was allocated.
+  See https://docs.pytest.org/en/stable/how-to/capture-warnings.html#resource-warnings for more info.
+
+tests/test_server_routes.py::test_refresh_post_returns_202_with_queued_envelope
+  /usr/lib/python3.14/pathlib/__init__.py:636: ResourceWarning: unclosed database in <sqlite3.Connection object at 0x77cf2d949030>
+    return object.__new__(cls)
+  Enable tracemalloc to get traceback where the object was allocated.
+  See https://docs.pytest.org/en/stable/how-to/capture-warnings.html#resource-warnings for more info.
+
+tests/test_server_routes.py::test_refresh_post_returns_202_with_queued_envelope
+  /usr/lib/python3.14/pathlib/__init__.py:636: ResourceWarning: unclosed database in <sqlite3.Connection object at 0x77cf2d949120>
+    return object.__new__(cls)
+  Enable tracemalloc to get traceback where the object was allocated.
+  See https://docs.pytest.org/en/stable/how-to/capture-warnings.html#resource-warnings for more info.
+
+tests/test_server_routes.py::test_refresh_post_returns_202_with_queued_envelope
+  /usr/lib/python3.14/pathlib/__init__.py:636: ResourceWarning: unclosed database in <sqlite3.Connection object at 0x77cf2d949210>
+    return object.__new__(cls)
+  Enable tracemalloc to get traceback where the object was allocated.
+  See https://docs.pytest.org/en/stable/how-to/capture-warnings.html#resource-warnings for more info.
+
+tests/test_server_routes.py::test_refresh_post_returns_202_with_queued_envelope
+  /usr/lib/python3.14/pathlib/__init__.py:636: ResourceWarning: unclosed database in <sqlite3.Connection object at 0x77cf2d949300>
+    return object.__new__(cls)
+  Enable tracemalloc to get traceback where the object was allocated.
+  See https://docs.pytest.org/en/stable/how-to/capture-warnings.html#resource-warnings for more info.
+
+tests/test_server_routes.py::test_refresh_post_returns_202_with_queued_envelope
+  /usr/lib/python3.14/pathlib/__init__.py:636: ResourceWarning: unclosed database in <sqlite3.Connection object at 0x77cf2d9493f0>
+    return object.__new__(cls)
+  Enable tracemalloc to get traceback where the object was allocated.
+  See https://docs.pytest.org/en/stable/how-to/capture-warnings.html#resource-warnings for more info.
+
+tests/test_server_routes.py::test_refresh_post_returns_202_with_queued_envelope
+  /usr/lib/python3.14/pathlib/__init__.py:636: ResourceWarning: unclosed database in <sqlite3.Connection object at 0x77cf2d9494e0>
+    return object.__new__(cls)
+  Enable tracemalloc to get traceback where the object was allocated.
+  See https://docs.pytest.org/en/stable/how-to/capture-warnings.html#resource-warnings for more info.
+
+tests/test_server_routes.py::test_refresh_post_returns_202_with_queued_envelope
+  /usr/lib/python3.14/pathlib/__init__.py:636: ResourceWarning: unclosed database in <sqlite3.Connection object at 0x77cf2d9498a0>
+    return object.__new__(cls)
+  Enable tracemalloc to get traceback where the object was allocated.
+  See https://docs.pytest.org/en/stable/how-to/capture-warnings.html#resource-warnings for more info.
+
+tests/test_server_routes.py::test_refresh_post_returns_202_with_queued_envelope
+  /usr/lib/python3.14/pathlib/__init__.py:636: ResourceWarning: unclosed database in <sqlite3.Connection object at 0x77cf2d9495d0>
+    return object.__new__(cls)
+  Enable tracemalloc to get traceback where the object was allocated.
+  See https://docs.pytest.org/en/stable/how-to/capture-warnings.html#resource-warnings for more info.
+
+-- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html
+================================ tests coverage ================================
+_______________ coverage: platform linux, python 3.14.4-final-0 ________________
+
+Name                                             Stmts   Miss  Cover
+--------------------------------------------------------------------
+src/symphony/__init__.py                             1      0   100%
+src/symphony/__main__.py                             5      5     0%
+src/symphony/_shell.py                             283    107    62%
+src/symphony/agent.py                                4      4     0%
+src/symphony/artifacts.py                          339     59    83%
+src/symphony/backends/__init__.py                  120      2    98%
+src/symphony/backends/agy.py                       161     20    88%
+src/symphony/backends/approval_policy.py            37      0   100%
+src/symphony/backends/claude_code.py               409     69    83%
+src/symphony/backends/codex.py                     837    205    76%
+src/symphony/backends/copilot.py                   315     48    85%
+src/symphony/backends/gemini.py                    163     34    79%
+src/symphony/backends/kiro.py                       76     20    74%
+src/symphony/backends/opencode.py                  268     26    90%
+src/symphony/backends/per_turn.py                  187     18    90%
+src/symphony/backends/pi.py                        363     51    86%
+src/symphony/backends/plain_cli.py                  23      0   100%
+src/symphony/backends/prime_agent.py                37      3    92%
+src/symphony/backends/usage.py                      59     15    75%
+src/symphony/chat.py                              1094    151    86%
+src/symphony/cli/__init__.py                         3      0   100%
+src/symphony/cli/__main__.py                         5      5     0%
+src/symphony/cli/board.py                          324     29    91%
+src/symphony/cli/doctor.py                         641    111    83%
+src/symphony/cli/main.py                           201     48    76%
+src/symphony/cli/project.py                        130     27    79%
+src/symphony/cli/release.py                         87     23    74%
+src/symphony/continuous_improvement.py             816     77    91%
+src/symphony/errors.py                              92      0   100%
+src/symphony/hub.py                                222     56    75%
+src/symphony/i18n.py                                32      0   100%
+src/symphony/intent.py                             175     12    93%
+src/symphony/issue.py                               75      1    99%
+src/symphony/logging.py                             80      3    96%
+src/symphony/mcp/__init__.py                         1      0   100%
+src/symphony/mcp/audit.py                           17      0   100%
+src/symphony/mcp/auth.py                            32      2    94%
+src/symphony/mcp/client.py                          99     18    82%
+src/symphony/mcp/config.py                          43      3    93%
+src/symphony/mcp/errors.py                          24      0   100%
+src/symphony/mcp/idempotency.py                     19      0   100%
+src/symphony/mcp/models.py                         137      1    99%
+src/symphony/mcp/policy.py                          15      0   100%
+src/symphony/mcp/server.py                         170    106    38%
+src/symphony/mock_codex.py                         134    134     0%
+src/symphony/notifications/__init__.py               5      0   100%
+src/symphony/notifications/config.py                72      4    94%
+src/symphony/notifications/dispatcher.py            29      1    97%
+src/symphony/notifications/events.py                19      0   100%
+src/symphony/notifications/slack.py                 55      5    91%
+src/symphony/orchestrator/__init__.py               11      0   100%
+src/symphony/orchestrator/attempt.py               466     69    85%
+src/symphony/orchestrator/constants.py              28      0   100%
+src/symphony/orchestrator/contracts.py             296     17    94%
+src/symphony/orchestrator/core.py                 3863    708    82%
+src/symphony/orchestrator/diagnostics.py            86     28    67%
+src/symphony/orchestrator/dispatch_state.py         42      0   100%
+src/symphony/orchestrator/entries.py               117      0   100%
+src/symphony/orchestrator/executors.py              23      0   100%
+src/symphony/orchestrator/helpers.py               173     24    86%
+src/symphony/orchestrator/migrations.py            157      9    94%
+src/symphony/orchestrator/parsing.py                95      8    92%
+src/symphony/orchestrator/release_contracts.py     821    118    86%
+src/symphony/orchestrator/release_cycle.py         345     52    85%
+src/symphony/orchestrator/run_registry.py          834    115    86%
+src/symphony/orchestrator/scheduler.py             184     16    91%
+src/symphony/orchestrator/usage.py                 148     28    81%
+src/symphony/product_preview.py                    206     19    91%
+src/symphony/progress_md.py                        209     24    89%
+src/symphony/projects.py                           631    124    80%
+src/symphony/prompt.py                             338     75    78%
+src/symphony/prompt_context.py                     120      1    99%
+src/symphony/pyright.py                             28      1    96%
+src/symphony/runtime_safety.py                      28      5    82%
+src/symphony/server.py                             124     14    89%
+src/symphony/service.py                            751    178    76%
+src/symphony/service_identity.py                    16      0   100%
+src/symphony/skills.py                              78     10    87%
+src/symphony/stats.py                              160     16    90%
+src/symphony/systemd.py                            158     25    84%
+src/symphony/ticket_markdown.py                     47      0   100%
+src/symphony/trackers/__init__.py                   34      6    82%
+src/symphony/trackers/_retry.py                     50      7    86%
+src/symphony/trackers/file.py                      703     98    86%
+src/symphony/trackers/jira.py                      203     12    94%
+src/symphony/trackers/linear.py                    188      9    95%
+src/symphony/trackers/validate.py                  104      3    97%
+src/symphony/tui/__init__.py                         7      0   100%
+src/symphony/tui/app.py                            647    215    67%
+src/symphony/tui/constants.py                       10      0   100%
+src/symphony/tui/helpers.py                        162     21    87%
+src/symphony/tui/screens.py                        187     51    73%
+src/symphony/tui/widgets.py                        354     60    83%
+src/symphony/utils/__init__.py                       0      0   100%
+src/symphony/utils/archive.py                       25      0   100%
+src/symphony/utils/atomic_json.py                   44      2    95%
+src/symphony/utils/auto_merge.py                    97      9    91%
+src/symphony/utils/git_inspect.py                  228     37    84%
+src/symphony/utils/git_ops.py                      102     24    76%
+src/symphony/utils/git_sandbox.py                  114     19    83%
+src/symphony/utils/keep_awake.py                    58     10    83%
+src/symphony/utils/wiki_sweep.py                   190     15    92%
+src/symphony/web_policy.py                         287     17    94%
+src/symphony/webapi.py                            1529    203    87%
+src/symphony/workflow/__init__.py                   10      0   100%
+src/symphony/workflow/builder.py                   595     61    90%
+src/symphony/workflow/coercion.py                   86      7    92%
+src/symphony/workflow/config.py                    365     24    93%
+src/symphony/workflow/constants.py                  61      0   100%
+src/symphony/workflow/mutate.py                    350     35    90%
+src/symphony/workflow/parser.py                     49      5    90%
+src/symphony/workflow/preflight.py                  60      3    95%
+src/symphony/workflow/presets.py                    35      0   100%
+src/symphony/workflow/profiles.py                   69      4    94%
+src/symphony/workflow/state.py                      30      2    93%
+src/symphony/workspace.py                          586     99    83%
+--------------------------------------------------------------------
+TOTAL                                            26737   4245    84%
+Required test coverage of 80% reached. Total coverage: 84.12%
+2926 passed, 14 skipped, 210 warnings in 207.39s (0:03:27)

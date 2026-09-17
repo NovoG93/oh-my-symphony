@@ -1,0 +1,45 @@
+# git scope check -- TIER-001, branch symphony/TIER-001
+# Recorded: Document pass 2, 2026-09-17, against revision 336499a.
+# Base: develop = 4ad0cb73edab0443668267e3ea6b7e108d5edf2b, which is also
+#       `git merge-base develop symphony/TIER-001` -- develop has not moved since
+#       the branch point, so the branch is strictly ahead of develop.
+# Commands: git diff --name-only develop   (tracked changes, incl. working tree)
+#           git status --short              (adds untracked new files)
+
+## git diff --name-only develop -- 17 tracked paths
+CHANGELOG.md
+README.md
+docs/TIER-001/document/details.md
+docs/TIER-001/qa/git-diff-check.txt
+docs/TIER-001/qa/git-scope-check.txt
+docs/TIER-001/qa/merge-tree.txt
+docs/TIER-001/qa/pyright.txt
+docs/TIER-001/qa/pytest-cov.txt
+docs/TIER-001/qa/pytest-mutate.txt
+docs/TIER-001/qa/pytest-presets.txt
+docs/TIER-001/qa/ruff-check.txt
+docs/TIER-001/work/details.md
+docs/llm-wiki/INDEX.md
+docs/symphony-prompts/file/deep/plan.md
+src/symphony/workflow/mutate.py
+tests/test_workflow_mutate.py
+tests/test_workflow_presets.py
+
+## untracked new files (invisible to git diff) -- 1 path
+docs/llm-wiki/planner-tiered-build-routing.md
+
+## classification against the ticket's "## Allowed files"
+# implementation scope (set during In Progress; unchanged since):
+#   src/symphony/workflow/mutate.py
+#   tests/test_workflow_mutate.py
+#   tests/test_workflow_presets.py
+#   docs/symphony-prompts/file/deep/plan.md
+#   README.md
+# conditional, satisfied: CHANGELOG.md -- the active ## [Unreleased] section already
+#   carries entries for agent.stage_kinds routing, lane presets, and
+#   docs/symphony-prompts/** rewrites, so convention requires an entry here.
+# ticket evidence: docs/TIER-001/** (document/ and qa/ and work/ notes)
+# Document-lane mandated write-back: docs/llm-wiki/** -- required by the Document lane
+#   contract ("update docs/llm-wiki/, add/refresh its INDEX.md row"); additive
+#   documentation only, no source, test, or shipped-prompt impact.
+# out-of-scope files changed: NONE

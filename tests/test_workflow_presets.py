@@ -97,6 +97,14 @@ def test_deep_prompts_are_succinct_and_carry_the_gates() -> None:
     assert "--request" in plan
     assert "release-contract.yaml" in plan
     assert "app-release-finalizer" in plan
+    assert "small-free" in plan
+    assert "large-capable" in plan
+    assert "minimum useful slice" in plan
+    assert "<= 3 files / <= 200 net lines" in plan
+    assert "--agent-profile opencode-free-small" in plan
+    assert "--agent-profile agy-builder" in plan
+    assert "Max 8 Build tickets" in plan
+    assert "Build workers must not spawn child tickets" in plan
     review = (deep_dir / "review.md").read_text(encoding="utf-8")
     assert "verdict: PASS" in review
     assert "Max 2 objection rounds" in review

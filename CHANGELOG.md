@@ -49,6 +49,21 @@ Versioning: [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   boards; the approved ticket then flows through the normal profile, usage,
   and scheduling machinery.
 
+- **Planner-driven tiered Build routing.** The deep `Plan` lane now classifies
+  every Build slice as `small-free` or `large-capable` and pins the ticket
+  profile explicitly. A `small-free` slice — exactly one observable behavior,
+  no unresolved design, at most 3 files / 200 net lines, one exact
+  verification command, and no auth, security, migration, concurrency,
+  release, or cross-service work — is routed with
+  `--agent-profile opencode-free-small`; every other or uncertain slice is
+  routed with `--agent-profile agy-builder`, so unknown classifications fall
+  back to the capable backend. `Plan` is the sole decomposition point: at most
+  8 Build tickets per request, and Build workers must not spawn child tickets.
+  QA, Verify, and Document tickets are never profile-pinned — stage routing
+  owns those lanes. These bounds are planning policy, not scheduler
+  enforcement, and a ticket-level profile outranks `agent.stage_profiles`
+  (precedence tier 3 over tier 5).
+
 ### Changed
 
 - **Sibling workflows get independent state files.** Non-canonical
@@ -110,6 +125,15 @@ Versioning: [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   process group as unknown, so proven-dead runs could stay stuck in
   "reclaiming" at startup; the zombie-filter probe now confirms them and
   reclaim proceeds.
+
+- **`agent.stage_profiles` follows lane renames, removals, and presets.**
+  Editing lanes no longer leaves profile routes pointing at states that do
+  not exist. `apply_states_update` and `apply_lane_preset` now rename and drop
+  `agent.stage_profiles` keys in lockstep with the other per-state maps
+  (`prompts.stages`, `agent.stage_kinds`, and the `*_by_state` maps), so a
+  renamed lane carries its named profile route and still reloads, an untouched
+  lane keeps its route verbatim, and a preset that removes states leaves no
+  obsolete keys behind.
 
 ## [0.21.0] - 2026-08-16 - Named agent profiles and MCP gateway
 

@@ -184,7 +184,7 @@ def apply_states_update(workflow_path: Path, specs: list[StateSpec]) -> StatesUp
     Handles add / remove / rename / reorder / description edits and keeps
     the per-state maps (`prompts.stages`, `agent.max_concurrent_agents_by_state`,
     `agent.max_total_tokens_by_state`, `agent.stall_timeout_ms_by_state`,
-    `agent.stage_kinds`) consistent. New
+    `agent.stage_kinds`, `agent.stage_profiles`) consistent. New
     active columns get a
     starter prompt file next to the existing stage prompts.
 
@@ -251,6 +251,7 @@ def apply_states_update(workflow_path: Path, specs: list[StateSpec]) -> StatesUp
         _rename_state_keyed_map(agent, "max_total_tokens_by_state", renamed, removed)
         _rename_state_keyed_map(agent, "stall_timeout_ms_by_state", renamed, removed)
         _rename_state_keyed_map(agent, "stage_kinds", renamed, removed)
+        _rename_state_keyed_map(agent, "stage_profiles", renamed, removed)
 
     _add_stage_prompts(data, workflow_path, [s for s in specs if not s.terminal and s.name in added])
 
@@ -607,6 +608,7 @@ def apply_lane_preset(workflow_path: Path, preset_name: str) -> StatesUpdatePlan
         _rename_state_keyed_map(agent, "max_total_tokens_by_state", {}, removed)
         _rename_state_keyed_map(agent, "stall_timeout_ms_by_state", {}, removed)
         _rename_state_keyed_map(agent, "stage_kinds", {}, removed)
+        _rename_state_keyed_map(agent, "stage_profiles", {}, removed)
 
     _write_workflow_atomic(workflow_path, data, body)
     return StatesUpdatePlan(
