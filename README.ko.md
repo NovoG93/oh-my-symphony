@@ -32,11 +32,11 @@
 
 > **인쇄용 매뉴얼:** [치트시트 (PDF)](https://cskwork.github.io/oh-my-symphony/manual/pdf/oh-my-symphony-cheatsheet-ko.pdf) · [튜토리얼 (PDF)](https://cskwork.github.io/oh-my-symphony/manual/pdf/oh-my-symphony-tutorial-ko.pdf) · [HTML + 영어](https://cskwork.github.io/oh-my-symphony/#manual). 배포할 때마다 `docs/manual/`에서 생성되며 키 표는 코드에서 뽑습니다.
 
+- [설치](#install)
+- [60초 체험](#try-it-in-60-seconds-no-agent-cli-required)
 - [Symphony를 쓰는 이유](#why-symphony)
 - [작동 방식](#how-it-works)
 - [에이전트 선택](#pick-an-agent)
-- [설치](#install)
-- [60초 체험](#try-it-in-60-seconds-no-agent-cli-required)
 - [첫 작업 Quickstart](#quickstart-your-first-task-end-to-end)
 - [레인 프리셋](#lane-presets)
 - [채팅 인테이크](#chat-intake-채팅에-요청하고-intent-하나만-승인하면-보드가-배달한다)
@@ -46,6 +46,92 @@
 - [테스트](#tests)
 - [설계 메모](#design-notes)
 - [아직 구현하지 않은 것](#what-is-not-implemented)
+
+## Install
+
+```bash
+python3 -m venv .venv
+source .venv/bin/activate
+python -m pip install -e .
+```
+
+기여자는 `pip install -e ".[dev]"`로 테스트·린트 도구까지 설치한다
+([CONTRIBUTING.md](CONTRIBUTING.md) 참고). 아직 PyPI에 배포되어 있지 않으므로
+이 체크아웃에서 editable 설치하는 방식이 공식 경로다.
+
+해당 CLI를 `$PATH`에서 사용할 수 있게 한다:
+
+| `agent.kind` | required CLI on `$PATH` |
+|--------------|------------------------|
+| `codex`      | `codex` (with `app-server` subcommand) |
+| `claude`     | `claude` (Claude Code) |
+| `gemini`     | `gemini` (Gemini CLI)  |
+| `agy`        | `agy` (Antigravity CLI, Google Antigravity에서 설치; Symphony가 `--dangerously-skip-permissions`를 붙임) |
+| `kiro`       | `kiro-cli` (Kiro CLI, `https://cli.kiro.dev/install`에서 설치; headless 실행에는 `kiro-cli login` 또는 `KIRO_API_KEY` 필요) |
+| `opencode`   | `opencode` (OpenCode CLI, `npm install -g opencode-ai`로 설치, `opencode auth login`으로 provider 인증) |
+| `pi`         | `pi` (Pi coding-agent, `npm i -g @earendil-works/pi-coding-agent` or `curl -fsSL https://pi.dev/install.sh \| sh`; sign in once via `pi` → `/login` (OAuth, credentials cached at `~/.pi/agent/auth.json`), no env var needed) |
+| `prime-agent` | `prime-agent` (Prime Agent, install from the Prime Agent installer; sign in via `prime-agent` → `/login`, or provide a provider API key; credentials cached at `~/.prime/agent/auth.json`) |
+
+## Try it in 60 seconds (no agent CLI required)
+
+실제 에이전트 CLI를 설치하기 전에 TUI가 카드를 옮기는 모습을 먼저 보고
+싶은가? 번들로 제공되는 목(mock) 백엔드를 쓰면 된다. Codex와 동일한 JSON-RPC
+프로토콜을 말하지만 실제 작업은 하지 않고, 턴을 시뮬레이션하며 토큰 사용량 틱을
+내보낼 뿐이다.
+
+```bash
+git clone https://github.com/cskwork/oh-my-symphony.git
+cd oh-my-symphony
+python3 -m venv .venv && source .venv/bin/activate
+python -m pip install -e .
+
+# 소스 체크아웃은 보호 대상이므로 데모는 별도 프로젝트로 만든다.
+# 이 명령은 실제 에이전트용으로 doctor를 통과하는 완전한 WORKFLOW.md를 생성한다.
+# 그 파일은 그대로 두고, 목 백엔드용 워크플로 파일을 옆에 따로 만든다.
+symphony project create "Symphony Demo" --path ../symphony-demo
+cd ../symphony-demo
+
+cat > WORKFLOW.mock.md <<'YAML'
+---
+tracker: { kind: file, board_root: ./kanban,
+           active_states: [Todo, "In Progress", Verify, Document],
+           terminal_states: ["Human Review", Done, Blocked, Archive] }
+polling: { interval_ms: 5000 }
+workspace: { root: ~/symphony_workspaces/symphony-demo-mock }
+hooks:
+  # 호스트 보드를 각 워크스페이스에 링크해 doctor와 런타임이 보드를 찾게 한다.
+  after_create: 'ln -sfn "$SYMPHONY_WORKFLOW_DIR/${SYMPHONY_BOARD_ROOT_NAME:-kanban}" "${SYMPHONY_BOARD_ROOT_NAME:-kanban}"'
+  before_run:   ": noop"
+  after_run:    "echo done"
+agent:  { kind: codex, max_concurrent_agents: 2, max_turns: 4, max_total_turns: 60 }
+codex:  { command: python -m symphony.mock_codex }
+server: { port: 9999 }
+---
+You are picking up ticket {{ issue.identifier }}: {{ issue.title }}.
+YAML
+
+symphony board init ./kanban           # 샘플 티켓 DEMO-001도 함께 생성된다
+symphony board new TASK-1 "smoke test"
+symphony doctor ./WORKFLOW.mock.md     # 모든 줄이 PASS여야 한다
+symphony tui ./WORKFLOW.mock.md
+```
+
+약 5초 안에 **Todo** 컬럼의 두 카드, 즉 샘플 티켓 DEMO-001과 TASK-1이 초록색
+● 표시와 함께 턴 카운터와 토큰 합계가 올라가며 자라난다. 충분히 봤으면
+`Ctrl-C`로 종료하고, 손대지 않은 `WORKFLOW.md`를 쓰는 아래의 실제 워크스루로
+넘어간다.
+
+> 목 환경에서는 카드가 원래 컬럼에 머문다. 카드를 **Done**으로 옮기려면 실제
+> 에이전트가 `kanban/TASK-1.md`를 다시 써야 한다. 다 본 뒤에는
+> `WORKFLOW.mock.md`를 지우거나 나중의 스모크 테스트용으로 남겨 둔다. 실제
+> 보드는 항상 `WORKFLOW.md`를 읽는다. 목은 LLM 호출 없이도
+> 오케스트레이터 → 백엔드 → 워크스페이스 → hooks 파이프라인이 end-to-end로
+> 동작함을 증명하기 위해 존재한다.
+
+> 목의 튜닝 옵션: `SYMPHONY_MOCK_TURN_SECONDS=12`,
+> `SYMPHONY_MOCK_FAIL_EVERY_N_TURNS=3` 등은 `src/symphony/mock_codex.py`를 참고한다.
+
+---
 
 ## Why Symphony?
 
@@ -214,78 +300,6 @@ Verify → Document를 한 디스패치로 걷는 티켓도 레인마다 설정�
 `true`다: 본문과 `Acceptance Criteria` 섹션이 있는 Todo 티켓은 모델 턴을 쓰지 않고
 한 줄짜리 `## Triage` 노트와 함께 In Progress로 이동한다. 버그 티켓, 블록된 티켓,
 모호한 티켓, 그리고 Linear 트래커는 여전히 Todo 프롬프트를 사용한다.
-
-## Install
-
-```bash
-python3 -m venv .venv
-source .venv/bin/activate
-python -m pip install -e ".[dev]"
-```
-
-해당 CLI를 `$PATH`에서 사용할 수 있게 한다:
-
-| `agent.kind` | required CLI on `$PATH` |
-|--------------|------------------------|
-| `codex`      | `codex` (with `app-server` subcommand) |
-| `claude`     | `claude` (Claude Code) |
-| `gemini`     | `gemini` (Gemini CLI)  |
-| `agy`        | `agy` (Antigravity CLI, Google Antigravity에서 설치; Symphony가 `--dangerously-skip-permissions`를 붙임) |
-| `kiro`       | `kiro-cli` (Kiro CLI, `https://cli.kiro.dev/install`에서 설치; headless 실행에는 `kiro-cli login` 또는 `KIRO_API_KEY` 필요) |
-| `opencode`   | `opencode` (OpenCode CLI, `npm install -g opencode-ai`로 설치, `opencode auth login`으로 provider 인증) |
-| `pi`         | `pi` (Pi coding-agent, `npm i -g @earendil-works/pi-coding-agent` or `curl -fsSL https://pi.dev/install.sh \| sh`; sign in once via `pi` → `/login` (OAuth, credentials cached at `~/.pi/agent/auth.json`), no env var needed) |
-| `prime-agent` | `prime-agent` (Prime Agent, install from the Prime Agent installer; sign in via `prime-agent` → `/login`, or provide a provider API key; credentials cached at `~/.prime/agent/auth.json`) |
-
-## Try it in 60 seconds (no agent CLI required)
-
-실제 에이전트 CLI를 설치하기 전에 TUI가 카드를 옮기는 모습을 먼저 보고
-싶은가? 번들로 제공되는 목(mock) 백엔드를 쓰면 된다. Codex와 동일한 JSON-RPC
-프로토콜을 말하지만 실제 작업은 하지 않고, 턴을 시뮬레이션하며 토큰 사용량 틱을
-내보낼 뿐이다.
-
-```bash
-git clone https://github.com/cskwork/oh-my-symphony.git
-cd oh-my-symphony
-python3 -m venv .venv && source .venv/bin/activate
-python -m pip install -e ".[dev]"
-
-# 목 백엔드를 가리키는 WORKFLOW.md
-cat > WORKFLOW.md <<'YAML'
----
-tracker: { kind: file, board_root: ./kanban,
-           active_states: [Todo, "In Progress", Verify, Document],
-           terminal_states: ["Human Review", Done, Blocked, Archive] }
-polling: { interval_ms: 5000 }
-workspace: { root: ~/symphony_workspaces }
-hooks:
-  after_create: ": noop"
-  before_run:   ": noop"
-  after_run:    "echo done"
-agent:  { kind: codex, max_concurrent_agents: 1, max_turns: 4, max_total_turns: 60 }
-codex:  { command: python -m symphony.mock_codex }
-server: { port: 9999 }
----
-You are picking up ticket {{ issue.identifier }}: {{ issue.title }}.
-YAML
-
-symphony board init ./kanban
-symphony board new TASK-1 "smoke test"
-symphony tui ./WORKFLOW.md
-```
-
-약 5초 안에 TASK-1이 **Todo** 컬럼에서 초록색 ● 표시와 함께 턴 카운터와 토큰
-합계가 올라가며 자라난다. 충분히 봤으면 `Ctrl-C`로 종료하고, 아래의 실제
-워크스루로 넘어간다.
-
-> 목 환경에서는 카드가 원래 컬럼에 머문다. 카드를 **Done**으로 옮기려면 실제
-> 에이전트가 `kanban/TASK-1.md`를 다시 써야 한다. 목은 LLM 호출 없이도
-> 오케스트레이터 → 백엔드 → 워크스페이스 → hooks 파이프라인이 end-to-end로
-> 동작함을 증명하기 위해 존재한다.
-
-> 목의 튜닝 옵션: `SYMPHONY_MOCK_TURN_SECONDS=12`,
-> `SYMPHONY_MOCK_FAIL_EVERY_N_TURNS=3` 등은 `src/symphony/mock_codex.py`를 참고한다.
-
----
 
 ## Preflight: `symphony doctor`
 

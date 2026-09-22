@@ -72,7 +72,7 @@ Separate tickets: Build slices → QA → Verify → Document</code></pre>
 cd oh-my-symphony
 python3 -m venv .venv
 source .venv/bin/activate
-python -m pip install -e ".[dev]"
+python -m pip install -e .
 symphony --version</code></pre>
 <p>What you should see: <code>symphony 0.25.0</code>.</p>
 </li>
@@ -144,28 +144,32 @@ PASS  tracker.board_root            ./kanban (3 tickets)</code></pre>
 <pre><code>symphony project create "Symphony Demo" --path ../symphony-demo
 cd ../symphony-demo
 
-cat &gt; WORKFLOW.md &lt;&lt;'YAML'
+# project create already wrote a doctor-clean WORKFLOW.md for real agents.
+# Leave it alone; give the mock its own workflow file next to it.
+cat &gt; WORKFLOW.mock.md &lt;&lt;'YAML'
 ---
 tracker: { kind: file, board_root: ./kanban,
            active_states: [Todo, "In Progress", Verify, Document],
            terminal_states: ["Human Review", Done, Blocked, Archive] }
 polling: { interval_ms: 5000 }
-workspace: { root: ~/symphony_workspaces }
+workspace: { root: ~/symphony_workspaces/symphony-demo-mock }
 hooks:
-  after_create: ": noop"
+  # Link the host board into each workspace so doctor and the runtime see it.
+  after_create: 'ln -sfn "$SYMPHONY_WORKFLOW_DIR/${SYMPHONY_BOARD_ROOT_NAME:-kanban}" "${SYMPHONY_BOARD_ROOT_NAME:-kanban}"'
   before_run:   ": noop"
   after_run:    "echo done"
-agent:  { kind: codex, max_concurrent_agents: 1, max_turns: 4, max_total_turns: 60 }
+agent:  { kind: codex, max_concurrent_agents: 2, max_turns: 4, max_total_turns: 60 }
 codex:  { command: python -m symphony.mock_codex }
 server: { port: 9999 }
 ---
 You are picking up ticket {{ issue.identifier }}: {{ issue.title }}.
 YAML
 
-symphony board init ./kanban
+symphony board init ./kanban           # also adds the sample ticket DEMO-001
 symphony board new TASK-1 "smoke test"
-symphony tui ./WORKFLOW.md</code></pre>
-<p>What you should see: within about 5 seconds TASK-1 grows a green ● in the Todo column with a climbing turn counter and token total. Quit with <kbd>Ctrl-C</kbd>.</p>
+symphony doctor ./WORKFLOW.mock.md     # every line should read PASS
+symphony tui ./WORKFLOW.mock.md</code></pre>
+<p>What you should see: within about 5 seconds both Todo cards, the sample ticket DEMO-001 and TASK-1, grow a green ● with a climbing turn counter and token total. Quit with <kbd>Ctrl-C</kbd>. The real walkthrough below keeps using the untouched <code>WORKFLOW.md</code>.</p>
 <div class="note"><strong>Cards stay in Todo under the mock.</strong> Only a real agent rewrites <code>kanban/TASK-1.md</code> to move the card. The mock proves the orchestrator → backend → workspace → hooks pipeline without an LLM call.</div>
 </li>
 

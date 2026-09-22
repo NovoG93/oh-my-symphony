@@ -72,7 +72,7 @@
 cd oh-my-symphony
 python3 -m venv .venv
 source .venv/bin/activate
-python -m pip install -e ".[dev]"
+python -m pip install -e .
 symphony --version</code></pre>
 <p>확인: <code>symphony 0.25.0</code>이 출력된다.</p>
 </li>
@@ -144,28 +144,32 @@ PASS  tracker.board_root            ./kanban (3 tickets)</code></pre>
 <pre><code>symphony project create "Symphony Demo" --path ../symphony-demo
 cd ../symphony-demo
 
-cat &gt; WORKFLOW.md &lt;&lt;'YAML'
+# project create가 실제 에이전트용 WORKFLOW.md를 이미 만들어 두었다(doctor 통과).
+# 그 파일은 그대로 두고 mock 전용 워크플로 파일을 옆에 만든다.
+cat &gt; WORKFLOW.mock.md &lt;&lt;'YAML'
 ---
 tracker: { kind: file, board_root: ./kanban,
            active_states: [Todo, "In Progress", Verify, Document],
            terminal_states: ["Human Review", Done, Blocked, Archive] }
 polling: { interval_ms: 5000 }
-workspace: { root: ~/symphony_workspaces }
+workspace: { root: ~/symphony_workspaces/symphony-demo-mock }
 hooks:
-  after_create: ": noop"
+  # 호스트 보드를 각 워크스페이스에 링크해 doctor와 런타임이 보드를 찾게 한다.
+  after_create: 'ln -sfn "$SYMPHONY_WORKFLOW_DIR/${SYMPHONY_BOARD_ROOT_NAME:-kanban}" "${SYMPHONY_BOARD_ROOT_NAME:-kanban}"'
   before_run:   ": noop"
   after_run:    "echo done"
-agent:  { kind: codex, max_concurrent_agents: 1, max_turns: 4, max_total_turns: 60 }
+agent:  { kind: codex, max_concurrent_agents: 2, max_turns: 4, max_total_turns: 60 }
 codex:  { command: python -m symphony.mock_codex }
 server: { port: 9999 }
 ---
 You are picking up ticket {{ issue.identifier }}: {{ issue.title }}.
 YAML
 
-symphony board init ./kanban
+symphony board init ./kanban           # 샘플 티켓 DEMO-001도 함께 생성된다
 symphony board new TASK-1 "smoke test"
-symphony tui ./WORKFLOW.md</code></pre>
-<p>확인: 약 5초 안에 Todo 컬럼의 TASK-1에 초록색 ●가 생기고 턴 카운터와 토큰 합계가 올라간다. <kbd>Ctrl-C</kbd>로 종료한다.</p>
+symphony doctor ./WORKFLOW.mock.md     # 모든 줄이 PASS여야 한다
+symphony tui ./WORKFLOW.mock.md</code></pre>
+<p>확인: 약 5초 안에 Todo 컬럼의 두 카드, 즉 샘플 티켓 DEMO-001과 TASK-1에 초록색 ●가 생기고 턴 카운터와 토큰 합계가 올라간다. <kbd>Ctrl-C</kbd>로 종료한다. 아래의 실제 워크스루는 손대지 않은 <code>WORKFLOW.md</code>를 계속 쓴다.</p>
 <div class="note"><strong>mock에서는 카드가 Todo에 머문다.</strong> 실제 에이전트만 <code>kanban/TASK-1.md</code>를 다시 써서 카드를 옮긴다. mock은 오케스트레이터 → 백엔드 → 워크스페이스 → hooks 파이프라인이 LLM 호출 없이 끝까지 도는지 증명하는 용도다.</div>
 </li>
 

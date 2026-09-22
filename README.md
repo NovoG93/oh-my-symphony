@@ -32,11 +32,11 @@ usage, and whatever rate-limit headroom the selected CLI reports.
 
 > **Printable manual:** [cheatsheet (PDF)](https://cskwork.github.io/oh-my-symphony/manual/pdf/oh-my-symphony-cheatsheet-en.pdf) · [tutorial (PDF)](https://cskwork.github.io/oh-my-symphony/manual/pdf/oh-my-symphony-tutorial-en.pdf) · [HTML + Korean](https://cskwork.github.io/oh-my-symphony/#manual). Rendered from `docs/manual/` on every deploy; key tables come from the code.
 
+- [Install](#install)
+- [Try it in 60 seconds](#try-it-in-60-seconds-no-agent-cli-required)
 - [Why Symphony?](#why-symphony)
 - [How it works](#how-it-works)
 - [Pick an agent](#pick-an-agent)
-- [Install](#install)
-- [Try it in 60 seconds](#try-it-in-60-seconds-no-agent-cli-required)
 - [Quickstart](#quickstart-your-first-task-end-to-end)
 - [Lane presets](#lane-presets)
 - [Chat intake](#chat-intake-type-a-request-approve-one-intent-the-board-delivers)
@@ -46,6 +46,123 @@ usage, and whatever rate-limit headroom the selected CLI reports.
 - [Tests](#tests)
 - [Design notes](#design-notes)
 - [What is not implemented](#what-is-not-implemented)
+
+## Install
+
+```bash
+python3 -m venv .venv
+source .venv/bin/activate
+python -m pip install -e .
+```
+
+Contributors add the test and lint toolchain with `pip install -e ".[dev]"`
+(see [CONTRIBUTING.md](CONTRIBUTING.md)). Symphony is not on PyPI yet; the
+editable install from this checkout is the supported path.
+
+Make the relevant CLI available on `$PATH`:
+
+| `agent.kind` | required CLI on `$PATH` |
+|--------------|------------------------|
+| `codex`      | `codex` (with `app-server` subcommand) |
+| `claude`     | `claude` (Claude Code) |
+| `gemini`     | `gemini` (Gemini CLI)  |
+| `agy`        | `agy` (Antigravity CLI, install from Google Antigravity; Symphony appends `--dangerously-skip-permissions`) |
+| `kiro`       | `kiro-cli` (Kiro CLI, install from `https://cli.kiro.dev/install`; run `kiro-cli login` or set `KIRO_API_KEY` for headless runs) |
+| `opencode`   | `opencode` (OpenCode CLI, install with `npm install -g opencode-ai`; authenticate providers with `opencode auth login`) |
+| `pi`         | `pi` (Pi coding-agent, `npm i -g @earendil-works/pi-coding-agent` or `curl -fsSL https://pi.dev/install.sh \| sh`; sign in once via `pi` → `/login` (OAuth, credentials cached at `~/.pi/agent/auth.json`), no env var needed) |
+| `prime-agent` | `prime-agent` (Prime Agent, install with `curl -fsSL https://app.primeintellect.ai/prime-agent/install.sh \| sh`; sign in once via `prime-agent` → `/login`, or provide a provider API key; credentials cached at `~/.prime/agent/auth.json`) |
+
+## Create or register a project
+
+Keep this `oh-my-symphony` checkout as the control plane. Doctor and normal
+startup refuse a `WORKFLOW.md` in Symphony's own canonical Git repository
+(including linked worktrees), preventing agents from editing the orchestrator
+that launched them.
+
+```bash
+symphony project create "My App" --path ../my-app
+# or adopt an existing directory; Git and missing Symphony files are added safely
+symphony project add /path/to/existing-project --name "My App"
+symphony project start my-app
+symphony hub
+```
+
+The Hub and every project board show the canonical repository, workflow, and
+"Issues are stored here" board paths. Use **Manage projects** to enter a name
+and local path. A missing path becomes a new Git repository; an existing
+non-Git directory is initialized in place; and an existing Git repository keeps
+its metadata and files. Symphony adds only missing operator files and never
+stages unrelated changes.
+
+Selecting another project starts its service when needed and navigates to that
+independent board. Services and workers for the previous project keep running
+against their original repository, so project switching cannot retarget active
+jobs.
+
+> **Existing non-Git directories:** Symphony initializes Git and commits only
+> the Symphony files it adds. Existing product files remain untracked to avoid
+> accidentally committing secrets or local artifacts. Review and commit those
+> files before dispatching tickets so worker worktrees include them.
+
+## Try it in 60 seconds (no agent CLI required)
+
+Want to see the TUI move cards around before installing an agent CLI? Use
+the bundled mock backend. It speaks the same JSON-RPC protocol as Codex but
+does no real work, just simulates turns and emits token-usage ticks.
+
+```bash
+git clone https://github.com/cskwork/oh-my-symphony.git
+cd oh-my-symphony
+python3 -m venv .venv && source .venv/bin/activate
+python -m pip install -e .
+
+# Keep the source checkout protected; create the demo as a separate project.
+# This writes a complete, doctor-clean WORKFLOW.md for real agents. Leave it
+# alone and give the mock its own workflow file next to it.
+symphony project create "Symphony Demo" --path ../symphony-demo
+cd ../symphony-demo
+
+cat > WORKFLOW.mock.md <<'YAML'
+---
+tracker: { kind: file, board_root: ./kanban,
+           active_states: [Todo, "In Progress", Verify, Document],
+           terminal_states: ["Human Review", Done, Blocked, Archive] }
+polling: { interval_ms: 5000 }
+workspace: { root: ~/symphony_workspaces/symphony-demo-mock }
+hooks:
+  # Link the host board into each workspace so doctor and the runtime see it.
+  after_create: 'ln -sfn "$SYMPHONY_WORKFLOW_DIR/${SYMPHONY_BOARD_ROOT_NAME:-kanban}" "${SYMPHONY_BOARD_ROOT_NAME:-kanban}"'
+  before_run:   ": noop"
+  after_run:    "echo done"
+agent:  { kind: codex, max_concurrent_agents: 2, max_turns: 4, max_total_turns: 60 }
+codex:  { command: python -m symphony.mock_codex }
+server: { port: 9999 }
+---
+You are picking up ticket {{ issue.identifier }}: {{ issue.title }}.
+YAML
+
+symphony board init ./kanban           # also adds the sample ticket DEMO-001
+symphony board new TASK-1 "smoke test"
+symphony doctor ./WORKFLOW.mock.md     # every line should read PASS
+symphony tui ./WORKFLOW.mock.md
+```
+
+Within ~5 seconds both cards in the **Todo** column, the sample ticket
+DEMO-001 and TASK-1, grow a green ● indicator with a turn counter and token
+totals climbing. Quit with `Ctrl-C` when you've seen enough; then proceed to
+the real walkthrough below, which uses the untouched `WORKFLOW.md`.
+
+> Cards stay in their original column under the mock. Only a real agent
+> would rewrite `kanban/TASK-1.md` to move the card to **Done**. Delete
+> `WORKFLOW.mock.md` afterwards or keep it for later smoke tests; the real
+> board always reads `WORKFLOW.md`. The mock
+> exists to prove the orchestrator → backend → workspace → hooks pipeline
+> end-to-end without an LLM call.
+
+> Tunables for the mock: `SYMPHONY_MOCK_TURN_SECONDS=12`,
+> `SYMPHONY_MOCK_FAIL_EVERY_N_TURNS=3`, and so on. See `src/symphony/mock_codex.py`.
+
+---
 
 ## Why Symphony?
 
@@ -244,113 +361,6 @@ For file-board workflows, `agent.auto_triage_actionable_todo` defaults to
 In Progress with a one-line `## Triage` note without spending a model turn. Bug
 tickets, blocked tickets, ambiguous tickets, and Linear trackers still use the
 Todo prompt.
-
-## Install
-
-```bash
-python3 -m venv .venv
-source .venv/bin/activate
-python -m pip install -e ".[dev]"
-```
-
-Make the relevant CLI available on `$PATH`:
-
-| `agent.kind` | required CLI on `$PATH` |
-|--------------|------------------------|
-| `codex`      | `codex` (with `app-server` subcommand) |
-| `claude`     | `claude` (Claude Code) |
-| `gemini`     | `gemini` (Gemini CLI)  |
-| `agy`        | `agy` (Antigravity CLI, install from Google Antigravity; Symphony appends `--dangerously-skip-permissions`) |
-| `kiro`       | `kiro-cli` (Kiro CLI, install from `https://cli.kiro.dev/install`; run `kiro-cli login` or set `KIRO_API_KEY` for headless runs) |
-| `opencode`   | `opencode` (OpenCode CLI, install with `npm install -g opencode-ai`; authenticate providers with `opencode auth login`) |
-| `pi`         | `pi` (Pi coding-agent, `npm i -g @earendil-works/pi-coding-agent` or `curl -fsSL https://pi.dev/install.sh \| sh`; sign in once via `pi` → `/login` (OAuth, credentials cached at `~/.pi/agent/auth.json`), no env var needed) |
-| `prime-agent` | `prime-agent` (Prime Agent, install with `curl -fsSL https://app.primeintellect.ai/prime-agent/install.sh \| sh`; sign in once via `prime-agent` → `/login`, or provide a provider API key; credentials cached at `~/.prime/agent/auth.json`) |
-
-## Create or register a project
-
-Keep this `oh-my-symphony` checkout as the control plane. Doctor and normal
-startup refuse a `WORKFLOW.md` in Symphony's own canonical Git repository
-(including linked worktrees), preventing agents from editing the orchestrator
-that launched them.
-
-```bash
-symphony project create "My App" --path ../my-app
-# or adopt an existing directory; Git and missing Symphony files are added safely
-symphony project add /path/to/existing-project --name "My App"
-symphony project start my-app
-symphony hub
-```
-
-The Hub and every project board show the canonical repository, workflow, and
-"Issues are stored here" board paths. Use **Manage projects** to enter a name
-and local path. A missing path becomes a new Git repository; an existing
-non-Git directory is initialized in place; and an existing Git repository keeps
-its metadata and files. Symphony adds only missing operator files and never
-stages unrelated changes.
-
-Selecting another project starts its service when needed and navigates to that
-independent board. Services and workers for the previous project keep running
-against their original repository, so project switching cannot retarget active
-jobs.
-
-> **Existing non-Git directories:** Symphony initializes Git and commits only
-> the Symphony files it adds. Existing product files remain untracked to avoid
-> accidentally committing secrets or local artifacts. Review and commit those
-> files before dispatching tickets so worker worktrees include them.
-
-## Try it in 60 seconds (no agent CLI required)
-
-Want to see the TUI move cards around before installing an agent CLI? Use
-the bundled mock backend. It speaks the same JSON-RPC protocol as Codex but
-does no real work, just simulates turns and emits token-usage ticks.
-
-```bash
-git clone https://github.com/cskwork/oh-my-symphony.git
-cd oh-my-symphony
-python3 -m venv .venv && source .venv/bin/activate
-python -m pip install -e ".[dev]"
-
-# Keep the source checkout protected; create the demo as a separate project.
-symphony project create "Symphony Demo" --path ../symphony-demo
-cd ../symphony-demo
-
-# WORKFLOW.md pointed at the mock backend
-cat > WORKFLOW.md <<'YAML'
----
-tracker: { kind: file, board_root: ./kanban,
-           active_states: [Todo, "In Progress", Verify, Document],
-           terminal_states: ["Human Review", Done, Blocked, Archive] }
-polling: { interval_ms: 5000 }
-workspace: { root: ~/symphony_workspaces }
-hooks:
-  after_create: ": noop"
-  before_run:   ": noop"
-  after_run:    "echo done"
-agent:  { kind: codex, max_concurrent_agents: 1, max_turns: 4, max_total_turns: 60 }
-codex:  { command: python -m symphony.mock_codex }
-server: { port: 9999 }
----
-You are picking up ticket {{ issue.identifier }}: {{ issue.title }}.
-YAML
-
-symphony board init ./kanban
-symphony board new TASK-1 "smoke test"
-symphony tui ./WORKFLOW.md
-```
-
-Within ~5 seconds TASK-1 grows a green ● indicator in the **Todo** column,
-with a turn counter and token totals climbing. Quit with `Ctrl-C` when
-you've seen enough; then proceed to the real walkthrough below.
-
-> Cards stay in their original column under the mock. Only a real agent
-> would rewrite `kanban/TASK-1.md` to move the card to **Done**. The mock
-> exists to prove the orchestrator → backend → workspace → hooks pipeline
-> end-to-end without an LLM call.
-
-> Tunables for the mock: `SYMPHONY_MOCK_TURN_SECONDS=12`,
-> `SYMPHONY_MOCK_FAIL_EVERY_N_TURNS=3`, and so on. See `src/symphony/mock_codex.py`.
-
----
 
 ## Preflight with `symphony doctor`
 

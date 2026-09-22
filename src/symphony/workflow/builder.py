@@ -148,8 +148,15 @@ def _canonical_agent_kind(kind: str) -> str:
     return kind
 
 
-def build_service_config(workflow: WorkflowDefinition) -> ServiceConfig:
-    """§6.1 — apply defaults and resolve typed values."""
+def build_service_config(
+    workflow: WorkflowDefinition, *, log_decisions: bool = True
+) -> ServiceConfig:
+    """§6.1 — apply defaults and resolve typed values.
+
+    ``log_decisions=False`` keeps read-only lookups (project registry
+    resource resolution) from emitting operator-facing decision logs about
+    *other* projects' workflows.
+    """
     cfg = workflow.config
     base_dir = workflow.base_dir()
 
@@ -846,7 +853,8 @@ def build_service_config(workflow: WorkflowDefinition) -> ServiceConfig:
         cfg.get("continuous_improvement")
     )
 
-    _log_stage_contracts_decision(agent, tracker)
+    if log_decisions:
+        _log_stage_contracts_decision(agent, tracker)
 
     return ServiceConfig(
         workflow_path=workflow.source_path,

@@ -48,7 +48,8 @@ def _write(tmp_path: Path, body: str) -> Path:
 def _extract_readme_quickstart_workflow(path: Path) -> str:
     text = path.read_text(encoding="utf-8")
     match = re.search(
-        r"cat > WORKFLOW\.md <<'YAML'\n(?P<workflow>---\n.*?\n)YAML",
+        # The 60-second demo writes its mock workflow beside the generated WORKFLOW.md.
+        r"cat > WORKFLOW\.mock\.md <<'YAML'\n(?P<workflow>---\n.*?\n)YAML",
         text,
         re.DOTALL,
     )

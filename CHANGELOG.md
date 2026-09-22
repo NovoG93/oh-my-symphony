@@ -8,6 +8,19 @@ this file is the in-repo summary.
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 Versioning: [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+- `symphony project create` and `project add` now copy project-facing `AGENTS.md` / `GEMINI.md` templates instead of Symphony's own repository instructions, which told Codex and Gemini that the user's project "is Symphony".
+- Bootstrapped projects exclude `.symphony/` (state database, token EMA, stats) and `WORKFLOW-PROGRESS.md` through the local `info/exclude`, so the first run no longer leaves runtime files as untracked noise in `git status`.
+- A refused orchestrator start (protected source repository, port in use) no longer toggles macOS keep-awake before failing, and the failure sentence no longer ends with a doubled period.
+- Registry resource lookups no longer emit `stage_contracts_disabled` decision logs about other registered projects during `symphony project create`.
+
+### Changed
+- The "Try it in 60 seconds" demo writes `WORKFLOW.mock.md` beside the generated `WORKFLOW.md` instead of overwriting it, links the host board into each mock workspace so `symphony doctor` and the runtime report no board-reachability warnings, runs two concurrent mock workers so both the sample ticket and the new ticket move, and installs without the `[dev]` extras. README, README.ko, and the manual tutorial and cheatsheet carry the same steps.
+- README (English and Korean) lists Install and the 60-second demo directly after the table of contents.
+- `symphony --help` names every supported backend instead of only Codex, Claude Code, and Gemini.
+
 ## [0.25.0] - 2026-09-12 - Execution diagnostics and Deep workflow reliability
 
 ### Fixed
