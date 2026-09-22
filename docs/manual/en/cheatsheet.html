@@ -37,7 +37,7 @@
 <h2>Install &amp; first run</h2>
 <pre><code>git clone https://github.com/cskwork/oh-my-symphony.git &amp;&amp; cd oh-my-symphony
 python3 -m venv .venv &amp;&amp; source .venv/bin/activate
-python -m pip install -e ".[dev]"
+python -m pip install -e .
 symphony project create "My App" --path ../my-app &amp;&amp; cd ../my-app
 symphony doctor ./WORKFLOW.md
 symphony tui ./WORKFLOW.md</code></pre>
