@@ -8,7 +8,7 @@ this file is the in-repo summary.
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 Versioning: [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.26.0] - 2026-09-22 - First-run experience: demo keeps the generated workflow, project-facing agent files, clean git status
 
 ### Fixed
 - `symphony project create` and `project add` now copy project-facing `AGENTS.md` / `GEMINI.md` templates instead of Symphony's own repository instructions, which told Codex and Gemini that the user's project "is Symphony".
