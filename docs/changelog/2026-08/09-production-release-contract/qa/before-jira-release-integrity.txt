@@ -1,7 +1,7 @@
 Exact repository baseline captured 2026-08-08T22:40:35Z
 
 Command:
-git -C /Users/danny/Documents/PARA/Resource/jira-dev-factory merge-base --is-ancestor symphony/JIRA-003 main
+git -C ~/Documents/PARA/Resource/jira-dev-factory merge-base --is-ancestor symphony/JIRA-003 main
 
 Exit: 1 (symphony/JIRA-003 is not an ancestor of main)
 

@@ -9,7 +9,7 @@ unchecked criteria tagged `(surfaced: ...)`. Ambiguous/product-changing candidat
 
 > app was made using oh my symphony [Pasted Content 2328 chars] but quality is bad some menus dont work ui ux is not up to my expectations features missing. from these learning what. what improvements can be made to enhance the app to produce high quality production software autonoumously with oh-my-symphony implement the improvement make fully functional and do a full e2e run using agents opencode glm-5.2 as model
 >
-> 1 was made /Users/danny/Documents/PARA/Resource/jira-dev-factory/jira-clone 2 yes all 3 symphony can issue new tickets to fix the low quality untill all pass (done autnomously)
+> 1 was made /Users/<user>/Documents/PARA/Resource/jira-dev-factory/jira-clone 2 yes all 3 symphony can issue new tickets to fix the low quality untill all pass (done autnomously)
 
 ## Spec
 
