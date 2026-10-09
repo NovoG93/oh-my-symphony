@@ -162,7 +162,7 @@ def test_safe_proc_wait_falls_back_when_asyncio_watcher_reaped(
 def test_safe_proc_wait_timeout_returns_none() -> None:
     """Long-running child past the timeout returns None instead of blocking."""
     popen = _subprocess.Popen(
-        ["bash", "-c", "sleep 5"],
+        ["bash", "-c", "sleep 1"],
         stdout=_subprocess.DEVNULL,
         stderr=_subprocess.DEVNULL,
     )

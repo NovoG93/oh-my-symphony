@@ -174,6 +174,23 @@ async def test_token_set_gates_mutation_routes_too(
     assert allowed.status == 202
 
 
+async def test_token_protected_artifact_requires_bearer_and_serves_with_header(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    from tests.test_webapi import _seed_artifact
+
+    _seed_artifact(tmp_path)
+    monkeypatch.setenv(API_TOKEN_ENV, "sekrit-token")
+    path = "/api/v1/issues/SEED-1/artifacts/shot.png"
+    blocked = await client.get(path)
+    assert blocked.status == 401
+    allowed = await client.get(
+        path, headers={"Authorization": "Bearer sekrit-token"}
+    )
+    assert allowed.status == 200
+    assert await allowed.read() == b"png-bytes"
+
+
 async def test_tokenized_health_accepts_only_exact_service_instance_header(
     client: TestClient, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -324,21 +341,85 @@ async def test_bodyless_browser_mutations_require_json_content_type(
     monkeypatch.delenv(API_TOKEN_ENV, raising=False)
     # An HTML form can submit an empty POST without a CORS preflight; any
     # browser provenance header must trigger the 415 even with no body.
+    for headers in ({"Sec-Fetch-Mode": "no-cors"},):
+        resp = await client.post("/api/v1/refresh", headers=headers)
+        assert resp.status == 415, headers
+        assert (await resp.json())["error"]["code"] == "unsupported_media_type"
     for headers in (
         {"Origin": "http://evil.example"},
         {"Referer": "http://evil.example/page"},
         {"Sec-Fetch-Site": "cross-site"},
-        {"Sec-Fetch-Mode": "no-cors"},
     ):
         resp = await client.post("/api/v1/refresh", headers=headers)
-        assert resp.status == 415, headers
-        assert (await resp.json())["error"]["code"] == "unsupported_media_type"
+        assert resp.status == 403, headers
+        assert (await resp.json())["error"]["code"] == "forbidden_origin"
     resp = await client.delete("/api/v1/issues/X-1", headers={"Origin": "http://evil.example"})
-    assert resp.status == 415
+    assert resp.status == 403
     resp = await client.post(
         "/api/v1/refresh", json={}, headers={"Origin": "http://127.0.0.1"}
     )
     assert resp.status == 202
+
+
+async def test_origin_guard_runs_after_bearer_and_before_mutation(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv(API_TOKEN_ENV, "secret")
+    path = "/api/v1/refresh"
+    missing = await client.post(
+        path, json={}, headers={"Origin": "https://evil.example"}
+    )
+    assert missing.status == 401
+    assert (await missing.json())["error"]["code"] == "unauthorized"
+    hostile = await client.post(
+        path,
+        json={},
+        headers={
+            "Authorization": "Bearer secret",
+            "Origin": "https://evil.example",
+        },
+    )
+    assert hostile.status == 403
+    assert (await hostile.json())["error"]["code"] == "forbidden_origin"
+    same_origin = await client.post(
+        path,
+        json={},
+        headers={
+            "Authorization": "Bearer secret",
+            "Origin": str(client.make_url("/")).rstrip("/"),
+        },
+    )
+    assert same_origin.status == 202
+
+
+async def test_malformed_origin_and_referer_fail_closed(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.delenv(API_TOKEN_ENV, raising=False)
+    for headers in ({"Origin": "http://["}, {"Referer": "http://["}):
+        response = await client.post(
+            "/api/v1/refresh", json={}, headers=headers
+        )
+        assert response.status == 403, headers
+        payload = await response.json()
+        assert payload["error"]["code"] == "forbidden_origin"
+
+
+async def test_host_guard_still_precedes_origin_for_authenticated_request(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv(API_TOKEN_ENV, "secret")
+    response = await client.post(
+        "/api/v1/refresh",
+        json={},
+        headers={
+            "Authorization": "Bearer secret",
+            "Host": "evil.example",
+            "Origin": "https://evil.example",
+        },
+    )
+    assert response.status == 403
+    assert (await response.json())["error"]["code"] == "forbidden_host"
 
 
 async def test_bodyless_cli_mutations_still_work_without_json(

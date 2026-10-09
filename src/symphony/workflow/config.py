@@ -479,6 +479,44 @@ class ArtifactsConfig:
 
 
 @dataclass(frozen=True)
+class ManualVerificationProcedure:
+    instructions: str
+    report: str = "required"
+    artifacts: str = "optional"
+    label: str | None = None
+
+
+@dataclass(frozen=True)
+class PmConfig:
+    """Default-off Human-Readable PM Workspace capabilities and hard limits."""
+
+    authoring: bool = False
+    exchange: bool = False
+    assistance: bool = False
+    handoff: bool = False
+    openspec_executable: str = "openspec"
+    planning_workspace_root: Path | None = None
+    max_encoded_upload_mb: int = 8
+    max_workbook_mb: int = 5
+    max_uncompressed_mb: int = 50
+    max_zip_entries: int = 1_000
+    max_nodes: int = 5_000
+    max_edges: int = 20_000
+    max_text_chars: int = 16_384
+    operation_timeout_ms: int = 30_000
+    exchange_concurrency: int = 1
+    planning_codex_version: str = "0.160.0"
+    planning_model: str = "gpt-5.6-sol"
+    planning_reasoning_effort: str = "medium"
+    verification_procedures: dict[str, tuple[str, ...]] = field(default_factory=dict)
+    manual_verification_procedures: dict[str, ManualVerificationProcedure] = field(default_factory=dict)
+
+    @property
+    def enabled(self) -> bool:
+        return any((self.authoring, self.exchange, self.assistance, self.handoff))
+
+
+@dataclass(frozen=True)
 class TuiConfig:
     """Display-time TUI tweaks. Affects rendering only; orchestrator ignores."""
 
@@ -651,6 +689,8 @@ class ServiceConfig:
     # Ticket artifact collection — appended after the original fields so
     # positional ServiceConfig callers keep receiving the same values.
     artifacts: ArtifactsConfig = field(default_factory=ArtifactsConfig)
+    # PM Workspace is appended to preserve positional ServiceConfig callers.
+    pm: PmConfig = field(default_factory=PmConfig)
 
     def prompt_template_for_state(self, state: str) -> str:
         """Return the runtime prompt template for one tracker state."""

@@ -30,6 +30,186 @@ def _issue(identifier: str = "MT-1") -> Issue:
     )
 
 
+def test_pm_workspace_claim_is_fenced_and_rejects_other_owner(tmp_path: Path) -> None:
+    registry = RunRegistry(tmp_path / "state.db")
+    first = registry.claim_pm_workspace(
+        project_id="p1",
+        change_id="c1",
+        workspace_path=tmp_path / "planning",
+        base_git_sha="a" * 40,
+        owner="owner-1",
+    )
+    assert first.fence == 1
+    with pytest.raises(RuntimeError, match="already claimed"):
+        registry.claim_pm_workspace(
+            project_id="p1",
+            change_id="c1",
+            workspace_path=tmp_path / "other",
+            base_git_sha="b" * 40,
+            owner="owner-2",
+        )
+    assert registry.set_pm_workspace_state(
+        "p1", "c1", fence=first.fence, state="EXTERNAL_EDIT", observed_hashes={"x": "y"}
+    )
+    assert registry.get_pm_workspace("p1", "c1").observed_hashes == {"x": "y"}  # type: ignore[union-attr]
+    reclaimed = registry.claim_pm_workspace(
+        project_id="p1",
+        change_id="c1",
+        workspace_path=tmp_path / "planning",
+        base_git_sha="a" * 40,
+        owner="owner-1",
+    )
+    assert reclaimed.fence == first.fence
+    assert reclaimed.state == "EXTERNAL_EDIT"
+    assert reclaimed.observed_hashes == {"x": "y"}
+
+
+def test_pm_operation_idempotency_rejects_different_input(tmp_path: Path) -> None:
+    registry = RunRegistry(tmp_path / "state.db")
+    args = dict(
+        operation_id="op-1",
+        project_id="p1",
+        change_id="c1",
+        kind="handoff",
+        expected_revision="r1",
+        input_hash="h1",
+    )
+    assert registry.create_pm_operation(**args) == ("op-1", True)
+    assert registry.create_pm_operation(**args) == ("op-1", False)
+    with pytest.raises(ValueError, match="different input"):
+            registry.create_pm_operation(**{**args, "input_hash": "different"})
+
+
+def test_pm_handoff_reserves_managed_identity_before_ticket_creation(tmp_path: Path) -> None:
+    registry = RunRegistry(tmp_path / "state.db")
+    created = registry.create_pm_handoff_batch(
+        handoff_id="h-stage", operation_id="op-stage", project_id="p1",
+        change_id="c1", scope_hash="scope", approval_id="a1",
+        snapshot_id="a1",
+        items=[{
+            "task_id": "T-ABCDEFGH", "task_revision": "r1",
+            "deterministic_ticket_id": "PM-STAGED", "content_hash": "hash",
+            "input_json": "{}",
+        }],
+    )
+    assert created
+    mapping = registry.get_pm_managed_ticket("p1", "PM-STAGED")
+    assert mapping is not None and mapping.state == "STAGING"
+
+
+def test_pm_managed_ticket_collision_never_overwrites_existing_identity(
+    tmp_path: Path,
+) -> None:
+    registry = RunRegistry(tmp_path / "state.db")
+    first = registry.register_pm_managed_ticket(
+        project_id="p1",
+        ticket_identifier="PM-1",
+        change_id="c1",
+        task_id="T-1",
+        task_revision="r1",
+        handoff_id="h1",
+        state="STAGING",
+    )
+    assert first.task_id == "T-1"
+    with pytest.raises(ValueError, match="collision"):
+        registry.register_pm_managed_ticket(
+            project_id="p1",
+            ticket_identifier="PM-1",
+            change_id="c2",
+            task_id="T-2",
+            task_revision="r2",
+            handoff_id="h2",
+            state="STAGING",
+        )
+
+
+def test_pm_dispatch_permit_requires_published_mapping_and_is_fenced(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "state.db"
+    registry = RunRegistry(path)
+    now = datetime(2026, 10, 4, tzinfo=timezone.utc)
+    with sqlite3.connect(path) as conn:
+        conn.execute("PRAGMA foreign_keys=ON")
+        conn.execute(
+            """
+            INSERT INTO pm_handoff_batches (
+                handoff_id, operation_id, project_id, change_id, scope_hash,
+                approval_id, snapshot_id, state, created_at, published_at
+            ) VALUES ('h1','op1','p1','c1','scope','a1','s1','PUBLISHED',?,?)
+            """,
+            (now.isoformat(), now.isoformat()),
+        )
+    registry.register_pm_managed_ticket(
+        project_id="p1",
+        ticket_identifier="PM-1",
+        change_id="c1",
+        task_id="T-1",
+        task_revision="r1",
+        handoff_id="h1",
+        state="PUBLISHED",
+        now=now,
+    )
+    permit = registry.reserve_pm_dispatch_permit(
+        project_id="p1",
+        ticket_identifier="PM-1",
+        handoff_id="h1",
+        task_revision="r1",
+        issue_hash="issue",
+        scope_hash="scope",
+        now=now,
+    )
+    assert permit.state == "RESERVED"
+    assert registry.transition_pm_dispatch_permit(
+        permit.permit_id,
+        fence=permit.fence,
+        from_states=("RESERVED",),
+        to_state="STARTING",
+        process_pid=123,
+        now=now,
+    )
+    assert not registry.transition_pm_dispatch_permit(
+        permit.permit_id,
+        fence=permit.fence + 1,
+        from_states=("STARTING",),
+        to_state="RUNNING",
+    )
+
+
+def test_pm_dispatch_permit_cannot_transition_after_expiry(tmp_path: Path) -> None:
+    path = tmp_path / "state.db"
+    registry = RunRegistry(path)
+    now = datetime(2026, 10, 4, tzinfo=timezone.utc)
+    with sqlite3.connect(path) as conn:
+        conn.execute("PRAGMA foreign_keys=ON")
+        conn.execute(
+            """
+            INSERT INTO pm_handoff_batches (
+                handoff_id, operation_id, project_id, change_id, scope_hash,
+                approval_id, snapshot_id, state, created_at, published_at
+            ) VALUES ('h1','op1','p1','c1','scope','a1','s1','PUBLISHED',?,?)
+            """,
+            (now.isoformat(), now.isoformat()),
+        )
+    registry.register_pm_managed_ticket(
+        project_id="p1", ticket_identifier="PM-1", change_id="c1",
+        task_id="T-1", task_revision="r1", handoff_id="h1",
+        state="PUBLISHED", now=now,
+    )
+    permit = registry.reserve_pm_dispatch_permit(
+        project_id="p1", ticket_identifier="PM-1", handoff_id="h1",
+        task_revision="r1", issue_hash="issue", scope_hash="scope",
+        ttl=timedelta(seconds=1), now=now,
+    )
+    assert not registry.transition_pm_dispatch_permit(
+        permit.permit_id,
+        fence=permit.fence,
+        from_states=("RESERVED",),
+        to_state="STARTING",
+        now=now + timedelta(days=1),
+    )
+
+
 def test_run_registry_active_lease_blocks_second_claim(tmp_path: Path) -> None:
     registry = RunRegistry(tmp_path / "state.db", lease_ttl=timedelta(seconds=60))
     now = datetime(2026, 7, 2, 1, 0, tzinfo=timezone.utc)
@@ -988,7 +1168,7 @@ def test_v4_release_gate_migration_backfills_generation_and_evidence_identity(
 
     registry = RunRegistry(path)
 
-    assert registry.applied_migrations == (5, 6, 7, 8)
+    assert registry.applied_migrations == (5, 6, 7, 8, 9)
     assert len(list(tmp_path.glob("state.db.backup-*"))) == 1
     for finalizer, verifier in (
         ("PENDING-FINAL", "PENDING-VERIFY"),
@@ -1111,7 +1291,7 @@ def test_v5_release_completion_without_ticket_token_is_invalidated(
     gate = registry.get_release_gate("APP-FINAL")
     evidence = registry.get_release_evidence_identity("VERIFY-1")
 
-    assert registry.applied_migrations == (6, 7, 8)
+    assert registry.applied_migrations == (6, 7, 8, 9)
     assert gate is not None and evidence is not None
     assert gate.status == "pending"
     assert gate.generation and gate.generation != "old-generation"
@@ -1235,7 +1415,7 @@ def test_concurrent_v4_migration_applies_each_pending_version_once(
         for applied, _generation in results
         for version in applied
     )
-    assert applied_versions == [5, 6, 7, 8]
+    assert applied_versions == [5, 6, 7, 8, 9]
     generations = {generation for _applied, generation in results}
     assert len(generations) == 1
     assert next(iter(generations))
@@ -1412,7 +1592,7 @@ def test_run_explorer_v7_summary_events_and_diagnostic_are_bounded(tmp_path: Pat
         now=datetime(2026, 9, 1, tzinfo=timezone.utc),
     )
     assert run_id is not None
-    assert registry.schema_version() == 8
+    assert registry.schema_version() == 9
 
     registry.append_attempt_event(
         run_id=run_id,
@@ -2314,3 +2494,63 @@ def test_pid_alive_win32_probe_on_real_processes() -> None:
     assert run_registry_mod._pid_alive(4_000_000) is False, (
         "never-existing pid must read dead"
     )
+
+
+def _running_pm_permit(tmp_path: Path, now: datetime):
+    path = tmp_path / "state.db"
+    registry = RunRegistry(path, lease_ttl=timedelta(minutes=5))
+    with sqlite3.connect(path) as conn:
+        conn.execute(
+            """
+            INSERT INTO pm_handoff_batches (
+                handoff_id, operation_id, project_id, change_id, scope_hash,
+                approval_id, snapshot_id, state, created_at, published_at
+            ) VALUES ('h1','op1','p1','c1','scope','a1','s1','PUBLISHED',?,?)
+            """,
+            (now.isoformat(), now.isoformat()),
+        )
+    registry.register_pm_managed_ticket(
+        project_id="p1", ticket_identifier="PM-1", change_id="c1",
+        task_id="T-1", task_revision="r1", handoff_id="h1",
+        state="PUBLISHED", now=now,
+    )
+    issue = replace(_issue("PM-1"), id="pm-1")
+    run_id = registry.acquire_run(
+        issue, workspace_path=tmp_path, attempt=None,
+        attempt_kind="initial", agent_kind="codex", now=now,
+    )
+    assert run_id is not None
+    permit = registry.reserve_pm_dispatch_permit(
+        project_id="p1", ticket_identifier="PM-1", handoff_id="h1",
+        task_revision="r1", issue_hash="issue", scope_hash="scope", now=now,
+    )
+    for source, target in ((("RESERVED",), "STARTING"), (("STARTING",), "RUNNING")):
+        assert registry.transition_pm_dispatch_permit(
+            permit.permit_id, fence=permit.fence, from_states=source,
+            to_state=target, process_pid=123, run_id=run_id, now=now,
+        )
+    return registry, issue, run_id, permit
+
+
+def test_live_run_heartbeat_keeps_its_pm_permit_for_a_later_turn(tmp_path: Path) -> None:
+    now = datetime(2026, 10, 5, tzinfo=timezone.utc)
+    registry, issue, run_id, permit = _running_pm_permit(tmp_path, now)
+    assert registry.heartbeat(issue_id=issue.id, run_id=run_id, now=now + timedelta(minutes=4))
+    assert registry.transition_pm_dispatch_permit(
+        permit.permit_id, fence=permit.fence, from_states=("RUNNING",),
+        to_state="STARTING", now=now + timedelta(minutes=6),
+    )
+
+
+def test_heartbeat_never_revives_expired_or_revoked_pm_permits(tmp_path: Path) -> None:
+    now = datetime(2026, 10, 5, tzinfo=timezone.utc)
+    registry, issue, run_id, permit = _running_pm_permit(tmp_path, now)
+    registry.heartbeat(issue_id=issue.id, run_id=run_id, now=now + timedelta(minutes=6))
+    assert not registry.transition_pm_dispatch_permit(
+        permit.permit_id, fence=permit.fence, from_states=("RUNNING",),
+        to_state="STARTING", now=now + timedelta(minutes=6, seconds=1),
+    )
+    registry2, issue2, run_id2, permit2 = _running_pm_permit(tmp_path / "revoked", now)
+    assert registry2.revoke_pm_dispatch("p1", "PM-1", now=now) >= 1
+    registry2.heartbeat(issue_id=issue2.id, run_id=run_id2, now=now + timedelta(minutes=1))
+    assert registry2.get_pm_dispatch_permit(permit2.permit_id).state == "REVOKED"

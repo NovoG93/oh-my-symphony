@@ -171,7 +171,7 @@ def test_web_chat_page_contract() -> None:
 
     assert 'data-route="chat"' in html
     assert (
-        "const ROUTES = ['board', 'runs', 'stats', 'workflow', 'git', 'chat', 'preview', 'settings']"
+        "const ROUTES = ['board', 'runs', 'stats', 'workflow', 'git', 'chat', 'preview', 'artifacts', 'settings']"
         in js
     )
     assert "function renderChatPage(container)" in js
@@ -329,6 +329,39 @@ def test_web_api_token_prompt_contract() -> None:
     assert "'auth.tokenSave': '연결'" in js
     assert ".api-token-banner" in css
     assert ".api-token-input" in css
+
+
+def test_pm_artifact_downloads_use_authenticated_host_fetch() -> None:
+    js = _script_bundle()
+    pm = (STATIC_ROOT / "pm" / "index.js").read_text(encoding="utf-8")
+    assert "async function authenticatedDownload(path, filename)" in js
+    assert "const target = String(path).startsWith(API_BASE) ? String(path) : `${API_BASE}${path}`" in js
+    assert "fetch(target, { headers: withAuthHeaders({}) })" in js
+    assert "downloadArtifact: (path, filename) => authenticatedDownload(path, filename)" in js
+    assert "ui.downloadArtifact(`/issues/${encodeURIComponent(ticket.ticket_identifier)}/artifacts/" in pm
+    assert "href: `/api/v1/issues/${encodeURIComponent(ticket.ticket_identifier)}/artifacts/" not in pm
+
+
+def test_pm_korean_validation_and_handoff_controls_are_complete() -> None:
+    pm = (STATIC_ROOT / "pm" / "index.js").read_text(encoding="utf-8")
+    assert "'Validation results': '검증 결과'" in pm
+    assert "'Ready for review': '검토 준비 완료'" in pm
+    assert "'No findings.': '발견된 문제가 없습니다.'" in pm
+    assert "'Confirm native handoff': '네이티브 전달 확인'" in pm
+    assert "'Create native tickets': '네이티브 티켓 생성'" in pm
+    assert "`이 승인된 리비전에서 티켓 ${preview.items.length}개를 생성합니다.`" in pm
+    assert "ui.announce(korean ? '승인된 계획을 전달했습니다.'" in pm
+
+
+def test_pm_korean_import_conflict_and_approval_controls_are_complete() -> None:
+    pm = (STATIC_ROOT / "pm" / "index.js").read_text(encoding="utf-8")
+    exchange = (STATIC_ROOT / "pm" / "exchange.js").read_text(encoding="utf-8")
+    assert "'Apply reviewed import': '검토한 가져오기 적용'" in pm
+    assert "'{count} conflicts require resolution': '해결이 필요한 충돌 {count}개'" in pm
+    assert "'Resolve {key}': '{key} 해결'" in pm
+    assert "'Approve this exact planning revision locally?': '이 정확한 기획 리비전을 로컬에서 승인하시겠습니까?'" in pm
+    assert "translate('Resolve {key}', { key })" in exchange
+    assert "translate('Apply reviewed import')" in exchange
 
 
 def test_web_stale_board_gates_keyboard_activation() -> None:

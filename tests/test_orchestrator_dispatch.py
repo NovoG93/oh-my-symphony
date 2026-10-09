@@ -16,13 +16,15 @@ from pathlib import Path
 import pytest
 
 import symphony.orchestrator.core as core_module
+import symphony.orchestrator.attempt as attempt_module
+import symphony.backends.per_turn as per_turn_module
 from symphony.backends import (
     EVENT_APPROVAL_DENIED,
     EVENT_SESSION_STARTED,
     EVENT_TURN_COMPLETED,
 )
 from symphony.errors import LinearUnknownPayload, TurnFailed
-from symphony.issue import BlockerRef, Issue, sort_for_dispatch
+from symphony.issue import BlockerRef, Issue, PlanningRef, sort_for_dispatch
 from symphony.orchestrator import (
     STALL_FORCE_EJECT_GRACE_S,
     Orchestrator,
@@ -1718,7 +1720,8 @@ def test_startup_reclaim_kills_recorded_orphan_agent_before_return(
     status_during_kill: list[str] = []
     contender_claims: list[str | None] = []
 
-    def kill_while_proving_fence(pid: int) -> bool:
+    def kill_while_proving_fence(pid: int, *, identity=None) -> bool:
+        assert identity == "proc-1"
         killed.append(pid)
         assert restarted._run_registry is not None
         status_during_kill.append(restarted._run_registry.get_run(run_id).status)
@@ -10547,6 +10550,785 @@ def test_dispatch_without_stage_kinds_still_stamps_agent_kind(tmp_path, monkeypa
     assert stamped == [("MT-1", "codex")]
 
 
+def test_dispatch_pm_inherited_backend_records_audit_without_mutating_pin(
+    tmp_path, monkeypatch
+):
+    """A PM task with no approved override inherits the workflow backend.
+
+    Persisting that resolved backend as ``agent.kind`` changes the approved
+    issue scope between permit reservation and process launch.  PM tickets
+    therefore use the audit-only field, while explicit overrides already
+    present on the issue remain authoritative inputs.
+    """
+    cfg = _make_config(
+        workflow_path=tmp_path / "WORKFLOW.md", workspace_root=tmp_path / "ws"
+    )
+    pins: list[tuple[str, str]] = []
+    audits: list[tuple[str, str]] = []
+    monkeypatch.setattr(
+        Orchestrator,
+        "_tracker_call_record_agent_kind",
+        staticmethod(
+            lambda _cfg, identifier, agent_kind: pins.append(
+                (identifier, agent_kind)
+            )
+        ),
+    )
+    monkeypatch.setattr(
+        Orchestrator,
+        "_tracker_call_record_last_agent_kind",
+        staticmethod(
+            lambda _cfg, identifier, agent_kind: audits.append(
+                (identifier, agent_kind)
+            )
+        ),
+    )
+
+    async def _parked_worker(_issue, _attempt, _cfg) -> None:
+        await asyncio.sleep(3600)
+
+    async def _run() -> None:
+        orch = _orch()
+        orch._loop = asyncio.get_running_loop()
+        orch._run_registry = RunRegistry(
+            tmp_path / ".symphony" / "state.db", lease_ttl=timedelta(minutes=5)
+        )
+        monkeypatch.setattr(orch, "_run_agent_attempt", _parked_worker)
+        issue = replace(
+            _issue("PM-1", state="Todo"),
+            planning_ref=PlanningRef("c1", "T-1", "r1", "h1", "a1"),
+            planning_ref_state="valid",
+        )
+        orch._dispatch(issue, cfg, attempt=None)
+        assert orch._running[issue.id].agent_kind == "codex"
+        task = orch._running[issue.id].worker_task
+        assert task is not None
+        task.cancel()
+        try:
+            await task
+        except (asyncio.CancelledError, Exception):
+            pass
+
+    asyncio.run(_run())
+    assert pins == []
+    assert audits == [("PM-1", "codex")]
+
+
+def test_pm_dispatch_refuses_automatic_delivery_policy_before_workspace(
+    tmp_path, monkeypatch,
+):
+    from tests.test_pm_authority import _authority, _issue, _valid_ref
+
+    _authority_service, registry = _authority(tmp_path)
+    issue = _issue(_valid_ref())
+    cfg = _make_config(
+        workflow_path=tmp_path / "WORKFLOW.md", workspace_root=tmp_path / "ws",
+    )
+    cfg = replace(
+        cfg,
+        tracker=replace(cfg.tracker, project_slug="p1"),
+        agent=replace(cfg.agent, auto_merge_on_done=True),
+    )
+    orch = _orch()
+    orch._run_registry = registry
+    _install_running_entry(orch, issue)
+    monkeypatch.setattr(
+        attempt_module, "_resolve_release_authority",
+        lambda _orch, candidate, _cfg: candidate,
+    )
+
+    result = asyncio.run(attempt_module._start_attempt(orch, issue, None, cfg))
+    assert isinstance(result, attempt_module._AttemptExit)
+    assert result.outcome == "pm_delivery_policy_conflict"
+    assert "automatic merge or push" in (result.error or "")
+    assert not (tmp_path / "ws").exists()
+
+
+def test_pm_combined_restart_marker_fallback_delivery_policy_and_revocation(
+    tmp_path,
+):
+    from symphony.orchestrator.attempt import _AttemptExit, _start_attempt
+    from symphony.pm.authority import PmAuthority
+    from tests.test_pm_authority import _authority, _issue as _pm_issue, _valid_ref
+
+    authority, registry = _authority(tmp_path)
+    approved_issue = _pm_issue(_valid_ref())
+    permit = authority.reserve_dispatch(approved_issue, "p1")
+    assert permit is not None
+    registry._merge_pm_fallback(
+        "p1",
+        {
+            approved_issue.identifier: {
+                "change_id": "c1",
+                "task_id": "T-ABCDEFGH",
+                "task_revision": "r1",
+                "handoff_id": "h1",
+                "state": "PUBLISHED",
+            }
+        },
+    )
+    database_path = registry.path
+    fallback_path = registry._pm_fallback_path()
+    registry.close()
+
+    restarted_registry = RunRegistry(database_path)
+    restarted_authority = PmAuthority(restarted_registry, tmp_path / "locks")
+    markerless = _pm_issue()
+    membership = restarted_authority.recognize(markerless, "p1")
+    assert membership.managed and not membership.runnable
+    assert "provenance is missing" in (membership.reason or "")
+
+    cfg = _make_config(workflow_path=tmp_path / "WORKFLOW.md")
+    cfg = replace(
+        cfg,
+        tracker=replace(cfg.tracker, project_slug="p1"),
+        agent=replace(cfg.agent, auto_merge_on_done=True),
+    )
+    restarted = _orch()
+    restarted._run_registry = restarted_registry
+    restarted._running[markerless.id] = RunningEntry(
+        issue=markerless,
+        started_at=datetime.now(timezone.utc),
+        retry_attempt=1,
+        worker_task=None,
+        workspace_path=tmp_path / "workspace",
+        attempt_kind="fallback",
+        run_id="restart-fallback-run",
+    )
+    denied = asyncio.run(_start_attempt(restarted, markerless, 1, cfg))
+    assert isinstance(denied, _AttemptExit)
+    assert denied.outcome == "pm_delivery_policy_conflict"
+    assert "automatic merge or push" in (denied.error or "")
+
+    assert restarted_authority.revoke("p1", markerless.identifier) == 1
+    revoked = restarted_registry.get_pm_dispatch_permit(permit.permit_id)
+    assert revoked is not None and revoked.state == "REVOKED"
+    restarted_registry.close()
+
+    assert fallback_path.is_file()
+    database_path.unlink()
+    for suffix in ("-wal", "-shm"):
+        database_path.with_name(database_path.name + suffix).unlink(missing_ok=True)
+    fallback_registry = RunRegistry(database_path)
+    try:
+        fallback = PmAuthority(fallback_registry, tmp_path / "locks").recognize(
+            markerless, "p1"
+        )
+        assert fallback.managed and not fallback.runnable
+        assert "fallback" in (fallback.reason or "")
+        assert fallback_registry.get_pm_dispatch_permit(permit.permit_id) is None
+    finally:
+        fallback_registry.close()
+
+
+def test_successful_terminal_worker_cleanup_consumes_owned_pm_permit(
+    tmp_path,
+):
+    from tests.test_pm_authority import _authority, _issue as _pm_issue, _valid_ref
+
+    authority, registry = _authority(tmp_path)
+    issue = _pm_issue(_valid_ref())
+    run_id = registry.acquire_run(
+        issue,
+        workspace_path=tmp_path / "workspace",
+        attempt=None,
+        attempt_kind="initial",
+        agent_kind="codex",
+    )
+    assert run_id is not None
+    permit = authority.reserve_dispatch(issue, "p1")
+    assert permit is not None
+
+    async def load_issue():
+        return issue
+
+    async def publish_running() -> None:
+        async with authority.launch_guard(permit, load_issue, run_id)() as publish:
+            await publish(424242)
+
+    asyncio.run(publish_running())
+    assert registry.get_pm_dispatch_permit(permit.permit_id).state == "RUNNING"  # type: ignore[union-attr]
+    assert not registry.consume_pm_dispatch_permit(
+        permit.permit_id, fence=permit.fence, run_id=run_id
+    )
+    assert not registry.complete_run(
+        issue_id=issue.id,
+        run_id=run_id,
+        status="normal",
+        pm_dispatch_permit_id=permit.permit_id,
+        pm_dispatch_fence=permit.fence + 1,
+    )
+    assert registry.get_run(run_id).status == "active"
+    assert registry.get_pm_dispatch_permit(permit.permit_id).state == "RUNNING"  # type: ignore[union-attr]
+
+    orch = _orch()
+    orch._run_registry = registry
+    entry = RunningEntry(
+        issue=issue,
+        started_at=datetime.now(timezone.utc),
+        retry_attempt=None,
+        worker_task=None,
+        workspace_path=tmp_path / "workspace",
+        agent_kind="codex",
+        run_id=run_id,
+        pm_dispatch_permit=permit,
+        backend_cleanup_unconfirmed=True,
+    )
+    orch._finish_run_lease(issue.id, entry, "normal")
+    assert registry.get_run(run_id).status == "active"  # type: ignore[union-attr]
+    assert registry.get_pm_dispatch_permit(permit.permit_id).state == "RUNNING"  # type: ignore[union-attr]
+
+    entry.backend_cleanup_unconfirmed = False
+    orch._finish_run_lease(issue.id, entry, "normal")
+
+    completed = registry.get_run(run_id)
+    assert completed is not None and completed.status == "normal"
+    consumed = registry.get_pm_dispatch_permit(permit.permit_id)
+    assert consumed is not None and consumed.state == "CONSUMED"
+    assert not registry.has_active_pm_dispatch("p1", issue.identifier)
+    orch._finish_run_lease(issue.id, entry, "normal")
+    assert registry.get_pm_dispatch_permit(permit.permit_id).state == "CONSUMED"  # type: ignore[union-attr]
+
+
+def test_forced_eject_keeps_pm_fences_when_process_cleanup_is_unconfirmed(
+    tmp_path, monkeypatch,
+):
+    from tests.test_pm_authority import _authority, _issue as _pm_issue, _valid_ref
+
+    authority, registry = _authority(tmp_path)
+    issue = _pm_issue(_valid_ref())
+    run_id = registry.acquire_run(
+        issue,
+        workspace_path=tmp_path / "workspace",
+        attempt=None,
+        attempt_kind="initial",
+        agent_kind="codex",
+    )
+    assert run_id is not None
+    permit = authority.reserve_dispatch(issue, "p1")
+    assert permit is not None
+
+    async def load_issue():
+        return issue
+
+    async def publish_running() -> None:
+        async with authority.launch_guard(permit, load_issue, run_id)() as publish:
+            await publish(424242)
+
+    asyncio.run(publish_running())
+    orch = _orch()
+    orch._run_registry = registry
+    entry = RunningEntry(
+        issue=issue,
+        started_at=datetime.now(timezone.utc),
+        retry_attempt=None,
+        worker_task=None,
+        workspace_path=tmp_path / "workspace",
+        agent_kind="codex",
+        run_id=run_id,
+        pm_dispatch_permit=permit,
+        agent_pgid=424242,
+    )
+    orch._running[issue.id] = entry
+    monkeypatch.setattr(core_module, "kill_process_group", lambda *_args, **_kwargs: False)
+    monkeypatch.setattr(core_module, "process_group_exists", lambda _pid: True)
+
+    orch._force_eject_zombie(issue.id, entry, _make_config())
+
+    assert registry.get_run(run_id).status == "active"
+    assert registry.get_pm_dispatch_permit(permit.permit_id).state == "RUNNING"  # type: ignore[union-attr]
+    assert registry.has_active_lease(issue.id)
+    assert registry.has_active_pm_dispatch("p1", issue.identifier)
+
+
+def test_shutdown_abandonment_keeps_pm_fences_when_cleanup_is_unconfirmed(
+    tmp_path, monkeypatch,
+):
+    from tests.test_pm_authority import _authority, _issue as _pm_issue, _valid_ref
+
+    authority, registry = _authority(tmp_path)
+    issue = _pm_issue(_valid_ref())
+    run_id = registry.acquire_run(
+        issue,
+        workspace_path=tmp_path / "workspace",
+        attempt=None,
+        attempt_kind="initial",
+        agent_kind="codex",
+    )
+    assert run_id is not None
+    permit = authority.reserve_dispatch(issue, "p1")
+    assert permit is not None
+
+    async def load_issue():
+        return issue
+
+    async def exercise() -> None:
+        async with authority.launch_guard(permit, load_issue, run_id)() as publish:
+            await publish(424242)
+        assert registry.heartbeat(
+            issue_id=issue.id,
+            run_id=run_id,
+            backend_agent_pid=424242,
+        )
+        release = asyncio.Event()
+
+        async def stubborn_worker() -> None:
+            await release.wait()
+
+        task = asyncio.create_task(stubborn_worker())
+        orch = _orch()
+        orch._run_registry = registry
+        entry = RunningEntry(
+            issue=issue,
+            started_at=datetime.now(timezone.utc),
+            retry_attempt=None,
+            worker_task=task,
+            workspace_path=tmp_path / "workspace",
+            agent_kind="codex",
+            run_id=run_id,
+            pm_dispatch_permit=permit,
+            agent_pgid=424242,
+        )
+        orch._running[issue.id] = entry
+        monkeypatch.setattr(core_module, "STALL_FORCE_EJECT_GRACE_S", 0)
+        monkeypatch.setattr(core_module, "_reclaim_kill_confirm", lambda _record: None)
+        try:
+            await orch._drain_worker_tasks()
+            assert entry.backend_cleanup_unconfirmed
+            assert registry.get_run(run_id).status == "active"
+            assert registry.get_pm_dispatch_permit(permit.permit_id).state == "RUNNING"  # type: ignore[union-attr]
+            assert registry.has_active_lease(issue.id)
+            assert registry.has_active_pm_dispatch("p1", issue.identifier)
+        finally:
+            release.set()
+            await task
+
+    asyncio.run(exercise())
+
+
+def test_normal_attempt_cleanup_retains_pm_fences_when_group_is_unconfirmed(
+    tmp_path, monkeypatch,
+):
+    from tests.test_pm_authority import _authority, _issue as _pm_issue, _valid_ref
+
+    authority, registry = _authority(tmp_path)
+    issue = _pm_issue(_valid_ref())
+    cfg = _make_config()
+    run_id = registry.acquire_run(
+        issue,
+        workspace_path=tmp_path / "workspace",
+        attempt=None,
+        attempt_kind="initial",
+        agent_kind="codex",
+    )
+    assert run_id is not None
+    permit = authority.reserve_dispatch(issue, "p1")
+    assert permit is not None
+
+    async def load_issue():
+        return issue
+
+    async def exercise() -> None:
+        async with authority.launch_guard(permit, load_issue, run_id)() as publish:
+            await publish(424242)
+        assert registry.heartbeat(
+            issue_id=issue.id,
+            run_id=run_id,
+            backend_agent_pid=424242,
+        )
+
+        class UnconfirmedBackend:
+            async def stop(self) -> None:
+                raise RuntimeError("backend process cleanup could not be confirmed")
+
+        class Workspace:
+            path = tmp_path / "workspace"
+
+        orch = _orch()
+        orch._run_registry = registry
+        entry = RunningEntry(
+            issue=issue,
+            started_at=datetime.now(timezone.utc),
+            retry_attempt=None,
+            worker_task=None,
+            workspace_path=Workspace.path,
+            agent_kind="codex",
+            run_id=run_id,
+            pm_dispatch_permit=permit,
+            agent_pgid=424242,
+        )
+        orch._running[issue.id] = entry
+
+        async def no_artifacts(*_args, **_kwargs):
+            return None
+
+        monkeypatch.setattr(orch, "_collect_ticket_artifacts", no_artifacts)
+        state = attempt_module._AttemptState(
+            running_issue_id=issue.id,
+            attempt=None,
+            base_cfg=cfg,
+            issue=issue,
+            cfg=cfg,
+            workspace=Workspace(),  # type: ignore[arg-type]
+            running=entry,
+            client=UnconfirmedBackend(),  # type: ignore[arg-type]
+        )
+
+        await attempt_module._cleanup_backend(orch, state)
+        assert entry.backend_cleanup_unconfirmed
+        saved = registry.get_run(run_id)
+        assert saved.backend_agent_pid == 424242
+        orch._finish_run_lease(issue.id, entry, "normal")
+        assert registry.get_run(run_id).status == "active"
+        assert registry.get_pm_dispatch_permit(permit.permit_id).state == "RUNNING"  # type: ignore[union-attr]
+
+    asyncio.run(exercise())
+
+
+def _pm_cleanup_cancellation_fixture(tmp_path):
+    from tests.test_pm_authority import _authority, _issue as _pm_issue, _valid_ref
+
+    authority, registry = _authority(tmp_path)
+    issue = _pm_issue(_valid_ref())
+    run_id = registry.acquire_run(
+        issue,
+        workspace_path=tmp_path / "workspace",
+        attempt=None,
+        attempt_kind="initial",
+        agent_kind="codex",
+    )
+    assert run_id is not None
+    permit = authority.reserve_dispatch(issue, "p1")
+    assert permit is not None
+
+    async def load_issue():
+        return issue
+
+    async def publish() -> None:
+        async with authority.launch_guard(permit, load_issue, run_id)() as started:
+            await started(424242)
+
+    asyncio.run(publish())
+    assert registry.heartbeat(
+        issue_id=issue.id,
+        run_id=run_id,
+        backend_agent_pid=424242,
+    )
+    orch = _orch()
+    orch._run_registry = registry
+    entry = RunningEntry(
+        issue=issue,
+        started_at=datetime.now(timezone.utc),
+        retry_attempt=None,
+        worker_task=None,
+        workspace_path=tmp_path / "workspace",
+        agent_kind="codex",
+        run_id=run_id,
+        pm_dispatch_permit=permit,
+        agent_pgid=424242,
+    )
+    orch._running[issue.id] = entry
+    return orch, registry, issue, entry, permit
+
+
+def _assert_pm_cleanup_fences_retained(orch, registry, issue, entry, permit) -> None:
+    orch._finish_run_lease(issue.id, entry, "cancelled")
+    assert registry.get_run(entry.run_id).status == "active"
+    assert registry.get_run(entry.run_id).backend_agent_pid == entry.agent_pgid
+    assert registry.get_pm_dispatch_permit(permit.permit_id).state == "RUNNING"  # type: ignore[union-attr]
+
+
+def test_final_stop_cancellation_propagates_and_retains_pm_fences(
+    tmp_path, monkeypatch,
+):
+    orch, registry, issue, entry, permit = _pm_cleanup_cancellation_fixture(tmp_path)
+
+    class CancelledBackend:
+        async def stop(self) -> None:
+            raise asyncio.CancelledError
+
+    class Workspace:
+        path = tmp_path / "workspace"
+
+    async def no_artifacts(*_args, **_kwargs):
+        return None
+
+    monkeypatch.setattr(orch, "_collect_ticket_artifacts", no_artifacts)
+    state = attempt_module._AttemptState(
+        running_issue_id=issue.id,
+        attempt=None,
+        base_cfg=_make_config(),
+        issue=issue,
+        cfg=_make_config(),
+        workspace=Workspace(),  # type: ignore[arg-type]
+        running=entry,
+        client=CancelledBackend(),  # type: ignore[arg-type]
+    )
+
+    with pytest.raises(asyncio.CancelledError):
+        asyncio.run(attempt_module._cleanup_backend(orch, state))
+
+    assert entry.backend_cleanup_unconfirmed
+    _assert_pm_cleanup_fences_retained(orch, registry, issue, entry, permit)
+
+
+def test_phase_old_stop_cancellation_propagates_and_retains_pm_fences(tmp_path):
+    orch, registry, issue, entry, permit = _pm_cleanup_cancellation_fixture(tmp_path)
+
+    class CancelledBackend:
+        async def stop(self) -> None:
+            raise asyncio.CancelledError
+
+    with pytest.raises(asyncio.CancelledError):
+        asyncio.run(orch._rebuild_backend_for_phase(
+            issue=issue,
+            running_issue_id=issue.id,
+            cfg=_make_config(),
+            workspace_path=tmp_path / "workspace",
+            attempt=None,
+            doc_language="English",
+            old_client=CancelledBackend(),  # type: ignore[arg-type]
+            is_rewind=False,
+            turn_number=2,
+        ))
+
+    assert entry.backend_cleanup_unconfirmed
+    _assert_pm_cleanup_fences_retained(orch, registry, issue, entry, permit)
+
+
+def test_phase_new_stop_cancellation_propagates_and_retains_pm_fences(
+    tmp_path, monkeypatch,
+):
+    orch, registry, issue, entry, permit = _pm_cleanup_cancellation_fixture(tmp_path)
+
+    class StoppedBackend:
+        async def stop(self) -> None:
+            return None
+
+    class FailedNewBackend:
+        pid = 525252
+
+        async def start(self) -> None:
+            return None
+
+        async def initialize(self) -> None:
+            raise RuntimeError("initialize failed")
+
+        async def stop(self) -> None:
+            raise asyncio.CancelledError
+
+    monkeypatch.setattr(orch, "_build_agent_backend", lambda _init: FailedNewBackend())
+
+    with pytest.raises(asyncio.CancelledError):
+        asyncio.run(orch._rebuild_backend_for_phase(
+            issue=issue,
+            running_issue_id=issue.id,
+            cfg=_make_config(),
+            workspace_path=tmp_path / "workspace",
+            attempt=None,
+            doc_language="English",
+            old_client=StoppedBackend(),  # type: ignore[arg-type]
+            is_rewind=False,
+            turn_number=2,
+        ))
+
+    assert entry.backend_cleanup_unconfirmed
+    assert entry.agent_pgid == 525252
+    _assert_pm_cleanup_fences_retained(orch, registry, issue, entry, permit)
+
+
+def test_actual_attempt_guard_exit_cancellation_retains_original_owner_and_permit(
+    tmp_path, monkeypatch,
+):
+    from symphony.pm.authority import PmAuthority
+    from tests.test_backends import _FakeSubprocess
+    from tests.test_pm_authority import _authority, _issue as _pm_issue, _valid_ref
+
+    _authority_service, registry = _authority(tmp_path)
+    issue = _pm_issue(_valid_ref())
+    workspace = tmp_path / "workspaces" / "worker"
+    workspace.mkdir(parents=True)
+    run_id = registry.acquire_run(
+        issue,
+        workspace_path=workspace,
+        attempt=None,
+        attempt_kind="initial",
+        agent_kind="gemini",
+    )
+    assert run_id is not None
+    cfg = _make_config(
+        workflow_path=tmp_path / "WORKFLOW.md",
+        workspace_root=tmp_path / "workspaces",
+    )
+    cfg = replace(
+        cfg,
+        tracker=replace(cfg.tracker, project_slug="p1"),
+        agent=replace(
+            cfg.agent,
+            kind="gemini",
+            max_turns=1,
+            auto_merge_on_done=False,
+            auto_merge_push_target=None,
+        ),
+    )
+
+    class Workspace:
+        path = workspace
+
+    class WorkspaceManagerStub:
+        async def create_or_reuse(self, _identifier):
+            return Workspace()
+
+        async def before_run(self, _path):
+            return None
+
+        async def after_run_best_effort(self, _path):
+            return None
+
+    process = _FakeSubprocess(returncode=None)
+
+    async def spawn(*_args, **_kwargs):
+        return process
+
+    original_release = PmAuthority._release_lock
+
+    def cancelled_release(self, handle):
+        original_release(self, handle)
+        raise asyncio.CancelledError
+
+    async def cancelled_cleanup(_proc, **_kwargs):
+        raise asyncio.CancelledError
+
+    monkeypatch.setattr(per_turn_module.asyncio, "create_subprocess_exec", spawn)
+    monkeypatch.setattr(per_turn_module, "process_identity", lambda _pid: "spawn-owner")
+    monkeypatch.setattr(
+        per_turn_module, "terminate_process_tree", cancelled_cleanup
+    )
+    monkeypatch.setattr(PmAuthority, "_release_lock", cancelled_release)
+
+    orch = _orch()
+    orch._run_registry = registry
+    orch._workspace_manager = WorkspaceManagerStub()  # type: ignore[assignment]
+    entry = RunningEntry(
+        issue=issue,
+        started_at=datetime.now(timezone.utc),
+        retry_attempt=None,
+        worker_task=None,
+        workspace_path=workspace,
+        agent_kind="gemini",
+        run_id=run_id,
+    )
+    orch._running[issue.id] = entry
+    monkeypatch.setattr(
+        orch, "_tracker_call_fetch_issue_full_by_id", lambda _cfg, _id: issue
+    )
+
+    async def no_artifacts(*_args, **_kwargs):
+        return None
+
+    monkeypatch.setattr(orch, "_collect_ticket_artifacts", no_artifacts)
+
+    with pytest.raises(asyncio.CancelledError):
+        asyncio.run(attempt_module._run_attempt(orch, issue, None, cfg))
+
+    permit = entry.pm_dispatch_permit
+    assert permit is not None
+    assert entry.backend_cleanup_unconfirmed
+    assert entry.agent_pgid == process.pid
+    assert entry.agent_process_identity == "spawn-owner"
+    saved = registry.get_run(run_id)
+    assert saved.backend_agent_pid == process.pid
+    assert saved.backend_process_identity == "spawn-owner"
+    assert registry.get_pm_dispatch_permit(permit.permit_id).state == "RUNNING"  # type: ignore[union-attr]
+    _assert_pm_cleanup_fences_retained(orch, registry, issue, entry, permit)
+
+
+def test_confirmed_reclaim_consumes_only_exact_owning_pm_permit(
+    tmp_path, monkeypatch,
+):
+    from tests.test_pm_authority import _authority, _issue as _pm_issue, _valid_ref
+
+    authority, registry = _authority(tmp_path)
+    issue = _pm_issue(_valid_ref())
+    run_id = registry.acquire_run(
+        issue,
+        workspace_path=tmp_path / "workspace",
+        attempt=None,
+        attempt_kind="initial",
+        agent_kind="codex",
+    )
+    assert run_id is not None
+    permit = authority.reserve_dispatch(issue, "p1")
+    assert permit is not None
+
+    async def load_issue():
+        return issue
+
+    async def publish_running() -> None:
+        async with authority.launch_guard(permit, load_issue, run_id)() as publish:
+            await publish(424242)
+
+    asyncio.run(publish_running())
+    registry._connect().execute(
+        "UPDATE runs SET status = 'reclaiming' WHERE run_id = ?", (run_id,)
+    )
+    record = registry.get_run(run_id)
+    monkeypatch.setattr(core_module, "_reclaim_kill_confirm", lambda _record: "not_found")
+    orch = _orch()
+    orch._run_registry = registry
+
+    assert orch._reap_and_finalize_reclaimed_run(registry, record)
+    assert registry.get_run(run_id).status == "orphaned"
+    assert registry.get_pm_dispatch_permit(permit.permit_id).state == "CONSUMED"  # type: ignore[union-attr]
+    assert not registry.has_active_pm_dispatch("p1", issue.identifier)
+
+    continuation = authority.reserve_dispatch(issue, "p1")
+    assert continuation is not None
+    assert continuation.state == "RESERVED"
+    assert not registry.finalize_reclaimed_lease(run_id)
+    assert registry.get_pm_dispatch_permit(continuation.permit_id).state == "RESERVED"  # type: ignore[union-attr]
+
+
+def test_confirmed_reclaim_preserves_revoked_pm_permit(
+    tmp_path, monkeypatch,
+):
+    from tests.test_pm_authority import _authority, _issue as _pm_issue, _valid_ref
+
+    authority, registry = _authority(tmp_path)
+    issue = _pm_issue(_valid_ref())
+    run_id = registry.acquire_run(
+        issue,
+        workspace_path=tmp_path / "workspace",
+        attempt=None,
+        attempt_kind="initial",
+        agent_kind="codex",
+    )
+    assert run_id is not None
+    permit = authority.reserve_dispatch(issue, "p1")
+    assert permit is not None
+
+    async def load_issue():
+        return issue
+
+    async def publish_running() -> None:
+        async with authority.launch_guard(permit, load_issue, run_id)() as publish:
+            await publish(424242)
+
+    asyncio.run(publish_running())
+    assert authority.revoke("p1", issue.identifier) == 1
+    registry._connect().execute(
+        "UPDATE runs SET status = 'reclaiming' WHERE run_id = ?", (run_id,)
+    )
+    record = registry.get_run(run_id)
+    monkeypatch.setattr(core_module, "_reclaim_kill_confirm", lambda _record: "not_found")
+    orch = _orch()
+    orch._run_registry = registry
+
+    assert orch._reap_and_finalize_reclaimed_run(registry, record)
+    assert registry.get_run(run_id).status == "orphaned"
+    assert registry.get_pm_dispatch_permit(permit.permit_id).state == "REVOKED"  # type: ignore[union-attr]
+
+
 # ---------------------------------------------------------------------------
 # Off-loop reclaim (ITEM 1) + identity-gated shutdown kills (ITEM 2)
 # ---------------------------------------------------------------------------
@@ -10621,7 +11403,7 @@ def test_async_ensure_reclaim_runs_kill_off_event_loop(tmp_path, monkeypatch):
 
     asyncio.run(_run())
 
-    assert kills == [(4343, None)], "reclaim kill must run exactly once"
+    assert kills == [(4343, "proc-1")], "reclaim kill must run exactly once"
     assert len(kill_threads) == 1
     assert kill_threads[0] != loop_threads[0], "kill must run off the event loop"
     assert restarted._run_registry is not None
@@ -10649,6 +11431,13 @@ def _orchestrator_with_identity_run(
     # `_pid_alive` untouched.
     monkeypatch.setattr(
         run_registry_module,
+        "process_identity",
+        (lambda _pid: recorded_identity)
+        if recorded_identity is not None
+        else (lambda _pid: None),
+    )
+    monkeypatch.setattr(
+        core_module,
         "process_identity",
         (lambda _pid: recorded_identity)
         if recorded_identity is not None
@@ -10699,6 +11488,58 @@ def test_force_eject_kill_passes_recorded_identity(tmp_path, monkeypatch):
     orch._force_eject_zombie(issue.id, entry, cfg)
 
     assert captured == [(4242, "fp-recorded")]
+
+
+def test_spawn_identity_remains_immutable_through_events_and_heartbeats(
+    tmp_path, monkeypatch,
+):
+    import symphony.orchestrator.run_registry as run_registry_module
+
+    issue = _issue("MT-SPAWN-IDENTITY", state="Todo")
+    registry = RunRegistry(tmp_path / ".symphony" / "state.db")
+    run_id = registry.acquire_run(
+        issue,
+        workspace_path=tmp_path / "workspace",
+        attempt=None,
+        attempt_kind="initial",
+        agent_kind="codex",
+    )
+    assert run_id is not None
+    orch = _orch()
+    orch._run_registry = registry
+    entry = RunningEntry(
+        issue=issue,
+        started_at=datetime.now(timezone.utc),
+        retry_attempt=None,
+        worker_task=None,
+        workspace_path=tmp_path / "workspace",
+        run_id=run_id,
+        agent_pgid=None,
+    )
+    orch._running[issue.id] = entry
+    monkeypatch.setattr(
+        run_registry_module,
+        "process_identity",
+        lambda _pid: "replacement-owner",
+    )
+
+    orch._sync_backend_agent_pid(
+        issue.id,
+        424242,
+        backend_process_identity="spawn-owner",
+        identity_captured=True,
+    )
+    asyncio.run(orch._on_codex_event(
+        issue.id,
+        {"event": "turn_started", "agent_pid": 424242},
+    ))
+    assert orch._heartbeat_run_lease(issue.id, entry)
+
+    saved = registry.get_run(run_id)
+    assert saved.backend_agent_pid == 424242
+    assert saved.backend_process_identity == "spawn-owner"
+    assert entry.agent_process_identity == "spawn-owner"
+    assert entry.agent_process_identity_captured
 
 
 def test_kill_gate_skips_when_identity_mismatches(tmp_path, monkeypatch):
@@ -11213,3 +12054,39 @@ def test_startup_terminal_cleanup_preserves_human_review_workspace(
 
     assert calls == []
     assert workspace.exists()
+
+
+def test_pm_dispatch_fails_closed_when_host_project_identity_is_unreadable(
+    tmp_path, monkeypatch,
+):
+    from tests.test_pm_authority import _authority, _issue as _pm_issue, _valid_ref
+
+    authority, registry = _authority(tmp_path)
+    assert authority.reserve_dispatch(_pm_issue(_valid_ref()), "p1") is not None
+    corrupt = tmp_path / "projects.json"
+    corrupt.write_text("{not json", encoding="utf-8")
+    monkeypatch.setenv("SYMPHONY_PROJECTS_FILE", str(corrupt))
+    markerless = _pm_issue()
+    cfg = _make_config(
+        workflow_path=tmp_path / "WORKFLOW.md", workspace_root=tmp_path / "ws",
+    )
+    cfg = replace(
+        cfg,
+        tracker=replace(cfg.tracker, project_slug="legacy-slug"),
+        agent=replace(cfg.agent, auto_merge_on_done=True),
+    )
+    orch = _orch()
+    orch._run_registry = registry
+    _install_running_entry(orch, markerless)
+    monkeypatch.setattr(
+        attempt_module, "_resolve_release_authority",
+        lambda _orch, candidate, _cfg: candidate,
+    )
+
+    result = asyncio.run(attempt_module._start_attempt(orch, markerless, None, cfg))
+    assert isinstance(result, attempt_module._AttemptExit)
+    assert result.outcome == "pm_dispatch_denied"
+    assert "project registry is unreadable" in (result.error or "")
+    assert not (tmp_path / "ws").exists()
+    assert registry.pm_ticket_identifier_known(markerless.identifier)
+    assert not registry.pm_ticket_identifier_known("ORDINARY-1")

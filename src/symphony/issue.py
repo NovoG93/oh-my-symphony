@@ -16,6 +16,15 @@ class BlockerRef:
 
 
 @dataclass(frozen=True)
+class PlanningRef:
+    change_id: str
+    task_id: str
+    task_revision: str
+    handoff_id: str
+    snapshot_id: str
+
+
+@dataclass(frozen=True)
 class Issue:
     id: str
     identifier: str
@@ -37,6 +46,8 @@ class Issue:
     # `stage_kinds`-routed board the pin field must stay empty or the first
     # lane's backend would freeze for the whole ticket (F-20).
     last_agent_kind: str | None = None
+    planning_ref: PlanningRef | None = None
+    planning_ref_state: str = "absent"
 
     def to_template_dict(self) -> dict[str, Any]:
         """§12.2 — convert keys to strings, preserve nested arrays/maps."""
@@ -60,6 +71,18 @@ class Issue:
             "last_agent_kind": self.last_agent_kind or "",
             "skills": list(self.skills),
             "request": self.request or "",
+            "planning_ref": (
+                {
+                    "change_id": self.planning_ref.change_id,
+                    "task_id": self.planning_ref.task_id,
+                    "task_revision": self.planning_ref.task_revision,
+                    "handoff_id": self.planning_ref.handoff_id,
+                    "snapshot_id": self.planning_ref.snapshot_id,
+                }
+                if self.planning_ref
+                else None
+            ),
+            "planning_ref_state": self.planning_ref_state,
         }
 
 

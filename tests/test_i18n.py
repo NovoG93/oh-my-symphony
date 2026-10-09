@@ -8,6 +8,7 @@ from pathlib import Path
 from symphony.i18n import (
     DEFAULT_LANGUAGE,
     DOC_LANG_PREAMBLE,
+    DOC_WRITING_RULE,
     LANGUAGE_ENV_VAR,
     STRINGS,
     doc_language_preamble,
@@ -284,3 +285,13 @@ def test_check_i18n_treats_template_literal_prefixes_as_used() -> None:
         check=False,
     )
     assert "workflow.ciMode" not in result.stdout
+
+
+def test_every_preamble_carries_the_single_writing_rule():
+    from symphony.pm.planning import DEVELOPER_INSTRUCTIONS
+
+    assert set(DOC_WRITING_RULE) == set(DOC_LANG_PREAMBLE)
+    for lang in DOC_LANG_PREAMBLE:
+        assert doc_language_preamble(lang).endswith(DOC_WRITING_RULE[lang])
+    assert doc_language_preamble("fr").endswith(DOC_WRITING_RULE["en"])
+    assert DEVELOPER_INSTRUCTIONS.endswith(DOC_WRITING_RULE["en"])

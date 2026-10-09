@@ -8,6 +8,24 @@ this file is the in-repo summary.
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 Versioning: [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+- Add the default-off local PM Workspace: five planning artifacts, managed WBS, constrained XLSX exchange, pinned OpenSpec integration, proposal-only assistance, revision approval, native ticket handoff, evidence checks, and fenced actual-process dispatch authority.
+- PM approval and handoff remain separate local actions. This change does not enable automatic merge/push, deployment, publication, or real-project archive.
+- PM Workspace storyboard cards use structured server-owned fields and stable frame identities.
+- PM assistance exposes all seven bounded planning actions with per-document diff review.
+- No-run verification supports real host-executed native commands and immutable manual evidence through explicit acceptance.
+- Requirement and scenario coverage shows independent partial states and non-authoritative waiver records.
+- XLSX preview binds a plain `.xlsx` filename to the durable import snapshot and rejects hostile XML, duplicate IDs, active content, and unsupported containers before mutation.
+
+### Changed
+- CI runs the suite in parallel (`pytest-xdist`) and the wall-clock `timing` tests alone afterwards; about 7.5 → 2 minutes. Plain `python -m pytest -q` still runs everything serially.
+- Every worker prompt and the PM planning assistant now carry one shared writing rule (lead with the result, no filler or repetition, keep every number and warning).
+
+### Fixed
+- Failed project and planning-change selection restores the prior selection, content, focus, and announced error instead of leaving mismatched UI state.
+
 ## [0.25.0] - 2026-09-12 - Execution diagnostics and Deep workflow reliability
 
 ### Fixed

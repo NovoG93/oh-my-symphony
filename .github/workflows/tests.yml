@@ -46,4 +46,5 @@ jobs:
         run: symphony-pyright
 
       - name: Run tests with coverage
-        run: python -m pytest -q --cov=src/symphony --cov-report=term --cov-fail-under=80
+        # Parallel suite, then the wall-clock budget tests alone (see the `timing` marker).
+        run: python -m pytest -q -n auto -m "not timing" --cov=src/symphony --cov-report= && python -m pytest -q -n0 -m timing --cov=src/symphony --cov-append --cov-report=term --cov-fail-under=80
