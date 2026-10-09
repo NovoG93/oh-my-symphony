@@ -678,6 +678,9 @@ browser = [
     { name = "playwright" },
 ]
 dev = [
+    { name = "defusedxml" },
+    { name = "et-xmlfile" },
+    { name = "openpyxl" },
     { name = "pyright" },
     { name = "pytest" },
     { name = "pytest-asyncio" },
@@ -697,6 +700,7 @@ requires-dist = [
     { name = "defusedxml", marker = "extra == 'pm-exchange'", specifier = "==0.7.1" },
     { name = "et-xmlfile", marker = "extra == 'pm-exchange'", specifier = "==2.0.0" },
     { name = "httpx", specifier = ">=0.27" },
+    { name = "oh-my-symphony", extras = ["pm-exchange"], marker = "extra == 'dev'" },
     { name = "openpyxl", marker = "extra == 'pm-exchange'", specifier = "==3.1.5" },
     { name = "playwright", marker = "extra == 'browser'", specifier = ">=1.48" },
     { name = "pyright", marker = "extra == 'dev'", specifier = ">=1.1.390" },

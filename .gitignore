@@ -6,6 +6,7 @@ __pycache__/
 build/
 dist/
 .coverage
+.coverage.*
 htmlcov/
 /tmp_workspaces/
 .claude/

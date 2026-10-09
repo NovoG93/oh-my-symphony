@@ -100,7 +100,22 @@ async function enhanceWithTabulator(root, tasks, ui, semanticIndex, onNavigateRe
     movableRows: false, clipboard: false, selectableRows: 1,
     rowFormatter: (row) => {
       const element = row.getElement(); element.tabIndex = 0;
+      const control = element.querySelector('.tabulator-data-tree-control');
+      if (control) { control.setAttribute('role', 'button'); control.setAttribute('aria-label', L('Collapse or expand')); control.setAttribute('aria-expanded', String(row.isTreeExpanded())); }
       element.addEventListener('keydown', (event) => {
+        // Tree keys: Enter/Space on the collapse control toggles it; Left/Right
+        // on a parent row collapse/expand it. Neither opens the task drawer.
+        const hasChildren = row.getTreeChildren().length > 0;
+        const onControl = Boolean(event.target.closest?.('.tabulator-data-tree-control'));
+        const tree = onControl && (event.key === 'Enter' || event.key === ' ') ? 'toggle'
+          : hasChildren && event.key === 'ArrowLeft' ? 'collapse'
+            : hasChildren && event.key === 'ArrowRight' ? 'expand' : '';
+        if (tree) {
+          event.preventDefault(); event.stopPropagation();
+          if (tree === 'toggle') row.treeToggle(); else if (tree === 'collapse') row.treeCollapse(); else row.treeExpand();
+          element.querySelector('.tabulator-data-tree-control')?.setAttribute('aria-expanded', String(row.isTreeExpanded()));
+          return;
+        }
         if (event.key === 'Enter') { event.preventDefault(); onSelect(row.getData().task_id); openTaskDrawer(ui, row.getData(), tasks, semanticIndex, onNavigateReference, onSetField, readOnlyReason); }
         if (event.key === 'ArrowDown') { event.preventDefault(); element.nextElementSibling?.focus(); }
         if (event.key === 'ArrowUp') { event.preventDefault(); element.previousElementSibling?.focus(); }
@@ -200,5 +215,5 @@ function dependencyPicker(el, task, tasks, onSetField, readOnlyReason = '') {
   return el('label', { class: 'pm-drawer-field' }, [el('span', null, L('Dependencies')), select, el('small', null, L('Choose required predecessor tasks.'))]);
 }
 
-const KO = { 'Filter tasks': '작업 필터', 'Work breakdown': '작업 분해', 'executable tasks': '실행 작업', Task: '작업', Type: '유형', Owner: '담당자', Priority: '우선순위', Estimate: '예상치', 'Add group': '그룹 추가', 'Add root': '최상위 추가', 'Add sibling': '같은 단계 추가', 'Add child': '하위 추가', Indent: '들여쓰기', Outdent: '내어쓰기', 'Move up': '위로', 'Move down': '아래로', Delete: '삭제', 'Cancel task': '작업 취소', Undo: '실행 취소', Redo: '다시 실행', 'Copy TSV': 'TSV 복사', Close: '닫기', Title: '제목', 'Human owner': '담당자', 'Agent override': '에이전트 지정', 'Target date': '목표 날짜', Description: '설명', Acceptance: '인수 조건', Verification: '검증', 'Requirement references': '요구사항 참조', 'Storyboard references': '스토리보드 참조', 'Design references': '설계 참조', Dependencies: '의존성', 'Integration impact': '통합 영향', Risk: '위험', Notes: '메모', 'Source revision': '소스 리비전', 'Choose required predecessor tasks.': '필수 선행 작업을 선택하세요.', 'Reference navigation': '참조 탐색', 'No linked planning items.': '연결된 기획 항목이 없습니다.', Unresolved: '해결되지 않음' };
+const KO = { 'Filter tasks': '작업 필터', 'Work breakdown': '작업 분해', 'executable tasks': '실행 작업', Task: '작업', Type: '유형', Owner: '담당자', Priority: '우선순위', Estimate: '예상치', 'Add group': '그룹 추가', 'Add root': '최상위 추가', 'Add sibling': '같은 단계 추가', 'Add child': '하위 추가', Indent: '들여쓰기', Outdent: '내어쓰기', 'Move up': '위로', 'Move down': '아래로', Delete: '삭제', 'Cancel task': '작업 취소', Undo: '실행 취소', Redo: '다시 실행', 'Copy TSV': 'TSV 복사', Close: '닫기', Title: '제목', 'Human owner': '담당자', 'Agent override': '에이전트 지정', 'Target date': '목표 날짜', Description: '설명', Acceptance: '인수 조건', Verification: '검증', 'Requirement references': '요구사항 참조', 'Storyboard references': '스토리보드 참조', 'Design references': '설계 참조', Dependencies: '의존성', 'Integration impact': '통합 영향', Risk: '위험', Notes: '메모', 'Source revision': '소스 리비전', 'Choose required predecessor tasks.': '필수 선행 작업을 선택하세요.', 'Reference navigation': '참조 탐색', 'No linked planning items.': '연결된 기획 항목이 없습니다.', Unresolved: '해결되지 않음', 'Collapse or expand': '접기 또는 펼치기' };
 function L(value) { return window.i18n?.lang === 'ko' ? (KO[value] || value) : value; }

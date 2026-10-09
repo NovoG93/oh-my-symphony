@@ -1046,3 +1046,35 @@ def test_completed_archive_replay_refuses_target_swapped_for_outside_symlink(tmp
     with pytest.raises(PmError) as refused:
         env.application.apply_archive(env.ctx, "owner", candidate, token)
     assert refused.value.code == "archive_reconcile"
+
+
+def test_archive_recovery_ignores_a_planted_temp_symlink(tmp_path: Path) -> None:
+    env, candidate, token = _archive_env(tmp_path)
+    _archive_crash(env, candidate, token, None, adapter_mode="partial")
+    env = _archive_restart(env)
+    victim = tmp_path / "outside" / "victim.txt"
+    victim.parent.mkdir()
+    victim.write_text("untouched\n", encoding="utf-8")
+    baseline = env.workspace / "openspec" / "specs" / "requirements" / "spec.md"
+    baseline.parent.mkdir(parents=True, exist_ok=True)
+    (baseline.parent / "spec.md.pm-archive-tmp").symlink_to(victim)
+    result = env.application.apply_archive(env.ctx, "owner", candidate, token)
+    assert Path(result.archived_path).resolve() == Path(candidate.target_paths[0]).resolve()
+    assert victim.read_text(encoding="utf-8") == "untouched\n"
+    assert not baseline.is_symlink()
+    assert baseline.read_text(encoding="utf-8") == "# Archived baseline\n"
+
+
+def test_archive_recovery_refuses_an_aliased_change_directory(tmp_path: Path) -> None:
+    env, candidate, token = _archive_env(tmp_path)
+    _archive_crash(env, candidate, token, None, adapter_mode="baseline_first")
+    env = _archive_restart(env)
+    changes = env.workspace / "openspec" / "changes"
+    (changes / "archive-ready").rename(changes / "internal-alias")
+    (changes / "archive-ready").symlink_to(changes / "internal-alias", target_is_directory=True)
+    with pytest.raises(PmError) as refused:
+        env.application.apply_archive(env.ctx, "owner", candidate, token)
+    assert refused.value.code == "archive_reconcile"
+    assert (changes / "internal-alias").is_dir()
+    record = env.repo.registry.get_pm_workspace("p1", env.change_id)
+    assert record is not None and record.state == "ACTIVE"

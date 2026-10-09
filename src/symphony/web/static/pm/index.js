@@ -547,7 +547,7 @@ export function mountArtifacts({ root, projectId, api: hostApi, ui, onDirtyChang
   async function setTaskField(taskId, field, value) {
     const task = state.wbs.tasks.find((item) => item.task_id === taskId); if (!task) return;
     const normalized = ['acceptance', 'verification', 'requirement_refs', 'storyboard_refs', 'design_refs'].includes(field) && typeof value === 'string' ? value.split('\n').map((item) => item.trim()).filter(Boolean) : value;
-    const apiField = ({ kind: 'type', agent_kind_override: 'agent_kind', dependencies: 'depends_on', requirement_refs: 'requirements', storyboard_refs: 'storyboards' })[field] || field;
+    const apiField = TASK_TO_API_FIELD[field] || field;
     await runWbs([{ op: 'set_field', task_id: taskId, field: apiField, value: normalized }], [{ op: 'set_field', task_id: taskId, field: apiField, value: task[field] }]);
   }
 
@@ -611,8 +611,13 @@ export function mountArtifacts({ root, projectId, api: hostApi, ui, onDirtyChang
     const serverPreview = await api.previewWbs(state.change.change_id, state.change.revision, operations);
     const blocking = (serverPreview.findings || []).filter((item) => item.severity === 'blocking');
     const preview = ui.el('section', { class: 'pm-inline-dialog', role: 'dialog', 'aria-label': 'Paste preview' });
+    // One undo step restores every pasted field to its value before Apply.
+    const inverse = operations.map((op) => {
+      const task = state.wbs.tasks.find((item) => item.task_id === op.task_id);
+      return { op: 'set_field', task_id: op.task_id, field: op.field, value: task[API_TO_TASK_FIELD[op.field] || op.field] };
+    });
     const apply = button(`Apply ${rows.length} rows`, async () => {
-      await runWbs(operations); preview.remove();
+      await runWbs(operations, inverse); preview.remove();
     }, 'btn btn-primary');
     apply.disabled = blocking.length > 0;
     preview.append(ui.el('h2', null, 'Transactional TSV preview'), ui.el('p', null, 'Columns: Task ID, field, value. Quoted cells and multiline values are preserved.'), simpleTable(['Task', 'Field', 'Value'], rows.map((row) => [row[0], row[1], row.slice(2).join('\t')])), renderFindings(ui, serverPreview.findings), ui.el('div', { class: 'pm-actions' }, [apply, button('Cancel', () => preview.remove())]));
@@ -791,6 +796,9 @@ export function mountArtifacts({ root, projectId, api: hostApi, ui, onDirtyChang
   load().catch((error) => { if (error.name !== 'AbortError') root.replaceChildren(ui.el('div', { class: 'banner banner-danger', role: 'alert' }, error.message)); });
   return { unmount: () => { state.dispose(); root.classList.remove('pm-workspace-host'); }, beforeProjectSwitch: () => guard('Discard unsaved PM Workspace edits and switch projects?'), isDirty: () => state.dirty };
 }
+
+const TASK_TO_API_FIELD = { kind: 'type', agent_kind_override: 'agent_kind', dependencies: 'depends_on', requirement_refs: 'requirements', storyboard_refs: 'storyboards' };
+const API_TO_TASK_FIELD = Object.fromEntries(Object.entries(TASK_TO_API_FIELD).map(([task, api]) => [api, task]));
 
 function extractSection(source, name) {
   const aliases = { ux: ['ux', 'experience'], storyboard: ['storyboard', 'flow'], architecture: ['architecture'], erd: ['erd', 'data model'], api: ['api'], integration: ['integration'] }[name] || [name];

@@ -517,12 +517,19 @@ def _require_archive_contained(candidate: ArchiveCandidate) -> None:
         return real == root or root in real.parents
 
     target = Path(candidate.target_paths[0])
+    # The change directory each listed source sits in (openspec/changes/<name>),
+    # taken from the unresolved path so an alias symlink is still visible.
+    change_dirs = {
+        parent for item in candidate.source_paths for parent in Path(item).parents
+        if parent.parent.name == "changes" and parent.parent.parent.name == "openspec"
+    }
     for path in (
         target,
         target.parent,
         root / "openspec",
         root / "openspec" / "changes",
         root / "openspec" / "specs",
+        *sorted(change_dirs),
     ):
         if path.is_symlink() or not inside(path.parent if path is target else path):
             raise PmError(
@@ -651,9 +658,14 @@ def _roll_archive_forward(
             continue
         destination = specs / relative
         destination.parent.mkdir(parents=True, exist_ok=True)
-        temporary = destination.with_name(destination.name + ".pm-archive-tmp")
-        temporary.write_text(text, encoding="utf-8")
-        os.replace(temporary, destination)
+        # mkstemp creates a fresh file exclusively (O_EXCL), so a symlink planted
+        # under any predictable temp name can never redirect this write.
+        handle, raw_temporary = tempfile.mkstemp(
+            dir=destination.parent, prefix=f".{destination.name}.", suffix=".pm-archive-tmp"
+        )
+        with os.fdopen(handle, "w", encoding="utf-8") as stream:
+            stream.write(text)
+        os.replace(raw_temporary, destination)
     if move_from is not None:
         target.parent.mkdir(parents=True, exist_ok=True)
         os.rename(move_from, target)
