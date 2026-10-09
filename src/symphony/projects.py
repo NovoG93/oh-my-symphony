@@ -337,8 +337,11 @@ _BUNDLE_FILES = {
     "tui-open.bat": "tui-open.bat",
     "WORKFLOW.file.example.md": "WORKFLOW.md",
     "scripts/symphony-setup-worktree.sh": "scripts/symphony-setup-worktree.sh",
-    "AGENTS.md": "AGENTS.md",
-    "GEMINI.md": "GEMINI.md",
+    # Project-facing entry points. The source checkout's own AGENTS.md /
+    # GEMINI.md describe *Symphony's* repository and must not be copied into
+    # a user project, where they would tell Codex "this repo is Symphony".
+    "AGENTS.project.md": "AGENTS.md",
+    "GEMINI.project.md": "GEMINI.md",
 }
 _BUNDLE_DIRS = {
     "docs/symphony-prompts": "docs/symphony-prompts",
@@ -705,7 +708,12 @@ def _write_runtime_git_excludes(repo: Path, workflow_path: Path) -> None:
       so Claude Code discovers the skill on this machine, and is relinked
       per machine rather than committed.
     """
-    entries: list[str] = []
+    entries: list[str] = [
+        # Orchestrator state (SQLite + WAL, token EMA, stats) and the live
+        # progress mirror are per-machine runtime files, never product code.
+        "/.symphony/",
+        "/WORKFLOW-PROGRESS.md",
+    ]
     board, _workspace = _workflow_resources(workflow_path, strict=False)
     if board is not None and _inside(board, repo) and board != repo:
         entries.append(f"/{board.relative_to(repo)}/.locks/")
@@ -836,7 +844,9 @@ def _workflow_resources(
 ) -> tuple[Path | None, Path | None]:
     """Resolve runtime-owned paths through the canonical workflow builder."""
     try:
-        config = build_service_config(load_workflow(workflow_path))
+        config = build_service_config(
+            load_workflow(workflow_path), log_decisions=False
+        )
     except (SymphonyError, OSError, UnicodeError) as exc:
         if strict:
             raise ProjectError(f"cannot resolve workflow resources: {exc}") from exc

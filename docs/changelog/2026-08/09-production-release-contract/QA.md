@@ -24,7 +24,7 @@ Backward-trace: pending
 
 | Command | Source | Proves |
 |---|---|---|
-| `git -C /Users/danny/Documents/PARA/Resource/jira-dev-factory merge-base --is-ancestor symphony/JIRA-003 main` | evaluator_owned | The required implementation branch did not reach the declared release target. |
+| `git -C ~/Documents/PARA/Resource/jira-dev-factory merge-base --is-ancestor symphony/JIRA-003 main` | evaluator_owned | The required implementation branch did not reach the declared release target. |
 | `pytest -q tests/test_release_contracts.py tests/test_orchestrator_release_contract_integration.py tests/test_orchestrator_contract_integration.py tests/test_workflow_pipeline_prompt.py tests/test_workflow_presets.py tests/skills/test_symphony_oneshot_bootstrap.py tests/test_doctor.py tests/test_workflow.py` | frozen_repo | Release validator/lifecycle/prompt compatibility and existing contract regressions. |
 | `ruff check src tests` | frozen_repo | Static lint gate. |
 | `symphony-pyright` | frozen_repo | Repository type gate using the active interpreter. |

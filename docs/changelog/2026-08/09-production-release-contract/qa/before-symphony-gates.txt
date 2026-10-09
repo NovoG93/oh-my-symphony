@@ -12,7 +12,7 @@ latest verifier identity validation.
 
 Preserve-baseline regression command:
 PYTHONPATH=/private/tmp/symphony-release-contract-LuIfCN/src \
-/Users/danny/Documents/PARA/Resource/symphony-multi-agent/.venv/bin/pytest -q \
+~/Documents/PARA/Resource/symphony-multi-agent/.venv/bin/pytest -q \
   tests/test_orchestrator_contract_integration.py \
   tests/test_workflow_pipeline_prompt.py \
   tests/test_workflow_presets.py \
