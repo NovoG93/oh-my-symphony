@@ -579,6 +579,92 @@ async def test_terminate_process_tree_retains_unowned_group_after_parent_already
                 os.killpg(proc.pid, signal.SIGKILL)
 
 
+@pytest.mark.skipif(os.name != "posix", reason="process groups are POSIX-only")
+@pytest.mark.asyncio
+async def test_terminate_process_tree_signals_own_live_group_when_ps_is_missing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A ps-less host must still stop our own unreaped worker.
+
+    The leader is our child and not yet reaped, so its pid (and pgid) cannot
+    have been reused; ``ps`` being unavailable is no reason to send nothing.
+    """
+    proc = await asyncio.create_subprocess_exec(
+        sys.executable, "-c", "import time; time.sleep(60)",
+        start_new_session=True,
+    )
+    try:
+        empty_path = tmp_path / "no-ps"
+        empty_path.mkdir()
+        monkeypatch.setenv("PATH", str(empty_path))
+        # Precondition: the group is live but ps cannot describe it.
+        assert shell_module.process_group_exists(proc.pid) is None
+
+        rc = await asyncio.wait_for(
+            shell_module.terminate_process_tree(proc), timeout=30
+        )
+
+        assert rc == -signal.SIGTERM
+        assert proc.returncode == rc
+        assert shell_module.process_group_exists(proc.pid) is False
+    finally:
+        if proc.returncode is None:
+            with contextlib.suppress(OSError):
+                os.killpg(proc.pid, signal.SIGKILL)
+            await shell_module.safe_proc_wait(proc, timeout=5)
+
+
+@pytest.mark.skipif(os.name != "posix", reason="process groups are POSIX-only")
+@pytest.mark.asyncio
+async def test_terminate_process_tree_stays_unconfirmed_when_ps_is_missing_and_group_survives(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Without ps a surviving group member must keep cleanup unconfirmed."""
+    ready = tmp_path / "member.ready"
+    member = tmp_path / "term_ignoring_member.py"
+    member.write_text(
+        "import signal, time\n"
+        "from pathlib import Path\n"
+        "signal.signal(signal.SIGTERM, signal.SIG_IGN)\n"
+        f"Path({str(ready)!r}).write_text('ready', encoding='utf-8')\n"
+        "time.sleep(60)\n",
+        encoding="utf-8",
+    )
+    leader = tmp_path / "leader.py"
+    leader.write_text(
+        "import subprocess, sys, time\n"
+        f"subprocess.Popen([sys.executable, {str(member)!r}])\n"
+        "time.sleep(60)\n",
+        encoding="utf-8",
+    )
+    proc = await asyncio.create_subprocess_exec(
+        sys.executable, str(leader), start_new_session=True,
+    )
+    try:
+        await _wait_for_file(ready, timeout_s=10)
+        empty_path = tmp_path / "no-ps"
+        empty_path.mkdir()
+        monkeypatch.setenv("PATH", str(empty_path))
+        assert shell_module.process_group_exists(proc.pid) is None
+
+        rc = await asyncio.wait_for(
+            shell_module.terminate_process_tree(
+                proc, term_timeout=0.5, kill_timeout=0.5
+            ),
+            timeout=30,
+        )
+
+        assert rc is None
+        assert proc.returncode == -signal.SIGTERM
+        # The TERM-ignoring member is still in the group.
+        os.killpg(proc.pid, 0)
+    finally:
+        with contextlib.suppress(OSError):
+            os.killpg(proc.pid, signal.SIGKILL)
+        if proc.returncode is None:
+            await shell_module.safe_proc_wait(proc, timeout=5)
+
+
 @pytest.mark.asyncio
 async def test_terminate_process_tree_skips_already_dead_process(
     monkeypatch: pytest.MonkeyPatch,

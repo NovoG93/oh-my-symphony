@@ -22,6 +22,7 @@ Versioning: [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ### Changed
 - CI runs the suite in parallel (`pytest-xdist`) and the wall-clock `timing` tests alone afterwards; about 7.5 → 2 minutes. Plain `python -m pytest -q` still runs everything serially.
 - Every worker prompt and the PM planning assistant now carry one shared writing rule (lead with the result, no filler or repetition, keep every number and warning).
+- Worker process cleanup is now confirmed per process group for every per-turn CLI backend (all backends except the Codex app-server). A turn whose agent leaves a background process running in its process group fails cleanup confirmation, and that backend refuses further turns until a stop confirms the group is gone.
 
 ### Fixed
 - Failed project and planning-change selection restores the prior selection, content, focus, and announced error instead of leaving mismatched UI state.

@@ -475,7 +475,20 @@ async def terminate_process_tree(
     if exists is False:
         return proc.returncode
     if exists is None:
-        return None
+        if proc.returncode is not None:
+            return None
+        # ps could not describe the group (missing, timed out, or EPERM),
+        # but the leader is our own unreaped child: its pid — and so its
+        # pgid — cannot have been reused. Run the plain ladder on it, then
+        # report success only if the group is observed gone.
+        _signal_process_group(pid, signal.SIGTERM)
+        rc = await safe_proc_wait(proc, timeout=term_timeout)
+        if rc is None and proc.returncode is None:
+            _signal_process_group(pid, signal.SIGKILL)
+            rc = await safe_proc_wait(proc, timeout=kill_timeout)
+        if await group_gone(term_timeout) is not True:
+            return None
+        return proc.returncode if proc.returncode is not None else rc
     if proc.returncode is not None and (
         identity is None
         or await asyncio.to_thread(process_identity, pid) != identity
