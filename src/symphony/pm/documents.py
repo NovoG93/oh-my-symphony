@@ -8,6 +8,7 @@ import os
 import re
 import subprocess
 import tempfile
+import threading
 import uuid
 from dataclasses import asdict
 from datetime import date
@@ -1305,8 +1306,7 @@ def _resolve_change_root(
         )
     resolved, identity = matches[0]
     if not archived:
-        _recover_semantic_transaction(resolved)
-        _recover_multi_document_transaction(resolved)
+        _recover_change_transactions(resolved)
         identity_path = resolved / "symphony.yaml"
         try:
             identity = load_unique_yaml(identity_path.read_text(encoding="utf-8")) or {}
@@ -1778,6 +1778,25 @@ def _atomic_semantic_write(
     journal_path.unlink(missing_ok=True)
 
 
+_TRANSACTION_JOURNALS = (
+    ".symphony-semantic-journal.json",
+    ".symphony-multi-document-journal.json",
+)
+
+
+def _recover_change_transactions(root: Path) -> None:
+    """Roll interrupted document transactions forward under the change lock.
+
+    A journal is only a crash once its writer has released the lock; replaying
+    it earlier races the live writer's own stage replaces and journal unlink.
+    """
+    if not any((root / name).is_file() for name in _TRANSACTION_JOURNALS):
+        return
+    with _change_lock(root):
+        _recover_semantic_transaction(root)
+        _recover_multi_document_transaction(root)
+
+
 def _recover_semantic_transaction(root: Path) -> None:
     journal_path = root / ".symphony-semantic-journal.json"
     if not journal_path.is_file():
@@ -2095,8 +2114,18 @@ def _read_utf8(path: Path) -> str:
         ) from exc
 
 
+_HELD_CHANGE_LOCKS = threading.local()
+
+
 @contextmanager
 def _change_lock(root: Path):
+    held: set[Path] = _HELD_CHANGE_LOCKS.__dict__.setdefault("roots", set())
+    key = root.resolve()
+    if key in held:
+        # Same-thread re-entry (approval reads the change it has locked): a
+        # second lock on a new file description would wait on this thread.
+        yield
+        return
     lock_path = root / ".symphony-pm.lock"
     lock_path.touch(exist_ok=True)
     with lock_path.open("a+b") as handle:
@@ -2105,18 +2134,22 @@ def _change_lock(root: Path):
 
             handle.seek(0)
             msvcrt.locking(handle.fileno(), msvcrt.LK_LOCK, 1)
+            held.add(key)
             try:
                 yield
             finally:
+                held.discard(key)
                 handle.seek(0)
                 msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
         else:
             import fcntl
 
             fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+            held.add(key)
             try:
                 yield
             finally:
+                held.discard(key)
                 fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
 
 

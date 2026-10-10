@@ -224,6 +224,112 @@ def test_multi_document_apply_recovers_after_each_published_checkpoint(
     assert recovered.revision != change.revision
 
 
+def _interrupted_transaction(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, kind: str
+) -> tuple[PmDocumentRepository, str, Path, Path]:
+    """Leave a journal + staged effects on disk, as a live writer would mid-transaction."""
+    from tests.test_pm_approval import _populate
+
+    repo, change_id, workspace = _repository(tmp_path)
+    change = _populate(repo, change_id, workspace, f"live-{kind}")
+    root = (workspace / "openspec" / "changes" / f"live-{kind}").resolve()
+    ctx = PmRequestContext("p1", change_id, change.revision, f"live-{kind}")
+    if kind == "semantic":
+        monkeypatch.setenv("SYMPHONY_PM_SEMANTIC_FAULT", "after_document")
+        with pytest.raises(RuntimeError):
+            repo.patch_document(
+                ctx, "ux",
+                ({"op": "create_semantic", "kind": "storyboard", "title": "Live frame"},),
+                owner="owner",
+            )
+        monkeypatch.delenv("SYMPHONY_PM_SEMANTIC_FAULT")
+        journal = root / ".symphony-semantic-journal.json"
+        assert (root / ".symphony-semantic-identity.next").is_file()
+    else:
+        proposal = repo.get_document(PmRequestContext("p1", change_id), "proposal", owner="owner")
+        design = repo.get_document(PmRequestContext("p1", change_id), "design", owner="owner")
+        monkeypatch.setenv("SYMPHONY_PM_MULTI_FAULT", "after_document_1")
+        with pytest.raises(RuntimeError):
+            repo.patch_documents(
+                ctx,
+                {"proposal": proposal.source + "\nLive note.\n", "design": design.source + "\nLive note.\n"},
+                owner="owner",
+            )
+        monkeypatch.delenv("SYMPHONY_PM_MULTI_FAULT")
+        journal = root / ".symphony-multi-document-journal.json"
+    assert journal.is_file()
+    return repo, change_id, root, journal
+
+
+@pytest.mark.parametrize("kind", ["semantic", "multi"])
+def test_reader_does_not_roll_forward_a_journal_while_the_change_lock_is_held(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, kind: str
+) -> None:
+    # A journal is indistinguishable from a crash only once its writer has let
+    # go of the change lock; a reader thread must wait for that instead of
+    # replaying stage files out from under the live writer.
+    import threading
+
+    from symphony.pm.documents import _change_lock
+    from symphony.pm.routes import _with_thread_repository
+
+    repo, change_id, root, journal = _interrupted_transaction(tmp_path, monkeypatch, kind)
+    outcome: dict[str, object] = {}
+
+    def read() -> None:
+        try:
+            outcome["change"] = _with_thread_repository(
+                repo, lambda thread_repo: thread_repo.get_change(PmRequestContext("p1", change_id), owner="owner"),
+            )
+        except BaseException as exc:  # surfaced by the assertions below
+            outcome["error"] = exc
+
+    reader = threading.Thread(target=read, daemon=True)
+    with _change_lock(root):
+        reader.start()
+        # Bounded observation window: without the lock the reader finishes the
+        # roll-forward well inside it; with the lock it can only be blocked.
+        reader.join(timeout=0.5)
+        assert reader.is_alive(), outcome
+        assert journal.is_file()
+    reader.join(timeout=30)
+    assert not reader.is_alive()
+    assert "error" not in outcome, outcome
+    assert not journal.exists()
+
+
+def test_lock_holding_reader_recovers_without_self_deadlock(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Approval and end_external_edit read the change while already holding its
+    # lock; recovery there must reuse the held lock, not flock a second fd.
+    import threading
+
+    from symphony.pm.documents import _change_lock
+    from symphony.pm.routes import _with_thread_repository
+
+    repo, change_id, root, journal = _interrupted_transaction(tmp_path, monkeypatch, "semantic")
+    outcome: dict[str, object] = {}
+
+    def locked_read() -> None:
+        try:
+            with _change_lock(root):
+                outcome["change"] = _with_thread_repository(
+                    repo, lambda thread_repo: thread_repo.get_change(PmRequestContext("p1", change_id), owner="owner"),
+                )
+        except BaseException as exc:
+            outcome["error"] = exc
+
+    worker = threading.Thread(target=locked_read, daemon=True)
+    worker.start()
+    worker.join(timeout=30)
+    assert not worker.is_alive(), "get_change deadlocked under its own change lock"
+    assert "error" not in outcome, outcome
+    assert not journal.exists()
+    frames = [item for item in outcome["change"].semantic_index if item.kind == "storyboard"]  # type: ignore[attr-defined]
+    assert any(item.title == "Live frame" for item in frames)
+
+
 def test_workspace_claim_rejects_protected_checkout(tmp_path: Path):
     project = tmp_path / "project"
     project.mkdir()
