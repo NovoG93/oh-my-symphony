@@ -120,27 +120,6 @@ class PmApplication:
             findings.extend(external.findings)
         return ValidationReport(not any(item.severity == "blocking" for item in findings), tuple(findings), "combined", "1.14.0")
 
-    def export_xlsx(self, ctx: PmRequestContext, owner: str, *, export_id: str | None = None):
-        self._require("exchange")
-        return self.exchange.export(
-            self.repository.get_change(ctx, owner=owner), {}, export_id=export_id
-        )
-
-    def preview_import(
-        self,
-        ctx: PmRequestContext,
-        owner: str,
-        data: bytes,
-        trusted_export_snapshot,
-        *,
-        filename: str = "workbook.xlsx",
-    ):
-        self._require("exchange")
-        current = self.repository.get_change(ctx, owner=owner)
-        return self.exchange.preview_import(
-            data, trusted_export_snapshot, current, filename=filename
-        )
-
     def preview_archive(self, ctx: PmRequestContext, owner: str) -> dict[str, Any]:
         self._require("handoff")
         change = self.repository.get_change(ctx, owner=owner)
