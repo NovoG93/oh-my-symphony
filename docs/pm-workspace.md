@@ -15,6 +15,27 @@ Storyboard frames are ordered functional cards. Selecting one opens structured s
 
 The planning assistant offers seven explicit proposal-only actions: Draft artifact, Refine selected section, Find gaps, Review consistency, Explain dependency, Propose WBS, and Update impacted artifacts. The server owns section and target scope; every proposed document diff is reviewed before apply. When a proposal needs new managed identities, the host reserves permanent IDs and shows them in the review. Apply activates those IDs. Discard or cancellation retires unused reservations.
 
+Each planning screen has a **What do these buttons do?** panel that explains every button in one sentence. It is folded by default and open in the demo. To choose the page language, add `?lang=en` or `?lang=ko` before the `#` in the address, for example `http://127.0.0.1:<port>/?lang=ko#/artifacts`. The choice is remembered like the language switch.
+
+## Demo
+
+Try PM Workspace on sample content without touching a real project:
+
+```bash
+symphony pm demo             # English
+symphony pm demo --lang ko   # Korean
+```
+
+The command creates a throwaway folder with its own Git project and one sample planning change, `team-leave-request`, in Draft. It validates the sample, then serves it on a free port at `127.0.0.1`, which only this computer can reach. Open the `Open:` link it prints. In the demo you can validate, edit, approve, and hand off to tickets; the tickets land on the demo's own board, no AI worker starts, and the planning assistant stays off.
+
+- `--lang en|ko` picks the sample content and the page language. Without it, the demo follows `SYMPHONY_LANG`, then English.
+- `--path DIR` puts the demo in `DIR`, which must be empty or not exist yet. Without it, the demo uses a new temporary folder.
+- It needs `git` and Node.js 20.19.0 or newer on PATH.
+- Press Ctrl-C to stop. The folder stays; delete it when you are done.
+- `symphony pm demo` is not verified on Windows.
+
+`symphony pm` always runs this command, even when the current folder contains a `pm` directory. To run a workflow from a directory named `pm`, give the path: `symphony ./pm`.
+
 ## Verification and coverage
 
 An approved task may require native host commands, manual observation procedures, or both. **Run verification** executes an approved native command at the selected tested commit and records the real result without inventing a worker run. **Submit completion evidence** records a configured manual procedure with an immutable report from that commit. Evidence submission never completes a task by itself; the complete procedure set for one commit must pass, then a person reviews and explicitly accepts it.
@@ -31,9 +52,13 @@ pm:
   exchange: false
   assistance: false
   handoff: false
-  openspec_executable: openspec
   planning_workspace_root: /absolute/path/outside/the/protected/checkout
+  # openspec_executable: /path/to/openspec   # optional: your own OpenSpec 1.14.0
 ```
+
+Symphony ships a trimmed OpenSpec 1.14.0 CLI that keeps only the commands PM Workspace calls. It is the default: when `openspec_executable` is absent, PM Workspace runs it with the `node` on your PATH, which must be Node.js 20.19.0 or newer. Set `openspec_executable` only to use your own OpenSpec 1.14.0 install. A config copied from an older example with `openspec_executable: openspec` keeps calling that external program; remove the line to use the bundle.
+
+Buttons that need a missing tool are disabled from the start and show the reason. Without a suitable Node.js, Approve revision and Preview archive are disabled; Validate still runs and lists the problems it can find without OpenSpec. With `assistance: true`, the planning assistant is disabled until Codex 0.160.0 is installed and logged in.
 
 XLSX exchange requires the `pm-exchange` optional dependencies. Browser assets are local and lazy; no CDN is contacted. Automatic PM assistance uses a dedicated Codex app-server 0.160.0 process with GPT-5.6 Sol at medium reasoning, an isolated configuration home, no tools/connectors/network execution, read-only sandboxing, and a strict proposal-only output contract.
 

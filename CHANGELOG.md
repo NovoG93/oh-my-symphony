@@ -11,7 +11,8 @@ Versioning: [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ## [Unreleased]
 
 ### Added
-- Add the default-off local PM Workspace: five planning artifacts, managed WBS, constrained XLSX exchange, pinned OpenSpec integration, proposal-only assistance, revision approval, native ticket handoff, evidence checks, and fenced actual-process dispatch authority.
+- Add the default-off local PM Workspace: five planning artifacts, managed WBS, constrained XLSX exchange, pinned OpenSpec integration, proposal-only assistance, revision approval, native ticket handoff, evidence checks, and fenced actual-process dispatch authority. A trimmed OpenSpec 1.14.0 CLI ships inside Symphony and runs with the host's Node.js 20.19.0 or newer whenever `pm.openspec_executable` is absent; set that key only to use your own OpenSpec 1.14.0.
+- Add `symphony pm demo [--path DIR] [--lang en|ko]`: a disposable, loopback-only PM Workspace with one validated sample change in English or Korean. It never starts an agent; Ctrl-C stops it and keeps the folder. Not verified on Windows. Each planning screen gains a "What do these buttons do?" guide (open in the demo), `?lang=en|ko` sets the page language, and buttons that need a missing host tool are disabled up front with the reason: Approve revision and Preview archive without Node.js 20.19.0+, the planning assistant without Codex 0.160.0 and a Codex login. `symphony pm` now always runs this command, even when a `./pm` directory exists; run a workflow there with `symphony ./pm`.
 - PM approval and handoff remain separate local actions. This change does not enable automatic merge/push, deployment, publication, or real-project archive.
 - PM Workspace storyboard cards use structured server-owned fields and stable frame identities.
 - PM assistance exposes all seven bounded planning actions with per-document diff review.
