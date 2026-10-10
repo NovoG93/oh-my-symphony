@@ -165,8 +165,7 @@ def test_pm_config_defaults_off_and_uses_separate_workspace_root(tmp_path):
     assert cfg.pm.assistance is False
     assert cfg.pm.handoff is False
     assert cfg.pm.planning_workspace_root == (cfg.workspace_root / "pm-planning").resolve()
-    assert cfg.pm.planning_model == "gpt-5.6-sol"
-    assert cfg.pm.planning_reasoning_effort == "medium"
+    assert not hasattr(cfg.pm, "planning_model")
 
 
 def test_pm_config_parses_capabilities_and_hard_limits(tmp_path):
@@ -241,6 +240,26 @@ Prompt
 """)
     with pytest.raises(ConfigValidationError, match="unique"):
         build_service_config(load_workflow(collision))
+
+
+@pytest.mark.parametrize(
+    ("key", "value"),
+    [
+        ("planning_codex_version", "0.161.0"),
+        ("planning_model", "gpt-5.6-sol"),
+        ("planning_reasoning_effort", "high"),
+    ],
+)
+def test_pm_config_rejects_pinned_planning_keys(tmp_path, key, value):
+    # The planning client pins its Codex version, model, and effort; a
+    # WORKFLOW key that looks configurable but is never read must fail loudly.
+    path = _write(tmp_path, f"---\npm:\n  {key}: {value}\n---\nPrompt")
+    with pytest.raises(ConfigValidationError, match=f"pm.{key}") as raised:
+        build_service_config(load_workflow(path))
+    message = str(raised.value)
+    assert "0.160.0" in message
+    assert "gpt-5.6-sol" in message
+    assert "medium" in message
 
 
 def test_pm_config_rejects_non_mapping(tmp_path):

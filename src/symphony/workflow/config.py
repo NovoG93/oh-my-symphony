@@ -505,9 +505,6 @@ class PmConfig:
     max_text_chars: int = 16_384
     operation_timeout_ms: int = 30_000
     exchange_concurrency: int = 1
-    planning_codex_version: str = "0.160.0"
-    planning_model: str = "gpt-5.6-sol"
-    planning_reasoning_effort: str = "medium"
     verification_procedures: dict[str, tuple[str, ...]] = field(default_factory=dict)
     manual_verification_procedures: dict[str, ManualVerificationProcedure] = field(default_factory=dict)
 

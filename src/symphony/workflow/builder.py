@@ -747,6 +747,28 @@ def build_service_config(
     if not isinstance(pm_raw, dict):
         raise ConfigValidationError("pm must be a mapping", value=pm_raw)
     pm_defaults = PmConfig()
+    pinned_planning_keys = [
+        key
+        for key in (
+            "planning_codex_version",
+            "planning_model",
+            "planning_reasoning_effort",
+        )
+        if key in pm_raw
+    ]
+    if pinned_planning_keys:
+        # The planning client pins these on purpose; accepting the keys would
+        # suggest an effect they never have.
+        from ..pm.planning import EFFORT, MODEL, SUPPORTED_CODEX_VERSION
+
+        raise ConfigValidationError(
+            f"pm.{pinned_planning_keys[0]} is not configurable; the PM planning "
+            f"assistant is pinned to Codex {SUPPORTED_CODEX_VERSION}, model "
+            f"{MODEL}, reasoning effort {EFFORT}. Remove "
+            + ", ".join(f"pm.{key}" for key in pinned_planning_keys)
+            + " from WORKFLOW.md",
+            value={key: pm_raw[key] for key in pinned_planning_keys},
+        )
     raw_pm_workspace = pm_raw.get("planning_workspace_root")
     if isinstance(raw_pm_workspace, str) and raw_pm_workspace.strip():
         pm_workspace_root = _resolve_config_path(base_dir, raw_pm_workspace.strip())
@@ -815,20 +837,6 @@ def build_service_config(
             pm_defaults.exchange_concurrency,
             name="pm.exchange_concurrency",
         ),
-        planning_codex_version=_as_str(
-            pm_raw.get("planning_codex_version"),
-            pm_defaults.planning_codex_version,
-        ).strip()
-        or pm_defaults.planning_codex_version,
-        planning_model=_as_str(
-            pm_raw.get("planning_model"), pm_defaults.planning_model
-        ).strip()
-        or pm_defaults.planning_model,
-        planning_reasoning_effort=_as_str(
-            pm_raw.get("planning_reasoning_effort"),
-            pm_defaults.planning_reasoning_effort,
-        ).strip()
-        or pm_defaults.planning_reasoning_effort,
         verification_procedures=_parse_pm_verification_procedures(
             pm_raw.get("verification_procedures")
         ),
