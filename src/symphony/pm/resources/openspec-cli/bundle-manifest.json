@@ -1,0 +1,169 @@
+{
+  "openspec": "1.14.0",
+  "esbuild": "0.25.10",
+  "node_min": "20.19.0",
+  "packages": [
+    {
+      "name": "@fission-ai/openspec",
+      "version": "1.14.0",
+      "license": "MIT"
+    },
+    {
+      "name": "@nodelib/fs.scandir",
+      "version": "2.1.5",
+      "license": "MIT"
+    },
+    {
+      "name": "@nodelib/fs.stat",
+      "version": "2.0.5",
+      "license": "MIT"
+    },
+    {
+      "name": "@nodelib/fs.walk",
+      "version": "1.2.8",
+      "license": "MIT"
+    },
+    {
+      "name": "braces",
+      "version": "3.0.3",
+      "license": "MIT"
+    },
+    {
+      "name": "chalk",
+      "version": "5.6.2",
+      "license": "MIT"
+    },
+    {
+      "name": "commander",
+      "version": "14.0.3",
+      "license": "MIT"
+    },
+    {
+      "name": "fast-glob",
+      "version": "3.3.3",
+      "license": "MIT"
+    },
+    {
+      "name": "fastq",
+      "version": "1.20.3",
+      "license": "ISC"
+    },
+    {
+      "name": "fill-range",
+      "version": "7.1.1",
+      "license": "MIT"
+    },
+    {
+      "name": "glob-parent",
+      "version": "5.1.2",
+      "license": "ISC"
+    },
+    {
+      "name": "is-extglob",
+      "version": "2.1.1",
+      "license": "MIT"
+    },
+    {
+      "name": "is-glob",
+      "version": "4.0.3",
+      "license": "MIT"
+    },
+    {
+      "name": "is-number",
+      "version": "7.0.0",
+      "license": "MIT"
+    },
+    {
+      "name": "merge2",
+      "version": "1.4.1",
+      "license": "MIT"
+    },
+    {
+      "name": "micromatch",
+      "version": "4.0.8",
+      "license": "MIT"
+    },
+    {
+      "name": "picomatch",
+      "version": "2.3.2",
+      "license": "MIT"
+    },
+    {
+      "name": "queue-microtask",
+      "version": "1.2.3",
+      "license": "MIT"
+    },
+    {
+      "name": "reusify",
+      "version": "1.1.0",
+      "license": "MIT"
+    },
+    {
+      "name": "run-parallel",
+      "version": "1.2.0",
+      "license": "MIT"
+    },
+    {
+      "name": "to-regex-range",
+      "version": "5.0.1",
+      "license": "MIT"
+    },
+    {
+      "name": "yaml",
+      "version": "2.9.1",
+      "license": "ISC"
+    },
+    {
+      "name": "zod",
+      "version": "4.6.5",
+      "license": "MIT"
+    }
+  ],
+  "files": [
+    {
+      "path": "LICENSE",
+      "bytes": 1079,
+      "sha256": "c3c7235bea1214ab62df643473975c2e8b8848f528901a976693f7d069713e64"
+    },
+    {
+      "path": "THIRD_PARTY_NOTICES.txt",
+      "bytes": 24845,
+      "sha256": "82586546b50a6613d87180dbe7727fea9eef8001113080b52f45e30c700ac64e"
+    },
+    {
+      "path": "lib/openspec/cli/openspec.mjs",
+      "bytes": 880892,
+      "sha256": "5187d45f897bb0feaf678d16dccbdb9ea878441a6b8d7f497ae614fcea50a4ff"
+    },
+    {
+      "path": "package.json",
+      "bytes": 100,
+      "sha256": "b34a11ccf2c6a8b708366dc5dacc8b857a19f8a4a924d5e941f706e12871e7ca"
+    },
+    {
+      "path": "schemas/spec-driven/schema.yaml",
+      "bytes": 14444,
+      "sha256": "2d69b13d01739ae3e7dd75cc95df920dbae545e4b51ae3799c9a1785a4b98b86"
+    },
+    {
+      "path": "schemas/spec-driven/templates/design.md",
+      "bytes": 417,
+      "sha256": "6ccc87f5017fb190e69e8759dd4e20d5ac3320cc4dabf152708bf8f2aa5205f8"
+    },
+    {
+      "path": "schemas/spec-driven/templates/proposal.md",
+      "bytes": 1468,
+      "sha256": "0dd70e35db5c696ba8ac3cc3a53e2d6561865c1e4e7d49db5a1eaa3e4a6ad86e"
+    },
+    {
+      "path": "schemas/spec-driven/templates/spec.md",
+      "bytes": 374,
+      "sha256": "1cccfb573f031c6352bed2a879b7035ff710bc909112fc23d10bdcfcdd8d4318"
+    },
+    {
+      "path": "schemas/spec-driven/templates/tasks.md",
+      "bytes": 218,
+      "sha256": "fa67d99fb4a93b12d702f89ea83e1838219d1cad1c90a4192c402278001cd30e"
+    }
+  ]
+}
