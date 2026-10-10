@@ -182,6 +182,7 @@ async def test_registered_same_slug_routes_use_host_project_identity(
         await client_b.close()
 
 
+@pytest.mark.timing
 @pytest.mark.asyncio
 async def test_acceptance_post_refuses_cross_project_and_keeps_event_loop_live(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
