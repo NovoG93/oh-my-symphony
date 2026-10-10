@@ -164,8 +164,20 @@ def test_pm_config_defaults_off_and_uses_separate_workspace_root(tmp_path):
     assert cfg.pm.exchange is False
     assert cfg.pm.assistance is False
     assert cfg.pm.handoff is False
+    assert cfg.pm.openspec_executable is None
     assert cfg.pm.planning_workspace_root == (cfg.workspace_root / "pm-planning").resolve()
     assert not hasattr(cfg.pm, "planning_model")
+
+
+@pytest.mark.parametrize("value", ["", "null", "''", "'   '"])
+def test_pm_config_blank_openspec_uses_bundle(tmp_path, value):
+    path = _write(tmp_path, f"---\npm:\n  openspec_executable: {value}\n---\nPrompt\n")
+    assert build_service_config(load_workflow(path)).pm.openspec_executable is None
+
+
+def test_pm_config_explicit_openspec_from_path_is_preserved(tmp_path):
+    path = _write(tmp_path, "---\npm:\n  openspec_executable: openspec\n---\nPrompt\n")
+    assert build_service_config(load_workflow(path)).pm.openspec_executable == "openspec"
 
 
 def test_pm_config_parses_capabilities_and_hard_limits(tmp_path):

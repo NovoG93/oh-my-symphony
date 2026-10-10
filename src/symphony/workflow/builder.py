@@ -792,7 +792,7 @@ def build_service_config(
         ),
         handoff=_validated_bool(pm_raw.get("handoff"), False, name="pm.handoff"),
         openspec_executable=_as_str(
-            pm_raw.get("openspec_executable"), pm_defaults.openspec_executable
+            pm_raw.get("openspec_executable")
         ).strip()
         or pm_defaults.openspec_executable,
         planning_workspace_root=pm_workspace_root,

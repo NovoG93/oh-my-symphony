@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import json
 import os
+import sys
+import subprocess
 import time
 from pathlib import Path
 
@@ -9,6 +11,13 @@ import pytest
 
 from symphony.pm.models import ArchiveCandidate, PmError
 from symphony.pm.openspec import MAX_OUTPUT_BYTES, OpenSpecAdapter
+import symphony.pm.openspec as openspec_module
+from tests._pm_support import fake_node, skip_or_fail
+
+
+@pytest.fixture(autouse=True)
+def isolated_node_cache(monkeypatch):
+    monkeypatch.setattr(openspec_module, "_NODE_CACHE", {})
 
 
 class FakeOpenSpec(OpenSpecAdapter):
@@ -192,3 +201,169 @@ def test_cli_cleanup_kills_descendant_holding_output_pipes(tmp_path: Path) -> No
     started = time.monotonic()
     assert OpenSpecAdapter(str(script), timeout_seconds=5)._run(tmp_path, "--version") == "1.14.0"
     assert time.monotonic() - started < 4
+
+
+def test_missing_node_does_not_spawn_and_reports_exact_error(tmp_path, monkeypatch):
+    monkeypatch.setenv("PATH", str(tmp_path))
+    monkeypatch.setattr(subprocess, "run", lambda *a, **k: pytest.fail("missing Node spawned"))
+    # Construction is lazy, including when the host has no Node.
+    adapter = OpenSpecAdapter()
+    with pytest.raises(PmError) as caught:
+        adapter._run(tmp_path, "--version")
+    assert caught.value.code == "capability_unavailable"
+    assert caught.value.status == 503
+    assert caught.value.message == (
+        "Bundled OpenSpec needs Node.js 20.19.0 or newer on PATH (found: none)"
+    )
+
+
+def test_old_node_failure_is_not_cached_and_upgrade_needs_no_restart(tmp_path, monkeypatch):
+    executable = fake_node(tmp_path, "v20.17.0")
+    monkeypatch.setenv("PATH", str(tmp_path))
+    for _ in range(2):
+        with pytest.raises(PmError, match=r"\(found: v20\.17\.0\)"):
+            openspec_module.resolve_node()
+        assert openspec_module._NODE_CACHE == {}
+    fake_node(tmp_path, "v20.19.0")
+    assert openspec_module.resolve_node() == ("/x/node", "v20.19.0")
+    assert openspec_module._NODE_CACHE == {str(executable): ("/x/node", "v20.19.0")}
+    monkeypatch.setattr(subprocess, "run", lambda *a, **k: pytest.fail("success reprobed"))
+    assert openspec_module.resolve_node() == ("/x/node", "v20.19.0")
+
+
+@pytest.mark.parametrize("version", ["v20.18.9", "v19.99.0", "v20.19.0-rc.1"])
+def test_node_below_floor_is_rejected(tmp_path, monkeypatch, version):
+    fake_node(tmp_path, version)
+    monkeypatch.setenv("PATH", str(tmp_path))
+    with pytest.raises(PmError) as caught:
+        openspec_module.resolve_node()
+    assert caught.value.message.endswith(f"(found: {version})")
+    assert caught.value.status == 503
+
+
+def test_node_cache_is_keyed_by_which_path(tmp_path, monkeypatch):
+    first = tmp_path / "first"
+    second = tmp_path / "second"
+    first.mkdir()
+    second.mkdir()
+    fake_node(first, "v22.22.3")
+    fake_node(second, "v20.17.0")
+    monkeypatch.setenv("PATH", str(first))
+    assert openspec_module.resolve_node() == ("/x/node", "v22.22.3")
+    monkeypatch.setenv("PATH", str(second))
+    with pytest.raises(PmError, match="found: v20.17.0"):
+        openspec_module.resolve_node()
+
+
+@pytest.mark.parametrize(("returncode", "output"), [
+    (1, '["/x/node", "v22.22.3"]'),
+    (0, '["relative/node", "v22.22.3"]'),
+    (0, '[true, "v22.22.3"]'),
+    (0, '["/x/node", 22]'),
+    (0, '"not an array"'),
+    (0, '["/x/node"]'),
+    (0, 'not JSON'),
+])
+def test_invalid_node_probe_is_not_cached(tmp_path, monkeypatch, returncode, output):
+    fake_node(tmp_path, "v22.22.3")
+    monkeypatch.setenv("PATH", str(tmp_path))
+    monkeypatch.setattr(subprocess, "run", lambda *a, **k: subprocess.CompletedProcess(
+        a[0], returncode, stdout=output, stderr="",
+    ))
+    with pytest.raises(PmError) as caught:
+        openspec_module.resolve_node()
+    assert caught.value.code == "capability_unavailable"
+    assert caught.value.status == 503
+    assert openspec_module._NODE_CACHE == {}
+
+
+@pytest.mark.parametrize("failure", [OSError("cannot execute"), subprocess.TimeoutExpired("node", 5)])
+def test_failed_node_probe_can_recover(tmp_path, monkeypatch, failure):
+    fake_node(tmp_path, "v22.22.3")
+    monkeypatch.setenv("PATH", str(tmp_path))
+    calls = 0
+    real_run = subprocess.run
+
+    def run(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise failure
+        return real_run(*args, **kwargs)
+
+    monkeypatch.setattr(subprocess, "run", run)
+    with pytest.raises(PmError, match="found: none"):
+        openspec_module.resolve_node()
+    assert openspec_module._NODE_CACHE == {}
+    assert openspec_module.resolve_node() == ("/x/node", "v22.22.3")
+    assert calls == 2
+
+
+def test_bundled_run_uses_absolute_execpath_and_caches_across_adapters(tmp_path, monkeypatch):
+    try:
+        expected = openspec_module.resolve_node()
+    except PmError as exc:
+        skip_or_fail(exc.message, flag="SYMPHONY_PM_NODE_REQUIRED")
+    openspec_module._NODE_CACHE.clear()
+    probes = []
+    commands = []
+    real_run = subprocess.run
+    real_popen = subprocess.Popen
+
+    def run(command, **kwargs):
+        probes.append((command, kwargs))
+        return real_run(command, **kwargs)
+
+    def popen(command, **kwargs):
+        commands.append((command, kwargs))
+        return real_popen(command, **kwargs)
+
+    monkeypatch.setattr(subprocess, "run", run)
+    monkeypatch.setattr(subprocess, "Popen", popen)
+    for _ in range(2):
+        assert OpenSpecAdapter()._run(tmp_path, "--version") == "1.14.0"
+    assert len(probes) == 1
+    assert probes[0][0] == [
+        openspec_module.shutil.which("node"), "-p",
+        "JSON.stringify([process.execPath, process.version])",
+    ]
+    assert probes[0][1]["cwd"] == openspec_module.BUNDLE_ROOT
+    assert probes[0][1]["timeout"] == 5
+    assert Path(expected[0]).is_absolute()
+    # subprocess.run also uses Popen; select just the actual OpenSpec invocations.
+    runs = [(argv, kwargs) for argv, kwargs in commands if argv[-1] == "--version"]
+    assert len(runs) == 2
+    for argv, kwargs in runs:
+        assert argv == [expected[0], str(openspec_module.BUNDLE_CLI), "--version"]
+        assert kwargs["cwd"] == tmp_path
+        assert kwargs["env"]["OPENSPEC_TELEMETRY"] == "0"
+
+
+def test_explicit_executable_bypasses_node_resolution(tmp_path, monkeypatch):
+    monkeypatch.setenv("PATH", str(tmp_path))
+    monkeypatch.setattr(openspec_module, "resolve_node", lambda: pytest.fail("explicit Node lookup"))
+    commands = []
+    real_popen = subprocess.Popen
+
+    def popen(command, **kwargs):
+        commands.append(command)
+        return real_popen(command, **kwargs)
+
+    monkeypatch.setattr(subprocess, "Popen", popen)
+    args = ["-c", "print('1.14.0')"]
+    assert OpenSpecAdapter(sys.executable)._run(tmp_path, *args) == "1.14.0"
+    assert commands == [[sys.executable, *args]]
+
+
+def test_real_old_node_is_rejected_when_requested(tmp_path, monkeypatch):
+    executable = os.environ.get("SYMPHONY_PM_OLD_NODE")
+    if not executable:
+        skip_or_fail("Set SYMPHONY_PM_OLD_NODE to the real Node v20.17.0 binary",
+                     flag="SYMPHONY_PM_NODE_REQUIRED")
+    assert Path(executable).is_file(), "SYMPHONY_PM_OLD_NODE must name an existing binary"
+    monkeypatch.setenv("PATH", str(Path(executable).parent))
+    with pytest.raises(PmError) as caught:
+        openspec_module.resolve_node()
+    assert caught.value.message == (
+        "Bundled OpenSpec needs Node.js 20.19.0 or newer on PATH (found: v20.17.0)"
+    )

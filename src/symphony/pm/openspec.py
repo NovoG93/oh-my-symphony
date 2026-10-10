@@ -6,6 +6,7 @@ import hashlib
 import json
 import os
 import re
+import shutil
 import signal
 import subprocess
 import threading
@@ -26,10 +27,50 @@ from .models import (
 
 SUPPORTED_VERSION = "1.14.0"
 MAX_OUTPUT_BYTES = 2 * 1024 * 1024
+BUNDLE_ROOT = (Path(__file__).parent / "resources" / "openspec-cli").resolve()
+BUNDLE_CLI = BUNDLE_ROOT / "lib" / "openspec" / "cli" / "openspec.mjs"
+_NODE_CACHE: dict[str, tuple[str, str]] = {}
+
+
+def resolve_node() -> tuple[str, str]:
+    """Resolve the host Node outside the project; cache only supported versions."""
+    executable = shutil.which("node")
+    if executable in _NODE_CACHE:
+        return _NODE_CACHE[executable]
+    found = "none"
+    if executable is not None:
+        try:
+            result = subprocess.run(
+                [executable, "-p", "JSON.stringify([process.execPath, process.version])"],
+                cwd=BUNDLE_ROOT, capture_output=True, text=True, timeout=5,
+            )
+            payload = json.loads(result.stdout)
+            if isinstance(payload, list) and len(payload) == 2:
+                exec_path, version = payload
+                if isinstance(version, str):
+                    found = version
+                    match = re.fullmatch(r"v(\d+)\.(\d+)\.(\d+)", version)
+                    if (
+                        result.returncode == 0
+                        and isinstance(exec_path, str)
+                        and Path(exec_path).is_absolute()
+                        and match is not None
+                        and tuple(map(int, match.groups())) >= (20, 19, 0)
+                    ):
+                        resolved = (exec_path, version)
+                        _NODE_CACHE[executable] = resolved
+                        return resolved
+        except (OSError, subprocess.TimeoutExpired, ValueError):
+            pass
+    raise PmError(
+        "capability_unavailable",
+        f"Bundled OpenSpec needs Node.js 20.19.0 or newer on PATH (found: {found})",
+        status=503,
+    )
 
 
 class OpenSpecAdapter:
-    def __init__(self, executable: str = "openspec", timeout_seconds: float = 30.0):
+    def __init__(self, executable: str | None = None, timeout_seconds: float = 30.0):
         self.executable = executable
         self.timeout_seconds = timeout_seconds
         self._profiles: dict[str, tuple[str, OpenSpecProfile]] = {}
@@ -243,10 +284,14 @@ class OpenSpecAdapter:
         allow_nonzero: bool = False,
     ) -> str:
         del json_output
+        command = (
+            [self.executable, *args] if self.executable is not None
+            else [resolve_node()[0], str(BUNDLE_CLI), *args]
+        )
         env = {**os.environ, "OPENSPEC_TELEMETRY": "0"}
         try:
             process = subprocess.Popen(
-                [self.executable, *args], cwd=project_root, env=env,
+                command, cwd=project_root, env=env,
                 stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                 start_new_session=os.name != "nt",
             )

@@ -494,7 +494,7 @@ class PmConfig:
     exchange: bool = False
     assistance: bool = False
     handoff: bool = False
-    openspec_executable: str = "openspec"
+    openspec_executable: str | None = None
     planning_workspace_root: Path | None = None
     max_encoded_upload_mb: int = 8
     max_workbook_mb: int = 5
