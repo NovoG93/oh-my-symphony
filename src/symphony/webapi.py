@@ -158,6 +158,9 @@ API_TOKEN_ENV = "SYMPHONY_API_TOKEN"
 # the part of a URL most likely to end up in access logs.
 _CHAT_WS_PATH = "/api/v1/chat/ws"
 _HEALTH_PATH = "/api/v1/health"
+# PM Workspace routes refuse cross-origin mutations in `_api_guard`; the rest
+# of the board keeps its narrower per-route origin checks (projects, chat ws).
+_PM_API_PREFIX = "/api/v1/pm/"
 _CI_EDITABLE_KEYS = {"enabled", "interval_ms", "max_turns", "agent_kind", "modes"}
 BIND_HOST_KEY: web.AppKey[str] = web.AppKey("symphony.bind_host", str)
 CHAT_MANAGER_KEY: web.AppKey[ChatManager] = web.AppKey("symphony.chat", ChatManager)
@@ -409,7 +412,9 @@ async def _api_guard(request: web.Request, handler):
             return _json_error(
                 403, "forbidden_host", f"host {request.host!r} not allowed"
             )
-        if request.method in {"POST", "PUT", "PATCH", "DELETE"}:
+        if request.method in {
+            "POST", "PUT", "PATCH", "DELETE"
+        } and request.path.startswith(_PM_API_PREFIX):
             origin = request.headers.get("Origin", "")
             referer = request.headers.get("Referer", "")
             malformed_referer = False
@@ -427,17 +432,8 @@ async def _api_guard(request: web.Request, handler):
                 or (origin and not _origin_is_trusted(request, origin))
                 or (fetch_site == "cross-site" and not origin)
             ):
-                message = "cross-origin mutation is not allowed"
-                if request.path == "/api/v1/projects" or request.path.startswith(
-                    "/api/v1/projects/"
-                ):
-                    message = (
-                        f"origin {origin!r} may not manage projects; set "
-                        f"{TRUSTED_ORIGINS_ENV}={origin} if you front this board "
-                        "with a reverse proxy or tunnel"
-                    )
                 return _json_error(
-                    403, "forbidden_origin", message
+                    403, "forbidden_origin", "cross-origin mutation is not allowed"
                 )
         # A JSON content type is what forces the CORS preflight, so it is
         # required on every mutation a browser sends, including a body-less

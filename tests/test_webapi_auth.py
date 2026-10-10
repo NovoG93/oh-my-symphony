@@ -341,22 +341,52 @@ async def test_bodyless_browser_mutations_require_json_content_type(
     monkeypatch.delenv(API_TOKEN_ENV, raising=False)
     # An HTML form can submit an empty POST without a CORS preflight; any
     # browser provenance header must trigger the 415 even with no body.
-    for headers in ({"Sec-Fetch-Mode": "no-cors"},):
-        resp = await client.post("/api/v1/refresh", headers=headers)
-        assert resp.status == 415, headers
-        assert (await resp.json())["error"]["code"] == "unsupported_media_type"
     for headers in (
         {"Origin": "http://evil.example"},
         {"Referer": "http://evil.example/page"},
         {"Sec-Fetch-Site": "cross-site"},
+        {"Sec-Fetch-Mode": "no-cors"},
     ):
         resp = await client.post("/api/v1/refresh", headers=headers)
-        assert resp.status == 403, headers
-        assert (await resp.json())["error"]["code"] == "forbidden_origin"
+        assert resp.status == 415, headers
+        assert (await resp.json())["error"]["code"] == "unsupported_media_type"
     resp = await client.delete("/api/v1/issues/X-1", headers={"Origin": "http://evil.example"})
-    assert resp.status == 403
+    assert resp.status == 415
     resp = await client.post(
         "/api/v1/refresh", json={}, headers={"Origin": "http://127.0.0.1"}
+    )
+    assert resp.status == 202
+
+
+PM_MUTATION_PATH = "/api/v1/pm/changes"
+
+
+async def test_pm_mutations_refuse_cross_origin_provenance(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.delenv(API_TOKEN_ENV, raising=False)
+    for method in ("POST", "PATCH", "PUT", "DELETE"):
+        for headers in (
+            {"Origin": "http://evil.example"},
+            {"Referer": "http://evil.example/page"},
+            {"Sec-Fetch-Site": "cross-site"},
+        ):
+            resp = await client.request(
+                method, PM_MUTATION_PATH, json={}, headers=headers
+            )
+            assert resp.status == 403, (method, headers)
+            payload = await resp.json()
+            assert payload["error"]["code"] == "forbidden_origin", (method, headers)
+
+
+async def test_cross_origin_refusal_is_scoped_to_pm_routes(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Board routes outside PM keep their pre-PM behavior: a JSON mutation
+    # with a foreign Origin is not refused by the global guard.
+    monkeypatch.delenv(API_TOKEN_ENV, raising=False)
+    resp = await client.post(
+        "/api/v1/refresh", json={}, headers={"Origin": "http://evil.example"}
     )
     assert resp.status == 202
 
@@ -365,7 +395,7 @@ async def test_origin_guard_runs_after_bearer_and_before_mutation(
     client: TestClient, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     monkeypatch.setenv(API_TOKEN_ENV, "secret")
-    path = "/api/v1/refresh"
+    path = PM_MUTATION_PATH
     missing = await client.post(
         path, json={}, headers={"Origin": "https://evil.example"}
     )
@@ -389,7 +419,10 @@ async def test_origin_guard_runs_after_bearer_and_before_mutation(
             "Origin": str(client.make_url("/")).rstrip("/"),
         },
     )
-    assert same_origin.status == 202
+    # Same-origin passes every guard and reaches the PM handler, which
+    # rejects the empty body on its own terms.
+    assert same_origin.status == 409
+    assert (await same_origin.json())["error"]["code"] == "wrong_project"
 
 
 async def test_malformed_origin_and_referer_fail_closed(
@@ -398,7 +431,7 @@ async def test_malformed_origin_and_referer_fail_closed(
     monkeypatch.delenv(API_TOKEN_ENV, raising=False)
     for headers in ({"Origin": "http://["}, {"Referer": "http://["}):
         response = await client.post(
-            "/api/v1/refresh", json={}, headers=headers
+            PM_MUTATION_PATH, json={}, headers=headers
         )
         assert response.status == 403, headers
         payload = await response.json()
@@ -410,7 +443,7 @@ async def test_host_guard_still_precedes_origin_for_authenticated_request(
 ) -> None:
     monkeypatch.setenv(API_TOKEN_ENV, "secret")
     response = await client.post(
-        "/api/v1/refresh",
+        PM_MUTATION_PATH,
         json={},
         headers={
             "Authorization": "Bearer secret",
