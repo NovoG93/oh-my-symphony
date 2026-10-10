@@ -17,7 +17,7 @@ import zipfile
 from dataclasses import asdict, is_dataclass
 from datetime import date, datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable, TypeVar
 
 from aiohttp import web
 
@@ -37,6 +37,7 @@ from .identity import host_project_identity
 from ..orchestrator.run_registry import RunRegistry
 
 _CHANGE_ID = re.compile(r"^[0-9a-f]{32}$")
+_T = TypeVar("_T")
 PM_DEVELOPMENT_VERIFICATION_KEY: web.AppKey[bool] = web.AppKey(
     "symphony.pm.development_verification", bool
 )
@@ -151,7 +152,8 @@ def register_pm_routes(app: web.Application, ctx: Any, orchestrator: Any) -> Non
                 raise PmError("payload_too_large", "encoded upload exceeds limit", status=413)
             chunks.append(chunk)
         try:
-            value = json.loads(b"".join(chunks))
+            # A multi-MB base64 upload decodes off the event loop.
+            value = await asyncio.to_thread(json.loads, b"".join(chunks))
         except (UnicodeDecodeError, json.JSONDecodeError) as exc:
             raise PmError("invalid_json", "request body is invalid") from exc
         if not isinstance(value, dict):
@@ -425,20 +427,34 @@ def register_pm_routes(app: web.Application, ctx: Any, orchestrator: Any) -> Non
         export_root = storage_root("exports")
         format_name = str(payload.get("format") or payload.get("payload", {}).get("format") or "xlsx").lower()
         pmapp = service()
-        change = pmapp.repository.get_change(pctx, owner=owner(request))
+        request_owner = owner(request)
+
+        def load_change() -> ChangeView:
+            change = _with_thread_repository(
+                pmapp.repository,
+                lambda repository: repository.get_change(pctx, owner=request_owner),
+            )
+            if format_name == "xlsx":
+                pmapp._require("exchange")
+            return change
+
+        change = await asyncio.to_thread(load_change)
         if format_name == "xlsx":
-            pmapp._require("exchange")
             async with exchange_semaphore():
                 exported = await asyncio.to_thread(
                     pmapp.exchange.export, change, {}, export_id=export_id
                 )
         else:
             exported = _render_export(change, format_name, pmapp.exchange)
-        export_root.mkdir(parents=True, exist_ok=True)
-        suffix = Path(exported.filename).suffix
-        (export_root / f"{export_id}{suffix}").write_bytes(exported.data)
-        (export_root / f"{export_id}.snapshot.json").write_text(json.dumps(_json(change), sort_keys=True), encoding="utf-8")
-        (export_root / f"{export_id}.json").write_text(json.dumps({"filename": exported.filename, "suffix": suffix, "content_type": exported.content_type, "metadata": exported.metadata}), encoding="utf-8")
+
+        def store_export() -> None:
+            export_root.mkdir(parents=True, exist_ok=True)
+            suffix = Path(exported.filename).suffix
+            (export_root / f"{export_id}{suffix}").write_bytes(exported.data)
+            (export_root / f"{export_id}.snapshot.json").write_text(json.dumps(_json(change), sort_keys=True), encoding="utf-8")
+            (export_root / f"{export_id}.json").write_text(json.dumps({"filename": exported.filename, "suffix": suffix, "content_type": exported.content_type, "metadata": exported.metadata}), encoding="utf-8")
+
+        await asyncio.to_thread(store_export)
         return web.json_response({"export_id": export_id, "filename": exported.filename, "metadata": exported.metadata}, status=201)
 
     async def get_export(request: web.Request):
@@ -494,17 +510,26 @@ def register_pm_routes(app: web.Application, ctx: Any, orchestrator: Any) -> Non
             )
         export_root = storage_root("exports")
         pmapp = service()
-        pmapp._require("exchange")
+        request_owner = owner(request)
+        await asyncio.to_thread(pmapp._require, "exchange")
         async with exchange_semaphore():
             metadata = await asyncio.to_thread(pmapp.exchange.inspect_metadata, data)
         export_id = metadata.get("export_id", "")
         if not re.fullmatch(r"[0-9a-f]{32}", export_id):
             raise PmError("trusted_base_missing", "workbook is not tied to a durable Symphony export", status=409)
         snapshot_path = export_root / f"{export_id}.snapshot.json"
-        if not snapshot_path.exists():
-            raise PmError("trusted_base_missing", "trusted export snapshot is unavailable", status=409)
-        trusted = _change_from_json(json.loads(snapshot_path.read_text(encoding="utf-8")))
-        current = pmapp.repository.get_change(pctx, owner=owner(request))
+
+        def load_bases() -> tuple[ChangeView, ChangeView]:
+            if not snapshot_path.exists():
+                raise PmError("trusted_base_missing", "trusted export snapshot is unavailable", status=409)
+            trusted = _change_from_json(json.loads(snapshot_path.read_text(encoding="utf-8")))
+            current = _with_thread_repository(
+                pmapp.repository,
+                lambda repository: repository.get_change(pctx, owner=request_owner),
+            )
+            return trusted, current
+
+        trusted, current = await asyncio.to_thread(load_bases)
         async with exchange_semaphore():
             candidate = await asyncio.to_thread(
                 pmapp.exchange.preview_import, data, trusted, current,
@@ -514,10 +539,14 @@ def register_pm_routes(app: web.Application, ctx: Any, orchestrator: Any) -> Non
         result = _json(candidate)
         result["import_id"] = import_id
         result["change_id"] = pctx.change_id
-        result["owner"] = owner(request)
+        result["owner"] = request_owner
         import_root = storage_root("imports")
-        import_root.mkdir(parents=True, exist_ok=True)
-        (import_root / f"{import_id}.json").write_text(json.dumps(result, sort_keys=True), encoding="utf-8")
+
+        def store_preview() -> None:
+            import_root.mkdir(parents=True, exist_ok=True)
+            (import_root / f"{import_id}.json").write_text(json.dumps(result, sort_keys=True), encoding="utf-8")
+
+        await asyncio.to_thread(store_preview)
         return web.json_response(result)
 
     async def apply_import(request: web.Request):
@@ -1268,6 +1297,30 @@ def register_pm_routes(app: web.Application, ctx: Any, orchestrator: Any) -> Non
     app.router.add_get("/api/v1/pm/exports/{export_id}/file", wrap(get_export))
     app.router.add_post("/api/v1/pm/changes/{change_id}/imports/preview", wrap(preview_import))
     app.router.add_post("/api/v1/pm/changes/{change_id}/imports/{import_id}/apply", wrap(apply_import))
+
+
+def _with_thread_repository(
+    repository: PmDocumentRepository,
+    work: Callable[[PmDocumentRepository], _T],
+) -> _T:
+    """Run repository work in a worker thread on its own registry connection.
+
+    The orchestrator's SQLite connection belongs to the event-loop thread, so
+    a worker opens a private one, as verification and acceptance do.
+    """
+    thread_registry = RunRegistry(repository.registry.path)
+    try:
+        return work(PmDocumentRepository(
+            project_id=repository.project_id,
+            project_root=repository.project_root,
+            registry=thread_registry,
+            planning_workspace_root=repository.planning_workspace_root,
+            max_nodes=repository.max_nodes,
+            max_edges=repository.max_edges,
+            max_text_chars=repository.max_text_chars,
+        ))
+    finally:
+        thread_registry.close()
 
 
 def _json(value: Any) -> Any:

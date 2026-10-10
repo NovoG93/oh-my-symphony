@@ -8,8 +8,11 @@ import subprocess
 import json
 import hashlib
 import difflib
+import http.client
 import threading
+import time
 import uuid
+from typing import Any
 
 import pytest
 from aiohttp.test_utils import TestClient, TestServer
@@ -232,6 +235,96 @@ async def test_acceptance_post_refuses_cross_project_and_keeps_event_loop_live(
         assert accepted.status == 201
     finally:
         release.set()
+        await client.close()
+
+
+@pytest.mark.timing
+@pytest.mark.asyncio
+async def test_xlsx_export_and_import_preview_keep_state_route_responsive(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Loading a 1000-task change must not stall the event loop.
+
+    Mirrors the release benchmark's api_exchange, whose heartbeat budget is
+    0.25 s: /api/v1/state is polled while the export and the import preview
+    run. With the change read on the loop the worst poll took 0.12-0.15 s;
+    off the loop it takes 0.03-0.05 s, which is GIL handoff while workbook
+    threads run.
+    """
+    # Keep the developer's host project registry out of the measured path.
+    monkeypatch.setenv("SYMPHONY_PROJECTS_FILE", str(tmp_path / "projects.json"))
+    client, planning = await _authoring_client(tmp_path)
+    try:
+        created = await client.post("/api/v1/pm/changes", json={
+            "project_id": "p1", "workspace_path": str(planning),
+            "locator": "exchange-load", "title": "Exchange load",
+        })
+        assert created.status == 201, await created.text()
+        change = await created.json()
+        change_id = change["change_id"]
+        seeded = await client.patch(
+            f"/api/v1/pm/changes/{change_id}/wbs",
+            json={"project_id": "p1", "change_id": change_id,
+                  "expected_revision": change["revision"],
+                  "payload": {"operations": [{"op": "create_task", "task": {
+                      "kind": "Feature", "title": f"Task {index}", "order": index,
+                      "description": f"Implement task {index}.",
+                      "acceptance": [f"Task {index} is observable."],
+                      "verification": ["focused"],
+                      "integration_impact": "Existing PM workspace.",
+                      "executable": True,
+                  }} for index in range(1000)]}},
+        )
+        assert seeded.status == 200, await seeded.text()
+
+        async def worst_state_latency(request) -> tuple[float, Any]:
+            # Poll from a separate thread like the benchmark's external
+            # client: an in-loop poller would sleep through a stall unmeasured.
+            stop = threading.Event()
+            samples: list[tuple[int, float]] = []
+
+            def poll_state() -> None:
+                connection = http.client.HTTPConnection(
+                    str(client.host), int(client.port), timeout=5,
+                )
+                try:
+                    while not stop.is_set():
+                        started = time.perf_counter()
+                        connection.request("GET", "/api/v1/state")
+                        response = connection.getresponse()
+                        response.read()
+                        samples.append((response.status, time.perf_counter() - started))
+                        stop.wait(0.02)
+                finally:
+                    connection.close()
+
+            poller = asyncio.create_task(asyncio.to_thread(poll_state))
+            try:
+                result = await request
+            finally:
+                stop.set()
+                await poller
+            assert samples and {status for status, _ in samples} == {200}
+            return max(latency for _, latency in samples), result
+
+        export_latency, exported = await worst_state_latency(client.post(
+            f"/api/v1/pm/changes/{change_id}/exports",
+            json={"project_id": "p1", "format": "xlsx"},
+        ))
+        assert exported.status == 201, await exported.text()
+        export_id = (await exported.json())["export_id"]
+        workbook = await (await client.get(f"/api/v1/pm/exports/{export_id}/file")).read()
+        import_latency, previewed = await worst_state_latency(client.post(
+            f"/api/v1/pm/changes/{change_id}/imports/preview",
+            json={"project_id": "p1", "payload": {
+                "filename": "exchange-load.xlsx",
+                "base64": base64.b64encode(workbook).decode(),
+            }},
+        ))
+        assert previewed.status == 200, await previewed.text()
+        assert export_latency < 0.1, f"export stalled /api/v1/state for {export_latency:.3f}s"
+        assert import_latency < 0.1, f"import preview stalled /api/v1/state for {import_latency:.3f}s"
+    finally:
         await client.close()
 
 
