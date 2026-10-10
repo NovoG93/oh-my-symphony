@@ -6,12 +6,21 @@ import { renderExchangePanel } from './exchange.js';
 import { renderDiagram, diagramSummary } from './diagrams.js';
 import { renderStoryboard } from './storyboard.js';
 import { PLANNING_ACTIONS, planningActionRequest, verificationActions, evidenceProvenance } from './assistance.js';
+import { PM_GUIDES } from './guide.js';
 
 const TABS = [['idea', 'Idea'], ['requirements', 'Requirements'], ['design', 'Design'], ['plan', 'Plan'], ['code', 'Code Files']];
 const DESIGN_VIEWS = [['ux', 'UX'], ['storyboard', 'Storyboard'], ['architecture', 'Architecture'], ['erd', 'ERD'], ['api', 'API'], ['integration', 'Integration']];
 const PLAN_VIEWS = [['wbs', 'Work breakdown'], ['dependencies', 'Dependencies'], ['source', 'Plan document']];
 
 export function capabilityAvailability(payload, name) {
+  const value = declaredAvailability(payload, name);
+  // Codex (version or login) is checked up front, so every assistance control
+  // is disabled with its reason before a proposal could fail.
+  const codex = name === 'assistance' ? unavailableHostTool(payload, 'codex') : '';
+  return codex ? { ...value, effective: false, reasons: [...value.reasons, codex] } : value;
+}
+
+function declaredAvailability(payload, name) {
   const explicit = payload?.capabilities?.[name];
   if (explicit) return {
     requested: Boolean(explicit.requested),
@@ -22,6 +31,12 @@ export function capabilityAvailability(payload, name) {
   const requested = Boolean(payload?.flags?.[name]);
   const effective = payload?.effective_flags?.[name] ?? requested;
   return { requested, effective: Boolean(effective), reasons: [], developmentVerification: false };
+}
+
+// The reason a probed host tool is unavailable, or '' when it is available or not probed.
+function unavailableHostTool(payload, name) {
+  const tool = payload?.host_tools?.[name];
+  return tool?.available === false ? String(tool.reason || `${name} is unavailable in this host.`) : '';
 }
 
 export function mountArtifacts({ root, projectId, api: hostApi, ui, onDirtyChange }) {
@@ -66,6 +81,17 @@ export function mountArtifacts({ root, projectId, api: hostApi, ui, onDirtyChang
     if (archived()) { item.disabled = true; item.title = 'Archived planning history is read-only.'; }
     return item;
   };
+  // OpenSpec runs on Node. Without it the existing title stays first and the
+  // Node reason follows (P6); archived history keeps only its read-only title.
+  const limitNodeAction = (item, { keepEnabled = false } = {}) => {
+    const reason = archived() ? '' : unavailableHostTool(state.capabilities, 'node');
+    if (!reason) return item;
+    if (!keepEnabled) item.disabled = true;
+    item.title = [item.title, reason].filter(Boolean).join(' ');
+    item.setAttribute('aria-describedby', 'pm-capability-status');
+    return item;
+  };
+  const demoActive = () => Boolean(state.capabilities?.demo?.active);
   const safeAction = (handler, source = null) => (...args) => Promise.resolve()
     .then(() => handler(...args))
     .catch((error) => reportActionError(error, source || document.activeElement));
@@ -87,13 +113,18 @@ export function mountArtifacts({ root, projectId, api: hostApi, ui, onDirtyChang
     const names = ['authoring', 'exchange', 'assistance', 'handoff'];
     const unavailable = names.filter((name) => !availability(name).effective);
     const development = names.filter((name) => availability(name).developmentVerification);
-    if (!unavailable.length && !development.length) return null;
-    const rows = unavailable.map((name) => ui.el('li', null, [
-      ui.el('strong', null, `${name}: `), ui.el('span', null, unavailableReason(name)),
+    // Codex is already listed through assistance; Node gates several actions, so it gets its own row.
+    const tools = ['node'].map((name) => [name, unavailableHostTool(state.capabilities, name)]).filter(([, reason]) => reason);
+    const demo = demoActive();
+    if (!demo && !unavailable.length && !development.length && !tools.length) return null;
+    const rows = [...unavailable.map((name) => [name, unavailableReason(name)]), ...tools].map(([name, reason]) => ui.el('li', null, [
+      ui.el('strong', null, `${name}: `), ui.el('span', null, reason),
     ]));
-    if (development.length) rows.push(ui.el('li', null, 'Development verification is active for configured actions. Dependency checks still apply, and release gates are not marked passed.'));
+    if (demo) rows.unshift(ui.el('li', null, 'This is a disposable demo. Planning actions are unlocked only on this server; no AI worker starts and nothing leaves this computer.'));
+    else if (development.length) rows.push(ui.el('li', null, 'Development verification is active for configured actions. Dependency checks still apply, and release gates are not marked passed.'));
+    const heading = demo ? 'Demo workspace' : unavailable.length || tools.length ? 'Some planning actions are unavailable' : 'Development verification context';
     return ui.el('section', { id: 'pm-capability-status', class: 'pm-status-card', role: 'status' }, [
-      ui.el('strong', null, unavailable.length ? 'Some planning actions are unavailable' : 'Development verification context'),
+      ui.el('strong', null, heading),
       ui.el('ul', { class: 'pm-capability-list' }, rows),
     ]);
   }
@@ -231,6 +262,15 @@ export function mountArtifacts({ root, projectId, api: hostApi, ui, onDirtyChang
     return ui.el('header', { class: 'pm-header' }, [
       ui.el('div', { class: 'pm-heading-copy' }, [ui.el('span', { class: 'pm-kicker' }, 'Product planning'), ui.el('h1', null, 'Artifacts'), ui.el('p', null, 'Shape the idea, align requirements, and hand off executable work.')]),
       ui.el('div', { class: 'pm-header-controls' }, [ui.el('div', { class: 'pm-actions' }, [select, repair, convert, create])]),
+      buildGuide('workspace'),
+    ]);
+  }
+
+  // Collapsed everywhere; open in the demo, where first-time readers land.
+  function buildGuide(area) {
+    return ui.el('details', { class: 'pm-guide', open: demoActive() }, [
+      ui.el('summary', null, 'What do these buttons do?'),
+      ui.el('dl', { class: 'pm-guide-list' }, Object.entries(PM_GUIDES[area]).flatMap(([label, text]) => [ui.el('dt', null, label), ui.el('dd', null, text)])),
     ]);
   }
 
@@ -250,6 +290,7 @@ export function mountArtifacts({ root, projectId, api: hostApi, ui, onDirtyChang
       body.append(ui.el('section', { class: 'pm-empty-state', role: 'status' }, [ui.el('h2', null, 'External editing is active'), ui.el('p', null, 'Workspace writes are paused. Finish external editing to reindex, validate, and resume here.') ]));
       return body;
     }
+    body.append(buildGuide(state.tab));
     if (state.tab === 'plan') body.append(buildPlan());
     else if (state.tab === 'design') body.append(buildDesign());
     else if (state.tab === 'requirements') body.append(buildRequirements());
@@ -262,11 +303,12 @@ export function mountArtifacts({ root, projectId, api: hostApi, ui, onDirtyChang
     const external = state.externalEdit
       ? limitAction(button('Finish external edit & reindex', async () => { const report = await api.endExternal(state.change.change_id); state.externalEdit = false; await refreshChange(); showFindings(report); }), 'authoring')
       : limitAction(button('Edit in external editor', async () => { await api.beginExternal(state.change.change_id, state.change.revision); state.externalEdit = true; render(); ui.announce('App writes paused while external editing is active.'); }), 'authoring');
-    const validate = limitArchivedAction(button('Validate', async () => showFindings(await api.validate(state.change.change_id, state.change.revision))));
-    const approve = limitAction(button('Approve revision', async () => {
+    // Validate still returns local findings without Node, so it only explains.
+    const validate = limitNodeAction(limitArchivedAction(button('Validate', async () => showFindings(await api.validate(state.change.change_id, state.change.revision)))), { keepEnabled: true });
+    const approve = limitNodeAction(limitAction(button('Approve revision', async () => {
       if (!window.confirm(pmText('Approve this exact planning revision locally?'))) return;
       await api.approve(state.change.change_id, state.change.revision, state.change.approval_confirmation_token); await refreshChange(); ui.announce(pmText('Revision approved.'));
-    }, 'btn btn-primary'), 'authoring');
+    }, 'btn btn-primary'), 'authoring'));
     return ui.el('section', { class: 'pm-revision-bar' }, [
       ui.el('div', null, [ui.el('strong', null, state.change.locator), ui.el('span', { class: `pm-state ${state.change.state.toLowerCase()}` }, state.change.state), ui.el('code', { title: state.change.revision }, state.change.revision)]),
       ui.el('div', { class: 'pm-actions' }, [external, validate, approve]),
@@ -365,7 +407,7 @@ export function mountArtifacts({ root, projectId, api: hostApi, ui, onDirtyChang
       stack.append(simpleTable(['Task', 'Needs', 'Dependency', 'Reason'], rows)); return stack;
     }
     const handoff = limitAction(button('Preview approved handoff', previewHandoff, 'btn btn-primary'), 'handoff');
-    const archive = limitAction(button('Preview archive', previewArchive), 'handoff');
+    const archive = limitNodeAction(limitAction(button('Preview archive', previewArchive), 'handoff'));
     stack.append(ui.el('div', { class: 'pm-plan-action-row' }, [archive, handoff]));
     stack.append(renderWbs({ ui, view: state.wbs, semanticIndex: state.change.semantic_index || [], onNavigateReference: safeAction(navigateSemantic), onSetField: safeAction(setTaskField), onPaste: safeAction(previewPaste), onCommand: safeAction(commandWbs), onCopy: safeAction(copyTsv), onSelect: state.setSelectedTask, onFilter: state.setPlanFilter, onScroll: state.setPlanScroll, selectedTask: state.selectedTask, filter: state.planFilter, scrollTop: state.planScroll, canUndo: history.undo.length > 0, canRedo: history.redo.length > 0, approved: Boolean(state.change.approval_id), readOnlyReason: availability('authoring').effective ? '' : unavailableReason('authoring') }));
     stack.append(renderExchangePanel({ ui, onExport: exportPlanning, onImport: importWorkbook, onApply: applyImport, workbookAvailability: hostAvailability('exchange'), readOnly: archived(), onError: reportActionError, translate: pmText }), renderFindings(ui, state.wbs.findings));
@@ -931,6 +973,48 @@ const KO = new Map(Object.entries({
   'Waiver reason': '면제 사유', 'Reviewer label': '검토자 이름', 'Confirm waiver': '면제 확인',
   'Proposed': '변경안', 'Current baseline': '현재 기준', 'Source revision': '소스 리비전',
   'External editing is active': '외부 편집 중', 'Choose or create a planning change': '기획 변경을 선택하거나 만드세요',
+  'Save storyboard': '스토리보드 저장', 'Cancel task': '작업 취소', 'Review Git commit': 'Git 커밋 검토', 'Open run evidence': '실행 증거 열기',
+  'Demo workspace': '데모 작업공간',
+  'This is a disposable demo. Planning actions are unlocked only on this server; no AI worker starts and nothing leaves this computer.': '일회용 데모입니다. 기획 작업은 이 서버에서만 열려 있으며, AI 작업자는 시작되지 않고 어떤 내용도 이 컴퓨터 밖으로 나가지 않습니다.',
+  'Off in the demo: it would contact an AI model.': '데모에서는 꺼져 있습니다. AI 모델에 연결해야 하기 때문입니다.',
+  // Button guides (guide.js).
+  'What do these buttons do?': '이 버튼들은 무엇을 하나요?',
+  'Creates a new planning change in a separate Git working folder (worktree) that you name. Other changes stay as they are.': '지정한 별도 Git 작업 폴더(worktree)에 새 기획 변경을 만듭니다. 다른 변경은 그대로 둡니다.',
+  'Reconnects this change to its planning folder after the folder was moved or lost, then reads its documents again.': '기획 폴더가 옮겨졌거나 사라졌을 때 이 변경을 폴더에 다시 연결하고 문서를 다시 읽습니다.',
+  'Replaces an older board ticket with a new planning change: the ticket is parked, and only tasks approved here can carry out its work.': '기존 보드 티켓을 새 기획 변경으로 대체합니다. 티켓은 보류되고, 여기서 승인된 작업만 그 일을 수행할 수 있습니다.',
+  'Pauses editing on this page so you can change the planning files in another editor; finishing reads and validates them again.': '다른 편집기에서 기획 파일을 고칠 수 있도록 이 화면의 편집을 멈춥니다. 편집을 마치면 파일을 다시 읽고 검증합니다.',
+  'Checks every planning document against the rules and OpenSpec and lists what blocks approval. Changes nothing.': '모든 기획 문서를 규칙과 OpenSpec으로 점검하고 승인을 막는 항목을 보여 줍니다. 아무것도 바꾸지 않습니다.',
+  'Runs the same checks as Validate and records your sign-off on this exact version of the plan. Any later edit needs a new approval before handoff.': '검증과 같은 점검을 거친 뒤 이 정확한 버전의 계획에 대한 승인을 기록합니다. 이후에 수정하면 전달 전에 다시 승인해야 합니다.',
+  'Opens the plain text of this document for editing; nothing is saved until you press Save draft.': '이 문서의 원문을 편집할 수 있게 엽니다. 초안 저장을 누르기 전에는 저장되지 않습니다.',
+  'Saves your edits as a new revision of the plan. It does not approve or hand off anything.': '편집한 내용을 계획의 새 리비전으로 저장합니다. 승인이나 전달은 하지 않습니다.',
+  'Asks an AI assistant to suggest changes to the plan; you review the proposal, and nothing changes unless you apply it.': 'AI 도우미에게 계획 변경 제안을 요청합니다. 제안을 검토해 적용하기 전에는 아무것도 바뀌지 않습니다.',
+  'Adds a decision with the title you type, with room for its owner, impact, status and reason.': '입력한 제목으로 결정 항목을 추가하고 담당자, 영향, 상태, 사유를 적을 자리를 만듭니다.',
+  'Starts a requirements document for a new capability (an area of the product) with a first requirement that you name.': '새 기능(제품의 한 영역)의 요구사항 문서를 만들고, 이름을 지정한 첫 요구사항을 넣습니다.',
+  'Opens the requirements of this capability for editing; nothing is saved until you press Save draft.': '이 기능의 요구사항을 편집할 수 있게 엽니다. 초안 저장을 누르기 전에는 저장되지 않습니다.',
+  'Adds a requirement with the title you type; each requirement states something the product must do.': '입력한 제목으로 요구사항을 추가합니다. 요구사항은 제품이 반드시 해야 할 일을 적은 것입니다.',
+  'Adds a scenario with the title you type: a concrete example that shows a requirement working.': '입력한 제목으로 시나리오를 추가합니다. 시나리오는 요구사항이 실제로 동작하는 모습을 보여 주는 구체적인 예입니다.',
+  'Records a reviewed reason why a requirement does not need full coverage. It does not mark any work as done or accepted.': '요구사항에 완전한 커버리지가 필요 없는 이유를 검토 기록으로 남깁니다. 어떤 작업도 완료나 인수로 표시하지 않습니다.',
+  'Withdraws an active waiver, so the requirement needs normal coverage again.': '적용 중인 면제를 철회해 요구사항이 다시 일반 커버리지를 갖추어야 하게 합니다.',
+  'Shows each screen as a frame: what the user sees and does, and how the system responds.': '화면마다 사용자가 보고 하는 일과 시스템의 반응을 프레임으로 보여 줍니다.',
+  'Saves your edits to the open storyboard frame as a new revision of the plan.': '열려 있는 스토리보드 프레임의 수정 내용을 계획의 새 리비전으로 저장합니다.',
+  'Adds a storyboard frame with the title you type to the UX document.': '입력한 제목으로 UX 문서에 스토리보드 프레임을 추가합니다.',
+  'Adds an API contract with the title you type, describing who owns it, what data it exchanges and how errors are handled.': '입력한 제목으로 API 계약을 추가합니다. 담당자, 주고받는 데이터, 오류 처리 방식을 적습니다.',
+  'Shows the plan as a tree of groups and tasks with owner, priority and estimate.': '계획을 그룹과 작업의 트리로 보여 주고 담당자, 우선순위, 예상치를 함께 표시합니다.',
+  'Lists which tasks must wait for other tasks, and why.': '어떤 작업이 다른 작업을 기다려야 하는지와 그 이유를 보여 줍니다.',
+  'Adds a group that holds related tasks; a group itself is never handed off as work.': '관련 작업을 묶는 그룹을 추가합니다. 그룹 자체는 작업으로 전달되지 않습니다.',
+  'Adds a new task under the selected item.': '선택한 항목 아래에 새 작업을 추가합니다.',
+  'Removes the selected task while the plan is not yet approved; Undo brings it back.': '계획이 승인되기 전에 선택한 작업을 삭제합니다. 실행 취소로 되돌릴 수 있습니다.',
+  'Takes the place of Delete after approval: cancels the selected task with a reason you give and keeps its reviewed scope on record.': '승인 후에는 삭제 대신 나타납니다. 입력한 사유로 선택한 작업을 취소하고 검토된 범위는 기록으로 남깁니다.',
+  'Reverses your last change to the work breakdown.': '작업 분해에서 마지막으로 바꾼 내용을 되돌립니다.',
+  'Downloads the plan as an Excel workbook, CSV, Markdown, printable HTML or a planning package. Changes nothing.': '계획을 Excel 워크북, CSV, Markdown, 인쇄용 HTML 또는 기획 패키지로 내려받습니다. 아무것도 바꾸지 않습니다.',
+  'Reads an edited Excel workbook and lists each proposed change and conflict; nothing is applied until you review and apply it.': '수정한 Excel 워크북을 읽어 제안된 변경과 충돌을 하나씩 보여 줍니다. 검토 후 적용하기 전에는 아무것도 반영되지 않습니다.',
+  'Shows the board tickets the approved plan would create; nothing is created until you confirm.': '승인된 계획으로 만들어질 보드 티켓을 보여 줍니다. 확인하기 전에는 아무것도 만들지 않습니다.',
+  'Checks that all work is accepted and shows what archiving would record; nothing is archived until you confirm.': '모든 작업이 인수되었는지 확인하고 아카이브에 기록될 내용을 보여 줍니다. 확인하기 전에는 아카이브하지 않습니다.',
+  'Has this computer run an approved check on the code of a task and records the actual result.': '이 컴퓨터에서 작업의 코드에 승인된 점검을 실행하고 실제 결과를 기록합니다.',
+  'Records the result of a check that a person ran, with its report. It does not complete or accept the task.': '사람이 직접 수행한 점검 결과를 보고서와 함께 기록합니다. 작업을 완료하거나 인수하지는 않습니다.',
+  'Opens the code change (Git commit) that this task produced.': '이 작업이 만든 코드 변경(Git 커밋)을 엽니다.',
+  'Opens the record of the agent run that worked on this task.': '이 작업을 수행한 에이전트 실행 기록을 엽니다.',
+  'Signs off the work of a task once all its required checks have passed; nothing is accepted automatically.': '필요한 점검을 모두 통과한 작업을 인수합니다. 자동으로 인수되는 것은 없습니다.',
 }));
 
 export function pmText(value, values = {}, language = globalThis.window?.i18n?.lang || 'en') {

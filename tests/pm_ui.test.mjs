@@ -1,7 +1,9 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
+import { readFile, readdir } from 'node:fs/promises';
+import vm from 'node:vm';
 
-import { applyUnifiedDiff, capabilityAvailability, chooseAvailableChange, directHistoryChangeId, moveOperations, parseTsv, pmText, serializeWbsTsv, withProjectIdentity } from '../src/symphony/web/static/pm/index.js';
+import { applyUnifiedDiff, capabilityAvailability, chooseAvailableChange, directHistoryChangeId, mountArtifacts, moveOperations, parseTsv, pmText, serializeWbsTsv, withProjectIdentity } from '../src/symphony/web/static/pm/index.js';
 import { createPmApi } from '../src/symphony/web/static/pm/api.js';
 import { diagramSummary, diagramWindows } from '../src/symphony/web/static/pm/diagrams.js';
 import { exchangeControlState, validateWorkbookFilename } from '../src/symphony/web/static/pm/exchange.js';
@@ -284,4 +286,345 @@ test('a redefined node label keeps its final definition inside a diagram part', 
   const lines = parts.window(1).source.split('\n');
   const labels = lines.filter((line) => line.startsWith('n100['));
   assert.equal(labels.at(-1), 'n100["Final Korean 결제 승인"]');
+});
+
+// D7 is pinned here rather than read from an unshipped planning document.
+const GUIDE_LABELS = {
+  workspace: ['New change', 'Repair workspace', 'Convert legacy plan', 'Edit in external editor', 'Validate', 'Approve revision'],
+  idea: ['Edit source', 'Save draft', 'Planning assistant', 'Add decision'],
+  requirements: ['Add capability', 'Edit requirements', 'Add requirement', 'Add scenario', 'Waive coverage', 'Revoke waiver'],
+  design: ['Storyboard', 'Save storyboard', 'Add storyboard', 'Add contract'],
+  plan: ['Work breakdown', 'Dependencies', 'Add group', 'Add child', 'Delete', 'Cancel task', 'Undo', 'Download export', 'Preview import', 'Preview approved handoff', 'Preview archive'],
+  code: ['Run verification', 'Submit completion evidence', 'Review Git commit', 'Open run evidence', 'Accept verified revision'],
+};
+const GUIDE_SUMMARY = 'What do these buttons do?';
+const DEMO_HEADING = 'Demo workspace';
+const DEMO_SENTENCE = 'This is a disposable demo. Planning actions are unlocked only on this server; no AI worker starts and nothing leaves this computer.';
+const DEMO_ASSISTANCE_REASON = 'Off in the demo: it would contact an AI model.';
+const DEVELOPMENT_SENTENCE = 'Development verification is active for configured actions. Dependency checks still apply, and release gates are not marked passed.';
+const NODE_REASON = 'Bundled OpenSpec needs Node.js 20.19.0 or newer on PATH (found: none)';
+const CODEX_REASON = 'Planning assistant needs Codex 0.160.0 (found: 0.162.0). Planning assistant needs a Codex login: ~/.codex/auth.json is missing. Run codex login.';
+const ARCHIVED_REASON = 'Archived planning history is read-only.';
+const PM_DIRECTORY = new URL('../src/symphony/web/static/pm/', import.meta.url);
+
+async function guideEntries() {
+  // A missing future module must fail these tests, not abort the original suite.
+  const { PM_GUIDES } = await import(new URL('guide.js', PM_DIRECTORY));
+  assert.ok(PM_GUIDES && typeof PM_GUIDES === 'object', 'guide.js must export PM_GUIDES (area -> label -> sentence)');
+  return PM_GUIDES;
+}
+
+function withoutKoMaps(source) {
+  return source.replace(/\bconst\s+KO\s*=\s*(?:new\s+Map\(Object\.entries\()?\{[\s\S]*?\}(?:\)\))?\s*;/g, '');
+}
+
+function controlLabels(source) {
+  const clean = withoutKoMaps(source);
+  const literals = [...clean.matchAll(/(['"])((?:\\.|(?!\1)[^\\\r\n])*)\1/g)].map((match) => match[2]);
+  const labels = new Set(literals);
+  // Only this actual template and its declared kind list satisfy Add <kind>.
+  if (clean.includes('`Add ${kind}`')) {
+    const kinds = clean.match(/\bconst\s+kinds\s*=([\s\S]*?);/)?.[1] || '';
+    for (const match of kinds.matchAll(/['"](decision|storyboard|contract|requirement|scenario)['"]/g)) labels.add(`Add ${match[1]}`);
+  }
+  return labels;
+}
+
+test('R9 guide table pins all six areas and exactly 36 D7 labels', async () => {
+  const entries = await guideEntries();
+  assert.deepEqual(Object.keys(entries).sort(), Object.keys(GUIDE_LABELS).sort());
+  assert.equal(Object.values(entries).reduce((count, area) => count + Object.keys(area).length, 0), 36);
+  for (const [area, labels] of Object.entries(GUIDE_LABELS)) {
+    assert.deepEqual(Object.keys(entries[area]).sort(), [...labels].sort(), area);
+    for (const sentence of Object.values(entries[area])) {
+      assert.equal(typeof sentence, 'string', area);
+      assert.ok(sentence.trim().length > 0 && !/<[^>]+>/.test(sentence), `${area}: a plain explanation is required`);
+    }
+  }
+});
+
+test('R9 guide labels exist outside guide.js and KO maps, including Add ${kind}', async () => {
+  // Counterexamples prove that translation keys and arbitrary kinds cannot pass.
+  assert.equal(controlLabels("const KO = new Map(Object.entries({ 'Only in KO': '번역' }));").has('Only in KO'), false);
+  assert.equal(controlLabels("const KO = { 'Only in KO': '번역' };").has('Only in KO'), false);
+  assert.equal(controlLabels("const kinds = ['decision']; button(`Add ${kind}`);").has('Add decision'), true);
+  assert.equal(controlLabels("const kinds = ['decision']; button(`Add ${kind}`);").has('Add scenario'), false);
+  assert.equal(controlLabels("const kinds = ['scenario']; button(`Other ${kind}`);").has('Add scenario'), false);
+  const files = (await readdir(PM_DIRECTORY)).filter((name) => name.endsWith('.js') && name !== 'guide.js');
+  const labels = new Set((await Promise.all(files.map(async (name) => [...controlLabels(await readFile(new URL(name, PM_DIRECTORY), 'utf8'))]))).flat());
+  for (const label of Object.values(GUIDE_LABELS).flat()) assert.ok(labels.has(label), `D7 label has no control literal: ${label}`);
+  const entries = await guideEntries();
+  for (const label of Object.values(entries).flatMap(Object.keys)) assert.ok(labels.has(label), `Guide label has no control literal: ${label}`);
+});
+
+function assertKorean(strings) {
+  const missing = strings.filter((value) => pmText(value, {}, 'ko') === value || !/[가-힣]/.test(pmText(value, {}, 'ko')));
+  assert.deepEqual(missing, [], 'Every guide/status string must have a Korean entry in index.js');
+}
+
+test('R9 every guide summary, label and explanation has a Korean entry', async () => {
+  const entries = await guideEntries();
+  assertKorean([GUIDE_SUMMARY, ...Object.values(entries).flatMap((area) => Object.entries(area).flat())]);
+});
+
+test('R9 index.js translates Save storyboard, Review Git commit, Open run evidence and Cancel task', () => {
+  assertKorean(['Save storyboard', 'Review Git commit', 'Open run evidence', 'Cancel task']);
+});
+
+// Small DOM adapter for the real mountArtifacts renderer. It implements only
+// construction, queries and text walking; no browser library or UI exports added.
+class UiNode {
+  constructor(tag = '', text = '') {
+    this.tag = tag; this.nodeType = tag ? 1 : 3; this.nodeValue = text;
+    this.childNodes = []; this.attributes = new Map(); this.dataset = {};
+    this.disabled = false; this.title = ''; this.open = false;
+    this.classList = {
+      add: (name) => this.setAttribute('class', `${this.getAttribute('class') || ''} ${name}`.trim()),
+      remove: (name) => this.setAttribute('class', (this.getAttribute('class') || '').split(' ').filter((item) => item !== name).join(' ')),
+    };
+  }
+  get textContent() { return this.nodeType === 3 ? this.nodeValue : this.childNodes.map((node) => node.textContent).join(''); }
+  set textContent(value) { this.replaceChildren(String(value)); }
+  append(...nodes) {
+    for (const node of nodes.flat()) if (node !== null && node !== undefined && node !== false) this.childNodes.push(node instanceof UiNode ? node : new UiNode('', String(node)));
+  }
+  appendChild(node) { this.append(node); return node; }
+  replaceChildren(...nodes) { this.childNodes = []; this.append(...nodes); }
+  setAttribute(key, value) {
+    this.attributes.set(key, String(value));
+    if (['open', 'disabled', 'hidden', 'selected'].includes(key)) this[key] = true;
+    if (['value', 'title'].includes(key)) this[key] = String(value);
+  }
+  getAttribute(key) { return this.attributes.get(key) ?? null; }
+  matches(selector) {
+    const match = selector.match(/^([\w-]+)?(?:\.([\w-]+))?(?:\[([\w-]+)(?:="([^"]*)")?\])?$/);
+    if (!match || this.nodeType !== 1) return false;
+    const [, tag, className, attr, value] = match;
+    return (!tag || this.tag === tag) && (!className || (this.getAttribute('class') || '').split(' ').includes(className))
+      && (!attr || (this.attributes.has(attr) && (value === undefined || this.getAttribute(attr) === value)));
+  }
+  querySelectorAll(selector) {
+    const selectors = selector.split(',').map((item) => item.trim());
+    return this.childNodes.flatMap((node) => [...(selectors.some((item) => node.matches(item)) ? [node] : []), ...node.querySelectorAll(selector)]);
+  }
+  querySelector(selector) { return this.querySelectorAll(selector)[0] || null; }
+  addEventListener() {}
+  focus() {}
+}
+
+function storageStub() {
+  const values = new Map();
+  return { getItem: (key) => values.get(key) ?? null, setItem: (key, value) => values.set(key, String(value)), removeItem: (key) => values.delete(key) };
+}
+
+async function mountedPm(t, { tab = 'idea', demo = false, language = 'en', hostTools = {}, gated = false, archived = false, development = false, demoAssistance = false } = {}) {
+  const el = (tag, attrs, children) => {
+    const node = new UiNode(tag);
+    for (const [key, value] of Object.entries(attrs || {})) if (value !== null && value !== undefined && value !== false) node.setAttribute(key, typeof value === 'boolean' ? '' : value);
+    node.append(children ?? []); return node;
+  };
+  const globals = {
+    window: { i18n: { lang: language } },
+    location: new URL(`http://127.0.0.1/?pmTab=${tab}#/artifacts`),
+    history: { replaceState() {} }, sessionStorage: storageStub(), localStorage: storageStub(), NodeFilter: { SHOW_TEXT: 4 },
+    document: {
+      // WBS enhancement stays disconnected; these tests exercise native controls.
+      querySelector: () => null, head: { appendChild() {} }, createElement: (tag) => el(tag),
+      createTreeWalker: (scope) => {
+        const texts = (node) => node.nodeType === 3 ? [node] : node.childNodes.flatMap(texts);
+        const nodes = texts(scope); let index = 0;
+        return { nextNode: () => nodes[index++] || null };
+      },
+    },
+  };
+  const previous = Object.fromEntries(Object.keys(globals).map((key) => [key, Object.getOwnPropertyDescriptor(globalThis, key)]));
+  for (const [key, value] of Object.entries(globals)) Object.defineProperty(globalThis, key, { configurable: true, writable: true, value });
+  const restore = () => {
+    for (const [key, descriptor] of Object.entries(previous)) {
+      if (descriptor) Object.defineProperty(globalThis, key, descriptor); else delete globalThis[key];
+    }
+  };
+  let mount;
+  t.after(() => { try { mount?.unmount(); } finally { restore(); } });
+  const capabilities = {
+    project_id: 'p1', demo: { active: demo }, host_tools: hostTools,
+    capabilities: Object.fromEntries(['authoring', 'exchange', 'assistance', 'handoff'].map((name) => [name, {
+      requested: true, effective: !gated, reasons: gated ? [`${name} requires G0 and G1.`] : [], development_verification: development,
+    }])),
+  };
+  if (demoAssistance) capabilities.capabilities.assistance = { requested: false, effective: false, reasons: [DEMO_ASSISTANCE_REASON] };
+  const change = { change_id: 'c1', locator: 'team-leave-request', revision: 'rev1', state: archived ? 'Archived' : 'Draft', workspace_state: archived ? 'RELEASED' : 'ATTACHED', documents: [{ document_id: 'proposal', path: 'proposal.md' }], storyboard_frames: [] };
+  const root = el('div');
+  mount = mountArtifacts({ root, projectId: 'p1', onDirtyChange() {}, ui: { el, renderMarkdown: (source) => el('p', null, source), announce() {} }, api: {
+    request: async (path) => {
+      const pathname = path.split('?')[0];
+      if (pathname === '/capabilities') return capabilities;
+      if (pathname === '/changes') return { changes: [change] };
+      if (pathname === '/changes/c1') return change;
+      if (pathname.includes('/documents/')) return { document_id: pathname.split('/').at(-1), source: 'Demo document', path: 'proposal.md' };
+      if (pathname.endsWith('/wbs')) return { tasks: [], findings: [] };
+      if (pathname.endsWith('/managed-tickets')) return { tickets: [] };
+      if (pathname.endsWith('/coverage')) return { entities: [] };
+      throw new Error(`Unexpected PM request: ${path}`);
+    },
+  } });
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(root.querySelector('.pm-action-error'), null, root.textContent);
+  assert.ok(root.querySelector('.pm-revision-bar'), `PM renderer must finish without an error: ${root.textContent}`);
+  return root;
+}
+
+function findButton(root, label) {
+  const node = root.querySelectorAll('button').find((item) => item.textContent === label);
+  assert.ok(node, `Missing button: ${label}`); return node;
+}
+
+test('R9 each area renders visible guide entries and follows demo.active in English and Korean', async (t) => {
+  for (const language of ['en', 'ko']) for (const demo of [false, true]) for (const tab of ['idea', 'requirements', 'design', 'plan', 'code']) {
+    await t.test(`${tab}, ${language}, demo=${demo}`, async (context) => {
+      const root = await mountedPm(context, { tab, language, demo });
+      const guides = root.querySelectorAll('details.pm-guide');
+      assert.ok(guides.length >= 2, `${tab}: workspace and area guides must both be visible`);
+      const entries = await guideEntries();
+      for (const [area, labels] of [['workspace', GUIDE_LABELS.workspace], [tab, GUIDE_LABELS[tab]]]) {
+        const guide = guides.find((node) => labels.every((label) => node.textContent.includes(pmText(label, {}, language))));
+        assert.ok(guide, `${area}: missing visible guide labels`);
+        assert.equal(guide.open, demo, `${area}: open must follow capabilities.demo.active`);
+        assert.equal(guide.querySelector('summary')?.textContent, pmText(GUIDE_SUMMARY, {}, language));
+        for (const label of labels) {
+          const text = guide.textContent;
+          const translatedLabel = pmText(label, {}, language), sentence = pmText(entries[area][label], {}, language);
+          assert.ok(text.indexOf(sentence, text.indexOf(translatedLabel) + translatedLabel.length) >= 0, `${area}/${label}: sentence must follow its label`);
+        }
+      }
+    });
+  }
+});
+
+async function loadI18n({ href, stored = null, storageDisabled = false }) {
+  const source = await readFile(new URL('../src/symphony/web/static/i18n.js', import.meta.url), 'utf8');
+  const values = new Map(stored === null ? [] : [['symphony.lang', stored]]), writes = [], replacements = [];
+  const location = new URL(href);
+  const history = { state: { retained: true }, replaceState: (state, title, url) => { replacements.push(String(url)); location.href = new URL(url, location).href; } };
+  const document = { documentElement: { lang: '' }, querySelectorAll: () => [] };
+  const window = { location, history };
+  const localStorage = {
+    getItem: (key) => { if (storageDisabled) throw new Error('Storage disabled'); return values.get(key) ?? null; },
+    setItem: (key, value) => { if (storageDisabled) throw new Error('Storage disabled'); writes.push([key, String(value)]); values.set(key, String(value)); },
+  };
+  vm.runInNewContext(source, { window, document, location, history, localStorage, URL, URLSearchParams }, { filename: 'i18n.js' });
+  return { i18n: window.i18n, document, values, writes, replacements, location };
+}
+
+test('R10 ?lang=ko overrides storage, persists like the switch, and is consumed before reload', async () => {
+  for (const stored of [null, 'en', 'ko']) {
+    const page = await loadI18n({ href: 'http://127.0.0.1/?keep=1&lang=ko&pmTab=design#/artifacts', stored });
+    assert.equal(page.i18n.lang, 'ko');
+    assert.equal(page.document.documentElement.lang, 'ko');
+    assert.equal(page.values.get('symphony.lang'), 'ko');
+    assert.equal(page.location.searchParams.has('lang'), false);
+    assert.equal(page.location.searchParams.get('keep'), '1');
+    assert.equal(page.location.searchParams.get('pmTab'), 'design');
+    assert.equal(page.location.hash, '#/artifacts');
+    assert.ok(page.replacements.length > 0, 'Consume lang through history.replaceState');
+    let changed;
+    page.i18n.onChange((language) => { changed = language; });
+    page.i18n.setLang('en');
+    assert.equal(changed, 'en');
+    assert.deepEqual(page.writes.at(-1), ['symphony.lang', 'en']);
+    const reload = await loadI18n({ href: page.location.href, stored: page.values.get('symphony.lang') });
+    assert.equal(reload.i18n.lang, 'en', 'Reload must preserve a later manual language choice (P3)');
+  }
+});
+
+test('R10 query values are exactly en or ko; xx and ko-KR keep stored or default language', async () => {
+  for (const value of ['xx', 'ko-KR', 'KO']) for (const stored of [null, 'en', 'ko']) {
+    const page = await loadI18n({ href: `http://127.0.0.1/?lang=${value}#/artifacts`, stored });
+    assert.equal(page.i18n.lang, stored || 'en', `${value}, stored=${stored}`);
+    assert.equal(page.document.documentElement.lang, stored || 'en');
+    assert.deepEqual(page.writes, [], 'An invalid URL value must not change storage');
+  }
+  const english = await loadI18n({ href: 'http://127.0.0.1/?lang=en#/artifacts', stored: 'ko' });
+  assert.equal(english.i18n.lang, 'en');
+  assert.equal(english.values.get('symphony.lang'), 'en');
+  assert.equal(english.location.searchParams.has('lang'), false);
+});
+
+test('R10 URL language still applies and is consumed when localStorage is unavailable', async () => {
+  const page = await loadI18n({ href: 'http://127.0.0.1/?lang=ko&keep=1#/artifacts', storageDisabled: true });
+  assert.equal(page.i18n.lang, 'ko');
+  assert.equal(page.document.documentElement.lang, 'ko');
+  assert.equal(page.location.searchParams.has('lang'), false);
+  assert.equal(page.location.searchParams.get('keep'), '1');
+});
+
+test('R15 Node titles follow P6, gate approval/archive, and leave Validate enabled', async (t) => {
+  for (const gated of [false, true]) for (const node of [undefined, { available: true, reason: null }, { available: false, reason: NODE_REASON }]) {
+    await t.test(`gated=${gated}, node=${node?.available ?? 'absent'}`, async (context) => {
+      const root = await mountedPm(context, { tab: 'plan', gated, hostTools: node ? { node } : {} });
+      const controls = [['Approve revision', 'authoring'], ['Preview archive', 'handoff'], ['Validate', null]];
+      const expected = controls.map(([label, capability]) => {
+        if (!capability) return { label, disabled: false, title: node?.available === false ? NODE_REASON : '' };
+        const oldTitle = gated ? `${capability} requires G0 and G1.` : '';
+        const title = node?.available === false ? [oldTitle, NODE_REASON].filter(Boolean).join(' ') : oldTitle;
+        return { label, disabled: gated || node?.available === false, title };
+      });
+      const actual = controls.map(([label]) => { const button = findButton(root, label); return { label, disabled: button.disabled, title: button.title }; });
+      assert.deepEqual({ controls: actual, toolReasonShown: Boolean(root.querySelector('.pm-status-card')?.textContent.includes(NODE_REASON)) },
+        { controls: expected, toolReasonShown: node?.available === false });
+    });
+  }
+  await t.test('archived controls keep only the read-only title', async (context) => {
+    const root = await mountedPm(context, { tab: 'plan', archived: true, gated: true, hostTools: { node: { available: false, reason: NODE_REASON } } });
+    for (const label of ['Approve revision', 'Preview archive', 'Validate']) {
+      assert.equal(findButton(root, label).title, ARCHIVED_REASON, label);
+      assert.equal(findButton(root, label).disabled, true, label);
+    }
+  });
+});
+
+test('R15 unavailable Codex folds into assistance and lists version/login reasons up front', async (t) => {
+  for (const gated of [false, true]) for (const codex of [undefined, { available: true, reason: null }, { available: false, reason: CODEX_REASON }]) {
+    await t.test(`gated=${gated}, codex=${codex?.available ?? 'absent'}`, async (context) => {
+      const root = await mountedPm(context, { gated, hostTools: codex ? { codex } : {} });
+      const button = findButton(root, 'Planning assistant');
+      assert.equal(button.disabled, gated || codex?.available === false);
+      if (codex?.available === false) {
+        assert.ok(button.title.includes(CODEX_REASON), button.title);
+        assert.ok(root.querySelector('.pm-status-card')?.textContent.includes(CODEX_REASON), 'Status card lists the unavailable Codex reason');
+        if (gated) assert.ok(button.title.includes('assistance requires G0 and G1.'));
+      } else assert.equal(button.title, gated ? 'assistance requires G0 and G1.' : '');
+    });
+  }
+});
+
+test('R15 demo status and assistance reason render in en/ko in place of development text', async (t) => {
+  for (const language of ['en', 'ko']) await t.test(language, async (context) => {
+    const root = await mountedPm(context, { demo: true, language, development: true, demoAssistance: true });
+    const card = root.querySelector('.pm-status-card');
+    assert.ok(card);
+    assert.equal(card.querySelector('strong').textContent, pmText(DEMO_HEADING, {}, language));
+    assert.ok(card.textContent.includes(pmText(DEMO_SENTENCE, {}, language)));
+    assert.ok(card.textContent.includes(pmText(DEMO_ASSISTANCE_REASON, {}, language)));
+    assert.ok(!card.textContent.includes(DEVELOPMENT_SENTENCE));
+    assert.ok(!card.textContent.includes('Development verification context'));
+    assertKorean([DEMO_HEADING, DEMO_SENTENCE, DEMO_ASSISTANCE_REASON]);
+    const button = findButton(root, pmText('Planning assistant', {}, language));
+    assert.equal(button.disabled, true);
+    assert.ok(button.title.includes(DEMO_ASSISTANCE_REASON) || button.title.includes(pmText(DEMO_ASSISTANCE_REASON, {}, language)));
+  });
+  await t.test('demo status is visible even without unavailable actions or development flags', async (context) => {
+    const root = await mountedPm(context, { demo: true });
+    const card = root.querySelector('.pm-status-card');
+    assert.ok(card, 'An active demo always identifies itself');
+    assert.equal(card.querySelector('strong').textContent, DEMO_HEADING);
+    assert.ok(card.textContent.includes(DEMO_SENTENCE));
+  });
+  await t.test('ordinary development status is preserved', async (context) => {
+    const root = await mountedPm(context, { development: true });
+    const card = root.querySelector('.pm-status-card');
+    assert.equal(card.querySelector('strong').textContent, 'Development verification context');
+    assert.ok(card.textContent.includes(DEVELOPMENT_SENTENCE));
+    assert.ok(!card.textContent.includes(DEMO_SENTENCE));
+  });
 });

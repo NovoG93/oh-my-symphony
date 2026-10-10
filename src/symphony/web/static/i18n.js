@@ -1284,7 +1284,24 @@
     return normalize(stored) || DEFAULT_LANG;
   }
 
-  let current = detectInitialLang();
+  // A link may carry `?lang=en|ko` (exact values only). It is stored like a
+  // switch choice and then removed from the address, so a later manual switch
+  // still wins on reload. Any other value is ignored.
+  function consumeUrlLang() {
+    const url = new URL(window.location.href);
+    const code = url.searchParams.get('lang');
+    if (!LANGUAGES.some((item) => item.code === code)) return null;
+    try {
+      localStorage.setItem(STORAGE_KEY, code);
+    } catch (_err) {
+      /* storage disabled — the language applies to this page only */
+    }
+    url.searchParams.delete('lang');
+    window.history.replaceState(window.history.state, '', url.href);
+    return code;
+  }
+
+  let current = consumeUrlLang() || detectInitialLang();
   const listeners = new Set();
 
   function interpolate(template, params) {
