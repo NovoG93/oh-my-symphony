@@ -22,6 +22,7 @@ from symphony.orchestrator.run_registry import RunRegistry
 import symphony.pm.routes as routes_module
 from symphony.server import build_app
 from symphony.workflow import WorkflowState
+from symphony.pm.documents import PmDocumentRepository
 from symphony.pm.models import PmRequestContext
 from symphony.pm.planning import PlanningProposal
 from symphony.pm.routes import (
@@ -249,10 +250,21 @@ async def test_xlsx_export_and_import_preview_keep_state_route_responsive(
     0.25 s: /api/v1/state is polled while the export and the import preview
     run. With the change read on the loop the worst poll took 0.12-0.15 s;
     off the loop it takes 0.03-0.05 s, which is GIL handoff while workbook
-    threads run.
+    threads run. Wall-clock margins that narrow flap under host load, so the
+    cause is asserted directly (no change read on the loop thread) and the
+    latency only against the release budget.
     """
     # Keep the developer's host project registry out of the measured path.
     monkeypatch.setenv("SYMPHONY_PROJECTS_FILE", str(tmp_path / "projects.json"))
+    loop_thread = threading.get_ident()
+    read_threads: list[int] = []
+    original_get_change = PmDocumentRepository.get_change
+
+    def recording_get_change(self, *args, **kwargs):
+        read_threads.append(threading.get_ident())
+        return original_get_change(self, *args, **kwargs)
+
+    monkeypatch.setattr(PmDocumentRepository, "get_change", recording_get_change)
     client, planning = await _authoring_client(tmp_path)
     try:
         created = await client.post("/api/v1/pm/changes", json={
@@ -276,6 +288,7 @@ async def test_xlsx_export_and_import_preview_keep_state_route_responsive(
                   }} for index in range(1000)]}},
         )
         assert seeded.status == 200, await seeded.text()
+        read_threads.clear()
 
         async def worst_state_latency(request) -> tuple[float, Any]:
             # Poll from a separate thread like the benchmark's external
@@ -322,8 +335,10 @@ async def test_xlsx_export_and_import_preview_keep_state_route_responsive(
             }},
         ))
         assert previewed.status == 200, await previewed.text()
-        assert export_latency < 0.1, f"export stalled /api/v1/state for {export_latency:.3f}s"
-        assert import_latency < 0.1, f"import preview stalled /api/v1/state for {import_latency:.3f}s"
+        assert len(read_threads) >= 2, "export and import preview must read the change"
+        assert loop_thread not in read_threads, "a 1000-task change was read on the event loop"
+        assert export_latency < 0.25, f"export stalled /api/v1/state for {export_latency:.3f}s"
+        assert import_latency < 0.25, f"import preview stalled /api/v1/state for {import_latency:.3f}s"
     finally:
         await client.close()
 
