@@ -578,6 +578,154 @@ def await_worker_release(
     )
 
 
+WBS_TREE_PRESS_BUDGET_SECONDS = 0.5
+WBS_TREE_FILTER = "new "
+_WBS_TREE_STATE = """([groupId, childId]) => {
+  const rows = [...document.querySelectorAll('.pm-tabulator .tabulator-row')];
+  const idOf = (row) => row.querySelector('.tabulator-cell[tabulator-field="task_id"]')?.textContent.trim();
+  const group = rows.find((row) => idOf(row) === groupId);
+  const control = group?.querySelector('.tabulator-data-tree-control');
+  const active = document.activeElement;
+  return {
+    rows: rows.length,
+    child_shown: rows.some((row) => idOf(row) === childId),
+    role: control?.getAttribute('role') ?? null,
+    label: control?.getAttribute('aria-label') ?? null,
+    expanded: control?.getAttribute('aria-expanded') ?? null,
+    focus: active === control ? 'control' : active === group ? 'group-row'
+      : active?.closest?.('.tabulator-row') ? `row:${idOf(active.closest('.tabulator-row'))}` : active?.tagName,
+    drawers: document.querySelectorAll('.pm-task-drawer').length,
+    drawer_names: [...document.querySelectorAll('.pm-task-drawer')].map((item) => item.getAttribute('aria-label')),
+  };
+}"""
+
+
+def _wbs_row(page, task_id: str):
+    return page.locator(".pm-tabulator .tabulator-row").filter(
+        has=page.locator(
+            '.tabulator-cell[tabulator-field="task_id"]',
+            has_text=re.compile(rf"^{re.escape(task_id)}$"),
+        )
+    )
+
+
+def _wbs_command(page, name: str) -> str:
+    with page.expect_response(
+        lambda response: response.url.endswith("/wbs")
+        and response.request.method == "PATCH"
+    ) as info:
+        button = page.get_by_role("button", name=name, exact=True)
+        button.focus()
+        page.keyboard.press("Enter")
+    assert info.value.status == 200, info.value.text()
+    return info.value.json()["impacted_ids"][0] if name.startswith("Add") else ""
+
+
+def _wbs_open_and_close_drawer(page, task_id: str) -> None:
+    row = _wbs_row(page, task_id)
+    row.focus()
+    page.keyboard.press("Enter")
+    page.get_by_role("dialog", name=f"Task {task_id}").wait_for()
+    page.keyboard.press("Escape")
+    page.get_by_role("dialog", name=f"Task {task_id}").wait_for(state="hidden")
+
+
+def prove_wbs_tree_keyboard(
+    page, group_id: str, child_id: str, label: str = "Collapse or expand"
+) -> dict[str, object]:
+    """Assert WBS tree keyboard handling on a rendered parent/child pair.
+
+    Repeated Enter/Space on the tree control must alternate collapse/expand
+    with stable row counts, stay fast, keep focus on the rebuilt control, and
+    never open a drawer; Enter on a row opens exactly one drawer even after
+    pointer toggles (R32-01: listeners used to accumulate per re-format).
+    """
+
+    def state() -> dict:
+        return page.evaluate(_WBS_TREE_STATE, [group_id, child_id])
+
+    def press(key: str) -> tuple[dict, float]:
+        started = time.monotonic()
+        page.keyboard.press(key)
+        page.evaluate("() => new Promise((resolve) => requestAnimationFrame(() => resolve()))")
+        return state(), time.monotonic() - started
+
+    def check(observed: dict, *, expanded: bool, focus: str, step: str) -> None:
+        expected = {
+            "rows": expanded_rows if expanded else collapsed_rows,
+            "child_shown": expanded, "role": "button", "label": label,
+            "expanded": str(expanded).lower(), "focus": focus, "drawers": 0,
+        }
+        actual = {key: observed[key] for key in expected}
+        if collapsed_rows is None and not expanded:
+            actual.pop("rows")
+            expected.pop("rows")
+        assert actual == expected, f"WBS tree {step}: expected {expected}, got {observed}"
+
+    _wbs_row(page, child_id).wait_for()
+    initial = state()
+    expanded_rows, collapsed_rows = initial["rows"], None
+    check(initial, expanded=True, focus=initial["focus"], step="initial render")
+    _wbs_row(page, group_id).locator(".tabulator-data-tree-control").focus()
+    presses: list[dict[str, object]] = []
+    expanded = True
+    for key in ("Enter", "Enter", "Space", "Space", "Enter", "Space", "Space", "Enter"):
+        observed, seconds = press(key)
+        expanded = not expanded
+        check(observed, expanded=expanded, focus="control", step=f"control {key} #{len(presses) + 1}")
+        if not expanded:
+            collapsed_rows = collapsed_rows if collapsed_rows is not None else observed["rows"]
+        assert collapsed_rows is not None and collapsed_rows < expanded_rows
+        assert seconds < WBS_TREE_PRESS_BUDGET_SECONDS, f"WBS tree {key} press took {seconds:.3f}s"
+        presses.append({"key": key, "expanded": expanded, "rows": observed["rows"], "seconds": round(seconds, 3)})
+    _wbs_row(page, group_id).focus()
+    for key, expanded in (("ArrowLeft", False), ("ArrowLeft", False), ("ArrowRight", True), ("ArrowRight", True)):
+        observed, seconds = press(key)
+        check(observed, expanded=expanded, focus="group-row", step=f"parent row {key}")
+        assert seconds < WBS_TREE_PRESS_BUDGET_SECONDS, f"WBS tree {key} press took {seconds:.3f}s"
+        presses.append({"key": key, "expanded": expanded, "rows": observed["rows"], "seconds": round(seconds, 3)})
+    observed, _ = press("ArrowDown")
+    assert observed["focus"] == f"row:{child_id}", observed
+    observed, _ = press("ArrowUp")
+    assert observed["focus"] == "group-row", observed
+    for _ in range(4):
+        _wbs_row(page, group_id).locator(".tabulator-data-tree-control").click()
+    assert state()["child_shown"] is True
+    row_enter: dict[str, object] = {}
+    for task_id in (group_id, child_id):
+        _wbs_row(page, task_id).focus()
+        observed, _ = press("Enter")
+        assert observed["drawers"] == 1 and observed["drawer_names"] == [f"Task {task_id}"], observed
+        page.keyboard.press("Escape")
+        page.get_by_role("dialog", name=f"Task {task_id}").wait_for(state="hidden")
+        row_enter[task_id] = observed["drawers"]
+    return {
+        "group_id": group_id, "child_id": child_id,
+        "expanded_rows": expanded_rows, "collapsed_rows": collapsed_rows,
+        "control": {key: initial[key] for key in ("role", "label", "expanded")},
+        "presses": presses, "row_enter_drawers": row_enter,
+        "press_budget_seconds": WBS_TREE_PRESS_BUDGET_SECONDS,
+    }
+
+
+def exercise_wbs_tree_keyboard(page) -> dict[str, object]:
+    """Create a disposable group/child in the Plan view, prove tree keys, remove both."""
+    page.get_by_role("button", name="Plan", exact=True).click()
+    group_id = _wbs_command(page, "Add group")
+    search = page.get_by_label("Filter tasks")
+    search.fill(WBS_TREE_FILTER)
+    _wbs_open_and_close_drawer(page, group_id)
+    child_id = _wbs_command(page, "Add child")
+    proof = prove_wbs_tree_keyboard(page, group_id, child_id)
+    for task_id in (child_id, group_id):
+        _wbs_open_and_close_drawer(page, task_id)
+        page.once("dialog", lambda dialog: dialog.accept())
+        _wbs_command(page, "Delete")
+        _wbs_row(page, task_id).wait_for(state="detached")
+    search.fill("")
+    return proof
+
+
 class BrowserProof:
     """Drive the installed static UI while the disposable server is live."""
 
@@ -596,6 +744,7 @@ class BrowserProof:
         self.actions: list[str] = ["opened_registered_project"]
         self.task_id = ""
         self.requirements_delta: dict[str, object] = {}
+        self.wbs_tree_keyboard: dict[str, object] = {}
 
     def review_and_edit(self) -> None:
         page = self.page
@@ -749,6 +898,10 @@ class BrowserProof:
         assert group_delete_info.value.status == 200, group_delete_info.value.text()
         page.get_by_text(group_id, exact=True).first.wait_for(state="hidden")
         self.actions.append("created_renamed_reordered_deleted_and_restored_server_work_ids")
+
+    def exercise_wbs_tree_keyboard(self) -> None:
+        self.wbs_tree_keyboard = exercise_wbs_tree_keyboard(self.page)
+        self.actions.append("toggled_wbs_tree_by_keyboard")
 
     def export_workbook(self) -> Path:
         with self.page.expect_download() as download_info:
@@ -1000,6 +1153,7 @@ class BrowserProof:
             "driver": "playwright",
             "actions": self.actions,
             "requirements_delta": self.requirements_delta,
+            "wbs_tree_keyboard": self.wbs_tree_keyboard,
             "screenshots": [
                 str(self.evidence_root / "review.png"),
                 str(self.evidence_root / "archive-preview.png"),
@@ -1269,6 +1423,7 @@ The existing system SHALL retain accepted behavior and explicit review boundarie
                 "heading", name="Artifacts", exact=True
             ).wait_for()
             browser_proof.exercise_work_item_identity()
+            browser_proof.exercise_wbs_tree_keyboard()
             browser_proof.review_and_edit()
             current = api.call("GET", f"/changes/{change}?project_id={project}")
             reviewed_workbook = browser_proof.export_workbook()

@@ -94,32 +94,19 @@ async function enhanceWithTabulator(root, tasks, ui, semanticIndex, onNavigateRe
   root.querySelector('.pm-table-scroll').replaceChildren(holder);
   const children = byParent(tasks);
   const nest = (parent = '') => (children.get(parent) || []).map((task) => ({ ...task, _children: nest(task.task_id) }));
+  const rowsByElement = new WeakMap();
   const table = new Tabulator(holder, {
     data: nest(), dataTree: true, dataTreeStartExpanded: true,
     index: 'task_id', layout: 'fitColumns', height: '520px',
     movableRows: false, clipboard: false, selectableRows: 1,
+    // Tabulator re-runs rowFormatter on the same row element after every tree
+    // toggle, so it must stay idempotent: record the row and decorate its tree
+    // control, but never add listeners here.
     rowFormatter: (row) => {
       const element = row.getElement(); element.tabIndex = 0;
-      const control = element.querySelector('.tabulator-data-tree-control');
-      if (control) { control.setAttribute('role', 'button'); control.setAttribute('aria-label', L('Collapse or expand')); control.setAttribute('aria-expanded', String(row.isTreeExpanded())); }
-      element.addEventListener('keydown', (event) => {
-        // Tree keys: Enter/Space on the collapse control toggles it; Left/Right
-        // on a parent row collapse/expand it. Neither opens the task drawer.
-        const hasChildren = row.getTreeChildren().length > 0;
-        const onControl = Boolean(event.target.closest?.('.tabulator-data-tree-control'));
-        const tree = onControl && (event.key === 'Enter' || event.key === ' ') ? 'toggle'
-          : hasChildren && event.key === 'ArrowLeft' ? 'collapse'
-            : hasChildren && event.key === 'ArrowRight' ? 'expand' : '';
-        if (tree) {
-          event.preventDefault(); event.stopPropagation();
-          if (tree === 'toggle') row.treeToggle(); else if (tree === 'collapse') row.treeCollapse(); else row.treeExpand();
-          element.querySelector('.tabulator-data-tree-control')?.setAttribute('aria-expanded', String(row.isTreeExpanded()));
-          return;
-        }
-        if (event.key === 'Enter') { event.preventDefault(); onSelect(row.getData().task_id); openTaskDrawer(ui, row.getData(), tasks, semanticIndex, onNavigateReference, onSetField, readOnlyReason); }
-        if (event.key === 'ArrowDown') { event.preventDefault(); element.nextElementSibling?.focus(); }
-        if (event.key === 'ArrowUp') { event.preventDefault(); element.previousElementSibling?.focus(); }
-      });
+      rowsByElement.set(element, row);
+      // The tree module inserts the control only after rowFormatter returns.
+      queueMicrotask(() => describeTreeControl(row));
     },
     columns: [
       { title: L('ID'), field: 'task_id', width: 150 },
@@ -130,6 +117,30 @@ async function enhanceWithTabulator(root, tasks, ui, semanticIndex, onNavigateRe
       { title: L('Estimate'), field: 'estimate', width: 100 },
     ],
   });
+  // One delegated listener per table. Tree keys: Enter/Space on the collapse
+  // control toggles it; Left/Right on a parent row collapse/expand it. Neither
+  // opens the task drawer. A toggle rebuilds the row's cells, so focus returns
+  // to the rebuilt control (or the row) instead of falling to <body>.
+  holder.addEventListener('keydown', (event) => {
+    const element = event.target.closest?.('.tabulator-row');
+    const row = element && rowsByElement.get(element);
+    if (!row) return;
+    const onControl = Boolean(event.target.closest('.tabulator-data-tree-control'));
+    const hasChildren = row.getTreeChildren().length > 0;
+    const tree = onControl && (event.key === 'Enter' || event.key === ' ') ? 'toggle'
+      : hasChildren && event.key === 'ArrowLeft' ? 'collapse'
+        : hasChildren && event.key === 'ArrowRight' ? 'expand' : '';
+    if (tree) {
+      event.preventDefault(); event.stopPropagation();
+      if (tree === 'toggle') row.treeToggle(); else if (tree === 'collapse') row.treeCollapse(); else row.treeExpand();
+      const control = describeTreeControl(row);
+      (onControl && control ? control : row.getElement()).focus();
+      return;
+    }
+    if (event.key === 'Enter') { event.preventDefault(); onSelect(row.getData().task_id); openTaskDrawer(ui, row.getData(), tasks, semanticIndex, onNavigateReference, onSetField, readOnlyReason); }
+    if (event.key === 'ArrowDown') { event.preventDefault(); element.nextElementSibling?.focus(); }
+    if (event.key === 'ArrowUp') { event.preventDefault(); element.previousElementSibling?.focus(); }
+  });
   table.on('rowClick', (_event, row) => { onSelect(row.getData().task_id); openTaskDrawer(ui, row.getData(), tasks, semanticIndex, onNavigateReference, onSetField, readOnlyReason); });
   const matches = (data, value) => `${data.task_id} ${data.title} ${data.kind}`.toLowerCase().includes(value) || (data._children || []).some((child) => matches(child, value));
   if (filter) table.setFilter((data) => matches(data, filter.toLowerCase()));
@@ -139,6 +150,12 @@ async function enhanceWithTabulator(root, tasks, ui, semanticIndex, onNavigateRe
     if (text && text.includes('\t')) { event.preventDefault(); if (readOnlyReason) ui.announce(readOnlyReason); else await onPaste(text); }
   }, true);
   activeTable = table;
+}
+
+function describeTreeControl(row) {
+  const control = row.getElement().querySelector('.tabulator-data-tree-control');
+  if (control) { control.setAttribute('role', 'button'); control.setAttribute('aria-label', L('Collapse or expand')); control.setAttribute('aria-expanded', String(row.isTreeExpanded())); }
+  return control;
 }
 
 function ensureStyles(href) {

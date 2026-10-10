@@ -292,6 +292,8 @@ def test_clean_wheel_review_handoff_accept_archive_journey(tmp_path: Path) -> No
     assert receipt["assistance"]["cancelled"] is True
     assert "created_change_from_idea_in_ui" in receipt["browser"]["actions"]
     assert "created_renamed_reordered_deleted_and_restored_server_work_ids" in receipt["browser"]["actions"]
+    assert "toggled_wbs_tree_by_keyboard" in receipt["browser"]["actions"]
+    assert len(receipt["browser"]["wbs_tree_keyboard"]["presses"]) == 12
     assert "opened_real_worker_artifact_in_ui" in receipt["browser"]["actions"]
     assert "confirmed_native_handoff_in_ui" in receipt["browser"]["actions"]
     assert "accepted_verified_revision_in_ui" in receipt["browser"]["actions"]
