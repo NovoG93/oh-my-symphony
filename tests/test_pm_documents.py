@@ -330,6 +330,98 @@ def test_lock_holding_reader_recovers_without_self_deadlock(
     assert any(item.title == "Live frame" for item in frames)
 
 
+def test_exchange_snapshot_read_does_not_observe_a_half_applied_write(
+    tmp_path: Path,
+) -> None:
+    # Export and import preview read the change on a worker thread; a loop
+    # writer holding the change lock mid-commit must not leak a mixture of
+    # old and new documents (or documents that disagree with the revision)
+    # into the trusted export base.
+    import threading
+
+    from tests.test_pm_approval import _populate
+
+    from symphony.pm.documents import _change_lock, _revision_hash
+    from symphony.pm.routes import _read_change_snapshot
+
+    repo, change_id, workspace = _repository(tmp_path)
+    _populate(repo, change_id, workspace, "snapshot")
+    root = (workspace / "openspec" / "changes" / "snapshot").resolve()
+    proposal = (root / "proposal.md").read_text(encoding="utf-8") + "\nWriter note.\n"
+    design = (root / "design.md").read_text(encoding="utf-8") + "\nWriter note.\n"
+    outcome: dict[str, object] = {}
+
+    def read() -> None:
+        try:
+            outcome["change"] = _read_change_snapshot(
+                repo, PmRequestContext("p1", change_id), "owner"
+            )
+        except BaseException as exc:  # surfaced by the assertions below
+            outcome["error"] = exc
+
+    reader = threading.Thread(target=read, daemon=True)
+    with _change_lock(root):
+        (root / "proposal.md").write_text(proposal, encoding="utf-8")
+        reader.start()
+        # Bounded window: an unlocked reader finishes well inside it and sees
+        # the new proposal beside the old design.
+        reader.join(timeout=0.5)
+        assert reader.is_alive(), outcome
+        (root / "design.md").write_text(design, encoding="utf-8")
+    reader.join(timeout=30)
+    assert not reader.is_alive()
+    assert "error" not in outcome, outcome
+    change = outcome["change"]
+    sources = {item.document_id: item.source for item in change.documents}  # type: ignore[attr-defined]
+    assert sources["proposal"] == proposal
+    assert sources["design"] == design
+    assert change.revision == _revision_hash(root)  # type: ignore[attr-defined]
+
+
+@pytest.mark.skipif(__import__("os").name == "nt", reason="msvcrt has no shared lock")
+def test_exchange_snapshot_readers_share_the_change_lock(tmp_path: Path) -> None:
+    import threading
+
+    from tests.test_pm_approval import _populate
+
+    from symphony.pm.documents import _change_lock
+    from symphony.pm.routes import _read_change_snapshot
+
+    repo, change_id, workspace = _repository(tmp_path)
+    _populate(repo, change_id, workspace, "shared")
+    root = (workspace / "openspec" / "changes" / "shared").resolve()
+    outcome: dict[str, object] = {}
+
+    def read() -> None:
+        try:
+            outcome["change"] = _read_change_snapshot(
+                repo, PmRequestContext("p1", change_id), "owner"
+            )
+        except BaseException as exc:
+            outcome["error"] = exc
+
+    reader = threading.Thread(target=read, daemon=True)
+    with _change_lock(root, shared=True):
+        reader.start()
+        reader.join(timeout=30)
+        assert not reader.is_alive(), "a concurrent reader serialized behind a shared lock"
+    assert "error" not in outcome, outcome
+
+
+def test_change_lock_refuses_to_upgrade_a_held_shared_lock(tmp_path: Path) -> None:
+    from symphony.pm.documents import _change_lock
+
+    with _change_lock(tmp_path, shared=True):
+        with _change_lock(tmp_path, shared=True):
+            pass
+        with pytest.raises(RuntimeError):
+            with _change_lock(tmp_path):
+                pass
+    with _change_lock(tmp_path):
+        with _change_lock(tmp_path, shared=True):
+            pass
+
+
 def test_workspace_claim_rejects_protected_checkout(tmp_path: Path):
     project = tmp_path / "project"
     project.mkdir()

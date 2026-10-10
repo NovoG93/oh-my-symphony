@@ -430,10 +430,7 @@ def register_pm_routes(app: web.Application, ctx: Any, orchestrator: Any) -> Non
         request_owner = owner(request)
 
         def load_change() -> ChangeView:
-            change = _with_thread_repository(
-                pmapp.repository,
-                lambda repository: repository.get_change(pctx, owner=request_owner),
-            )
+            change = _read_change_snapshot(pmapp.repository, pctx, request_owner)
             if format_name == "xlsx":
                 pmapp._require("exchange")
             return change
@@ -523,10 +520,7 @@ def register_pm_routes(app: web.Application, ctx: Any, orchestrator: Any) -> Non
             if not snapshot_path.exists():
                 raise PmError("trusted_base_missing", "trusted export snapshot is unavailable", status=409)
             trusted = _change_from_json(json.loads(snapshot_path.read_text(encoding="utf-8")))
-            current = _with_thread_repository(
-                pmapp.repository,
-                lambda repository: repository.get_change(pctx, owner=request_owner),
-            )
+            current = _read_change_snapshot(pmapp.repository, pctx, request_owner)
             return trusted, current
 
         trusted, current = await asyncio.to_thread(load_bases)
@@ -1321,6 +1315,22 @@ def _with_thread_repository(
         ))
     finally:
         thread_registry.close()
+
+
+def _read_change_snapshot(
+    repository: PmDocumentRepository, pctx: PmRequestContext, request_owner: str,
+) -> ChangeView:
+    """Read the change an export or import preview is built from, off the loop.
+
+    The read takes the change lock (shared) so a loop-thread writer mid-commit
+    cannot hand a torn snapshot to the export's trusted base.
+    """
+    return _with_thread_repository(
+        repository,
+        lambda thread_repository: thread_repository.get_change(
+            pctx, owner=request_owner, locked=True
+        ),
+    )
 
 
 def _json(value: Any) -> Any:

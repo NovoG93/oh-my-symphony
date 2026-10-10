@@ -14,7 +14,7 @@ from dataclasses import asdict
 from datetime import date
 from pathlib import Path
 from typing import Any, Iterable, cast
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 
 import yaml
 
@@ -276,23 +276,34 @@ class PmDocumentRepository:
         return tuple(views)
 
     def get_change(
-        self, ctx: PmRequestContext, *, owner: str | None = None
+        self, ctx: PmRequestContext, *, owner: str | None = None,
+        locked: bool = False,
     ) -> ChangeView:
+        """Read the change; ``locked`` reads its files under a shared lock.
+
+        Callers off the event-loop thread pass ``locked`` so a writer's
+        multi-file commit cannot interleave and tear the snapshot.
+        """
         self._check_project(ctx)
         claim = self._read_claim(ctx.change_id, owner=owner)
         archived = claim.state == "RELEASED"
         root, identity = _resolve_change_root(
             claim.workspace_path, ctx.change_id, archived=archived
         )
-        docs = tuple(self._documents(root, editable=not archived))
+        # Archived history is immutable; locking it would write a lock file.
+        locked = locked and not archived
+        with _change_lock(root, shared=True) if locked else nullcontext():
+            if locked:
+                identity = _load_identity(root)
+            docs = tuple(self._documents(root, editable=not archived))
+            manifest = _managed_manifest(root)
+            scope_hash = _scope_hash(
+                root, claim.workspace_path, managed_manifest=manifest
+            )
         report, semantic, idea = self._validate_loaded(
             docs, identity, workspace=claim.workspace_path
         )
-        manifest = _managed_manifest(root)
         revision = _revision_from_manifest(manifest)
-        scope_hash = _scope_hash(
-            root, claim.workspace_path, managed_manifest=manifest
-        )
         findings = list(report.findings)
         state = "Archived" if archived else (
             "Validated" if not any(
@@ -1307,14 +1318,18 @@ def _resolve_change_root(
     resolved, identity = matches[0]
     if not archived:
         _recover_change_transactions(resolved)
-        identity_path = resolved / "symphony.yaml"
-        try:
-            identity = load_unique_yaml(identity_path.read_text(encoding="utf-8")) or {}
-        except yaml.YAMLError as exc:
-            raise PmError(
-                "unsupported_format", "change identity is malformed", status=409
-            ) from exc
+        identity = _load_identity(resolved)
     return resolved, dict(identity)
+
+
+def _load_identity(root: Path) -> dict[str, Any]:
+    try:
+        identity = load_unique_yaml((root / "symphony.yaml").read_text(encoding="utf-8")) or {}
+    except yaml.YAMLError as exc:
+        raise PmError(
+            "unsupported_format", "change identity is malformed", status=409
+        ) from exc
+    return dict(identity)
 
 
 def _document_path(root: Path, document_id: str) -> Path:
@@ -2118,12 +2133,20 @@ _HELD_CHANGE_LOCKS = threading.local()
 
 
 @contextmanager
-def _change_lock(root: Path):
-    held: set[Path] = _HELD_CHANGE_LOCKS.__dict__.setdefault("roots", set())
+def _change_lock(root: Path, *, shared: bool = False):
+    """Hold the change's file lock: exclusive for writers, shared for readers.
+
+    Shared readers (exchange snapshots read off the event loop) do not block
+    each other, only writers. msvcrt has no shared mode, so Windows readers
+    take the lock exclusively.
+    """
+    held: dict[Path, bool] = _HELD_CHANGE_LOCKS.__dict__.setdefault("modes", {})
     key = root.resolve()
     if key in held:
         # Same-thread re-entry (approval reads the change it has locked): a
         # second lock on a new file description would wait on this thread.
+        if held[key] and not shared:
+            raise RuntimeError("a shared change lock cannot be upgraded in place")
         yield
         return
     lock_path = root / ".symphony-pm.lock"
@@ -2134,22 +2157,22 @@ def _change_lock(root: Path):
 
             handle.seek(0)
             msvcrt.locking(handle.fileno(), msvcrt.LK_LOCK, 1)
-            held.add(key)
+            held[key] = shared
             try:
                 yield
             finally:
-                held.discard(key)
+                del held[key]
                 handle.seek(0)
                 msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
         else:
             import fcntl
 
-            fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
-            held.add(key)
+            fcntl.flock(handle.fileno(), fcntl.LOCK_SH if shared else fcntl.LOCK_EX)
+            held[key] = shared
             try:
                 yield
             finally:
-                held.discard(key)
+                del held[key]
                 fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
 
 
