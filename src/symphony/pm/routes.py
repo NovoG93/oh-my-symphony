@@ -21,6 +21,7 @@ from typing import Any, Callable, TypeVar
 
 from aiohttp import web
 
+from . import host_tools
 from .application import PmApplication
 from .approval import PmApprovalService
 from .documents import PmDocumentRepository
@@ -41,6 +42,7 @@ _T = TypeVar("_T")
 PM_DEVELOPMENT_VERIFICATION_KEY: web.AppKey[bool] = web.AppKey(
     "symphony.pm.development_verification", bool
 )
+PM_DEMO_KEY: web.AppKey[Path] = web.AppKey("symphony.pm.demo", Path)
 
 
 def register_pm_routes(app: web.Application, ctx: Any, orchestrator: Any) -> None:
@@ -113,6 +115,7 @@ def register_pm_routes(app: web.Application, ctx: Any, orchestrator: Any) -> Non
             development_verification=bool(
                 app.get(PM_DEVELOPMENT_VERIFICATION_KEY, False)
             ),
+            demo=PM_DEMO_KEY in app,
         )
         return result
 
@@ -192,7 +195,8 @@ def register_pm_routes(app: web.Application, ctx: Any, orchestrator: Any) -> Non
         return wrapped
 
     async def capabilities(_request: web.Request):
-        return web.json_response(_json(service().capabilities()))
+        tools = await asyncio.to_thread(host_tools.probe, ctx.config())
+        return web.json_response(_json(service().capabilities(host_tools=tools)))
 
     async def list_changes(request: web.Request):
         if request.query.get("project_id") != host_project_id():

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import base64
 import asyncio
+import os
 from pathlib import Path
 import shutil
 import subprocess
@@ -27,6 +28,7 @@ from symphony.pm.models import PmRequestContext
 from symphony.pm.planning import PlanningProposal
 from symphony.pm.routes import (
     PM_DEVELOPMENT_VERIFICATION_KEY,
+    PM_DEMO_KEY,
     _apply_unified_diff,
     _assert_planning_reservations,
     _import_recovery_matches,
@@ -36,10 +38,29 @@ from tests.test_pm_approval import _populate
 from tests.test_pm_documents import _repository
 
 
-async def _client(tmp_path: Path) -> TestClient:
+@pytest.fixture(autouse=True)
+def _isolate_host_context(tmp_path, monkeypatch):
+    # Route fixtures are standalone projects, not entries in the user's registry.
+    monkeypatch.setenv("SYMPHONY_PROJECTS_FILE", str(tmp_path / "projects.json"))
+    for key in tuple(os.environ):
+        if key in {
+            "SYMPHONY_LANG", "SYMPHONY_API_TOKEN", "SYMPHONY_TRUSTED_ORIGINS",
+            "SYMPHONY_SERVICE_INSTANCE_ID", "GIT_CONFIG_GLOBAL",
+        } or key.startswith(("GIT_AUTHOR_", "GIT_COMMITTER_")):
+            monkeypatch.delenv(key)
+    # Assistance-on fixtures must never spawn the developer's host Codex.
+    monkeypatch.setattr(routes_module.host_tools, "probe_codex", lambda: {
+        "required": "0.160.0", "found": "0.160.0", "available": True, "reason": None,
+    })
+
+
+async def _client(
+    tmp_path: Path, *, authoring: bool = False, demo: bool = False,
+    development_verification: bool = False,
+) -> TestClient:
     (tmp_path / "kanban").mkdir()
     (tmp_path / "WORKFLOW.md").write_text(
-        """---
+        f"""---
 tracker:
   kind: file
   board_root: ./kanban
@@ -49,7 +70,7 @@ tracker:
 agent:
   kind: claude
 pm:
-  authoring: false
+  authoring: {str(authoring).lower()}
   exchange: false
   assistance: false
   handoff: false
@@ -61,7 +82,12 @@ Prompt
     state = WorkflowState(tmp_path / "WORKFLOW.md")
     cfg, error = state.reload()
     assert cfg is not None and error is None
-    client = TestClient(TestServer(build_app(Orchestrator(state))))
+    app = build_app(Orchestrator(state))
+    if demo:
+        app[PM_DEMO_KEY] = tmp_path.resolve()
+    if development_verification:
+        app[PM_DEVELOPMENT_VERIFICATION_KEY] = True
+    client = TestClient(TestServer(app))
     await client.start_server()
     return client
 
@@ -122,6 +148,10 @@ async def test_capabilities_are_default_off_and_mutation_returns_stable_error(tm
             "authoring": False, "exchange": False,
             "assistance": False, "handoff": False,
         }
+        assert PM_DEVELOPMENT_VERIFICATION_KEY not in client.app
+        assert PM_DEMO_KEY not in client.app
+        assert payload["demo"] == {"active": False}
+        assert payload["host_tools"] == {}
         change_id = "a" * 32
         response = await client.post(
             f"/api/v1/pm/changes/{change_id}/workspace/claim",
@@ -129,6 +159,98 @@ async def test_capabilities_are_default_off_and_mutation_returns_stable_error(tm
         )
         assert response.status == 503
         assert (await response.json())["error"]["code"] == "capability_disabled"
+    finally:
+        await client.close()
+
+
+@pytest.mark.parametrize(("demo", "development_verification"), [
+    (False, False), (True, False), (False, True), (True, True),
+])
+@pytest.mark.asyncio
+async def test_demo_constructor_flag_is_separate_from_release_gate_bypass(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, demo: bool, development_verification: bool,
+) -> None:
+    node = {
+        "required": "20.19.0", "found": None, "available": False,
+        "reason": "Bundled OpenSpec needs Node.js 20.19.0 or newer on PATH (found: none)",
+    }
+    monkeypatch.setattr(routes_module.host_tools, "probe_node", lambda: node)
+    client = await _client(
+        tmp_path, authoring=True, demo=demo,
+        development_verification=development_verification,
+    )
+    try:
+        app = client.app
+        assert (PM_DEMO_KEY in app) is demo
+        assert (PM_DEVELOPMENT_VERIFICATION_KEY in app) is development_verification
+        response = await client.get("/api/v1/pm/capabilities")
+        assert response.status == 200
+        payload = await response.json()
+        assert payload["demo"] == {"active": demo}
+        assert payload["host_tools"] == {"node": node}
+        assert payload["health"]["development_verification"] is development_verification
+        assert payload["highest_passed_gate"] is None
+        assert all(not gate["passed"] for gate in payload["gates"].values())
+        assert payload["effective_flags"]["authoring"] is development_verification
+        assert payload["capabilities"]["assistance"]["reasons"] == [
+            "Off in the demo: it would contact an AI model." if demo
+            else "PM assistance is disabled by host configuration"
+        ]
+        if not development_verification:
+            # U2: even a PM-enabled build_app has no release-gate bypass.
+            mutation = await client.post("/api/v1/pm/changes", json={
+                "project_id": "p1", "workspace_path": str(tmp_path / "planning"),
+                "locator": "locked", "title": "Locked",
+            })
+            assert mutation.status == 503
+            assert (await mutation.json())["error"]["code"] == "capability_not_ready"
+    finally:
+        await client.close()
+
+
+@pytest.mark.asyncio
+async def test_host_tool_payload_does_not_replace_gate_reasons_or_effective_flags(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    available = {"required": "20.19.0", "found": "v22.22.3", "available": True, "reason": None}
+    unavailable = {
+        "required": "20.19.0", "found": None, "available": False,
+        "reason": "Bundled OpenSpec needs Node.js 20.19.0 or newer on PATH (found: none)",
+    }
+    monkeypatch.setattr(routes_module.host_tools, "probe_node", lambda: available)
+    client = await _client(tmp_path, authoring=True)
+    try:
+        before = await (await client.get("/api/v1/pm/capabilities")).json()
+        monkeypatch.setattr(routes_module.host_tools, "probe_node", lambda: unavailable)
+        after = await (await client.get("/api/v1/pm/capabilities")).json()
+        for key in ("flags", "effective_flags", "capabilities", "gates", "demo"):
+            assert after[key] == before[key]
+        assert before["host_tools"] == {"node": available}
+        assert after["host_tools"] == {"node": unavailable}
+        # P6's UI order uses these existing gate reasons, then the separate Node reason.
+        reasons = after["capabilities"]["authoring"]["reasons"]
+        assert reasons[0].startswith("Requires passed release gates:")
+        assert unavailable["reason"] not in reasons
+    finally:
+        await client.close()
+
+
+@pytest.mark.asyncio
+async def test_assistance_on_capabilities_include_stubbed_codex_and_node(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    node = {"required": "20.19.0", "found": "v22.22.3", "available": True, "reason": None}
+    monkeypatch.setattr(routes_module.host_tools, "probe_node", lambda: node)
+    client, _ = await _authoring_client(tmp_path)
+    try:
+        response = await client.get("/api/v1/pm/capabilities")
+        assert response.status == 200
+        payload = await response.json()
+        assert payload["demo"] == {"active": False}
+        assert payload["host_tools"] == {
+            "codex": {"required": "0.160.0", "found": "0.160.0", "available": True, "reason": None},
+            "node": node,
+        }
     finally:
         await client.close()
 
@@ -295,10 +417,12 @@ async def test_xlsx_export_and_import_preview_keep_state_route_responsive(
             # client: an in-loop poller would sleep through a stall unmeasured.
             stop = threading.Event()
             samples: list[tuple[int, float]] = []
+            port = client.port
+            assert port is not None
 
             def poll_state() -> None:
                 connection = http.client.HTTPConnection(
-                    str(client.host), int(client.port), timeout=5,
+                    str(client.host), port, timeout=5,
                 )
                 try:
                     while not stop.is_set():
@@ -479,7 +603,7 @@ async def test_pm_import_rejects_decoded_workbook_over_limit_with_413(
 async def test_pm_workspace_registers_operation_archive_and_acceptance_surfaces(tmp_path: Path) -> None:
     client = await _client(tmp_path)
     try:
-        resources = {resource.canonical for resource in client.server.app.router.resources()}
+        resources = {resource.canonical for resource in client.app.router.resources()}
         assert "/api/v1/pm/operations/{operation_id}" in resources
         assert "/api/v1/pm/operations/{operation_id}/cancel" in resources
         assert "/api/v1/pm/changes/{change_id}/archive/preview" in resources

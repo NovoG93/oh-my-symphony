@@ -56,6 +56,7 @@ class PmApplication:
         flags: dict[str, bool],
         archive_journal_root: Path | None = None,
         development_verification: bool = False,
+        demo: bool = False,
     ) -> None:
         self.repository = repository
         self.approval = approval
@@ -65,9 +66,10 @@ class PmApplication:
         self.project_root = project_root.resolve()
         self.flags = flags
         self.development_verification = development_verification
+        self.demo = demo
         self.archive_journal_root = (archive_journal_root or self.project_root / ".symphony" / "pm" / "archive-journal").resolve()
 
-    def capabilities(self) -> dict[str, Any]:
+    def capabilities(self, *, host_tools: dict[str, Any] | None = None) -> dict[str, Any]:
         readiness = self._readiness()
         health = _runtime_health(self.repository, self.archive_journal_root)
         health["development_verification"] = self.development_verification
@@ -77,6 +79,8 @@ class PmApplication:
         }
         return {
             "project_id": self.repository.project_id,
+            "demo": {"active": self.demo},
+            "host_tools": host_tools or {},
             "flags": dict(self.flags),
             "effective_flags": {
                 name: state["effective"] for name, state in capabilities.items()
@@ -441,7 +445,11 @@ class PmApplication:
         )
         reasons: list[str] = []
         if not requested:
-            reasons.append(f"PM {flag} is disabled by host configuration")
+            reasons.append(
+                "Off in the demo: it would contact an AI model."
+                if self.demo and flag == "assistance"
+                else f"PM {flag} is disabled by host configuration"
+            )
         elif self.development_verification and not dependency_reasons:
             reasons.append(
                 "Enabled only in the host development verification context; "
