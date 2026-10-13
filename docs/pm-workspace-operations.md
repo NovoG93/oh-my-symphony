@@ -39,6 +39,10 @@ PM authority uses the registered host project ID throughout HTTP, repository, ha
 
 Release evidence binds the installed distribution RECORD, METADATA, package code, and static assets. A metadata or version byte change invalidates the cached binding and requires fresh source-bound evidence.
 
+## Browser origin and owner claims
+
+PM mutations refuse untrusted browser origins with `403 forbidden_origin`, including behind a reverse proxy. A reverse-proxy operator must declare the actual browser origin in `SYMPHONY_TRUSTED_ORIGINS`; the PM error currently does not name that setting. The disposable demo ignores this setting and accepts only its local addresses. `X-Symphony-PM-Owner` supplies the recorded owner claim (default `local-operator`); it is not authentication or an authorization boundary.
+
 ## Accepted baseline identities
 
 Later OpenSpec `MODIFIED` and `REMOVED` deltas may reuse an exact accepted baseline REQ/SC identity only with the same capability, semantic kind, and scenario parent. Supported requirement renames retain the original IDs through the next real archive. `ADDED` blocks still receive new server IDs. Cross-capability, fabricated, retyped, reparented, duplicate, and retired IDs are refused.
@@ -48,6 +52,12 @@ Later OpenSpec `MODIFIED` and `REMOVED` deltas may reuse an exact accepted basel
 Symphony writes newly generated managed files with explicit UTF-8/LF bytes on every platform. It preserves UTF-8 BOM and mixed LF/CRLF bytes outside an edited span. A no-op save does not rewrite the file or revision. An all-CRLF managed WBS is currently unsupported by the canonical parser, so external-edit re-index places it in repair-required/read-only state before any application write. Convert it to supported LF or mixed source outside the application, then re-index; Symphony never silently normalizes it.
 
 Workbook import requests carry the original plain filename together with base64 content. Only `.xlsx` is accepted, case-insensitively; path-like names, `.xls`, `.xlsm`, and renamed unsupported media are refused before workbook parsing. The validated filename participates in the preview digest and persisted import snapshot. Every XML member is parsed before workbook loading; malformed XML, DTD/entity declarations, hidden rows outside a deceptive declared dimension, and duplicate task identities fail as `unsafe_workbook` without creating a preview.
+
+Read Me records the export's UTC time and counts leaf tasks by supplied execution state. Execution Snapshot values are informational export-time snapshots and do not authorize state changes. HTTP XLSX export reads native tickets once, off the event loop, for published mappings matching the registered project, saved change and task revision. The native planning reference must match the recorded task, revision, handoff and approval snapshot. Missing, stale, unpublished or mismatched tickets supply neither state nor runtime link. Durable published records remain readable after an approval is superseded or the change is archived; export does not require a current active approval. Read Me stays within 64 rows and two columns: at most 48 supplied states appear separately, with the remaining leaf count shown as Additional supplied statuses; WBS retains each full state.
+
+The six sheets and Metadata format version 1 remain unchanged. WBS appends read-only Display Number and Dependency Summary after its existing 12 columns; Dependencies appends Task Title and Predecessor Title after its existing five. Display numbers follow parent/order hierarchy and never replace permanent IDs. Long derived numbers/summaries are abbreviated within the configured text limit with a pointer to Parent ID or Dependencies; allowed task titles remain intact. Runtime Link is literal relative text on existing typed Traceability rows, with no added references or workbook hyperlinks. Import ignores edits to these derived/runtime fields, accepts narrower legacy version 1 workbooks and retains exact extended column limits of 14 for WBS and seven for Dependencies.
+
+Gray cells distinguish existing Task IDs, derived display/dependency fields, runtime links/snapshots, and export provenance; this is a visual guide, not worksheet protection. New tasks still use `Action=Add` and a `NEW-*` temporary ID. Dropdowns are advisory: blank Action defaults to Keep, blank dependency Kind defaults to requires_code, and Reference Type accepts case-normalized values. Custom Type, Priority, and Agent Override values remain valid. Legacy version 1 workbooks still use the same import preview.
 
 ## Downgrade
 
@@ -60,3 +70,28 @@ The PM v9 schema is still additive relative to released v1-v8. Use a fresh v8→
 Archive is a separate confirmed operation after completion evidence and conflict checks. OpenSpec 1.14.0 writes `openspec/changes/archive/YYYY-MM-DD-<locator>` (or preserves a locator already carrying a date prefix). The adapter accepts only the exact previewed contained destination. Delivery verification archives only disposable fixtures; archiving this repository or another real project requires separate authorization.
 
 An existing `pmChange=<change-id>` link remains available after archive as read-only history, including its planning documents, WBS, managed tickets, verification evidence, and ArtifactStore links. Archived changes stay out of the active change list, and their original IDs cannot be reclaimed, repaired, edited, approved, handed off, or archived again.
+
+## Accepted findings and current handling
+
+These existing Low/Medium findings were accepted as follow-ups under the owner's release rule. They are disclosed here without claiming that their runtime causes were repaired by the bilingual UI change. The IDs preserve the review record in `.sdlc/work/261004-pm-workspace/evidence.md:176–191` (R32, R33, and R35 round two). N1 process-group cleanup changes are already recorded in the changelog.
+
+| Finding | Current behavior or handling |
+|---|---|
+| R32-02 (Low) | Archive concurrent with an off-loop snapshot read can raise a raw `FileNotFoundError` and return HTTP 500. |
+| R32-03 (Low) | Off-loop `git status` can contend with approval's `git add` for `index.lock`, producing HTTP 409. The optional-lock optimization remains a follow-up. |
+| R32-04 (Low) | A loop-thread writer can wait for a reader's shared file lock and delay the event loop. |
+| R32-05 (Low) | `mkstemp`/atomic writes leave files at mode 0600. The roll-forward temporary file is not fsynced and may remain after failure. |
+| N2 | An exception while recognizing PM authority in the registry can block or crash ordinary ticket dispatch. |
+| N3 | The UI regression runs separately with `node --test tests/pm_ui.test.mjs`; hosted CI does not run that command. |
+| N4 | The owner header is an audit claim. Its meaning is now documented above; the authentication policy is unchanged. |
+| N5 | `guarded()` maps every `ValueError` to HTTP 400 `invalid_body`, which can obscure the underlying cause. |
+| N6 | Evidence reports run `git show` synchronously without a timeout. |
+| N7 | The main application's project-switch confirmation remains English when the page language is Korean. |
+| N8 | `PmVerificationService.build_from_receipts` is used only by tests. |
+| R2-M1 (Medium) | On a host without `ps`, if a process leader exits on SIGTERM while a group member ignores it, final group SIGKILL may not run. Cleanup stays uncertain and `stop()` raises. This is an existing limitation relative to main. |
+| R2-L1 (Low) | Proxy guidance now covers PM `forbidden_origin` above. The runtime PM error still omits `SYMPHONY_TRUSTED_ORIGINS`. |
+| R2-L2 (Low) | Unreleased notes now disclose cross-origin PM refusal and rejected pinned planning settings. This is documentation of existing behavior. |
+| R2-L3 (Low) | Unknown `pm.*` keys other than `planning_codex_version`, `planning_model`, and `planning_reasoning_effort` are silently ignored. |
+| Assistance review (Low) | A proposal with no blocked instruction or reserved IDs may display literal `nullnull` beside its review. Review the actual diff and operation result; omitting those empty dialog arguments remains a UI follow-up. |
+
+Native Windows PM locking behavior, a real provider quota-fallback event, a real CLI agent leaving background processes, and ps-less Linux cleanup remain unverified platform/provider observations. Historical Linux/macOS runs do not prove them. Current-source checks and hosted CI status belong to the delivered completion evidence; this limitation list is not a fresh PASS. The [human review checklist](pm-workspace.md#final-human-review) must be performed before owner acceptance.

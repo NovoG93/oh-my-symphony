@@ -326,7 +326,7 @@ export function mountArtifacts({ root, projectId, api: hostApi, ui, onDirtyChang
       }),
       onAssist: safeAction(async () => openPlanningDialog(docId)),
       authoring: availability('authoring'), assistance: availability('assistance'),
-      onError: reportActionError,
+      onError: reportActionError, translate: pmText,
     });
     const kinds = docId === 'proposal' ? ['decision'] : docId === 'ux' ? ['storyboard'] : docId === 'design' ? ['contract'] : docId.startsWith('spec:') ? ['requirement', 'scenario'] : [];
     if (!kinds.length) return editor;
@@ -384,7 +384,7 @@ export function mountArtifacts({ root, projectId, api: hostApi, ui, onDirtyChang
           selectedStoryboardId = ''; await refreshChange(); ui.announce('Storyboard frame saved.');
         },
       }));
-      surface.append(limitArchivedAction(button('Edit source', () => { state.setDesignView('ux'); surface.replaceChildren(selector, buildDocument('ux')); })));
+      surface.append(limitArchivedAction(button('Edit source', () => { state.setDesignView('ux'); surface.replaceChildren(selector, buildDocument('ux')); localizePm(surface); })));
       return surface;
     }
     const section = extractSection(doc.source, state.designView);
@@ -394,7 +394,7 @@ export function mountArtifacts({ root, projectId, api: hostApi, ui, onDirtyChang
       surface.append(target, ui.el('details', { class: 'pm-source-details' }, [ui.el('summary', null, 'Diagram text alternative'), ui.el('pre', null, diagram)]));
       queueMicrotask(() => renderDiagram(target, diagram, diagramSummary(diagram).text));
     }
-    surface.append(limitArchivedAction(button('Edit source', () => { state.setDesignView(docId === 'ux' ? 'ux' : 'architecture'); surface.replaceChildren(selector, buildDocument(docId)); })));
+    surface.append(limitArchivedAction(button('Edit source', () => { state.setDesignView(docId === 'ux' ? 'ux' : 'architecture'); surface.replaceChildren(selector, buildDocument(docId)); localizePm(surface); })));
     return surface;
   }
 

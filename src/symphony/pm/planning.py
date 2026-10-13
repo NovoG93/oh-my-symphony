@@ -18,7 +18,7 @@ from .._shell import process_group_exists, process_group_identities, process_ide
 from .models import PmError
 
 SUPPORTED_CODEX_VERSION = "0.160.0"
-MODEL = "gpt-5.6-sol"
+MODEL = "gpt-6.1-sol"
 EFFORT = "medium"
 DISABLED_FEATURES = (
     "apps", "plugins", "remote_plugin", "browser_use", "browser_use_external",

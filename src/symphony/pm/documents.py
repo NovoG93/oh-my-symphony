@@ -305,11 +305,20 @@ class PmDocumentRepository:
         )
         revision = _revision_from_manifest(manifest)
         findings = list(report.findings)
+        approval = None if archived else self.registry.get_active_pm_approval(
+            ctx.project_id, ctx.change_id
+        )
+        if approval is not None and (
+            str(approval["scope_hash"]), str(approval["revision_hash"])
+        ) != (scope_hash, revision):
+            approval = None
         state = "Archived" if archived else (
             "Validated" if not any(
                 item.severity == "blocking" for item in findings
             ) else "Draft"
         )
+        if approval is not None:
+            state = "Approved"
         return ChangeView(
             project_id=self.project_id,
             change_id=ctx.change_id,
@@ -325,6 +334,7 @@ class PmDocumentRepository:
             else "",
             documents=docs,
             findings=tuple(findings),
+            approval_id=str(approval["approval_id"]) if approval is not None else None,
             next_action="history" if archived else (
                 "fix_gaps" if findings else "review"
             ),

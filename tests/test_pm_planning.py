@@ -12,7 +12,6 @@ from symphony.pm.models import PmError
 from symphony.pm.planning import (
     DISABLED_FEATURES,
     EFFORT,
-    MODEL,
     PmPlanningClient,
 )
 
@@ -55,7 +54,9 @@ async def test_proposal_contract_uses_exact_restricted_profile(tmp_path: Path) -
     assert proposal.proposal_patch == "add clarification"
     thread = next(params for method, params in client.requests if method == "thread/start")
     turn = next(params for method, params in client.requests if method == "turn/start")
-    assert thread["model"] == MODEL and thread["allowProviderModelFallback"] is False
+    assert thread["model"] == "gpt-6.1-sol"
+    assert turn["model"] == "gpt-6.1-sol"
+    assert thread["allowProviderModelFallback"] is False
     assert thread["dynamicTools"] == [] and thread["environments"] == []
     assert turn["effort"] == EFFORT
     assert turn["sandboxPolicy"] == {"type": "readOnly", "networkAccess": False}

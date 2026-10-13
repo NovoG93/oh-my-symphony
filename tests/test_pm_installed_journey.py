@@ -247,7 +247,7 @@ def test_runner_prepares_distinct_same_slug_projects_and_evidence_policies(
     ]
     assert all("project_slug: pm-installed-e2e" in value for value in workflows)
     assert "manual_verification_procedures:" in workflows[0]
-    assert "model: gpt-5.6-sol" in workflows[0]
+    assert "model: gpt-6.1-sol" in workflows[0]
     baseline = planning / "openspec" / "specs" / "requirements" / "spec.md"
     assert "symphony:req=REQ-A1B2C3D4" in baseline.read_text(encoding="utf-8")
     assert (project / "reports" / "manual-ux.json").is_file()
@@ -303,7 +303,7 @@ def test_clean_wheel_review_handoff_accept_archive_journey(tmp_path: Path) -> No
     assert receipt["browser"]["requirements_delta"]["same_requirement_modified"] is True
     assert receipt["execution"]["scheduler_dispatched"] is True
     assert receipt["execution"]["agent_kind"] == "codex"
-    assert receipt["execution"]["model"] == "gpt-5.6-sol"
+    assert receipt["execution"]["model"] == "gpt-6.1-sol"
     reach = receipt["combined_recovery_reach"]
     assert reach["staging_response_lost"] is True
     assert reach["restart_reconciled"] is True

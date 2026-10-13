@@ -377,7 +377,7 @@ class UiNode {
   constructor(tag = '', text = '') {
     this.tag = tag; this.nodeType = tag ? 1 : 3; this.nodeValue = text;
     this.childNodes = []; this.attributes = new Map(); this.dataset = {};
-    this.disabled = false; this.title = ''; this.open = false;
+    this.disabled = false; this.title = ''; this.open = false; this.listeners = new Map();
     this.classList = {
       add: (name) => this.setAttribute('class', `${this.getAttribute('class') || ''} ${name}`.trim()),
       remove: (name) => this.setAttribute('class', (this.getAttribute('class') || '').split(' ').filter((item) => item !== name).join(' ')),
@@ -408,8 +408,12 @@ class UiNode {
     return this.childNodes.flatMap((node) => [...(selectors.some((item) => node.matches(item)) ? [node] : []), ...node.querySelectorAll(selector)]);
   }
   querySelector(selector) { return this.querySelectorAll(selector)[0] || null; }
-  addEventListener() {}
-  focus() {}
+  addEventListener(type, listener) {
+    const listeners = this.listeners.get(type) || [];
+    listeners.push(listener); this.listeners.set(type, listeners);
+  }
+  async trigger(type) { for (const listener of this.listeners.get(type) || []) await listener({ type, target: this }); }
+  focus() { globalThis.document.activeElement = this; }
 }
 
 function storageStub() {
@@ -417,7 +421,7 @@ function storageStub() {
   return { getItem: (key) => values.get(key) ?? null, setItem: (key, value) => values.set(key, String(value)), removeItem: (key) => values.delete(key) };
 }
 
-async function mountedPm(t, { tab = 'idea', demo = false, language = 'en', hostTools = {}, gated = false, archived = false, development = false, demoAssistance = false } = {}) {
+async function mountedPm(t, { tab = 'idea', view = '', demo = false, language = 'en', hostTools = {}, gated = false, archived = false, development = false, demoAssistance = false, dirtyChanges = [] } = {}) {
   const el = (tag, attrs, children) => {
     const node = new UiNode(tag);
     for (const [key, value] of Object.entries(attrs || {})) if (value !== null && value !== undefined && value !== false) node.setAttribute(key, typeof value === 'boolean' ? '' : value);
@@ -425,7 +429,7 @@ async function mountedPm(t, { tab = 'idea', demo = false, language = 'en', hostT
   };
   const globals = {
     window: { i18n: { lang: language } },
-    location: new URL(`http://127.0.0.1/?pmTab=${tab}#/artifacts`),
+    location: new URL(`http://127.0.0.1/?pmTab=${tab}&pmView=${view}#/artifacts`),
     history: { replaceState() {} }, sessionStorage: storageStub(), localStorage: storageStub(), NodeFilter: { SHOW_TEXT: 4 },
     document: {
       // WBS enhancement stays disconnected; these tests exercise native controls.
@@ -455,7 +459,7 @@ async function mountedPm(t, { tab = 'idea', demo = false, language = 'en', hostT
   if (demoAssistance) capabilities.capabilities.assistance = { requested: false, effective: false, reasons: [DEMO_ASSISTANCE_REASON] };
   const change = { change_id: 'c1', locator: 'team-leave-request', revision: 'rev1', state: archived ? 'Archived' : 'Draft', workspace_state: archived ? 'RELEASED' : 'ATTACHED', documents: [{ document_id: 'proposal', path: 'proposal.md' }], storyboard_frames: [] };
   const root = el('div');
-  mount = mountArtifacts({ root, projectId: 'p1', onDirtyChange() {}, ui: { el, renderMarkdown: (source) => el('p', null, source), announce() {} }, api: {
+  mount = mountArtifacts({ root, projectId: 'p1', onDirtyChange: (dirty) => dirtyChanges.push(dirty), ui: { el, renderMarkdown: (source) => el('p', null, source), announce() {} }, api: {
     request: async (path) => {
       const pathname = path.split('?')[0];
       if (pathname === '/capabilities') return capabilities;
@@ -478,6 +482,65 @@ function findButton(root, label) {
   const node = root.querySelectorAll('button').find((item) => item.textContent === label);
   assert.ok(node, `Missing button: ${label}`); return node;
 }
+
+test('document review/source toggles retain language, focus, draft and input handlers', async (t) => {
+  for (const language of ['en', 'ko']) await t.test(language, async (context) => {
+    const dirtyChanges = [];
+    const root = await mountedPm(context, { language, dirtyChanges });
+    const layout = root.querySelector('.pm-document-layout');
+    const toggle = layout.querySelector('.pm-view-switcher').querySelector('button');
+    const source = layout.querySelector('textarea');
+    const sourcePane = layout.querySelector('.pm-editor-pane');
+    const reviewPane = layout.querySelector('.pm-preview-pane');
+    assert.equal(toggle.textContent, pmText('Edit source', {}, language));
+    await toggle.trigger('click');
+    assert.equal(toggle.textContent, pmText('Review document', {}, language));
+    assert.equal(toggle.getAttribute('aria-pressed'), 'true');
+    assert.equal(sourcePane.hidden, false);
+    assert.equal(reviewPane.hidden, true);
+    assert.equal(document.activeElement, source);
+    source.value += '\nLocal draft';
+    await source.trigger('input');
+    assert.equal(dirtyChanges.at(-1), true);
+    assert.equal(findButton(layout, pmText('Save draft', {}, language)).disabled, false);
+    const draft = source.value;
+    assert.equal(layout.querySelector('.pm-document-preview').textContent, draft);
+    await toggle.trigger('click');
+    assert.equal(toggle.textContent, pmText('Edit source', {}, language));
+    assert.equal(toggle.getAttribute('aria-pressed'), 'false');
+    assert.equal(sourcePane.hidden, true);
+    assert.equal(reviewPane.hidden, false);
+    await toggle.trigger('click');
+    assert.equal(toggle.textContent, pmText('Review document', {}, language));
+    assert.equal(layout.querySelector('textarea'), source);
+    assert.equal(source.value, draft);
+    assert.equal(document.activeElement, source);
+  });
+});
+
+test('Design direct source replacements localize both callbacks and the nested toggle', async (t) => {
+  for (const language of ['en', 'ko']) for (const view of ['storyboard', 'ux', 'api']) {
+    await t.test(`${view}, ${language}`, async (context) => {
+      const root = await mountedPm(context, { tab: 'design', view, language });
+      const surface = root.querySelector('.pm-design-stack');
+      const selector = surface.querySelector('.pm-segmented');
+      await findButton(surface, pmText('Edit source', {}, language)).trigger('click');
+      assert.equal(root.querySelector('.pm-action-error'), null, root.textContent);
+      assert.equal(surface.querySelector('.pm-segmented'), selector);
+      findButton(surface, pmText(view === 'api' ? 'Add contract' : 'Add storyboard', {}, language));
+      const layout = surface.querySelector('.pm-document-layout');
+      assert.ok(layout, 'The document editor is rendered after the direct replacement');
+      findButton(layout, pmText('Save draft', {}, language));
+      const toggle = findButton(layout, pmText('Edit source', {}, language));
+      await toggle.trigger('click');
+      assert.equal(toggle.textContent, pmText('Review document', {}, language));
+      assert.equal(document.activeElement, layout.querySelector('textarea'));
+      assert.equal(layout.querySelector('textarea').value, 'Demo document');
+      await toggle.trigger('click');
+      assert.equal(toggle.textContent, pmText('Edit source', {}, language));
+    });
+  }
+});
 
 test('R9 each area renders visible guide entries and follows demo.active in English and Korean', async (t) => {
   for (const language of ['en', 'ko']) for (const demo of [false, true]) for (const tab of ['idea', 'requirements', 'design', 'plan', 'code']) {

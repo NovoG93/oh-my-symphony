@@ -13,9 +13,12 @@ import http.client
 import threading
 import time
 import uuid
+import io
 from typing import Any
 
 import pytest
+import openpyxl
+import yaml
 from aiohttp.test_utils import TestClient, TestServer
 
 from symphony.orchestrator import Orchestrator
@@ -23,6 +26,7 @@ from symphony.orchestrator.run_registry import RunRegistry
 import symphony.pm.routes as routes_module
 from symphony.server import build_app
 from symphony.workflow import WorkflowState
+from symphony.trackers.file import FileBoardTracker
 from symphony.pm.documents import PmDocumentRepository
 from symphony.pm.models import PmRequestContext
 from symphony.pm.planning import PlanningProposal
@@ -135,6 +139,148 @@ Prompt
     client = TestClient(TestServer(app))
     await client.start_server()
     return client, planning
+
+
+async def _published_export_fixture(tmp_path: Path, monkeypatch, *, historical=False):
+    from symphony.pm.models import ValidationReport
+
+    monkeypatch.setattr(routes_module, "_openspec_readiness", lambda *_args: ValidationReport(True))
+    client, planning = await _authoring_client(tmp_path)
+    registry = RunRegistry(tmp_path / "project/.symphony/state.db")
+    repository = PmDocumentRepository(project_id="p1", project_root=tmp_path / "project",
+                                     registry=registry, planning_workspace_root=planning.parent)
+    change_id = uuid.uuid4().hex
+    repository.claim_workspace(change_id, planning, "owner")
+    _populate(repository, change_id, planning)
+    path = f"/api/v1/pm/changes/{change_id}"
+    headers = {"X-Symphony-PM-Owner": "owner"}
+    try:
+        for index in range(2 if historical else 1):
+            if index:
+                tasks = planning / "openspec/changes/approved/tasks.md"
+                tasks.write_text(tasks.read_text().replace("Implement approved scope", "Implement newer approved scope"))
+            response = await client.get(path + "?project_id=p1", headers=headers)
+            assert response.status == 200, await response.text()
+            change = await response.json()
+            envelope = {"project_id": "p1", "change_id": change_id, "expected_revision": change["revision"]}
+            response = await client.post(path + "/approvals", headers=headers, json={
+                **envelope, "confirmation_token": change["approval_confirmation_token"], "reviewer_label": "reviewer",
+            })
+            assert response.status == 201, await response.text()
+            response = await client.post(path + "/handoffs/preview", headers=headers, json=envelope)
+            assert response.status == 200, await response.text()
+            preview = await response.json()
+            response = await client.post(path + "/handoffs", headers=headers, json={
+                **envelope, "client_operation_id": f"export-handoff-{index}",
+                "preview_token": preview["preview_token"], "confirmation_token": preview["preview_token"],
+            })
+            assert response.status == 201, await response.text()
+            result = await response.json()
+            identifier = result["ticket_identifiers"][0]
+        # The real native file is modified as a fixture's execution state, without dispatch.
+        ticket = tmp_path / "project/kanban" / f"{identifier}.md"
+        text = ticket.read_text()
+        ticket.write_text(text.replace("state: Todo", "state: Done", 1))
+        return client, registry, planning, path, headers, identifier
+    except BaseException:
+        registry.close()
+        await client.close()
+        raise
+
+
+@pytest.mark.asyncio
+async def test_xlsx_export_projects_matching_native_state_and_link_once_off_loop(tmp_path, monkeypatch):
+    client, registry, planning, path, headers, identifier = await _published_export_fixture(tmp_path, monkeypatch, historical=True)
+    scans = []
+    original = FileBoardTracker.scan_all
+    monkeypatch.setattr(FileBoardTracker, "scan_all", lambda self: (scans.append(threading.get_ident()), original(self))[1])
+    before = {item: item.read_bytes() for item in (tmp_path / "project/kanban").glob("*.md")}
+    canonical = {item: item.read_bytes() for item in (planning / "openspec/changes/approved").rglob("*") if item.is_file() and item.name != ".symphony-pm.lock"}
+    try:
+        response = await client.post(path + "/exports", headers=headers, json={"project_id": "p1", "format": "xlsx"})
+        assert response.status == 201, await response.text()
+        export = await response.json()
+        data = await (await client.get(f"/api/v1/pm/exports/{export['export_id']}/file")).read()
+        workbook = openpyxl.load_workbook(io.BytesIO(data))
+        try:
+            assert workbook["WBS"]["L2"].value == "Done"
+            assert dict(workbook["Read Me"].values)["Supplied: Done"] == 1
+            assert workbook["Traceability"].max_row == 4
+            assert [workbook["Traceability"].cell(row, 4).value for row in range(2, 5)] == [f"/api/v1/issues/{identifier}"] * 3
+            assert all(cell.hyperlink is None and cell.data_type != "f" for row in workbook["Traceability"] for cell in row)
+        finally:
+            workbook.close()
+        assert scans == [scans[0]] and scans[0] != threading.get_ident()
+        assert {item: item.read_bytes() for item in before} == before
+        assert {item: item.read_bytes() for item in canonical} == canonical
+        assert len(registry.list_pm_managed_tickets("p1")) == 2
+        assert registry._connect().execute("SELECT count(*) FROM runs").fetchone()[0] == 0
+    finally:
+        registry.close()
+        await client.close()
+
+
+@pytest.mark.parametrize("mismatch", ["missing", "change_id", "task_id", "task_revision", "handoff_id", "snapshot_id", "unpublished", "stale", "wrong_project", "wrong_change", "batch_unpublished", "batch_snapshot", "approval_scope", "no_mapping"])
+@pytest.mark.asyncio
+async def test_xlsx_export_omits_unmatched_runtime_state_and_link(tmp_path, monkeypatch, mismatch):
+    client, registry, planning, path, headers, identifier = await _published_export_fixture(tmp_path, monkeypatch)
+    ticket = tmp_path / "project/kanban" / f"{identifier}.md"
+    scans = []
+    original = FileBoardTracker.scan_all
+    try:
+        if mismatch == "missing":
+            ticket.unlink()
+        elif mismatch in {"change_id", "task_id", "task_revision", "handoff_id", "snapshot_id"}:
+            _, front, body = ticket.read_text().split("---", 2)
+            values = yaml.safe_load(front)
+            values["symphony_pm"][mismatch] = "wrong"
+            ticket.write_text("---\n" + yaml.safe_dump(values, sort_keys=False) + "---" + body)
+        elif mismatch == "no_mapping":
+            registry._connect().execute("DELETE FROM pm_managed_tickets")
+        elif mismatch in {"batch_unpublished", "batch_snapshot", "approval_scope"}:
+            table, field, value = {
+                "batch_unpublished": ("pm_handoff_batches", "state", "STAGING"),
+                "batch_snapshot": ("pm_handoff_batches", "snapshot_id", "wrong"),
+                "approval_scope": ("pm_approvals", "scope_hash", "wrong"),
+            }[mismatch]
+            registry._connect().execute(f"UPDATE {table} SET {field}=?", (value,))
+        else:
+            field, value = {"unpublished": ("state", "STAGING"), "stale": ("task_revision", "wrong"), "wrong_project": ("project_id", "p2"), "wrong_change": ("change_id", "wrong")}[mismatch]
+            registry._connect().execute(f"UPDATE pm_managed_tickets SET {field}=?", (value,))
+        monkeypatch.setattr(FileBoardTracker, "scan_all", lambda self: (scans.append(threading.get_ident()), original(self))[1])
+        response = await client.post(path + "/exports", headers=headers, json={"project_id": "p1", "format": "xlsx"})
+        assert response.status == 201, await response.text()
+        export = await response.json()
+        data = await (await client.get(f"/api/v1/pm/exports/{export['export_id']}/file")).read()
+        workbook = openpyxl.load_workbook(io.BytesIO(data))
+        try:
+            assert workbook["WBS"]["L2"].value is None
+            assert dict(workbook["Read Me"].values)["Not supplied"] == 1
+            assert all(workbook["Traceability"].cell(row, 4).value is None for row in range(2, 5))
+        finally:
+            workbook.close()
+        if mismatch in {"missing", "change_id", "task_id", "task_revision", "handoff_id", "snapshot_id"}:
+            assert len(scans) == 1 and scans[0] != threading.get_ident()
+        else:
+            assert scans == []
+    finally:
+        registry.close()
+        await client.close()
+
+
+@pytest.mark.parametrize("format_name", ["markdown", "html", "zip", "csv"])
+@pytest.mark.asyncio
+async def test_non_xlsx_export_does_not_scan_native_runtime(tmp_path, monkeypatch, format_name):
+    client, registry, _planning, path, headers, _identifier = await _published_export_fixture(tmp_path, monkeypatch)
+    def unexpected_scan(_self):
+        pytest.fail("non-XLSX export scanned native tickets")
+    monkeypatch.setattr(FileBoardTracker, "scan_all", unexpected_scan)
+    try:
+        response = await client.post(path + "/exports", headers=headers, json={"project_id": "p1", "format": format_name})
+        assert response.status == 201, await response.text()
+    finally:
+        registry.close()
+        await client.close()
 
 
 @pytest.mark.asyncio
@@ -1642,4 +1788,47 @@ async def test_coverage_waiver_is_revision_bound_idempotent_and_non_authoritativ
         )
         assert replay_revoked.status == 200
     finally:
+        await client.close()
+
+
+@pytest.mark.asyncio
+async def test_change_get_projects_real_approval_and_invalidates_after_edit(tmp_path: Path, monkeypatch) -> None:
+    from symphony.pm.models import ValidationReport
+
+    monkeypatch.setattr(routes_module, "_openspec_readiness", lambda *_args: ValidationReport(True))
+    client, planning = await _authoring_client(tmp_path)
+    registry = RunRegistry(tmp_path / "project/.symphony/state.db")
+    repository = PmDocumentRepository(project_id="p1", project_root=tmp_path / "project",
+                                     registry=registry, planning_workspace_root=planning.parent)
+    change_id = uuid.uuid4().hex
+    repository.claim_workspace(change_id, planning, "owner")
+    change = _populate(repository, change_id, planning)
+    path = f"/api/v1/pm/changes/{change_id}"
+    headers = {"X-Symphony-PM-Owner": "owner"}
+    envelope = {"project_id": "p1", "change_id": change_id, "expected_revision": change.revision}
+    try:
+        initial = await (await client.get(path + "?project_id=p1", headers=headers)).json()
+        approval = await client.post(path + "/approvals", headers=headers, json={
+            **envelope, "confirmation_token": initial["approval_confirmation_token"], "reviewer_label": "reviewer",
+        })
+        assert approval.status == 201, await approval.text()
+        manifest = await approval.json()
+        response = await client.get(path + "?project_id=p1", headers=headers)
+        assert response.status == 200, await response.text()
+        approved = await response.json()
+        assert (approved["state"], approved["approval_id"]) == ("Approved", manifest["approval_id"])
+        assert (approved["scope_hash"], approved["revision"]) == (manifest["scope_hash"], manifest["revision"])
+        source = repository.get_document(PmRequestContext("p1", change_id), "proposal", owner="owner").source
+        patched = await client.patch(path + "/documents/proposal", headers=headers, json={
+            **envelope, "client_operation_id": "approval-api-edit",
+            "payload": {"operations": [{"op": "replace_source", "source": source + "\nReview note: edited.\n"}]},
+        })
+        assert patched.status == 200, await patched.text()
+        current_response = await client.get(path + "?project_id=p1", headers=headers)
+        assert current_response.status == 200, await current_response.text()
+        current = await current_response.json()
+        assert current["revision"] != approved["revision"]
+        assert (current["state"], current["approval_id"]) == ("Validated", None)
+    finally:
+        registry.close()
         await client.close()

@@ -19,14 +19,23 @@ Versioning: [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - No-run verification supports real host-executed native commands and immutable manual evidence through explicit acceptance.
 - Requirement and scenario coverage shows independent partial states and non-authoritative waiver records.
 - XLSX preview binds a plain `.xlsx` filename to the durable import snapshot and rejects hostile XML, duplicate IDs, active content, and unsupported containers before mutation.
+- XLSX exports include a UTC export time, native execution snapshots/links and leaf-status summary, derived display numbers/dependency summaries/adjacent titles, frozen identifying columns, parent indentation, read-only shading, and advisory controlled-field dropdowns while retaining version 1 import compatibility and custom task values.
 
 ### Changed
+- PM planning assistance now pins GPT-6.1 Sol at medium reasoning; Codex 0.160.0, isolation, read-only/tool-disabled/no-network execution, and no provider fallback remain required.
+- PM planning configuration rejects `pm.planning_codex_version`, `pm.planning_model`, and `pm.planning_reasoning_effort`; the dedicated planning client pins these values. Other unknown `pm.*` keys are still ignored, so use only documented settings.
+- PM mutations refuse untrusted cross-origin requests with `403 forbidden_origin`. Reverse-proxy operators must declare the browser origin in `SYMPHONY_TRUSTED_ORIGINS`; the disposable demo remains loopback-only and ignores that setting. `X-Symphony-PM-Owner` is an audit claim, not authentication.
 - CI runs the suite in parallel (`pytest-xdist`) and the wall-clock `timing` tests alone afterwards; about 7.5 → 2 minutes. Plain `python -m pytest -q` still runs everything serially.
 - Every worker prompt and the PM planning assistant now carry one shared writing rule (lead with the result, no filler or repetition, keep every number and warning).
 - Worker process cleanup is now confirmed per process group for every per-turn CLI backend (all backends except the Codex app-server). A turn whose agent leaves a background process running in its process group fails cleanup confirmation, and that backend refuses further turns until a stop confirms the group is gone.
 
 ### Fixed
+- Korean Design source editors retain translated controls after opening from Storyboard, UX, or API. Repeated source/review toggles keep the selected language, existing source, focus behavior, and event handlers.
 - Failed project and planning-change selection restores the prior selection, content, focus, and announced error instead of leaving mismatched UI state.
+
+### Known limitations
+- Accepted PM follow-ups remain: concurrent archive/snapshot errors, optional Git index-lock contention, shared-lock waits on the event loop, private file modes and roll-forward durability, registry errors affecting ordinary dispatch, broad `ValueError` classification, evidence Git reads without a timeout, the English project-switch confirmation, and a test-only receipt builder. Node UI regressions require a separate local command; hosted CI does not run them. See the [finding IDs and operational effects](docs/pm-workspace-operations.md#accepted-findings-and-current-handling).
+- On a host without `ps`, a surviving process-group member that ignores SIGTERM can escape the final SIGKILL after its leader exits; cleanup stays uncertain and `stop()` raises. Native Windows PM behavior and real provider quota fallback remain unverified. The [human review checklist](docs/pm-workspace.md#final-human-review) is separate from automated proof and merge approval.
 
 ## [0.26.0] - 2026-09-22 - First-run experience: demo keeps the generated workflow, project-facing agent files, clean git status
 

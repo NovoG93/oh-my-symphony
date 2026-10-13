@@ -259,13 +259,18 @@ def _page(chrome, token="", *, preset_english=False):
 
 
 def _button(page, name, lang):
-    return page.get_by_role("button", name=_label(name, lang), exact=True)
+    # PM's segmented HTML buttons expose the accessible tab role.
+    role = "tab" if name in {"Storyboard", "Work breakdown", "Dependencies"} else "button"
+    return page.get_by_role(role, name=_label(name, lang), exact=True)
 
 
 def _tab(page, area, lang):
+    from playwright.sync_api import expect
     name = TABS[area][lang == "ko"]
-    page.locator(".pm-tabs").get_by_role("button", name=name, exact=True).click()
-    page.wait_for_function("document.querySelector('.pm-workspace-host')?.getAttribute('aria-busy') !== 'true'")
+    tab = page.locator(".pm-tabs").get_by_role("button", name=name, exact=True)
+    tab.click()
+    # selectTab renders this marker only after its panel hydration completes.
+    expect(tab).to_have_attribute("aria-current", "page")
 
 
 def _guides(page, area, lang, matched):
@@ -285,6 +290,7 @@ def _guides(page, area, lang, matched):
         for en, _ in LABELS[key]:
             buttons = _button(page, en, lang)
             if buttons.count():
+                expect(buttons.first).to_have_js_property("tagName", "BUTTON")
                 expect(buttons.first).to_have_text(_label(en, lang))
                 matched.add(en)
 
@@ -309,18 +315,35 @@ def test_installed_demo_r7_journey(tmp_path, installed_python, chrome, lang):
     matched = set()
     with _server(argv, tmp_path, env) as (_, url), _page(chrome, token, preset_english=lang == "ko") as (page, dialogs):
         page.goto(url)
+        if token:
+            # app.js authenticates through its tab-scoped HTML banner.
+            banner = page.locator(".api-token-banner")
+            expect(banner).to_be_visible()
+            banner.get_by_label("API 토큰" if lang == "ko" else "API token", exact=True).fill(token)
+            with page.expect_response(lambda response: response.url.endswith("/board") and response.status == 200) as connected:
+                banner.get_by_role("button", name="연결" if lang == "ko" else "Connect", exact=True).click()
+            assert connected.value.request.headers["authorization"] == f"Bearer {token}"
+            expect(banner).to_have_count(0)
+            # Connect refreshes the board; revisit PM with the saved tab token.
+            page.reload()
         expect(_button(page, "Validate", lang)).to_be_visible()
         assert page.evaluate("window.i18n.lang") == lang
         assert page.evaluate("localStorage.getItem('symphony.lang')") == lang
         assert "lang=" not in page.url
         if token:
-            assert len([kind for kind, _ in dialogs if kind == "prompt"]) == 1
+            assert page.evaluate("sessionStorage.getItem('symphony.apiToken')") == token
+            expect(page.locator(".api-token-banner")).to_have_count(0)
         _guides(page, "idea", lang, matched)
         _button(page, "Edit source", lang).click()
+        expect(page.locator(".pm-view-switcher button")).to_have_text("문서 검토" if lang == "ko" else "Review document")
+        expect(page.locator(".pm-source-editor")).to_be_focused()
         _guides(page, "idea", lang, matched)
         expect(_button(page, "Planning assistant", lang)).to_be_disabled()
         expect(_button(page, "Planning assistant", lang)).to_have_attribute("title", "Off in the demo: it would contact an AI model.")
-        _button(page, "Review document", lang).click() if lang == "en" else page.get_by_role("button", name="문서 검토", exact=True).click()
+        page.locator('.pm-view-switcher button[aria-pressed="true"]').click()
+        expect(page.locator('.pm-view-switcher button[aria-pressed="false"]')).to_be_visible()
+        expect(page.locator(".pm-view-switcher button")).to_have_text("소스 편집" if lang == "ko" else "Edit source")
+        expect(page.locator('.pm-editor-pane')).to_be_hidden()
         # R7.1: the real combined validation, including OpenSpec, is ready.
         with page.expect_response(lambda response: response.url.endswith("/validate") and response.request.method == "POST") as validation:
             _button(page, "Validate", lang).click()
@@ -330,10 +353,13 @@ def test_installed_demo_r7_journey(tmp_path, installed_python, chrome, lang):
         page.get_by_role("button", name="닫기" if lang == "ko" else "Close", exact=True).click()
         _tab(page, "plan", lang)
         _guides(page, "plan", lang, matched)
-        rows = page.locator(".pm-wbs-table tbody tr")
+        rows = page.locator(".pm-tabulator .tabulator-row")
+        expect(rows).to_have_count(7)
         before = rows.all_text_contents()
-        first_id = rows.first.get_attribute("data-task-id")
-        rows.first.locator("td").first.click()
+        first_id = rows.first.locator('[tabulator-field="task_id"]').inner_text()
+        assert first_id.startswith("G-")
+        rows.first.locator('[tabulator-field="task_id"]').click()
+        page.get_by_role("dialog", name=f"Task {first_id}", exact=True).get_by_role("button", name="닫기" if lang == "ko" else "Close", exact=True).click()
         # R7.2–3: add a child under a real group, undo, preserve every row/id.
         with page.expect_response(lambda response: response.url.endswith("/wbs") and response.request.method == "PATCH") as added:
             _button(page, "Add child", lang).click()
@@ -350,6 +376,8 @@ def test_installed_demo_r7_journey(tmp_path, installed_python, chrome, lang):
             _button(page, "Approve revision", lang).click()
         assert approval.value.status == 201
         expect(page.locator(".pm-revision-bar .pm-state")).to_have_text("Approved")
+        expect(_button(page, "Cancel task", lang)).to_be_visible()
+        expect(_button(page, "Delete", lang)).to_have_count(0)
         git = subprocess.run(["git", "-C", str(directory / "planning"), "show", "-s", "--format=%an <%ae>%n%s", "HEAD"], env=env, capture_output=True, text=True, check=True)
         author, subject = git.stdout.strip().split("\n")
         assert author == "Symphony PM Demo <pm-demo@example.invalid>"
@@ -385,6 +413,8 @@ def test_installed_demo_r7_journey(tmp_path, installed_python, chrome, lang):
         _inspect_other_guides(page, lang, matched)
         assert _runs(directory) == 0
         page.screenshot(path=str(tmp_path / f"demo-{lang}.png"), full_page=True)
+        _inspect_fixture_guides(page, lang, matched, tmp_path)
+        assert _runs(directory) == 0
         if lang == "ko":
             # R10.context: use the user's settings language picker, then reload.
             page.goto(url.split("/?")[0] + "/#/settings")
@@ -399,15 +429,38 @@ def test_installed_demo_r7_journey(tmp_path, installed_python, chrome, lang):
     assert list((tmp_path / "home").iterdir()) == []
     if marker:
         assert not marker.exists()
-    # These require an active waiver or completed/verified worker evidence;
-    # the demo deliberately dispatches no worker. Keep this gap explicit.
-    assert {en for entries in LABELS.values() for en, _ in entries} - matched == {
-        "Revoke waiver", "Review Git commit", "Open run evidence", "Accept verified revision",
-    }
+    assert matched == {en for entries in LABELS.values() for en, _ in entries}
+    print(f"R7 {lang}: real journey; D7: {len(matched)}/36 rendered labels (4 read-only presentation controls); 0 runs; HOME empty; no external requests")
+
+
+def _assert_document_toggle(page, lang):
+    from playwright.sync_api import expect
+    layout = page.locator(".pm-design-stack .pm-document-layout")
+    toggle = layout.locator(".pm-view-switcher button")
+    source = layout.locator(".pm-source-editor")
+    original = source.input_value()
+    for _ in range(2):
+        expect(toggle).to_have_text("소스 편집" if lang == "ko" else "Edit source")
+        toggle.click()
+        expect(toggle).to_have_text("문서 검토" if lang == "ko" else "Review document")
+        expect(toggle).to_have_attribute("aria-pressed", "true")
+        expect(source).to_be_focused()
+        expect(source).to_have_value(original)
+        expect(layout.locator(".pm-preview-pane")).to_be_hidden()
+        toggle.click()
+        expect(toggle).to_have_text("소스 편집" if lang == "ko" else "Edit source")
+        expect(toggle).to_have_attribute("aria-pressed", "false")
+        expect(source).to_be_hidden()
+        expect(layout.locator(".pm-preview-pane")).to_be_visible()
 
 
 def _inspect_other_guides(page, lang, matched):
+    from playwright.sync_api import expect
     _tab(page, "requirements", lang)
+    coverage = page.locator(".pm-coverage-entity").first
+    coverage.locator("summary").click()
+    expect(coverage).to_have_attribute("open", "")
+    expect(_button(page, "Waive coverage", lang).first).to_be_visible()
     _guides(page, "requirements", lang, matched)
     _button(page, "Edit requirements", lang).first.click()
     _guides(page, "requirements", lang, matched)
@@ -416,13 +469,91 @@ def _inspect_other_guides(page, lang, matched):
     page.locator(".pm-storyboard-card").first.click()
     _guides(page, "design", lang, matched)
     page.get_by_role("dialog").get_by_role("button", name="취소" if lang == "ko" else "Cancel", exact=True).click()
+    # Storyboard replaces its surface directly, separately from UX/API.
+    _button(page, "Edit source", lang).click()
+    expect(_button(page, "Add storyboard", lang)).to_be_visible()
+    _assert_document_toggle(page, lang)
+    _guides(page, "design", lang, matched)
     # Both UX and API document subviews expose their semantic Add controls.
     for name in (["사용자 경험", "API"] if lang == "ko" else ["UX", "API"]):
-        page.locator(".pm-design-stack").get_by_role("button", name=name, exact=True).click()
+        segment = page.locator(".pm-design-stack").get_by_role("tab", name=name, exact=True)
+        segment.click()
+        expect(segment).to_have_attribute("aria-selected", "true")
         _button(page, "Edit source", lang).click()
+        expect(page.locator(".pm-design-stack .pm-document-layout")).to_be_visible()
+        expect(_button(page, "Add contract" if name == "API" else "Add storyboard", lang)).to_be_visible()
+        _assert_document_toggle(page, lang)
         _guides(page, "design", lang, matched)
     _tab(page, "code", lang)
     _guides(page, "code", lang, matched)
+
+
+def _inspect_fixture_guides(page, lang, matched, tmp_path):
+    """D7 presentation only: no waiver, worker evidence or acceptance is written."""
+    from playwright.sync_api import expect
+    visited = set()
+    mutations = []
+
+    def presentation(route):
+        request = route.request
+        path = urlparse(request.url).path
+        if request.method != "GET":
+            mutations.append((request.method, path))
+            route.abort()
+            return
+        if path.endswith("/acceptance/preview"):
+            visited.add("acceptance")
+            route.fulfill(json={"ready": True, "confirmation_token": "presentation-only",
+                                "passing_receipt_ids": ["presentation-receipt"],
+                                "missing_procedure_ids": [], "findings": []})
+        elif path.endswith("/coverage"):
+            response = route.fetch()
+            body = response.json()
+            assert body["entities"]
+            body["entities"][0]["waivers"] = [{"state": "ACTIVE", "waiver_id": "presentation-waiver",
+                                             "reason": "D7 presentation fixture", "reviewer": "fixture",
+                                             "revision": "presentation-only"}]
+            visited.add("coverage")
+            route.fulfill(response=response, json=body)
+        elif path.endswith("/managed-tickets"):
+            response = route.fetch()
+            body = response.json()
+            assert body["tickets"]
+            body["tickets"][0].update(head_commit="a" * 40, verified_commit="a" * 40,
+                                       run_id="presentation-run", acceptance=None)
+            visited.add("tickets")
+            route.fulfill(response=response, json=body)
+        else:
+            route.fallback()
+
+    pattern = "**/api/v1/pm/**"
+    page.route(pattern, presentation)
+    try:
+        # Fresh navigation resets the requirement editor before fixture reads.
+        page.reload()
+        expect(_button(page, "Validate", lang)).to_be_visible()
+        _tab(page, "requirements", lang)
+        page.locator(".pm-coverage-entity").first.locator("summary").click()
+        expect(_button(page, "Revoke waiver", lang)).to_be_visible()
+        _guides(page, "requirements", lang, matched)
+        page.screenshot(path=str(tmp_path / f"mocked-reads-requirements-{lang}.png"), full_page=True)
+        _tab(page, "code", lang)
+        for name in ["Review Git commit", "Open run evidence"]:
+            expect(_button(page, name, lang)).to_be_visible()
+        _guides(page, "code", lang, matched)
+        page.screenshot(path=str(tmp_path / f"mocked-reads-code-{lang}.png"), full_page=True)
+        with page.expect_response(lambda response: "/acceptance/preview?" in response.url) as preview:
+            page.get_by_role("button", name="검증 검토" if lang == "ko" else "Review verification", exact=True).first.click()
+        assert preview.value.json()["ready"] is True
+        expect(_button(page, "Accept verified revision", lang)).to_be_visible()
+        expect(_button(page, "Accept verified revision", lang)).to_be_enabled()
+        _guides(page, "code", lang, matched)
+        page.screenshot(path=str(tmp_path / f"mocked-reads-acceptance-{lang}.png"), full_page=True)
+        page.get_by_role("dialog").get_by_role("button", name="취소" if lang == "ko" else "Cancel", exact=True).click()
+        assert visited == {"coverage", "tickets", "acceptance"}
+        assert not mutations, f"Presentation fixture attempted mutations: {mutations}"
+    finally:
+        page.unroute(pattern, presentation)
 
 
 def test_ordinary_server_without_node_r15_context(tmp_path, installed_python, chrome):

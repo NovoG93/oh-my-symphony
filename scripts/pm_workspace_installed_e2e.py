@@ -314,7 +314,7 @@ codex:
     --disable standalone_web_search --disable web_search_request --disable web_search_cached
     --disable memories --disable multi_agent --disable multi_agent_v2 --disable hooks
     --disable view_image
-  model: gpt-5.6-sol
+  model: gpt-6.1-sol
   reasoning_effort: medium
   approval_policy: never
   thread_sandbox: danger-full-access
@@ -1537,7 +1537,7 @@ The existing system SHALL retain accepted behavior and explicit review boundarie
                 "invalid_digest_rejected": True,
                 "cancel_operation_id": cancel_operation,
                 "cancelled": True,
-                "model": "gpt-5.6-sol",
+                "model": "gpt-6.1-sol",
                 "effort": "medium",
                 "proposal_digest": proposal["result"]["proposal_digest"],
             })
@@ -1853,7 +1853,7 @@ The existing system SHALL retain accepted behavior and explicit review boundarie
                 "guarded_native_spawns": ticket_spawns,
                 "phase_rebuild_reached": True,
                 "elapsed_seconds_between_spawns": ticket_spawns[-1]["at"] - ticket_spawns[0]["at"],
-                "provider": "codex app-server gpt-5.6-sol (genuine)",
+                "provider": "codex app-server gpt-6.1-sol (genuine)",
             }
 
         verification = api.call("POST", f"/changes/{change}/verification", envelope(project, change, payload={"ticket_identifier": ticket, "task_revision": item["task_revision"], "procedure_id": "focused", "run_id": run_id, "artifact_refs": [artifact_ref]}, operation=uuid.uuid4().hex))
@@ -2233,7 +2233,7 @@ The existing system SHALL retain accepted behavior and explicit review boundarie
             "execution": {
                 "scheduler_dispatched": True,
                 "agent_kind": "codex",
-                "model": "gpt-5.6-sol",
+                "model": "gpt-6.1-sol",
                 "effort": "medium",
                 "run_id": run_id,
                 "workspace": str(implementation),

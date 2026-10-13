@@ -7,7 +7,9 @@ import hashlib
 import io
 import posixpath
 import zipfile
+from collections import Counter
 from dataclasses import asdict, dataclass
+from datetime import UTC, datetime
 from typing import Any, Literal, cast
 from xml.etree import ElementTree
 
@@ -63,8 +65,11 @@ class WorkbookExchange:
         active = workbook.active
         if active is not None:
             workbook.remove(active)
-        from openpyxl.styles import Alignment
+        display_numbers = _display_numbers(tasks, self.max_text_chars)
+        titles = {task.task_id: task.title for task in tasks}
+        from openpyxl.styles import Alignment, Font, PatternFill
         from openpyxl.utils import get_column_letter
+        from openpyxl.worksheet.datavalidation import DataValidation
         readme = workbook.create_sheet("Read Me")
         wbs = workbook.create_sheet("WBS")
         details = workbook.create_sheet("Task Details")
@@ -83,6 +88,51 @@ class WorkbookExchange:
                 "Existing Task ID and runtime columns are read-only. Use Action=Add/Delete explicitly.",
             ),
         )
+        _append_literal(readme, ("Exported at (UTC)", datetime.now(UTC).isoformat()))
+        _append_literal(readme, (
+            "Execution snapshots",
+            "Execution Snapshot values and the leaf status summary are export-time snapshots. "
+            "They do not update in this workbook and are ignored during import.",
+        ))
+        _append_literal(readme, (
+            "Status legend",
+            "Supplied statuses use the runtime state's own name. Not supplied means no execution "
+            "state was supplied; the planning State above is separate. Up to 48 distinct supplied "
+            "statuses are listed; additional statuses are counted together. Full values remain in WBS.",
+        ))
+        _append_literal(readme, (
+            "Read-only shading",
+            "Gray cells identify existing Task IDs, derived display/dependency fields, runtime "
+            "links/snapshots and export provenance. "
+            "For Action=Add, enter a NEW-* temporary Task ID. Other task fields remain editable.",
+        ))
+        _append_literal(readme, (
+            "Dropdown hints",
+            "Dropdowns suggest existing Action, dependency Kind and Reference Type values. "
+            "Import preview validates edits. Type, Priority and Agent Override accept custom values.",
+        ))
+        _append_literal(readme, (
+            "Defaults",
+            "Blank Action means Keep. Blank dependency Kind means requires_code. "
+            "Reference Type is case-insensitive.",
+        ))
+        parents = {task.task_id: task.parent_id for task in tasks}
+        parent_ids = {task.parent_id for task in tasks if task.parent_id}
+        leaves = [task for task in tasks if task.kind != "Group" and task.task_id not in parent_ids]
+        statuses = Counter(
+            str(runtime_projection.get(task.task_id, {}).get("state") or "")
+            for task in leaves
+        )
+        _append_literal(readme, ("Leaf tasks", len(leaves)))
+        _append_literal(readme, ("Leaf status summary", "Leaf task count"))
+        _append_literal(readme, ("Not supplied", statuses.pop("", 0)))
+        supplied_statuses = sorted(statuses.items())
+        for state, count in supplied_statuses[:48]:
+            _append_literal(readme, (f"Supplied: {state}", count))
+        if len(supplied_statuses) > 48:
+            _append_literal(readme, (
+                "Additional supplied statuses", sum(count for _, count in supplied_statuses[48:]),
+            ))
 
         _append_literal(
             wbs,
@@ -99,6 +149,8 @@ class WorkbookExchange:
                 "Target Date",
                 "Estimate",
                 "Execution Snapshot",
+                "Display Number",
+                "Dependency Summary",
             ),
         )
         _append_literal(
@@ -114,7 +166,7 @@ class WorkbookExchange:
             ),
         )
         _append_literal(
-            deps, ("Task ID", "Predecessor ID", "Kind", "Justification", "Action")
+            deps, ("Task ID", "Predecessor ID", "Kind", "Justification", "Action", "Task Title", "Predecessor Title")
         )
         _append_literal(
             trace,
@@ -159,6 +211,11 @@ class WorkbookExchange:
                     task.target_date or "",
                     task.estimate or "",
                     str(runtime.get("state") or ""),
+                    display_numbers.get(task.task_id, ""),
+                    _bounded_derived("\n".join(
+                        f"{dependency.task_id}: {titles.get(dependency.task_id, '')} ({dependency.kind})"
+                        for dependency in task.dependencies
+                    ), self.max_text_chars, "Dependencies"),
                 ),
             )
             _append_literal(
@@ -182,15 +239,23 @@ class WorkbookExchange:
                         dependency.kind,
                         dependency.justification or "",
                         "Keep",
+                        task.title,
+                        titles.get(dependency.task_id, ""),
                     ),
                 )
             for reference in task.requirement_refs:
-                _append_literal(trace, (task.task_id, "scenario" if reference.startswith("SC-") else "requirement", reference, "", "Keep"))
+                _append_literal(trace, (task.task_id, "scenario" if reference.startswith("SC-") else "requirement", reference, str(runtime.get("link") or ""), "Keep"))
             for kind, references in (("storyboard", task.storyboard_refs), ("design", task.design_refs)):
                 for reference in references:
-                    _append_literal(trace, (task.task_id, kind, reference, "", "Keep"))
+                    _append_literal(trace, (task.task_id, kind, reference, str(runtime.get("link") or ""), "Keep"))
+        frozen = {"WBS": "D2", "Task Details": "B2", "Dependencies": "C2", "Traceability": "B2"}
+        read_only_columns = {
+            "Read Me": {1, 2}, "WBS": {2, 12, 13, 14}, "Task Details": {1},
+            "Dependencies": {1, 6, 7}, "Traceability": {1, 4}, "Metadata": set(range(1, 7)),
+        }
+        read_only_fill = PatternFill("solid", fgColor="E9EDF2")
         for sheet in workbook.worksheets:
-            sheet.freeze_panes = "A2"
+            sheet.freeze_panes = frozen.get(sheet.title, "A2")
             sheet.auto_filter.ref = sheet.dimensions
             for column in sheet.columns:
                 values = [str(cell.value or "") for cell in column[:100]]
@@ -201,6 +266,39 @@ class WorkbookExchange:
                 sheet.column_dimensions[get_column_letter(column_index)].width = width
                 for cell in column:
                     cell.alignment = Alignment(vertical="top", wrap_text=True)
+                    if column_index in read_only_columns[sheet.title]:
+                        cell.fill = read_only_fill
+                        cell.font = Font(color="475569")
+                    if cell.row == 1 and sheet is not readme:
+                        cell.fill = PatternFill("solid", fgColor=(
+                            "475569" if column_index in read_only_columns[sheet.title] else "1E3A5F"
+                        ))
+                        cell.font = Font(color="FFFFFF", bold=True)
+        for row, task in enumerate(tasks, 2):
+            depth = 0
+            parent = task.parent_id
+            seen = {task.task_id}
+            while parent in parents and parent not in seen and depth < 250:
+                seen.add(parent)
+                depth += 1
+                parent = parents[parent]
+            wbs.cell(row, 6).alignment = Alignment(vertical="top", wrap_text=True, indent=depth)
+            wbs.row_dimensions[row].outlineLevel = min(depth, 7)
+            wbs.cell(row, 10).number_format = "yyyy-mm-dd"
+        for sheet, column, values, limit, prompt in (
+            (wbs, "A", "Keep,Add,Delete", self.max_nodes, "Blank means Keep. Add uses a NEW-* Task ID."),
+            (deps, "C", "requires_code,order_only", self.max_edges, "Blank means requires_code."),
+            (deps, "E", "Keep,Add,Delete", self.max_edges, "Blank means Keep."),
+            (trace, "B", "requirement,scenario,storyboard,design,api", self.max_edges, "Reference Type is case-insensitive."),
+            (trace, "E", "Keep,Add,Delete", self.max_edges, "Blank means Keep."),
+        ):
+            validation = DataValidation(
+                type="list", formula1=f'"{values}"', allow_blank=True,
+                showDropDown=False, showErrorMessage=False, showInputMessage=True,
+                promptTitle="Import value hint", prompt=prompt,
+            )
+            sheet.add_data_validation(validation)
+            validation.add(f"{column}2:{column}{max(2, limit + 1)}")
         output = io.BytesIO()
         workbook.save(output)
         data = output.getvalue()
@@ -480,9 +578,9 @@ class WorkbookExchange:
     def _sheet_limits(self) -> dict[str, tuple[int, int]]:
         return {
             "Read Me": (64, 2),
-            "WBS": (self.max_nodes + 1, 12),
+            "WBS": (self.max_nodes + 1, 14),
             "Task Details": (self.max_nodes + 1, 7),
-            "Dependencies": (self.max_edges + 1, 5),
+            "Dependencies": (self.max_edges + 1, 7),
             "Traceability": (self.max_edges + 1, 5),
             "Metadata": (2, 6),
         }
@@ -549,6 +647,35 @@ def _preflight(
                 for relationship in root:
                     if relationship.attrib.get("TargetMode") == "External":
                         raise PmError("unsafe_workbook", "external relationship")
+
+
+def _bounded_derived(value: str, limit: int, sheet: str) -> str:
+    if len(value) <= limit:
+        return value
+    notice = f"... See {sheet}."
+    return value[:max(0, limit - len(notice))] + notice[:limit]
+
+
+def _display_numbers(tasks: tuple[WbsTask, ...], limit: int) -> dict[str, str]:
+    task_ids = {task.task_id for task in tasks}
+    children: dict[str | None, list[WbsTask]] = {}
+    for task in tasks:
+        parent = task.parent_id if task.parent_id in task_ids else None
+        children.setdefault(parent, []).append(task)
+    for siblings in children.values():
+        siblings.sort(key=lambda task: (task.order, task.task_id))
+    stack = [(task, str(index)) for index, task in reversed(list(enumerate(children.get(None, []), 1)))]
+    numbers = {}
+    while stack:
+        task, number = stack.pop()
+        if task.task_id in numbers:
+            continue
+        numbers[task.task_id] = _bounded_derived(number, limit, "Parent ID")
+        stack.extend(
+            (child, f"{number}.{index}")
+            for index, child in reversed(list(enumerate(children.get(task.task_id, []), 1)))
+        )
+    return numbers
 
 
 def _tasks(change: ChangeView) -> tuple[WbsTask, ...]:

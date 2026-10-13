@@ -4,7 +4,7 @@ export function sourceEditPolicy(source) {
     : { editable: true, reason: '' };
 }
 
-export function renderDocumentEditor({ ui, document, error, draft, onSave, onAssist, onDirty, onDraft, authoring = { effective: true, reasons: [] }, assistance = { effective: true, reasons: [] }, onError = () => {} }) {
+export function renderDocumentEditor({ ui, document, error, draft, onSave, onAssist, onDirty, onDraft, authoring = { effective: true, reasons: [] }, assistance = { effective: true, reasons: [] }, onError = () => {}, translate = (value) => value }) {
   const { el, renderMarkdown } = ui;
   if (error) return el('section', { class: 'pm-error-state', role: 'alert' }, [el('h2', null, 'Document unavailable'), el('p', null, error)]);
   if (!document) return el('div', { class: 'pm-loading', role: 'status' }, 'Loading document…');
@@ -22,7 +22,7 @@ export function renderDocumentEditor({ ui, document, error, draft, onSave, onAss
   const preview = el('article', { class: 'pm-document-preview' }, renderMarkdown(initial));
   const sourcePane = el('section', { class: 'pm-editor-pane', hidden: true });
   const reviewPane = el('section', { class: 'pm-preview-pane pm-preview-readable' }, [el('h2', null, 'Readable view'), preview]);
-  const toggle = el('button', { class: 'btn', type: 'button', 'aria-pressed': 'false' }, 'Edit source');
+  const toggle = el('button', { class: 'btn', type: 'button', 'aria-pressed': 'false' }, translate('Edit source'));
   const save = el('button', { class: 'btn btn-primary', type: 'button' }, 'Save draft');
   const assist = el('button', { class: 'btn', type: 'button' }, 'Planning assistant');
   save.disabled = true;
@@ -49,7 +49,7 @@ export function renderDocumentEditor({ ui, document, error, draft, onSave, onAss
     const editing = sourcePane.hidden;
     sourcePane.hidden = !editing;
     reviewPane.hidden = editing;
-    toggle.textContent = editing ? 'Review document' : 'Edit source';
+    toggle.textContent = translate(editing ? 'Review document' : 'Edit source');
     toggle.setAttribute('aria-pressed', String(editing));
     if (editing) source.focus();
   });

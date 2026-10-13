@@ -258,7 +258,7 @@ Prompt
     ("key", "value"),
     [
         ("planning_codex_version", "0.161.0"),
-        ("planning_model", "gpt-5.6-sol"),
+        ("planning_model", "gpt-6.1-sol"),
         ("planning_reasoning_effort", "high"),
     ],
 )
@@ -270,7 +270,7 @@ def test_pm_config_rejects_pinned_planning_keys(tmp_path, key, value):
         build_service_config(load_workflow(path))
     message = str(raised.value)
     assert "0.160.0" in message
-    assert "gpt-5.6-sol" in message
+    assert "gpt-6.1-sol" in message
     assert "medium" in message
 
 

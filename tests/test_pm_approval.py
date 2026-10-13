@@ -258,3 +258,26 @@ def test_fenced_or_quoted_requirement_examples_do_not_define_requirements(
     with pytest.raises(PmError) as exc:
         service.approve(ctx, service.confirmation_token(ctx, owner="owner"), "reviewer", owner="owner")
     assert exc.value.code == "unresolved_reference"
+
+
+def test_current_approval_projects_until_real_revision_edit(tmp_path: Path) -> None:
+    repo, change_id, workspace = _repository(tmp_path)
+    change = _populate(repo, change_id, workspace)
+    service = PmApprovalService(repo, repo.registry, lambda _root, _locator: ValidationReport(True))
+    ctx = PmRequestContext("p1", change_id, change.revision)
+    manifest = service.approve(ctx, service.confirmation_token(ctx, owner="owner"), "reviewer", owner="owner")
+    approved = repo.get_change(ctx, owner="owner", locked=True)
+    assert (approved.state, approved.approval_id) == ("Approved", manifest.approval_id)
+    assert (approved.scope_hash, approved.revision) == (manifest.scope_hash, manifest.revision)
+
+    document = repo.get_document(ctx, "proposal", owner="owner")
+    edited = repo.patch_document(
+        PmRequestContext("p1", change_id, approved.revision, "approval-edit"),
+        "proposal", ({"op": "replace_source", "source": document.source + "\nReview note: updated scope.\n"},),
+        owner="owner",
+    )
+    assert edited.revision != approved.revision
+    current = repo.get_change(PmRequestContext("p1", change_id), owner="owner")
+    assert (current.state, current.approval_id) == ("Validated", None)
+    active = repo.registry.get_active_pm_approval("p1", change_id)
+    assert active is not None and active["revision_hash"] == approved.revision

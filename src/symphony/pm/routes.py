@@ -18,6 +18,7 @@ from dataclasses import asdict, is_dataclass
 from datetime import date, datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, TypeVar
+from urllib.parse import quote
 
 from aiohttp import web
 
@@ -26,7 +27,7 @@ from .application import PmApplication
 from .approval import PmApprovalService
 from .documents import PmDocumentRepository
 from .exchange import WorkbookExchange
-from .handoff import PmHandoffService
+from .handoff import PmHandoffService, _task_revision
 from .models import ArchiveCandidate, ChangeView, DocumentView, ExportPayload, PmError, PmFinding, PmRequestContext, ValidationReport
 from .openspec import OpenSpecAdapter
 from .planning import PmPlanningClient
@@ -36,6 +37,8 @@ from .verification import PmVerificationService, successful_run_provenance
 from .coverage import PmCoverageService
 from .identity import host_project_identity
 from ..orchestrator.run_registry import RunRegistry
+from ..issue import PlanningRef
+from ..trackers.file import FileBoardTracker
 
 _CHANGE_ID = re.compile(r"^[0-9a-f]{32}$")
 _T = TypeVar("_T")
@@ -442,8 +445,12 @@ def register_pm_routes(app: web.Application, ctx: Any, orchestrator: Any) -> Non
         change = await asyncio.to_thread(load_change)
         if format_name == "xlsx":
             async with exchange_semaphore():
+                runtime = await asyncio.to_thread(
+                    _with_thread_repository, pmapp.repository,
+                    lambda repository: _export_runtime_projection(repository.registry, pmapp.handoff.tracker, change),
+                )
                 exported = await asyncio.to_thread(
-                    pmapp.exchange.export, change, {}, export_id=export_id
+                    pmapp.exchange.export, change, runtime, export_id=export_id
                 )
         else:
             exported = _render_export(change, format_name, pmapp.exchange)
@@ -1319,6 +1326,53 @@ def _with_thread_repository(
         ))
     finally:
         thread_registry.close()
+
+
+def _export_runtime_projection(
+    registry: RunRegistry, tracker: FileBoardTracker, change: ChangeView,
+) -> dict[str, dict[str, str]]:
+    document = next((item for item in change.documents if item.document_id == "tasks"), None)
+    revisions = {
+        task.task_id: _task_revision(task) for task in parse_wbs(document.source).tasks
+    } if document is not None else {}
+    eligible = []
+    approvals: dict[str, dict[str, Any] | None] = {}
+    for mapping in registry.list_pm_managed_tickets(change.project_id):
+        if (
+            mapping.project_id != change.project_id or mapping.change_id != change.change_id
+            or mapping.state != "PUBLISHED" or mapping.task_revision != revisions.get(mapping.task_id)
+        ):
+            continue
+        scope = registry.get_pm_managed_ticket_scope(change.project_id, mapping.ticket_identifier)
+        if scope is None or (
+            scope["project_id"], scope["change_id"], scope["task_id"], scope["task_revision"],
+            scope["handoff_id"], scope["deterministic_ticket_id"], scope["state"], scope["batch_state"],
+        ) != (
+            change.project_id, change.change_id, mapping.task_id, mapping.task_revision,
+            mapping.handoff_id, mapping.ticket_identifier, "PUBLISHED", "PUBLISHED",
+        ):
+            continue
+        approval_id = str(scope["approval_id"])
+        if approval_id not in approvals:
+            approvals[approval_id] = registry.get_pm_approval(approval_id)
+        approval = approvals[approval_id]
+        if approval is None or (
+            approval["project_id"], approval["change_id"], approval["scope_hash"], approval["approval_id"],
+        ) != (change.project_id, change.change_id, scope["scope_hash"], scope["snapshot_id"]):
+            continue
+        reference = PlanningRef(change.change_id, mapping.task_id, mapping.task_revision, mapping.handoff_id, str(scope["snapshot_id"]))
+        eligible.append((mapping, reference))
+    if not eligible:
+        return {}
+    issues = {issue.identifier: issue for issue in tracker.scan_all()}
+    runtime = {}
+    for mapping, reference in sorted(eligible, key=lambda item: item[0].updated_at, reverse=True):
+        issue = issues.get(mapping.ticket_identifier)
+        if issue is not None and issue.planning_ref_state == "valid" and issue.planning_ref == reference:
+            runtime.setdefault(mapping.task_id, {
+                "state": issue.state, "link": f"/api/v1/issues/{quote(issue.identifier, safe='')}",
+            })
+    return runtime
 
 
 def _read_change_snapshot(

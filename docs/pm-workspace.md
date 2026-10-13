@@ -17,6 +17,8 @@ The planning assistant offers seven explicit proposal-only actions: Draft artifa
 
 Each planning screen has a **What do these buttons do?** panel that explains every button in one sentence. It is folded by default and open in the demo. To choose the page language, add `?lang=en` or `?lang=ko` before the `#` in the address, for example `http://127.0.0.1:<port>/?lang=ko#/artifacts`. The choice is remembered like the language switch.
 
+Document editors begin in readable view. **Edit source** reveals the editor and focuses its textarea; **Review document** returns to the preview. In Korean these controls read **소스 편집** and **문서 검토** through repeated toggles. Opening the source from Design → Storyboard, UX, or API preserves the selected language for the nested editor and its Add controls. Toggling does not save or discard a draft.
+
 ## Demo
 
 Try PM Workspace on sample content without touching a real project:
@@ -60,7 +62,9 @@ Symphony ships a trimmed OpenSpec 1.14.0 CLI that keeps only the commands PM Wor
 
 Buttons that need a missing tool are disabled from the start and show the reason. Without a suitable Node.js, Approve revision and Preview archive are disabled; Validate still runs and lists the problems it can find without OpenSpec. With `assistance: true`, the planning assistant is disabled until Codex 0.160.0 is installed and logged in.
 
-XLSX exchange requires the `pm-exchange` optional dependencies. Browser assets are local and lazy; no CDN is contacted. Automatic PM assistance uses a dedicated Codex app-server 0.160.0 process with GPT-5.6 Sol at medium reasoning, an isolated configuration home, no tools/connectors/network execution, read-only sandboxing, and a strict proposal-only output contract.
+The planning client pins its Codex version, model, and reasoning effort. `pm.planning_codex_version`, `pm.planning_model`, and `pm.planning_reasoning_effort` are rejected at workflow load; remove them rather than expecting an override. Other unknown `pm.*` settings are currently ignored.
+
+XLSX exchange requires the `pm-exchange` optional dependencies. Browser assets are local and lazy; no CDN is contacted. Automatic PM assistance uses a dedicated Codex app-server 0.160.0 process with GPT-6.1 Sol at medium reasoning, an isolated configuration home, no tools/connectors/network execution, read-only sandboxing, and a strict proposal-only output contract.
 
 ## Managed WBS
 
@@ -81,3 +85,15 @@ verification_policy:
 Human-readable Verification bullets remain descriptive. Only the structured policy selects procedures; an absent policy retains legacy native-command behavior.
 
 Workbook imports accept a plain `.xlsx` filename and base64 workbook content. The preview uses a three-way comparison. Missing sheets or rows retain content; deletion requires an explicit `Action=Delete`. Formulas, duplicate IDs, external relationships, macros, embedded objects, hostile XML, oversized ZIPs, and oversized worksheet dimensions are rejected before mutation.
+
+Workbook exports include a UTC export time and a leaf-task status summary in Read Me. Execution statuses are snapshots of matching published native tickets; missing or stale states are marked **Not supplied**, independently of the change's planning state. The summary lists up to 48 distinct supplied states and counts any additional states together; full values remain in WBS. Display Number follows parent/order hierarchy, WBS summarizes dependencies, and Dependencies shows adjacent task titles. Read-only runtime links point to matching native tickets on existing Traceability rows. Identifying columns stay frozen, task titles are indented by parent depth, and gray cells distinguish existing identities and derived/runtime/provenance fields. Dropdowns provide hints for Action, dependency Kind, and Reference Type. Type, Priority, and Agent Override still accept custom values.
+
+## Final human review
+
+Human acceptance is pending until the owner performs this review on the delivered commit and installed wheel. Automated checks do not grant merge approval. Use new disposable demo folders for each language and keep the reported commit, wheel hash, and installed package binding with your observations.
+
+1. Run `symphony pm demo --lang en`, then repeat with `--lang ko`. Open the printed loopback link. The sample, five tabs, and button guides should use the chosen language; the planning assistant should be disabled with its demo reason. No agent run should start.
+2. In Idea, toggle Edit source → Review document twice. Repeat in Design → Storyboard, UX, and API, including the outer Edit source action. Expect translated nested controls, a focused textarea when editing, unchanged source after toggling, and the appropriate Add storyboard or Add contract control. Type a disposable draft and toggle again: the draft and unsaved state should remain until Save draft or an explicit discard.
+3. Validate and approve the unchanged sample. Expect combined validation, then Approved with a current approval ID. Edit and save a planning document: the earlier approval should no longer authorize that revision. Undo your disposable edit as needed, validate, approve, and preview handoff. Confirm only in the demo; expect ordinary demo-board tickets and no worker run.
+4. Use the separately prepared installed-workflow fixture for XLSX review/import, proposal-only assistance, native/manual verification, explicit task acceptance, and archive/history. Check the expected observations in its evidence and [operations rules](pm-workspace-operations.md); the demo does not supply real worker or provider proof. Archived history should remain readable and refuse mutation.
+5. Read the [accepted findings and platform limits](pm-workspace-operations.md#accepted-findings-and-current-handling). Record any failure with language, tab/subview, action, observed label/state, screenshot, and the exact delivered commit. Human acceptance and any later merge decision remain separate recorded decisions.

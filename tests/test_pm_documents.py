@@ -844,3 +844,65 @@ def test_structured_field_batch_parses_the_full_wbs_only_before_and_after(
     assert {task.task_id: task.notes for task in wbs_view.tasks if task.task_id in task_ids} == {
         task_id: "batched" for task_id in task_ids
     }
+
+
+def _record_projection_approval(repo, change, tmp_path, *, approval_id="projection-approval", **overrides):
+    manifest = tmp_path / f"{approval_id}.json"
+    manifest.write_text("{}\n", encoding="utf-8")
+    payload = dict(
+        approval_id=approval_id, project_id=change.project_id, change_id=change.change_id,
+        scope_hash=change.scope_hash, revision_hash=change.revision,
+        manifest_ref=str(manifest), reviewer_label="reviewer", approved_at="2026-10-11T00:00:00Z",
+    )
+    repo.registry.record_pm_approval(**{**payload, **overrides})
+
+
+@pytest.mark.parametrize("case", ["missing", "scope", "revision", "project", "change", "superseded", "active-stale"])
+def test_approval_projection_ignores_noncurrent_records(tmp_path: Path, case: str) -> None:
+    repo, change_id, _ = _repository(tmp_path)
+    change = repo.create_change(change_id=change_id, locator="projection", title="Projection", owner="owner")
+    overrides = {
+        "scope": {"scope_hash": "sha256:stale-scope"},
+        "revision": {"revision_hash": "sha256:stale-revision"},
+        "project": {"project_id": "other-project"},
+        "change": {"change_id": "other-change"},
+    }
+    if case != "missing":
+        _record_projection_approval(repo, change, tmp_path, **overrides.get(case, {}))
+    if case == "superseded":
+        repo.registry._connect().execute(
+            "UPDATE pm_approvals SET superseded_by = ? WHERE approval_id = ?",
+            ("replacement", "projection-approval"),
+        )
+        repo.registry._connect().commit()
+    elif case == "active-stale":
+        _record_projection_approval(repo, change, tmp_path, approval_id="active-stale", revision_hash="sha256:stale")
+        active = repo.registry.get_active_pm_approval("p1", change_id)
+        assert active is not None and active["approval_id"] == "active-stale"
+    current = repo.get_change(PmRequestContext("p1", change_id), owner="owner")
+    assert (current.state, current.approval_id) == (change.state, None)
+    assert (current.revision, current.scope_hash) == (change.revision, change.scope_hash)
+
+
+def test_archived_approval_projection_is_immutable_and_readonly(tmp_path: Path, monkeypatch) -> None:
+    import symphony.pm.documents as documents_module
+
+    repo, change_id, workspace = _repository(tmp_path)
+    change = repo.create_change(change_id=change_id, locator="projection-history", title="History", owner="owner")
+    _record_projection_approval(repo, change, tmp_path)
+    active = workspace / "openspec/changes/projection-history"
+    archived = workspace / "openspec/changes/archive/2026-10-11-projection-history"
+    archived.parent.mkdir(parents=True)
+    active.rename(archived)
+    assert repo.registry.set_pm_workspace_state("p1", change_id, fence=1, state="RELEASED")
+    before = {path.relative_to(archived): path.read_bytes() for path in archived.rglob("*") if path.is_file()}
+
+    def forbidden(*args, **kwargs):
+        pytest.fail("Archived reads must not lock history or look up active approval")
+
+    monkeypatch.setattr(documents_module, "_change_lock", forbidden)
+    monkeypatch.setattr(repo.registry, "get_active_pm_approval", forbidden)
+    history = repo.get_change(PmRequestContext("p1", change_id), owner="owner", locked=True)
+    assert (history.state, history.approval_id) == ("Archived", None)
+    assert history.next_action == "history" and all(not doc.editable for doc in history.documents)
+    assert {path.relative_to(archived): path.read_bytes() for path in archived.rglob("*") if path.is_file()} == before

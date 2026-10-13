@@ -3,6 +3,8 @@ from __future__ import annotations
 import io
 import re
 import zipfile
+from dataclasses import replace
+from datetime import UTC, datetime
 
 import openpyxl
 import pytest
@@ -132,6 +134,251 @@ def test_export_id_is_embedded_for_durable_trusted_base_lookup() -> None:
     metadata = exchange.inspect_metadata(payload.data)
     assert metadata["export_id"] == "a" * 32
     assert metadata["revision"] == "sha256:base"
+
+
+def test_export_readme_counts_only_leaf_runtime_snapshots_and_records_time() -> None:
+    before = datetime.now(UTC)
+    payload = WorkbookExchange().export(_change(), {
+        "G-ABCDEFGH": {"state": "Done"},
+        "T-ABCDEFGH": {"state": "=Custom state"},
+        "unknown-task": {"state": "Done"},
+    })
+    after = datetime.now(UTC)
+    workbook = openpyxl.load_workbook(io.BytesIO(payload.data))
+    try:
+        rows = dict(workbook["Read Me"].values)
+        assert before <= datetime.fromisoformat(rows["Exported at (UTC)"]) <= after
+        assert rows["Leaf tasks"] == 2
+        assert rows["Not supplied"] == 1
+        assert rows["Supplied: =Custom state"] == 1
+        assert "Supplied: Done" not in rows
+        assert "Supplied: Draft" not in rows
+        assert "export-time snapshots" in rows["Execution snapshots"]
+        assert "not supplied" in rows["Status legend"].lower()
+        assert workbook["WBS"]["L3"].value == "=Custom state"
+        assert all(cell.data_type != "f" for row in workbook["Read Me"] for cell in row)
+    finally:
+        workbook.close()
+
+
+@pytest.mark.parametrize("runtime", [{}, {"T-ABCDEFGH": {"state": ""}}, {"T-ABCDEFGH": {"state": None}}])
+def test_export_missing_runtime_is_not_inferred_from_planning_state(runtime) -> None:
+    change = replace(_change(), state="Approved")
+    payload = WorkbookExchange().export(change, runtime)
+    workbook = openpyxl.load_workbook(io.BytesIO(payload.data))
+    try:
+        rows = dict(workbook["Read Me"].values)
+        assert rows["State"] == "Approved"
+        assert rows["Not supplied"] == rows["Leaf tasks"] == 2
+        assert workbook["WBS"]["L3"].value is None
+    finally:
+        workbook.close()
+
+
+def test_export_empty_and_many_distinct_statuses_stay_within_readme_bounds() -> None:
+    exchange = WorkbookExchange()
+    empty = replace(_change(), documents=())
+    workbook = openpyxl.load_workbook(io.BytesIO(exchange.export(empty, {}).data))
+    try:
+        assert dict(workbook["Read Me"].values)["Leaf tasks"] == 0
+        assert workbook["Read Me"].max_row <= 64
+    finally:
+        workbook.close()
+
+    change = _change()
+    document = change.documents[0]
+    group = document.source.split("<!-- symphony-task:", 1)[0]
+    foundation = document.source.split("<!-- symphony-task:T-ZZZZZZZZ -->", 1)[1]
+    ids = [f"T-{index:08d}" for index in range(80)]
+    source = group + "".join(
+        f"<!-- symphony-task:{task_id} -->" + foundation.replace("T-ZZZZZZZZ", task_id)
+        for task_id in ids
+    )
+    change = replace(change, documents=(replace(document, source=source),))
+    runtime = {task_id: {"state": f"@state {index} " + "x" * 200} for index, task_id in enumerate(ids)}
+    payload = exchange.export(change, runtime)
+    workbook = openpyxl.load_workbook(io.BytesIO(payload.data))
+    try:
+        readme = workbook["Read Me"]
+        rows = dict(readme.values)
+        assert readme.max_row <= 64 and readme.max_column == 2
+        assert rows["Leaf tasks"] == 80
+        assert rows["Additional supplied statuses"] > 0
+        summary_start = next(row[0].row for row in readme if row[0].value == "Leaf status summary")
+        assert sum(row[1].value for row in list(readme)[summary_start:]) == 80
+        assert workbook["WBS"]["L3"].value == runtime[ids[0]]["state"]
+        assert all(cell.data_type != "f" for row in readme for cell in row)
+    finally:
+        workbook.close()
+    assert exchange.preview_import(payload.data, change, change).changes == ()
+
+
+def test_export_native_presentation_preserves_headers_and_advisory_controls() -> None:
+    workbook = openpyxl.load_workbook(io.BytesIO(WorkbookExchange().export(_change(), {}).data))
+    try:
+        assert {name: workbook[name].freeze_panes for name in ("WBS", "Task Details", "Dependencies", "Traceability")} == {
+            "WBS": "D2", "Task Details": "B2", "Dependencies": "C2", "Traceability": "B2",
+        }
+        assert workbook["WBS"]["F2"].alignment.indent == 0
+        assert workbook["WBS"]["F3"].alignment.indent == 1
+        assert workbook["WBS"].row_dimensions[3].outlineLevel == 1
+        assert workbook["WBS"]["B3"].fill.fgColor != workbook["WBS"]["F3"].fill.fgColor
+        assert workbook["WBS"]["L3"].fill.fgColor == workbook["WBS"]["B3"].fill.fgColor
+        assert workbook["Traceability"]["D2"].fill.fgColor != workbook["Traceability"]["C2"].fill.fgColor
+        assert workbook["Metadata"]["A2"].fill.fgColor == workbook["WBS"]["B3"].fill.fgColor
+        assert workbook["WBS"]["F3"].alignment.wrap_text
+        assert workbook["WBS"].auto_filter.ref == "A1:N4"
+        expected = {
+            "WBS": {"A": '"Keep,Add,Delete"'},
+            "Dependencies": {"C": '"requires_code,order_only"', "E": '"Keep,Add,Delete"'},
+            "Traceability": {"B": '"requirement,scenario,storyboard,design,api"', "E": '"Keep,Add,Delete"'},
+        }
+        for name, columns in expected.items():
+            validations = workbook[name].data_validations.dataValidation
+            assert len(validations) == len(columns)
+            for validation in validations:
+                column = str(validation.sqref).split("2:")[0]
+                assert validation.type == "list" and validation.formula1 == columns[column]
+                assert validation.allowBlank and validation.showInputMessage
+                assert not validation.showErrorMessage and not validation.showDropDown
+        assert tuple(cell.value for cell in workbook["Metadata"][1]) == (
+            "format_version", "project_id", "change_id", "revision", "scope_hash", "export_id",
+        )
+        assert workbook["Metadata"].max_row == 2 and workbook["Metadata"].max_column == 6
+    finally:
+        workbook.close()
+
+
+@pytest.mark.parametrize("legacy", [False, True])
+@pytest.mark.parametrize("prefix", ["=", "+", "-", "@"])
+def test_export_custom_values_literal_prefixes_and_legacy_v1_still_round_trip(legacy, prefix) -> None:
+    exchange = WorkbookExchange()
+    change = _change(prefix + "Custom title")
+    document = change.documents[0]
+    source = document.source.replace("type: Backend", "type: CustomDelivery").replace(
+        "type: CustomDelivery", "type: CustomDelivery\npriority: urgent-custom\nagent_kind: bespoke-agent", 1,
+    )
+    change = replace(change, documents=(replace(document, source=source),))
+    payload = exchange.export(change, {})
+    workbook = openpyxl.load_workbook(io.BytesIO(payload.data))
+    try:
+        assert workbook["WBS"]["E3"].value == "CustomDelivery"
+        assert workbook["WBS"]["I3"].value == "urgent-custom"
+        assert workbook["WBS"]["H3"].value == "bespoke-agent"
+        assert workbook["WBS"]["F3"].data_type == "s"
+        workbook["WBS"]["A3"] = None
+        workbook["Dependencies"]["C2"] = None
+        workbook["Dependencies"]["E2"] = None
+        workbook["Traceability"]["B2"] = " ReQuIrEmEnT "
+        workbook["Traceability"]["E2"] = None
+        if legacy:
+            workbook["Read Me"].delete_rows(6, 64)
+            workbook["WBS"].delete_cols(13, 2)
+            workbook["Dependencies"].delete_cols(6, 2)
+            for sheet in workbook:
+                sheet.freeze_panes = "A2"
+                sheet.data_validations.dataValidation.clear()
+        output = io.BytesIO()
+        workbook.save(output)
+    finally:
+        workbook.close()
+    candidate = exchange.preview_import(output.getvalue(), change, change)
+    assert candidate.changes == () and candidate.conflicts == () and candidate.findings == ()
+
+
+def test_export_derived_fields_are_snapshot_only_and_ignored_on_import() -> None:
+    exchange = WorkbookExchange()
+    change = _change("=SUM(1,1)")
+    payload = exchange.export(change, {"T-ABCDEFGH": {"state": "Done", "link": "/api/v1/issues/PM-1"}})
+    workbook = openpyxl.load_workbook(io.BytesIO(payload.data))
+    try:
+        assert [cell.value for cell in workbook["WBS"][1]][12:] == ["Display Number", "Dependency Summary"]
+        assert [cell.value for cell in workbook["Dependencies"][1]][5:] == ["Task Title", "Predecessor Title"]
+        assert workbook["WBS"]["M2"].value == "1"
+        assert workbook["WBS"]["M3"].value == "1.1"
+        assert workbook["WBS"]["M4"].value == "1.2"
+        assert workbook["WBS"]["N3"].value == "T-ZZZZZZZZ: Foundation (requires_code)"
+        assert workbook["Dependencies"]["F2"].value == "=SUM(1,1)"
+        assert workbook["Dependencies"]["F2"].data_type == "s"
+        assert workbook["Dependencies"]["G2"].value == "Foundation"
+        assert workbook["Traceability"]["D2"].value == "/api/v1/issues/PM-1"
+        for sheet, cells in {"WBS": ("L3", "M3", "N3"), "Dependencies": ("F2", "G2"), "Traceability": ("D2",)}.items():
+            for coordinate in cells:
+                assert workbook[sheet][coordinate].fill.fgColor == workbook["WBS"]["B3"].fill.fgColor
+                workbook[sheet][coordinate] = "Derived edit is ignored"
+        output = io.BytesIO()
+        workbook.save(output)
+    finally:
+        workbook.close()
+    candidate = exchange.preview_import(output.getvalue(), change, change)
+    assert candidate.changes == candidate.conflicts == candidate.findings == ()
+    workbook = openpyxl.load_workbook(io.BytesIO(output.getvalue()))
+    workbook["WBS"]["M3"] = "=1+1"
+    unsafe = io.BytesIO()
+    workbook.save(unsafe)
+    workbook.close()
+    with pytest.raises(PmError, match="formula cell"):
+        exchange.preview_import(unsafe.getvalue(), change, change)
+
+
+def test_derived_numbering_uses_parent_order_and_bounds_summary_text() -> None:
+    exchange = WorkbookExchange(max_text_chars=128)
+    change = _change()
+    document = change.documents[0]
+    source = document.source.replace("order: 10\ntype: Backend", "order: 30\ntype: Backend", 1)
+    title = ("@" + "Long foundation " * 7).rstrip()
+    source = source.replace("- [ ] Foundation", "- [ ] " + title)
+    change = replace(change, documents=(replace(document, source=source),))
+    payload = exchange.export(change, {})
+    workbook = openpyxl.load_workbook(io.BytesIO(payload.data))
+    try:
+        assert workbook["WBS"]["M3"].value == "1.2"
+        assert workbook["WBS"]["M4"].value == "1.1"
+        assert len(workbook["WBS"]["N3"].value) <= 128
+        assert workbook["WBS"]["N3"].value.endswith("See Dependencies.")
+        assert workbook["Dependencies"]["G2"].value == title
+        assert workbook["Dependencies"]["G2"].data_type == "s"
+    finally:
+        workbook.close()
+    assert exchange.preview_import(payload.data, change, change).changes == ()
+
+
+def test_deep_derived_numbering_does_not_recurse_and_remains_importable() -> None:
+    change = _change()
+    document = change.documents[0]
+    group = document.source.split("<!-- symphony-task:", 1)[0]
+    group_block = group[group.index("<!-- symphony-group:"):]
+    foundation = document.source.split("<!-- symphony-task:T-ZZZZZZZZ -->", 1)[1]
+    blocks = []
+    parent = "G-ABCDEFGH"
+    for index in range(1_100):
+        group_id = f"G-{index:08d}"
+        blocks.append(group_block.replace("G-ABCDEFGH", group_id).replace("parent_id: null", "parent_id: " + parent))
+        parent = group_id
+    leaf = "<!-- symphony-task:T-ZZZZZZZZ -->" + foundation.replace("parent_id: G-ABCDEFGH", "parent_id: " + parent)
+    change = replace(change, documents=(replace(document, source=group + "".join(blocks) + leaf),))
+    exchange = WorkbookExchange(max_text_chars=128)
+    payload = exchange.export(change, {})
+    workbook = openpyxl.load_workbook(io.BytesIO(payload.data), read_only=True)
+    try:
+        number = workbook["WBS"]["M1103"].value
+        assert len(number) <= 128 and number.endswith("See Parent ID.")
+    finally:
+        workbook.close()
+    assert exchange.preview_import(payload.data, change, change).changes == ()
+
+
+@pytest.mark.parametrize("sheet,column", [("WBS", 15), ("Dependencies", 8)])
+def test_derived_columns_keep_exact_worksheet_bounds(sheet, column) -> None:
+    exchange = WorkbookExchange()
+    change = _change()
+    workbook = openpyxl.load_workbook(io.BytesIO(exchange.export(change, {}).data))
+    workbook[sheet].cell(1, column, "Unsupported extra column")
+    output = io.BytesIO()
+    workbook.save(output)
+    workbook.close()
+    with pytest.raises(PmError, match="worksheet dimensions exceed limit"):
+        exchange.preview_import(output.getvalue(), change, change)
 
 
 def test_nondefault_instance_limits_are_enforced() -> None:
