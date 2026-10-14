@@ -482,3 +482,40 @@ def test_manual_evidence_confirm_rechecks_current_policy(tmp_path: Path) -> None
         service.confirm_manual_evidence(
             preview, preview.confirmation_token, "policy-drift"
         )
+
+
+@pytest.mark.timing
+def test_manual_git_timeout_reaps_process_and_repair_resolves_same_immutable_blob(tmp_path, monkeypatch):
+    import os
+    import time
+    import symphony.pm.verification as verification
+    from symphony.pm.models import PmError
+
+    _repo, commit, _run_id, registry, _store, service = _fixture(tmp_path)
+    service.project_root = _repo
+    service.timeout_seconds = .5
+    pid_file = tmp_path / "git-child.pid"
+    original = subprocess.run
+    def slow_git(argv, *args, **kwargs):
+        if argv[0] == "git" and "show" in argv:
+            child = [sys.executable, "-c", "import os,time; from pathlib import Path; Path(" + repr(str(pid_file)) + ").write_text(str(os.getpid())); time.sleep(60)"]
+            return original(child, *args, **kwargs)
+        return original(argv, *args, **kwargs)
+    monkeypatch.setattr(verification.subprocess, "run", slow_git)
+    ref = {"ref_kind": "git_blob", "ref": "file"}
+    try:
+        started = time.monotonic()
+        with pytest.raises(PmError) as failure:
+            service._resolve_ref("PM-1", commit, ref, report=True)
+        assert failure.value.code == "invalid_evidence_ref" and failure.value.status == 409
+        assert failure.value.message == "Git evidence blob is unavailable"
+        assert time.monotonic() - started < 2
+        pid = int(pid_file.read_text())
+        with pytest.raises(ProcessLookupError):
+            os.kill(pid, 0)
+        monkeypatch.setattr(verification.subprocess, "run", original)
+        recovered = service._resolve_ref("PM-1", commit, ref, report=True)
+        assert recovered["sha256"] == "sha256:" + hashlib.sha256(b"fixture\n").hexdigest()
+        assert recovered["size_bytes"] == len(b"fixture\n")
+    finally:
+        registry.close()

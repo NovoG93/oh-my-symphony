@@ -19,6 +19,11 @@ Each planning screen has a **What do these buttons do?** panel that explains eve
 
 Document editors begin in readable view. **Edit source** reveals the editor and focuses its textarea; **Review document** returns to the preview. In Korean these controls read **소스 편집** and **문서 검토** through repeated toggles. Opening the source from Design → Storyboard, UX, or API preserves the selected language for the nested editor and its Add controls. Toggling does not save or discard a draft.
 
+Recovered local source drafts can be saved immediately. The editor compares them with the saved document; a recovered draft is not already saved. When leaving a tab, Design subview, planning change, or project with unsaved edits, Cancel keeps the draft and selection. Confirming discard clears that recovery draft. Save explicitly to keep the changes in the planning files.
+
+PM drawers and dialogs use one active overlay with an opaque readable surface. While it is open, the background is unavailable and Tab/Shift+Tab stay inside it; Escape or Close returns focus to its trigger. Storyboard Escape, Cancel, or background close asks before discarding changed fields. Cancelling keeps those fields available; a failed save keeps the editor and its error visible. Task autosave keeps its current drawer open.
+
+
 ## Demo
 
 Try PM Workspace on sample content without touching a real project:
@@ -60,11 +65,11 @@ pm:
 
 Symphony ships a trimmed OpenSpec 1.14.0 CLI that keeps only the commands PM Workspace calls. It is the default: when `openspec_executable` is absent, PM Workspace runs it with the `node` on your PATH, which must be Node.js 20.19.0 or newer. Set `openspec_executable` only to use your own OpenSpec 1.14.0 install. A config copied from an older example with `openspec_executable: openspec` keeps calling that external program; remove the line to use the bundle.
 
-Buttons that need a missing tool are disabled from the start and show the reason. Without a suitable Node.js, Approve revision and Preview archive are disabled; Validate still runs and lists the problems it can find without OpenSpec. With `assistance: true`, the planning assistant is disabled until Codex 0.160.0 is installed and logged in.
+Buttons that need a missing tool are disabled from the start and show the reason. Without a suitable Node.js, Approve revision and Preview archive are disabled; Validate still runs and lists the problems it can find without OpenSpec. With `assistance: true`, the planning assistant is disabled until the installed Codex CLI supports the restricted app-server controls and is logged in.
 
-The planning client pins its Codex version, model, and reasoning effort. `pm.planning_codex_version`, `pm.planning_model`, and `pm.planning_reasoning_effort` are rejected at workflow load; remove them rather than expecting an override. Other unknown `pm.*` settings are currently ignored.
+The planning client uses the installed Codex CLI after a bounded capability check and pins its model and reasoning effort. `pm.planning_codex_version`, `pm.planning_model`, and `pm.planning_reasoning_effort` are rejected at workflow load; remove them rather than expecting an override. Other unknown `pm.*` settings are currently ignored.
 
-XLSX exchange requires the `pm-exchange` optional dependencies. Browser assets are local and lazy; no CDN is contacted. Automatic PM assistance uses a dedicated Codex app-server 0.160.0 process with GPT-6.1 Sol at medium reasoning, an isolated configuration home, no tools/connectors/network execution, read-only sandboxing, and a strict proposal-only output contract.
+XLSX exchange requires the `pm-exchange` optional dependencies. Browser assets are local and lazy; no CDN is contacted. Automatic PM assistance uses a dedicated compatible installed Codex app-server process with GPT-6.1 Sol at medium reasoning, an isolated configuration home, no tools/connectors/network execution, read-only sandboxing, and a strict proposal-only output contract.
 
 ## Managed WBS
 

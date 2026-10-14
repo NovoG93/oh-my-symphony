@@ -24,7 +24,7 @@ export function storyboardPatchOperation(frame, values) {
   return { op: 'set_storyboard_fields', storyboard_id: frame.storyboard_id, fields };
 }
 
-export function renderStoryboard({ ui, frames = [], selectedId = '', onSelect, onSave, onClose, authoring = { effective: true, reasons: [] }, onError = () => {} }) {
+export function renderStoryboard({ ui, overlay, localize = () => {}, onDirty = () => {}, confirmDiscard = () => true, frames = [], selectedId = '', onSelect, onSave, onClose, authoring = { effective: true, reasons: [] }, onError = () => {} }) {
   const { el } = ui;
   if (!frames.length) return el('section', { class: 'pm-empty-state' }, el('p', null, 'No storyboard frames are available.'));
   const selected = frames.find((frame) => frame.storyboard_id === selectedId);
@@ -47,6 +47,8 @@ export function renderStoryboard({ ui, frames = [], selectedId = '', onSelect, o
 
   const drawer = el('section', { class: 'pm-task-drawer pm-storyboard-drawer', role: 'dialog', 'aria-modal': 'true', 'aria-label': `Edit storyboard ${selected.storyboard_id}` });
   const inputs = {};
+  const originals = {};
+  const changed = () => Object.keys(inputs).some((name) => inputs[name].value !== originals[name]);
   const labels = {
     title: 'Title', screen_route: 'Screen / route', actor_goal: 'Actor and goal', initial_state: 'Initial state',
     ui: 'UI', user_action: 'User action', system_response: 'System response', success: 'Success', alternate: 'Alternate', failure: 'Failure',
@@ -56,7 +58,8 @@ export function renderStoryboard({ ui, frames = [], selectedId = '', onSelect, o
     const multiline = !['title', 'screen_route'].includes(name);
     const input = el(multiline ? 'textarea' : 'input', { class: multiline ? 'input pm-drawer-textarea' : 'input', 'aria-label': labels[name] });
     const value = name.endsWith('_refs') ? (selected[name] || []).join('\n') : selected[name] || '';
-    input.value = value;
+    input.value = value; originals[name] = value;
+    input.addEventListener('input', () => onDirty(changed()));
     input.disabled = !authoring.effective;
     inputs[name] = input;
     drawer.append(el('label', { class: 'pm-drawer-field' }, [el('span', null, labels[name]), input]));
@@ -64,27 +67,20 @@ export function renderStoryboard({ ui, frames = [], selectedId = '', onSelect, o
   const close = el('button', { class: 'btn', type: 'button' }, 'Cancel');
   const save = el('button', { class: 'btn btn-primary', type: 'button' }, 'Save storyboard');
   if (!authoring.effective) { save.disabled = true; save.title = (authoring.reasons || []).join(' '); }
-  close.addEventListener('click', () => onClose(close));
+  close.addEventListener('click', () => overlay.close(drawer));
   save.addEventListener('click', async () => {
     save.disabled = true;
     try {
       const operation = storyboardPatchOperation(selected, Object.fromEntries(Object.entries(inputs).map(([name, input]) => [name, input.value])));
-      await onSave(operation, save);
+      await onSave(operation, save); onDirty(false);
     } catch (error) { onError(error, save); }
     finally { save.disabled = !authoring.effective; }
   });
   drawer.prepend(el('div', { class: 'pm-drawer-heading' }, [el('div', null, [el('span', { class: 'pm-kicker' }, selected.storyboard_id), el('h2', null, selected.title || 'Storyboard frame')]), close]));
   drawer.append(el('div', { class: 'pm-actions' }, save));
-  drawer.addEventListener('keydown', (event) => {
-    if (event.key === 'Escape') { event.preventDefault(); onClose(close); return; }
-    if (event.key !== 'Tab') return;
-    const focusable = [...drawer.querySelectorAll('button:not([disabled]), input:not([disabled]), textarea:not([disabled]), select:not([disabled])')];
-    if (!focusable.length) return;
-    const first = focusable[0], last = focusable.at(-1);
-    if (event.shiftKey && document.activeElement === first) { event.preventDefault(); last.focus(); }
-    else if (!event.shiftKey && document.activeElement === last) { event.preventDefault(); first.focus(); }
-  });
-  result.append(drawer);
-  queueMicrotask(() => inputs.title.focus());
+  queueMicrotask(() => { localize(drawer); overlay.open(drawer, {
+    initialFocus: inputs.title, canClose: () => !changed() || confirmDiscard(),
+    onClose: () => { onDirty(false); onClose(close); },
+  }); });
   return result;
 }

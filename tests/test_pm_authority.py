@@ -464,3 +464,90 @@ async def test_orchestrator_artifacts_block_does_not_revoke_a_later_phase_launch
     with pytest.raises(PmError, match="authority drifted"):
         async with authority.launch_guard(permit, scope_edit, "run-1")():
             pass
+
+
+@pytest.mark.asyncio
+async def test_pm_registry_failure_is_contained_at_attempt_and_recovery_reaches_workspace(tmp_path, monkeypatch):
+    from unittest.mock import AsyncMock
+    import symphony.orchestrator.attempt as attempt
+    from tests.test_orchestrator_phase_transition import _orch, _make_config, _make_issue, _seed_running_entry
+
+    monkeypatch.setenv("SYMPHONY_PROJECTS_FILE", str(tmp_path / "projects.json"))
+    orch = _orch(tmp_path)
+    issue = _make_issue()
+    _seed_running_entry(orch, issue, tmp_path)
+    registry = RunRegistry(tmp_path / "state.db")
+    orch._run_registry = registry
+    cfg = _make_config()
+    monkeypatch.setattr(attempt, "_resolve_release_authority", lambda *_args: issue)
+    original = registry.get_pm_managed_ticket
+    def fail_lookup(*_args):
+        raise sqlite3.OperationalError("injected registry unavailable")
+    monkeypatch.setattr(registry, "get_pm_managed_ticket", fail_lookup)
+    try:
+        result = await attempt._start_attempt(orch, issue, None, cfg)
+        assert result.outcome == "pm_dispatch_denied"
+        assert "injected registry unavailable" in result.error
+        assert orch._running[issue.id].pm_dispatch_permit is None
+        assert not registry.has_active_pm_dispatch(cfg.tracker.project_slug, issue.identifier)
+        monkeypatch.setattr(registry, "get_pm_managed_ticket", original)
+        workspace = AsyncMock(side_effect=RuntimeError("healthy ordinary issue reached workspace"))
+        monkeypatch.setattr(orch._workspace_manager, "create_or_reuse", workspace)
+        with pytest.raises(RuntimeError, match="healthy ordinary issue reached workspace"):
+            await attempt._start_attempt(orch, issue, None, cfg)
+        workspace.assert_awaited_once_with(issue.identifier)
+    finally:
+        registry.close()
+
+
+@pytest.mark.asyncio
+async def test_actual_launch_guard_waits_for_snapshot_and_keeps_separate_async_lock_owner(tmp_path, monkeypatch):
+    import asyncio
+    import threading
+    import symphony.pm.documents as documents
+    from symphony.pm.documents import PmDocumentRepository
+    from symphony.pm.routes import _read_change_snapshot
+    from symphony.pm.models import PmRequestContext
+
+    authority, registry = _authority(tmp_path)
+    issue = _issue(_valid_ref())
+    permit = authority.reserve_dispatch(issue, "p1")
+    assert permit is not None
+    repository = PmDocumentRepository(project_id="p1", project_root=tmp_path, registry=registry, planning_workspace_root=tmp_path)
+    ready, resume = threading.Event(), threading.Event()
+    original = documents._resolve_change_root
+    outcomes = {}
+    def pause_reader(*args, **kwargs):
+        result = original(*args, **kwargs)
+        if threading.current_thread().name == "launch-snapshot":
+            ready.set()
+            assert resume.wait(2)
+        return result
+    def read():
+        try:
+            outcomes["snapshot"] = _read_change_snapshot(repository, PmRequestContext("p1", "c1"), "owner")
+        except BaseException as exc:
+            outcomes["error"] = exc
+    async def load():
+        return issue
+    async def launch():
+        async with authority.launch_guard(permit, load, "guarded-run")() as publish:
+            assert registry.get_pm_dispatch_permit(permit.permit_id).state == "STARTING"
+            await publish(4242)
+    monkeypatch.setattr(documents, "_resolve_change_root", pause_reader)
+    reader = threading.Thread(target=read, name="launch-snapshot")
+    reader.start()
+    assert ready.wait(2)
+    task = asyncio.create_task(launch())
+    try:
+        await asyncio.sleep(.05)
+        assert not task.done()
+        assert registry.get_pm_dispatch_permit(permit.permit_id).state == "RESERVED"
+    finally:
+        resume.set()
+    await asyncio.wait_for(task, timeout=2)
+    reader.join(2)
+    assert not reader.is_alive() and "error" not in outcomes, outcomes
+    running = registry.get_pm_dispatch_permit(permit.permit_id)
+    assert running.state == "RUNNING" and running.run_id == "guarded-run" and running.process_pid == 4242
+    registry.close()

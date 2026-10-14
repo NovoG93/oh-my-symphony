@@ -9,9 +9,10 @@ import time
 
 import pytest
 
-from symphony.pm import host_tools, openspec
+from symphony.pm import codex_compatibility, host_tools, openspec
 from symphony.workflow import build_service_config, parse_workflow_text
 from tests._pm_support import fake_node
+from tests._pm_codex_runtime import fake_codex
 from tests.test_pm_routes import _authoring_client
 
 
@@ -35,7 +36,7 @@ def clean_environment(environment_unchanged, tmp_path, monkeypatch):
             monkeypatch.delenv(key)
     monkeypatch.setenv("HOME", str(tmp_path))
     monkeypatch.setenv("SYMPHONY_PROJECTS_FILE", str(tmp_path / "projects.json"))
-    monkeypatch.setattr(host_tools, "_CODEX_CACHE", {})
+    monkeypatch.setattr(codex_compatibility, "_CACHE", {})
     monkeypatch.setattr(openspec, "_NODE_CACHE", {})
 
 
@@ -45,15 +46,12 @@ def _config(tmp_path, **pm):
     ))
 
 
-def _codex(directory, output="codex-cli 0.160.0", returncode=0):
-    directory.mkdir(exist_ok=True)
-    executable = directory / "codex"
-    executable.write_text(
-        f"#!/bin/sh\nprintf '%s\\n' '{output}'\nexit {returncode}\n",
-        encoding="utf-8",
-    )
-    executable.chmod(0o755)
-    return executable
+def _codex(directory, output="codex-cli 0.162.1", returncode=0, **kwargs):
+    return fake_codex(directory, output=output, returncode=returncode, **kwargs)
+
+
+def _calls(executable):
+    return [json.loads(line) for line in executable.with_suffix(".calls").read_text().splitlines()]
 
 
 def _login(tmp_path):
@@ -63,97 +61,96 @@ def _login(tmp_path):
     return auth
 
 
-def test_matching_codex_is_cached_but_login_is_checked_each_request(tmp_path, monkeypatch):
+def test_matching_codex_is_cached_but_login_and_version_are_checked_each_request(tmp_path, monkeypatch):
     executable = _codex(tmp_path)
     auth = _login(tmp_path)
     monkeypatch.setenv("PATH", str(tmp_path))
     assert host_tools.probe_codex() == {
-        "required": "0.160.0", "found": "0.160.0", "available": True, "reason": None,
+        "required": "restricted app-server controls", "found": "0.162.1", "available": True, "reason": None,
     }
-    assert host_tools._CODEX_CACHE == {str(executable.resolve()): "0.160.0"}
-    monkeypatch.setattr(subprocess, "run", lambda *a, **k: pytest.fail("cached Codex reprobed"))
+    assert len(_calls(executable)) == 3
     auth.unlink()
     result = host_tools.probe_codex()
     assert result["available"] is False
-    assert result["found"] == "0.160.0"
+    assert result["found"] == "0.162.1"
     assert result["reason"] == (
         "Planning assistant needs a Codex login: ~/.codex/auth.json is missing. Run codex login."
     )
+    assert _calls(executable)[3:] == [["--version"]]
     _login(tmp_path)
     assert host_tools.probe_codex()["available"] is True
+    assert _calls(executable)[4:] == [["--version"]]
 
 
-def test_wrong_codex_is_reprobed_and_upgrade_recovers(tmp_path, monkeypatch):
-    executable = _codex(tmp_path, "codex-cli 0.162.1")
+def test_incompatible_codex_is_reprobed_and_replacement_recovers(tmp_path, monkeypatch):
+    executable = _codex(tmp_path, missing=("TurnStartParams.json", "outputSchema"))
     _login(tmp_path)
     monkeypatch.setenv("PATH", str(tmp_path))
     for _ in range(2):
-        assert host_tools.probe_codex() == {
-            "required": "0.160.0", "found": "0.162.1", "available": False,
-            "reason": "Planning assistant needs Codex 0.160.0 (found: 0.162.1).",
-        }
-        assert host_tools._CODEX_CACHE == {}
+        result = host_tools.probe_codex()
+        assert result["found"] == "0.162.1" and result["available"] is False
+        assert "outputSchema" in result["reason"]
+        assert codex_compatibility._CACHE == {}
+    assert len(_calls(executable)) == 4
     _codex(tmp_path)
     assert host_tools.probe_codex()["available"] is True
-    assert host_tools._CODEX_CACHE == {str(executable.resolve()): "0.160.0"}
+    assert len(codex_compatibility._CACHE) == 1
 
 
 def test_missing_codex_and_login_report_both_without_spawning(tmp_path, monkeypatch):
     monkeypatch.setenv("PATH", str(tmp_path))
-    monkeypatch.setattr(subprocess, "run", lambda *a, **k: pytest.fail("missing Codex spawned"))
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", lambda *a, **k: pytest.fail("missing Codex spawned"))
     assert host_tools.probe_codex() == {
-        "required": "0.160.0", "found": None, "available": False,
+        "required": "restricted app-server controls", "found": None, "available": False,
         "reason": (
-            "Planning assistant needs Codex 0.160.0 (found: none). "
+            "Codex is missing on PATH (found: none). Install a compatible Codex CLI. "
             "Planning assistant needs a Codex login: ~/.codex/auth.json is missing. Run codex login."
         ),
     }
 
 
-def test_wrong_codex_and_missing_login_report_each_failure(tmp_path, monkeypatch):
-    _codex(tmp_path, "codex-cli 0.162.1")
+def test_incompatible_codex_and_missing_login_report_each_failure(tmp_path, monkeypatch):
+    _codex(tmp_path, missing=("ThreadStartParams.json", "dynamicTools"))
     monkeypatch.setenv("PATH", str(tmp_path))
     result = host_tools.probe_codex()
-    assert result["reason"] == (
-        "Planning assistant needs Codex 0.160.0 (found: 0.162.1). "
-        "Planning assistant needs a Codex login: ~/.codex/auth.json is missing. Run codex login."
-    )
+    assert "dynamicTools" in result["reason"]
+    assert "Codex login" in result["reason"]
     assert result["available"] is False
 
 
 @pytest.mark.parametrize(("output", "returncode"), [
-    ("codex-cli 0.160.0 extra", 0), ("0.160.0", 0), ("", 0), ("codex-cli 0.160.0", 1),
+    ("codex-cli 0.162.1 extra", 0), ("0.162.1", 0), ("", 0), ("codex-cli 0.162.1", 1),
 ])
-def test_codex_version_requires_exact_successful_output(tmp_path, monkeypatch, output, returncode):
+def test_codex_version_requires_recognized_successful_output(tmp_path, monkeypatch, output, returncode):
     _codex(tmp_path, output, returncode)
     _login(tmp_path)
     monkeypatch.setenv("PATH", str(tmp_path))
     assert host_tools.probe_codex()["available"] is False
-    assert host_tools._CODEX_CACHE == {}
+    assert codex_compatibility._CACHE == {}
 
 
-@pytest.mark.parametrize("failure", [OSError("cannot execute"), subprocess.TimeoutExpired("codex", 5)])
-def test_codex_probe_failure_uses_five_second_timeout_and_can_retry(tmp_path, monkeypatch, failure):
+@pytest.mark.parametrize("failure", [OSError("cannot execute"), asyncio.TimeoutError()])
+def test_codex_probe_failure_is_bounded_and_can_retry(tmp_path, monkeypatch, failure):
     executable = _codex(tmp_path)
     _login(tmp_path)
     monkeypatch.setenv("PATH", str(tmp_path))
-    real_run = subprocess.run
+    real_run = codex_compatibility._run
     calls = []
 
-    def run(argv, **kwargs):
-        calls.append((argv, kwargs))
+    async def run(argv, home, deadline):
+        calls.append((argv, deadline))
+        assert 0 < deadline - asyncio.get_running_loop().time() <= 5
         if len(calls) == 1:
             raise failure
-        return real_run(argv, **kwargs)
+        return await real_run(argv, home, deadline)
 
-    monkeypatch.setattr(subprocess, "run", run)
+    monkeypatch.setattr(codex_compatibility, "_run", run)
     result = host_tools.probe_codex()
-    assert result["reason"] == "Planning assistant needs Codex 0.160.0 (found: none)."
-    assert host_tools._CODEX_CACHE == {}
+    assert "version compatibility failed (found: none)" in result["reason"]
+    assert codex_compatibility._CACHE == {}
     assert host_tools.probe_codex()["available"] is True
-    assert len(calls) == 2
-    assert all(argv == [str(executable.resolve()), "--version"] for argv, _ in calls)
-    assert all(kwargs["timeout"] == 5 for _, kwargs in calls)
+    assert calls[0][0] == [str(executable.resolve()), "--version"]
+    assert len(calls) == 3  # failed version, retry version and binary-owned schema
 
 
 def test_codex_cache_uses_resolved_path_and_detects_changed_path(tmp_path, monkeypatch):
@@ -161,21 +158,18 @@ def test_codex_cache_uses_resolved_path_and_detects_changed_path(tmp_path, monke
     second = tmp_path / "second"
     alias = tmp_path / "alias"
     original = _codex(first)
-    _codex(second, "codex-cli 0.162.1")
+    _codex(second, "codex-cli 0.163.0", missing=("ThreadStartParams.json", "ephemeral"))
     alias.mkdir()
     (alias / "codex").symlink_to(original)
     _login(tmp_path)
     monkeypatch.setenv("PATH", str(first))
     assert host_tools.probe_codex()["available"] is True
     monkeypatch.setenv("PATH", str(alias))
-    real_run = subprocess.run
-    with monkeypatch.context() as cache_check:
-        cache_check.setattr(subprocess, "run", lambda *a, **k: pytest.fail("resolved path reprobed"))
-        assert host_tools.probe_codex()["available"] is True
+    assert host_tools.probe_codex()["available"] is True
+    assert _calls(original)[3:] == [["--version"]]
     monkeypatch.setenv("PATH", str(second))
-    assert subprocess.run is real_run
-    assert host_tools.probe_codex()["found"] == "0.162.1"
-    assert len(host_tools._CODEX_CACHE) == 1
+    assert host_tools.probe_codex()["found"] == "0.163.0"
+    assert len(codex_compatibility._CACHE) == 1
 
 
 def test_node_probe_uses_shared_success_cache(tmp_path, monkeypatch):
@@ -213,7 +207,7 @@ def test_no_requested_flags_spawn_no_probes(tmp_path, monkeypatch):
 
 @pytest.mark.parametrize("flag", ["authoring", "exchange", "assistance", "handoff"])
 def test_probe_fields_follow_requested_flags_and_executable_override(tmp_path, monkeypatch, flag):
-    codex = {"required": "0.160.0", "found": None, "available": False, "reason": "codex reason"}
+    codex = {"required": "restricted app-server controls", "found": None, "available": False, "reason": "codex reason"}
     node = {"required": "20.19.0", "found": None, "available": False, "reason": "node reason"}
     monkeypatch.setattr(host_tools, "probe_codex", lambda: codex)
     monkeypatch.setattr(host_tools, "probe_node", lambda: node)
@@ -267,7 +261,7 @@ async def test_hanging_probe_times_out_off_loop_and_health_stays_live(tmp_path, 
         assert result["available"] is False
         assert "found: none" in result["reason"]
         assert 4.5 <= elapsed < 6.5, f"probe returned after {elapsed:.2f}s"
-        cache = host_tools._CODEX_CACHE if tool == "codex" else openspec._NODE_CACHE
+        cache = codex_compatibility._CACHE if tool == "codex" else openspec._NODE_CACHE
         assert cache == {}
     finally:
         if request is not None and not request.done():

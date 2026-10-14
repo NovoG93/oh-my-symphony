@@ -1,12 +1,13 @@
 import { createPmApi } from './api.js';
 import { createPmState } from './state.js';
 import { renderDocumentEditor, renderFindings } from './documents.js';
-import { renderWbs } from './wbs.js';
+import { disposeWbs, renderWbs } from './wbs.js';
 import { renderExchangePanel } from './exchange.js';
 import { renderDiagram, diagramSummary } from './diagrams.js';
 import { renderStoryboard } from './storyboard.js';
 import { PLANNING_ACTIONS, planningActionRequest, verificationActions, evidenceProvenance } from './assistance.js';
 import { PM_GUIDES } from './guide.js';
+import { createPmOverlay } from './overlay.js';
 
 const TABS = [['idea', 'Idea'], ['requirements', 'Requirements'], ['design', 'Design'], ['plan', 'Plan'], ['code', 'Code Files']];
 const DESIGN_VIEWS = [['ux', 'UX'], ['storyboard', 'Storyboard'], ['architecture', 'Architecture'], ['erd', 'ERD'], ['api', 'API'], ['integration', 'Integration']];
@@ -45,9 +46,26 @@ export function mountArtifacts({ root, projectId, api: hostApi, ui, onDirtyChang
   const history = { undo: [], redo: [] };
   let editingRequirement = null;
   let selectedStoryboardId = '';
+  let editedDocumentId = null;
+  const overlay = createPmOverlay(root);
   root.classList.add('pm-workspace-host');
 
-  const guard = (message = 'Discard unsaved changes?') => !state.dirty || window.confirm(message);
+  const guard = (message = 'Discard unsaved changes?') => {
+    if (!state.dirty) return true;
+    if (!window.confirm(pmText(message))) return false;
+    if (editedDocumentId) state.clearDraft(editedDocumentId);
+    state.setDirty(false); return true;
+  };
+  const openDialog = (dialog, options = {}) => { localizePm(dialog); return !state.disposed && overlay.open(dialog, options); };
+  function captureView() {
+    const changeId = state.change?.change_id, revision = state.change?.revision, epoch = state.epoch;
+    const tab = state.tab, designView = state.designView, planView = state.planView, panel = overlay.panel;
+    return { changeId, revision, current: (checkOverlay = true) => state.isCurrent(epoch)
+      && state.change?.change_id === changeId && state.change?.revision === revision
+      && state.tab === tab && state.designView === designView && state.planView === planView
+      && (!checkOverlay || overlay.panel === panel) };
+  }
+
   const hostAvailability = (name) => capabilityAvailability(state.capabilities, name);
   const archived = () => state.change?.state === 'Archived' || state.change?.workspace_state === 'RELEASED';
   const availability = (name) => archived()
@@ -100,11 +118,12 @@ export function mountArtifacts({ root, projectId, api: hostApi, ui, onDirtyChang
     if (error?.name === 'AbortError') return;
     const code = error?.code ? `${error.code}: ` : '';
     const message = `${code}${error?.message || 'The action failed.'}`;
-    root.querySelector('.pm-action-error')?.remove();
+    const errorHost = overlay.panel || root.querySelector('.pm-body') || root;
+    errorHost.querySelector('.pm-action-error')?.remove();
     const alert = ui.el('section', { class: 'banner banner-danger pm-action-error', role: 'alert' }, [
       ui.el('strong', null, 'Action unavailable'), ui.el('span', null, message),
     ]);
-    (root.querySelector('.pm-body') || root).prepend(alert);
+    localizePm(alert); errorHost.prepend(alert);
     ui.announce(message);
     if (source?.isConnected && typeof source.focus === 'function') source.focus({ preventScroll: true });
   }
@@ -189,12 +208,12 @@ export function mountArtifacts({ root, projectId, api: hostApi, ui, onDirtyChang
     await Promise.all(jobs);
   }
 
-  async function refreshChange() {
+  async function refreshChange({ keepOverlay = false } = {}) {
     const changeId = state.change.change_id; const token = state.beginLoad();
     const change = await api.change(changeId, token.signal);
     if (!state.isCurrent(token.epoch) || change.change_id !== changeId) return;
     state.change = change; state.externalEdit = change.workspace_state === 'EXTERNAL_EDIT';
-    await hydrate(token); if (state.isCurrent(token.epoch)) render();
+    await hydrate(token); if (state.isCurrent(token.epoch)) render({ keepOverlay });
   }
 
   async function selectChange(id) {
@@ -236,14 +255,25 @@ export function mountArtifacts({ root, projectId, api: hostApi, ui, onDirtyChang
 
   async function selectTab(tab) {
     if (tab === state.tab || !guard('Discard unsaved changes and leave this tab?')) return;
-    state.setDirty(false); state.setTab(tab); await hydrate(); render();
+    state.setDirty(false); state.setTab(tab);
+    const token = state.beginLoad(); await hydrate(token);
+    if (state.isCurrent(token.epoch)) render();
   }
 
-  function render() {
+  async function selectSubview(kind, value) {
+    if (!guard()) return;
+    if (kind === 'design') state.setDesignView(value); else state.setPlanView(value);
+    const token = state.beginLoad(); await hydrate(token);
+    if (state.isCurrent(token.epoch)) render();
+  }
+
+  function render({ keepOverlay = false } = {}) {
     if (state.disposed) return;
+    if (!keepOverlay) overlay.dispose();
+    disposeWbs();
     root.replaceChildren(buildHeader(), buildTabs(), buildBody());
     localizePm(root);
-    root.querySelector('[aria-current="page"]')?.focus({ preventScroll: true });
+    if (!keepOverlay) root.querySelector('[aria-current="page"]')?.focus({ preventScroll: true });
   }
 
   function buildHeader() {
@@ -304,7 +334,7 @@ export function mountArtifacts({ root, projectId, api: hostApi, ui, onDirtyChang
       ? limitAction(button('Finish external edit & reindex', async () => { const report = await api.endExternal(state.change.change_id); state.externalEdit = false; await refreshChange(); showFindings(report); }), 'authoring')
       : limitAction(button('Edit in external editor', async () => { await api.beginExternal(state.change.change_id, state.change.revision); state.externalEdit = true; render(); ui.announce('App writes paused while external editing is active.'); }), 'authoring');
     // Validate still returns local findings without Node, so it only explains.
-    const validate = limitNodeAction(limitArchivedAction(button('Validate', async () => showFindings(await api.validate(state.change.change_id, state.change.revision)))), { keepEnabled: true });
+    const validate = limitNodeAction(limitArchivedAction(button('Validate', async () => { const view = captureView(); const report = await api.validate(view.changeId, view.revision); if (view.current()) showFindings(report); })), { keepEnabled: true });
     const approve = limitNodeAction(limitAction(button('Approve revision', async () => {
       if (!window.confirm(pmText('Approve this exact planning revision locally?'))) return;
       await api.approve(state.change.change_id, state.change.revision, state.change.approval_confirmation_token); await refreshChange(); ui.announce(pmText('Revision approved.'));
@@ -319,11 +349,13 @@ export function mountArtifacts({ root, projectId, api: hostApi, ui, onDirtyChang
     const doc = state.documents.get(docId); const draft = doc ? state.readDraft(docId) : null;
     const editor = renderDocumentEditor({
       ui, document: doc, error: state.errors.get(docId), draft,
-      onDirty: state.setDirty, onDraft: (source) => state.writeDraft(docId, source),
-      onSave: safeAction(async (source) => {
-        await api.saveDocument(state.change.change_id, state.change.revision, docId, source);
+      onDirty: (dirty) => { editedDocumentId = docId; state.setDirty(dirty); }, onDraft: (source) => state.writeDraft(docId, source),
+      onSave: async (source) => {
+        const view = captureView();
+        await api.saveDocument(view.changeId, view.revision, docId, source);
+        if (!view.current()) return false;
         state.clearDraft(docId); state.setDirty(false); await refreshChange(); ui.announce('Draft saved as a new revision.');
-      }),
+      },
       onAssist: safeAction(async () => openPlanningDialog(docId)),
       authoring: availability('authoring'), assistance: availability('assistance'),
       onError: reportActionError, translate: pmText,
@@ -341,7 +373,7 @@ export function mountArtifacts({ root, projectId, api: hostApi, ui, onDirtyChang
 
   function buildRequirements() {
     const ids = requiredDocumentIds();
-    if (editingRequirement && ids.includes(editingRequirement)) return ui.el('div', { class: 'pm-card-grid' }, [ui.el('div', { class: 'pm-plan-action-row' }, [button('Back to requirements', () => { editingRequirement = null; render(); })]), buildDocument(editingRequirement)]);
+    if (editingRequirement && ids.includes(editingRequirement)) return ui.el('div', { class: 'pm-card-grid' }, [ui.el('div', { class: 'pm-plan-action-row' }, [button('Back to requirements', () => { if (!guard()) return; editingRequirement = null; render(); })]), buildDocument(editingRequirement)]);
     const create = limitAction(button('Add capability', createCapability, 'btn btn-primary'), 'authoring');
     if (!ids.length) return ui.el('div', { class: 'pm-card-grid' }, [ui.el('div', { class: 'pm-plan-action-row' }, [create]), empty('No requirement specifications are available for this change.')]);
     const cards = ids.map((id) => {
@@ -368,17 +400,17 @@ export function mountArtifacts({ root, projectId, api: hostApi, ui, onDirtyChang
   }
 
   function buildDesign() {
-    const selector = segmented(DESIGN_VIEWS, state.designView, async (value) => { state.setDesignView(value); await hydrate(); render(); });
+    const selector = segmented(DESIGN_VIEWS, state.designView, (value) => selectSubview('design', value));
     const docId = state.designView === 'ux' || state.designView === 'storyboard' ? 'ux' : 'design';
     const doc = state.documents.get(docId);
     const surface = ui.el('div', { class: 'pm-design-stack' }, [selector]);
     if (!doc) { surface.append(empty(state.errors.get(docId) || 'Loading design document…')); return surface; }
     if (state.designView === 'storyboard') {
       surface.append(renderStoryboard({
-        ui, frames: state.change.storyboard_frames || [], selectedId: selectedStoryboardId,
+        ui, overlay, localize: localizePm, onDirty: state.setDirty, confirmDiscard: () => guard('Discard unsaved storyboard changes?'), frames: state.change.storyboard_frames || [], selectedId: selectedStoryboardId,
         authoring: availability('authoring'), onError: reportActionError,
         onSelect: (id) => { selectedStoryboardId = id; render(); },
-        onClose: () => { const prior = selectedStoryboardId; selectedStoryboardId = ''; render(); queueMicrotask(() => root.querySelector(`[data-storyboard-id="${prior}"]`)?.focus()); },
+        onClose: () => { state.setDirty(false); const prior = selectedStoryboardId; selectedStoryboardId = ''; render(); queueMicrotask(() => root.querySelector(`[data-storyboard-id="${prior}"]`)?.focus()); },
         onSave: async (operation) => {
           await api.patchStoryboard(state.change.change_id, state.change.revision, operation);
           selectedStoryboardId = ''; await refreshChange(); ui.announce('Storyboard frame saved.');
@@ -399,7 +431,7 @@ export function mountArtifacts({ root, projectId, api: hostApi, ui, onDirtyChang
   }
 
   function buildPlan() {
-    const stack = ui.el('div', { class: 'pm-plan-stack' }, [segmented(PLAN_VIEWS, state.planView, async (value) => { state.setPlanView(value); await hydrate(); render(); })]);
+    const stack = ui.el('div', { class: 'pm-plan-stack' }, [segmented(PLAN_VIEWS, state.planView, (value) => selectSubview('plan', value))]);
     if (state.planView === 'source') { stack.append(buildDocument('tasks')); return stack; }
     if (!state.wbs) { stack.append(empty('Loading plan…')); return stack; }
     if (state.planView === 'dependencies') {
@@ -409,7 +441,7 @@ export function mountArtifacts({ root, projectId, api: hostApi, ui, onDirtyChang
     const handoff = limitAction(button('Preview approved handoff', previewHandoff, 'btn btn-primary'), 'handoff');
     const archive = limitNodeAction(limitAction(button('Preview archive', previewArchive), 'handoff'));
     stack.append(ui.el('div', { class: 'pm-plan-action-row' }, [archive, handoff]));
-    stack.append(renderWbs({ ui, view: state.wbs, semanticIndex: state.change.semantic_index || [], onNavigateReference: safeAction(navigateSemantic), onSetField: safeAction(setTaskField), onPaste: safeAction(previewPaste), onCommand: safeAction(commandWbs), onCopy: safeAction(copyTsv), onSelect: state.setSelectedTask, onFilter: state.setPlanFilter, onScroll: state.setPlanScroll, selectedTask: state.selectedTask, filter: state.planFilter, scrollTop: state.planScroll, canUndo: history.undo.length > 0, canRedo: history.redo.length > 0, approved: Boolean(state.change.approval_id), readOnlyReason: availability('authoring').effective ? '' : unavailableReason('authoring') }));
+    stack.append(renderWbs({ ui, overlay, view: state.wbs, semanticIndex: state.change.semantic_index || [], onNavigateReference: safeAction(navigateSemantic), onSetField: safeAction(setTaskField), onPaste: safeAction(previewPaste), onCommand: safeAction(commandWbs), onCopy: safeAction(copyTsv), onSelect: state.setSelectedTask, onFilter: state.setPlanFilter, onScroll: state.setPlanScroll, selectedTask: state.selectedTask, filter: state.planFilter, scrollTop: state.planScroll, canUndo: history.undo.length > 0, canRedo: history.redo.length > 0, approved: Boolean(state.change.approval_id), readOnlyReason: availability('authoring').effective ? '' : unavailableReason('authoring') }));
     stack.append(renderExchangePanel({ ui, onExport: exportPlanning, onImport: importWorkbook, onApply: applyImport, workbookAvailability: hostAvailability('exchange'), readOnly: archived(), onError: reportActionError, translate: pmText }), renderFindings(ui, state.wbs.findings));
     return stack;
   }
@@ -453,21 +485,21 @@ export function mountArtifacts({ root, projectId, api: hostApi, ui, onDirtyChang
   }
 
   function openWaiverDialog(entity) {
-    const previousFocus = document.activeElement;
     const reason = ui.el('textarea', { class: 'input pm-drawer-textarea', 'aria-label': 'Waiver reason' });
     const reviewer = ui.el('input', { class: 'input', 'aria-label': 'Reviewer label', value: 'local operator' });
     const dialog = ui.el('section', { class: 'pm-inline-dialog', role: 'dialog', 'aria-label': 'Waive coverage' });
-    const close = () => { dialog.remove(); previousFocus?.focus?.(); };
+    const close = () => overlay.close(dialog);
     const preview = button('Preview waiver', async () => {
-      const result = await api.waiverPreview(state.change.change_id, state.change.revision, entity.semantic_id, reason.value, reviewer.value);
+      const view = captureView();
+      const result = await api.waiverPreview(view.changeId, view.revision, entity.semantic_id, reason.value, reviewer.value);
+      if (!view.current()) return;
       showConfirmation('Confirm coverage waiver', 'This waiver does not grant execution, acceptance, ancestry, completion, or archive authority.', `${entity.semantic_id}\n${reason.value}\n${state.change.revision}`, 'Confirm waiver', async () => {
-        await api.createWaiver(state.change.change_id, state.change.revision, { semantic_id: entity.semantic_id, reason: reason.value, reviewer_label: reviewer.value }, result.confirmation_token);
+        await api.createWaiver(view.changeId, view.revision, { semantic_id: entity.semantic_id, reason: reason.value, reviewer_label: reviewer.value }, result.confirmation_token);
         await refreshChange(); ui.announce('Coverage waiver recorded without granting completion authority.');
       }); close();
     }, 'btn btn-primary');
     dialog.append(ui.el('h2', null, `Waive ${entity.semantic_id}`), field('Reason', reason), field('Reviewer', reviewer), ui.el('div', { class: 'pm-actions' }, [preview, button('Cancel', close)]));
-    dialog.addEventListener('keydown', (event) => { if (event.key === 'Escape') close(); });
-    root.querySelector('.pm-body')?.prepend(dialog); reason.focus();
+    openDialog(dialog, { initialFocus: reason });
   }
 
   async function revokeWaiver(waiver) {
@@ -522,7 +554,6 @@ export function mountArtifacts({ root, projectId, api: hostApi, ui, onDirtyChang
   }
 
   function openEvidenceDialog(ticket, procedure) {
-    const previousFocus = document.activeElement;
     const native = procedure.kind === 'native';
     const testedCommit = ui.el('input', { class: 'input', 'aria-label': 'Tested commit', value: ticket.head_commit || ticket.base_commit || '' });
     const environment = ui.el('textarea', { class: 'input', 'aria-label': 'Environment summary' });
@@ -532,8 +563,9 @@ export function mountArtifacts({ root, projectId, api: hostApi, ui, onDirtyChang
     const report = ui.el('input', { class: 'input', 'aria-label': 'Report path' });
     const artifacts = ui.el('textarea', { class: 'input', 'aria-label': 'Artifact references' });
     const dialog = ui.el('section', { class: 'pm-inline-dialog', role: 'dialog', 'aria-label': native ? 'Run verification' : 'Submit completion evidence' });
-    const close = () => { dialog.remove(); previousFocus?.focus?.(); };
+    const close = () => overlay.close(dialog);
     const preview = button(native ? 'Preview host verification' : 'Preview evidence', async () => {
+      const view = captureView();
       if (!testedCommit.value.trim()) throw new Error('Tested commit is required.');
       if (!native && (!environment.value.trim() || !started.value || !completed.value || !report.value.trim())) throw new Error('Environment, timestamps, and report path are required.');
       if (!native && procedure.artifacts === 'required' && !artifacts.value.trim()) throw new Error('This procedure requires at least one artifact reference.');
@@ -547,9 +579,10 @@ export function mountArtifacts({ root, projectId, api: hostApi, ui, onDirtyChang
         report_ref: { ref_kind: 'git_blob', ref: report.value.trim() },
         artifact_refs: artifacts.value.split('\n').map((ref) => ref.trim()).filter(Boolean).map((ref) => ref.startsWith('artifact://') ? { ref_kind: 'artifact_store', ref } : { ref_kind: 'git_blob', ref }),
       });
-      const response = await api.evidencePreview(state.change.change_id, state.change.revision, payload);
+      const response = await api.evidencePreview(view.changeId, view.revision, payload);
+      if (!view.current()) return;
       showConfirmation(native ? 'Confirm host verification' : 'Confirm completion evidence', native ? 'The host will run the approved command and derive the actual result.' : 'This stores inspectable evidence but does not complete or accept the task.', JSON.stringify(response.normalized || payload, null, 2), native ? 'Run approved command' : 'Submit evidence', async () => {
-        await api.evidenceSubmit(state.change.change_id, state.change.revision, response.normalized || payload, response.confirmation_token);
+        await api.evidenceSubmit(view.changeId, view.revision, response.normalized || payload, response.confirmation_token);
         await refreshChange(); ui.announce(native ? 'Host verification receipt recorded.' : 'Manual completion evidence recorded. Explicit acceptance is still required.');
       }); close();
     }, 'btn btn-primary');
@@ -557,20 +590,22 @@ export function mountArtifacts({ root, projectId, api: hostApi, ui, onDirtyChang
     if (native) dialog.append(ui.el('p', { class: 'pm-empty' }, 'The host derives return code, output hashes, timeout, and result. You cannot report a native pass.'));
     else dialog.append(field('Environment summary', environment), field('Result', result), field(`Started at · ${Intl.DateTimeFormat().resolvedOptions().timeZone}`, started), field(`Completed at · ${Intl.DateTimeFormat().resolvedOptions().timeZone}`, completed), field('Report path at tested commit', report), field('Artifact references', artifacts));
     dialog.append(ui.el('div', { class: 'pm-actions' }, [preview, button('Cancel', close)]));
-    dialog.addEventListener('keydown', (event) => { if (event.key === 'Escape') close(); });
-    localizePm(dialog); root.querySelector('.pm-body')?.prepend(dialog); testedCommit.focus();
+    openDialog(dialog, { initialFocus: testedCommit });
   }
 
   async function reviewAcceptance(ticket) {
+    const view = captureView();
     const preview = await api.acceptancePreview(ticket.ticket_identifier, ticket.task_revision, ticket.verified_commit);
+    if (!view.current()) return;
     const dialog = ui.el('section', { class: 'pm-inline-dialog', role: 'dialog', 'aria-label': 'Acceptance review' });
     const confirm = button('Accept verified revision', async () => {
+      if (!view.current(false)) return;
       await api.accept(ticket.ticket_identifier, ticket.task_revision, ticket.verified_commit, preview.confirmation_token);
-      dialog.remove(); await refreshChange(); ui.announce('Verified revision accepted.');
+      overlay.close(dialog, { force: true }); await refreshChange(); ui.announce('Verified revision accepted.');
     }, 'btn btn-primary');
     confirm.disabled = !preview.ready;
-    dialog.append(ui.el('h2', null, preview.ready ? 'Verification is complete' : 'Verification is incomplete'), ui.el('p', null, `${preview.passing_receipt_ids.length} passing receipts · ${preview.missing_procedure_ids.length} missing procedures`), renderFindings(ui, preview.findings), ui.el('div', { class: 'pm-actions' }, [confirm, button('Cancel', () => dialog.remove())]));
-    localizePm(dialog); root.querySelector('.pm-body')?.prepend(dialog); dialog.querySelector('button:not([disabled])')?.focus();
+    dialog.append(ui.el('h2', null, preview.ready ? 'Verification is complete' : 'Verification is incomplete'), ui.el('p', null, `${preview.passing_receipt_ids.length} passing receipts · ${preview.missing_procedure_ids.length} missing procedures`), renderFindings(ui, preview.findings), ui.el('div', { class: 'pm-actions' }, [confirm, button('Cancel', () => overlay.close(dialog))]));
+    openDialog(dialog);
   }
 
   async function runVerification(ticket, procedureId) {
@@ -579,10 +614,10 @@ export function mountArtifacts({ root, projectId, api: hostApi, ui, onDirtyChang
     ui.announce(`${procedureId}: ${receipt.result}`); await refreshChange();
   }
 
-  async function runWbs(operations, inverse = null, record = true) {
+  async function runWbs(operations, inverse = null, record = true, keepOverlay = false) {
     const result = await api.patchWbs(state.change.change_id, state.change.revision, operations);
     if (record && inverse) { history.undo.push({ operations: inverse, inverse: operations }); history.redo = []; }
-    await refreshChange();
+    await refreshChange({ keepOverlay });
     return result;
   }
 
@@ -590,7 +625,7 @@ export function mountArtifacts({ root, projectId, api: hostApi, ui, onDirtyChang
     const task = state.wbs.tasks.find((item) => item.task_id === taskId); if (!task) return;
     const normalized = ['acceptance', 'verification', 'requirement_refs', 'storyboard_refs', 'design_refs'].includes(field) && typeof value === 'string' ? value.split('\n').map((item) => item.trim()).filter(Boolean) : value;
     const apiField = TASK_TO_API_FIELD[field] || field;
-    await runWbs([{ op: 'set_field', task_id: taskId, field: apiField, value: normalized }], [{ op: 'set_field', task_id: taskId, field: apiField, value: task[field] }]);
+    await runWbs([{ op: 'set_field', task_id: taskId, field: apiField, value: normalized }], [{ op: 'set_field', task_id: taskId, field: apiField, value: task[field] }], true, true);
   }
 
   async function commandWbs(command, selectedId) {
@@ -635,6 +670,7 @@ export function mountArtifacts({ root, projectId, api: hostApi, ui, onDirtyChang
   }
 
   async function previewPaste(text) {
+    const view = captureView();
     let rows;
     try { rows = parseTsv(text); } catch (error) { ui.announce(error.message); return; }
     if (rows[0]?.[0].toLowerCase() === 'task id' && rows[0]?.[1].toLowerCase() === 'field') rows.shift();
@@ -650,7 +686,8 @@ export function mountArtifacts({ root, projectId, api: hostApi, ui, onDirtyChang
       try { parseTsvValue(row[1], row.slice(2).join('\t')); } catch (error) { ui.announce(error.message); return; }
     }
     const operations = rows.map((row) => ({ op: 'set_field', task_id: row[0], field: row[1], value: parseTsvValue(row[1], row.slice(2).join('\t')) }));
-    const serverPreview = await api.previewWbs(state.change.change_id, state.change.revision, operations);
+    const serverPreview = await api.previewWbs(view.changeId, view.revision, operations);
+    if (!view.current()) return;
     const blocking = (serverPreview.findings || []).filter((item) => item.severity === 'blocking');
     const preview = ui.el('section', { class: 'pm-inline-dialog', role: 'dialog', 'aria-label': 'Paste preview' });
     // One undo step restores every pasted field to its value before Apply.
@@ -659,11 +696,12 @@ export function mountArtifacts({ root, projectId, api: hostApi, ui, onDirtyChang
       return { op: 'set_field', task_id: op.task_id, field: op.field, value: task[API_TO_TASK_FIELD[op.field] || op.field] };
     });
     const apply = button(`Apply ${rows.length} rows`, async () => {
-      await runWbs(operations, inverse); preview.remove();
+      if (!view.current(false)) return;
+      await runWbs(operations, inverse); overlay.close(preview, { force: true });
     }, 'btn btn-primary');
     apply.disabled = blocking.length > 0;
-    preview.append(ui.el('h2', null, 'Transactional TSV preview'), ui.el('p', null, 'Columns: Task ID, field, value. Quoted cells and multiline values are preserved.'), simpleTable(['Task', 'Field', 'Value'], rows.map((row) => [row[0], row[1], row.slice(2).join('\t')])), renderFindings(ui, serverPreview.findings), ui.el('div', { class: 'pm-actions' }, [apply, button('Cancel', () => preview.remove())]));
-    root.querySelector('.pm-plan-stack')?.prepend(preview); apply.focus();
+    preview.append(ui.el('h2', null, 'Transactional TSV preview'), ui.el('p', null, 'Columns: Task ID, field, value. Quoted cells and multiline values are preserved.'), simpleTable(['Task', 'Field', 'Value'], rows.map((row) => [row[0], row[1], row.slice(2).join('\t')])), renderFindings(ui, serverPreview.findings), ui.el('div', { class: 'pm-actions' }, [apply, button('Cancel', () => overlay.close(preview))]));
+    openDialog(preview, { initialFocus: apply });
   }
 
   async function copyTsv(tasks) {
@@ -675,39 +713,40 @@ export function mountArtifacts({ root, projectId, api: hostApi, ui, onDirtyChang
   async function applyImport(preview, resolutions) { await api.importApply(state.change.change_id, state.change.revision, preview.import_id, preview.preview_digest, resolutions, preview.apply_operation_id); await refreshChange(); ui.announce(pmText('Reviewed workbook changes applied.')); }
 
   async function previewHandoff() {
-    const preview = await api.handoffPreview(state.change.change_id, state.change.revision);
+    const view = captureView();
+    const preview = await api.handoffPreview(view.changeId, view.revision);
+    if (!view.current()) return;
     const korean = window.i18n?.lang === 'ko';
     const summary = preview.items.map((item) => `${item.task_id} → ${item.deterministic_ticket_id}${item.runnable ? '' : korean ? ' (차단됨)' : ' (blocked)'}`).join('\n');
     showConfirmation('Confirm native handoff', korean ? `이 승인된 리비전에서 티켓 ${preview.items.length}개를 생성합니다.` : `${preview.items.length} tickets will be created from this exact approved revision.`, summary, 'Create native tickets', async () => {
-      await api.handoff(state.change.change_id, state.change.revision, preview.preview_token, preview.preview_token); ui.announce(korean ? '승인된 계획을 전달했습니다.' : 'Approved plan handed off.'); await refreshChange();
+      await api.handoff(view.changeId, view.revision, preview.preview_token, preview.preview_token); ui.announce(korean ? '승인된 계획을 전달했습니다.' : 'Approved plan handed off.'); await refreshChange();
     });
   }
 
   async function previewArchive() {
-    const preview = await api.archivePreview(state.change.change_id, state.change.revision);
+    const view = captureView();
+    const preview = await api.archivePreview(view.changeId, view.revision);
+    if (!view.current()) return;
     const target = preview.candidate?.target_paths?.[0] || 'archive';
     const accepted = Object.entries(preview.accepted_commits || {}).map(([ticket, commit]) => `${ticket} · ${commit}`).join('\n');
     showConfirmation('Confirm archive', 'All active scope is explicitly accepted. Archiving mutates only the controlled planning worktree.', `${target}\n\nAccepted evidence:\n${accepted}`, 'Archive reviewed revision', async () => {
-      await api.archive(state.change.change_id, state.change.revision, preview.archive_id, preview.confirmation_token);
+      await api.archive(view.changeId, view.revision, preview.archive_id, preview.confirmation_token);
       ui.announce('Planning change archived in its controlled worktree.'); await load();
     });
   }
 
   function showConfirmation(title, description, details, actionLabel, action) {
-    const previousFocus = document.activeElement;
+    const view = captureView();
     const dialog = ui.el('section', { class: 'pm-inline-dialog', role: 'dialog', 'aria-label': title });
-    const close = () => { dialog.remove(); if (previousFocus?.isConnected) previousFocus.focus(); };
-    const confirm = button(actionLabel, async () => { confirm.disabled = true; try { await action(); close(); } finally { confirm.disabled = false; } }, 'btn btn-primary');
+    const close = () => overlay.close(dialog);
+    const confirm = button(actionLabel, async () => { if (!view.current(false)) return; confirm.disabled = true; try { await action(); close(); } finally { confirm.disabled = false; } }, 'btn btn-primary');
     dialog.append(ui.el('h2', null, title), ui.el('p', null, description), ui.el('pre', null, details), ui.el('div', { class: 'pm-actions' }, [confirm, button('Cancel', close)]));
-    dialog.addEventListener('keydown', (event) => {
-      if (event.key === 'Escape') { event.preventDefault(); close(); }
-    });
-    localizePm(dialog); root.querySelector('.pm-body')?.prepend(dialog); confirm.focus();
+    openDialog(dialog, { initialFocus: confirm });
   }
 
   function showFindings(report) {
-    const dialog = ui.el('section', { class: 'pm-inline-dialog', role: 'dialog', 'aria-label': 'Validation results' }, [ui.el('h2', null, report.valid ? 'Ready for review' : 'Needs attention'), renderFindings(ui, report.findings), button('Close', () => dialog.remove())]);
-    localizePm(dialog); root.querySelector('.pm-body')?.prepend(dialog); dialog.querySelector('button')?.focus();
+    const dialog = ui.el('section', { class: 'pm-inline-dialog', role: 'dialog', 'aria-label': 'Validation results' }, [ui.el('h2', null, report.valid ? 'Ready for review' : 'Needs attention'), renderFindings(ui, report.findings), button('Close', () => overlay.close(dialog))]);
+    openDialog(dialog);
   }
 
   function showProposal(response) {
@@ -715,7 +754,7 @@ export function mountArtifacts({ root, projectId, api: hostApi, ui, onDirtyChang
     const dialog = ui.el('section', { class: 'pm-inline-dialog', role: 'dialog', 'aria-label': 'Planning proposal' });
     const apply = limitAction(limitAction(button('Apply proposal', async () => {
       await api.applyPlanning(state.change.change_id, state.change.revision, response.operation_id, proposal.proposal_digest);
-      dialog.remove(); await refreshChange(); ui.announce('Proposal applied as a new draft revision.');
+      overlay.close(dialog, { force: true }); await refreshChange(); ui.announce('Proposal applied as a new draft revision.');
     }, 'btn btn-primary'), 'assistance'), 'authoring');
     const proposals = proposal.proposals || (proposal.proposal_patch ? [{ document_id: proposal.document_id, proposal_patch: proposal.proposal_patch }] : []);
     if (!proposals.length) apply.disabled = true;
@@ -723,7 +762,7 @@ export function mountArtifacts({ root, projectId, api: hostApi, ui, onDirtyChang
     const reserved = Object.entries(proposal.reserved_ids || {}).map(([placeholder, permanentId]) => [placeholder, permanentId]);
     const discard = button('Discard proposal', async () => {
       await api.cancelOperation(response.operation_id);
-      dialog.remove(); ui.announce('Planning proposal discarded and reserved identities retired.');
+      overlay.close(dialog, { force: true }); ui.announce('Planning proposal discarded and reserved identities retired.');
     });
     dialog.append(ui.el('h2', null, 'Review proposal'), ui.el('p', null, proposal.explanation || 'This proposal has not changed the plan.'),
       ui.el('dl', { class: 'pm-task-meta' }, [
@@ -734,16 +773,17 @@ export function mountArtifacts({ root, projectId, api: hostApi, ui, onDirtyChang
         ui.el('dt', null, 'Impacted artifacts'), ui.el('dd', null, (scope.impacted_document_ids || []).join(', ') || '—'),
         ui.el('dt', null, 'External writes or dispatch'), ui.el('dd', null, proposal.write_or_dispatch_performed ? 'Reported' : 'None performed'),
       ]),
-      proposal.blocked_instruction ? ui.el('p', { class: 'pm-status-card danger', role: 'alert' }, `Blocked instruction: ${proposal.blocked_instruction}`) : null,
-      reserved.length ? ui.el('section', { class: 'pm-proposal-ids' }, [ui.el('h3', null, 'Reserved permanent identities'), simpleTable(['Placeholder', 'Permanent ID'], reserved)]) : null,
+      ...(proposal.blocked_instruction ? [ui.el('p', { class: 'pm-status-card danger', role: 'alert' }, `Blocked instruction: ${proposal.blocked_instruction}`)] : []),
+      ...(reserved.length ? [ui.el('section', { class: 'pm-proposal-ids' }, [ui.el('h3', null, 'Reserved permanent identities'), simpleTable(['Placeholder', 'Permanent ID'], reserved)])] : []),
       ...proposals.map((item) => ui.el('section', { class: 'pm-proposal-diff' }, [ui.el('h3', null, item.document_id), ui.el('pre', null, item.proposal_patch || '')])),
       ui.el('div', { class: 'pm-actions' }, [apply, discard]));
-    localizePm(dialog); root.querySelector('.pm-body')?.prepend(dialog); apply.focus();
+    openDialog(dialog, { initialFocus: apply });
   }
 
   async function openPlanningDialog(docId) {
-    const previousFocus = document.activeElement;
-    const planningWbs = state.wbs || await api.wbs(state.change.change_id);
+    const view = captureView();
+    const planningWbs = state.wbs || await api.wbs(view.changeId);
+    if (!view.current()) return;
     const dialog = ui.el('section', { class: 'pm-inline-dialog', role: 'dialog', 'aria-label': 'Planning assistant' });
     const action = ui.el('select', { class: 'input', 'aria-label': 'Planning action' }, PLANNING_ACTIONS.map(([id, label]) => ui.el('option', { value: id, selected: id === 'find_gaps' }, label)));
     const documents = state.change.documents.filter((item) => item.editable);
@@ -767,7 +807,7 @@ export function mountArtifacts({ root, projectId, api: hostApi, ui, onDirtyChang
       impactField.hidden = !['review_consistency', 'update_impacted_artifacts', 'find_gaps'].includes(action.value);
     };
     action.addEventListener('change', updateScope); documentSelect.addEventListener('change', updateSections); updateScope();
-    const close = () => { dialog.remove(); previousFocus?.focus?.(); };
+    const close = () => overlay.close(dialog);
     const run = button('Prepare proposal', async () => {
       const [taskId, predecessorId] = dependency.value.split('|');
       const request = planningActionRequest(action.value, {
@@ -775,14 +815,13 @@ export function mountArtifacts({ root, projectId, api: hostApi, ui, onDirtyChang
         dependency: taskId && predecessorId ? { task_id: taskId, predecessor_id: predecessorId } : null,
         impactedDocumentIds: [...impacted.selectedOptions].map((item) => item.value), instruction: instruction.value,
       });
-      dialog.remove(); await runPlanning(request);
+      overlay.close(dialog, { force: true }); await runPlanning(request);
     }, 'btn btn-primary');
     dialog.append(ui.el('h2', null, 'Planning assistant'),
       field('Action', action), field('Artifact', documentSelect), sectionField, dependencyField, field('Instructions', instruction), impactField,
       ui.el('p', { class: 'pm-empty' }, 'The server reloads the selected revision and enforces allowed targets. Viewing never starts AI.'),
       ui.el('div', { class: 'pm-actions' }, [run, button('Cancel', close)]));
-    dialog.addEventListener('keydown', (event) => { if (event.key === 'Escape') { event.preventDefault(); close(); } });
-    localizePm(dialog); root.querySelector('.pm-body')?.prepend(dialog); action.focus();
+    openDialog(dialog, { initialFocus: action });
   }
 
   async function runPlanning(request) {
@@ -792,15 +831,15 @@ export function mountArtifacts({ root, projectId, api: hostApi, ui, onDirtyChang
       cancel.disabled = true;
       try {
         await api.cancelOperation(task.operationId);
-        running.remove(); ui.announce('Planning proposal cancelled.');
+        overlay.close(running, { force: true }); ui.announce('Planning proposal cancelled.');
       } finally {
         if (running.isConnected) cancel.disabled = false;
       }
     });
     running.append(ui.el('h2', null, 'Preparing a proposal'), ui.el('p', { role: 'status' }, 'The assistant can propose a diff only. Project code and workflow dispatch are unavailable.'), cancel);
-    root.querySelector('.pm-body')?.prepend(running); cancel.focus();
-    try { const response = await task.promise; if (running.isConnected) { running.remove(); showProposal(response); } }
-    catch (error) { if (running.isConnected) { running.remove(); reportActionError(error, cancel); } }
+    openDialog(running, { initialFocus: cancel, canClose: () => { cancel.click(); return false; } });
+    try { const response = await task.promise; if (running.isConnected) { overlay.close(running, { force: true }); showProposal(response); } }
+    catch (error) { if (running.isConnected) { overlay.close(running, { force: true }); reportActionError(error, cancel); } }
   }
 
   async function openCreateDialog() {
@@ -836,7 +875,7 @@ export function mountArtifacts({ root, projectId, api: hostApi, ui, onDirtyChang
   function simpleTable(headers, rows) { return ui.el('div', { class: 'pm-table-scroll' }, ui.el('table', { class: 'pm-compact-table' }, [ui.el('thead', null, ui.el('tr', null, headers.map((name) => ui.el('th', { scope: 'col' }, name)))), ui.el('tbody', null, rows.map((row) => ui.el('tr', null, row.map((value) => ui.el('td', null, String(value ?? '—'))))))])); }
 
   load().catch((error) => { if (error.name !== 'AbortError') root.replaceChildren(ui.el('div', { class: 'banner banner-danger', role: 'alert' }, error.message)); });
-  return { unmount: () => { state.dispose(); root.classList.remove('pm-workspace-host'); }, beforeProjectSwitch: () => guard('Discard unsaved PM Workspace edits and switch projects?'), isDirty: () => state.dirty };
+  return { unmount: () => { state.dispose(); overlay.destroy(); disposeWbs(); root.classList.remove('pm-workspace-host'); }, beforeProjectSwitch: () => guard('Discard unsaved PM Workspace edits and switch projects?'), isDirty: () => state.dirty };
 }
 
 const TASK_TO_API_FIELD = { kind: 'type', agent_kind_override: 'agent_kind', dependencies: 'depends_on', requirement_refs: 'requirements', storyboard_refs: 'storyboards' };
@@ -936,6 +975,15 @@ export function applyUnifiedDiff(source, patch) {
 }
 
 const KO = new Map(Object.entries({
+  'Discard unsaved changes?': '저장하지 않은 변경을 버리시겠습니까?',
+  'Discard unsaved changes and leave this tab?': '저장하지 않은 변경을 버리고 이 탭을 나가시겠습니까?',
+  'Discard unsaved PM edits and switch changes?': '저장하지 않은 기획 변경을 버리고 다른 변경으로 이동하시겠습니까?',
+  'Discard unsaved PM Workspace edits and switch projects?': '저장하지 않은 기획 변경을 버리고 프로젝트를 바꾸시겠습니까?',
+  'Discard unsaved storyboard changes?': '저장하지 않은 스토리보드 변경을 버리시겠습니까?',
+  'Recovered local draft': '복원된 로컬 초안',
+  'Action unavailable': '작업을 수행할 수 없습니다',
+  'Title': '제목', 'Screen / route': '화면 / 경로', 'Actor and goal': '사용자와 목표', 'Initial state': '초기 상태',
+  'User action': '사용자 행동', 'System response': '시스템 반응', 'Success': '성공', 'Alternate': '다른 경로', 'Failure': '실패',
   'Product planning': '제품 기획', 'Artifacts': '기획 산출물',
   'Shape the idea, align requirements, and hand off executable work.': '아이디어를 구체화하고 요구사항을 맞춘 뒤 실행 가능한 작업으로 전달합니다.',
   'Idea': '아이디어', 'Requirements': '요구사항', 'Design': '설계', 'Plan': '계획', 'Code Files': '코드 파일',

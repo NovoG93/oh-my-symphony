@@ -228,7 +228,7 @@ def _hostile_git(tmp_path):
 
 
 @contextmanager
-def _page(chrome, token="", *, preset_english=False):
+def _page(chrome, token="", *, preset_english=False, confirm_response=None):
     context = chrome.new_context(viewport={"width": 1440, "height": 1000}, accept_downloads=True)
     denied = []
     dialogs = []
@@ -248,7 +248,10 @@ def _page(chrome, token="", *, preset_english=False):
 
     def dialog(item):
         dialogs.append((item.type, item.message))
-        item.accept(token if item.type == "prompt" else None)
+        if item.type == "confirm" and confirm_response and not confirm_response():
+            item.dismiss()
+        else:
+            item.accept(token if item.type == "prompt" else None)
 
     page.on("dialog", dialog)
     try:
@@ -605,3 +608,187 @@ def test_ordinary_server_without_node_r15_context(tmp_path, installed_python, ch
         assert _runs(directory) == 0
         page.screenshot(path=str(tmp_path / "ordinary-no-node.png"), full_page=True)
     assert _runs(directory) == 0
+
+
+@pytest.mark.parametrize('lang', ['en', 'ko'])
+def test_installed_demo_hardening_surfaces(tmp_path, installed_python, chrome, lang):
+    """Actual installed CSS/geometry/modal evidence; no provider or fixture writes."""
+    from playwright.sync_api import expect
+    directory = tmp_path / 'demo'
+    argv = [str(installed_python.parent / 'symphony'), 'pm', 'demo', '--path', str(directory), '--lang', lang]
+    with _server(argv, tmp_path, _environment(tmp_path)) as (_, url), _page(chrome) as (page, _):
+        page.goto(url)
+        expect(page.locator('.pm-tabs')).to_be_visible()
+        page.screenshot(path=str(tmp_path / f'hardening-before-{lang}.png'))
+        background = page.locator('.pm-tabs').evaluate('(node) => getComputedStyle(node).backgroundColor')
+        assert background not in {'rgba(0, 0, 0, 0)', 'transparent'}, background
+        _tab(page, 'requirements', lang)
+        expect(page.locator('.pm-readable-card').first).to_be_visible()
+        for width in [320, 375, 440, 1280]:
+            page.set_viewport_size({'width': width, 'height': 800 if width == 1280 else 667})
+            geometry = page.locator('.pm-workspace-host').evaluate('(node) => ({client: node.clientWidth, scroll: node.scrollWidth})')
+            assert geometry['scroll'] <= geometry['client'] + 1, (width, geometry)
+            page.screenshot(path=str(tmp_path / f'requirements-{width}-{lang}.png'))
+        # Text-size proxy only: double the actual root font; this is not browser zoom.
+        page.evaluate('document.documentElement.style.fontSize = `${parseFloat(getComputedStyle(document.documentElement).fontSize) * 2}px`')
+        geometry = page.locator('.pm-workspace-host').evaluate('(node) => ({client: node.clientWidth, scroll: node.scrollWidth})')
+        assert geometry['scroll'] <= geometry['client'] + 1, geometry
+        page.screenshot(path=str(tmp_path / f'requirements-font2x-{lang}.png'))
+        page.evaluate('document.documentElement.style.fontSize = ""')
+        _tab(page, 'plan', lang)
+        expect(page.locator('.tabulator-row').first).to_be_visible()
+        page.locator('.tabulator-row').nth(1).click()
+        drawer = page.locator('.pm-task-drawer')
+        expect(drawer).to_have_count(1)
+        assert page.locator('.app').evaluate('(node) => node.inert'), 'Modal background must be inert'
+        assert drawer.evaluate('(node) => getComputedStyle(node).backgroundColor') not in {'rgba(0, 0, 0, 0)', 'transparent'}
+        drawer.get_by_role('button', name='닫기' if lang == 'ko' else 'Close', exact=True).focus()
+        page.keyboard.press('Shift+Tab')
+        assert drawer.evaluate('(node) => node.contains(document.activeElement)')
+        page.keyboard.press('Escape')
+        expect(drawer).to_have_count(0)
+        assert not page.locator('.app').evaluate('(node) => node.inert')
+        _tab(page, 'design', lang)
+        _button(page, 'Storyboard', lang).click()
+        page.locator('.pm-storyboard-card').first.click()
+        drawer = page.locator('.pm-storyboard-drawer')
+        expect(drawer).to_have_count(1)
+        assert page.locator('.app').evaluate('(node) => node.inert')
+        page.keyboard.press('Escape')
+        expect(drawer).to_have_count(0)
+        assert page.locator('.pm-storyboard-card').first.evaluate('(node) => node === document.activeElement')
+        assert _runs(directory) == 0
+
+
+@pytest.mark.parametrize('lang', ['en', 'ko'])
+def test_installed_demo_hardening_drafts(tmp_path, installed_python, chrome, lang):
+    from playwright.sync_api import expect
+    directory = tmp_path / 'demo'
+    argv = [str(installed_python.parent / 'symphony'), 'pm', 'demo', '--path', str(directory), '--lang', lang]
+    discard = False
+    with _server(argv, tmp_path, _environment(tmp_path)) as (_, url), _page(chrome, confirm_response=lambda: discard) as (page, dialogs):
+        page.goto(url)
+        _button(page, 'Edit source', lang).click()
+        editor = page.locator('.pm-source-editor')
+        original = editor.input_value()
+        draft = original + '\nUnsaved recovery marker\n'
+        editor.fill(draft)
+        page.reload()
+        _button(page, 'Edit source', lang).click()
+        expect(editor).to_have_value(draft)
+        expect(_button(page, 'Save draft', lang)).to_be_enabled()
+        page.locator('.pm-tabs').get_by_role('button', name='설계' if lang == 'ko' else 'Design', exact=True).click()
+        expect(editor).to_have_value(draft)
+        assert dialogs[-1][0] == 'confirm'
+        if lang == 'ko':
+            assert '저장하지 않은' in dialogs[-1][1]
+        discard = True
+        _tab(page, 'design', lang)
+        page.locator('.pm-design-stack > button').click()
+        page.locator('.pm-view-switcher button').click()
+        editor = page.locator('.pm-source-editor')
+        ux_source = editor.input_value()
+        editor.fill(ux_source + '\nUnsaved nested marker\n')
+        discard = False
+        page.locator('.pm-segment').filter(has_text='아키텍처' if lang == 'ko' else 'Architecture').click()
+        expect(editor).to_have_value(ux_source + '\nUnsaved nested marker\n')
+        discard = True
+        architecture = page.locator('.pm-segment').filter(has_text='아키텍처' if lang == 'ko' else 'Architecture')
+        architecture.click()
+        expect(architecture).to_have_attribute('aria-selected', 'true')
+        ux_tab = page.locator('.pm-segment').filter(has_text='사용자 경험' if lang == 'ko' else 'UX')
+        ux_tab.click()
+        expect(ux_tab).to_have_attribute('aria-selected', 'true')
+        expect(page.locator('.pm-document-preview').first).to_contain_text('휴가 신청' if lang == 'ko' else 'leave')
+        page.locator('.pm-design-stack > button').click()
+        page.locator('.pm-view-switcher button').click()
+        expect(page.locator('.pm-source-editor')).to_have_value(ux_source)
+        expect(_button(page, 'Save draft', lang)).to_be_disabled()
+        # Dirty storyboard Escape/cancel keeps input; explicit discard closes it.
+        page.locator('.pm-segment').filter(has_text='스토리보드' if lang == 'ko' else 'Storyboard').click()
+        page.locator('.pm-storyboard-card').first.click()
+        title = page.locator('.pm-storyboard-drawer input').first
+        title.fill('Unsaved storyboard marker')
+        discard = False
+        page.keyboard.press('Escape')
+        expect(title).to_have_value('Unsaved storyboard marker')
+        expect(page.locator('.pm-storyboard-drawer')).to_have_count(1)
+        assert dialogs[-1][0] == 'confirm'
+        if lang == 'ko':
+            assert '저장하지 않은 스토리보드' in dialogs[-1][1]
+        discard = True
+        page.keyboard.press('Escape')
+        expect(page.locator('.pm-storyboard-drawer')).to_have_count(0)
+        assert not page.locator('.app').evaluate('(node) => node.inert')
+        assert _runs(directory) == 0
+        page.screenshot(path=str(tmp_path / f'dirty-discard-{lang}.png'))
+
+
+@pytest.mark.parametrize('lang', ['en', 'ko'])
+def test_installed_demo_project_switch_has_one_localized_dirty_guard(tmp_path, installed_python, chrome, lang):
+    """Read-only alternate project + refused open fixture; real browser switch handler."""
+    import json
+    from playwright.sync_api import expect
+    directory = tmp_path / 'demo'
+    argv = [str(installed_python.parent / 'symphony'), 'pm', 'demo', '--path', str(directory), '--lang', lang]
+    discard = False
+    opened = []
+    def projects(route):
+        response = route.fetch()
+        body = response.json()
+        other = {**body['current'], 'id': 'fixture-other-project', 'name': 'Other fixture'}
+        body['projects'].append(other)
+        route.fulfill(response=response, json=body)
+    def refuse_open(route):
+        opened.append(route.request.url)
+        route.fulfill(status=409, content_type='application/json', body=json.dumps({'error': {'code': 'fixture_refusal', 'message': 'Fixture project open refused.'}}))
+    with _server(argv, tmp_path, _environment(tmp_path)) as (_, url), _page(chrome, confirm_response=lambda: discard) as (page, dialogs):
+        page.route('**/api/v1/projects', projects)
+        page.route('**/api/v1/projects/fixture-other-project/open', refuse_open)
+        page.goto(url)
+        _button(page, 'Edit source', lang).click()
+        editor = page.locator('.pm-source-editor')
+        draft = editor.input_value() + '\nProject switch draft\n'
+        editor.fill(draft)
+        page.locator('#project-selector').select_option('fixture-other-project')
+        assert len(dialogs) == 1 and dialogs[0][0] == 'confirm'
+        if lang == 'ko':
+            assert '저장하지 않은' in dialogs[0][1]
+        expect(editor).to_have_value(draft)
+        assert not opened
+        discard = True
+        page.locator('#project-selector').select_option('fixture-other-project')
+        expect(page.get_by_text('Fixture project open refused.', exact=True)).to_be_visible()
+        assert len(dialogs) == 2 and len(opened) == 1
+        assert _runs(directory) == 0
+
+
+@pytest.mark.parametrize('kind', ['handoffs', 'archive'])
+def test_installed_demo_delayed_preview_stays_on_its_original_view(tmp_path, installed_python, chrome, kind):
+    """Delayed read-only preview must not reopen an old plan on Code Files."""
+    from playwright.sync_api import expect
+    directory = tmp_path / 'demo'
+    argv = [str(installed_python.parent / 'symphony'), 'pm', 'demo', '--path', str(directory), '--lang', 'en']
+    pending = []
+    writes = []
+    with _server(argv, tmp_path, _environment(tmp_path)) as (_, url), _page(chrome) as (page, _):
+        pattern = f'**/api/v1/pm/changes/*/{kind}/preview'
+        page.route(pattern, lambda route: pending.append(route))
+        page.route(f'**/api/v1/pm/changes/*/{kind}', lambda route: (writes.append(route.request.url), route.abort()))
+        page.goto(url)
+        _tab(page, 'plan', 'en')
+        with page.expect_request(pattern):
+            _button(page, 'Preview approved handoff' if kind == 'handoffs' else 'Preview archive', 'en').click()
+        _tab(page, 'code', 'en')
+        assert len(pending) == 1
+        body = {'items': [], 'preview_token': 'old-view-token'} if kind == 'handoffs' else {'candidate': {'target_paths': ['old-view-archive']}, 'accepted_commits': {}, 'archive_id': 'old-view', 'confirmation_token': 'old-token'}
+        with page.expect_response(pattern) as response:
+            pending.pop().fulfill(status=200, json=body)
+        response.value.finished()
+        # Flush the completed response's render callbacks before the negative assertion.
+        page.evaluate('() => new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve)))')
+        expect(page.locator('[role=dialog]')).to_have_count(0)
+        expect(page.locator('.pm-tabs [aria-current=page]')).to_have_text('Code Files')
+        assert not page.locator('.app').evaluate('(node) => node.inert')
+        assert not writes and _runs(directory) == 0
+        page.screenshot(path=str(tmp_path / f'delayed-{kind}-ignored.png'))

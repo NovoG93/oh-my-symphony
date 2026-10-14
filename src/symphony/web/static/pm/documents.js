@@ -11,7 +11,8 @@ export function renderDocumentEditor({ ui, document, error, draft, onSave, onAss
   if (document.unsupported_reason) return el('section', { class: 'pm-error-state', role: 'status' }, [el('h2', null, 'Read-only document'), el('p', null, document.unsupported_reason), el('pre', null, document.source || '')]);
   const initial = draft === null ? document.source : draft;
   const editPolicy = sourceEditPolicy(document.source);
-  let changed = false;
+  let changed = initial !== document.source;
+  onDirty(changed);
   const source = el('textarea', {
     class: 'pm-source-editor',
     'aria-label': `${document.document_id} source`,
@@ -25,12 +26,12 @@ export function renderDocumentEditor({ ui, document, error, draft, onSave, onAss
   const toggle = el('button', { class: 'btn', type: 'button', 'aria-pressed': 'false' }, translate('Edit source'));
   const save = el('button', { class: 'btn btn-primary', type: 'button' }, 'Save draft');
   const assist = el('button', { class: 'btn', type: 'button' }, 'Planning assistant');
-  save.disabled = true;
+  save.disabled = !changed || !authoring.effective || !editPolicy.editable;
   if (!authoring.effective) { save.title = (authoring.reasons || []).join(' '); save.dataset.capability = 'authoring'; }
   else if (!editPolicy.editable) save.title = editPolicy.reason;
   if (!assistance.effective) { assist.disabled = true; assist.title = (assistance.reasons || []).join(' '); assist.dataset.capability = 'assistance'; }
   source.addEventListener('input', () => {
-    changed = source.value !== initial; save.disabled = !changed || !authoring.effective;
+    changed = source.value !== document.source; save.disabled = !changed || !authoring.effective;
     onDirty(changed);
     onDraft?.(source.value);
     preview.replaceChildren(renderMarkdown(source.value));
@@ -38,7 +39,7 @@ export function renderDocumentEditor({ ui, document, error, draft, onSave, onAss
   save.addEventListener('click', async () => {
     if (!changed || !editPolicy.editable) return;
     save.disabled = true;
-    try { await onSave(source.value); changed = false; onDirty(false); }
+    try { if (await onSave(source.value) === false) return; changed = false; onDirty(false); }
     catch (error) { onError(error, save); }
     finally { save.disabled = !changed || !authoring.effective; }
   });

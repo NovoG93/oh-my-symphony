@@ -9,6 +9,7 @@ import pytest
 
 import symphony.pm.planning as planning_module
 from symphony.pm.models import PmError
+from tests._pm_codex_runtime import schemas
 from symphony.pm.planning import (
     DISABLED_FEATURES,
     EFFORT,
@@ -107,7 +108,14 @@ async def test_real_owned_process_group_cleanup_leaves_no_descendant(tmp_path: P
             #!/usr/bin/env python3
             import json, subprocess, sys
             if '--version' in sys.argv:
-                print('codex-cli 0.160.0')
+                print('codex-cli 0.162.1')
+                raise SystemExit(0)
+            if 'generate-json-schema' in sys.argv:
+                from pathlib import Path
+                root = Path(sys.argv[sys.argv.index('--out') + 1]) / 'v2'
+                root.mkdir(parents=True)
+                for name, schema in {schemas()!r}.items():
+                    (root / name).write_text(json.dumps(schema))
                 raise SystemExit(0)
             child = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(30)'])
             open({str(pid_file)!r}, 'w').write(str(child.pid))
@@ -176,7 +184,9 @@ async def test_version_probe_timeout_reaps_owned_process(
     client = PmPlanningClient(codex_executable=str(executable), auth_file=auth, timeout_seconds=0.2)
     with pytest.raises(PmError) as exc:
         await client.propose(tmp_path, "snapshot", "review")
-    assert exc.value.code == "planning_timeout"
+    assert exc.value.code == "capability_unavailable"
+    assert exc.value.status == 503
+    assert "timed out" in exc.value.message
     assert len(spawned_pids) == 1
     with pytest.raises(ProcessLookupError):
         os.kill(spawned_pids[0], 0)

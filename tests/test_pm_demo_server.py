@@ -44,7 +44,8 @@ def clean_environment(environment_unchanged, tmp_path, monkeypatch):
     monkeypatch.setenv("HOME", str(home))
     monkeypatch.setenv("SYMPHONY_PROJECTS_FILE", str(tmp_path / "unused-projects.json"))
     monkeypatch.setattr(openspec, "_NODE_CACHE", {})
-    monkeypatch.setattr(host_tools, "_CODEX_CACHE", {})
+    from symphony.pm import codex_compatibility
+    monkeypatch.setattr(codex_compatibility, "_CACHE", {})
 
     async def forbid_start(self):
         pytest.fail("a demo server must never start dispatch")

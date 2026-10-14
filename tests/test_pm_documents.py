@@ -906,3 +906,164 @@ def test_archived_approval_projection_is_immutable_and_readonly(tmp_path: Path, 
     assert (history.state, history.approval_id) == ("Archived", None)
     assert history.next_action == "history" and all(not doc.editable for doc in history.documents)
     assert {path.relative_to(archived): path.read_bytes() for path in archived.rglob("*") if path.is_file()} == before
+
+
+def test_R32_03_git_status_does_not_refresh_index(tmp_path):
+    subprocess.run(["git", "init", "-q", str(tmp_path)], check=True)
+    tracked = tmp_path / "tracked.txt"
+    tracked.write_text("same bytes\n")
+    subprocess.run(["git", "-C", str(tmp_path), "add", "tracked.txt"], check=True)
+    index = tmp_path / ".git/index"
+    before = index.stat().st_mtime_ns
+    __import__("time").sleep(.02)
+    tracked.touch()
+    assert __import__("symphony.pm.documents", fromlist=["_git"])._git(tmp_path, "status", "--porcelain=v1", "--untracked-files=all") == "A  tracked.txt"
+    after = index.stat().st_mtime_ns
+    print("INDEX_MTIME", before, after)
+    assert after == before, "read-only Git status wrote the index (optional locking enabled)"
+
+
+def test_R32_05_atomic_replacement_preserves_existing_mode(tmp_path):
+    path = tmp_path / "proposal.md"
+    path.write_text("old")
+    path.chmod(0o644)
+    __import__("symphony.pm.documents", fromlist=["_atomic_write"])._atomic_write(path, "new")
+    actual = path.stat().st_mode & 0o777
+    print("REPLACEMENT_MODE", oct(actual))
+    assert actual == 0o644
+
+
+
+def test_snapshot_holds_stable_authority_until_all_files_are_read(tmp_path, monkeypatch):
+    import threading
+    import symphony.pm.documents as documents
+    from symphony.pm.locks import change_authority_lock
+    from symphony.pm.routes import _read_change_snapshot
+
+    repo, change_id, workspace = _repository(tmp_path)
+    repo.create_change(change_id=change_id, locator="archive-race", title="Archive race", owner="owner")
+    resolved, resume, archived = threading.Event(), threading.Event(), threading.Event()
+    original = documents._resolve_change_root
+    outcomes = {}
+
+    def pause_reader(*args, **kwargs):
+        result = original(*args, **kwargs)
+        if threading.current_thread().name == "snapshot-reader":
+            resolved.set()
+            assert resume.wait(2)
+        return result
+
+    def read():
+        try:
+            outcomes["view"] = _read_change_snapshot(repo, PmRequestContext("p1", change_id), "owner")
+        except BaseException as exc:
+            outcomes["error"] = exc
+
+    def archive():
+        registry = RunRegistry(repo.registry.path)
+        try:
+            with change_authority_lock(registry, "p1", change_id):
+                root = workspace / "openspec/changes/archive-race"
+                target = root.parent / "archive/2026-10-14-archive-race"
+                target.parent.mkdir()
+                root.rename(target)
+                assert registry.set_pm_workspace_state("p1", change_id, fence=1, state="RELEASED")
+                archived.set()
+        except BaseException as exc:
+            outcomes["archive_error"] = exc
+        finally:
+            registry.close()
+
+    monkeypatch.setattr(documents, "_resolve_change_root", pause_reader)
+    reader = threading.Thread(target=read, name="snapshot-reader")
+    writer = threading.Thread(target=archive)
+    reader.start()
+    assert resolved.wait(2)
+    writer.start()
+    try:
+        assert not archived.wait(.1), "archive moved a change while snapshot held its resolved root"
+    finally:
+        resume.set()
+        reader.join(2)
+        writer.join(2)
+    assert not reader.is_alive() and not writer.is_alive()
+    assert "error" not in outcomes and "archive_error" not in outcomes, outcomes
+    assert outcomes["view"].state == "Draft"
+    assert repo.get_change(PmRequestContext("p1", change_id), owner="owner").state == "Archived"
+    repo.registry.close()
+
+
+def test_atomic_write_keeps_new_files_private_and_failure_preserves_old_bytes_and_mode(tmp_path, monkeypatch):
+    import symphony.pm.documents as documents
+
+    path = tmp_path / "proposal.md"
+    documents._atomic_write(path, "private")
+    assert path.stat().st_mode & 0o777 == 0o600
+    path.chmod(0o644)
+    def fail_replace(*_args):
+        raise OSError("injected replace failure")
+    monkeypatch.setattr(documents.os, "replace", fail_replace)
+    with pytest.raises(OSError, match="injected replace"):
+        documents._atomic_write(path, "replacement")
+    assert path.read_text() == "private"
+    assert path.stat().st_mode & 0o777 == 0o644
+    assert sorted(item.name for item in tmp_path.iterdir()) == ["proposal.md"]
+
+
+def test_authority_lock_reentry_is_same_thread_only_and_shared_upgrade_is_refused(tmp_path):
+    import threading
+    from symphony.pm.locks import change_authority_lock
+
+    registry = RunRegistry(tmp_path / "state.db")
+    entered = threading.Event()
+    started = threading.Event()
+    def competitor():
+        other = RunRegistry(registry.path)
+        try:
+            started.set()
+            with change_authority_lock(other, "p1", "c1"):
+                entered.set()
+        finally:
+            other.close()
+    with change_authority_lock(registry, "p1", "c1"):
+        with change_authority_lock(registry, "p1", "c1"):
+            with change_authority_lock(registry, "p1", "c1", shared=True):
+                pass
+        thread = threading.Thread(target=competitor)
+        thread.start()
+        assert started.wait(2) and not entered.wait(.05)
+    thread.join(2)
+    assert entered.is_set() and not thread.is_alive()
+    with change_authority_lock(registry, "p1", "c1", shared=True):
+        with pytest.raises(RuntimeError, match="cannot be upgraded"):
+            with change_authority_lock(registry, "p1", "c1"):
+                pass
+    registry.close()
+
+
+@pytest.mark.parametrize("fault", [None, "after_document", "after_identity"])
+def test_semantic_edit_and_journal_recovery_preserve_document_and_identity_modes(tmp_path, monkeypatch, fault):
+    repo, change_id, workspace = _repository(tmp_path)
+    created = repo.create_change(change_id=change_id, locator="semantic-modes", title="Semantic modes", owner="owner")
+    root = workspace / "openspec/changes/semantic-modes"
+    document = root / "ux.md"
+    identity = root / "symphony.yaml"
+    document.chmod(0o644)
+    identity.chmod(0o640)
+    context = PmRequestContext("p1", change_id, created.revision, "semantic-mode-write")
+    operation = ({"op": "create_semantic", "kind": "storyboard", "title": "Mode preserving frame"},)
+    try:
+        if fault:
+            monkeypatch.setenv("SYMPHONY_PM_SEMANTIC_FAULT", fault)
+            with pytest.raises(RuntimeError, match="semantic fault"):
+                repo.patch_document(context, "ux", operation, owner="owner")
+            monkeypatch.delenv("SYMPHONY_PM_SEMANTIC_FAULT")
+        else:
+            repo.patch_document(context, "ux", operation, owner="owner")
+        recovered = repo.get_change(PmRequestContext("p1", change_id), owner="owner")
+        assert "Mode preserving frame" in next(item.source for item in recovered.documents if item.document_id == "ux")
+        assert document.stat().st_mode & 0o777 == 0o644
+        assert identity.stat().st_mode & 0o777 == 0o640
+        assert not list(root.glob(".symphony-semantic-*"))
+    finally:
+        repo.registry.close()

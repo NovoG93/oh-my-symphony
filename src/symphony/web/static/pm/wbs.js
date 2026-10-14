@@ -9,7 +9,7 @@ function byParent(tasks) {
   return map;
 }
 
-export function renderWbs({ ui, view, semanticIndex = [], onNavigateReference = () => {}, onSetField, onPaste, onCommand, onCopy, onSelect, onFilter, onScroll, selectedTask = '', filter = '', scrollTop = 0, canUndo = false, canRedo = false, approved = false, readOnlyReason = '' }) {
+export function renderWbs({ ui, overlay, view, semanticIndex = [], onNavigateReference = () => {}, onSetField, onPaste, onCommand, onCopy, onSelect, onFilter, onScroll, selectedTask = '', filter = '', scrollTop = 0, canUndo = false, canRedo = false, approved = false, readOnlyReason = '' }) {
   const { el } = ui;
   const tasks = view.tasks;
   const root = el('section', { class: 'pm-plan-surface' });
@@ -49,7 +49,7 @@ export function renderWbs({ ui, view, semanticIndex = [], onNavigateReference = 
         el('td', null, task.priority || '—'),
         el('td', null, task.estimate || '—'),
       ]);
-      title.addEventListener('click', () => openTaskDrawer(ui, task, tasks, semanticIndex, onNavigateReference, onSetField, readOnlyReason));
+      title.addEventListener('click', () => openTaskDrawer(ui, task, tasks, semanticIndex, onNavigateReference, onSetField, readOnlyReason, overlay));
       if (selected === task.task_id) row.classList.add('selected');
       row.addEventListener('click', () => { selected = task.task_id; onSelect(selected); tbody.querySelectorAll('tr').forEach((item) => item.classList.toggle('selected', item === row)); });
       row.addEventListener('keydown', (event) => {
@@ -73,7 +73,7 @@ export function renderWbs({ ui, view, semanticIndex = [], onNavigateReference = 
   const scroll = el('div', { class: 'pm-table-scroll' }, table); scroll.scrollTop = scrollTop; scroll.addEventListener('scroll', () => onScroll(scroll.scrollTop), { passive: true });
   root.append(toolbar, scroll);
   root.addEventListener('pm-copy', () => onCopy(view.tasks));
-  enhanceWithTabulator(root, view.tasks, ui, semanticIndex, onNavigateReference, onSetField, onPaste, (id) => { selected = id; onSelect(id); }, filter, search, readOnlyReason).catch(() => {});
+  enhanceWithTabulator(root, view.tasks, ui, semanticIndex, onNavigateReference, onSetField, onPaste, (id) => { selected = id; onSelect(id); }, filter, search, readOnlyReason, overlay).catch(() => {});
   return root;
 }
 
@@ -81,14 +81,17 @@ export function renderWbs({ ui, view, semanticIndex = [], onNavigateReference = 
 // Only one WBS grid is visible at a time, so release the previous one before
 // building the next; otherwise each Plan render retains a full 1,000-row table.
 let activeTable = null;
+export function disposeWbs() {
+  if (activeTable) { activeTable.destroy(); activeTable = null; }
+}
 
-async function enhanceWithTabulator(root, tasks, ui, semanticIndex, onNavigateReference, onSetField, onPaste, onSelect, filter, search, readOnlyReason) {
+async function enhanceWithTabulator(root, tasks, ui, semanticIndex, onNavigateReference, onSetField, onPaste, onSelect, filter, search, readOnlyReason, overlay) {
   const [{ TabulatorFull: Tabulator }] = await Promise.all([
     import('./vendor/tabulator.min.mjs'),
     ensureStyles('/static/pm/vendor/tabulator.min.css'),
   ]);
   if (!root.isConnected) return;
-  if (activeTable) { activeTable.destroy(); activeTable = null; }
+  disposeWbs();
   const holder = document.createElement('div');
   holder.className = 'pm-tabulator';
   root.querySelector('.pm-table-scroll').replaceChildren(holder);
@@ -137,11 +140,11 @@ async function enhanceWithTabulator(root, tasks, ui, semanticIndex, onNavigateRe
       (onControl && control ? control : row.getElement()).focus();
       return;
     }
-    if (event.key === 'Enter') { event.preventDefault(); onSelect(row.getData().task_id); openTaskDrawer(ui, row.getData(), tasks, semanticIndex, onNavigateReference, onSetField, readOnlyReason); }
+    if (event.key === 'Enter') { event.preventDefault(); onSelect(row.getData().task_id); openTaskDrawer(ui, row.getData(), tasks, semanticIndex, onNavigateReference, onSetField, readOnlyReason, overlay); }
     if (event.key === 'ArrowDown') { event.preventDefault(); element.nextElementSibling?.focus(); }
     if (event.key === 'ArrowUp') { event.preventDefault(); element.previousElementSibling?.focus(); }
   });
-  table.on('rowClick', (_event, row) => { onSelect(row.getData().task_id); openTaskDrawer(ui, row.getData(), tasks, semanticIndex, onNavigateReference, onSetField, readOnlyReason); });
+  table.on('rowClick', (_event, row) => { onSelect(row.getData().task_id); openTaskDrawer(ui, row.getData(), tasks, semanticIndex, onNavigateReference, onSetField, readOnlyReason, overlay); });
   const matches = (data, value) => `${data.task_id} ${data.title} ${data.kind}`.toLowerCase().includes(value) || (data._children || []).some((child) => matches(child, value));
   if (filter) table.setFilter((data) => matches(data, filter.toLowerCase()));
   search.addEventListener('input', () => table.setFilter((data) => matches(data, search.value.toLowerCase())));
@@ -167,11 +170,9 @@ function ensureStyles(href) {
   });
 }
 
-function openTaskDrawer(ui, task, tasks, semanticIndex, onNavigateReference, onSetField, readOnlyReason = '') {
+function openTaskDrawer(ui, task, tasks, semanticIndex, onNavigateReference, onSetField, readOnlyReason = '', overlay) {
   const { el } = ui;
-  const overlay = document.getElementById('overlay-root');
-  const previousFocus = document.activeElement;
-  const close = () => { panel.remove(); previousFocus?.focus?.(); };
+  const close = () => overlay.close(panel);
   const field = (label, key, value, multiline = false) => {
     const input = multiline
       ? el('textarea', { class: 'input pm-drawer-textarea', 'aria-label': L(label) })
@@ -210,17 +211,7 @@ function openTaskDrawer(ui, task, tasks, semanticIndex, onNavigateReference, onS
     field('Notes', 'notes', task.notes, true),
     el('dl', { class: 'pm-task-meta' }, [el('dt', null, L('Source revision')), el('dd', null, task.task_id)]),
   ]);
-  overlay.appendChild(panel);
-  panel.addEventListener('keydown', (event) => {
-    if (event.key === 'Escape') { event.preventDefault(); close(); }
-    if (event.key !== 'Tab') return;
-    const focusable = [...panel.querySelectorAll('button,input,textarea,select')].filter((item) => !item.disabled);
-    if (!focusable.length) return;
-    const first = focusable[0], last = focusable.at(-1);
-    if (event.shiftKey && document.activeElement === first) { event.preventDefault(); last.focus(); }
-    if (!event.shiftKey && document.activeElement === last) { event.preventDefault(); first.focus(); }
-  });
-  panel.querySelector('input, textarea, button').focus();
+  overlay.open(panel);
 }
 
 function dependencyPicker(el, task, tasks, onSetField, readOnlyReason = '') {

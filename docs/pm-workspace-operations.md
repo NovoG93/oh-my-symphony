@@ -71,27 +71,33 @@ Archive is a separate confirmed operation after completion evidence and conflict
 
 An existing `pmChange=<change-id>` link remains available after archive as read-only history, including its planning documents, WBS, managed tickets, verification evidence, and ArtifactStore links. Archived changes stay out of the active change list, and their original IDs cannot be reclaimed, repaired, edited, approved, handed off, or archived again.
 
+## Installed Codex readiness
+
+PM assistance uses the resolved installed Codex executable without automatic upgrades or downgrades. Readiness and planning start share a five-second local probe deadline followed by confirmed cleanup: successful version output, binary-generated ThreadStartParams/TurnStartParams schemas supporting the exact restricted control values, and strict startup/initialize with all existing disabled features. This probe uses an empty isolated CODEX_HOME, strips API keys, and never reads authentication content or starts a thread, turn, or provider call. Login availability is checked separately on every readiness request.
+
+Successful admission is cached only against the resolved executable's device/inode/size/modification/change timestamps and freshly checked version. Replacement invalidates it; JavaScript launchers are reprobed because their native package can change independently. Compatibility failures report the missing control or failed probe and ask for a compatible installed CLI; planning returns `503 capability_unavailable` without relaxed settings or fallback. GPT-6.1 Sol, medium effort, isolated authenticated runtime, read-only/no-network/tool-disabled execution, output limits and unexpected-request refusal remain enforced. Local readiness proves these controls, not provider entitlement or completion; actual assistance requires its own successful turn evidence. Future CLI versions are checked rather than assumed compatible.
+
 ## Accepted findings and current handling
 
-These existing Low/Medium findings were accepted as follow-ups under the owner's release rule. They are disclosed here without claiming that their runtime causes were repaired by the bilingual UI change. The IDs preserve the review record in `.sdlc/work/261004-pm-workspace/evidence.md:176–191` (R32, R33, and R35 round two). N1 process-group cleanup changes are already recorded in the changelog.
+These IDs preserve the original accepted Low/Medium findings in `.sdlc/work/261004-pm-workspace/evidence.md:176–191` (R32, R33, and R35 round two). Current handling reflects the local hardening changes and their focused regressions; it does not establish final installed lifecycle, performance, or quality approval. N1 process-group cleanup changes are already recorded in the changelog.
 
 | Finding | Current behavior or handling |
 |---|---|
-| R32-02 (Low) | Archive concurrent with an off-loop snapshot read can raise a raw `FileNotFoundError` and return HTTP 500. |
-| R32-03 (Low) | Off-loop `git status` can contend with approval's `git add` for `index.lock`, producing HTTP 409. The optional-lock optimization remains a follow-up. |
-| R32-04 (Low) | A loop-thread writer can wait for a reader's shared file lock and delay the event loop. |
-| R32-05 (Low) | `mkstemp`/atomic writes leave files at mode 0600. The roll-forward temporary file is not fsynced and may remain after failure. |
-| N2 | An exception while recognizing PM authority in the registry can block or crash ordinary ticket dispatch. |
-| N3 | The UI regression runs separately with `node --test tests/pm_ui.test.mjs`; hosted CI does not run that command. |
+| R32-02 (Low) | Snapshots hold stable per-change authority while resolving and reading the change; archive uses the same lock. Focused concurrent snapshot/archive checks retain complete active or archived history without the missing-lock-path race. |
+| R32-03 (Low) | Read-only `git status` uses `--no-optional-locks` and no longer refreshes the index. Approval's `git add` and commit retain normal locking. |
+| R32-04 (Low) | Synchronous PM transactions run on worker threads with owned registry connections. File/authority locks and revision conflicts remain enforced; focused HTTP heartbeat and concurrent-writer checks pass. |
+| R32-05 (Low) | Atomic replacement and semantic-stage publication/recovery preserve existing regular-file modes; new files remain 0600. Archive recovery uses the fsynced atomic writer and cleans failed temporary files. |
+| N2 | Registry recognition failures are contained by the existing `pm_dispatch_denied` attempt result. Uncertain authority stays non-runnable; repairing the registry restores healthy ordinary-ticket progress. |
+| N3 | The default pytest suite now invokes `node --test tests/pm_ui.test.mjs`; missing Node or a failing UI suite fails the check. Hosted execution of this local candidate remains unverified. |
 | N4 | The owner header is an audit claim. Its meaning is now documented above; the authentication policy is unchanged. |
-| N5 | `guarded()` maps every `ValueError` to HTTP 400 `invalid_body`, which can obscure the underlying cause. |
-| N6 | Evidence reports run `git show` synchronously without a timeout. |
-| N7 | The main application's project-switch confirmation remains English when the page language is Korean. |
+| N5 | Unchanged: `guarded()` maps every `ValueError` to HTTP 400 `invalid_body`, which can obscure an internal cause. Response-status changes require separately scoped contract approval. |
+| N6 | Manual evidence checks and report downloads run off the event loop with the existing PM operation timeout. Timed-out Git processes are killed and reaped; immutable hashes, project checks, and existing refusal errors remain enforced. |
+| N7 | PM project switching uses the localized draft-discard guard. Cancel retains the current selection and draft; confirmed discard follows the existing switch flow. |
 | N8 | `PmVerificationService.build_from_receipts` is used only by tests. |
 | R2-M1 (Medium) | On a host without `ps`, if a process leader exits on SIGTERM while a group member ignores it, final group SIGKILL may not run. Cleanup stays uncertain and `stop()` raises. This is an existing limitation relative to main. |
 | R2-L1 (Low) | Proxy guidance now covers PM `forbidden_origin` above. The runtime PM error still omits `SYMPHONY_TRUSTED_ORIGINS`. |
 | R2-L2 (Low) | Unreleased notes now disclose cross-origin PM refusal and rejected pinned planning settings. This is documentation of existing behavior. |
 | R2-L3 (Low) | Unknown `pm.*` keys other than `planning_codex_version`, `planning_model`, and `planning_reasoning_effort` are silently ignored. |
-| Assistance review (Low) | A proposal with no blocked instruction or reserved IDs may display literal `nullnull` beside its review. Review the actual diff and operation result; omitting those empty dialog arguments remains a UI follow-up. |
+| Assistance review (Low) | Empty optional blocked-instruction and reserved-ID sections are omitted. Proposal diffs and server-owned apply/discard authority are unchanged. |
 
 Native Windows PM locking behavior, a real provider quota-fallback event, a real CLI agent leaving background processes, and ps-less Linux cleanup remain unverified platform/provider observations. Historical Linux/macOS runs do not prove them. Current-source checks and hosted CI status belong to the delivered completion evidence; this limitation list is not a fresh PASS. The [human review checklist](pm-workspace.md#final-human-review) must be performed before owner acceptance.

@@ -6,6 +6,7 @@ import hashlib
 import json
 import os
 import re
+import stat
 import subprocess
 import tempfile
 import threading
@@ -218,8 +219,7 @@ class PmDocumentRepository:
         claim = self._claim(ctx.change_id, owner=owner)
         if claim.state != "ACTIVE":
             raise PmError("scope_locked", "planning workspace is not ACTIVE", status=409)
-        root, identity = _resolve_change_root(claim.workspace_path, ctx.change_id)
-        with change_authority_lock(self.registry, self.project_id, ctx.change_id), _change_lock(root):
+        with _locked_change(self.registry, self.project_id, ctx.change_id, claim.workspace_path) as (root, identity):
             current = self._claim(ctx.change_id, owner=owner)
             if current.fence != claim.fence or current.state != "ACTIVE":
                 raise PmError("scope_locked", "workspace authority changed", status=409)
@@ -268,7 +268,7 @@ class PmDocumentRepository:
                 views.append(
                     self.get_change(
                         PmRequestContext(self.project_id, str(row["change_id"])),
-                        owner=str(row["owner"]),
+                        owner=str(row["owner"]), locked=True,
                     )
                 )
             except PmError:
@@ -285,67 +285,68 @@ class PmDocumentRepository:
         multi-file commit cannot interleave and tear the snapshot.
         """
         self._check_project(ctx)
-        claim = self._read_claim(ctx.change_id, owner=owner)
-        archived = claim.state == "RELEASED"
-        root, identity = _resolve_change_root(
-            claim.workspace_path, ctx.change_id, archived=archived
-        )
-        # Archived history is immutable; locking it would write a lock file.
-        locked = locked and not archived
-        with _change_lock(root, shared=True) if locked else nullcontext():
-            if locked:
-                identity = _load_identity(root)
-            docs = tuple(self._documents(root, editable=not archived))
-            manifest = _managed_manifest(root)
-            scope_hash = _scope_hash(
-                root, claim.workspace_path, managed_manifest=manifest
+        with change_authority_lock(self.registry, ctx.project_id, ctx.change_id, shared=True) if locked else nullcontext():
+            claim = self._read_claim(ctx.change_id, owner=owner)
+            archived = claim.state == "RELEASED"
+            root, identity = _resolve_change_root(
+                claim.workspace_path, ctx.change_id, archived=archived
             )
-        report, semantic, idea = self._validate_loaded(
-            docs, identity, workspace=claim.workspace_path
-        )
-        revision = _revision_from_manifest(manifest)
-        findings = list(report.findings)
-        approval = None if archived else self.registry.get_active_pm_approval(
-            ctx.project_id, ctx.change_id
-        )
-        if approval is not None and (
-            str(approval["scope_hash"]), str(approval["revision_hash"])
-        ) != (scope_hash, revision):
-            approval = None
-        state = "Archived" if archived else (
-            "Validated" if not any(
-                item.severity == "blocking" for item in findings
-            ) else "Draft"
-        )
-        if approval is not None:
-            state = "Approved"
-        return ChangeView(
-            project_id=self.project_id,
-            change_id=ctx.change_id,
-            locator=root.name,
-            revision=revision,
-            scope_hash=scope_hash,
-            state=state,
-            base_git_sha=claim.base_git_sha,
-            schema_hash=_hash_bytes(
-                (claim.workspace_path / "openspec" / "schemas" / "symphony-pm" / "schema.yaml").read_bytes()
+            # Archived history is immutable; locking it would write a lock file.
+            locked = locked and not archived
+            with _change_lock(root, shared=True) if locked else nullcontext():
+                if locked:
+                    identity = _load_identity(root)
+                docs = tuple(self._documents(root, editable=not archived))
+                manifest = _managed_manifest(root)
+                scope_hash = _scope_hash(
+                    root, claim.workspace_path, managed_manifest=manifest
+                )
+            report, semantic, idea = self._validate_loaded(
+                docs, identity, workspace=claim.workspace_path
             )
-            if (claim.workspace_path / "openspec" / "schemas" / "symphony-pm" / "schema.yaml").exists()
-            else "",
-            documents=docs,
-            findings=tuple(findings),
-            approval_id=str(approval["approval_id"]) if approval is not None else None,
-            next_action="history" if archived else (
-                "fix_gaps" if findings else "review"
-            ),
-            semantic_index=semantic.items,
-            decisions=idea.decisions if idea is not None else (),
-            affected_capabilities=idea.affected_capabilities if idea is not None else (),
-            storyboard_frames=storyboard_frames(
-                next((document.source for document in docs if document.document_id == "ux"), "")
-            ),
-            planning_sections=planning_sections(docs),
-        )
+            revision = _revision_from_manifest(manifest)
+            findings = list(report.findings)
+            approval = None if archived else self.registry.get_active_pm_approval(
+                ctx.project_id, ctx.change_id
+            )
+            if approval is not None and (
+                str(approval["scope_hash"]), str(approval["revision_hash"])
+            ) != (scope_hash, revision):
+                approval = None
+            state = "Archived" if archived else (
+                "Validated" if not any(
+                    item.severity == "blocking" for item in findings
+                ) else "Draft"
+            )
+            if approval is not None:
+                state = "Approved"
+            return ChangeView(
+                project_id=self.project_id,
+                change_id=ctx.change_id,
+                locator=root.name,
+                revision=revision,
+                scope_hash=scope_hash,
+                state=state,
+                base_git_sha=claim.base_git_sha,
+                schema_hash=_hash_bytes(
+                    (claim.workspace_path / "openspec" / "schemas" / "symphony-pm" / "schema.yaml").read_bytes()
+                )
+                if (claim.workspace_path / "openspec" / "schemas" / "symphony-pm" / "schema.yaml").exists()
+                else "",
+                documents=docs,
+                findings=tuple(findings),
+                approval_id=str(approval["approval_id"]) if approval is not None else None,
+                next_action="history" if archived else (
+                    "fix_gaps" if findings else "review"
+                ),
+                semantic_index=semantic.items,
+                decisions=idea.decisions if idea is not None else (),
+                affected_capabilities=idea.affected_capabilities if idea is not None else (),
+                storyboard_frames=storyboard_frames(
+                    next((document.source for document in docs if document.document_id == "ux"), "")
+                ),
+                planning_sections=planning_sections(docs),
+            )
 
     def get_document(
         self, ctx: PmRequestContext, document_id: str, *, owner: str | None = None
@@ -394,8 +395,7 @@ class PmDocumentRepository:
             raise PmError(
                 "revision_conflict", "expected_revision is required", status=409
             )
-        root, identity = _resolve_change_root(claim.workspace_path, ctx.change_id)
-        with change_authority_lock(self.registry, self.project_id, ctx.change_id), _change_lock(root):
+        with _locked_change(self.registry, self.project_id, ctx.change_id, claim.workspace_path) as (root, identity):
             current_claim = self._claim(ctx.change_id, owner=owner)
             if current_claim.fence != claim.fence or current_claim.state != "ACTIVE":
                 raise PmError("scope_locked", "workspace authority changed", status=409)
@@ -618,9 +618,8 @@ class PmDocumentRepository:
         claim = self._claim(ctx.change_id, owner=owner)
         if claim.state != "ACTIVE":
             raise PmError("scope_locked", "planning workspace is not ACTIVE", status=409)
-        root, identity = _resolve_change_root(claim.workspace_path, ctx.change_id)
-        path = root / "tasks.md"
-        with change_authority_lock(self.registry, self.project_id, ctx.change_id), _change_lock(root):
+        with _locked_change(self.registry, self.project_id, ctx.change_id, claim.workspace_path) as (root, identity):
+            path = root / "tasks.md"
             current = self._claim(ctx.change_id, owner=owner)
             if current.fence != claim.fence or current.state != "ACTIVE":
                 raise PmError("scope_locked", "workspace authority changed", status=409)
@@ -691,8 +690,7 @@ class PmDocumentRepository:
         if ctx.expected_revision is None or not sources or len(sources) > 8:
             raise PmError("invalid_request", "multi-document apply requires revision and bounded sources")
         claim = self._claim(ctx.change_id, owner=owner)
-        root, identity = _resolve_change_root(claim.workspace_path, ctx.change_id)
-        with change_authority_lock(self.registry, self.project_id, ctx.change_id), _change_lock(root):
+        with _locked_change(self.registry, self.project_id, ctx.change_id, claim.workspace_path) as (root, identity):
             previous = _revision_hash(root)
             if previous != ctx.expected_revision:
                 raise PmError("revision_conflict", "planning revision changed", status=409, details={"current_revision": previous})
@@ -1120,8 +1118,7 @@ class PmDocumentRepository:
         self, change_id: str, *, fence: int, owner: str
     ) -> WorkspaceClaim:
         claim = self._claim(change_id, owner=owner)
-        root, identity = _resolve_change_root(claim.workspace_path, change_id)
-        with change_authority_lock(self.registry, self.project_id, change_id), _change_lock(root):
+        with _locked_change(self.registry, self.project_id, change_id, claim.workspace_path) as (root, identity):
             current = self._claim(change_id, owner=owner)
             parsed = parse_wbs(_read_utf8(root / "tasks.md"))
             _require_valid_wbs(
@@ -1148,8 +1145,7 @@ class PmDocumentRepository:
         self, change_id: str, *, fence: int, owner: str
     ) -> ValidationReport:
         claim = self._claim(change_id, owner=owner)
-        root, identity = _resolve_change_root(claim.workspace_path, change_id)
-        with change_authority_lock(self.registry, self.project_id, change_id), _change_lock(root):
+        with _locked_change(self.registry, self.project_id, change_id, claim.workspace_path) as (root, identity):
             current = self.registry.get_pm_workspace(self.project_id, change_id)
             if (
                 current is None
@@ -1274,6 +1270,14 @@ class PmDocumentRepository:
                     document_id, str(safe_path.relative_to(root)), source,
                     _hash_text(source), "draft", editable, reason,
                 )
+
+
+@contextmanager
+def _locked_change(registry: RunRegistry, project_id: str, change_id: str, workspace: Path):
+    with change_authority_lock(registry, project_id, change_id):
+        root, identity = _resolve_change_root(workspace, change_id)
+        with _change_lock(root):
+            yield root, identity
 
 
 def _resolve_change_root(
@@ -1774,6 +1778,26 @@ def _identity_source(
     return yaml.safe_dump(updated, sort_keys=False)
 
 
+def _replace_semantic_stage(stage: Path, destination: Path) -> None:
+    """Retain destination permissions when publishing or recovering a staged file."""
+    try:
+        existing = destination.lstat()
+    except FileNotFoundError:
+        pass
+    else:
+        if stat.S_ISREG(existing.st_mode):
+            with os.fdopen(os.open(stage, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)), "rb") as handle:
+                if not stat.S_ISREG(os.fstat(handle.fileno()).st_mode):
+                    raise OSError("semantic stage is not a regular file")
+                mode = stat.S_IMODE(existing.st_mode)
+                if hasattr(os, "fchmod"):
+                    os.fchmod(handle.fileno(), mode)
+                else:
+                    os.chmod(stage, mode)
+                os.fsync(handle.fileno())
+    os.replace(stage, destination)
+
+
 def _atomic_semantic_write(
     root: Path,
     document_path: Path,
@@ -1796,9 +1820,9 @@ def _atomic_semantic_write(
         "identity_hash": _hash_text(identity_source),
     }
     _atomic_write(journal_path, json.dumps(journal, sort_keys=True) + "\n")
-    os.replace(document_stage, document_path)
+    _replace_semantic_stage(document_stage, document_path)
     _semantic_faultpoint("after_document")
-    os.replace(identity_stage, root / "symphony.yaml")
+    _replace_semantic_stage(identity_stage, root / "symphony.yaml")
     _semantic_faultpoint("after_identity")
     journal_path.unlink(missing_ok=True)
 
@@ -1837,9 +1861,9 @@ def _recover_semantic_transaction(root: Path) -> None:
         document_stage = root / ".symphony-semantic-document.next"
         identity_stage = root / ".symphony-semantic-identity.next"
         if document_stage.is_file():
-            os.replace(document_stage, document_path)
+            _replace_semantic_stage(document_stage, document_path)
         if identity_stage.is_file():
-            os.replace(identity_stage, root / "symphony.yaml")
+            _replace_semantic_stage(identity_stage, root / "symphony.yaml")
         if (
             not document_path.is_file()
             or _hash_bytes(document_path.read_bytes()) != journal.get("document_hash")
@@ -2065,7 +2089,7 @@ def _dirty_paths(path: Path) -> list[str]:
 
 def _git(path: Path, *args: str) -> str:
     result = subprocess.run(
-        ["git", "-C", str(path), *args],
+        ["git", *(["--no-optional-locks"] if args and args[0] == "status" else []), "-C", str(path), *args],
         check=False,
         capture_output=True,
         text=True,
@@ -2113,9 +2137,17 @@ def _require_contained_directory(
 
 def _atomic_write(path: Path, text: str) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        existing = path.lstat()
+    except FileNotFoundError:
+        mode = None
+    else:
+        mode = stat.S_IMODE(existing.st_mode) if stat.S_ISREG(existing.st_mode) else None
     fd, name = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
     try:
         with os.fdopen(fd, "w", encoding="utf-8", newline="") as handle:
+            if mode is not None:
+                os.chmod(name, mode)
             handle.write(text)
             handle.flush()
             os.fsync(handle.fileno())

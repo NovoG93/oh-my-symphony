@@ -1073,11 +1073,10 @@
   async function switchProject(projectId) {
     if (!projectId || projectId === (state.currentProject && state.currentProject.id)) return;
     const previousProjectId = state.currentProject && state.currentProject.id;
-    if (pmDirty && !window.confirm('Discard unsaved PM Workspace edits and switch projects?')) {
-      renderProjectSwitcher();
-      return;
-    }
-    if (pmMount && pmMount.beforeProjectSwitch && pmMount.beforeProjectSwitch() === false) {
+    const maySwitch = pmMount && pmMount.beforeProjectSwitch
+      ? pmMount.beforeProjectSwitch()
+      : !pmDirty || window.confirm(t('pm.discardRoute'));
+    if (!maySwitch) {
       renderProjectSwitcher();
       return;
     }

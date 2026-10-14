@@ -54,7 +54,7 @@ def _isolate_host_context(tmp_path, monkeypatch):
             monkeypatch.delenv(key)
     # Assistance-on fixtures must never spawn the developer's host Codex.
     monkeypatch.setattr(routes_module.host_tools, "probe_codex", lambda: {
-        "required": "0.160.0", "found": "0.160.0", "available": True, "reason": None,
+        "required": "restricted app-server controls", "found": "0.162.1", "available": True, "reason": None,
     })
 
 
@@ -394,7 +394,7 @@ async def test_assistance_on_capabilities_include_stubbed_codex_and_node(
         payload = await response.json()
         assert payload["demo"] == {"active": False}
         assert payload["host_tools"] == {
-            "codex": {"required": "0.160.0", "found": "0.160.0", "available": True, "reason": None},
+            "codex": {"required": "restricted app-server controls", "found": "0.162.1", "available": True, "reason": None},
             "node": node,
         }
     finally:
@@ -1830,5 +1830,202 @@ async def test_change_get_projects_real_approval_and_invalidates_after_edit(tmp_
         assert current["revision"] != approved["revision"]
         assert (current["state"], current["approval_id"]) == ("Validated", None)
     finally:
+        registry.close()
+        await client.close()
+
+
+@pytest.mark.timing
+@pytest.mark.asyncio
+async def test_R32_04_http_writer_does_not_block_loop_waiting_for_snapshot_lock(tmp_path):
+    client, workspace = await _authoring_client(tmp_path)
+    registry = RunRegistry(tmp_path / "project/.symphony/state.db")
+    repo = PmDocumentRepository(project_id="p1", project_root=tmp_path / "project", registry=registry, planning_workspace_root=tmp_path / "planning-root")
+    cid = "b" * 32
+    repo.claim_workspace(cid, workspace, "local-operator")
+    change = repo.create_change(change_id=cid, locator="lock-test", title="Lock test", owner="local-operator")
+    root = workspace / "openspec/changes/lock-test"
+    ready = threading.Event()
+    def reader():
+        with __import__("symphony.pm.documents", fromlist=["_change_lock"])._change_lock(root, shared=True):
+            ready.set()
+            time.sleep(.15)
+    thread = threading.Thread(target=reader)
+    thread.start()
+    assert ready.wait(1)
+    delays = []
+    async def heartbeat():
+        previous = time.monotonic()
+        while True:
+            await asyncio.sleep(.01)
+            now = time.monotonic()
+            delays.append(now - previous)
+            previous = now
+    beat = asyncio.create_task(heartbeat())
+    try:
+        response = await client.patch(f"/api/v1/pm/changes/{cid}/documents/proposal", json={"project_id":"p1", "expected_revision":change.revision, "client_operation_id":"lock-patch", "payload":{"operations":[{"op":"replace_source", "source":"# Lock test\n\n## Problem\nPreserve source.\n"}]}})
+        payload = await response.text()
+        await asyncio.sleep(.02)
+        print("HTTP_WRITER", response.status, payload[:160], "MAX_HEARTBEAT_SECONDS", max(delays))
+        assert response.status == 200
+        assert max(delays) < .07, "HTTP patch waits on a shared snapshot lock on the event loop"
+    finally:
+        beat.cancel()
+        await asyncio.gather(beat, return_exceptions=True)
+        thread.join(1)
+        registry.close()
+        await client.close()
+
+
+@pytest.mark.timing
+@pytest.mark.asyncio
+async def test_N6_report_git_is_bounded_and_off_event_loop(tmp_path, monkeypatch):
+    client = await _client(tmp_path)
+    blob = b'{"result":"passed"}\n'
+    row = {"project_id": "p1", "tested_commit": "a" * 40, "report_ref_json": json.dumps({"ref_kind": "git_blob", "ref": "manual-report.json", "sha256": "sha256:" + hashlib.sha256(blob).hexdigest()})}
+    monkeypatch.setattr(RunRegistry, "get_pm_manual_verification_receipt", lambda *_args: row)
+    original = subprocess.run
+    observed = []
+    def slow_git(argv, *args, **kwargs):
+        if argv[0] == "git" and "show" in argv:
+            observed.append({"thread": threading.current_thread().name, "timeout": kwargs.get("timeout")})
+            time.sleep(.15)
+            return subprocess.CompletedProcess(argv, 0, stdout=blob, stderr=b"")
+        return original(argv, *args, **kwargs)
+    monkeypatch.setattr(routes_module.subprocess, "run", slow_git)
+    delays = []
+    async def heartbeat():
+        previous = time.monotonic()
+        while True:
+            await asyncio.sleep(.01)
+            now = time.monotonic()
+            delays.append(now - previous)
+            previous = now
+    beat = asyncio.create_task(heartbeat())
+    try:
+        response = await client.get("/api/v1/pm/evidence/manual-receipt/report?project_id=p1")
+        assert response.status == 200 and await response.read() == blob
+        await asyncio.sleep(.02)
+        print("REPORT_GIT", observed, "MAX_HEARTBEAT_SECONDS", max(delays))
+        assert observed[0]["timeout"] is not None and observed[0]["thread"] != "MainThread" and max(delays) < .07
+    finally:
+        beat.cancel()
+        await asyncio.gather(beat, return_exceptions=True)
+        await client.close()
+
+
+
+@pytest.mark.asyncio
+async def test_concurrent_http_writers_keep_one_revision_and_refuse_stale_retry(tmp_path):
+    client, workspace = await _authoring_client(tmp_path)
+    registry = RunRegistry(tmp_path / "project/.symphony/state.db")
+    repository = PmDocumentRepository(project_id="p1", project_root=tmp_path / "project", registry=registry, planning_workspace_root=tmp_path / "planning-root")
+    change_id = "c" * 32
+    repository.claim_workspace(change_id, workspace, "local-operator")
+    change = repository.create_change(change_id=change_id, locator="concurrent-writers", title="Writers", owner="local-operator")
+    url = f"/api/v1/pm/changes/{change_id}/documents/proposal"
+    bodies = [{"project_id": "p1", "expected_revision": change.revision, "client_operation_id": f"writer-{index}", "payload": {"operations": [{"op": "replace_source", "source": f"# Writer {index}\n\n## Problem\nSave exactly one revision.\n"}]}} for index in range(2)]
+    try:
+        responses = await asyncio.gather(*(client.patch(url, json=body) for body in bodies))
+        assert sorted(response.status for response in responses) == [200, 409]
+        winner = next(index for index, response in enumerate(responses) if response.status == 200)
+        loser = 1 - winner
+        refusal = await responses[loser].json()
+        assert refusal["error"]["code"] == "revision_conflict"
+        saved = await client.get(url + "?project_id=p1")
+        assert (await saved.json())["source"] == bodies[winner]["payload"]["operations"][0]["source"]
+        retry = await client.patch(url, json=bodies[loser])
+        assert retry.status == 409 and (await retry.json())["error"]["code"] == "revision_conflict"
+        current = await client.get(f"/api/v1/pm/changes/{change_id}?project_id=p1")
+        recovered = await current.json()
+        bodies[loser]["expected_revision"] = recovered["revision"]
+        corrected = await client.patch(url, json=bodies[loser])
+        assert corrected.status == 200
+    finally:
+        registry.close()
+        await client.close()
+
+
+@pytest.mark.asyncio
+async def test_report_git_timeout_and_missing_executable_preserve_refusal_and_retry(tmp_path, monkeypatch):
+    client = await _client(tmp_path)
+    blob = b"immutable manual report\n"
+    row = {"project_id": "p1", "tested_commit": "a" * 40, "report_ref_json": json.dumps({"ref_kind": "git_blob", "ref": "manual-report.txt", "sha256": "sha256:" + hashlib.sha256(blob).hexdigest()})}
+    monkeypatch.setattr(RunRegistry, "get_pm_manual_verification_receipt", lambda *_args: row)
+    original = subprocess.run
+    def unavailable(argv, *args, **kwargs):
+        if argv[0] == "git" and "show" in argv:
+            assert kwargs.get("timeout") == 30
+            raise subprocess.TimeoutExpired(argv, kwargs["timeout"])
+        return original(argv, *args, **kwargs)
+    try:
+        monkeypatch.setattr(routes_module.subprocess, "run", unavailable)
+        response = await client.get("/api/v1/pm/evidence/manual-receipt/report?project_id=p1")
+        assert response.status == 404 and (await response.json())["error"]["code"] == "evidence_not_found"
+        def missing(argv, *args, **kwargs):
+            if argv[0] == "git" and "show" in argv:
+                raise FileNotFoundError("git unavailable")
+            return original(argv, *args, **kwargs)
+        monkeypatch.setattr(routes_module.subprocess, "run", missing)
+        response = await client.get("/api/v1/pm/evidence/manual-receipt/report?project_id=p1")
+        assert response.status == 404 and (await response.json())["error"]["code"] == "evidence_not_found"
+        def recovered(argv, *args, **kwargs):
+            if argv[0] == "git" and "show" in argv:
+                return subprocess.CompletedProcess(argv, 0, stdout=blob, stderr=b"")
+            return original(argv, *args, **kwargs)
+        monkeypatch.setattr(routes_module.subprocess, "run", recovered)
+        response = await client.get("/api/v1/pm/evidence/manual-receipt/report?project_id=p1")
+        assert response.status == 200 and await response.read() == blob
+        row["project_id"] = "other"
+        assert (await client.get("/api/v1/pm/evidence/manual-receipt/report?project_id=p1")).status == 409
+    finally:
+        await client.close()
+
+
+@pytest.mark.timing
+@pytest.mark.asyncio
+async def test_manual_preview_confirm_run_git_off_loop_and_keep_actual_receipt_binding(tmp_path, monkeypatch):
+    client, registry, _planning, path, headers, ticket = await _published_export_fixture(tmp_path, monkeypatch)
+    mapping = registry.get_pm_managed_ticket("p1", ticket)
+    assert mapping is not None
+    change = await (await client.get(path + "?project_id=p1", headers=headers)).json()
+    project = tmp_path / "project"
+    commit = subprocess.check_output(["git", "-C", str(project), "rev-parse", "HEAD"], text=True).strip()
+    definition = {"procedure_id": "manual-ux", "kind": "manual", "instructions": "Review immutable fixture report", "report": "required", "artifacts": "optional"}
+    definition["definition_digest"] = "sha256:" + hashlib.sha256(json.dumps(definition, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+    registry._connect().execute("UPDATE pm_handoff_items SET required_procedures_json=? WHERE ticket_identifier=?", (json.dumps({"manual-ux": definition}), ticket))
+    payload = {"project_id": "p1", "expected_revision": change["revision"], "ticket_identifier": ticket, "task_revision": mapping.task_revision, "tested_commit": commit, "procedure_id": "manual-ux", "environment_summary": "disposable test", "started_at": "2026-10-14T00:00:00Z", "completed_at": "2026-10-14T00:01:00Z", "result": "passed", "report_ref": {"ref_kind": "git_blob", "ref": "README.md"}, "artifact_refs": []}
+    original = subprocess.run
+    observed = []
+    def slow_git(argv, *args, **kwargs):
+        if argv[0] == "git" and "show" in argv:
+            observed.append((threading.current_thread().name, kwargs.get("timeout")))
+            time.sleep(.12)
+        return original(argv, *args, **kwargs)
+    monkeypatch.setattr(routes_module.subprocess, "run", slow_git)
+    delays = []
+    async def heartbeat():
+        previous = time.monotonic()
+        while True:
+            await asyncio.sleep(.01)
+            now = time.monotonic()
+            delays.append(now - previous)
+            previous = now
+    beat = asyncio.create_task(heartbeat())
+    try:
+        preview_response = await client.post(path + "/manual-evidence/preview", headers=headers, json=payload)
+        assert preview_response.status == 200
+        preview = await preview_response.json()
+        assert preview["ready"] is True, preview
+        confirmed = await client.post(path + "/manual-evidence", headers=headers, json={**payload, "confirmation_token": preview["confirmation_token"], "client_operation_id": "manual-thread-receipt"})
+        assert confirmed.status == 201, await confirmed.text()
+        receipt = await confirmed.json()
+        assert receipt["tested_commit"] == commit and receipt["task_revision"] == mapping.task_revision
+        assert receipt["return_code"] is None and receipt["run_id"] is None
+        assert observed and all(name != "MainThread" and timeout == 30 for name, timeout in observed)
+        await asyncio.sleep(.02)
+        assert max(delays) < .07, delays
+    finally:
+        beat.cancel()
+        await asyncio.gather(beat, return_exceptions=True)
         registry.close()
         await client.close()

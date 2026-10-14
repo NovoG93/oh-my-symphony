@@ -263,13 +263,13 @@ Prompt
     ],
 )
 def test_pm_config_rejects_pinned_planning_keys(tmp_path, key, value):
-    # The planning client pins its Codex version, model, and effort; a
+    # The planning client admits installed controls and pins model/effort; a
     # WORKFLOW key that looks configurable but is never read must fail loudly.
     path = _write(tmp_path, f"---\npm:\n  {key}: {value}\n---\nPrompt")
     with pytest.raises(ConfigValidationError, match=f"pm.{key}") as raised:
         build_service_config(load_workflow(path))
     message = str(raised.value)
-    assert "0.160.0" in message
+    assert "compatible installed Codex CLI" in message
     assert "gpt-6.1-sol" in message
     assert "medium" in message
 

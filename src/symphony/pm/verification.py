@@ -260,10 +260,16 @@ class PmVerificationService:
         )
         if policy is None:
             findings.append(PmFinding("unknown_procedure", "procedure is not approved for this task", severity="blocking"))
-        if not re.fullmatch(r"[0-9a-f]{40}", commit) or self.project_root is None or subprocess.run(
-            ["git", "-C", str(self.project_root or Path(".")), "cat-file", "-e", f"{commit}^{{commit}}"],
-            capture_output=True, check=False,
-        ).returncode != 0:
+        commit_exists = False
+        if re.fullmatch(r"[0-9a-f]{40}", commit) and self.project_root is not None:
+            try:
+                commit_exists = subprocess.run(
+                    ["git", "-C", str(self.project_root), "cat-file", "-e", f"{commit}^{{commit}}"],
+                    capture_output=True, check=False, timeout=self.timeout_seconds,
+                ).returncode == 0
+            except (OSError, subprocess.TimeoutExpired):
+                pass
+        if not commit_exists:
             findings.append(PmFinding("tested_commit_missing", "tested commit is unavailable", severity="blocking"))
         report_ref = None
         artifacts: list[dict[str, Any]] = []
@@ -378,7 +384,13 @@ class PmVerificationService:
         if kind == "git_blob":
             if self.project_root is None or not ref or ref.startswith("/") or ".." in Path(ref).parts:
                 raise PmError("invalid_evidence_ref", "Git evidence path is unsafe", status=409)
-            completed = subprocess.run(["git", "-C", str(self.project_root), "show", f"{commit}:{ref}"], capture_output=True, check=False)
+            try:
+                completed = subprocess.run(
+                    ["git", "-C", str(self.project_root), "show", f"{commit}:{ref}"],
+                    capture_output=True, check=False, timeout=self.timeout_seconds,
+                )
+            except (OSError, subprocess.TimeoutExpired) as exc:
+                raise PmError("invalid_evidence_ref", "Git evidence blob is unavailable", status=409) from exc
             if completed.returncode != 0 or len(completed.stdout) > 25 * 1024 * 1024:
                 raise PmError("invalid_evidence_ref", "Git evidence blob is missing or oversized", status=409)
             data = completed.stdout

@@ -12,8 +12,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 from ..orchestrator.run_registry import RunRegistry
-from .documents import PmDocumentRepository, _atomic_write, _change_lock, _resolve_change_root
-from .locks import change_authority_lock
+from .documents import PmDocumentRepository, _atomic_write, _locked_change
 from .models import ApprovalManifest, PmError, PmRequestContext, ValidationReport
 
 
@@ -47,8 +46,7 @@ class PmApprovalService:
         if ctx.expected_revision is None:
             raise PmError("revision_conflict", "expected_revision is required", status=409)
         claim = self.repository._claim(ctx.change_id, owner=owner)
-        root, _ = _resolve_change_root(claim.workspace_path, ctx.change_id)
-        with change_authority_lock(self.registry, ctx.project_id, ctx.change_id), _change_lock(root):
+        with _locked_change(self.registry, ctx.project_id, ctx.change_id, claim.workspace_path) as (root, _):
             current_claim = self.repository._claim(ctx.change_id, owner=owner)
             if current_claim.fence != claim.fence or current_claim.state != "ACTIVE":
                 raise PmError("scope_locked", "planning workspace is not ACTIVE", status=409)
@@ -217,7 +215,7 @@ def _tree_hashes(root: Path) -> dict[str, str]:
 
 
 def _git(path: Path, *args: str) -> str:
-    result = subprocess.run(["git", "-C", str(path), *args], check=False, capture_output=True, text=True)
+    result = subprocess.run(["git", *(["--no-optional-locks"] if args and args[0] == "status" else []), "-C", str(path), *args], check=False, capture_output=True, text=True)
     if result.returncode != 0:
         raise PmError("git_snapshot_failed", result.stderr.strip() or "Git command failed", status=409)
     return result.stdout.rstrip("\r\n")

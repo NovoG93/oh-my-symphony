@@ -17,7 +17,6 @@ from ..i18n import DOC_WRITING_RULE
 from .._shell import process_group_exists, process_group_identities, process_identity
 from .models import PmError
 
-SUPPORTED_CODEX_VERSION = "0.160.0"
 MODEL = "gpt-6.1-sol"
 EFFORT = "medium"
 DISABLED_FEATURES = (
@@ -127,9 +126,20 @@ class PmPlanningClient:
         if not self.auth_file.is_file():
             raise PmError("capability_unavailable", "Codex authentication is unavailable", status=503)
         deadline = deadline or (asyncio.get_running_loop().time() + self.timeout_seconds)
-        version = await self._version(deadline)
-        if version != f"codex-cli {SUPPORTED_CODEX_VERSION}":
-            raise PmError("capability_unavailable", f"Codex {SUPPORTED_CODEX_VERSION} is required", status=503)
+        from .codex_compatibility import admit_codex
+
+        admission = await admit_codex(self.codex_executable, deadline=deadline)
+        if admission.reason is not None:
+            raise PmError("capability_unavailable", admission.reason, status=503)
+        assert admission.executable is not None
+        self.codex_executable = admission.executable
+        try:
+            await self._start_runtime(cwd, deadline, authenticated=True)
+        except BaseException:
+            await self.stop()
+            raise
+
+    async def _start_runtime(self, cwd: Path, deadline: float, *, authenticated: bool) -> None:
         if self.runtime_root is None:
             self._temp = tempfile.TemporaryDirectory(prefix="symphony-pm-codex-")
             home = Path(self._temp.name)
@@ -138,14 +148,14 @@ class PmPlanningClient:
             home.mkdir(parents=True, exist_ok=True)
             if any(home.iterdir()):
                 raise PmError("capability_unavailable", "PM Codex home must be empty", status=503)
-        (home / "auth.json").symlink_to(self.auth_file)
+        if authenticated:
+            (home / "auth.json").symlink_to(self.auth_file)
         command = [self.codex_executable, "app-server", "--listen", "stdio://", "--strict-config", "-c", "mcp_servers={}", "-c", 'shell_environment_policy.inherit="none"', "--enable", "skip_host_skill_discovery"]
         for feature in DISABLED_FEATURES:
             command.extend(("--disable", feature))
-        env = dict(os.environ)
-        env["CODEX_HOME"] = str(home)
-        for key in ("OPENAI_API_KEY", "ANTHROPIC_API_KEY", "GEMINI_API_KEY"):
-            env.pop(key, None)
+        from .codex_compatibility import isolated_environment
+
+        env = isolated_environment(home)
         self.process = await asyncio.create_subprocess_exec(
             *command, cwd=cwd, stdin=asyncio.subprocess.PIPE,
             stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
@@ -510,25 +520,6 @@ class PmPlanningClient:
         if self._token_limit_error is not None and not future.done():
             future.set_exception(self._token_limit_error)
         return await asyncio.wait_for(asyncio.shield(future), _remaining(deadline))
-
-    async def _version(self, deadline: float) -> str:
-        process = await asyncio.create_subprocess_exec(
-            self.codex_executable, "--version", stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE, start_new_session=os.name == "posix",
-        )
-        try:
-            stdout, _ = await asyncio.wait_for(process.communicate(), min(10, _remaining(deadline)))
-        except (asyncio.TimeoutError, PmError):
-            try:
-                if os.name == "posix":
-                    os.killpg(process.pid, signal.SIGKILL)
-                else:
-                    process.kill()
-            except ProcessLookupError:
-                pass
-            await process.wait()
-            raise PmError("planning_timeout", "Codex version probe timed out", status=504)
-        return stdout.decode(errors="replace").strip()
 
 
 def _uncertain_group_cleanup() -> PmError:

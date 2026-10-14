@@ -9,6 +9,7 @@ import { diagramSummary, diagramWindows } from '../src/symphony/web/static/pm/di
 import { exchangeControlState, validateWorkbookFilename } from '../src/symphony/web/static/pm/exchange.js';
 import { sourceEditPolicy } from '../src/symphony/web/static/pm/documents.js';
 import { storyboardPatchOperation } from '../src/symphony/web/static/pm/storyboard.js';
+import { createPmOverlay } from '../src/symphony/web/static/pm/overlay.js';
 import { planningActionRequest, verificationActions } from '../src/symphony/web/static/pm/assistance.js';
 import { analyzeSafeDiagram } from '../scripts/pm_diagram_entry.mjs';
 
@@ -303,7 +304,7 @@ const DEMO_SENTENCE = 'This is a disposable demo. Planning actions are unlocked 
 const DEMO_ASSISTANCE_REASON = 'Off in the demo: it would contact an AI model.';
 const DEVELOPMENT_SENTENCE = 'Development verification is active for configured actions. Dependency checks still apply, and release gates are not marked passed.';
 const NODE_REASON = 'Bundled OpenSpec needs Node.js 20.19.0 or newer on PATH (found: none)';
-const CODEX_REASON = 'Planning assistant needs Codex 0.160.0 (found: 0.162.0). Planning assistant needs a Codex login: ~/.codex/auth.json is missing. Run codex login.';
+const CODEX_REASON = 'Codex schema probe is missing restricted app-server controls. Install a compatible Codex CLI supporting restricted app-server controls, then retry. No fallback is used. Planning assistant needs a Codex login: ~/.codex/auth.json is missing. Run codex login.';
 const ARCHIVED_REASON = 'Archived planning history is read-only.';
 const PM_DIRECTORY = new URL('../src/symphony/web/static/pm/', import.meta.url);
 
@@ -386,9 +387,20 @@ class UiNode {
   get textContent() { return this.nodeType === 3 ? this.nodeValue : this.childNodes.map((node) => node.textContent).join(''); }
   set textContent(value) { this.replaceChildren(String(value)); }
   append(...nodes) {
-    for (const node of nodes.flat()) if (node !== null && node !== undefined && node !== false) this.childNodes.push(node instanceof UiNode ? node : new UiNode('', String(node)));
+    for (const node of nodes) this.childNodes.push(node instanceof UiNode ? node : new UiNode('', String(node)));
+    for (const child of this.childNodes) child.parentNode = this;
   }
   appendChild(node) { this.append(node); return node; }
+  prepend(...nodes) { const children = this.childNodes; this.childNodes = []; this.append(...nodes); this.childNodes.push(...children); }
+  remove() { if (this.parentNode) this.parentNode.childNodes = this.parentNode.childNodes.filter((node) => node !== this); this.parentNode = null; }
+  get isConnected() { return this.tag === 'body' || !!this.parentNode?.isConnected; }
+  contains(node) { return this === node || this.childNodes.some((child) => child.contains(node)); }
+  closest(selector) { return this.matches(selector) ? this : this.parentNode?.closest(selector) || null; }
+  get className() { return this.getAttribute('class') || ''; }
+  set className(value) { this.setAttribute('class', value); }
+  get options() { return this.querySelectorAll('option'); }
+  get selectedOptions() { return this.options.filter((node) => node.selected); }
+  get children() { return this.childNodes.filter((node) => node.nodeType === 1); }
   replaceChildren(...nodes) { this.childNodes = []; this.append(...nodes); }
   setAttribute(key, value) {
     this.attributes.set(key, String(value));
@@ -412,7 +424,7 @@ class UiNode {
     const listeners = this.listeners.get(type) || [];
     listeners.push(listener); this.listeners.set(type, listeners);
   }
-  async trigger(type) { for (const listener of this.listeners.get(type) || []) await listener({ type, target: this }); }
+  async trigger(type, extra = {}) { for (const listener of this.listeners.get(type) || []) await listener({ type, target: this, preventDefault() {}, stopPropagation() {}, ...extra }); }
   focus() { globalThis.document.activeElement = this; }
 }
 
@@ -421,11 +433,13 @@ function storageStub() {
   return { getItem: (key) => values.get(key) ?? null, setItem: (key, value) => values.set(key, String(value)), removeItem: (key) => values.delete(key) };
 }
 
-async function mountedPm(t, { tab = 'idea', view = '', demo = false, language = 'en', hostTools = {}, gated = false, archived = false, development = false, demoAssistance = false, dirtyChanges = [] } = {}) {
+async function mountedPm(t, { tab = 'idea', view = '', demo = false, language = 'en', hostTools = {}, gated = false, archived = false, development = false, demoAssistance = false, dirtyChanges = [], apiRequest = null, draft = null } = {}) {
   const el = (tag, attrs, children) => {
     const node = new UiNode(tag);
     for (const [key, value] of Object.entries(attrs || {})) if (value !== null && value !== undefined && value !== false) node.setAttribute(key, typeof value === 'boolean' ? '' : value);
-    node.append(children ?? []); return node;
+    for (const child of (Array.isArray(children) ? children : children == null ? [] : [children])) if (child != null && child !== false) node.append(child);
+    if (tag === 'select') node.value = node.options.find((item) => item.selected)?.value || node.options[0]?.value || '';
+    return node;
   };
   const globals = {
     window: { i18n: { lang: language } },
@@ -433,7 +447,7 @@ async function mountedPm(t, { tab = 'idea', view = '', demo = false, language = 
     history: { replaceState() {} }, sessionStorage: storageStub(), localStorage: storageStub(), NodeFilter: { SHOW_TEXT: 4 },
     document: {
       // WBS enhancement stays disconnected; these tests exercise native controls.
-      querySelector: () => null, head: { appendChild() {} }, createElement: (tag) => el(tag),
+      querySelector: () => null, head: { appendChild() {} }, createElement: (tag) => el(tag), body: el('body'),
       createTreeWalker: (scope) => {
         const texts = (node) => node.nodeType === 3 ? [node] : node.childNodes.flatMap(texts);
         const nodes = texts(scope); let index = 0;
@@ -457,10 +471,12 @@ async function mountedPm(t, { tab = 'idea', view = '', demo = false, language = 
     }])),
   };
   if (demoAssistance) capabilities.capabilities.assistance = { requested: false, effective: false, reasons: [DEMO_ASSISTANCE_REASON] };
-  const change = { change_id: 'c1', locator: 'team-leave-request', revision: 'rev1', state: archived ? 'Archived' : 'Draft', workspace_state: archived ? 'RELEASED' : 'ATTACHED', documents: [{ document_id: 'proposal', path: 'proposal.md' }], storyboard_frames: [] };
-  const root = el('div');
+  const change = { change_id: 'c1', locator: 'team-leave-request', revision: 'rev1', state: archived ? 'Archived' : 'Draft', workspace_state: archived ? 'RELEASED' : 'ATTACHED', documents: [{ document_id: 'proposal', path: 'proposal.md', editable: true }], storyboard_frames: [] };
+  const root = el('div'); document.body.append(root);
+  if (draft !== null) localStorage.setItem('symphony.pm.draft.p1.c1.proposal.rev1', draft);
   mount = mountArtifacts({ root, projectId: 'p1', onDirtyChange: (dirty) => dirtyChanges.push(dirty), ui: { el, renderMarkdown: (source) => el('p', null, source), announce() {} }, api: {
-    request: async (path) => {
+    request: async (path, options) => {
+      const extra = await apiRequest?.(path, options); if (extra !== undefined) return extra;
       const pathname = path.split('?')[0];
       if (pathname === '/capabilities') return capabilities;
       if (pathname === '/changes') return { changes: [change] };
@@ -646,7 +662,7 @@ test('R15 Node titles follow P6, gate approval/archive, and leave Validate enabl
   });
 });
 
-test('R15 unavailable Codex folds into assistance and lists version/login reasons up front', async (t) => {
+test('R15 unavailable Codex folds into assistance and lists capability/login reasons up front', async (t) => {
   for (const gated of [false, true]) for (const codex of [undefined, { available: true, reason: null }, { available: false, reason: CODEX_REASON }]) {
     await t.test(`gated=${gated}, codex=${codex?.available ?? 'absent'}`, async (context) => {
       const root = await mountedPm(context, { gated, hostTools: codex ? { codex } : {} });
@@ -690,4 +706,114 @@ test('R15 demo status and assistance reason render in en/ko in place of developm
     assert.ok(card.textContent.includes(DEVELOPMENT_SENTENCE));
     assert.ok(!card.textContent.includes(DEMO_SENTENCE));
   });
+});
+
+
+test('hardening recovered source is dirty against saved document and immediately savable', async (t) => {
+  for (const language of ['en', 'ko']) await t.test(language, async (context) => {
+    const dirtyChanges = [];
+    const root = await mountedPm(context, { language, draft: 'Recovered unsaved text', dirtyChanges });
+    assert.equal(root.querySelector('textarea').value, 'Recovered unsaved text');
+    assert.equal(findButton(root, pmText('Save draft', {}, language)).disabled, false);
+    assert.equal(dirtyChanges.at(-1), true);
+    root.querySelector('textarea').value = 'Demo document';
+    await root.querySelector('textarea').trigger('input');
+    assert.equal(findButton(root, pmText('Save draft', {}, language)).disabled, true);
+    assert.equal(dirtyChanges.at(-1), false);
+  });
+});
+
+test('hardening empty assistant review omits absent nodes without null text or authority changes', async (t) => {
+  const calls = [];
+  const root = await mountedPm(t, { apiRequest: (path, options) => {
+    if (path.endsWith('/planning-actions')) { calls.push(options); return { operation_id: 'op-empty', result: { explanation: 'No changes suggested.', proposals: [], blocked_instruction: null, reserved_ids: {} } }; }
+  } });
+  await findButton(root, 'Planning assistant').trigger('click');
+  await findButton(document.body, 'Prepare proposal').trigger('click');
+  await new Promise((resolve) => setImmediate(resolve));
+  const dialog = document.body.querySelector('[aria-label="Planning proposal"]');
+  assert.ok(dialog, document.body.textContent);
+  assert.ok(!dialog.textContent.includes('null'), dialog.textContent);
+  assert.ok(!dialog.textContent.includes('undefined'), dialog.textContent);
+  assert.equal(findButton(dialog, 'Apply proposal').disabled, true);
+  assert.equal(calls.length, 1);
+});
+
+test('hardening Korean tab discard is localized and cancellation retains unsaved input', async (t) => {
+  const root = await mountedPm(t, { language: 'ko' });
+  const editor = root.querySelector('textarea'); editor.value = 'Unsaved'; await editor.trigger('input');
+  let message; window.confirm = (value) => { message = value; return false; };
+  await findButton(root, '설계').trigger('click');
+  assert.match(message, /저장하지 않은/);
+  assert.equal(root.querySelector('textarea').value, 'Unsaved');
+});
+
+
+test('hardening owned overlay refuses dirty replacement and restores focus and original inert values', async (t) => {
+  const root = await mountedPm(t);
+  const trigger = findButton(root, 'Edit source'); trigger.focus();
+  const unrelated = new UiNode('section'); unrelated.inert = true; document.body.append(unrelated);
+  const overlay = createPmOverlay(root);
+  const panel = new UiNode('section'), close = new UiNode('button'), last = new UiNode('input'); panel.append(close, last);
+  let mayClose = false;
+  assert.equal(overlay.open(panel, { canClose: () => mayClose }), true);
+  assert.equal(root.inert, true); assert.equal(document.activeElement, close);
+  await panel.trigger('keydown', { key: 'Tab', shiftKey: true });
+  assert.equal(document.activeElement, last);
+  assert.equal(overlay.open(new UiNode('section')), false);
+  assert.equal(overlay.panel, panel);
+  assert.equal(overlay.close(), false);
+  mayClose = true;
+  assert.equal(overlay.close(), true);
+  assert.equal(root.inert, undefined); assert.equal(unrelated.inert, true);
+  assert.equal(document.activeElement, trigger);
+  assert.equal(document.body.querySelector('.pm-overlay-backdrop'), null);
+  overlay.open(new UiNode('section'));
+  overlay.dispose();
+  assert.equal(document.body.querySelector('.pm-overlay-backdrop'), null);
+  assert.equal(root.inert, undefined);
+  overlay.destroy();
+  assert.equal(overlay.open(new UiNode('section')), false, 'Late responses cannot reopen an unmounted project overlay');
+});
+
+test('hardening delayed previews cannot open or confirm on a later PM view', async (t) => {
+  for (const kind of ['handoffs', 'archive']) await t.test(kind, async (context) => {
+    let complete;
+    const waiting = new Promise((resolve) => { complete = resolve; });
+    const root = await mountedPm(context, { tab: 'plan', apiRequest: (path) => path.endsWith(`/${kind}/preview`) ? waiting : undefined });
+    const pending = findButton(root, kind === 'handoffs' ? 'Preview approved handoff' : 'Preview archive').trigger('click');
+    await new Promise((resolve) => setImmediate(resolve));
+    await findButton(root, 'Code Files').trigger('click');
+    complete(kind === 'handoffs' ? { items: [], preview_token: 'old-view-token' } : { candidate: { target_paths: ['old-view-archive'] }, accepted_commits: {}, archive_id: 'old-view-archive', confirmation_token: 'old-token' });
+    await pending;
+    assert.equal(document.body.querySelector('[role="dialog"]'), null, 'An old preview must not create a dialog on the new view');
+    assert.equal(root.querySelector('.pm-action-error'), null);
+  });
+});
+
+test('hardening detached confirmation cannot submit after PM navigation', async (t) => {
+  let writes = 0;
+  const root = await mountedPm(t, { tab: 'plan', apiRequest: (path) => {
+    if (path.endsWith('/handoffs/preview')) return { items: [], preview_token: 'view-token' };
+    if (path.endsWith('/handoffs')) { writes += 1; return {}; }
+  } });
+  await findButton(root, 'Preview approved handoff').trigger('click');
+  const confirm = findButton(document.body, 'Create native tickets');
+  await findButton(root, 'Code Files').trigger('click');
+  await confirm.trigger('click');
+  assert.equal(writes, 0, 'An event queued on the detached old confirmation cannot authorize a new view');
+  assert.equal(document.body.querySelector('[role="dialog"]'), null);
+});
+
+test('hardening failed source save keeps dirty input and allows an immediate retry', async (t) => {
+  const dirtyChanges = [];
+  const root = await mountedPm(t, { dirtyChanges, apiRequest: (path, options) => {
+    if (options?.method === 'PATCH' && path.includes('/documents/')) throw new Error('Fixture save failed; retry.');
+  } });
+  const source = root.querySelector('textarea'); source.value += '\nRetry marker'; await source.trigger('input');
+  const save = findButton(root, 'Save draft'); await save.trigger('click');
+  assert.equal(source.value, 'Demo document\nRetry marker');
+  assert.ok(root.querySelector('.pm-action-error').textContent.includes('Fixture save failed'));
+  assert.equal(save.disabled, false, 'Failure must not masquerade as a saved clean document');
+  assert.equal(dirtyChanges.at(-1), true);
 });

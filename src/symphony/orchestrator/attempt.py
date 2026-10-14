@@ -311,29 +311,29 @@ async def _start_attempt(
         from ..pm.models import PmError
 
         try:
-            pm_project_id = host_project_identity(
-                cfg.workflow_path, standalone_id=cfg.tracker.project_slug
-            )
-        except PmError as exc:
-            # Without the host identity, PM authority would be looked up under
-            # the wrong key. Refuse anything that may be PM-managed; work with
-            # no PM trace and no PM handoff configured keeps running.
-            if (
-                issue.planning_ref is not None
-                or cfg.pm.handoff
-                or orch._run_registry.pm_ticket_identifier_known(issue.identifier)
+            try:
+                pm_project_id = host_project_identity(
+                    cfg.workflow_path, standalone_id=cfg.tracker.project_slug
+                )
+            except PmError as exc:
+                # Without the host identity, PM authority would be looked up under
+                # the wrong key. Refuse anything that may be PM-managed; work with
+                # no PM trace and no PM handoff configured keeps running.
+                if (
+                    issue.planning_ref is not None
+                    or cfg.pm.handoff
+                    or orch._run_registry.pm_ticket_identifier_known(issue.identifier)
+                ):
+                    return _AttemptExit("pm_dispatch_denied", exc.message)
+                pm_project_id = cfg.tracker.project_slug
+            membership = authority.recognize(issue, pm_project_id)
+            if membership.managed and (
+                cfg.agent.auto_merge_on_done or cfg.agent.auto_merge_push_target
             ):
-                return _AttemptExit("pm_dispatch_denied", exc.message)
-            pm_project_id = cfg.tracker.project_slug
-        membership = authority.recognize(issue, pm_project_id)
-        if membership.managed and (
-            cfg.agent.auto_merge_on_done or cfg.agent.auto_merge_push_target
-        ):
-            return _AttemptExit(
-                "pm_delivery_policy_conflict",
-                "PM handoff refuses automatic merge or push delivery policy",
-            )
-        try:
+                return _AttemptExit(
+                    "pm_delivery_policy_conflict",
+                    "PM handoff refuses automatic merge or push delivery policy",
+                )
             running.pm_dispatch_permit = authority.reserve_dispatch(
                 issue, pm_project_id
             )

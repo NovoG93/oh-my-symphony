@@ -757,13 +757,14 @@ def build_service_config(
         if key in pm_raw
     ]
     if pinned_planning_keys:
-        # The planning client pins these on purpose; accepting the keys would
+        # The installed runtime and fixed model/effort have no workflow overrides;
+        # accepting these keys would
         # suggest an effect they never have.
-        from ..pm.planning import EFFORT, MODEL, SUPPORTED_CODEX_VERSION
+        from ..pm.planning import EFFORT, MODEL
 
         raise ConfigValidationError(
             f"pm.{pinned_planning_keys[0]} is not configurable; the PM planning "
-            f"assistant is pinned to Codex {SUPPORTED_CODEX_VERSION}, model "
+            "assistant uses the compatible installed Codex CLI, pinned model "
             f"{MODEL}, reasoning effort {EFFORT}. Remove "
             + ", ".join(f"pm.{key}" for key in pinned_planning_keys)
             + " from WORKFLOW.md",

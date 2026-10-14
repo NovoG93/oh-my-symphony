@@ -19,7 +19,7 @@ from pathlib import Path
 from typing import Any
 
 from .approval import PmApprovalService
-from .documents import PmDocumentRepository
+from .documents import PmDocumentRepository, _atomic_write
 from .exchange import WorkbookExchange
 from .handoff import PmHandoffService
 from .locks import change_authority_lock
@@ -645,14 +645,7 @@ def _roll_archive_forward(
             continue
         destination = specs / relative
         destination.parent.mkdir(parents=True, exist_ok=True)
-        # mkstemp creates a fresh file exclusively (O_EXCL), so a symlink planted
-        # under any predictable temp name can never redirect this write.
-        handle, raw_temporary = tempfile.mkstemp(
-            dir=destination.parent, prefix=f".{destination.name}.", suffix=".pm-archive-tmp"
-        )
-        with os.fdopen(handle, "w", encoding="utf-8") as stream:
-            stream.write(text)
-        os.replace(raw_temporary, destination)
+        _atomic_write(destination, text)
     if move_from is not None:
         target.parent.mkdir(parents=True, exist_ok=True)
         os.rename(move_from, target)

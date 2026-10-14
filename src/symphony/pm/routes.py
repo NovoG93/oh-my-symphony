@@ -14,6 +14,7 @@ import sqlite3
 import subprocess
 import uuid
 import zipfile
+from contextlib import nullcontext
 from dataclasses import asdict, is_dataclass
 from datetime import date, datetime, timezone
 from pathlib import Path
@@ -36,6 +37,7 @@ from .wbs import parse_wbs, patch_task_fields
 from .verification import PmVerificationService, successful_run_provenance
 from .coverage import PmCoverageService
 from .identity import host_project_identity
+from .locks import change_authority_lock
 from ..orchestrator.run_registry import RunRegistry
 from ..issue import PlanningRef
 from ..trackers.file import FileBoardTracker
@@ -122,14 +124,17 @@ def register_pm_routes(app: web.Application, ctx: Any, orchestrator: Any) -> Non
         )
         return result
 
+    async def run_service(work: Callable[[PmApplication], _T], pctx: PmRequestContext | None = None) -> _T:
+        return await asyncio.to_thread(_with_thread_application, service(), work, pctx)
+
     def owner(request: web.Request) -> str:
         value = request.headers.get("X-Symphony-PM-Owner", "local-operator").strip()
         return value[:128] or "local-operator"
 
-    def verification_service() -> PmVerificationService:
+    def verification_service(pmapp: PmApplication | None = None) -> PmVerificationService:
         cfg = ctx.config()
         return PmVerificationService(
-            service().repository.registry, cfg.pm.verification_procedures,
+            (pmapp or service()).repository.registry, cfg.pm.verification_procedures,
             manual_procedures=cfg.pm.manual_verification_procedures,
             artifacts=ctx.artifacts(), timeout_seconds=cfg.pm.operation_timeout_ms / 1000,
             project_root=cfg.workflow_path.parent,
@@ -199,12 +204,19 @@ def register_pm_routes(app: web.Application, ctx: Any, orchestrator: Any) -> Non
 
     async def capabilities(_request: web.Request):
         tools = await asyncio.to_thread(host_tools.probe, ctx.config())
-        return web.json_response(_json(service().capabilities(host_tools=tools)))
+        return web.json_response(_json(await run_service(lambda pmapp: pmapp.capabilities(host_tools=tools))))
 
     async def list_changes(request: web.Request):
         if request.query.get("project_id") != host_project_id():
             raise PmError("wrong_project", "request project does not match", status=409)
-        return web.json_response({"changes": _json(service().repository.list_changes(owner=owner(request)))})
+        request_owner = owner(request)
+        request_query = dict(request.query)
+        def execute(pmapp: PmApplication):
+            if request_query.get("project_id") != pmapp.repository.project_id:
+                raise PmError("wrong_project", "request project does not match", status=409)
+            return web.json_response({"changes": _json(pmapp.repository.list_changes(owner=request_owner))})
+
+        return await run_service(execute)
 
     async def create_change(request: web.Request):
         payload = await body(request)
@@ -220,212 +232,278 @@ def register_pm_routes(app: web.Application, ctx: Any, orchestrator: Any) -> Non
         locator = str(payload.get("locator") or "")
         if not workspace_path or not re.fullmatch(r"[a-z0-9]+(?:-[a-z0-9]+)*", locator):
             raise PmError("invalid_request", "workspace_path and valid locator are required")
-        pmapp = service()
-        change_id = uuid.uuid4().hex
-        claim_record = pmapp.claim_workspace(change_id, workspace_path, owner(request))
-        try:
-            change = pmapp.create_change(
-                change_id, locator, str(payload.get("title") or ""), owner(request)
-            )
-        except Exception:
-            pmapp.repository.registry.set_pm_workspace_state(
-                host_project_id(), change_id,
-                fence=claim_record.fence, state="RELEASED",
-            )
-            raise
-        return web.json_response(_json(change), status=201)
+        request_owner = owner(request)
+        def execute(pmapp: PmApplication):
+            change_id = uuid.uuid4().hex
+            claim_record = pmapp.claim_workspace(change_id, workspace_path, request_owner)
+            try:
+                change = pmapp.create_change(
+                    change_id, locator, str(payload.get("title") or ""), request_owner
+                )
+            except Exception:
+                pmapp.repository.registry.set_pm_workspace_state(
+                    pmapp.repository.project_id, change_id,
+                    fence=claim_record.fence, state="RELEASED",
+                )
+                raise
+            return web.json_response(_json(change), status=201)
+
+        return await run_service(execute)
 
     async def get_change(request: web.Request):
         payload = {"project_id": request.query.get("project_id", "")}
         pctx = context(payload, request)
-        pmapp = service()
-        change = pmapp.repository.get_change(pctx, owner=owner(request))
-        result = _json(change)
-        workspace = pmapp.repository.registry.get_pm_workspace(pctx.project_id, pctx.change_id)
-        result["workspace_state"] = workspace.state if workspace is not None else "UNAVAILABLE"
-        result["approval_confirmation_token"] = (
-            None if workspace is not None and workspace.state == "RELEASED"
-            else pmapp.approval.confirmation_token(pctx, owner=owner(request))
-        )
-        return web.json_response(result)
+        request_owner = owner(request)
+        def execute(pmapp: PmApplication):
+            change = pmapp.repository.get_change(pctx, owner=request_owner)
+            result = _json(change)
+            workspace = pmapp.repository.registry.get_pm_workspace(pctx.project_id, pctx.change_id)
+            result["workspace_state"] = workspace.state if workspace is not None else "UNAVAILABLE"
+            result["approval_confirmation_token"] = (
+                None if workspace is not None and workspace.state == "RELEASED"
+                else pmapp.approval.confirmation_token(pctx, owner=request_owner)
+            )
+            return web.json_response(result)
+
+        return await run_service(execute, pctx)
 
     async def claim(request: web.Request):
         payload = await body(request)
         pctx = context(payload, request)
-        raw_inner = payload.get("payload")
-        inner: dict[str, Any] = raw_inner if isinstance(raw_inner, dict) else payload
-        pmapp = service()
-        pmapp._require("authoring")
-        if pmapp.repository.registry.get_pm_workspace(pctx.project_id, pctx.change_id) is None:
-            raise PmError(
-                "server_minted_id_required",
-                "new change identities are allocated by POST /changes",
-                status=409,
-            )
-        claim_result = pmapp.claim_workspace(pctx.change_id, str(inner.get("workspace_path") or ""), owner(request))
-        return web.json_response(_json(claim_result))
+        request_owner = owner(request)
+        def execute(pmapp: PmApplication):
+            raw_inner = payload.get("payload")
+            inner: dict[str, Any] = raw_inner if isinstance(raw_inner, dict) else payload
+            pmapp._require("authoring")
+            if pmapp.repository.registry.get_pm_workspace(pctx.project_id, pctx.change_id) is None:
+                raise PmError(
+                    "server_minted_id_required",
+                    "new change identities are allocated by POST /changes",
+                    status=409,
+                )
+            claim_result = pmapp.claim_workspace(pctx.change_id, str(inner.get("workspace_path") or ""), request_owner)
+            return web.json_response(_json(claim_result))
+
+        return await run_service(execute, pctx)
 
     async def repair(request: web.Request):
         payload = await body(request)
         pctx = context(payload, request)
-        pmapp = service()
-        pmapp._require("authoring")
-        current = pmapp.repository.registry.get_pm_workspace(pctx.project_id, pctx.change_id)
-        if current is None:
-            raise PmError("workspace_unavailable", "planning workspace is not claimed", status=409)
-        if current.state == "RELEASED":
-            raise PmError("workspace_repair_required", "archived change identity is retired", status=409)
-        raw_inner = payload.get("payload")
-        inner: dict[str, Any] = raw_inner if isinstance(raw_inner, dict) else payload
-        result = pmapp.repository.claim_workspace(
-            pctx.change_id, Path(str(inner.get("workspace_path") or "")),
-            owner(request), replace_existing=True,
-        )
-        return web.json_response(_json(result))
+        request_owner = owner(request)
+        def execute(pmapp: PmApplication):
+            pmapp._require("authoring")
+            current = pmapp.repository.registry.get_pm_workspace(pctx.project_id, pctx.change_id)
+            if current is None:
+                raise PmError("workspace_unavailable", "planning workspace is not claimed", status=409)
+            if current.state == "RELEASED":
+                raise PmError("workspace_repair_required", "archived change identity is retired", status=409)
+            raw_inner = payload.get("payload")
+            inner: dict[str, Any] = raw_inner if isinstance(raw_inner, dict) else payload
+            result = pmapp.repository.claim_workspace(
+                pctx.change_id, Path(str(inner.get("workspace_path") or "")),
+                request_owner, replace_existing=True,
+            )
+            return web.json_response(_json(result))
+
+        return await run_service(execute, pctx)
 
     async def get_document(request: web.Request):
         pctx = context({"project_id": request.query.get("project_id", "")}, request)
-        return web.json_response(_json(service().repository.get_document(pctx, request.match_info["document_id"], owner=owner(request))))
+        request_owner = owner(request)
+        request_match_info = dict(request.match_info)
+        def execute(pmapp: PmApplication):
+            return web.json_response(_json(pmapp.repository.get_document(pctx, request_match_info["document_id"], owner=request_owner)))
+
+        return await run_service(execute, pctx)
 
     async def get_baseline(request: web.Request):
         pctx = context({"project_id": request.query.get("project_id", "")}, request)
-        capability = request.match_info["capability"]
-        if not re.fullmatch(r"[a-z0-9][a-z0-9-]{0,79}", capability):
-            raise PmError("invalid_request", "invalid capability")
-        claim_record = service().repository._read_claim(
-            pctx.change_id, owner=owner(request)
-        )
-        path = Path(claim_record.workspace_path) / "openspec" / "specs" / capability / "spec.md"
-        root = Path(claim_record.workspace_path).resolve()
-        resolved = path.resolve()
-        if root not in resolved.parents or not resolved.exists():
-            return web.json_response({"capability": capability, "exists": False, "source": ""})
-        return web.json_response({"capability": capability, "exists": True, "source": resolved.read_text(encoding="utf-8")})
+        request_owner = owner(request)
+        request_match_info = dict(request.match_info)
+        def execute(pmapp: PmApplication):
+            capability = request_match_info["capability"]
+            if not re.fullmatch(r"[a-z0-9][a-z0-9-]{0,79}", capability):
+                raise PmError("invalid_request", "invalid capability")
+            claim_record = pmapp.repository._read_claim(
+                pctx.change_id, owner=request_owner
+            )
+            path = Path(claim_record.workspace_path) / "openspec" / "specs" / capability / "spec.md"
+            root = Path(claim_record.workspace_path).resolve()
+            resolved = path.resolve()
+            if root not in resolved.parents or not resolved.exists():
+                return web.json_response({"capability": capability, "exists": False, "source": ""})
+            return web.json_response({"capability": capability, "exists": True, "source": resolved.read_text(encoding="utf-8")})
+
+        return await run_service(execute, pctx)
 
     async def create_spec(request: web.Request):
         payload = await body(request)
         pctx = context(payload, request, revision=True, operation=True)
-        pmapp = service()
-        pmapp._require("authoring")
-        result = pmapp.repository.create_spec(
-            pctx, str(payload.get("capability") or ""),
-            str(payload.get("title") or ""), owner=owner(request),
-        )
-        return web.json_response(result.as_json(), status=201)
+        request_owner = owner(request)
+        def execute(pmapp: PmApplication):
+            pmapp._require("authoring")
+            result = pmapp.repository.create_spec(
+                pctx, str(payload.get("capability") or ""),
+                str(payload.get("title") or ""), owner=request_owner,
+            )
+            return web.json_response(result.as_json(), status=201)
+
+        return await run_service(execute, pctx)
 
     async def patch_document(request: web.Request):
         payload = await body(request)
         pctx = context(payload, request, revision=True)
-        operations = payload.get("payload", {}).get("operations") if isinstance(payload.get("payload"), dict) else None
-        if not isinstance(operations, list):
-            raise PmError("invalid_request", "payload.operations must be a list")
-        pmapp = service()
-        pmapp._require("authoring")
-        result = pmapp.repository.patch_document(pctx, request.match_info["document_id"], operations, owner=owner(request))
-        return web.json_response(result.as_json())
+        request_owner = owner(request)
+        request_match_info = dict(request.match_info)
+        def execute(pmapp: PmApplication):
+            operations = payload.get("payload", {}).get("operations") if isinstance(payload.get("payload"), dict) else None
+            if not isinstance(operations, list):
+                raise PmError("invalid_request", "payload.operations must be a list")
+            pmapp._require("authoring")
+            result = pmapp.repository.patch_document(pctx, request_match_info["document_id"], operations, owner=request_owner)
+            return web.json_response(result.as_json())
+
+        return await run_service(execute, pctx)
 
     async def get_wbs(request: web.Request):
         pctx = context({"project_id": request.query.get("project_id", "")}, request)
-        return web.json_response(_json(service().repository.get_wbs(pctx, owner=owner(request))))
+        request_owner = owner(request)
+        def execute(pmapp: PmApplication):
+            return web.json_response(_json(pmapp.repository.get_wbs(pctx, owner=request_owner)))
+
+        return await run_service(execute, pctx)
 
     async def patch_wbs(request: web.Request):
         payload = await body(request)
         pctx = context(payload, request, revision=True)
-        operations = payload.get("payload", {}).get("operations") if isinstance(payload.get("payload"), dict) else None
-        if not isinstance(operations, list):
-            raise PmError("invalid_request", "payload.operations must be a list")
-        pmapp = service()
-        pmapp._require("authoring")
-        return web.json_response(pmapp.repository.patch_wbs(pctx, operations, owner=owner(request)).as_json())
+        request_owner = owner(request)
+        def execute(pmapp: PmApplication):
+            operations = payload.get("payload", {}).get("operations") if isinstance(payload.get("payload"), dict) else None
+            if not isinstance(operations, list):
+                raise PmError("invalid_request", "payload.operations must be a list")
+            pmapp._require("authoring")
+            return web.json_response(pmapp.repository.patch_wbs(pctx, operations, owner=request_owner).as_json())
+
+        return await run_service(execute, pctx)
 
     async def preview_wbs(request: web.Request):
         payload = await body(request)
         pctx = context(payload, request, revision=True)
-        pmapp = service()
-        pmapp._require("authoring")
-        change = pmapp.repository.get_change(pctx, owner=owner(request))
-        if change.revision != pctx.expected_revision:
-            raise PmError("revision_conflict", "planning revision changed", status=409)
-        operations = payload.get("payload", {}).get("operations") if isinstance(payload.get("payload"), dict) else None
-        if not isinstance(operations, list) or any(item.get("op") != "set_field" for item in operations if isinstance(item, dict)):
-            raise PmError("invalid_request", "preview supports set_field operations")
-        changes = []
-        for operation in operations:
-            if not isinstance(operation, dict) or not isinstance(operation.get("task_id"), str) or not isinstance(operation.get("field"), str):
-                raise PmError("invalid_request", "preview operation requires task_id and field")
-            changes.append((operation["task_id"], operation["field"], operation.get("value")))
-        document = pmapp.repository.get_document(pctx, "tasks", owner=owner(request))
-        proposed = patch_task_fields(document.source, changes)
-        parsed = parse_wbs(proposed)
-        return web.json_response({"revision": change.revision, "findings": _json(parsed.findings), "tasks": _json(parsed.tasks)})
+        request_owner = owner(request)
+        def execute(pmapp: PmApplication):
+            pmapp._require("authoring")
+            change = pmapp.repository.get_change(pctx, owner=request_owner)
+            if change.revision != pctx.expected_revision:
+                raise PmError("revision_conflict", "planning revision changed", status=409)
+            operations = payload.get("payload", {}).get("operations") if isinstance(payload.get("payload"), dict) else None
+            if not isinstance(operations, list) or any(item.get("op") != "set_field" for item in operations if isinstance(item, dict)):
+                raise PmError("invalid_request", "preview supports set_field operations")
+            changes = []
+            for operation in operations:
+                if not isinstance(operation, dict) or not isinstance(operation.get("task_id"), str) or not isinstance(operation.get("field"), str):
+                    raise PmError("invalid_request", "preview operation requires task_id and field")
+                changes.append((operation["task_id"], operation["field"], operation.get("value")))
+            document = pmapp.repository.get_document(pctx, "tasks", owner=request_owner)
+            proposed = patch_task_fields(document.source, changes)
+            parsed = parse_wbs(proposed)
+            return web.json_response({"revision": change.revision, "findings": _json(parsed.findings), "tasks": _json(parsed.tasks)})
+
+        return await run_service(execute, pctx)
 
     async def begin_external(request: web.Request):
         payload = await body(request)
         pctx = context(payload, request, revision=True)
-        pmapp = service()
-        pmapp._require("authoring")
-        claim_record = pmapp.repository._claim(pctx.change_id, owner=owner(request))
-        return web.json_response(_json(pmapp.repository.begin_external_edit(pctx.change_id, fence=claim_record.fence, owner=owner(request))))
+        request_owner = owner(request)
+        def execute(pmapp: PmApplication):
+            pmapp._require("authoring")
+            claim_record = pmapp.repository._claim(pctx.change_id, owner=request_owner)
+            return web.json_response(_json(pmapp.repository.begin_external_edit(pctx.change_id, fence=claim_record.fence, owner=request_owner)))
+
+        return await run_service(execute, pctx)
 
     async def end_external(request: web.Request):
         payload = await body(request)
         pctx = context(payload, request)
-        pmapp = service()
-        pmapp._require("authoring")
-        claim_record = pmapp.repository._claim(pctx.change_id, owner=owner(request))
-        return web.json_response(_json(pmapp.repository.end_external_edit(pctx.change_id, fence=claim_record.fence, owner=owner(request))))
+        request_owner = owner(request)
+        def execute(pmapp: PmApplication):
+            pmapp._require("authoring")
+            claim_record = pmapp.repository._claim(pctx.change_id, owner=request_owner)
+            return web.json_response(_json(pmapp.repository.end_external_edit(pctx.change_id, fence=claim_record.fence, owner=request_owner)))
+
+        return await run_service(execute, pctx)
 
     async def validate(request: web.Request):
         payload = await body(request)
         pctx = context(payload, request)
-        return web.json_response(_json(service().validate_change(pctx, owner(request))))
+        request_owner = owner(request)
+        def execute(pmapp: PmApplication):
+            return web.json_response(_json(pmapp.validate_change(pctx, request_owner)))
+
+        return await run_service(execute, pctx)
 
     async def convert_legacy(request: web.Request):
         payload = await body(request)
         if request.match_info.get("change_id"):
-            raise PmError(
-                "server_minted_id_required",
-                "legacy conversion change identities are assigned by the server",
-                status=409,
-            )
-        project_id = str(payload.get("project_id") or "")
-        if project_id != host_project_id():
+            raise PmError("server_minted_id_required", "legacy conversion change identities are assigned by the server", status=409)
+        if str(payload.get("project_id") or "") != host_project_id():
             raise PmError("wrong_project", "request project does not match", status=409)
-        pctx = PmRequestContext(project_id, uuid.uuid4().hex)
-        pmapp = service()
-        pmapp._require("handoff")
-        result = pmapp.handoff.convert_legacy(
-            pctx, str(payload.get("source_ticket_id") or ""),
-            str(payload.get("workspace_path") or ""),
-            str(payload.get("locator") or ""), str(payload.get("title") or ""),
-            owner=owner(request),
-        )
-        return web.json_response(_json(result), status=201)
+        request_owner = owner(request)
+        request_match_info = dict(request.match_info)
+        def execute(pmapp: PmApplication):
+            if request_match_info.get("change_id"):
+                raise PmError(
+                    "server_minted_id_required",
+                    "legacy conversion change identities are assigned by the server",
+                    status=409,
+                )
+            project_id = str(payload.get("project_id") or "")
+            if project_id != pmapp.repository.project_id:
+                raise PmError("wrong_project", "request project does not match", status=409)
+            pctx = PmRequestContext(project_id, uuid.uuid4().hex)
+            pmapp._require("handoff")
+            result = pmapp.handoff.convert_legacy(
+                pctx, str(payload.get("source_ticket_id") or ""),
+                str(payload.get("workspace_path") or ""),
+                str(payload.get("locator") or ""), str(payload.get("title") or ""),
+                owner=request_owner,
+            )
+            return web.json_response(_json(result), status=201)
+
+        return await run_service(execute)
 
     async def approve(request: web.Request):
         payload = await body(request)
         pctx = context(payload, request, revision=True)
-        pmapp = service()
-        pmapp._require("authoring")
-        manifest = pmapp.approval.approve(pctx, str(payload.get("confirmation_token") or ""), str(payload.get("reviewer_label") or owner(request)), owner=owner(request))
-        return web.json_response(_json(manifest), status=201)
+        request_owner = owner(request)
+        def execute(pmapp: PmApplication):
+            pmapp._require("authoring")
+            manifest = pmapp.approval.approve(pctx, str(payload.get("confirmation_token") or ""), str(payload.get("reviewer_label") or request_owner), owner=request_owner)
+            return web.json_response(_json(manifest), status=201)
+
+        return await run_service(execute, pctx)
 
     async def handoff_preview(request: web.Request):
         payload = await body(request)
         pctx = context(payload, request, revision=True)
-        pmapp = service()
-        pmapp._require("handoff")
-        pmapp.repository._claim(pctx.change_id, owner=owner(request))
-        return web.json_response(_json(pmapp.handoff.preview(pctx, owner=owner(request))))
+        request_owner = owner(request)
+        def execute(pmapp: PmApplication):
+            pmapp._require("handoff")
+            pmapp.repository._claim(pctx.change_id, owner=request_owner)
+            return web.json_response(_json(pmapp.handoff.preview(pctx, owner=request_owner)))
+
+        return await run_service(execute, pctx)
 
     async def handoff_publish(request: web.Request):
         payload = await body(request)
         pctx = context(payload, request, revision=True, operation=True)
-        pmapp = service()
-        pmapp._require("handoff")
-        pmapp.repository._claim(pctx.change_id, owner=owner(request))
-        result = pmapp.handoff.publish(pctx, str(payload.get("preview_token") or ""), str(payload.get("confirmation_token") or ""), owner=owner(request))
-        return web.json_response(_json(result), status=201)
+        request_owner = owner(request)
+        def execute(pmapp: PmApplication):
+            pmapp._require("handoff")
+            pmapp.repository._claim(pctx.change_id, owner=request_owner)
+            result = pmapp.handoff.publish(pctx, str(payload.get("preview_token") or ""), str(payload.get("confirmation_token") or ""), owner=request_owner)
+            return web.json_response(_json(result), status=201)
+
+        return await run_service(execute, pctx)
 
     async def create_export(request: web.Request):
         payload = await body(request)
@@ -453,7 +531,7 @@ def register_pm_routes(app: web.Application, ctx: Any, orchestrator: Any) -> Non
                     pmapp.exchange.export, change, runtime, export_id=export_id
                 )
         else:
-            exported = _render_export(change, format_name, pmapp.exchange)
+            exported = await asyncio.to_thread(_render_export, change, format_name, pmapp.exchange)
 
         def store_export() -> None:
             export_root.mkdir(parents=True, exist_ok=True)
@@ -557,137 +635,144 @@ def register_pm_routes(app: web.Application, ctx: Any, orchestrator: Any) -> Non
     async def apply_import(request: web.Request):
         payload = await body(request)
         pctx = context(payload, request, revision=True, operation=True)
-        pmapp = service()
-        pmapp._require("exchange")
-        import_id = request.match_info["import_id"]
-        import_root = storage_root("imports")
-        preview_path = import_root / f"{import_id}.json"
-        if not re.fullmatch(r"[0-9a-f]{32}", import_id) or not preview_path.exists():
-            raise PmError("import_not_found", "import preview is missing or expired", status=404)
-        candidate = json.loads(preview_path.read_text(encoding="utf-8"))
-        if candidate.get("change_id") != pctx.change_id or candidate.get("owner") != owner(request):
-            raise PmError("import_not_found", "import preview belongs to another change", status=404)
-        if candidate["preview_digest"] != str(payload.get("preview_digest") or ""):
-            raise PmError("confirmation_mismatch", "import preview changed", status=409)
-        if candidate["current_revision"] != pctx.expected_revision:
-            raise PmError("revision_conflict", "planning revision changed after import preview", status=409)
-        resolutions = payload.get("resolutions") or {}
-        if not isinstance(resolutions, dict):
-            raise PmError("invalid_request", "resolutions must be an object")
-        conflict_keys = {f"{item['item_id']}:{item['field']}" for item in candidate.get("conflicts", [])}
-        if any(key not in conflict_keys or value not in {"current", "imported"} for key, value in resolutions.items()):
-            raise PmError("invalid_resolution", "conflict resolution is unknown or invalid")
-        unresolved = [item for item in candidate.get("conflicts", []) if f"{item['item_id']}:{item['field']}" not in resolutions]
-        if unresolved or any(item.get("severity") == "blocking" for item in candidate.get("findings", [])):
-            raise PmError("import_conflict", "import conflicts must be resolved before apply", status=409, details={"unresolved": len(unresolved)})
-        operations = []
-        changes = list(candidate.get("changes", []))
-        for conflict in candidate.get("conflicts", []):
-            if resolutions.get(f"{conflict['item_id']}:{conflict['field']}") == "imported":
-                changes.append(conflict)
-        for change in changes:
-            if change["action"] == "add":
-                operations.append({"op": "add_task", "task_id": change["item_id"], "task": change["imported"]})
-            elif change["action"] == "delete":
-                operations.append({"op": "delete_task", "task_id": change["item_id"]})
-            else:
-                operations.append({"op": "set_field", "task_id": change["item_id"], "field": change["field"], "value": change["imported"]})
-        registry = pmapp.repository.registry
-        input_hash = "sha256:" + hashlib.sha256(json.dumps({"import_id": import_id, "preview_digest": candidate["preview_digest"], "resolutions": resolutions}, sort_keys=True).encode()).hexdigest()
-        try:
-            _, created = registry.create_pm_operation(
-                operation_id=pctx.client_operation_id or "", project_id=pctx.project_id,
-                change_id=pctx.change_id, kind="import_apply",
-                expected_revision=pctx.expected_revision, input_hash=input_hash,
-                owner_token=owner(request),
-            )
-        except ValueError as exc:
-            raise PmError("invalid_operation", "operation id was reused for different input", status=409) from exc
-        prepared: dict[str, Any]
-        if not created:
-            existing = _operation(registry, pctx.client_operation_id or "", project_id=pctx.project_id)
-            if existing["state"] == "completed":
-                return web.json_response(existing["result"])
-            prepared = existing["result"]
-            if _import_recovery_matches(
-                pmapp.repository, pctx, prepared, owner=owner(request)
-            ):
-                current_change = pmapp.repository.get_change(pctx, owner=owner(request))
-                reconciled = {
-                    "project_id": pctx.project_id, "change_id": pctx.change_id,
-                    "previous_revision": pctx.expected_revision,
-                    "revision": current_change.revision, "changed": ["tasks.md"],
-                    "findings": [], "impacted_ids": sorted({item["item_id"] for item in candidate.get("changes", []) + candidate.get("conflicts", [])}),
-                    "approval_invalidated": True, "operation_id": pctx.client_operation_id,
-                    "import_id": import_id, "reconciled": True,
-                }
-                registry.finish_pm_operation(pctx.client_operation_id or "", state="completed", result=reconciled)
-                return web.json_response(reconciled)
-            current_change = pmapp.repository.get_change(pctx, owner=owner(request))
-            if current_change.revision != pctx.expected_revision:
-                registry.finish_pm_operation(pctx.client_operation_id or "", state="reconcile", error_code="import_reconcile")
-                raise PmError("import_reconcile", "import operation requires manual reconciliation", status=409)
-            computed = {
-                "import_id": import_id,
-                **pmapp.repository.preview_wbs_patch(
-                    pctx, operations, owner=owner(request)
-                ),
-            }
-            if existing["state"] == "pending":
-                prepared = computed
-                registry.prepare_pm_operation(
-                    pctx.client_operation_id or "", result=prepared
-                )
-            elif prepared != computed:
-                registry.finish_pm_operation(
-                    pctx.client_operation_id or "", state="reconcile",
-                    error_code="import_reconcile",
-                )
-                raise PmError("import_reconcile", "import prepared state differs from current input", status=409)
-        else:
+        request_owner = owner(request)
+        request_match_info = dict(request.match_info)
+        def execute(pmapp: PmApplication):
+            pmapp._require("exchange")
+            import_id = request_match_info["import_id"]
+            import_root = storage_root("imports")
+            preview_path = import_root / f"{import_id}.json"
+            if not re.fullmatch(r"[0-9a-f]{32}", import_id) or not preview_path.exists():
+                raise PmError("import_not_found", "import preview is missing or expired", status=404)
+            candidate = json.loads(preview_path.read_text(encoding="utf-8"))
+            if candidate.get("change_id") != pctx.change_id or candidate.get("owner") != request_owner:
+                raise PmError("import_not_found", "import preview belongs to another change", status=404)
+            if candidate["preview_digest"] != str(payload.get("preview_digest") or ""):
+                raise PmError("confirmation_mismatch", "import preview changed", status=409)
+            if candidate["current_revision"] != pctx.expected_revision:
+                raise PmError("revision_conflict", "planning revision changed after import preview", status=409)
+            resolutions = payload.get("resolutions") or {}
+            if not isinstance(resolutions, dict):
+                raise PmError("invalid_request", "resolutions must be an object")
+            conflict_keys = {f"{item['item_id']}:{item['field']}" for item in candidate.get("conflicts", [])}
+            if any(key not in conflict_keys or value not in {"current", "imported"} for key, value in resolutions.items()):
+                raise PmError("invalid_resolution", "conflict resolution is unknown or invalid")
+            unresolved = [item for item in candidate.get("conflicts", []) if f"{item['item_id']}:{item['field']}" not in resolutions]
+            if unresolved or any(item.get("severity") == "blocking" for item in candidate.get("findings", [])):
+                raise PmError("import_conflict", "import conflicts must be resolved before apply", status=409, details={"unresolved": len(unresolved)})
+            operations = []
+            changes = list(candidate.get("changes", []))
+            for conflict in candidate.get("conflicts", []):
+                if resolutions.get(f"{conflict['item_id']}:{conflict['field']}") == "imported":
+                    changes.append(conflict)
+            for change in changes:
+                if change["action"] == "add":
+                    operations.append({"op": "add_task", "task_id": change["item_id"], "task": change["imported"]})
+                elif change["action"] == "delete":
+                    operations.append({"op": "delete_task", "task_id": change["item_id"]})
+                else:
+                    operations.append({"op": "set_field", "task_id": change["item_id"], "field": change["field"], "value": change["imported"]})
+            registry = pmapp.repository.registry
+            input_hash = "sha256:" + hashlib.sha256(json.dumps({"import_id": import_id, "preview_digest": candidate["preview_digest"], "resolutions": resolutions}, sort_keys=True).encode()).hexdigest()
             try:
-                prepared = {
+                _, created = registry.create_pm_operation(
+                    operation_id=pctx.client_operation_id or "", project_id=pctx.project_id,
+                    change_id=pctx.change_id, kind="import_apply",
+                    expected_revision=pctx.expected_revision, input_hash=input_hash,
+                    owner_token=request_owner,
+                )
+            except ValueError as exc:
+                raise PmError("invalid_operation", "operation id was reused for different input", status=409) from exc
+            prepared: dict[str, Any]
+            if not created:
+                existing = _operation(registry, pctx.client_operation_id or "", project_id=pctx.project_id)
+                if existing["state"] == "completed":
+                    return web.json_response(existing["result"])
+                prepared = existing["result"]
+                if _import_recovery_matches(
+                    pmapp.repository, pctx, prepared, owner=request_owner
+                ):
+                    current_change = pmapp.repository.get_change(pctx, owner=request_owner)
+                    reconciled = {
+                        "project_id": pctx.project_id, "change_id": pctx.change_id,
+                        "previous_revision": pctx.expected_revision,
+                        "revision": current_change.revision, "changed": ["tasks.md"],
+                        "findings": [], "impacted_ids": sorted({item["item_id"] for item in candidate.get("changes", []) + candidate.get("conflicts", [])}),
+                        "approval_invalidated": True, "operation_id": pctx.client_operation_id,
+                        "import_id": import_id, "reconciled": True,
+                    }
+                    registry.finish_pm_operation(pctx.client_operation_id or "", state="completed", result=reconciled)
+                    return web.json_response(reconciled)
+                current_change = pmapp.repository.get_change(pctx, owner=request_owner)
+                if current_change.revision != pctx.expected_revision:
+                    registry.finish_pm_operation(pctx.client_operation_id or "", state="reconcile", error_code="import_reconcile")
+                    raise PmError("import_reconcile", "import operation requires manual reconciliation", status=409)
+                computed = {
                     "import_id": import_id,
                     **pmapp.repository.preview_wbs_patch(
-                        pctx, operations, owner=owner(request)
+                        pctx, operations, owner=request_owner
                     ),
                 }
-                registry.prepare_pm_operation(
-                    pctx.client_operation_id or "", result=prepared
-                )
+                if existing["state"] == "pending":
+                    prepared = computed
+                    registry.prepare_pm_operation(
+                        pctx.client_operation_id or "", result=prepared
+                    )
+                elif prepared != computed:
+                    registry.finish_pm_operation(
+                        pctx.client_operation_id or "", state="reconcile",
+                        error_code="import_reconcile",
+                    )
+                    raise PmError("import_reconcile", "import prepared state differs from current input", status=409)
+            else:
+                try:
+                    prepared = {
+                        "import_id": import_id,
+                        **pmapp.repository.preview_wbs_patch(
+                            pctx, operations, owner=request_owner
+                        ),
+                    }
+                    registry.prepare_pm_operation(
+                        pctx.client_operation_id or "", result=prepared
+                    )
+                except Exception as exc:
+                    registry.finish_pm_operation(
+                        pctx.client_operation_id or "", state="failed",
+                        error_code=getattr(exc, "code", "import_prepare_failed"),
+                    )
+                    raise
+            try:
+                result = pmapp.repository.patch_wbs(pctx, operations, owner=request_owner)
+                if not _import_recovery_matches(
+                    pmapp.repository,
+                    PmRequestContext(pctx.project_id, pctx.change_id),
+                    prepared,
+                    owner=request_owner,
+                ):
+                    registry.finish_pm_operation(
+                        pctx.client_operation_id or "", state="reconcile",
+                        error_code="import_postcondition",
+                    )
+                    raise PmError("import_reconcile", "import post-apply state differs from prepared manifest", status=409)
+                response = result.as_json()
+                response["import_id"] = import_id
+                registry.finish_pm_operation(pctx.client_operation_id or "", state="completed", result=response)
+                return web.json_response(response)
             except Exception as exc:
-                registry.finish_pm_operation(
-                    pctx.client_operation_id or "", state="failed",
-                    error_code=getattr(exc, "code", "import_prepare_failed"),
-                )
+                registry.finish_pm_operation(pctx.client_operation_id or "", state="failed", error_code=getattr(exc, "code", "import_failed"))
                 raise
-        try:
-            result = pmapp.repository.patch_wbs(pctx, operations, owner=owner(request))
-            if not _import_recovery_matches(
-                pmapp.repository,
-                PmRequestContext(pctx.project_id, pctx.change_id),
-                prepared,
-                owner=owner(request),
-            ):
-                registry.finish_pm_operation(
-                    pctx.client_operation_id or "", state="reconcile",
-                    error_code="import_postcondition",
-                )
-                raise PmError("import_reconcile", "import post-apply state differs from prepared manifest", status=409)
-            response = result.as_json()
-            response["import_id"] = import_id
-            registry.finish_pm_operation(pctx.client_operation_id or "", state="completed", result=response)
-            return web.json_response(response)
-        except Exception as exc:
-            registry.finish_pm_operation(pctx.client_operation_id or "", state="failed", error_code=getattr(exc, "code", "import_failed"))
-            raise
+
+        return await run_service(execute, pctx)
 
     async def planning_action(request: web.Request):
         payload = await body(request)
         pctx = context(payload, request, revision=True, operation=True)
         pmapp = service()
-        pmapp._require("assistance")
-        change = pmapp.repository.get_change(pctx, owner=owner(request))
+        request_owner = owner(request)
+        def load_planning(thread_application: PmApplication):
+            thread_application._require("assistance")
+            return thread_application.repository.get_change(pctx, owner=request_owner)
+        change = await run_service(load_planning, pctx)
         require_current_revision(change, pctx)
         action = str(payload.get("action") or "")
         legacy_payload = payload.get("payload") if isinstance(payload.get("payload"), dict) else {}
@@ -718,7 +803,7 @@ def register_pm_routes(app: web.Application, ctx: Any, orchestrator: Any) -> Non
             dependency = payload.get("dependency")
             if not isinstance(dependency, dict) or set(dependency) != {"task_id", "predecessor_id"}:
                 raise PmError("invalid_planning_scope", "dependency selection is required")
-            wbs = pmapp.repository.get_wbs(pctx, owner=owner(request))
+            wbs = await run_service(lambda thread_application: thread_application.repository.get_wbs(pctx, owner=request_owner), pctx)
             task = next((item for item in wbs.tasks if item.task_id == dependency["task_id"]), None)
             if task is None or str(dependency["predecessor_id"]) not in {item.task_id for item in task.dependencies}:
                 raise PmError("invalid_planning_scope", "selected dependency is not current", status=409)
@@ -814,11 +899,8 @@ def register_pm_routes(app: web.Application, ctx: Any, orchestrator: Any) -> Non
             assert proposal is not None
             occupied_ids = {item.semantic_id for item in change.semantic_index}
             if "tasks" in impacted:
-                occupied_ids.update(
-                    item.task_id for item in pmapp.repository.get_wbs(
-                        pctx, owner=owner(request)
-                    ).tasks
-                )
+                current_wbs = await run_service(lambda thread_application: thread_application.repository.get_wbs(pctx, owner=request_owner), pctx)
+                occupied_ids.update(item.task_id for item in current_wbs.tasks)
             reserved_ids, raw_proposals = _reserve_planning_ids(
                 registry, operation_id, raw_proposals,
                 occupied_ids=occupied_ids,
@@ -874,40 +956,44 @@ def register_pm_routes(app: web.Application, ctx: Any, orchestrator: Any) -> Non
     async def apply_planning_action(request: web.Request):
         payload = await body(request)
         pctx = context(payload, request, revision=True, operation=True)
-        pmapp = service()
-        pmapp._require("assistance")
-        pmapp._require("authoring")
-        proposal_id = request.match_info["operation_id"]
-        operation = _operation(pmapp.repository.registry, proposal_id, project_id=pctx.project_id)
-        if operation["state"] != "completed" or operation["kind"] != "planning_proposal" or operation["change_id"] != pctx.change_id:
-            raise PmError("operation_not_ready", "planning proposal is not complete", status=409)
-        if operation["expected_revision"] != pctx.expected_revision:
-            raise PmError("revision_conflict", "planning proposal targets another revision", status=409)
-        proposed = operation["result"] or {}
-        if payload.get("proposal_digest") != proposed.get("proposal_digest"):
-            raise PmError("confirmation_mismatch", "planning proposal confirmation is stale", status=409)
-        proposals = proposed.get("proposals")
-        if not isinstance(proposals, list) or not proposals:
-            raise PmError("operation_not_ready", "planning result has no mutable proposal", status=409)
-        reserved_ids = proposed.get("reserved_ids") or {}
-        _assert_planning_reservations(
-            pmapp.repository.registry, proposal_id, reserved_ids
-        )
-        sources: dict[str, str] = {}
-        for item in proposals:
-            document_id = str(item.get("document_id") or "")
-            document = pmapp.repository.get_document(pctx, document_id, owner=owner(request))
-            if document.content_hash != item.get("base_document_hash"):
-                raise PmError("proposal_conflict", "proposal base document changed", status=409)
-            sources[document_id] = _apply_unified_diff(document.source, str(item.get("proposal_patch") or ""))
-        result = pmapp.repository.patch_documents(
-            pctx, sources, authorized_ids=tuple(reserved_ids.values()), owner=owner(request)
-        )
-        pmapp.repository.registry._connect().execute(
-            "UPDATE pm_planning_reserved_ids SET state='ACTIVE' WHERE operation_id=? AND state='RESERVED'",
-            (proposal_id,),
-        )
-        return web.json_response(result.as_json())
+        request_owner = owner(request)
+        request_match_info = dict(request.match_info)
+        def execute(pmapp: PmApplication):
+            pmapp._require("assistance")
+            pmapp._require("authoring")
+            proposal_id = request_match_info["operation_id"]
+            operation = _operation(pmapp.repository.registry, proposal_id, project_id=pctx.project_id)
+            if operation["state"] != "completed" or operation["kind"] != "planning_proposal" or operation["change_id"] != pctx.change_id:
+                raise PmError("operation_not_ready", "planning proposal is not complete", status=409)
+            if operation["expected_revision"] != pctx.expected_revision:
+                raise PmError("revision_conflict", "planning proposal targets another revision", status=409)
+            proposed = operation["result"] or {}
+            if payload.get("proposal_digest") != proposed.get("proposal_digest"):
+                raise PmError("confirmation_mismatch", "planning proposal confirmation is stale", status=409)
+            proposals = proposed.get("proposals")
+            if not isinstance(proposals, list) or not proposals:
+                raise PmError("operation_not_ready", "planning result has no mutable proposal", status=409)
+            reserved_ids = proposed.get("reserved_ids") or {}
+            _assert_planning_reservations(
+                pmapp.repository.registry, proposal_id, reserved_ids
+            )
+            sources: dict[str, str] = {}
+            for item in proposals:
+                document_id = str(item.get("document_id") or "")
+                document = pmapp.repository.get_document(pctx, document_id, owner=request_owner)
+                if document.content_hash != item.get("base_document_hash"):
+                    raise PmError("proposal_conflict", "proposal base document changed", status=409)
+                sources[document_id] = _apply_unified_diff(document.source, str(item.get("proposal_patch") or ""))
+            result = pmapp.repository.patch_documents(
+                pctx, sources, authorized_ids=tuple(reserved_ids.values()), owner=request_owner
+            )
+            pmapp.repository.registry._connect().execute(
+                "UPDATE pm_planning_reserved_ids SET state='ACTIVE' WHERE operation_id=? AND state='RESERVED'",
+                (proposal_id,),
+            )
+            return web.json_response(result.as_json())
+
+        return await run_service(execute, pctx)
 
     async def get_operation(request: web.Request):
         return web.json_response(_operation(service().repository.registry, request.match_info["operation_id"], project_id=host_project_id()))
@@ -957,35 +1043,44 @@ def register_pm_routes(app: web.Application, ctx: Any, orchestrator: Any) -> Non
     async def archive_preview(request: web.Request):
         payload = await body(request)
         pctx = context(payload, request, revision=True)
-        preview = service().preview_archive(pctx, owner(request))
-        archive_id = uuid.uuid4().hex
-        archive_root = storage_root("archives")
-        archive_root.mkdir(parents=True, exist_ok=True)
-        (archive_root / f"{archive_id}.json").write_text(json.dumps({**preview, "owner": owner(request)}, sort_keys=True), encoding="utf-8")
-        return web.json_response({"archive_id": archive_id, **preview})
+        request_owner = owner(request)
+        def execute(pmapp: PmApplication):
+            preview = pmapp.preview_archive(pctx, request_owner)
+            archive_id = uuid.uuid4().hex
+            archive_root = storage_root("archives")
+            archive_root.mkdir(parents=True, exist_ok=True)
+            (archive_root / f"{archive_id}.json").write_text(json.dumps({**preview, "owner": request_owner}, sort_keys=True), encoding="utf-8")
+            return web.json_response({"archive_id": archive_id, **preview})
+
+        return await run_service(execute, pctx)
 
     async def archive_apply(request: web.Request):
         payload = await body(request)
         pctx = context(payload, request, revision=True, operation=True)
-        archive_id = request.match_info["archive_id"]
-        archive_root = storage_root("archives")
-        path = archive_root / f"{archive_id}.json"
-        if not re.fullmatch(r"[0-9a-f]{32}", archive_id) or not path.exists():
-            raise PmError("archive_not_found", "archive preview is unavailable", status=404)
-        stored = json.loads(path.read_text(encoding="utf-8"))
-        if stored.get("owner") != owner(request):
-            raise PmError("archive_not_found", "archive preview belongs to another owner", status=404)
-        if payload.get("confirmation_token") != stored.get("confirmation_token"):
-            raise PmError("confirmation_mismatch", "archive confirmation does not match", status=409)
-        candidate = ArchiveCandidate(**{**stored["candidate"], "source_paths": tuple(stored["candidate"]["source_paths"]), "target_paths": tuple(stored["candidate"]["target_paths"]), "findings": tuple(PmFinding(**item) for item in stored["candidate"].get("findings", []))})
-        result = service().apply_archive(pctx, owner(request), candidate, str(payload.get("confirmation_token") or ""))
-        return web.json_response(_json(result), status=201)
+        request_owner = owner(request)
+        request_match_info = dict(request.match_info)
+        def execute(pmapp: PmApplication):
+            archive_id = request_match_info["archive_id"]
+            archive_root = storage_root("archives")
+            path = archive_root / f"{archive_id}.json"
+            if not re.fullmatch(r"[0-9a-f]{32}", archive_id) or not path.exists():
+                raise PmError("archive_not_found", "archive preview is unavailable", status=404)
+            stored = json.loads(path.read_text(encoding="utf-8"))
+            if stored.get("owner") != request_owner:
+                raise PmError("archive_not_found", "archive preview belongs to another owner", status=404)
+            if payload.get("confirmation_token") != stored.get("confirmation_token"):
+                raise PmError("confirmation_mismatch", "archive confirmation does not match", status=409)
+            candidate = ArchiveCandidate(**{**stored["candidate"], "source_paths": tuple(stored["candidate"]["source_paths"]), "target_paths": tuple(stored["candidate"]["target_paths"]), "findings": tuple(PmFinding(**item) for item in stored["candidate"].get("findings", []))})
+            result = pmapp.apply_archive(pctx, request_owner, candidate, str(payload.get("confirmation_token") or ""))
+            return web.json_response(_json(result), status=201)
+
+        return await run_service(execute, pctx)
 
     async def verify_task(request: web.Request):
         payload = await body(request)
         pctx = context(payload, request, operation=True)
         pmapp = service()
-        pmapp._require("handoff")
+        await run_service(lambda thread_application: thread_application._require("handoff"), pctx)
         cfg = ctx.config()
         registry_path = pmapp.repository.registry.path
         raw_inner = payload.get("payload")
@@ -1025,192 +1120,242 @@ def register_pm_routes(app: web.Application, ctx: Any, orchestrator: Any) -> Non
     async def manual_evidence_preview(request: web.Request):
         payload = await body(request)
         pctx = context(payload, request, revision=True)
-        change = service().repository.get_change(pctx, owner=owner(request))
-        require_current_revision(change, pctx)
-        preview = verification_service().preview_manual_evidence({
-            **payload, "change_id": pctx.change_id, "submitted_by": owner(request)
-        })
-        return web.json_response(_json(preview))
+        request_owner = owner(request)
+        def execute(pmapp: PmApplication):
+            change = pmapp.repository.get_change(pctx, owner=request_owner)
+            require_current_revision(change, pctx)
+            preview = verification_service(pmapp).preview_manual_evidence({
+                **payload, "change_id": pctx.change_id, "submitted_by": request_owner
+            })
+            return web.json_response(_json(preview))
+
+        return await run_service(execute, pctx)
 
     async def manual_evidence_confirm(request: web.Request):
         payload = await body(request)
         pctx = context(payload, request, revision=True, operation=True)
-        change = service().repository.get_change(pctx, owner=owner(request))
-        require_current_revision(change, pctx)
-        preview = verification_service().preview_manual_evidence({
-            **payload, "change_id": pctx.change_id, "submitted_by": owner(request)
-        })
-        receipt, created = verification_service().confirm_manual_evidence(
-            preview, str(payload.get("confirmation_token") or ""),
-            pctx.client_operation_id or "",
-        )
-        return web.json_response(_json(receipt), status=201 if created else 200)
+        request_owner = owner(request)
+        def execute(pmapp: PmApplication):
+            change = pmapp.repository.get_change(pctx, owner=request_owner)
+            require_current_revision(change, pctx)
+            preview = verification_service(pmapp).preview_manual_evidence({
+                **payload, "change_id": pctx.change_id, "submitted_by": request_owner
+            })
+            receipt, created = verification_service(pmapp).confirm_manual_evidence(
+                preview, str(payload.get("confirmation_token") or ""),
+                pctx.client_operation_id or "",
+            )
+            return web.json_response(_json(receipt), status=201 if created else 200)
+
+        return await run_service(execute, pctx)
 
     async def evidence_report(request: web.Request):
-        receipt_id = request.match_info["receipt_id"]
-        row = service().repository.registry.get_pm_manual_verification_receipt(receipt_id)
-        if row is None or not row.get("report_ref_json"):
-            raise PmError("evidence_not_found", "manual report is unavailable", status=404)
-        if request.query.get("project_id") != host_project_id() or str(row["project_id"]) != host_project_id():
-            raise PmError("wrong_project", "request project does not match", status=409)
-        report = json.loads(str(row["report_ref_json"]))
-        if report.get("ref_kind") != "git_blob":
-            raise PmError("evidence_not_found", "manual report is unavailable", status=404)
-        path = str(report.get("ref") or "")
-        commit = str(row["tested_commit"])
-        completed = subprocess.run(
-            ["git", "-C", str(ctx.config().workflow_path.parent), "show", f"{commit}:{path}"],
-            capture_output=True, check=False,
-        )
-        digest = "sha256:" + hashlib.sha256(completed.stdout).hexdigest()
-        if completed.returncode != 0 or digest != report.get("sha256"):
-            raise PmError("evidence_not_found", "manual report bytes are unavailable", status=404)
-        return web.Response(body=completed.stdout, content_type="application/octet-stream")
+        request_match_info = dict(request.match_info)
+        request_query = dict(request.query)
+        def execute(pmapp: PmApplication):
+            receipt_id = request_match_info["receipt_id"]
+            row = pmapp.repository.registry.get_pm_manual_verification_receipt(receipt_id)
+            if row is None or not row.get("report_ref_json"):
+                raise PmError("evidence_not_found", "manual report is unavailable", status=404)
+            if request_query.get("project_id") != pmapp.repository.project_id or str(row["project_id"]) != pmapp.repository.project_id:
+                raise PmError("wrong_project", "request project does not match", status=409)
+            report = json.loads(str(row["report_ref_json"]))
+            if report.get("ref_kind") != "git_blob":
+                raise PmError("evidence_not_found", "manual report is unavailable", status=404)
+            path = str(report.get("ref") or "")
+            commit = str(row["tested_commit"])
+            try:
+                completed = subprocess.run(
+                    ["git", "-C", str(pmapp.project_root), "show", f"{commit}:{path}"],
+                    capture_output=True, check=False, timeout=ctx.config().pm.operation_timeout_ms / 1000,
+                )
+            except (OSError, subprocess.TimeoutExpired) as exc:
+                raise PmError("evidence_not_found", "manual report bytes are unavailable", status=404) from exc
+            digest = "sha256:" + hashlib.sha256(completed.stdout).hexdigest()
+            if completed.returncode != 0 or digest != report.get("sha256"):
+                raise PmError("evidence_not_found", "manual report bytes are unavailable", status=404)
+            return web.Response(body=completed.stdout, content_type="application/octet-stream")
+
+        return await run_service(execute)
 
     async def managed_tickets(request: web.Request):
-        project_id = request.query.get("project_id", "")
-        if project_id != host_project_id():
-            raise PmError("wrong_project", "request project does not match", status=409)
-        change_id = request.match_info["change_id"]
-        registry = service().repository.registry
-        change = service().repository.get_change(PmRequestContext(project_id, change_id), owner=owner(request))
-        tickets = []
-        for item in registry.list_pm_managed_tickets(project_id):
-            if item.change_id != change_id:
-                continue
-            value = _json(item)
-            value["verified_commit"] = registry.get_verified_pm_commit(project_id, item.ticket_identifier)
-            value["acceptance"] = registry.get_active_pm_acceptance(project_id, item.ticket_identifier, item.task_revision)
-            value["required_procedure_ids"] = sorted(registry.get_pm_required_procedures(project_id, item.ticket_identifier))
-            required = registry.get_pm_required_procedures(project_id, item.ticket_identifier)
-            value["allowed_procedures"] = [
-                ({"procedure_id": procedure_id, "kind": "native", "definition_digest": definition}
-                 if isinstance(definition, str) else definition)
-                for procedure_id, definition in sorted(required.items())
-            ]
-            evidence_rows = [
-                ("native", dict(row))
-                for row in registry._connect().execute(
-                    "SELECT * FROM pm_verification_records WHERE project_id=? "
-                    "AND ticket_identifier=? AND task_revision=?",
-                    (project_id, item.ticket_identifier, item.task_revision),
-                ).fetchall()
-            ] + [
-                ("manual", dict(row))
-                for row in registry._connect().execute(
-                    "SELECT * FROM pm_manual_verification_records WHERE project_id=? "
-                    "AND ticket_identifier=? AND task_revision=?",
-                    (project_id, item.ticket_identifier, item.task_revision),
-                ).fetchall()
-            ]
-            evidence_rows.sort(
-                key=lambda value: (
-                    str(value[1].get("completed_at") or ""),
-                    str(value[1].get("receipt_id") or ""),
-                )
-            )
-            value["evidence"] = []
-            for provenance_kind, evidence in evidence_rows:
-                evidence["provenance_kind"] = provenance_kind
-                evidence["procedure_kind"] = str(
-                    evidence.get("procedure_kind") or "native"
-                )
-                evidence["definition_digest"] = str(
-                    evidence.get("definition_digest")
-                    or evidence.get("command_digest") or ""
-                )
-                evidence["test_provenance"] = (
-                    "manual_reported" if evidence.get("procedure_kind") == "manual"
-                    else "host_executed"
-                )
-                report_json = evidence.pop("report_ref_json", None)
-                evidence["report_ref"] = json.loads(report_json) if report_json else None
-                if isinstance(evidence["report_ref"], dict):
-                    evidence["report_ref"]["download_url"] = (
-                        f"/api/v1/pm/evidence/{evidence['receipt_id']}/report"
+        request_owner = owner(request)
+        request_match_info = dict(request.match_info)
+        request_query = dict(request.query)
+        pctx = PmRequestContext(request_query.get("project_id", ""), request_match_info["change_id"])
+        def execute(pmapp: PmApplication):
+            project_id = request_query.get("project_id", "")
+            if project_id != pmapp.repository.project_id:
+                raise PmError("wrong_project", "request project does not match", status=409)
+            change_id = request_match_info["change_id"]
+            registry = pmapp.repository.registry
+            change = pmapp.repository.get_change(PmRequestContext(project_id, change_id), owner=request_owner)
+            tickets = []
+            for item in registry.list_pm_managed_tickets(project_id):
+                if item.change_id != change_id:
+                    continue
+                value = _json(item)
+                value["verified_commit"] = registry.get_verified_pm_commit(project_id, item.ticket_identifier)
+                value["acceptance"] = registry.get_active_pm_acceptance(project_id, item.ticket_identifier, item.task_revision)
+                value["required_procedure_ids"] = sorted(registry.get_pm_required_procedures(project_id, item.ticket_identifier))
+                required = registry.get_pm_required_procedures(project_id, item.ticket_identifier)
+                value["allowed_procedures"] = [
+                    ({"procedure_id": procedure_id, "kind": "native", "definition_digest": definition}
+                     if isinstance(definition, str) else definition)
+                    for procedure_id, definition in sorted(required.items())
+                ]
+                evidence_rows = [
+                    ("native", dict(row))
+                    for row in registry._connect().execute(
+                        "SELECT * FROM pm_verification_records WHERE project_id=? "
+                        "AND ticket_identifier=? AND task_revision=?",
+                        (project_id, item.ticket_identifier, item.task_revision),
+                    ).fetchall()
+                ] + [
+                    ("manual", dict(row))
+                    for row in registry._connect().execute(
+                        "SELECT * FROM pm_manual_verification_records WHERE project_id=? "
+                        "AND ticket_identifier=? AND task_revision=?",
+                        (project_id, item.ticket_identifier, item.task_revision),
+                    ).fetchall()
+                ]
+                evidence_rows.sort(
+                    key=lambda value: (
+                        str(value[1].get("completed_at") or ""),
+                        str(value[1].get("receipt_id") or ""),
                     )
-                evidence["artifact_refs"] = json.loads(
-                    evidence.pop("artifact_refs_json", "[]") or "[]"
                 )
-                evidence.pop("input_hash", None)
-                value["evidence"].append(evidence)
-            value.update(_ticket_code_evidence(
-                registry, project_id, item.ticket_identifier, item.task_revision,
-                change.base_git_sha, _successful_terminal_states(ctx.config()),
-            ))
-            tickets.append(value)
-        return web.json_response({"tickets": _json(tickets)})
+                value["evidence"] = []
+                for provenance_kind, evidence in evidence_rows:
+                    evidence["provenance_kind"] = provenance_kind
+                    evidence["procedure_kind"] = str(
+                        evidence.get("procedure_kind") or "native"
+                    )
+                    evidence["definition_digest"] = str(
+                        evidence.get("definition_digest")
+                        or evidence.get("command_digest") or ""
+                    )
+                    evidence["test_provenance"] = (
+                        "manual_reported" if evidence.get("procedure_kind") == "manual"
+                        else "host_executed"
+                    )
+                    report_json = evidence.pop("report_ref_json", None)
+                    evidence["report_ref"] = json.loads(report_json) if report_json else None
+                    if isinstance(evidence["report_ref"], dict):
+                        evidence["report_ref"]["download_url"] = (
+                            f"/api/v1/pm/evidence/{evidence['receipt_id']}/report"
+                        )
+                    evidence["artifact_refs"] = json.loads(
+                        evidence.pop("artifact_refs_json", "[]") or "[]"
+                    )
+                    evidence.pop("input_hash", None)
+                    value["evidence"].append(evidence)
+                value.update(_ticket_code_evidence(
+                    registry, project_id, item.ticket_identifier, item.task_revision,
+                    change.base_git_sha, _successful_terminal_states(ctx.config()),
+                ))
+                tickets.append(value)
+            return web.json_response({"tickets": _json(tickets)})
+
+        return await run_service(execute, pctx)
 
     async def coverage_report(request: web.Request):
-        project_id = request.query.get("project_id", "")
-        revision = request.query.get("revision", "")
-        change_id = request.match_info["change_id"]
-        change = service().repository.get_change(PmRequestContext(project_id, change_id), owner=owner(request))
-        if revision and revision != change.revision:
-            raise PmError("revision_conflict", "coverage revision is stale", status=409)
-        tasks = service().repository.get_wbs(PmRequestContext(project_id, change_id), owner=owner(request)).tasks
-        return web.json_response(_json(PmCoverageService(
-            service().repository.registry,
-            successful_terminal_states=tuple(ctx.config().tracker.terminal_states),
-        ).build(change, tasks)))
+        request_owner = owner(request)
+        request_match_info = dict(request.match_info)
+        request_query = dict(request.query)
+        pctx = PmRequestContext(request_query.get("project_id", ""), request_match_info["change_id"])
+        def execute(pmapp: PmApplication):
+            project_id = request_query.get("project_id", "")
+            revision = request_query.get("revision", "")
+            change_id = request_match_info["change_id"]
+            change = pmapp.repository.get_change(PmRequestContext(project_id, change_id), owner=request_owner)
+            if revision and revision != change.revision:
+                raise PmError("revision_conflict", "coverage revision is stale", status=409)
+            tasks = pmapp.repository.get_wbs(PmRequestContext(project_id, change_id), owner=request_owner).tasks
+            return web.json_response(_json(PmCoverageService(
+                pmapp.repository.registry,
+                successful_terminal_states=tuple(ctx.config().tracker.terminal_states),
+            ).build(change, tasks)))
+
+        return await run_service(execute, pctx)
 
     async def waiver_preview(request: web.Request):
         payload = await body(request)
         pctx = context(payload, request, revision=True)
-        change = service().repository.get_change(pctx, owner=owner(request))
-        require_current_revision(change, pctx)
-        result = PmCoverageService(service().repository.registry).waiver_preview(
-            change, str(payload.get("semantic_id") or ""), str(payload.get("reason") or ""),
-            str(payload.get("reviewer_label") or owner(request)),
-        )
-        return web.json_response(result)
+        request_owner = owner(request)
+        def execute(pmapp: PmApplication):
+            change = pmapp.repository.get_change(pctx, owner=request_owner)
+            require_current_revision(change, pctx)
+            result = PmCoverageService(pmapp.repository.registry).waiver_preview(
+                change, str(payload.get("semantic_id") or ""), str(payload.get("reason") or ""),
+                str(payload.get("reviewer_label") or request_owner),
+            )
+            return web.json_response(result)
+
+        return await run_service(execute, pctx)
 
     async def waiver_create(request: web.Request):
         payload = await body(request)
         pctx = context(payload, request, revision=True, operation=True)
-        change = service().repository.get_change(pctx, owner=owner(request))
-        require_current_revision(change, pctx)
-        coverage = PmCoverageService(service().repository.registry)
-        preview = coverage.waiver_preview(
-            change, str(payload.get("semantic_id") or ""), str(payload.get("reason") or ""),
-            str(payload.get("reviewer_label") or owner(request)),
-        )
-        row, created = coverage.create_waiver(
-            preview, str(payload.get("confirmation_token") or ""), pctx.client_operation_id or ""
-        )
-        return web.json_response(_json(row), status=201 if created else 200)
+        request_owner = owner(request)
+        def execute(pmapp: PmApplication):
+            change = pmapp.repository.get_change(pctx, owner=request_owner)
+            require_current_revision(change, pctx)
+            coverage = PmCoverageService(pmapp.repository.registry)
+            preview = coverage.waiver_preview(
+                change, str(payload.get("semantic_id") or ""), str(payload.get("reason") or ""),
+                str(payload.get("reviewer_label") or request_owner),
+            )
+            row, created = coverage.create_waiver(
+                preview, str(payload.get("confirmation_token") or ""), pctx.client_operation_id or ""
+            )
+            return web.json_response(_json(row), status=201 if created else 200)
+
+        return await run_service(execute, pctx)
 
     async def waiver_revoke(request: web.Request):
         payload = await body(request)
         pctx = context(payload, request, revision=True, operation=True)
-        change = service().repository.get_change(pctx, owner=owner(request))
-        require_current_revision(change, pctx)
-        try:
-            result = service().repository.registry.revoke_pm_coverage_waiver(
-                request.match_info["waiver_id"], project_id=pctx.project_id,
-                change_id=pctx.change_id, revision=change.revision,
-                operation_id=pctx.client_operation_id or "",
-                reviewer=str(payload.get("reviewer_label") or owner(request)),
-                reason=str(payload.get("reason") or "revoked"),
-                revoked_at=datetime.now(timezone.utc).isoformat(),
-            )
-        except ValueError as exc:
-            raise PmError("operation_conflict", str(exc), status=409) from exc
-        if result is None:
-            raise PmError("waiver_not_found", "coverage waiver is unknown", status=404)
-        row, _created = result
-        return web.json_response(_json(row))
+        request_owner = owner(request)
+        request_match_info = dict(request.match_info)
+        def execute(pmapp: PmApplication):
+            change = pmapp.repository.get_change(pctx, owner=request_owner)
+            require_current_revision(change, pctx)
+            try:
+                result = pmapp.repository.registry.revoke_pm_coverage_waiver(
+                    request_match_info["waiver_id"], project_id=pctx.project_id,
+                    change_id=pctx.change_id, revision=change.revision,
+                    operation_id=pctx.client_operation_id or "",
+                    reviewer=str(payload.get("reviewer_label") or request_owner),
+                    reason=str(payload.get("reason") or "revoked"),
+                    revoked_at=datetime.now(timezone.utc).isoformat(),
+                )
+            except ValueError as exc:
+                raise PmError("operation_conflict", str(exc), status=409) from exc
+            if result is None:
+                raise PmError("waiver_not_found", "coverage waiver is unknown", status=404)
+            row, _created = result
+            return web.json_response(_json(row))
+
+        return await run_service(execute, pctx)
 
     async def acceptance_preview(request: web.Request):
-        project_id = request.query.get("project_id", "")
-        if project_id != host_project_id():
+        if request.query.get("project_id", "") != host_project_id():
             raise PmError("wrong_project", "request project does not match", status=409)
-        preview = verification_service().preview_acceptance(
-            project_id=project_id, ticket_identifier=request.match_info["ticket_identifier"],
-            task_revision=request.query.get("task_revision", ""),
-            tested_commit=request.query.get("tested_commit", ""),
-        )
-        return web.json_response(_json(preview))
+        request_match_info = dict(request.match_info)
+        request_query = dict(request.query)
+        def execute(pmapp: PmApplication):
+            project_id = request_query.get("project_id", "")
+            if project_id != pmapp.repository.project_id:
+                raise PmError("wrong_project", "request project does not match", status=409)
+            preview = verification_service(pmapp).preview_acceptance(
+                project_id=project_id, ticket_identifier=request_match_info["ticket_identifier"],
+                task_revision=request_query.get("task_revision", ""),
+                tested_commit=request_query.get("tested_commit", ""),
+            )
+            return web.json_response(_json(preview))
+
+        return await run_service(execute)
 
     async def accept_verification(request: web.Request):
         payload = await body(request)
@@ -1302,6 +1447,35 @@ def register_pm_routes(app: web.Application, ctx: Any, orchestrator: Any) -> Non
     app.router.add_get("/api/v1/pm/exports/{export_id}/file", wrap(get_export))
     app.router.add_post("/api/v1/pm/changes/{change_id}/imports/preview", wrap(preview_import))
     app.router.add_post("/api/v1/pm/changes/{change_id}/imports/{import_id}/apply", wrap(apply_import))
+
+
+def _with_thread_application(
+    application: PmApplication, work: Callable[[PmApplication], _T],
+    pctx: PmRequestContext | None = None,
+) -> _T:
+    """Run a complete synchronous transaction with thread-owned PM services."""
+    def execute(repository: PmDocumentRepository) -> _T:
+        registry = repository.registry
+        approval = PmApprovalService(
+            repository, registry, application.approval.external_validator,
+            verification_procedures=application.approval.verification_procedures,
+            manual_verification_procedures=application.approval.manual_verification_procedures,
+        )
+        handoff = PmHandoffService(
+            repository, registry, application.handoff.tracker,
+            target_state=application.handoff.target_state,
+            park_state=application.handoff.park_state,
+        )
+        thread_application = PmApplication(
+            repository, approval, handoff, application.openspec, application.exchange,
+            project_root=application.project_root, flags=application.flags,
+            archive_journal_root=application.archive_journal_root,
+            development_verification=application.development_verification,
+            demo=application.demo,
+        )
+        with change_authority_lock(registry, pctx.project_id, pctx.change_id) if pctx else nullcontext():
+            return work(thread_application)
+    return _with_thread_repository(application.repository, execute)
 
 
 def _with_thread_repository(

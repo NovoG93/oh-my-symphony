@@ -1078,3 +1078,90 @@ def test_archive_recovery_refuses_an_aliased_change_directory(tmp_path: Path) ->
     assert (changes / "internal-alias").is_dir()
     record = env.repo.registry.get_pm_workspace("p1", env.change_id)
     assert record is not None and record.state == "ACTIVE"
+
+
+def archive_recovery_fixture(tmp_path):
+    target = tmp_path / "openspec/changes/archive/2026-10-14-demo"
+    target.mkdir(parents=True)
+    (target / "proposal.md").write_text("archived")
+    baseline = "requirements/spec.md"
+    text = "recovered baseline\n"
+    candidate = ArchiveCandidate("p1", "c1", "r1", str(tmp_path), (str(tmp_path / "openspec/changes/demo/proposal.md"),), (str(target),))
+    record = {"state": "RECONCILE", "baseline_before": {}, "expected_archive": {
+        "baseline_files": {baseline: text}, "baseline_manifest": {baseline: "sha256:" + hashlib.sha256(text.encode()).hexdigest()},
+        "archive_manifest": application_module._file_manifest(target),
+    }}
+    return target, candidate, record
+
+
+def test_R32_05_archive_recovery_fsyncs_temporary_file(tmp_path, monkeypatch):
+    target, candidate, record = archive_recovery_fixture(tmp_path)
+    calls = []
+    monkeypatch.setattr(application_module.os, "fsync", lambda fd: calls.append(fd))
+    assert application_module._roll_archive_forward(tmp_path, target, candidate, record)
+    print("RECOVERY_FSYNC_CALLS", calls)
+    assert calls
+
+
+def test_R32_05_archive_recovery_cleans_failed_temporary_file(tmp_path, monkeypatch):
+    target, candidate, record = archive_recovery_fixture(tmp_path)
+    def fail_replace(*_args):
+        raise OSError("injected replace failure")
+    monkeypatch.setattr(application_module.os, "replace", fail_replace)
+    with pytest.raises(OSError, match="injected replace"):
+        application_module._roll_archive_forward(tmp_path, target, candidate, record)
+    leftovers = list(tmp_path.glob("openspec/specs/requirements/.spec.md.*"))
+    print("RECOVERY_LEFTOVERS", [str(p.relative_to(tmp_path)) for p in leftovers])
+    assert not leftovers
+
+
+
+def test_actual_archive_transaction_waits_for_complete_snapshot_and_retains_history(tmp_path, monkeypatch):
+    import threading
+    import symphony.pm.documents as documents
+    from symphony.pm.routes import _read_change_snapshot, _with_thread_application
+
+    env, candidate, token = _archive_env(tmp_path)
+    ready, resume, archived, archive_started = (threading.Event() for _ in range(4))
+    original = documents._resolve_change_root
+    outcomes = {}
+    def pause_snapshot(*args, **kwargs):
+        result = original(*args, **kwargs)
+        if threading.current_thread().name == "archive-snapshot":
+            ready.set()
+            assert resume.wait(2)
+        return result
+    def read():
+        try:
+            outcomes["before"] = _read_change_snapshot(env.repo, PmRequestContext("p1", env.change_id), "owner")
+        except BaseException as exc:
+            outcomes["reader_error"] = exc
+    def archive():
+        archive_started.set()
+        try:
+            outcomes["result"] = _with_thread_application(env.application, lambda app: app.apply_archive(env.ctx, "owner", candidate, token), env.ctx)
+            archived.set()
+        except BaseException as exc:
+            outcomes["archive_error"] = exc
+    monkeypatch.setattr(documents, "_resolve_change_root", pause_snapshot)
+    reader = threading.Thread(target=read, name="archive-snapshot")
+    writer = threading.Thread(target=archive)
+    reader.start()
+    assert ready.wait(2)
+    writer.start()
+    try:
+        assert archive_started.wait(2)
+        assert not archived.wait(.1), "archive changed files during an active snapshot"
+    finally:
+        resume.set()
+        reader.join(3)
+        writer.join(3)
+    assert not reader.is_alive() and not writer.is_alive()
+    assert "reader_error" not in outcomes and "archive_error" not in outcomes, outcomes
+    assert outcomes["before"].state == "Approved"
+    assert archived.is_set()
+    after = _read_change_snapshot(env.repo, PmRequestContext("p1", env.change_id), "owner")
+    assert after.state == "Archived" and after.revision == outcomes["before"].revision
+    assert all(not item.editable for item in after.documents)
+    _assert_archive_tickets_not_runnable(env)
+    env.repo.registry.close()
