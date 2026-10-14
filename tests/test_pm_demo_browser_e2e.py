@@ -559,6 +559,237 @@ def _inspect_fixture_guides(page, lang, matched, tmp_path):
         page.unroute(pattern, presentation)
 
 
+def test_installed_demo_delayed_bootstrap_401_preserves_token_input(tmp_path, installed_python, chrome):
+    """Deliver a real bootstrap 401 after typing, before submitting the token."""
+    from playwright.sync_api import expect
+    directory = tmp_path / "demo"
+    token = "pm-demo-browser-token"
+    argv = [str(installed_python.parent / "symphony"), "pm", "demo", "--path", str(directory), "--lang", "en"]
+    pending = []
+
+    def hold_projects(route):
+        response = route.fetch()
+        assert response.status == 401
+        assert "authorization" not in route.request.headers
+        pending.append((route, response))
+
+    with _server(argv, tmp_path, _environment(tmp_path, SYMPHONY_API_TOKEN=token)) as (_, url), _page(chrome) as (page, _):
+        page.route("**/api/v1/projects", hold_projects)
+        with page.expect_response(lambda response: response.url.endswith("/board") and response.status == 401) as initial:
+            page.goto(url.split("#")[0] + "#/board")
+        initial.value.finished()
+        banner = page.locator(".api-token-banner")
+        expect(banner).to_be_visible()
+        field = banner.get_by_label("API token", exact=True)
+        field.fill(token)
+        field.focus()
+        original = field.element_handle()
+        assert len(pending) == 1
+        route, actual = pending.pop()
+        with page.expect_response(lambda response: response.url.endswith("/projects") and response.status == 401) as delayed:
+            route.fulfill(response=actual)
+        delayed.value.finished()
+        assert delayed.value.body() == actual.body()
+        # Flush the completed response's render callbacks before checking preservation.
+        page.evaluate("() => new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve)))")
+        expect(field).to_have_value(token)
+        assert field.evaluate("(node, original) => node === original", original)
+        expect(field).to_be_focused()
+        assert page.evaluate("sessionStorage.getItem('symphony.apiToken')") is None
+        with page.expect_response(lambda response: response.url.endswith("/board") and response.status == 200) as connected:
+            banner.get_by_role("button", name="Connect", exact=True).click()
+        assert connected.value.request.headers["authorization"] == f"Bearer {token}"
+        expect(banner).to_have_count(0)
+        assert page.evaluate("sessionStorage.getItem('symphony.apiToken')") == token
+        assert _runs(directory) == 0
+
+
+def test_installed_demo_invalid_token_is_rejected_then_valid_token_connects(tmp_path, installed_python, chrome):
+    """A submitted wrong token still gets a real 401 and clears tab storage."""
+    from playwright.sync_api import expect
+    directory = tmp_path / "demo"
+    token = "pm-demo-browser-token"
+    wrong = "pm-demo-wrong-token"
+    argv = [str(installed_python.parent / "symphony"), "pm", "demo", "--path", str(directory), "--lang", "en"]
+    with _server(argv, tmp_path, _environment(tmp_path, SYMPHONY_API_TOKEN=token)) as (_, url), _page(chrome) as (page, _):
+        with page.expect_response(lambda response: response.url.endswith("/projects") and response.status == 401) as projects, page.expect_response(lambda response: response.url.endswith("/board") and response.status == 401) as initial:
+            page.goto(url.split("#")[0] + "#/board")
+        projects.value.finished()
+        initial.value.finished()
+        page.evaluate("() => new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve)))")
+        banner = page.locator(".api-token-banner")
+        expect(banner).to_be_visible()
+        field = banner.get_by_label("API token", exact=True)
+        field.fill(wrong)
+        original = field.element_handle()
+        with page.expect_response(lambda response: response.url.endswith("/board") and response.status == 401 and response.request.headers.get("authorization") == f"Bearer {wrong}") as rejected:
+            banner.get_by_role("button", name="Connect", exact=True).click()
+        rejected.value.finished()
+        expect(banner).to_contain_text("The stored token was rejected — enter it again.")
+        expect(field).to_have_value("")
+        assert field.evaluate("(node, original) => node !== original", original)
+        expect(field).to_be_focused()
+        assert page.evaluate("sessionStorage.getItem('symphony.apiToken')") is None
+        field.fill(token)
+        with page.expect_response(lambda response: response.url.endswith("/board") and response.status == 200) as connected:
+            field.press("Enter")
+        assert connected.value.request.headers["authorization"] == f"Bearer {token}"
+        expect(banner).to_have_count(0)
+        assert page.evaluate("sessionStorage.getItem('symphony.apiToken')") == token
+        assert _runs(directory) == 0
+
+
+def test_installed_demo_late_bootstrap_401_keeps_connected_token(tmp_path, installed_python, chrome):
+    """The actual pre-Connect projects 401 must not reject a newer valid token."""
+    from playwright.sync_api import expect
+    directory = tmp_path / "demo"
+    token = "pm-demo-browser-token"
+    pending = []
+    argv = [str(installed_python.parent / "symphony"), "pm", "demo", "--path", str(directory), "--lang", "en"]
+
+    def hold_projects(route):
+        response = route.fetch()
+        assert response.status == 401 and "authorization" not in route.request.headers
+        pending.append((route, response))
+
+    with _server(argv, tmp_path, _environment(tmp_path, SYMPHONY_API_TOKEN=token)) as (_, url), _page(chrome) as (page, _):
+        page.route("**/api/v1/projects", hold_projects)
+        page.goto(url.split("#")[0] + "#/board")
+        banner = page.locator(".api-token-banner")
+        expect(banner).to_be_visible()
+        banner.get_by_label("API token", exact=True).fill(token)
+        assert len(pending) == 1
+        with page.expect_response(lambda response: response.url.endswith("/board") and response.status == 200) as connected:
+            banner.get_by_role("button", name="Connect", exact=True).click()
+        connected.value.finished()
+        assert connected.value.request.headers["authorization"] == f"Bearer {token}"
+        expect(banner).to_have_count(0)
+        assert page.evaluate("sessionStorage.getItem('symphony.apiToken')") == token
+        route, actual = pending.pop()
+        with page.expect_response(lambda response: response.url.endswith("/projects") and response.status == 401) as delayed:
+            route.fulfill(response=actual)
+        delayed.value.finished()
+        assert delayed.value.body() == actual.body()
+        page.evaluate("() => new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve)))")
+        assert page.evaluate("sessionStorage.getItem('symphony.apiToken')") == token
+        expect(banner).to_have_count(0)
+        assert _runs(directory) == 0
+
+
+@pytest.mark.parametrize("caller", ["apiRequest", "downloadRunDiagnostic", "authenticatedDownload"])
+@pytest.mark.parametrize("credential", ["unauthenticated", "old-token", "current-token"])
+def test_installed_demo_401_is_bound_to_request_auth(tmp_path, installed_python, chrome, caller, credential):
+    """Bounded auth UI: real 401s, with controlled tab tokens and run presentation."""
+    import json
+    from playwright.sync_api import expect
+    directory = tmp_path / "demo"
+    valid = "pm-demo-valid-token-B"
+    expired = "pm-demo-expired-token-A"
+    request_token = None if credential == "unauthenticated" else expired
+    run_id = "a" * 32
+    pending = []
+    downloads = []
+    events = []
+    argv = [str(installed_python.parent / "symphony"), "pm", "demo", "--path", str(directory), "--lang", "en"]
+
+    def set_request_token(page):
+        page.evaluate("token => { if (token) sessionStorage.setItem('symphony.apiToken', token); else sessionStorage.removeItem('symphony.apiToken'); }", request_token)
+        events.append({"fixture_storage": "absent" if request_token is None else "expired-A"})
+
+    def hold_failure(route):
+        response = route.fetch()
+        assert response.status == 401
+        assert route.request.headers.get("authorization") == (f"Bearer {request_token}" if request_token else None)
+        assert response.json()["error"] == {"code": "unauthorized", "message": "missing or invalid bearer token"}
+        pending.append((route, response))
+        events.append({"actual_request": urlparse(route.request.url).path, "status": response.status, "request_credential": credential})
+        page.evaluate("window.__authHeld401 = true")
+
+    with _server(argv, tmp_path, _environment(tmp_path, SYMPHONY_API_TOKEN=valid)) as (_, url), _page(chrome) as (page, _):
+        # Controlled fixture credentials; no alternate product token cache or hook.
+        page.add_init_script("sessionStorage.setItem('symphony.apiToken', 'pm-demo-valid-token-B'); window.__authBlobCalls = 0; const originalBlobURL = URL.createObjectURL; URL.createObjectURL = function(...args) { window.__authBlobCalls++; return originalBlobURL.apply(this, args); };")
+        page.on("download", lambda download: downloads.append(download.suggested_filename))
+        if caller == "downloadRunDiagnostic":
+            # Read-only run presentation exposes the real diagnostic button; no run exists.
+            run = {"run_id": run_id, "identifier": "AUTH-FIXTURE", "title": "Auth UI presentation only", "status": "failed"}
+
+            def present_runs(route):
+                response = route.fetch()
+                assert response.status == 200
+                body = response.json()
+                body["runs"] = [run]
+                route.fulfill(response=response, json=body)
+
+            page.route("**/api/v1/runs?*", present_runs)
+            page.route(f"**/api/v1/runs/{run_id}", lambda route: route.fulfill(json={"run": run, "events": []}))
+        with page.expect_response(lambda response: response.url.endswith("/board") and response.status == 200) as initial:
+            page.goto(url.split("#")[0] + ("#/artifacts" if caller == "authenticatedDownload" else "#/runs"))
+        initial.value.finished()
+        assert initial.value.request.headers["authorization"] == f"Bearer {valid}"
+        if caller == "authenticatedDownload":
+            _tab(page, "plan", "en")
+            page.get_by_label("Export format", exact=True).select_option("markdown")
+            pattern = "**/api/v1/pm/exports/*/file"
+            page.route(pattern, hold_failure)
+
+            def export_then_change_credential(route):
+                response = route.fetch()
+                assert response.status == 201
+                assert route.request.headers["authorization"] == f"Bearer {valid}"
+                events.append({"actual_export_metadata_status": response.status})
+                set_request_token(page)
+                route.fulfill(response=response)
+
+            page.route("**/api/v1/pm/changes/*/exports", export_then_change_credential)
+            action = _button(page, "Download export", "en")
+        else:
+            action = page.get_by_role("button", name="Download diagnostic JSON" if caller == "downloadRunDiagnostic" else "Refresh", exact=True)
+            expect(action).to_be_visible()
+            if caller == "apiRequest":
+                expect(page.locator("#run-attempt-list .empty-state")).to_be_visible()
+            pattern = f"**/api/v1/runs/{run_id}/diagnostic" if caller == "downloadRunDiagnostic" else "**/api/v1/runs?*"
+            page.route(pattern, hold_failure)
+            set_request_token(page)
+        with page.expect_request(pattern):
+            action.click()
+        page.wait_for_function("window.__authHeld401 === true")
+        assert len(pending) == 1
+        if credential != "current-token":
+            # New B is accepted by the actual browser/server before delivering old 401.
+            with page.expect_response(lambda response: response.url.endswith("/board") and response.status == 200) as restored:
+                assert page.evaluate("async token => { sessionStorage.setItem('symphony.apiToken', token); return (await fetch('/api/v1/board', {headers: {Authorization: `Bearer ${token}`}})).status; }", valid) == 200
+            assert restored.value.request.headers["authorization"] == f"Bearer {valid}"
+            events.append({"replacement_board_status": restored.value.status, "fixture_storage": "valid-B", "expected_B_header": True})
+        else:
+            assert page.evaluate("sessionStorage.getItem('symphony.apiToken')") == expired
+        route, actual = pending.pop()
+        with page.expect_response(pattern) as rejected:
+            route.fulfill(response=actual)
+        rejected.value.finished()
+        assert rejected.value.status == 401 and rejected.value.body() == actual.body()
+        page.evaluate("() => new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve)))")
+        if caller == "apiRequest":
+            expect(page.locator("#run-attempt-list")).to_contain_text("missing or invalid bearer token")
+        elif caller == "downloadRunDiagnostic":
+            expect(page.get_by_text("missing or invalid bearer token", exact=True)).to_be_visible()
+        else:
+            expect(page.locator(".pm-action-error")).to_contain_text("download_failed: request failed (401)")
+        assert not downloads
+        assert page.evaluate("window.__authBlobCalls") == 0
+        stored = page.evaluate("sessionStorage.getItem('symphony.apiToken')")
+        banner = page.locator(".api-token-banner")
+        events.append({"actual_delivered_status": rejected.value.status, "body_unchanged": True, "stored_valid_B": stored == valid, "banner_count": banner.count(), "blob_calls": 0, "downloads": downloads})
+        (tmp_path / "auth-request-events.json").write_text(json.dumps(events, indent=2) + "\n")
+        if credential == "current-token":
+            assert stored is None
+            expect(banner).to_contain_text("The stored token was rejected — enter it again.")
+            expect(banner.get_by_label("API token", exact=True)).to_have_value("")
+        else:
+            assert stored == valid
+            expect(banner).to_have_count(0)
+        assert _runs(directory) == 0
+
+
 def test_ordinary_server_without_node_r15_context(tmp_path, installed_python, chrome):
     from playwright.sync_api import expect
     directory = tmp_path / "demo"

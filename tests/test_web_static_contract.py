@@ -315,7 +315,15 @@ def test_web_api_token_prompt_contract() -> None:
     assert "symphony.apiToken" in js
     assert "function withAuthHeaders(headers)" in js
     assert "Authorization: `Bearer ${token}`" in js
-    assert "if (res.status === 401) handleApiUnauthorized();" in js
+    assert "function handleApiUnauthorized(requestAuthorization)" in js
+    assert "if (requestAuthorization !== withAuthHeaders({}).Authorization) return;" in js
+    request = js.split("async function apiRequest(", 1)[1].split("const api =", 1)[0]
+    assert "headers: withAuthHeaders(headers)" in request
+    assert "if (res.status === 401) handleApiUnauthorized(init.headers.Authorization);" in request
+    diagnostic = js.split("downloadRunDiagnostic: async (runId)", 1)[1].split("putWorkflowStates:", 1)[0]
+    assert "const headers = withAuthHeaders({});" in diagnostic
+    assert "headers," in diagnostic
+    assert "if (res.status === 401) handleApiUnauthorized(headers.Authorization);" in diagnostic
     # WS handshake carries the token as a query parameter.
     assert "params.push(`token=${encodeURIComponent(token)}`)" in js
     # Dismissible inline prompt: password input + connect, i18n'd both ways.
@@ -336,7 +344,10 @@ def test_pm_artifact_downloads_use_authenticated_host_fetch() -> None:
     pm = (STATIC_ROOT / "pm" / "index.js").read_text(encoding="utf-8")
     assert "async function authenticatedDownload(path, filename)" in js
     assert "const target = String(path).startsWith(API_BASE) ? String(path) : `${API_BASE}${path}`" in js
-    assert "fetch(target, { headers: withAuthHeaders({}) })" in js
+    download = js.split("async function authenticatedDownload(path, filename)", 1)[1].split("function handleRouteChange()", 1)[0]
+    assert "const headers = withAuthHeaders({});" in download
+    assert "fetch(target, { headers })" in download
+    assert "if (response.status === 401) handleApiUnauthorized(headers.Authorization);" in download
     assert "downloadArtifact: (path, filename) => authenticatedDownload(path, filename)" in js
     assert "ui.downloadArtifact(`/issues/${encodeURIComponent(ticket.ticket_identifier)}/artifacts/" in pm
     assert "href: `/api/v1/issues/${encodeURIComponent(ticket.ticket_identifier)}/artifacts/" not in pm

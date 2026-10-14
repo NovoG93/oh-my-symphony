@@ -56,7 +56,9 @@
 
   let authBannerState = { open: false, dismissed: false };
 
-  function handleApiUnauthorized() {
+  function handleApiUnauthorized(requestAuthorization) {
+    // A late 401 must not reject a token saved after this request started.
+    if (requestAuthorization !== withAuthHeaders({}).Authorization) return;
     const hadToken = Boolean(storedApiToken());
     if (hadToken) {
       // The stored token was rejected — drop it so the next save is the
@@ -69,6 +71,8 @@
 
   function showApiTokenBanner(rejected) {
     let root = document.getElementById('api-token-banner-root');
+    // Another bootstrap 401 must keep the user's unsent input and focus.
+    if (root && authBannerState.open && !rejected) return;
     if (!root) {
       root = el('div', { id: 'api-token-banner-root' });
       const main = document.querySelector('.main');
@@ -163,7 +167,7 @@
       }
     }
     if (!res.ok) {
-      if (res.status === 401) handleApiUnauthorized();
+      if (res.status === 401) handleApiUnauthorized(init.headers.Authorization);
       const err = data && data.error;
       throw new ApiError(
         (err && err.message) || t('api.requestFailed', { status: res.status }),
@@ -202,11 +206,12 @@
     },
     getRunDetail: (runId) => apiRequest(`/runs/${encodeURIComponent(runId)}`),
     downloadRunDiagnostic: async (runId) => {
+      const headers = withAuthHeaders({});
       const res = await fetch(`${API_BASE}/runs/${encodeURIComponent(runId)}/diagnostic`, {
-        headers: withAuthHeaders({}),
+        headers,
       });
       if (!res.ok) {
-        if (res.status === 401) handleApiUnauthorized();
+        if (res.status === 401) handleApiUnauthorized(headers.Authorization);
         let message = t('api.requestFailed', { status: res.status });
         try {
           const payload = await res.json();
@@ -1244,9 +1249,10 @@
 
   async function authenticatedDownload(path, filename) {
     const target = String(path).startsWith(API_BASE) ? String(path) : `${API_BASE}${path}`;
-    const response = await fetch(target, { headers: withAuthHeaders({}) });
+    const headers = withAuthHeaders({});
+    const response = await fetch(target, { headers });
     if (!response.ok) {
-      if (response.status === 401) handleApiUnauthorized();
+      if (response.status === 401) handleApiUnauthorized(headers.Authorization);
       throw new ApiError(t('api.requestFailed', { status: response.status }), 'download_failed', response.status);
     }
     const blob = await response.blob();
