@@ -433,7 +433,7 @@ function storageStub() {
   return { getItem: (key) => values.get(key) ?? null, setItem: (key, value) => values.set(key, String(value)), removeItem: (key) => values.delete(key) };
 }
 
-async function mountedPm(t, { tab = 'idea', view = '', demo = false, language = 'en', hostTools = {}, gated = false, archived = false, development = false, demoAssistance = false, dirtyChanges = [], apiRequest = null, draft = null } = {}) {
+async function mountedPm(t, { tab = 'idea', view = '', demo = false, language = 'en', hostTools = {}, gated = false, archived = false, development = false, demoAssistance = false, dirtyChanges = [], apiRequest = null, draft = null, announcements = [] } = {}) {
   const el = (tag, attrs, children) => {
     const node = new UiNode(tag);
     for (const [key, value] of Object.entries(attrs || {})) if (value !== null && value !== undefined && value !== false) node.setAttribute(key, typeof value === 'boolean' ? '' : value);
@@ -474,7 +474,7 @@ async function mountedPm(t, { tab = 'idea', view = '', demo = false, language = 
   const change = { change_id: 'c1', locator: 'team-leave-request', revision: 'rev1', state: archived ? 'Archived' : 'Draft', workspace_state: archived ? 'RELEASED' : 'ATTACHED', documents: [{ document_id: 'proposal', path: 'proposal.md', editable: true }], storyboard_frames: [] };
   const root = el('div'); document.body.append(root);
   if (draft !== null) localStorage.setItem('symphony.pm.draft.p1.c1.proposal.rev1', draft);
-  mount = mountArtifacts({ root, projectId: 'p1', onDirtyChange: (dirty) => dirtyChanges.push(dirty), ui: { el, renderMarkdown: (source) => el('p', null, source), announce() {} }, api: {
+  mount = mountArtifacts({ root, projectId: 'p1', onDirtyChange: (dirty) => dirtyChanges.push(dirty), ui: { el, renderMarkdown: (source) => el('p', null, source), announce: (...args) => announcements.push(args) }, api: {
     request: async (path, options) => {
       const extra = await apiRequest?.(path, options); if (extra !== undefined) return extra;
       const pathname = path.split('?')[0];
@@ -816,4 +816,138 @@ test('hardening failed source save keeps dirty input and allows an immediate ret
   assert.ok(root.querySelector('.pm-action-error').textContent.includes('Fixture save failed'));
   assert.equal(save.disabled, false, 'Failure must not masquerade as a saved clean document');
   assert.equal(dirtyChanges.at(-1), true);
+});
+
+
+test('round5 exact archive guidance preserves unknown failures and silent aborts', async (t) => {
+  for (const language of ['en', 'ko']) for (const variant of ['exact', 'other-message', 'other-code', 'abort']) {
+    await t.test(`${language}/${variant}`, async (context) => {
+      const announcements = [];
+      const error = Object.assign(new Error(variant === 'other-message' ? 'Another approval is required' : 'archive requires the approved revision'), {
+        code: variant === 'other-code' ? 'different_code' : 'approval_required', name: variant === 'abort' ? 'AbortError' : 'Error',
+      });
+      const root = await mountedPm(context, { tab: 'plan', language, announcements, apiRequest: (path) => {
+        if (path.includes('/archive/preview')) throw error;
+      } });
+      const source = findButton(root, pmText('Preview archive', {}, language));
+      await source.trigger('click');
+      const alert = root.querySelector('.pm-action-error');
+      if (variant === 'abort') { assert.equal(alert, null); assert.deepEqual(announcements, []); return; }
+      assert.equal(alert.getAttribute('role'), 'alert');
+      assert.equal(document.activeElement, source);
+      const expected = variant === 'exact' ? (language === 'ko'
+        ? '승인된 리비전이 있어야 아카이브할 수 있습니다. 현재 리비전을 검토하고 승인한 뒤 아카이브 미리보기를 다시 여세요.'
+        : 'Archive requires an approved revision. Review and approve this revision, then preview archive again.') : error.message;
+      assert.ok(alert.textContent.includes(`${error.code}: ${expected}`), alert.textContent);
+      assert.deepEqual(announcements, [[`${error.code}: ${expected}`, 'error']]);
+      assert.equal(error.message, variant === 'other-message' ? 'Another approval is required' : 'archive requires the approved revision');
+    });
+  }
+});
+
+
+test('round5 validation guidance changes only the exact Problem finding', async (t) => {
+  for (const language of ['en', 'ko']) await t.test(language, async (context) => {
+    const findings = [
+      { code: 'idea_field_required', field: 'problem', message: 'Idea field problem is required', severity: 'error' },
+      { code: 'idea_field_required', field: 'goal', message: 'Idea field goal is required', severity: 'error' },
+      { code: 'other_code', field: 'problem', message: 'Idea field problem is required', severity: 'error' },
+      { code: 'idea_field_required', field: 'problem', message: 'Different problem message', severity: 'error' },
+    ];
+    const snapshot = JSON.stringify(findings);
+    const root = await mountedPm(context, { language, apiRequest: (path) => path.endsWith('/validate') ? { valid: false, findings } : undefined });
+    await findButton(root, pmText('Validate', {}, language)).trigger('click');
+    const dialog = document.body.querySelector('[role="dialog"]');
+    assert.ok(dialog);
+    const rows = dialog.querySelectorAll('.pm-finding');
+    assert.equal(rows.length, 4);
+    assert.ok(rows[0].textContent.includes(language === 'ko'
+      ? '문제 항목이 빠져 있습니다. 아이디어 소스에 문제 항목을 추가하고 저장한 뒤 다시 검증하세요.'
+      : 'The Problem field is missing. Add it to the idea source, save, then validate again.'), rows[0].textContent);
+    for (let index = 1; index < rows.length; index++) assert.ok(rows[index].textContent.includes(findings[index].message));
+    for (let index = 0; index < rows.length; index++) assert.equal(rows[index].querySelector('strong').textContent, findings[index].code);
+    assert.equal(JSON.stringify(findings), snapshot, 'The server findings, fields and codes remain untouched');
+  });
+});
+
+
+test('round5 all six compact-table consumers retain rows, column headings and local wrappers', async (t) => {
+  const task = { task_id: 'T-1', parent_id: null, order: 1, kind: 'Feature', title: 'A task', dependencies: [{ task_id: 'T-0', kind: 'hard', justification: 'Required first' }], requirement_refs: [], storyboard_refs: [], design_refs: [], acceptance: [], verification: [] };
+  const apiRequest = (path) => {
+    path = path.split('?')[0];
+    if (path.endsWith('/wbs')) return { tasks: [task], findings: [] };
+    if (path.endsWith('/wbs/preview')) return { findings: [] };
+    if (path.endsWith('/coverage')) return { entities: [{ semantic_id: 'REQ-12345678', title: 'Coverage', task_links: [{ task_id: 'T-1', task_revision: 'revision-1', ticket_identifier: 'TICKET-1', implemented: true, tested: false, accepted: false, test_provenance: 'manual_reported' }] }] };
+    if (path.endsWith('/managed-tickets')) return { tickets: [{ ticket_identifier: 'TICKET-1', task_id: 'T-1', task_revision: 'revision-1', code_files: [{ status: 'M', path: 'src/a-very-long-path.js' }] }] };
+    if (path.endsWith('/planning-actions')) return { operation_id: 'op-1', result: { reserved_ids: { '$new': 'REQ-87654321' } } };
+  };
+  const inspect = (scope, expectedHeaders, expectedText) => {
+    const table = scope.querySelectorAll('.pm-compact-table').find((node) => node.querySelectorAll('th').map((th) => th.textContent).join('|') === expectedHeaders.join('|'));
+    assert.ok(table, `Missing ${expectedHeaders.join('/')}`);
+    assert.equal(table.parentNode.className, 'pm-table-scroll');
+    assert.ok(table.closest('.pm-workspace-host') || table.closest('.pm-overlay-backdrop'));
+    assert.ok(table.querySelectorAll('th').every((th) => th.getAttribute('scope') === 'col'));
+    assert.ok(table.textContent.includes(expectedText), table.textContent);
+    return table;
+  };
+  for (const language of ['en', 'ko']) for (const consumer of ['dependencies', 'coverage', 'code', 'planning', 'paste', 'proposal']) {
+    await t.test(`${language}/${consumer}`, async (context) => {
+      const tab = consumer === 'proposal' ? 'idea' : ['code', 'planning', 'coverage'].includes(consumer) ? 'code' : 'plan';
+      const root = await mountedPm(context, { tab, view: consumer === 'dependencies' ? 'dependencies' : '', language, apiRequest });
+      const headers = (values) => values.map((value) => pmText(value, {}, language));
+      if (consumer === 'dependencies') inspect(root, headers(['Task', 'Needs', 'Dependency', 'Reason']), 'Required first');
+      if (consumer === 'coverage') inspect(root, headers(['Task', 'Revision', 'Ticket', 'Implemented', 'Tested', 'Accepted', 'Provenance']), 'TICKET-1');
+      if (consumer === 'code') inspect(root, headers(['Status', 'Path']), 'src/a-very-long-path.js');
+      if (consumer === 'planning') inspect(root, headers(['Path', 'State', 'Role']), 'proposal.md');
+      if (consumer === 'paste') {
+        await root.querySelector('.pm-wbs-table').trigger('paste', { clipboardData: { getData: () => 'T-1\ttitle\tChanged title' } });
+        const dialog = document.body.querySelector('[role="dialog"]');
+        inspect(dialog, headers(['Task', 'Field', 'Value']), 'Changed title');
+        await findButton(dialog, pmText('Cancel', {}, language)).trigger('click');
+        assert.equal(document.body.querySelector('[role="dialog"]'), null);
+      }
+      if (consumer === 'proposal') {
+        await findButton(root, pmText('Planning assistant', {}, language)).trigger('click');
+        const dialog = document.body.querySelector('[role="dialog"]');
+        await findButton(dialog, pmText('Prepare proposal', {}, language)).trigger('click');
+        const proposal = document.body.querySelector('[role="dialog"]');
+        inspect(proposal, headers(['Placeholder', 'Permanent ID']), 'REQ-87654321');
+        assert.ok(proposal.closest('.pm-overlay-backdrop'));
+      }
+    });
+  }
+});
+
+
+test('round5 shared toast adapter keeps ordinary host semantics and sets PM roles before append', async () => {
+  const source = await readFile(new URL('../src/symphony/web/static/app.js', import.meta.url), 'utf8');
+  const start = source.indexOf('  function showToast(');
+  const toastSource = source.slice(start, source.indexOf('\n  // ------------------------------------------------------------------', start));
+  const appended = [], pending = [];
+  const el = (tag, attrs, text) => {
+    const node = new UiNode(tag); node.textContent = text;
+    for (const [key, value] of Object.entries(attrs)) if (value !== null && value !== undefined) node.setAttribute(key, value);
+    return node;
+  };
+  const sandbox = { el, document: { getElementById: () => ({ appendChild: (node) => appended.push({node, role: node.getAttribute('role')}) }) }, setTimeout: (fn) => { pending.push(fn); return pending.length; }, clearTimeout() {} };
+  vm.runInNewContext(`${toastSource}; globalThis.toast = showToast;`, sandbox);
+  for (const type of ['info', 'success', 'error']) {
+    sandbox.toast(`Host ${type}`, type);
+    assert.equal(appended.at(-1).role, type === 'error' ? 'alert' : 'status');
+    assert.equal(appended.at(-1).node.className, `toast toast-${type}`);
+  }
+  const adapter = source.match(/announce:\s*(\([^)]*\)\s*=>\s*(?:\{[\s\S]*?\n {10}\}|showToast\([^\n]+\)))/);
+  assert.ok(adapter, 'Find the actual PM host adapter');
+  sandbox.showToast = sandbox.toast;
+  const announce = vm.runInNewContext(`(${adapter[1]})`, sandbox);
+  announce('PM saved');
+  assert.ok(appended.at(-1).node.className.includes('pm-toast'));
+  assert.equal(appended.at(-1).role, 'status');
+  announce('PM failed', 'error');
+  const error = appended.at(-1);
+  assert.ok(error.node.className.includes('toast-error'));
+  assert.ok(error.node.className.includes('pm-toast'));
+  assert.equal(error.role, null, 'PM inline error is already the live alert when the companion toast is appended');
+  assert.equal(error.node.getAttribute('aria-live'), null);
+  assert.equal(pending.length, 5);
 });

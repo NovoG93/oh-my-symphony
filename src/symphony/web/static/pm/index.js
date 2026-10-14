@@ -117,14 +117,17 @@ export function mountArtifacts({ root, projectId, api: hostApi, ui, onDirtyChang
   function reportActionError(error, source = null) {
     if (error?.name === 'AbortError') return;
     const code = error?.code ? `${error.code}: ` : '';
-    const message = `${code}${error?.message || 'The action failed.'}`;
+    const detail = error?.code === 'approval_required' && error?.message === 'archive requires the approved revision'
+      ? pmText('Archive requires an approved revision. Review and approve this revision, then preview archive again.')
+      : error?.message || 'The action failed.';
+    const message = `${code}${detail}`;
     const errorHost = overlay.panel || root.querySelector('.pm-body') || root;
     errorHost.querySelector('.pm-action-error')?.remove();
     const alert = ui.el('section', { class: 'banner banner-danger pm-action-error', role: 'alert' }, [
       ui.el('strong', null, 'Action unavailable'), ui.el('span', null, message),
     ]);
     localizePm(alert); errorHost.prepend(alert);
-    ui.announce(message);
+    ui.announce(message, 'error');
     if (source?.isConnected && typeof source.focus === 'function') source.focus({ preventScroll: true });
   }
 
@@ -745,7 +748,11 @@ export function mountArtifacts({ root, projectId, api: hostApi, ui, onDirtyChang
   }
 
   function showFindings(report) {
-    const dialog = ui.el('section', { class: 'pm-inline-dialog', role: 'dialog', 'aria-label': 'Validation results' }, [ui.el('h2', null, report.valid ? 'Ready for review' : 'Needs attention'), renderFindings(ui, report.findings), button('Close', () => overlay.close(dialog))]);
+    const findings = (report.findings || []).map((finding) => finding.code === 'idea_field_required'
+      && finding.field === 'problem' && finding.message === 'Idea field problem is required'
+      ? { ...finding, message: pmText('The Problem field is missing. Add it to the idea source, save, then validate again.') }
+      : finding);
+    const dialog = ui.el('section', { class: 'pm-inline-dialog', role: 'dialog', 'aria-label': 'Validation results' }, [ui.el('h2', null, report.valid ? 'Ready for review' : 'Needs attention'), renderFindings(ui, findings), button('Close', () => overlay.close(dialog))]);
     openDialog(dialog);
   }
 
@@ -1000,6 +1007,8 @@ const KO = new Map(Object.entries({
   'UX': '사용자 경험', 'Storyboard': '스토리보드', 'Architecture': '아키텍처', 'ERD': 'ERD', 'API': 'API', 'Integration': '통합',
   'Work breakdown': '작업 분해', 'Dependencies': '의존성', 'Plan document': '계획 문서',
   'Preview archive': '아카이브 미리보기', 'Preview approved handoff': '승인된 전달 미리보기',
+  'Archive requires an approved revision. Review and approve this revision, then preview archive again.': '승인된 리비전이 있어야 아카이브할 수 있습니다. 현재 리비전을 검토하고 승인한 뒤 아카이브 미리보기를 다시 여세요.',
+  'The Problem field is missing. Add it to the idea source, save, then validate again.': '문제 항목이 빠져 있습니다. 아이디어 소스에 문제 항목을 추가하고 저장한 뒤 다시 검증하세요.',
   'Validation results': '검증 결과', 'Ready for review': '검토 준비 완료', 'Needs attention': '조치 필요', 'No findings.': '발견된 문제가 없습니다.', 'Close': '닫기',
   'Confirm native handoff': '네이티브 전달 확인', 'Create native tickets': '네이티브 티켓 생성',
   'Add group': '그룹 추가', 'Add root': '최상위 추가', 'Add sibling': '같은 단계 추가', 'Add child': '하위 추가', 'Indent': '들여쓰기', 'Outdent': '내어쓰기',

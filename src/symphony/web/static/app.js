@@ -703,10 +703,10 @@
   // Toast system
   // ------------------------------------------------------------------
 
-  function showToast(message, type = 'info') {
+  function showToast(message, type = 'info', role = type === 'error' ? 'alert' : 'status') {
     const container = document.getElementById('toast-container');
     // Errors are assertive (role=alert); success/info are polite status.
-    const toast = el('div', { class: `toast toast-${type}`, role: type === 'error' ? 'alert' : 'status' }, message);
+    const toast = el('div', { class: `toast toast-${type}`, role }, message);
     const dismiss = () => {
       toast.classList.add('toast-out');
       setTimeout(() => toast.remove(), 160);
@@ -717,6 +717,7 @@
       dismiss();
     });
     container.appendChild(toast);
+    return toast;
   }
 
   // ------------------------------------------------------------------
@@ -1237,7 +1238,11 @@
           openRun: (runId) => { state.selectedRunId = runId; navigate('runs'); },
           openGitCommit: (commit) => { state.pmGitCommit = commit; navigate('git'); },
           downloadArtifact: (path, filename) => authenticatedDownload(path, filename),
-          announce: (message) => showToast(message, 'success'),
+          announce: (message, type = 'success') => {
+            // The persistent PM error banner already owns the live announcement.
+            const toast = showToast(message, type, type === 'error' ? null : 'status');
+            toast.classList.add('pm-toast');
+          },
         },
         onDirtyChange: (dirty) => { pmDirty = Boolean(dirty); },
       });

@@ -28,7 +28,7 @@
 .pm-source-editor { width: 100%; min-height: 540px; margin-top: 14px; padding: 16px; resize: vertical; border: 1px solid var(--border); border-radius: 8px; background: var(--bg); color: inherit; font: .93333rem/1.65 ui-monospace, SFMono-Regular, Menlo, monospace; }
 .pm-document-preview { font-size: 1rem; line-height: 1.65; }
 .pm-plan-stack { display: grid; min-width: 0; gap: 18px; }
-.pm-plan-action-row { justify-content: flex-end; }
+.pm-plan-action-row { justify-content: flex-end; flex-wrap: wrap; min-width: 0; }
 .pm-plan-surface, .pm-exchange-panel, .pm-inline-dialog { width: 100%; min-width: 0; padding: 18px; border: 1px solid var(--border); border-radius: 12px; background: var(--surface); }
 .pm-table-scroll { width: 100%; min-width: 0; max-width: 100%; overflow: auto; margin-top: 14px; }
 .pm-tabulator { width: 100%; max-width: 100%; }
@@ -69,7 +69,7 @@
 .pm-coverage-entity summary { cursor: pointer; font-weight: 700; }
 .pm-coverage-states { display: flex; flex-wrap: wrap; gap: 7px; margin: 14px 0; }
 .pm-coverage-state { padding: 5px 9px; border: 1px solid var(--border); border-radius: 999px; color: var(--text-secondary); font-size: 0.8rem; }
-.pm-coverage-state.ready { border-color: var(--success); color: var(--success); }
+.pm-coverage-state.ready { border-color: var(--success); color: #15803d; }
 .pm-waiver { padding: 10px; border: 1px solid color-mix(in srgb, var(--warning) 55%, var(--border)); border-radius: 8px; background: var(--bg); }
 .pm-readable-card, .pm-error-state, .pm-empty-state { padding: clamp(20px, 4vw, 38px); border: 1px solid var(--border); border-radius: 12px; background: var(--surface); }
 .pm-readable-card { min-width: 0; max-width: 1100px; overflow-wrap: anywhere; }
@@ -110,6 +110,7 @@
   .pm-tabs { padding: 0 20px; }
   .pm-body { padding: 20px; }
   .pm-plan-toolbar { align-items: flex-start; flex-direction: column; }
+  .pm-plan-toolbar > .pm-actions { width: 100%; }
   .pm-preview-readable { padding: 24px 18px; }
   .pm-revision-bar { align-items: flex-start; flex-direction: column; }
   .pm-requirement-delta { grid-template-columns: 1fr; }
@@ -136,7 +137,7 @@
 .pm-workspace-host .pm-card-grid > *, .pm-design-stack > *, .pm-card-heading > *, .pm-card-heading code, .pm-task-meta dd { min-width: 0; overflow-wrap: anywhere; }
 .pm-task-meta dd { margin-inline-start: 0; }
 .pm-workspace-host .pm-actions { min-width: 0; }
-.pm-workspace-host .pm-actions .btn { max-width: 100%; white-space: normal; }
+.pm-workspace-host .pm-actions .btn, .pm-workspace-host .pm-plan-action-row .btn { max-width: 100%; white-space: normal; }
 .pm-workspace-host :is(.btn, .input), .pm-overlay-backdrop :is(.btn, .input) { min-height: 44px; }
 .pm-overlay-backdrop .pm-drawer-heading { position: sticky; top: -24px; z-index: 1; padding-block: 12px; background: var(--surface); }
 .pm-overlay-backdrop .pm-drawer-heading .btn-icon { min-width: 44px; min-height: 44px; flex: 0 0 auto; }
@@ -150,3 +151,13 @@
   .pm-header-controls, .pm-header-controls > .pm-actions { width: 100%; }
   .pm-findings .pm-finding { grid-template-columns: minmax(0, 1fr); }
 }
+
+/* Keep compact-table columns readable inside their existing scroll wrapper. */
+:is(.pm-workspace-host, .pm-overlay-backdrop) .pm-compact-table { width: max-content; min-width: 100%; }
+:is(.pm-workspace-host, .pm-overlay-backdrop) .pm-compact-table :is(th, td) { word-break: keep-all; overflow-wrap: normal; }
+:is(.pm-workspace-host, .pm-overlay-backdrop) .pm-compact-table th { white-space: nowrap; }
+/* PM toasts are body-appended; ordinary host toast colors are unchanged. */
+.pm-toast { max-width: min(25.1852rem, calc(100vw - 2.963rem)); word-break: keep-all; overflow-wrap: anywhere; }
+.pm-toast.toast-success { background: #15803d; }
+.pm-toast.toast-error { background: #b91c1c; }
+.pm-action-error { display: grid; gap: 8px; margin-bottom: 18px; overflow-wrap: anywhere; }

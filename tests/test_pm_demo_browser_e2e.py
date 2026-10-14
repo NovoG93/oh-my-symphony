@@ -1023,3 +1023,221 @@ def test_installed_demo_delayed_preview_stays_on_its_original_view(tmp_path, ins
         assert not page.locator('.app').evaluate('(node) => node.inert')
         assert not writes and _runs(directory) == 0
         page.screenshot(path=str(tmp_path / f'delayed-{kind}-ignored.png'))
+
+
+def _round5_contrast(locator):
+    """Read the rendered solid text/background pair, including transparent parents."""
+    return locator.evaluate(r"""node => {
+      const rgb = value => value.match(/[\d.]+/g).map(Number);
+      const foreground = rgb(getComputedStyle(node).color);
+      let surface = node, background;
+      while (surface) {
+        background = rgb(getComputedStyle(surface).backgroundColor);
+        if (background.length < 4 || background[3] === 1) break;
+        if (background[3] !== 0) throw new Error('Contrast oracle requires a solid background');
+        surface = surface.parentElement;
+      }
+      if (!surface || (foreground.length === 4 && foreground[3] !== 1)) throw new Error('No solid rendered pair');
+      const luminance = channels => channels.slice(0, 3).map(value => {
+        value /= 255; return value <= .04045 ? value / 12.92 : ((value + .055) / 1.055) ** 2.4;
+      }).reduce((sum, value, index) => sum + value * [.2126, .7152, .0722][index], 0);
+      const a = luminance(foreground), b = luminance(background);
+      return {foreground, background, ratio: (Math.max(a, b) + .05) / (Math.min(a, b) + .05)};
+    }""")
+
+
+def _round5_table(table):
+    """Check actual line boxes and reach the final column through its local scroller."""
+    return table.evaluate("""table => {
+      const wrapper = table.parentElement;
+      const headings = [...table.querySelectorAll('th')].map(th => {
+        const range = document.createRange(); range.selectNodeContents(th);
+        return {text: th.textContent, lines: range.getClientRects().length};
+      });
+      const heading = table.querySelector('th:last-child');
+      const bounds = wrapper.getBoundingClientRect();
+      wrapper.scrollLeft += heading.getBoundingClientRect().left - bounds.left;
+      const range = document.createRange(); range.selectNodeContents(heading);
+      const last = range.getBoundingClientRect();
+      return {headings, clientWidth: wrapper.clientWidth, scrollWidth: wrapper.scrollWidth, scrollLeft: wrapper.scrollLeft,
+        lastReachable: last.right <= bounds.right + 1 && last.left >= bounds.left - 1};
+    }""")
+
+
+@pytest.mark.parametrize("lang", ["en", "ko"])
+@pytest.mark.parametrize("oracle", ["plan", "tables", "contrast"])
+def test_installed_demo_round5_rendered_ui(tmp_path, installed_python, chrome, lang, oracle):
+    """Independent oracles keep each of the three rendered defects visible in red proof."""
+    import json
+    from playwright.sync_api import expect
+    directory = tmp_path / "demo"
+    argv = [str(installed_python.parent / "symphony"), "pm", "demo", "--path", str(directory), "--lang", lang]
+    receipts = []
+    try:
+        with _server(argv, tmp_path, _environment(tmp_path)) as (_, url), _page(chrome) as (page, _):
+            page.goto(url)
+            expect(_button(page, "Validate", lang)).to_be_visible()
+            if oracle == 'tables':
+                _button(page, 'Approve revision', lang).click()
+                expect(page.locator('.pm-revision-bar .pm-state')).to_have_text('Approved')
+                _tab(page, 'plan', lang)
+                _button(page, 'Preview approved handoff', lang).click()
+                with page.expect_response(lambda response: response.url.endswith('/handoffs') and response.request.method == 'POST') as handed_off:
+                    page.get_by_role('button', name='네이티브 티켓 생성' if lang == 'ko' else 'Create native tickets', exact=True).click()
+                assert handed_off.value.status == 201
+            for width, height in [(320, 568), (375, 667), (440, 956), (1280, 800)]:
+                page.set_viewport_size({"width": width, "height": height})
+                if oracle == "plan":
+                    _tab(page, "plan", lang)
+                    host = page.locator('.pm-workspace-host').bounding_box()
+                    actions = page.locator('.pm-plan-action-row button, .pm-plan-toolbar button')
+                    assert actions.count() >= 10
+                    for action in actions.all():
+                        box = action.bounding_box()
+                        receipts.append({"width": width, "button": action.inner_text(), "box": box, "host": host})
+                        assert box and box['x'] >= host['x'] - 1 and box['x'] + box['width'] <= host['x'] + host['width'] + 1, receipts[-1]
+                else:
+                    _tab(page, "requirements", lang)
+                    coverage = page.locator('.pm-coverage-entity').first
+                    if coverage.get_attribute('open') is None:
+                        coverage.locator('summary').click()
+                    expect(page.locator('.pm-coverage-state.ready').first).to_be_visible()
+                    if oracle == "contrast":
+                        pair = _round5_contrast(page.locator('.pm-coverage-state.ready').first)
+                        receipts.append({"width": width, "coverage": pair})
+                        assert pair['ratio'] >= 4.5, receipts[-1]
+                    else:
+                        # Coverage task links, dependencies, code delta and planning files.
+                        tables = [page.locator('.pm-coverage-entity[open] .pm-compact-table').first]
+                        for table in tables:
+                            result = _round5_table(table)
+                            receipts.append({"width": width, **result})
+                            assert all(item['lines'] == 1 for item in result['headings']), receipts[-1]
+                            assert result['lastReachable'], receipts[-1]
+                        _tab(page, 'plan', lang)
+                        _button(page, 'Dependencies', lang).click()
+                        dependency_table = page.locator('.pm-compact-table')
+                        scroller = dependency_table.locator('..')
+                        if scroller.evaluate('node => node.scrollWidth > node.clientWidth'):
+                            # Start from the preceding real control and reach the overflow with Tab.
+                            page.locator('.pm-segmented button').last.focus()
+                            page.keyboard.press('Tab')
+                            expect(scroller).to_be_focused()
+                            scroller.evaluate('node => { node.scrollLeft = 0; }')
+                            page.keyboard.press('ArrowRight')
+                            page.wait_for_function('node => node.scrollLeft > 0', arg=scroller.element_handle())
+                            receipts.append({"width": width, "keyboardLocalScroll": scroller.evaluate('node => node.scrollLeft'), "pageScrollX": page.evaluate('scrollX')})
+                            assert page.evaluate('scrollX') == 0
+                        result = _round5_table(dependency_table)
+                        receipts.append({"width": width, **result})
+                        assert all(item['lines'] == 1 for item in result['headings']) and result['lastReachable'], receipts[-1]
+                        _button(page, 'Work breakdown', lang).click()
+                        rows = page.locator('.pm-tabulator .tabulator-row')
+                        expect(rows).to_have_count(7)
+                        task_id = rows.nth(1).locator('[tabulator-field="task_id"]').inner_text()
+                        holder = page.locator('.pm-tabulator .tabulator-tableholder')
+                        holder.focus()
+                        with page.expect_response(lambda response: response.url.endswith('/wbs/preview')) as preview:
+                            holder.evaluate("""(node, id) => {
+                                const data = new DataTransfer(); data.setData('text/plain', `${id}\ttitle\tRound5 preview only`);
+                                node.dispatchEvent(new ClipboardEvent('paste', {bubbles: true, clipboardData: data}));
+                            }""", task_id)
+                        assert preview.value.status == 200
+                        dialog = page.get_by_role('dialog')
+                        expect(dialog).to_be_visible()
+                        result = _round5_table(dialog.locator('.pm-compact-table'))
+                        receipts.append({"width": width, "dialog": "TSV preview", **result})
+                        assert all(item['lines'] == 1 for item in result['headings']) and result['lastReachable'], receipts[-1]
+                        page.keyboard.press('Escape')
+                        expect(dialog).to_have_count(0)
+                        _tab(page, 'code', lang)
+                        for detail in page.locator('details').all():
+                            detail.evaluate("node => { node.open = true; }")
+                        tables = page.locator('.pm-ticket-card .pm-compact-table, .pm-readable-card > .pm-table-scroll > .pm-compact-table')
+                        assert tables.count() == 6
+                        for table in tables.all():
+                            result = _round5_table(table)
+                            receipts.append({"width": width, **result})
+                            assert all(item['lines'] == 1 for item in result['headings']) and result['lastReachable'], receipts[-1]
+                page.screenshot(path=str(tmp_path / f'{oracle}-{lang}-{width}.png'), full_page=True)
+            assert _runs(directory) == 0
+    finally:
+        (tmp_path / 'round5-rendered.json').write_text(json.dumps(receipts, indent=2), encoding='utf-8')
+
+
+@pytest.mark.parametrize("lang", ["en", "ko"])
+@pytest.mark.parametrize("oracle", ["feedback", "guidance"])
+def test_installed_demo_round5_archive_failure(tmp_path, installed_python, chrome, lang, oracle):
+    from playwright.sync_api import expect
+    directory = tmp_path / "demo"
+    argv = [str(installed_python.parent / "symphony"), "pm", "demo", "--path", str(directory), "--lang", lang]
+    with _server(argv, tmp_path, _environment(tmp_path)) as (_, url), _page(chrome) as (page, _):
+        page.goto(url)
+        _tab(page, 'plan', lang)
+        with page.expect_response(lambda response: response.url.endswith('/archive/preview')) as refusal:
+            _button(page, 'Preview archive', lang).click()
+        assert refusal.value.status == 409
+        assert refusal.value.json()['error'] == {'code': 'approval_required', 'message': 'archive requires the approved revision', 'details': {}}
+        alert = page.locator('.pm-action-error')
+        expect(alert).to_have_attribute('role', 'alert')
+        expected = ('승인된 리비전이 있어야 아카이브할 수 있습니다. 현재 리비전을 검토하고 승인한 뒤 아카이브 미리보기를 다시 여세요.' if lang == 'ko' else
+                    'Archive requires an approved revision. Review and approve this revision, then preview archive again.')
+        if oracle == 'guidance':
+            expect(alert).to_contain_text('approval_required: ' + expected)
+        toast = page.locator('#toast-container .toast').last
+        expect(toast).to_have_class(re.compile(r'\btoast-error\b'))
+        expect(toast).not_to_have_attribute('role', re.compile('alert|status'))
+        expect(toast).not_to_have_attribute('aria-live', re.compile('polite|assertive'))
+        # One persistent announcer, with the same message; no duplicate live toast.
+        expect(page.locator('[role=alert]').filter(has_text='approval_required:')).to_have_count(1)
+        expect(_button(page, 'Preview archive', lang)).to_be_focused()
+        assert _round5_contrast(toast)['ratio'] >= 4.5
+        page.screenshot(path=str(tmp_path / f'archive-{lang}.png'), full_page=True)
+        assert _runs(directory) == 0
+
+
+@pytest.mark.parametrize("lang", ["en", "ko"])
+@pytest.mark.parametrize("oracle", ["contrast", "guidance"])
+def test_installed_demo_round5_problem_recovery(tmp_path, installed_python, chrome, lang, oracle):
+    from playwright.sync_api import expect
+    directory = tmp_path / "demo"
+    argv = [str(installed_python.parent / "symphony"), "pm", "demo", "--path", str(directory), "--lang", lang]
+    with _server(argv, tmp_path, _environment(tmp_path)) as (_, url), _page(chrome) as (page, _):
+        page.goto(url)
+        _button(page, 'Edit source', lang).click()
+        editor = page.locator('.pm-source-editor')
+        original = editor.input_value()
+        invalid = re.sub(r'(?m)^## Problem$', '## Missing problem heading', original)
+        assert invalid != original
+        identities = re.findall(r'<!-- symphony:[^>]+-->', original)
+        assert identities and re.findall(r'<!-- symphony:[^>]+-->', invalid) == identities
+        editor.fill(invalid)
+        with page.expect_response(lambda response: '/documents/proposal' in response.url and response.request.method == 'PATCH') as saved:
+            _button(page, 'Save draft', lang).click()
+        assert saved.value.status == 200
+        toast = page.locator('.toast-success').last
+        expect(toast).to_be_visible()
+        if oracle == 'contrast':
+            assert _round5_contrast(toast)['ratio'] >= 4.5
+        with page.expect_response(lambda response: response.url.endswith('/validate')) as validation:
+            _button(page, 'Validate', lang).click()
+        report = validation.value.json()
+        assert validation.value.status == 200 and report['valid'] is False
+        finding = next(item for item in report['findings'] if item['code'] == 'idea_field_required' and item['field'] == 'problem')
+        assert finding['message'] == 'Idea field problem is required'
+        dialog = page.get_by_role('dialog')
+        expect(dialog).to_contain_text('문제 항목이 빠져 있습니다. 아이디어 소스에 문제 항목을 추가하고 저장한 뒤 다시 검증하세요.' if lang == 'ko' else
+                                     'The Problem field is missing. Add it to the idea source, save, then validate again.')
+        expect(dialog).to_contain_text('idea_field_required')
+        page.keyboard.press('Escape')
+        expect(_button(page, 'Validate', lang)).to_be_focused()
+        _button(page, 'Edit source', lang).click() if page.locator('.pm-source-editor').is_hidden() else None
+        editor.fill(original)
+        with page.expect_response(lambda response: '/documents/proposal' in response.url and response.request.method == 'PATCH') as restored:
+            _button(page, 'Save draft', lang).click()
+        assert restored.value.status == 200
+        with page.expect_response(lambda response: response.url.endswith('/validate')) as validation:
+            _button(page, 'Validate', lang).click()
+        assert validation.value.status == 200 and validation.value.json()['valid'] is True
+        assert (directory / 'planning/openspec/changes/team-leave-request/proposal.md').read_text() == original
+        assert _runs(directory) == 0
