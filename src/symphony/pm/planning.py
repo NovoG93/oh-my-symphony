@@ -108,15 +108,36 @@ class PmPlanningClient:
         self._stream_bytes = 0
         self._token_limit_error: PmError | None = None
         self._stop_lock = asyncio.Lock()
+        self._cancel_requested = asyncio.Event()
+        self._proposal_task: asyncio.Task[PlanningProposal] | None = None
+        self._proposal_deadline: float | None = None
         self._cleanup_uncertain = False
         self._process_identity: str | None = None
         self._owned_process_identities: frozenset[str] = frozenset()
 
     @property
+    def proposal_running(self) -> bool:
+        return self._proposal_task is not None and not self._proposal_task.done()
+
+    @property
     def cleanup_uncertain(self) -> bool:
-        return self._cleanup_uncertain
+        return self._cleanup_uncertain or (
+            self._cancel_requested.is_set() and self.proposal_running
+        )
+
+    def _require_not_cancelled(self) -> None:
+        if self._cancel_requested.is_set():
+            raise PmError("operation_cancelled", "planning proposal was cancelled", status=409)
+
+    def _fail_waiters(self, error: PmError) -> None:
+        for future in (*self.pending.values(), *self._terminal.values()):
+            if not future.done():
+                future.set_exception(error)
+                # A disconnected caller may no longer await its shielded Future.
+                future.exception()
 
     async def start(self, cwd: Path, deadline: float | None = None) -> None:
+        self._require_not_cancelled()
         if self.process is not None:
             raise PmError(
                 "planning_cleanup_failed",
@@ -129,6 +150,7 @@ class PmPlanningClient:
         from .codex_compatibility import admit_codex
 
         admission = await admit_codex(self.codex_executable, deadline=deadline)
+        self._require_not_cancelled()
         if admission.reason is not None:
             raise PmError("capability_unavailable", admission.reason, status=503)
         assert admission.executable is not None
@@ -140,6 +162,11 @@ class PmPlanningClient:
             raise
 
     async def _start_runtime(self, cwd: Path, deadline: float, *, authenticated: bool) -> None:
+        self._require_not_cancelled()
+        self._fail_waiters(PmError("planning_failed", "planning app-server closed", status=503))
+        self._terminal.clear()
+        self._messages.clear()
+        self._deltas.clear()
         if self.runtime_root is None:
             self._temp = tempfile.TemporaryDirectory(prefix="symphony-pm-codex-")
             home = Path(self._temp.name)
@@ -167,6 +194,7 @@ class PmPlanningClient:
             if self._process_identity is not None
             else frozenset()
         )
+        self._require_not_cancelled()
         self.reader_task = asyncio.create_task(self._read_stdout())
         self.stderr_task = asyncio.create_task(self._read_stderr())
         await self.request("initialize", {"clientInfo": {"name": "symphony_pm", "title": "Symphony PM", "version": "1"}, "capabilities": {"experimentalApi": True}}, timeout=min(30, _remaining(deadline)))
@@ -179,9 +207,30 @@ class PmPlanningClient:
         instruction: str,
         on_started: Callable[[str, str], None] | None = None,
     ) -> PlanningProposal:
+        self._require_not_cancelled()
+        if self._proposal_task is not None and not self._proposal_task.done():
+            raise PmError("planning_cleanup_failed", "a planning proposal is already running", status=503)
         deadline = asyncio.get_running_loop().time() + self.timeout_seconds
+        self._proposal_deadline = deadline
+        task = asyncio.create_task(self._propose(cwd, planning_snapshot, instruction, on_started, deadline))
+        self._proposal_task = task
+        try:
+            return await asyncio.shield(task)
+        except asyncio.CancelledError:
+            # Preserve ownership of admission/spawn until its handle can be reaped.
+            await self.cancel_proposal()
+            raise
+        finally:
+            if task.done() and self._proposal_task is task:
+                self._proposal_task = None
+
+    async def _propose(
+        self, cwd: Path, planning_snapshot: str, instruction: str,
+        on_started: Callable[[str, str], None] | None, deadline: float,
+    ) -> PlanningProposal:
         try:
             await self.start(cwd, deadline)
+            self._require_not_cancelled()
             thread_result = await self.request("thread/start", {
             "cwd": str(cwd), "model": MODEL, "allowProviderModelFallback": False,
             "ephemeral": True, "approvalPolicy": "never", "sandbox": "read-only",
@@ -192,6 +241,7 @@ class PmPlanningClient:
             thread_id = str(thread.get("id") or thread_result.get("threadId") or "")
             if not thread_id:
                 raise PmError("planning_failed", "Codex returned no thread id", status=503)
+            self._require_not_cancelled()
             turn_result = await self.request("turn/start", {
             "threadId": thread_id,
             "input": [{"type": "text", "text": instruction}],
@@ -230,6 +280,27 @@ class PmPlanningClient:
         finally:
             await self.stop()
 
+    async def cancel_proposal(self) -> None:
+        self._cancel_requested.set()
+        self._fail_waiters(PmError("operation_cancelled", "planning proposal was cancelled", status=409))
+        task = self._proposal_task
+        if task is not None and task is not asyncio.current_task():
+            assert self._proposal_deadline is not None
+            try:
+                if task.done():
+                    result = task.exception() if not task.cancelled() else asyncio.CancelledError()
+                else:
+                    result, = await asyncio.wait_for(
+                        asyncio.gather(asyncio.shield(task), return_exceptions=True),
+                        _remaining(self._proposal_deadline),
+                    )
+            except (asyncio.TimeoutError, PmError) as exc:
+                self._cleanup_uncertain = True
+                raise _uncertain_group_cleanup() from exc
+            if isinstance(result, PmError) and result.code == "planning_cleanup_failed":
+                raise result
+        await self.stop()
+
     async def cancel(self, thread_id: str, turn_id: str) -> None:
         deadline = asyncio.get_running_loop().time() + 60
         try:
@@ -241,7 +312,16 @@ class PmPlanningClient:
             await self.stop()
 
     async def stop(self) -> None:
+        error = PmError(
+            "operation_cancelled" if self._cancel_requested.is_set() else "planning_failed",
+            "planning proposal was cancelled" if self._cancel_requested.is_set() else "planning app-server closed",
+            status=409 if self._cancel_requested.is_set() else 503,
+        )
+        self._fail_waiters(error)
         async with self._stop_lock:
+            if self.process is None and self.proposal_running and self._proposal_task is not asyncio.current_task():
+                self._cleanup_uncertain = True
+                raise _uncertain_group_cleanup()
             await self._stop_owned_process()
 
     async def _stop_owned_process(self) -> None:
@@ -364,7 +444,21 @@ class PmPlanningClient:
         else:
             self._cleanup_uncertain = True
             raise cleanup_error
+    async def _drain(self, writer: asyncio.StreamWriter) -> None:
+        self._require_not_cancelled()
+        drain = asyncio.create_task(writer.drain())
+        cancelled = asyncio.create_task(self._cancel_requested.wait())
+        try:
+            await asyncio.wait((drain, cancelled), return_when=asyncio.FIRST_COMPLETED)
+            self._require_not_cancelled()
+            await drain
+        finally:
+            for task in (drain, cancelled):
+                task.cancel()
+            await asyncio.gather(drain, cancelled, return_exceptions=True)
+
     async def request(self, method: str, params: dict[str, Any], *, timeout: float | None = None) -> dict[str, Any]:
+        self._require_not_cancelled()
         process = self.process
         if process is None or process.stdin is None:
             raise PmError("planning_failed", "planning client is not running", status=503)
@@ -376,12 +470,16 @@ class PmPlanningClient:
         try:
             async with asyncio.timeout(limit):
                 process.stdin.write((json.dumps({"id": request_id, "method": method, "params": params}) + "\n").encode())
-                await process.stdin.drain()
+                await self._drain(process.stdin)
                 response = await asyncio.shield(future)
         except TimeoutError as exc:
-            self.pending.pop(request_id, None)
-            future.cancel()
             raise PmError("planning_timeout", f"{method} exceeded its deadline", status=504) from exc
+        finally:
+            self.pending.pop(request_id, None)
+            if not future.done():
+                future.cancel()
+            elif not future.cancelled():
+                future.exception()
         if "error" in response:
             raise PmError("planning_failed", f"{method} failed", status=503, details={"error": response["error"]})
         result = response.get("result")
@@ -390,6 +488,7 @@ class PmPlanningClient:
     async def notify(
         self, method: str, params: dict[str, Any], *, timeout: float | None = None
     ) -> None:
+        self._require_not_cancelled()
         process = self.process
         if process is None or process.stdin is None:
             raise PmError("planning_failed", "planning client is not running", status=503)
@@ -397,33 +496,33 @@ class PmPlanningClient:
         try:
             async with asyncio.timeout(limit):
                 process.stdin.write((json.dumps({"method": method, "params": params}) + "\n").encode())
-                await process.stdin.drain()
+                await self._drain(process.stdin)
         except TimeoutError as exc:
             raise PmError("planning_timeout", f"{method} exceeded its deadline", status=504) from exc
 
     async def _read_stdout(self) -> None:
-        assert self.process is not None and self.process.stdout is not None
-        while line := await self.process.stdout.readline():
-            try:
-                message = json.loads(line)
-            except json.JSONDecodeError:
-                await self.stop()
-                return
-            request_id = message.get("id")
-            if request_id is not None and "method" not in message:
-                future = self.pending.pop(int(request_id), None)
-                if future is not None and not future.done():
-                    future.set_result(message)
-            elif request_id is not None and "method" in message:
-                self.server_request = str(message.get("method") or "unknown")
-                await self._deny(message)
-                asyncio.create_task(self.stop())
-            else:
-                self._dispatch_notification(message)
-        error = PmError("planning_failed", "planning app-server closed", status=503)
-        for future in (*self.pending.values(), *self._terminal.values()):
-            if not future.done():
-                future.set_exception(error)
+        try:
+            assert self.process is not None and self.process.stdout is not None
+            while line := await self.process.stdout.readline():
+                try:
+                    message = json.loads(line)
+                except json.JSONDecodeError:
+                    await self.stop()
+                    return
+                request_id = message.get("id")
+                if request_id is not None and "method" not in message:
+                    future = self.pending.pop(int(request_id), None)
+                    if future is not None and not future.done():
+                        future.set_result(message)
+                elif request_id is not None and "method" in message:
+                    self.server_request = str(message.get("method") or "unknown")
+                    await self._deny(message)
+                    asyncio.create_task(self.stop())
+                else:
+                    self._dispatch_notification(message)
+        finally:
+            error = PmError("planning_failed", "planning app-server closed", status=503)
+            self._fail_waiters(error)
 
     async def _read_stderr(self) -> None:
         assert self.process is not None and self.process.stderr is not None
@@ -512,6 +611,7 @@ class PmPlanningClient:
     async def _wait_turn(
         self, thread_id: str, turn_id: str, *, deadline: float
     ) -> tuple[str, str]:
+        self._require_not_cancelled()
         key = (thread_id, turn_id)
         future = self._terminal.get(key)
         if future is None:

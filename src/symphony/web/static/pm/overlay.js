@@ -2,8 +2,20 @@
 export function createPmOverlay(owner) {
   let current = null;
   let released = false;
-  const focusable = (panel) => [...panel.querySelectorAll('button,input,textarea,select,[tabindex]')]
-    .filter((item) => !item.disabled && !item.hidden && !item.closest?.('[hidden]'));
+  // Overflowing compact tables are keyboard-scrollable regions; recheck on each Tab so resizes stay correct.
+  const syncTableRegions = (panel) => {
+    for (const region of panel.querySelectorAll('.pm-table-scroll')) {
+      if (region.scrollWidth > region.clientWidth || region.scrollHeight > region.clientHeight) {
+        region.tabIndex = 0; region.setAttribute('role', 'region');
+        region.setAttribute('aria-label', [...region.querySelectorAll('th')].map((th) => th.textContent.trim()).join(', '));
+      } else { region.tabIndex = -1; region.removeAttribute?.('role'); region.removeAttribute?.('aria-label'); }
+    }
+  };
+  const focusable = (panel) => {
+    syncTableRegions(panel);
+    return [...panel.querySelectorAll('button,input,textarea,select,[tabindex]')]
+      .filter((item) => item.tabIndex >= 0 && !item.disabled && !item.hidden && !item.closest?.('[hidden]'));
+  };
   function close(panel = current?.panel, { force = false, restoreFocus = true } = {}) {
     if (!current || current.panel !== panel) return true;
     if (!force && current.canClose && !current.canClose()) return false;

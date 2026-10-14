@@ -143,6 +143,7 @@
 .pm-overlay-backdrop .pm-drawer-heading .btn-icon { min-width: 44px; min-height: 44px; flex: 0 0 auto; }
 .pm-overlay-backdrop :is(input, textarea, select), .pm-workspace-host :is(input, textarea, select) { font-size: max(1rem, 16px); }
 .pm-overlay-backdrop :is(button, input, textarea, select):focus-visible, .pm-workspace-host :is(button, input, textarea, select):focus-visible { outline: 2px solid var(--focus-ring); outline-offset: 2px; }
+.pm-overlay-backdrop .pm-table-scroll:focus-visible { outline: 2px solid var(--focus-ring); outline-offset: -2px; }
 @media (max-width: 560px) {
   .pm-overlay-backdrop { padding: 8px; }
   .pm-overlay-backdrop .pm-inline-dialog { max-height: calc(100dvh - 16px); }

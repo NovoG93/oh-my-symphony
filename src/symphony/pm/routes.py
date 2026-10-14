@@ -15,7 +15,7 @@ import subprocess
 import uuid
 import zipfile
 from contextlib import nullcontext
-from dataclasses import asdict, is_dataclass
+from dataclasses import asdict, dataclass, field, is_dataclass
 from datetime import date, datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, TypeVar
@@ -50,8 +50,16 @@ PM_DEVELOPMENT_VERIFICATION_KEY: web.AppKey[bool] = web.AppKey(
 PM_DEMO_KEY: web.AppKey[Path] = web.AppKey("symphony.pm.demo", Path)
 
 
+@dataclass
+class _ActivePlanning:
+    client: PmPlanningClient
+    deadline: float
+    finished: asyncio.Event = field(default_factory=asyncio.Event)
+    cleanup_error: BaseException | None = None
+
+
 def register_pm_routes(app: web.Application, ctx: Any, orchestrator: Any) -> None:
-    active_planning: dict[str, PmPlanningClient] = {}
+    active_planning: dict[str, _ActivePlanning] = {}
     cancelling_planning: set[str] = set()
     exchange_semaphores: dict[int, asyncio.Semaphore] = {}
 
@@ -824,8 +832,8 @@ def register_pm_routes(app: web.Application, ctx: Any, orchestrator: Any) -> Non
         registry = pmapp.repository.registry
         if any(
             active_id != operation_id
-            and getattr(active_client, "cleanup_uncertain", False)
-            for active_id, active_client in active_planning.items()
+            and (entry.cleanup_error is not None or getattr(entry.client, "cleanup_uncertain", False))
+            for active_id, entry in active_planning.items()
         ):
             raise PmError(
                 "planning_cleanup_failed",
@@ -847,13 +855,15 @@ def register_pm_routes(app: web.Application, ctx: Any, orchestrator: Any) -> Non
             timeout_seconds=cfg.pm.operation_timeout_ms / 1000,
             max_total_tokens=cfg.agent.max_total_tokens,
         )
-        active_planning[operation_id] = client
+        entry = _ActivePlanning(client, asyncio.get_running_loop().time() + cfg.pm.operation_timeout_ms / 1000)
+        active_planning[operation_id] = entry
         try:
             instruction = str(payload.get("instruction") or action)
             proposal = None
             raw_proposals: list[dict[str, Any]] = []
             preflight_findings: tuple[str, ...] = ()
             for proposal_attempt in range(2):
+                entry.deadline = asyncio.get_running_loop().time() + cfg.pm.operation_timeout_ms / 1000
                 proposal = await client.propose(
                     Path(tempfile_dir(ctx.workflow_dir())), snapshot, instruction
                 )
@@ -901,6 +911,8 @@ def register_pm_routes(app: web.Application, ctx: Any, orchestrator: Any) -> Non
             if "tasks" in impacted:
                 current_wbs = await run_service(lambda thread_application: thread_application.repository.get_wbs(pctx, owner=request_owner), pctx)
                 occupied_ids.update(item.task_id for item in current_wbs.tasks)
+            if operation_id in cancelling_planning:
+                raise PmError("operation_cancelled", "planning proposal was cancelled", status=409)
             reserved_ids, raw_proposals = _reserve_planning_ids(
                 registry, operation_id, raw_proposals,
                 occupied_ids=occupied_ids,
@@ -937,9 +949,16 @@ def register_pm_routes(app: web.Application, ctx: Any, orchestrator: Any) -> Non
                 )
         except asyncio.CancelledError:
             registry._connect().execute("UPDATE pm_planning_reserved_ids SET state='RETIRED' WHERE operation_id=? AND state='RESERVED'", (operation_id,))
-            registry.finish_pm_operation(operation_id, state="cancelled", error_code="cancelled")
+            if getattr(client, "cleanup_uncertain", False) and client.proposal_running:
+                cancelling_planning.add(operation_id)
+            else:
+                registry.finish_pm_operation(operation_id, state="cancelled", error_code="cancelled")
             raise
         except Exception as exc:
+            if getattr(client, "cleanup_uncertain", False) and client.proposal_running:
+                cancelling_planning.add(operation_id)
+                registry._connect().execute("UPDATE pm_planning_reserved_ids SET state='RETIRED' WHERE operation_id=? AND state='RESERVED'", (operation_id,))
+                raise
             existing = _operation(registry, operation_id, project_id=pctx.project_id)
             if operation_id in cancelling_planning or existing["state"] == "cancelled":
                 registry._connect().execute("UPDATE pm_planning_reserved_ids SET state='RETIRED' WHERE operation_id=? AND state='RESERVED'", (operation_id,))
@@ -948,9 +967,18 @@ def register_pm_routes(app: web.Application, ctx: Any, orchestrator: Any) -> Non
             registry.finish_pm_operation(operation_id, state="failed", error_code=getattr(exc, "code", "planning_failed"))
             raise
         finally:
-            await client.stop()
-            active_planning.pop(operation_id, None)
-            cancelling_planning.discard(operation_id)
+            try:
+                await client.stop()
+                if getattr(client, "cleanup_uncertain", False):
+                    raise PmError("planning_cleanup_failed", "planning process group could not be confirmed stopped", status=503)
+                entry.cleanup_error = None
+            except BaseException as exc:
+                entry.cleanup_error = exc
+                raise
+            finally:
+                entry.finished.set()
+                if entry.cleanup_error is None and operation_id not in cancelling_planning:
+                    active_planning.pop(operation_id, None)
         return web.json_response({"operation_id": operation_id, "state": "completed", "result": result}, status=201)
 
     async def apply_planning_action(request: web.Request):
@@ -1011,33 +1039,47 @@ def register_pm_routes(app: web.Application, ctx: Any, orchestrator: Any) -> Non
                 status=409,
             )
         terminal = operation["state"] in {"completed", "failed", "cancelled"}
-        client = active_planning.get(operation_id)
-        if terminal and client is None:
-            if operation["state"] in {"completed", "failed", "cancelled"}:
-                registry._connect().execute("UPDATE pm_planning_reserved_ids SET state='RETIRED' WHERE operation_id=? AND state='RESERVED'", (operation_id,))
+        entry = active_planning.get(operation_id)
+        if terminal and entry is None:
+            registry._connect().execute("UPDATE pm_planning_reserved_ids SET state='RETIRED' WHERE operation_id=? AND state='RESERVED'", (operation_id,))
             return web.json_response(operation)
-        if client is not None:
+        if entry is not None:
             if not terminal:
                 cancelling_planning.add(operation_id)
             try:
-                await client.stop()
-            except Exception:
-                # Retain the cancellation fence and active client while process
-                # ownership is uncertain. A later retry may confirm cleanup.
+                if terminal and not entry.client.proposal_running:
+                    await entry.client.stop()
+                else:
+                    finished_before_retry = entry.finished.is_set()
+                    await entry.client.cancel_proposal()
+                    if finished_before_retry:
+                        entry.cleanup_error = None
+                    if not entry.finished.is_set():
+                        await asyncio.wait_for(
+                            entry.finished.wait(), max(0, entry.deadline - asyncio.get_running_loop().time())
+                        )
+                    if entry.cleanup_error is not None:
+                        raise PmError("planning_cleanup_failed", "planning process group could not be confirmed stopped", status=503) from entry.cleanup_error
+                # A successful explicit retry supersedes an earlier cleanup error.
+                entry.cleanup_error = None
+            except asyncio.TimeoutError as exc:
+                entry.cleanup_error = exc
+                raise PmError("planning_cleanup_failed", "planning process group could not be confirmed stopped", status=503) from exc
+            except BaseException as exc:
+                entry.cleanup_error = exc
                 raise
             if terminal:
                 active_planning.pop(operation_id, None)
                 cancelling_planning.discard(operation_id)
                 return web.json_response(
-                    _operation(
-                        registry, operation_id,
-                        project_id=host_project_id(),
-                    )
+                    _operation(registry, operation_id, project_id=host_project_id())
                 )
         registry.finish_pm_operation(
             operation_id, state="cancelled", error_code="cancelled"
         )
         registry._connect().execute("UPDATE pm_planning_reserved_ids SET state='RETIRED' WHERE operation_id=? AND state='RESERVED'", (operation_id,))
+        active_planning.pop(operation_id, None)
+        cancelling_planning.discard(operation_id)
         return web.json_response(_operation(registry, operation_id, project_id=host_project_id()))
 
     async def archive_preview(request: web.Request):

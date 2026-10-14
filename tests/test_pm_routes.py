@@ -803,6 +803,9 @@ async def test_cancel_operation_keeps_pending_when_cleanup_is_uncertain(
                 "planning_cleanup_failed", "cleanup uncertain", status=503
             )
 
+        async def cancel_proposal(self) -> None:
+            await self.stop()
+
         async def stop(self) -> None:
             self.release.set()
             raise routes_module.PmError(
@@ -867,6 +870,9 @@ async def test_cancel_fence_survives_until_proposal_request_finishes(
             finally:
                 await self.stop()
 
+        async def cancel_proposal(self) -> None:
+            await self.stop()
+
         async def stop(self) -> None:
             async with self.stop_lock:
                 if not self.stop_entered.is_set():
@@ -917,6 +923,7 @@ async def test_failed_operation_can_retry_retained_owner_cleanup(
 ) -> None:
     class RetryCleanupClient:
         cleanup_uncertain = True
+        proposal_running = False
 
         def __init__(self) -> None:
             self.stop_calls = 0
@@ -966,6 +973,7 @@ async def test_uncertain_owner_blocks_new_planning_operation(
 ) -> None:
     class UncertainOwner:
         cleanup_uncertain = True
+        proposal_running = False
 
         async def propose(self, *_args, **_kwargs):
             raise routes_module.PmError("planning_failed", "failed", status=503)
@@ -2028,4 +2036,377 @@ async def test_manual_preview_confirm_run_git_off_loop_and_keep_actual_receipt_b
         beat.cancel()
         await asyncio.gather(beat, return_exceptions=True)
         registry.close()
+        await client.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("disconnect", [False, True])
+async def test_cancel_waits_for_real_admission_and_disconnected_request(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, disconnect: bool,
+) -> None:
+    from symphony.pm.planning import PmPlanningClient
+    from tests.test_pm_planning_cancellation import MemoryRuntime
+
+    runtime = MemoryRuntime("admission")
+    runtime.install(monkeypatch)
+    auth = tmp_path / "dummy-auth"
+    auth.write_text("{}")
+    planning_client = PmPlanningClient(auth_file=auth, timeout_seconds=240)
+    monkeypatch.setattr(routes_module, "PmPlanningClient", lambda **_kwargs: planning_client)
+    cancel_entered = asyncio.Event()
+    original_operation = routes_module._operation
+    operation_id = "9" * 32
+
+    def observe_operation(registry, requested_id, **kwargs):
+        row = original_operation(registry, requested_id, **kwargs)
+        if requested_id == operation_id:
+            cancel_entered.set()
+        return row
+
+    monkeypatch.setattr(routes_module, "_operation", observe_operation)
+    client, workspace = await _authoring_client(tmp_path)
+    proposal_request = None
+    try:
+        created = await client.post("/api/v1/pm/changes", json={
+            "project_id": "p1", "workspace_path": str(workspace),
+            "locator": "cancel-before-admission", "title": "Cancel before admission",
+        })
+        assert created.status == 201, await created.text()
+        change = await created.json()
+        proposal_request = asyncio.create_task(client.post(
+            f"/api/v1/pm/changes/{change['change_id']}/planning-actions",
+            json={"project_id": "p1", "change_id": change["change_id"],
+                  "expected_revision": change["revision"], "client_operation_id": operation_id,
+                  "action": "find_gaps", "document_id": "proposal",
+                  "impacted_document_ids": ["proposal"], "instruction": "Review"},
+        ))
+        await asyncio.wait_for(runtime.entered.wait(), 2)
+        if disconnect:
+            proposal_request.cancel()
+            await asyncio.gather(proposal_request, return_exceptions=True)
+        cancel = asyncio.create_task(client.post(f"/api/v1/pm/operations/{operation_id}/cancel"))
+        await asyncio.wait_for(cancel_entered.wait(), 2)
+        await asyncio.sleep(0)
+        runtime.release.set()
+        response = await asyncio.wait_for(cancel, 2)
+        assert response.status == 200, await response.text()
+        assert (await response.json())["state"] == "cancelled"
+        if not disconnect:
+            proposal = await asyncio.wait_for(proposal_request, 2)
+            assert proposal.status == 409, await proposal.text()
+            assert (await proposal.json())["error"]["code"] == "operation_cancelled"
+        assert runtime.spawns == 0, "cancel acknowledged before startup was fenced"
+        assert not runtime.admission_cancelled
+        repeated = await client.post(f"/api/v1/pm/operations/{operation_id}/cancel")
+        assert repeated.status == 200
+        assert (await repeated.json())["state"] == "cancelled"
+        assert planning_client.process is None and not planning_client.cleanup_uncertain
+    finally:
+        runtime.release.set()
+        if proposal_request is not None:
+            await asyncio.gather(proposal_request, return_exceptions=True)
+        await runtime.close()
+        await client.close()
+
+
+@pytest.mark.asyncio
+async def test_cancel_cleanup_retry_clears_retained_error_and_allows_new_operation(tmp_path, monkeypatch):
+    from symphony.pm.planning import PmPlanningClient
+    from tests.test_pm_planning_cancellation import MemoryRuntime
+
+    runtime = MemoryRuntime("turn_wait")
+    runtime.install(monkeypatch)
+    auth = tmp_path / "dummy-auth"
+    auth.write_text("{}")
+    first_client = PmPlanningClient(auth_file=auth, timeout_seconds=240)
+    second_client = PmPlanningClient(auth_file=auth, timeout_seconds=240)
+    clients = [first_client, second_client]
+    monkeypatch.setattr(routes_module, "PmPlanningClient", lambda **_kwargs: clients.pop(0))
+    client, workspace = await _authoring_client(tmp_path)
+    registry = RunRegistry(tmp_path / "project/.symphony/state.db")
+    next_runtime = None
+    proposal = None
+    operation_id = "7" * 32
+    try:
+        created = await client.post("/api/v1/pm/changes", json={
+            "project_id": "p1", "workspace_path": str(workspace),
+            "locator": "cancel-cleanup-retry", "title": "Cancel cleanup retry",
+        })
+        change = await created.json()
+        payload = {"project_id": "p1", "change_id": change["change_id"],
+                   "expected_revision": change["revision"], "client_operation_id": operation_id,
+                   "action": "find_gaps", "document_id": "proposal",
+                   "impacted_document_ids": ["proposal"], "instruction": "Review"}
+        path = f"/api/v1/pm/changes/{change['change_id']}/planning-actions"
+        proposal = asyncio.create_task(client.post(path, json=payload))
+        await runtime.entered.wait()
+        import symphony.pm.planning as planning_module
+        monkeypatch.setattr(planning_module, "process_group_exists", lambda _pid: None)
+        failed = await client.post(f"/api/v1/pm/operations/{operation_id}/cancel")
+        assert failed.status == 503
+        assert (await failed.json())["error"]["code"] == "planning_cleanup_failed"
+        original = await proposal
+        assert original.status == 503
+        row = routes_module._operation(registry, operation_id, project_id="p1")
+        assert row["state"] == "pending"
+        blocked = await client.post(path, json={**payload, "client_operation_id": "8" * 32})
+        assert blocked.status == 503
+        assert (await blocked.json())["error"]["code"] == "planning_cleanup_failed"
+        assert len(clients) == 1
+        monkeypatch.setattr(planning_module, "process_group_exists", lambda _pid: False)
+        retried = await client.post(f"/api/v1/pm/operations/{operation_id}/cancel")
+        assert retried.status == 200, await retried.text()
+        assert (await retried.json())["state"] == "cancelled"
+        assert first_client.process is None and not first_client.cleanup_uncertain
+        next_runtime = MemoryRuntime("none")
+        next_runtime.patch = ""
+        next_runtime.install(monkeypatch)
+        accepted = await client.post(path, json={**payload, "client_operation_id": "8" * 32})
+        assert accepted.status == 201, await accepted.text()
+        assert (await accepted.json())["state"] == "completed"
+    finally:
+        runtime.release.set()
+        if proposal is not None:
+            await asyncio.gather(proposal, return_exceptions=True)
+        await runtime.close()
+        if next_runtime is not None:
+            await next_runtime.close()
+        registry.close()
+        await client.close()
+
+
+@pytest.mark.asyncio
+async def test_cancel_finishes_original_http_request_thread_within_unchanged_join(tmp_path, monkeypatch):
+    import threading
+    import urllib.error
+    import urllib.request
+
+    from symphony.pm.planning import PmPlanningClient
+    from tests.test_pm_planning_cancellation import MemoryRuntime
+
+    runtime = MemoryRuntime("admission")
+    runtime.install(monkeypatch)
+    auth = tmp_path / "dummy-auth"
+    auth.write_text("{}")
+    planning_client = PmPlanningClient(auth_file=auth, timeout_seconds=240)
+    monkeypatch.setattr(routes_module, "PmPlanningClient", lambda **_kwargs: planning_client)
+    cancel_entered = asyncio.Event()
+    original_operation = routes_module._operation
+    operation_id = "6" * 32
+
+    def observe_operation(registry, requested_id, **kwargs):
+        row = original_operation(registry, requested_id, **kwargs)
+        if requested_id == operation_id:
+            cancel_entered.set()
+        return row
+
+    monkeypatch.setattr(routes_module, "_operation", observe_operation)
+    client, workspace = await _authoring_client(tmp_path)
+    result = {}
+    thread = None
+    try:
+        created = await client.post("/api/v1/pm/changes", json={
+            "project_id": "p1", "workspace_path": str(workspace),
+            "locator": "cancel-http-thread", "title": "Cancel HTTP thread",
+        })
+        change = await created.json()
+        url = str(client.make_url(f"/api/v1/pm/changes/{change['change_id']}/planning-actions"))
+        body = json.dumps({"project_id": "p1", "change_id": change["change_id"],
+                           "expected_revision": change["revision"], "client_operation_id": operation_id,
+                           "action": "find_gaps", "document_id": "proposal",
+                           "impacted_document_ids": ["proposal"], "instruction": "Review"}).encode()
+
+        def post_proposal():
+            try:
+                request = urllib.request.Request(url, data=body, headers={"Content-Type": "application/json"})
+                with urllib.request.urlopen(request, timeout=240) as response:
+                    result["status"] = response.status
+            except urllib.error.HTTPError as error:
+                result["status"] = error.code
+                result["error"] = json.loads(error.read())["error"]["code"]
+            except Exception as error:
+                result["exception"] = repr(error)
+
+        thread = threading.Thread(target=post_proposal, daemon=True)
+        thread.start()
+        await asyncio.wait_for(runtime.entered.wait(), 2)
+        cancelled = asyncio.create_task(client.post(f"/api/v1/pm/operations/{operation_id}/cancel"))
+        await asyncio.wait_for(cancel_entered.wait(), 2)
+        await asyncio.sleep(0)
+        runtime.release.set()
+        response = await asyncio.wait_for(cancelled, 2)
+        assert response.status == 200, await response.text()
+        assert (await response.json())["state"] == "cancelled"
+        await asyncio.to_thread(thread.join, 30)
+        assert not thread.is_alive(), "cancelled planning request did not terminate"
+        assert result == {"status": 409, "error": "operation_cancelled"}
+        assert runtime.spawns == 0
+    finally:
+        runtime.release.set()
+        if thread is not None:
+            await asyncio.to_thread(thread.join, 30)
+            assert not thread.is_alive()
+        await runtime.close()
+        await client.close()
+
+
+@pytest.mark.asyncio
+async def test_cancel_refuses_handler_cleanup_failure_then_explicit_retry_recovers(tmp_path, monkeypatch):
+    from symphony.pm.models import PmError
+    from symphony.pm.planning import PmPlanningClient
+    from tests.test_pm_planning_cancellation import MemoryRuntime
+
+    class HandlerCleanupClient(PmPlanningClient):
+        handler = None
+
+        async def propose(self, *args, **kwargs):
+            self.handler = asyncio.current_task()
+            return await super().propose(*args, **kwargs)
+
+        async def stop(self):
+            if asyncio.current_task() is self.handler:
+                raise PmError("planning_cleanup_failed", "handler cleanup uncertain", status=503)
+            await super().stop()
+
+    runtime = MemoryRuntime("turn_wait")
+    runtime.install(monkeypatch)
+    auth = tmp_path / "dummy-auth"
+    auth.write_text("{}")
+    planning_client = HandlerCleanupClient(auth_file=auth, timeout_seconds=240)
+    monkeypatch.setattr(routes_module, "PmPlanningClient", lambda **_kwargs: planning_client)
+    client, workspace = await _authoring_client(tmp_path)
+    proposal = None
+    operation_id = "5" * 32
+    try:
+        created = await client.post("/api/v1/pm/changes", json={
+            "project_id": "p1", "workspace_path": str(workspace),
+            "locator": "handler-cleanup", "title": "Handler cleanup",
+        })
+        change = await created.json()
+        proposal = asyncio.create_task(client.post(
+            f"/api/v1/pm/changes/{change['change_id']}/planning-actions",
+            json={"project_id": "p1", "change_id": change["change_id"],
+                  "expected_revision": change["revision"], "client_operation_id": operation_id,
+                  "action": "find_gaps", "document_id": "proposal", "impacted_document_ids": ["proposal"]},
+        ))
+        await runtime.entered.wait()
+        failed = await client.post(f"/api/v1/pm/operations/{operation_id}/cancel")
+        assert failed.status == 503
+        assert (await failed.json())["error"]["code"] == "planning_cleanup_failed"
+        assert (await proposal).status == 503
+        state = await client.get(f"/api/v1/pm/operations/{operation_id}")
+        assert (await state.json())["state"] == "pending"
+        retried = await client.post(f"/api/v1/pm/operations/{operation_id}/cancel")
+        assert retried.status == 200, await retried.text()
+        assert (await retried.json())["state"] == "cancelled"
+        assert planning_client.process is None and not planning_client.cleanup_uncertain
+    finally:
+        runtime.release.set()
+        if proposal is not None:
+            await asyncio.gather(proposal, return_exceptions=True)
+        await runtime.close()
+        await client.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("stage", ["admission", "spawn"])
+@pytest.mark.parametrize("repeated_caller_cancel", [False, True])
+async def test_disconnected_caller_deadline_retains_unfinished_startup_until_explicit_retry(
+    tmp_path, monkeypatch, stage, repeated_caller_cancel,
+):
+    from symphony.pm.models import PmError
+    from symphony.pm.planning import PmPlanningClient
+    from tests.test_pm_planning_cancellation import MemoryRuntime
+
+    class ObservedClient(PmPlanningClient):
+        handler = None
+
+        async def propose(self, *args, **kwargs):
+            self.handler = asyncio.current_task()
+            return await super().propose(*args, **kwargs)
+
+    class UnexpectedSecondClient(PmPlanningClient):
+        async def propose(self, *args, **kwargs):
+            raise PmError("planning_failed", "a second client was admitted", status=503)
+
+    runtime = MemoryRuntime(stage)
+    runtime.install(monkeypatch)
+    auth = tmp_path / "dummy-auth"
+    auth.write_text("{}")
+    first = ObservedClient(auth_file=auth, timeout_seconds=0.02)
+    constructed = []
+    recovered = False
+
+    def factory(**_kwargs):
+        if not constructed:
+            created = first
+        elif recovered:
+            created = PmPlanningClient(auth_file=auth, timeout_seconds=240)
+        else:
+            created = UnexpectedSecondClient(auth_file=auth)
+        constructed.append(created)
+        return created
+
+    monkeypatch.setattr(routes_module, "PmPlanningClient", factory)
+    client, workspace = await _authoring_client(tmp_path)
+    proposal = None
+    next_runtime = None
+    operation_id = "4" * 32
+    try:
+        created = await client.post("/api/v1/pm/changes", json={
+            "project_id": "p1", "workspace_path": str(workspace),
+            "locator": "caller-deadline", "title": "Caller deadline",
+        })
+        change = await created.json()
+        payload = {"project_id": "p1", "change_id": change["change_id"],
+                   "expected_revision": change["revision"], "client_operation_id": operation_id,
+                   "action": "find_gaps", "document_id": "proposal",
+                   "impacted_document_ids": ["proposal"]}
+        path = f"/api/v1/pm/changes/{change['change_id']}/planning-actions"
+        proposal = asyncio.create_task(client.post(path, json=payload))
+        await asyncio.wait_for(runtime.entered.wait(), 2)
+        proposal.cancel()
+        await asyncio.gather(proposal, return_exceptions=True)
+        await asyncio.wait_for(first._cancel_requested.wait(), 1)
+        if repeated_caller_cancel:
+            first.handler.cancel()
+        await asyncio.wait_for(asyncio.gather(asyncio.shield(first.handler), return_exceptions=True), 1)
+        assert first.process is None and first.cleanup_uncertain
+        assert first._proposal_task is not None and not first._proposal_task.done()
+        if stage == "spawn":
+            assert first._temp is not None and Path(first._temp.name).is_dir()
+        state = await client.get(f"/api/v1/pm/operations/{operation_id}")
+        actual_state = (await state.json())["state"]
+        blocked = await client.post(path, json={**payload, "client_operation_id": "3" * 32})
+        blocked_body = await blocked.json()
+        assert (actual_state, blocked.status, blocked_body["error"]["code"], len(constructed)) == (
+            "pending", 503, "planning_cleanup_failed", 1,
+        )
+        refused = await client.post(f"/api/v1/pm/operations/{operation_id}/cancel")
+        assert refused.status == 503
+        assert first.cleanup_uncertain and len(constructed) == 1
+        runtime.release.set()
+        await asyncio.wait_for(asyncio.gather(first._proposal_task, return_exceptions=True), 1)
+        retried = await client.post(f"/api/v1/pm/operations/{operation_id}/cancel")
+        assert retried.status == 200, await retried.text()
+        assert (await retried.json())["state"] == "cancelled"
+        assert not first.cleanup_uncertain and first.process is None
+        assert "turn/start" not in runtime.methods and not runtime.admission_cancelled
+        recovered = True
+        next_runtime = MemoryRuntime("none")
+        next_runtime.patch = ""
+        next_runtime.install(monkeypatch)
+        accepted = await client.post(path, json={**payload, "client_operation_id": "2" * 32})
+        assert accepted.status == 201, await accepted.text()
+        assert len(constructed) == 2
+    finally:
+        runtime.release.set()
+        if proposal is not None:
+            await asyncio.gather(proposal, return_exceptions=True)
+        if first._proposal_task is not None:
+            await asyncio.gather(first._proposal_task, return_exceptions=True)
+        await first.cancel_proposal()
+        await runtime.close()
+        if next_runtime is not None:
+            await next_runtime.close()
         await client.close()

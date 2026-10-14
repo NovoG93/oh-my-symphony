@@ -1241,3 +1241,140 @@ def test_installed_demo_round5_problem_recovery(tmp_path, installed_python, chro
         assert validation.value.status == 200 and validation.value.json()['valid'] is True
         assert (directory / 'planning/openspec/changes/team-leave-request/proposal.md').read_text() == original
         assert _runs(directory) == 0
+
+
+@pytest.mark.parametrize("lang", ["en", "ko"])
+def test_installed_demo_round6_overlay_table_keyboard(tmp_path, installed_python, chrome, lang):
+    """A real TSV preview's local overflow must participate in modal Tab order."""
+    import json
+    from playwright.sync_api import expect
+    directory = tmp_path / "demo"
+    argv = [str(installed_python.parent / "symphony"), "pm", "demo", "--path", str(directory), "--lang", lang]
+    receipt = {"language": lang, "tab_path": []}
+    try:
+        with _server(argv, tmp_path, _environment(tmp_path)) as (_, url), _page(chrome) as (page, _):
+            page.set_viewport_size({"width": 320, "height": 568})
+            page.goto(url)
+            _tab(page, 'plan', lang)
+            rows = page.locator('.pm-tabulator .tabulator-row')
+            expect(rows).to_have_count(7)
+            task_id = rows.nth(1).locator('[tabulator-field="task_id"]').inner_text()
+            source = (directory / 'planning/openspec/changes/team-leave-request/tasks.md').read_bytes()
+            holder = page.locator('.pm-tabulator .tabulator-tableholder')
+            holder.focus()
+            with page.expect_response(lambda response: response.url.endswith('/wbs/preview')) as response:
+                holder.evaluate("""(node, id) => {
+                    const data = new DataTransfer(); data.setData('text/plain', `${id}\tnotes\tRound6 preview keeps the planning source unchanged`);
+                    node.dispatchEvent(new ClipboardEvent('paste', {bubbles: true, clipboardData: data}));
+                }""", task_id)
+            assert response.value.status == 200
+            receipt['preview_status'] = response.value.status
+            receipt['preview_body'] = response.value.json()
+            dialog = page.get_by_role('dialog')
+            expect(dialog).to_be_visible()
+            scroller = dialog.locator('.pm-table-scroll')
+            receipt['dimensions'] = scroller.evaluate('node => ({clientWidth: node.clientWidth, scrollWidth: node.scrollWidth})')
+            assert receipt['dimensions']['scrollWidth'] > receipt['dimensions']['clientWidth']
+            for _ in range(12):
+                receipt['tab_path'].append(page.evaluate("() => ({tag: document.activeElement.tagName, text: document.activeElement.textContent, className: document.activeElement.className})"))
+                if scroller.evaluate('node => node === document.activeElement'):
+                    break
+                page.keyboard.press('Tab')
+            receipt['reached_by_tab'] = scroller.evaluate('node => node === document.activeElement')
+            assert receipt['reached_by_tab'], receipt
+            expect(scroller).to_have_attribute('tabindex', '0')
+            expect(scroller).to_have_attribute('role', 'region')
+            assert scroller.get_attribute('aria-label')
+            receipt['focus_style'] = scroller.evaluate("node => ({style: getComputedStyle(node).outlineStyle, width: getComputedStyle(node).outlineWidth, color: getComputedStyle(node).outlineColor})")
+            assert receipt['focus_style']['style'] != 'none'
+            assert float(receipt['focus_style']['width'].removesuffix('px')) >= 2
+            page.screenshot(path=str(tmp_path / f'overlay-scroller-focus-{lang}.png'))
+            # The scroller is before Apply/Cancel in document order; both trap edges stay contained.
+            page.keyboard.press('Shift+Tab')
+            expect(dialog.locator('.pm-actions button').last).to_be_focused()
+            page.keyboard.press('Tab')
+            expect(scroller).to_be_focused()
+            page.keyboard.press('ArrowRight')
+            page.wait_for_function('node => node.scrollLeft > 0', arg=scroller.element_handle())
+            receipt['keyboard_scroll_left'] = scroller.evaluate('node => node.scrollLeft')
+            receipt['page_scroll_x'] = page.evaluate('scrollX')
+            assert receipt['page_scroll_x'] == 0
+            page.keyboard.press('Tab')
+            expect(dialog.locator('.pm-actions button').first).to_be_focused()
+            page.keyboard.press('Tab')
+            expect(dialog.locator('.pm-actions button').last).to_be_focused()
+            page.keyboard.press('Tab')
+            expect(scroller).to_be_focused()
+            page.keyboard.press('Escape')
+            expect(dialog).to_have_count(0)
+            expect(holder).to_be_focused()
+            assert not page.locator('.app').evaluate('node => node.inert')
+            assert (directory / 'planning/openspec/changes/team-leave-request/tasks.md').read_bytes() == source
+            assert _runs(directory) == 0
+    finally:
+        (tmp_path / 'round6-overlay-keyboard.json').write_text(json.dumps(receipt, indent=2), encoding='utf-8')
+
+
+def test_installed_round6_reserved_ids_overlay_component(tmp_path, installed_python, chrome):
+    """Shared installed overlay/CSS component fixture; this does not simulate a provider result."""
+    import json
+    from playwright.sync_api import expect
+    directory = tmp_path / "demo"
+    argv = [str(installed_python.parent / "symphony"), "pm", "demo", "--path", str(directory), "--lang", "en"]
+    with _server(argv, tmp_path, _environment(tmp_path)) as (_, url), _page(chrome) as (page, _):
+        page.set_viewport_size({"width": 320, "height": 568})
+        page.goto(url)
+        expect(_button(page, 'Validate', 'en')).to_be_visible()
+        opener = _button(page, 'Validate', 'en')
+        opener.focus()
+        page.evaluate("""async () => {
+            const {createPmOverlay} = await import('/static/pm/overlay.js');
+            const make = (tag, className, text) => {
+                const node = document.createElement(tag); node.className = className || '';
+                if (text) node.textContent = text; return node;
+            };
+            const owner = document.querySelector('.pm-workspace-host');
+            const panel = make('section', 'pm-inline-dialog'); panel.setAttribute('role', 'dialog');
+            panel.setAttribute('aria-label', 'Reserved IDs component fixture');
+            const section = make('section', 'pm-proposal-ids');
+            section.append(make('h3', '', 'Reserved permanent identities'));
+            const wrapper = make('div', 'pm-table-scroll'), table = make('table', 'pm-compact-table');
+            const head = make('thead'), headings = make('tr');
+            for (const title of ['Placeholder', 'Permanent ID']) {
+                const cell = make('th', '', title); cell.setAttribute('scope', 'col'); headings.append(cell);
+            }
+            head.append(headings); const body = make('tbody'), row = make('tr');
+            row.append(make('td', '', '$requirement_for_team_leave_request_form'), make('td', '', 'REQ-12345678'));
+            body.append(row); table.append(head, body); wrapper.append(table); section.append(wrapper);
+            const actions = make('div', 'pm-actions'), apply = make('button', 'btn', 'Apply component fixture');
+            actions.append(apply, make('button', 'btn', 'Discard component fixture')); panel.append(section, actions);
+            window.__round6ComponentOverlay = createPmOverlay(owner);
+            window.__round6ComponentOverlay.open(panel, {initialFocus: apply});
+        }""")
+        dialog = page.get_by_role('dialog', name='Reserved IDs component fixture', exact=True)
+        scroller = dialog.locator('.pm-table-scroll')
+        assert scroller.evaluate('node => node.scrollWidth > node.clientWidth')
+        page.keyboard.press('Tab')
+        expect(dialog.get_by_role('button', name='Discard component fixture', exact=True)).to_be_focused()
+        page.keyboard.press('Tab')
+        expect(scroller).to_be_focused()
+        expect(scroller).to_have_attribute('aria-label', 'Placeholder, Permanent ID')
+        focus = scroller.evaluate("node => ({style: getComputedStyle(node).outlineStyle, width: getComputedStyle(node).outlineWidth})")
+        assert focus['style'] != 'none' and float(focus['width'].removesuffix('px')) >= 2
+        page.keyboard.press('ArrowRight')
+        page.wait_for_function('node => node.scrollLeft > 0', arg=scroller.element_handle())
+        assert page.evaluate('scrollX') == 0
+        page.screenshot(path=str(tmp_path / 'reserved-ids-component-focus.png'))
+        # A fitting table must leave the modal tab sequence after a real viewport resize.
+        page.set_viewport_size({"width": 1280, "height": 800})
+        assert scroller.evaluate('node => node.scrollWidth <= node.clientWidth')
+        dialog.get_by_role('button', name='Discard component fixture', exact=True).focus()
+        page.keyboard.press('Tab')
+        expect(dialog.get_by_role('button', name='Apply component fixture', exact=True)).to_be_focused()
+        expect(scroller).to_have_attribute('tabindex', '-1')
+        page.keyboard.press('Escape')
+        expect(dialog).to_have_count(0)
+        expect(opener).to_be_focused()
+        page.evaluate('window.__round6ComponentOverlay.destroy()')
+        assert _runs(directory) == 0
+        (tmp_path / 'reserved-ids-component.json').write_text(json.dumps({"kind": "real installed overlay and CSS with DOM component fixture", "provider_result": False, "focus": focus, "keyboard_local_scroll": True, "fitting_resize_excluded": True}, indent=2), encoding='utf-8')

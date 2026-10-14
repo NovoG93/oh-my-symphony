@@ -398,6 +398,8 @@ class UiNode {
   closest(selector) { return this.matches(selector) ? this : this.parentNode?.closest(selector) || null; }
   get className() { return this.getAttribute('class') || ''; }
   set className(value) { this.setAttribute('class', value); }
+  get tabIndex() { const value = this.getAttribute('tabindex'); return value === null ? (['button', 'input', 'textarea', 'select'].includes(this.tag) ? 0 : -1) : Number(value); }
+  set tabIndex(value) { this.setAttribute('tabindex', value); }
   get options() { return this.querySelectorAll('option'); }
   get selectedOptions() { return this.options.filter((node) => node.selected); }
   get children() { return this.childNodes.filter((node) => node.nodeType === 1); }
@@ -950,4 +952,55 @@ test('round5 shared toast adapter keeps ordinary host semantics and sets PM role
   assert.equal(error.role, null, 'PM inline error is already the live alert when the companion toast is appended');
   assert.equal(error.node.getAttribute('aria-live'), null);
   assert.equal(pending.length, 5);
+});
+
+
+test('round6 modal table focus cycle includes only current overflow and excludes non-tab stops', async (t) => {
+  const owner = await mountedPm(t);
+  const make = (tag, attrs = {}, text = '') => {
+    const node = new UiNode(tag);
+    for (const [key, value] of Object.entries(attrs)) node.setAttribute(key, value);
+    if (text) node.append(text);
+    return node;
+  };
+  const tableRegion = (scrollWidth, clientWidth) => {
+    const wrapper = make('div', { class: 'pm-table-scroll' });
+    const table = make('table', { class: 'pm-compact-table' });
+    const row = make('tr');
+    row.append(...['Task', 'Field', 'Value'].map((name) => make('th', { scope: 'col' }, name)));
+    table.append(row); wrapper.append(table);
+    wrapper.scrollWidth = scrollWidth; wrapper.clientWidth = clientWidth;
+    return wrapper;
+  };
+  const overflow = tableRegion(460, 160), fitting = tableRegion(120, 200);
+  const first = make('button', {}, 'Apply'), last = make('button', {}, 'Cancel');
+  const negativeBefore = make('div', { tabindex: '-2' }), negativeAfter = make('div', { tabindex: '-1' });
+  const disabled = make('button', { disabled: '' }, 'Disabled');
+  const hiddenParent = make('section', { hidden: '' }); hiddenParent.append(make('input'));
+  const dialog = make('section', { role: 'dialog' });
+  dialog.append(negativeBefore, overflow, fitting, first, last, negativeAfter, disabled, hiddenParent);
+  const opener = findButton(owner, 'Edit source'); opener.focus();
+  const overlay = createPmOverlay(owner); t.after(() => overlay.destroy());
+  assert.equal(overlay.open(dialog, { initialFocus: first }), true);
+  last.focus(); await dialog.trigger('keydown', { key: 'Tab', shiftKey: false });
+  assert.equal(document.activeElement, overflow, 'Forward modal wrap reaches the scroll region before Apply');
+  assert.equal(overflow.getAttribute('role'), 'region');
+  assert.equal(overflow.getAttribute('aria-label'), 'Task, Field, Value');
+  assert.equal(overflow.tabIndex, 0);
+  assert.equal(fitting.tabIndex, -1, 'A fitting table adds no tab stop');
+  await dialog.trigger('keydown', { key: 'Tab', shiftKey: true });
+  assert.equal(document.activeElement, last);
+  // Re-evaluate actual overflow when the dialog width changes while it stays open.
+  fitting.scrollWidth = 500; overflow.scrollWidth = 100;
+  last.focus(); await dialog.trigger('keydown', { key: 'Tab', shiftKey: false });
+  assert.equal(document.activeElement, fitting);
+  assert.equal(overflow.tabIndex, -1);
+  fitting.scrollWidth = 100;
+  last.focus(); await dialog.trigger('keydown', { key: 'Tab', shiftKey: false });
+  assert.equal(document.activeElement, first, 'Negative, disabled and hidden candidates are not tabbable');
+  await dialog.trigger('keydown', { key: 'Tab', shiftKey: true });
+  assert.equal(document.activeElement, last);
+  await dialog.trigger('keydown', { key: 'Escape' });
+  assert.equal(document.activeElement, opener);
+  assert.equal(document.body.querySelector('[role="dialog"]'), null);
 });
