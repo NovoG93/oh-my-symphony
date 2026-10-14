@@ -9,6 +9,7 @@ import time
 
 import pytest
 
+from symphony._shell import _host_boot_token
 from symphony.pm import codex_compatibility, host_tools, openspec
 from symphony.workflow import build_service_config, parse_workflow_text
 from tests._pm_support import fake_node
@@ -28,6 +29,8 @@ def environment_unchanged():
 
 @pytest.fixture(autouse=True)
 def clean_environment(environment_unchanged, tmp_path, monkeypatch):
+    # PATH-changing probes must not retain a failed host sysctl lookup.
+    _host_boot_token.cache_clear()
     for key in tuple(os.environ):
         if key in {
             "SYMPHONY_LANG", "SYMPHONY_API_TOKEN", "SYMPHONY_TRUSTED_ORIGINS",
@@ -38,6 +41,8 @@ def clean_environment(environment_unchanged, tmp_path, monkeypatch):
     monkeypatch.setenv("SYMPHONY_PROJECTS_FILE", str(tmp_path / "projects.json"))
     monkeypatch.setattr(codex_compatibility, "_CACHE", {})
     monkeypatch.setattr(openspec, "_NODE_CACHE", {})
+    yield
+    _host_boot_token.cache_clear()
 
 
 def _config(tmp_path, **pm):

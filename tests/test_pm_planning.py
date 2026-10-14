@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+import signal
 import textwrap
 from pathlib import Path
 
@@ -280,24 +281,42 @@ async def test_stop_kills_term_resistant_group_after_leader_exits(tmp_path: Path
         stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
     )
-    leader_identity = planning_module.process_identity(process.pid)
-    deadline = asyncio.get_running_loop().time() + 5
-    while not pid_file.exists():
-        assert asyncio.get_running_loop().time() < deadline
-        await asyncio.sleep(0.01)
-    owned_identities = planning_module.process_group_identities(process.pid)
-    assert leader_identity is not None
-    assert owned_identities is not None and len(owned_identities) >= 2
-    await process.wait()
-    child_pid = int(pid_file.read_text(encoding="utf-8"))
-    client = PmPlanningClient()
-    client.process = process
-    client._process_identity = leader_identity
-    client._owned_process_identities = owned_identities
-    await client.stop()
-    with pytest.raises(ProcessLookupError):
-        os.kill(child_pid, 0)
-    assert client.process is None
+    try:
+        leader_identity = planning_module.process_identity(process.pid)
+        deadline = asyncio.get_running_loop().time() + 5
+        while not pid_file.exists():
+            assert asyncio.get_running_loop().time() < deadline
+            await asyncio.sleep(0.01)
+        owned_identities = planning_module.process_group_identities(process.pid)
+        assert leader_identity is not None
+        assert owned_identities is not None and len(owned_identities) >= 2
+        await process.wait()
+        child_pid = int(pid_file.read_text(encoding="utf-8"))
+        client = PmPlanningClient()
+        client.process = process
+        client._process_identity = leader_identity
+        client._owned_process_identities = owned_identities
+        await client.stop()
+        with pytest.raises(ProcessLookupError):
+            os.kill(child_pid, 0)
+        assert client.process is None
+    finally:
+        # Keep assertion failures from leaving this fixture's resistant child alive.
+        owned_group = process.returncode is None
+        if not owned_group and pid_file.exists():
+            try:
+                owned_group = os.getpgid(int(pid_file.read_text())) == process.pid
+            except ProcessLookupError:
+                pass
+        if owned_group:
+            try:
+                os.killpg(process.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+        await process.wait()
+        if process.stdin is not None:
+            process.stdin.close()
+
 
 
 @pytest.mark.asyncio
