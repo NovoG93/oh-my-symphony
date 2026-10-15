@@ -731,6 +731,161 @@ test('round7 native Add child follows restored leaf/group selection and read-onl
   });
 });
 
+test('round12 Indent pressed before the Outdent refresh lands runs on the refreshed WBS', async (t) => {
+  const deferred = () => { let resolve; const promise = new Promise((done) => { resolve = done; }); return { promise, resolve }; };
+  const group = { task_id: 'G-1', parent_id: null, order: -1, kind: 'Group', title: 'Group', executable: false };
+  const child = { task_id: 'T-1', parent_id: 'G-1', order: 0, kind: 'Feature', title: 'Leaf', executable: true };
+  let server = { revision: 'rev1', tasks: [group, child] };
+  const patches = [], outdentPatch = deferred(), refreshChange = deferred();
+  let holdRefresh = false;
+  const root = await mountedPm(t, { tab: 'plan', apiRequest: async (path, options) => {
+    const pathname = path.split('?')[0];
+    if (pathname === '/changes/c1') {
+      if (holdRefresh) { holdRefresh = false; await refreshChange.promise; }
+      return { change_id: 'c1', locator: 'team-leave-request', revision: server.revision, state: 'Draft', workspace_state: 'ATTACHED', documents: [], storyboard_frames: [] };
+    }
+    if (!pathname.endsWith('/wbs')) return undefined;
+    if (options?.method !== 'PATCH') return { tasks: server.tasks, findings: [] };
+    patches.push(options.body);
+    const [operation] = options.body.payload.operations;
+    if (patches.length === 1) { await outdentPatch.promise; holdRefresh = true; }
+    server = { revision: `rev${patches.length + 1}`, tasks: server.tasks.map((task) => (task.task_id === operation.task_id ? { ...task, [operation.field]: operation.value } : task)) };
+    return { impacted_ids: [operation.task_id] };
+  } });
+  await root.querySelector('[data-task-id="T-1"]').trigger('click');
+  const outdent = findButton(root, 'Outdent').trigger('click'); await settlePm();
+  assert.deepEqual(patches.map((body) => [body.expected_revision, body.payload.operations]), [['rev1', [{ op: 'set_field', task_id: 'T-1', field: 'parent_id', value: null }]]]);
+  // PATCH 200 returns; the change refresh is still pending, so the outgoing view still shows T-1 as G-1's first child.
+  outdentPatch.resolve(); await settlePm();
+  assert.equal(root.querySelector('[data-task-id="T-1"]').getAttribute('aria-level'), '2');
+  const staleIndent = findButton(root, 'Indent'); staleIndent.focus();
+  const indent = staleIndent.trigger('click'); await settlePm();
+  refreshChange.resolve(); await Promise.all([outdent, indent]); await settlePm();
+  assert.equal(root.querySelector('.pm-action-error'), null, root.textContent);
+  assert.deepEqual(patches.map((body) => [body.expected_revision, body.payload.operations]), [
+    ['rev1', [{ op: 'set_field', task_id: 'T-1', field: 'parent_id', value: null }]],
+    ['rev2', [{ op: 'set_field', task_id: 'T-1', field: 'parent_id', value: 'G-1' }]],
+  ]);
+  assert.notEqual(patches[0].client_operation_id, patches[1].client_operation_id);
+  assert.equal(root.querySelector('.pm-revision-bar').textContent.includes('rev3'), true, root.querySelector('.pm-revision-bar').textContent);
+  assert.equal(root.querySelector('[data-task-id="T-1"]').getAttribute('aria-level'), '2');
+  assert.equal(document.activeElement, root.querySelector('[aria-current="page"]'), 'mutation refresh keeps the existing current-tab focus');
+  // T-1 is again G-1's first child, so a further Indent is genuinely ineligible and stays a no-op.
+  await findButton(root, 'Indent').trigger('click'); await settlePm();
+  assert.equal(patches.length, 2);
+});
+
+// Two changes with their own WBS; every PATCH waits until the test releases it.
+async function heldWbsPm(t, { failures = [], announcements = [] } = {}) {
+  const deferred = () => { let resolve; const promise = new Promise((done) => { resolve = done; }); return { promise, resolve }; };
+  const rows = [{ change_id: 'c1', locator: 'team-leave-request', state: 'Draft' }, { change_id: 'c2', locator: 'other-change', state: 'Draft' }];
+  const servers = {
+    c1: { version: 1, tasks: [{ task_id: 'G-1', parent_id: null, order: -1, kind: 'Group', title: 'Group', executable: false }, { task_id: 'T-1', parent_id: 'G-1', order: 0, kind: 'Feature', title: 'Leaf', executable: true }] },
+    c2: { version: 1, tasks: [{ task_id: 'G-9', parent_id: null, order: 10, kind: 'Group', title: 'Other group', executable: false }] },
+  };
+  const patches = [], gates = [];
+  const gate = (index) => (gates[index] ||= deferred());
+  const root = await mountedPm(t, { tab: 'plan', announcements, apiRequest: async (path, options) => {
+    const pathname = path.split('?')[0];
+    if (pathname === '/changes') return { changes: structuredClone(rows) };
+    const [, , id, resource] = pathname.split('/'), server = servers[id];
+    if (!server) return undefined;
+    if (!resource) return { ...rows.find((row) => row.change_id === id), revision: `${id}-rev${server.version}`, workspace_state: 'ATTACHED', documents: [], storyboard_frames: [] };
+    if (resource !== 'wbs') return undefined;
+    if (options?.method !== 'PATCH') return { tasks: server.tasks, findings: [] };
+    const index = patches.length, [operation] = options.body.payload.operations;
+    patches.push([id, options.body.expected_revision, operation.op]);
+    await gate(index).promise;
+    if (failures.includes(index)) throw new Error('Outdent was rejected.');
+    server.version += 1;
+    if (operation.op === 'create_task') {
+      const task_id = `${id}-NEW-${index}`; server.tasks = [...server.tasks, { ...operation.task, task_id }];
+      return { impacted_ids: [task_id] };
+    }
+    server.tasks = server.tasks.map((task) => (task.task_id === operation.task_id ? { ...task, [operation.field]: operation.value } : task));
+    return { impacted_ids: [operation.task_id] };
+  } });
+  const choose = async (id) => { const select = root.querySelector('.pm-change-select'); select.value = id; await select.trigger('change'); await settlePm(); };
+  // Outdent T-1 and hold its PATCH, then press Add group so it waits in the command queue.
+  const queueBehindOutdent = async () => {
+    await root.querySelector('[data-task-id="T-1"]').trigger('click');
+    const outdent = findButton(root, 'Outdent').trigger('click'); await settlePm();
+    const addGroup = findButton(root, 'Add group').trigger('click'); await settlePm();
+    assert.deepEqual(patches, [['c1', 'c1-rev1', 'set_field']], 'Add group waits behind the pending Outdent');
+    return { settled: Promise.all([outdent, addGroup]) };
+  };
+  return { root, patches, release: (index) => gate(index).resolve(), choose, queueBehindOutdent };
+}
+
+test('round13 a queued WBS command is dropped when its change is left before it runs', async (t) => {
+  for (const route of [['c2'], ['c2', 'c1']]) await t.test(`c1→${route.join('→')}`, async (context) => {
+    const { root, patches, release, choose, queueBehindOutdent } = await heldWbsPm(context);
+    const commands = await queueBehindOutdent();
+    for (const id of route) await choose(id);
+    const current = route.at(-1);
+    assert.equal(root.querySelector('.pm-change-select').value, current);
+    release(0); await settlePm();
+    assert.deepEqual(patches, [['c1', 'c1-rev1', 'set_field']], 'the old view\'s queued Add group writes to no change');
+    await commands.settled;
+    // A command pressed in the current view still runs, once, against that change.
+    const fresh = findButton(root, 'Add group').trigger('click'); await settlePm();
+    assert.deepEqual(patches[1], [current, current === 'c1' ? 'c1-rev2' : 'c2-rev1', 'create_task']);
+    release(1); await fresh; await settlePm();
+    assert.equal(root.querySelector('.pm-action-error'), null, root.textContent);
+    assert.equal(patches.length, 2);
+  });
+});
+
+test('round13 a queued WBS command is dropped when PM unmounts before it runs', async (t) => {
+  let held;
+  await t.test('mounted', async (context) => {
+    held = await heldWbsPm(context);
+    held.commands = await held.queueBehindOutdent();
+  });
+  // The subtest's teardown has unmounted PM; releasing the held Outdent must not issue the queued write.
+  held.release(0); await settlePm();
+  assert.deepEqual(held.patches, [['c1', 'c1-rev1', 'set_field']]);
+  await held.commands.settled;
+});
+
+test('round13 a rejected first WBS command is reported and the queued command runs once without replay', async (t) => {
+  const announcements = [];
+  const { root, patches, release, queueBehindOutdent } = await heldWbsPm(t, { failures: [0], announcements });
+  const commands = await queueBehindOutdent();
+  release(0); await settlePm();
+  assert.match(root.querySelector('.pm-action-error').textContent, /Outdent was rejected\./);
+  assert.ok(announcements.some(([message, kind]) => kind === 'error' && /Outdent was rejected\./.test(message)));
+  assert.deepEqual(patches, [['c1', 'c1-rev1', 'set_field'], ['c1', 'c1-rev1', 'create_task']], 'the failed Outdent is not replayed');
+  release(1); await commands.settled; await settlePm();
+  assert.equal(patches.length, 2);
+  assert.ok(root.querySelector('[data-task-id="c1-NEW-1"]'), root.textContent);
+  assert.equal(root.querySelector('.pm-revision-bar').textContent.includes('c1-rev2'), true);
+  // T-1 stayed G-1's first child, so Indent remains a genuine no-op.
+  await root.querySelector('[data-task-id="T-1"]').trigger('click');
+  assert.equal(root.querySelector('[data-task-id="T-1"]').getAttribute('aria-level'), '2');
+  await findButton(root, 'Indent').trigger('click'); await settlePm();
+  assert.equal(patches.length, 2);
+});
+
+test('round13 a queued WBS command is dropped when its Plan tab or WBS subview is left before it runs', async (t) => {
+  for (const route of [['Idea'], ['Idea', 'Plan'], ['Dependencies', 'Work breakdown'], ['Plan document', 'Work breakdown']]) await t.test(`WBS→${route.join('→')}`, async (context) => {
+    const { root, patches, release, queueBehindOutdent } = await heldWbsPm(context);
+    const commands = await queueBehindOutdent();
+    for (const label of route) { await findButton(root, label).trigger('click'); await settlePm(); }
+    release(0); await settlePm();
+    assert.equal(root.querySelector('.pm-action-error'), null, root.textContent);
+    assert.deepEqual(patches, [['c1', 'c1-rev1', 'set_field']], 'the left view\'s queued Add group is not sent');
+    await commands.settled;
+    if (route.at(-1) === 'Idea') { await findButton(root, 'Plan').trigger('click'); await settlePm(); }
+    // A command pressed in the current WBS view still runs, once, on the refreshed revision.
+    const fresh = findButton(root, 'Add group').trigger('click'); await settlePm();
+    assert.deepEqual(patches[1], ['c1', 'c1-rev2', 'create_task']);
+    release(1); await fresh; await settlePm();
+    assert.equal(root.querySelector('.pm-action-error'), null, root.textContent);
+    assert.equal(patches.length, 2);
+  });
+});
+
 async function loadI18n({ href, stored = null, storageDisabled = false }) {
   const source = await readFile(new URL('../src/symphony/web/static/i18n.js', import.meta.url), 'utf8');
   const values = new Map(stored === null ? [] : [['symphony.lang', stored]]), writes = [], replacements = [];

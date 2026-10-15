@@ -152,7 +152,7 @@ export function mountArtifacts({ root, projectId, api: hostApi, ui, onDirtyChang
   }
 
   async function load() {
-    const token = state.beginLoad();
+    const token = state.beginLoad(); wbsVisit += 1;
     const capabilities = await api.capabilities(token.signal);
     if (capabilities.project_id) api.setProjectId(capabilities.project_id);
     const changes = await api.changes(token.signal);
@@ -229,7 +229,7 @@ export function mountArtifacts({ root, projectId, api: hostApi, ui, onDirtyChang
       selectedTask: state.selectedTask, planScroll: state.planScroll, editingRequirement, selectedStoryboardId,
       undo: [...history.undo], redo: [...history.redo], url: location.href,
     };
-    const token = state.beginLoad();
+    const token = state.beginLoad(); wbsVisit += 1;
     root.setAttribute('aria-busy', 'true');
     for (const control of root.querySelectorAll('button, input, textarea, select')) control.disabled = true;
     try {
@@ -258,7 +258,7 @@ export function mountArtifacts({ root, projectId, api: hostApi, ui, onDirtyChang
 
   async function selectTab(tab) {
     if (tab === state.tab || !guard('Discard unsaved changes and leave this tab?')) return;
-    state.setDirty(false); state.setTab(tab);
+    state.setDirty(false); state.setTab(tab); wbsVisit += 1;
     const token = state.beginLoad(); await hydrate(token);
     if (state.isCurrent(token.epoch)) render();
   }
@@ -266,7 +266,7 @@ export function mountArtifacts({ root, projectId, api: hostApi, ui, onDirtyChang
   async function selectSubview(kind, value) {
     if (!guard()) return;
     if (kind === 'design') state.setDesignView(value); else state.setPlanView(value);
-    const token = state.beginLoad(); await hydrate(token);
+    wbsVisit += 1; const token = state.beginLoad(); await hydrate(token);
     if (state.isCurrent(token.epoch)) render();
   }
 
@@ -276,7 +276,18 @@ export function mountArtifacts({ root, projectId, api: hostApi, ui, onDirtyChang
     disposeWbs();
     root.replaceChildren(buildHeader(), buildTabs(), buildBody());
     localizePm(root);
+    revealActiveTab();
     if (!keepOverlay) root.querySelector('[aria-current="page"]')?.focus({ preventScroll: true });
+  }
+
+  // The rebuilt strip starts at scrollLeft 0, so a narrow screen can clip the active tab.
+  // Scroll only the strip, after localization sets label widths; ancestors stay put.
+  function revealActiveTab() {
+    const nav = root.querySelector('.pm-tabs'), item = nav?.querySelector('[aria-current="page"]')?.getBoundingClientRect?.();
+    if (!item) return;
+    const left = nav.getBoundingClientRect().left + nav.clientLeft, right = left + nav.clientWidth;
+    if (item.left < left) nav.scrollLeft += item.left - left;
+    else if (item.right > right) nav.scrollLeft += Math.min(item.right - right, item.left - left);
   }
 
   function buildHeader() {
@@ -451,7 +462,7 @@ export function mountArtifacts({ root, projectId, api: hostApi, ui, onDirtyChang
     const handoff = limitAction(button('Preview approved handoff', previewHandoff, 'btn btn-primary'), 'handoff');
     const archive = limitNodeAction(limitAction(button('Preview archive', previewArchive), 'handoff'));
     stack.append(ui.el('div', { class: 'pm-plan-action-row' }, [archive, handoff]));
-    stack.append(renderWbs({ ui, overlay, view: state.wbs, semanticIndex: state.change.semantic_index || [], onNavigateReference: safeAction(navigateSemantic), onSetField: safeAction(setTaskField), onPaste: safeAction(previewPaste), onCommand: safeAction(commandWbs), onCopy: safeAction(copyTsv), onSelect: state.setSelectedTask, onFilter: state.setPlanFilter, onScroll: state.setPlanScroll, selectedTask: state.selectedTask, filter: state.planFilter, scrollTop: state.planScroll, canUndo: history.undo.length > 0, canRedo: history.redo.length > 0, approved: Boolean(state.change.approval_id), readOnlyReason: availability('authoring').effective ? '' : unavailableReason('authoring') }));
+    stack.append(renderWbs({ ui, overlay, view: state.wbs, semanticIndex: state.change.semantic_index || [], onNavigateReference: safeAction(navigateSemantic), onSetField: safeAction(setTaskField), onPaste: safeAction(previewPaste), onCommand: safeAction(queueWbsCommand), onCopy: safeAction(copyTsv), onSelect: state.setSelectedTask, onFilter: state.setPlanFilter, onScroll: state.setPlanScroll, selectedTask: state.selectedTask, filter: state.planFilter, scrollTop: state.planScroll, canUndo: history.undo.length > 0, canRedo: history.redo.length > 0, approved: Boolean(state.change.approval_id), readOnlyReason: availability('authoring').effective ? '' : unavailableReason('authoring') }));
     stack.append(renderExchangePanel({ ui, onExport: exportPlanning, onImport: importWorkbook, onApply: applyImport, workbookAvailability: hostAvailability('exchange'), readOnly: archived(), onError: reportActionError, translate: pmText }), renderFindings(ui, state.wbs.findings));
     return stack;
   }
@@ -636,6 +647,20 @@ export function mountArtifacts({ root, projectId, api: hostApi, ui, onDirtyChang
     const normalized = ['acceptance', 'verification', 'requirement_refs', 'storyboard_refs', 'design_refs'].includes(field) && typeof value === 'string' ? value.split('\n').map((item) => item.trim()).filter(Boolean) : value;
     const apiField = TASK_TO_API_FIELD[field] || field;
     await runWbs([{ op: 'set_field', task_id: taskId, field: apiField, value: normalized }], [{ op: 'set_field', task_id: taskId, field: apiField, value: task[field] }], true, true);
+  }
+
+  // A command pressed while an earlier one is still refreshing would read the outgoing
+  // state.wbs; run commands in order so each sees the refreshed tasks and revision.
+  // A queued command belongs to the change and visit it was pressed in: a change
+  // switch, reload, tab or subview change or unmount drops it, while the queue's own
+  // refreshes keep it.
+  let wbsCommands = Promise.resolve(), wbsVisit = 0;
+  function queueWbsCommand(command, selectedId) {
+    const changeId = state.change?.change_id, visit = wbsVisit;
+    const owned = () => !state.disposed && visit === wbsVisit && state.change?.change_id === changeId;
+    const run = wbsCommands.then(() => (owned() ? commandWbs(command, selectedId) : undefined));
+    wbsCommands = run.catch(() => {});
+    return run;
   }
 
   async function commandWbs(command, selectedId) {

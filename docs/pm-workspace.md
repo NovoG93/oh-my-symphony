@@ -15,7 +15,7 @@ Storyboard frames are ordered functional cards. Selecting one opens structured s
 
 The planning assistant offers seven explicit proposal-only actions: Draft artifact, Refine selected section, Find gaps, Review consistency, Explain dependency, Propose WBS, and Update impacted artifacts. The server owns section and target scope; every proposed document diff is reviewed before apply. When a proposal needs new managed identities, the host reserves permanent IDs and shows them in the review. Apply activates those IDs. Discard or cancellation retires unused reservations.
 
-Each planning screen has a **What do these buttons do?** panel that explains every button in one sentence. It is folded by default and open in the demo. To choose the page language, add `?lang=en` or `?lang=ko` before the `#` in the address, for example `http://127.0.0.1:<port>/?lang=ko#/artifacts`. The choice is remembered like the language switch.
+Each planning screen has a **What do these buttons do?** panel that explains every button in one sentence. It is folded by default in ordinary and demo workspaces. To choose the page language, add `?lang=en` or `?lang=ko` before the `#` in the address, for example `http://127.0.0.1:<port>/?lang=ko#/artifacts`. The choice is remembered like the language switch.
 
 Document editors begin in readable view. **Edit source** reveals the editor and focuses its textarea; **Review document** returns to the preview. In Korean these controls read **소스 편집** and **문서 검토** through repeated toggles. Opening the source from Design → Storyboard, UX, or API preserves the selected language for the nested editor and its Add controls. Toggling does not save or discard a draft.
 

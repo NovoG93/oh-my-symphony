@@ -31,6 +31,7 @@
 .pm-plan-stack { display: grid; min-width: 0; gap: 18px; }
 .pm-plan-action-row { justify-content: flex-end; flex-wrap: wrap; min-width: 0; }
 .pm-plan-surface, .pm-exchange-panel, .pm-inline-dialog { width: 100%; min-width: 0; padding: 18px; border: 1px solid var(--border); border-radius: 12px; background: var(--surface); }
+.pm-exchange-panel input[type=file] { min-width: 0; max-width: 100%; }
 .pm-table-scroll { width: 100%; min-width: 0; max-width: 100%; overflow: auto; margin-top: 14px; }
 .pm-tabulator { width: 100%; max-width: 100%; }
 .pm-wbs-table, .pm-compact-table { width: 100%; border-collapse: collapse; font-size: 0.93333rem; }
