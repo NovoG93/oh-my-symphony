@@ -1281,7 +1281,7 @@ def _locked_change(registry: RunRegistry, project_id: str, change_id: str, works
 
 
 def _resolve_change_root(
-    workspace: Path, change_id: str, *, archived: bool = False
+    workspace: Path, change_id: str, *, archived: bool = False, recover: bool = True
 ) -> tuple[Path, dict[str, Any]]:
     changes = workspace / "openspec" / "changes"
     workspace = workspace.resolve()
@@ -1330,7 +1330,8 @@ def _resolve_change_root(
             status=409,
         )
     resolved, identity = matches[0]
-    if not archived:
+    # recover=False is a read-only lookup: no journal recovery or reload.
+    if not archived and recover:
         _recover_change_transactions(resolved)
         identity = _load_identity(resolved)
     return resolved, dict(identity)

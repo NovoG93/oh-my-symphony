@@ -4,6 +4,58 @@ export function sourceEditPolicy(source) {
     : { editable: true, reason: '' };
 }
 
+// Display-only projection for PM readable views. Removes only complete managed
+// metadata at top level (outside fences, quotes and indented code), mirroring
+// semantic.py/wbs.py grammar; every other line is returned byte for byte.
+const WBS_FORMAT_LINE = /^ {0,3}<!-- symphony-wbs-format: 1 -->\s*$/;
+const SEMANTIC_MARKER_LINE = /^ {0,3}<!--\s*symphony:(?:req|scenario|storyboard|contract|decision)=[A-Z]+-[A-Za-z0-9]+(?:-[A-Za-z0-9]+)*\s*-->\s*$/;
+const BLOCK_OPEN_LINE = /^ {0,3}<!-- symphony-(task|group):[A-Z]-[A-Z0-9]+ -->\s*$/;
+const BLOCK_CLOSE_LINE = /^ {0,3}<!-- \/symphony-(task|group) -->\s*$/;
+const BLOCK_YAML_LINE = /^ {0,3}```yaml symphony-(task|group)\s*$/;
+const BLOCK_YAML_CLOSE_LINE = /^```\s*$/;
+
+export function readableSource(source) {
+  const text = String(source ?? '');
+  const lines = text.split('\n');
+  // Pass 1: fence context. topLevel marks lines outside any fence, quote or indent;
+  // fenceEnd maps a top-level fence opener to its closing line (-1 when unclosed).
+  const topLevel = [], fenceEnd = new Map();
+  let fence = null;
+  lines.forEach((line, index) => {
+    const stripped = line.replace(/^[ \t]+/, '');
+    const marker = stripped.match(/^(`{3,}|~{3,})/);
+    if (fence) {
+      const closing = line.match(/^ {0,3}(`{3,}|~{3,})\s*$/);
+      if (closing && closing[1][0] === fence.char && closing[1].length >= fence.length) { fenceEnd.set(fence.start, index); fence = null; }
+      topLevel.push(false); return;
+    }
+    if (marker) { fence = { char: marker[1][0], length: marker[1].length, start: index }; fenceEnd.set(index, -1); }
+    topLevel.push(!marker && !stripped.startsWith('>') && !line.startsWith('    ') && !line.startsWith('\t'));
+  });
+  // Pass 2: pair complete task/group blocks with a stack, so groups may contain tasks.
+  const pairs = new Map(), stack = [];
+  lines.forEach((line, index) => {
+    if (!topLevel[index]) return;
+    const open = line.match(BLOCK_OPEN_LINE), close = line.match(BLOCK_CLOSE_LINE);
+    if (open) stack.push({ kind: open[1], index });
+    else if (close && stack.at(-1)?.kind === close[1]) pairs.set(stack.pop().index, index);
+  });
+  // Pass 3: remove S1/S2 lines, paired markers and same-kind YAML fences closed inside their block
+  // by an exact triple-backtick line; a longer or indented closer leaves the fence visible.
+  const removed = new Set(), enclosing = [];
+  lines.forEach((line, index) => {
+    if (enclosing.length && enclosing.at(-1).close === index) { enclosing.pop(); removed.add(index); return; }
+    if (pairs.has(index)) { enclosing.push({ kind: line.match(BLOCK_OPEN_LINE)[1], close: pairs.get(index) }); removed.add(index); return; }
+    if (topLevel[index] && (WBS_FORMAT_LINE.test(line) || SEMANTIC_MARKER_LINE.test(line))) { removed.add(index); return; }
+    const yaml = fenceEnd.has(index) && line.match(BLOCK_YAML_LINE);
+    const end = yaml ? fenceEnd.get(index) : -1;
+    if (yaml && enclosing.at(-1)?.kind === yaml[1] && end > index && end < enclosing.at(-1).close && BLOCK_YAML_CLOSE_LINE.test(lines[end])) {
+      for (let item = index; item <= end; item += 1) removed.add(item);
+    }
+  });
+  return removed.size ? lines.filter((_, index) => !removed.has(index)).join('\n') : text;
+}
+
 export function renderDocumentEditor({ ui, document, error, draft, onSave, onAssist, onDirty, onDraft, authoring = { effective: true, reasons: [] }, assistance = { effective: true, reasons: [] }, onError = () => {}, translate = (value) => value }) {
   const { el, renderMarkdown } = ui;
   if (error) return el('section', { class: 'pm-error-state', role: 'alert' }, [el('h2', null, 'Document unavailable'), el('p', null, error)]);
@@ -20,9 +72,10 @@ export function renderDocumentEditor({ ui, document, error, draft, onSave, onAss
   });
   source.value = initial;
   source.disabled = !editPolicy.editable;
-  const preview = el('article', { class: 'pm-document-preview' }, renderMarkdown(initial));
+  const preview = el('article', { class: 'pm-document-preview' }, renderMarkdown(readableSource(initial)));
   const sourcePane = el('section', { class: 'pm-editor-pane', hidden: true });
-  const reviewPane = el('section', { class: 'pm-preview-pane pm-preview-readable' }, [el('h2', null, 'Readable view'), preview]);
+  // The heading stays as the pane's accessible name without pushing content below the fold.
+  const reviewPane = el('section', { class: 'pm-preview-pane pm-preview-readable' }, [el('h2', { class: 'sr-only' }, 'Readable view'), preview]);
   const toggle = el('button', { class: 'btn', type: 'button', 'aria-pressed': 'false' }, translate('Edit source'));
   const save = el('button', { class: 'btn btn-primary', type: 'button' }, 'Save draft');
   const assist = el('button', { class: 'btn', type: 'button' }, 'Planning assistant');
@@ -34,7 +87,7 @@ export function renderDocumentEditor({ ui, document, error, draft, onSave, onAss
     changed = source.value !== document.source; save.disabled = !changed || !authoring.effective;
     onDirty(changed);
     onDraft?.(source.value);
-    preview.replaceChildren(renderMarkdown(source.value));
+    preview.replaceChildren(renderMarkdown(readableSource(source.value)));
   });
   save.addEventListener('click', async () => {
     if (!changed || !editPolicy.editable) return;

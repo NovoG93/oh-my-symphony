@@ -4,6 +4,9 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
+import re
+import stat
 import subprocess
 import uuid
 from dataclasses import asdict
@@ -12,8 +15,11 @@ from pathlib import Path
 from typing import Any, Callable
 
 from ..orchestrator.run_registry import RunRegistry
-from .documents import PmDocumentRepository, _atomic_write, _locked_change
+from .documents import (
+    _CHANGE_ID, PmDocumentRepository, _atomic_write, _locked_change, _resolve_change_root,
+)
 from .models import ApprovalManifest, PmError, PmRequestContext, ValidationReport
+from .yaml_safe import load_unique_yaml
 
 
 class PmApprovalService:
@@ -79,7 +85,10 @@ class PmApprovalService:
             external = self.external_validator(current_claim.workspace_path, change.locator)
             if not external.valid:
                 raise PmError("openspec_validation_failed", "OpenSpec validation has blocking findings", status=409, details={"findings": [item.code for item in external.findings]})
-            unrelated = _unrelated_dirty(claim.workspace_path, root)
+            unrelated = _unrelated_dirty(
+                claim.workspace_path, root,
+                registry=self.registry, project_id=ctx.project_id, owner=owner,
+            )
             if unrelated:
                 raise PmError("dirty_workspace", "planning worktree has unrelated changes", status=409, details={"paths": unrelated})
             approval_id = uuid.uuid4().hex
@@ -178,7 +187,14 @@ def _confirmation(project_id: str, change_id: str, revision: str, scope_hash: st
     return "sha256:" + hashlib.sha256(f"{project_id}\0{change_id}\0{revision}\0{scope_hash}".encode()).hexdigest()
 
 
-def _unrelated_dirty(workspace: Path, change_root: Path) -> list[str]:
+def _unrelated_dirty(
+    workspace: Path,
+    change_root: Path,
+    *,
+    registry: RunRegistry | None = None,
+    project_id: str = "",
+    owner: str | None = None,
+) -> list[str]:
     result = _git(workspace, "status", "--porcelain=v1", "--untracked-files=all")
     relative_root = str(change_root.relative_to(workspace))
     allowed_change_files = {
@@ -192,10 +208,18 @@ def _unrelated_dirty(workspace: Path, change_root: Path) -> list[str]:
     }
     external_file = "openspec/config.yaml"
     external_prefixes = ("openspec/schemas/", "openspec/specs/")
-    paths = [line[3:] for line in result.splitlines() if len(line) > 3]
+    entries = [(line[:2], line[3:]) for line in result.splitlines() if len(line) > 3]
     unrelated: list[str] = []
-    for path in paths:
+    for status, path in entries:
         if path in allowed_change_files or path == external_file or path.startswith(external_prefixes):
+            continue
+        if (
+            status == "??" and registry is not None and owner is not None
+            and _claimed_sibling_lock(
+                workspace, change_root, path,
+                registry=registry, project_id=project_id, owner=owner,
+            )
+        ):
             continue
         relative = path.removeprefix(relative_root + "/")
         pieces = relative.split("/")
@@ -203,6 +227,68 @@ def _unrelated_dirty(workspace: Path, change_root: Path) -> list[str]:
             continue
         unrelated.append(path)
     return unrelated
+
+
+_SIBLING_LOCK = re.compile(r"openspec/changes/([a-z0-9]+(?:-[a-z0-9]+)*)/\.symphony-pm\.lock")
+
+
+def _claimed_sibling_lock(
+    workspace: Path,
+    change_root: Path,
+    path: str,
+    *,
+    registry: RunRegistry,
+    project_id: str,
+    owner: str,
+) -> bool:
+    """True only for another change's empty internal lock proven to share this claim.
+
+    A previous change in the same planning worktree leaves its runtime lock
+    behind (``_change_lock`` never unlinks it). The lookup is read-only: no
+    recovery, locking or write. Every unproven or failing predicate returns
+    False, so the path stays unrelated and approval keeps its 409.
+    """
+    match = _SIBLING_LOCK.fullmatch(path)
+    if match is None or match.group(1) == "archive":
+        return False
+    directory = workspace / "openspec" / "changes" / match.group(1)
+    identity_path = directory / "symphony.yaml"
+    lock = directory / ".symphony-pm.lock"
+    components = (workspace / "openspec", workspace / "openspec" / "changes", directory, identity_path, lock)
+
+    def lock_identity() -> tuple[int, ...] | None:
+        if any(item.is_symlink() for item in components):
+            return None
+        info = os.lstat(lock)
+        if not stat.S_ISREG(info.st_mode) or info.st_size != 0 or info.st_nlink != 1:
+            return None
+        if not stat.S_ISREG(os.lstat(identity_path).st_mode):
+            return None
+        return (info.st_dev, info.st_ino, info.st_mode, info.st_size, info.st_nlink)
+
+    try:
+        before = lock_identity()
+        if before is None or directory.resolve(strict=True) == change_root.resolve():
+            return False
+        identity = load_unique_yaml(identity_path.read_text(encoding="utf-8"))
+        change_id = identity.get("change_id") if isinstance(identity, dict) else None
+        if not isinstance(change_id, str) or not _CHANGE_ID.fullmatch(change_id):
+            return False
+        record = registry.get_pm_workspace(project_id, change_id)
+        if (
+            record is None
+            or record.owner != owner
+            or record.state != "ACTIVE"
+            or Path(record.workspace_path).resolve(strict=True) != workspace.resolve(strict=True)
+        ):
+            return False
+        resolved, _ = _resolve_change_root(workspace, change_id, recover=False)
+        if resolved != directory.resolve(strict=True):
+            return False
+        return lock_identity() == before
+    except Exception:
+        # Registry, filesystem, YAML or resolver failure is never proof.
+        return False
 
 
 def _tree_hashes(root: Path) -> dict[str, str]:

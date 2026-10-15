@@ -12,6 +12,9 @@ import { storyboardPatchOperation } from '../src/symphony/web/static/pm/storyboa
 import { createPmOverlay } from '../src/symphony/web/static/pm/overlay.js';
 import { planningActionRequest, verificationActions } from '../src/symphony/web/static/pm/assistance.js';
 import { analyzeSafeDiagram } from '../scripts/pm_diagram_entry.mjs';
+// Namespace imports keep a missing round9 export a per-test failure instead of a module link error.
+import * as pmDocumentsModule from '../src/symphony/web/static/pm/documents.js';
+import * as pmIndexModule from '../src/symphony/web/static/pm/index.js';
 
 test('quoted TSV preserves tabs, quotes, and multiline values', () => {
   assert.deepEqual(parseTsv('"T-1"\t"notes"\t"first\nsecond\t""quoted"""\n'), [
@@ -591,6 +594,37 @@ test('R9 each area retains guide entries and starts closed in English and Korean
   }
 });
 
+test('round10 workspace guide joins the header controls after actions with unchanged order, help and status', async (t) => {
+  for (const language of ['en', 'ko']) for (const demo of [false, true]) for (const tab of ['idea', 'requirements', 'design', 'plan', 'code']) {
+    await t.test(`${tab}, ${language}, demo=${demo}`, async (context) => {
+      const root = await mountedPm(context, { tab, language, demo });
+      const header = root.querySelector('header.pm-header');
+      const controls = header.querySelector('div.pm-header-controls');
+      assert.deepEqual(header.children.map((node) => node.className), ['pm-heading-copy', 'pm-header-controls'], 'The header keeps two columns and no separate guide row');
+      assert.deepEqual(controls.children.map((node) => `${node.tag}.${node.className}`), ['div.pm-actions', 'details.pm-guide'], 'The workspace guide follows the actions');
+      const guides = root.querySelectorAll('details.pm-guide');
+      assert.equal(guides.length, 2);
+      assert.equal(guides[0], controls.children[1], 'Workspace help stays first among the native disclosures');
+      // DOM order is the Tab order; no tabindex is introduced.
+      const focusables = header.querySelectorAll('select, button, summary');
+      assert.deepEqual(focusables.map((node) => node.tag === 'select' ? 'select' : node.textContent),
+        ['select', ...['Repair workspace', 'Convert legacy plan', 'New change', GUIDE_SUMMARY].map((label) => pmText(label, {}, language))]);
+      assert.ok(focusables.every((node) => node.getAttribute('tabindex') === null));
+      const guide = guides[0];
+      assert.equal(guide.open, false);
+      assert.equal(guide.getAttribute('open'), null);
+      const entries = await guideEntries();
+      assert.deepEqual(guide.querySelectorAll('dt').map((node) => node.textContent), Object.keys(entries.workspace).map((label) => pmText(label, {}, language)));
+      assert.deepEqual(guide.querySelectorAll('dd').map((node) => node.textContent), Object.values(entries.workspace).map((text) => pmText(text, {}, language)));
+      const status = root.querySelector('section[id="pm-capability-status"]');
+      if (!demo) { assert.equal(status, null); return; }
+      assert.equal(status.getAttribute('role'), 'status');
+      assert.equal(status.querySelector('strong').textContent, pmText(DEMO_HEADING, {}, language));
+      assert.deepEqual(status.querySelector('ul.pm-capability-list').children.map((node) => node.textContent), [pmText(DEMO_SENTENCE, {}, language)]);
+    });
+  }
+});
+
 const settlePm = async () => { for (let i = 0; i < 3; i += 1) await new Promise((resolve) => setImmediate(resolve)); };
 
 test('round7 selected option projects authoritative detail after approval/edit without changing list rows', async (t) => {
@@ -1012,7 +1046,8 @@ test('round5 all six compact-table consumers retain rows, column headings and lo
       const tab = consumer === 'proposal' ? 'idea' : ['code', 'planning', 'coverage'].includes(consumer) ? 'code' : 'plan';
       const root = await mountedPm(context, { tab, view: consumer === 'dependencies' ? 'dependencies' : '', language, apiRequest });
       const headers = (values) => values.map((value) => pmText(value, {}, language));
-      if (consumer === 'dependencies') inspect(root, headers(['Task', 'Needs', 'Dependency', 'Reason']), 'Required first');
+      // Round9 F2: dependency headers come from the scoped catalog; English is unchanged.
+      if (consumer === 'dependencies') inspect(root, language === 'en' ? headers(['Task', 'Needs', 'Dependency', 'Reason']) : ['작업', '선행 작업', '의존 유형', '사유'], 'Required first');
       if (consumer === 'coverage') inspect(root, headers(['Task', 'Revision', 'Ticket', 'Implemented', 'Tested', 'Accepted', 'Provenance']), 'TICKET-1');
       if (consumer === 'code') inspect(root, headers(['Status', 'Path']), 'src/a-very-long-path.js');
       if (consumer === 'planning') inspect(root, headers(['Path', 'State', 'Role']), 'proposal.md');
@@ -1118,4 +1153,265 @@ test('round6 modal table focus cycle includes only current overflow and excludes
   await dialog.trigger('keydown', { key: 'Escape' });
   assert.equal(document.activeElement, opener);
   assert.equal(document.body.querySelector('[role="dialog"]'), null);
+});
+
+
+// Round9 F1: PM-only readable projection of managed metadata.
+const TASKS_FIXTURE = [
+  '# Implementation plan',
+  '<!-- symphony-wbs-format: 1 -->',
+  '',
+  'Use one managed group block per group and one managed task checkbox per executable leaf.',
+  '',
+  '<!-- symphony-task:T-E67463FA -->',
+  '- [ ] Prepare bounded proposal',
+  '```yaml symphony-task',
+  'id: T-E67463FA', 'parent_id: null', 'order: 1', 'type: Feature', 'priority: null', 'human_owner: null', 'agent_kind: null',
+  'depends_on: []', 'requirements: []', 'storyboards: []', 'design_refs: []', 'target_date: null', 'estimate: null',
+  '```',
+  '',
+  '### Scope',
+  'Prepare a bounded proposal.',
+  '<!-- /symphony-task -->',
+  '',
+].join('\n');
+const TASKS_READABLE = '# Implementation plan\n\nUse one managed group block per group and one managed task checkbox per executable leaf.\n\n- [ ] Prepare bounded proposal\n\n### Scope\nPrepare a bounded proposal.\n';
+const NESTED_FIXTURE = [
+  '<!-- symphony-group:G-ONE -->', '## Group one', '```yaml symphony-group', 'id: G-ONE', 'parent_id: null', 'order: 1', '```',
+  '<!-- symphony-task:T-ONE -->', '- [ ] First task', '```yaml symphony-task', 'id: T-ONE', 'parent_id: G-ONE', '```', '<!-- /symphony-task -->',
+  '<!-- /symphony-group -->',
+].join('\n');
+// Every guard contains managed-looking text that is not a complete top-level managed span.
+const READABLE_GUARDS = {
+  markdownFence: '# Documentation example\n\n```markdown\n<!-- symphony:req=REQ-1 -->\n#### Scenario: Example\n<!-- symphony:scenario=SC-1 -->\n```\n',
+  quote: '# Documentation example\n\n> <!-- symphony:req=REQ-1 -->\n> #### Scenario: Example\n> <!-- symphony:scenario=SC-1 -->\n',
+  longerFence: '# Documentation example\n\n````markdown\n```\n<!-- symphony:req=REQ-1 -->\n#### Scenario: Example\n<!-- symphony:scenario=SC-1 -->\n````\n',
+  nestedManagedFence: '````markdown\n<!-- symphony-task:T-X -->\n- [ ] Example\n```yaml symphony-task\nid: T-X\n```\n<!-- /symphony-task -->\n````\nAfter example.',
+  indented: 'Example:\n\n    <!-- symphony:req=REQ-1 -->\n    <!-- symphony-wbs-format: 1 -->\n\tid: T-X',
+  comments: '<!-- user note -->\n<!-- symphony-note: keep -->\n<!-- symphony-task:bad id -->\nBody',
+  ordinaryFences: '```mermaid\nflowchart LR\nA-->B\n```\n```ts\nconst value = 1;\n```',
+  unclosed: '<!-- symphony-task:T-A -->\n- [ ] A\n```yaml symphony-task\nid: T-A\n\nFollowing prose.',
+  unmatchedClose: 'Intro\n<!-- /symphony-task -->\nOutro',
+  plain: '# Plain\n\nNo managed metadata here.\n',
+};
+
+function documentApi(sources, { change = null, baselines = {}, wbs = null, patches = [] } = {}) {
+  return (path, options) => {
+    const pathname = path.split('?')[0];
+    if (options?.method === 'PATCH' && pathname.includes('/documents/')) { patches.push(options.body); return {}; }
+    if (change && pathname === '/changes') return { changes: [change] };
+    if (change && pathname === '/changes/c1') return change;
+    const doc = pathname.match(/\/documents\/([^/]+)$/);
+    const id = doc ? decodeURIComponent(doc[1]) : '';
+    if (doc && sources[id] !== undefined) return { document_id: id, source: sources[id], path: `${id}.md` };
+    const baseline = pathname.match(/\/baselines\/([^/]+)$/);
+    if (baseline) return baselines[decodeURIComponent(baseline[1])] ?? { exists: false };
+    if (wbs && pathname.endsWith('/wbs')) return wbs;
+    return undefined;
+  };
+}
+
+test('round9 F1 Plan document readable view hides complete managed metadata and keeps source/save bytes', async (t) => {
+  for (const language of ['en', 'ko']) await t.test(language, async (context) => {
+    const patches = [];
+    const root = await mountedPm(context, { tab: 'plan', view: 'source', language, apiRequest: documentApi({ tasks: TASKS_FIXTURE }, { patches }) });
+    const layout = root.querySelector('.pm-document-layout');
+    const preview = layout.querySelector('.pm-document-preview');
+    const source = layout.querySelector('textarea');
+    assert.equal(preview.textContent, TASKS_READABLE, 'initial readable renderer input');
+    assert.equal(source.value, TASKS_FIXTURE, 'textarea keeps the exact source');
+    source.value = `${TASKS_FIXTURE}<!-- symphony:decision=DEC-ABC12345 -->\nAdded note\n`;
+    await source.trigger('input');
+    assert.equal(preview.textContent, `${TASKS_READABLE}Added note\n`, 'input refresh uses the same projection');
+    await findButton(layout, pmText('Save draft', {}, language)).trigger('click');
+    assert.equal(patches.length, 1);
+    assert.equal(patches[0].payload.operations[0].source, `${TASKS_FIXTURE}<!-- symphony:decision=DEC-ABC12345 -->\nAdded note\n`, 'PATCH body keeps raw bytes');
+  });
+});
+
+test('round9 F1 readable heading keeps its accessible name while visually compact', async (t) => {
+  for (const language of ['en', 'ko']) await t.test(language, async (context) => {
+    const root = await mountedPm(context, { language });
+    const heading = root.querySelector('.pm-preview-readable').querySelector('h2');
+    assert.equal(heading.textContent, pmText('Readable view', {}, language));
+    assert.equal(heading.getAttribute('class'), 'sr-only');
+    const css = await readFile(new URL('../src/symphony/web/static/pm/pm.css', import.meta.url), 'utf8');
+    assert.match(css, /\.pm-preview-readable \{[^}]*padding: 24px clamp\(24px, 5vw, 64px\) clamp\(24px, 5vw, 64px\);/);
+    assert.match(css, /@media \(max-width: 900px\)[\s\S]*\.pm-preview-readable \{ padding: 24px 18px; \}/, 'mobile override unchanged');
+  });
+});
+
+test('round9 F1 nested group/task display fixture hides four markers and two YAML blocks', async (t) => {
+  const root = await mountedPm(t);
+  const source = root.querySelector('textarea');
+  source.value = NESTED_FIXTURE; await source.trigger('input');
+  assert.equal(root.querySelector('.pm-document-preview').textContent, '## Group one\n- [ ] First task');
+  source.value = `<!-- symphony:req=REQ-ABC12345 -->\nReal requirement\n${READABLE_GUARDS.markdownFence}`; await source.trigger('input');
+  assert.equal(root.querySelector('.pm-document-preview').textContent, `Real requirement\n${READABLE_GUARDS.markdownFence}`, 'top-level marker removed, fenced example kept');
+});
+
+test('round9 F1 preservation guards keep examples, unknown, malformed and unclosed text unchanged', async (t) => {
+  const root = await mountedPm(t);
+  const source = root.querySelector('textarea');
+  for (const [name, value] of Object.entries(READABLE_GUARDS)) {
+    source.value = value; await source.trigger('input');
+    assert.equal(root.querySelector('.pm-document-preview').textContent, value, name);
+  }
+  assert.equal(root.querySelector('textarea').value, READABLE_GUARDS.plain);
+});
+
+test('round9 F1 readableSource is identity without recognized spans and keeps CRLF on retained lines', () => {
+  const { readableSource } = pmDocumentsModule;
+  assert.equal(typeof readableSource, 'function');
+  for (const [name, value] of Object.entries(READABLE_GUARDS)) assert.equal(readableSource(value), value, name);
+  assert.equal(readableSource('A\r\n<!-- symphony:req=REQ-ABC12345 -->\r\nB\r\n'), 'A\r\nB\r\n');
+  assert.equal(readableSource('   <!-- symphony-wbs-format: 1 -->  \nkept'), 'kept');
+  assert.equal(readableSource('<!-- symphony-task:T-A -->\nA\n<!-- /symphony-group -->'), '<!-- symphony-task:T-A -->\nA\n<!-- /symphony-group -->', 'kind mismatch stays visible');
+  assert.equal(readableSource('<!-- symphony-group:G-A -->\n```yaml symphony-task\nid: T-A\n```\n<!-- /symphony-group -->'), '```yaml symphony-task\nid: T-A\n```', 'YAML kind must match its block');
+  assert.equal(readableSource(''), '');
+});
+
+test('round9 F1 Requirements projects both proposed and baseline while delta/source stay raw', async (t) => {
+  const proposed = '# Requirements\n\n### Requirement: New\n<!-- symphony:req=REQ-NEW22222 -->\nNew text\n```markdown\n<!-- symphony:req=REQ-1 -->\n```\n';
+  const baseline = '# Requirements\n\n### Requirement: Old\n<!-- symphony:req=REQ-OLD11111 -->\nOld text\n';
+  const change = { change_id: 'c1', locator: 'team-leave-request', revision: 'rev1', state: 'Draft', workspace_state: 'ATTACHED', storyboard_frames: [], documents: [{ document_id: 'proposal', path: 'proposal.md', editable: true }, { document_id: 'spec:requirements', path: 'specs/requirements/spec.md', editable: true }] };
+  for (const language of ['en', 'ko']) await t.test(language, async (context) => {
+    const root = await mountedPm(context, { tab: 'requirements', language, apiRequest: documentApi({ 'spec:requirements': proposed }, { change, baselines: { requirements: { exists: true, source: baseline } } }) });
+    const [left, right] = root.querySelector('.pm-requirement-delta').children;
+    assert.equal(left.querySelector('p').textContent, '# Requirements\n\n### Requirement: New\nNew text\n```markdown\n<!-- symphony:req=REQ-1 -->\n```\n');
+    assert.equal(right.querySelector('p').textContent, '# Requirements\n\n### Requirement: Old\nOld text\n');
+    assert.equal(root.querySelector('.pm-count').textContent, '+6 / −3 lines from baseline', 'line delta uses raw sources');
+    assert.equal(root.querySelector('.pm-source-details').querySelector('pre').textContent, proposed);
+  });
+});
+
+test('round9 F1 Design projects the full document before section extraction', async (t) => {
+  const real = '# Design\n\n## Architecture\n<!-- symphony:contract=API-ABC12345 -->\nReal architecture text\n## Integration\n<!-- symphony:contract=API-DEF67890 -->\nIntegration text\n';
+  const example = '# Design\n````markdown\n## Architecture\n<!-- symphony-task:T-X -->\n```yaml symphony-task\nid: T-X\n```\n<!-- /symphony-task -->\n````\n## Architecture\nreal';
+  const cases = [
+    ['architecture', real, '## Architecture\nReal architecture text'],
+    ['erd', real, '# Design\n\n## Architecture\nReal architecture text\n## Integration\nIntegration text\n'],
+    // Preservation guard: the first matching heading sits inside a user fence, so the raw extract is kept.
+    ['architecture', example, '## Architecture\n<!-- symphony-task:T-X -->\n```yaml symphony-task\nid: T-X\n```\n<!-- /symphony-task -->\n````'],
+  ];
+  for (const [view, source, expected] of cases) await t.test(`${view}/${source === real ? 'real' : 'example'}`, async (context) => {
+    const patches = [];
+    const root = await mountedPm(context, { tab: 'design', view, apiRequest: documentApi({ design: source }, { patches }) });
+    const surface = root.querySelector('.pm-design-stack');
+    assert.equal(surface.querySelector('.pm-document-preview').textContent, expected);
+    await findButton(surface, 'Edit source').trigger('click');
+    const editor = surface.querySelector('textarea');
+    assert.equal(editor.value, source, 'Design source editor keeps full raw bytes');
+    editor.value = `${source}\nEdited`; await editor.trigger('input');
+    await findButton(surface, 'Save draft').trigger('click');
+    assert.equal(patches[0].payload.operations[0].source, `${source}\nEdited`);
+  });
+});
+
+// S4 metadata ends only at an exact triple-backtick line; a longer closer leaves the YAML unrecognized.
+const LONGER_CLOSER = '<!-- symphony-task:T-A -->\n- [ ] A\n```yaml symphony-task\nid: T-A\nFollowing prose.\n````\n<!-- /symphony-task -->';
+const LONGER_CLOSER_READABLE = '- [ ] A\n```yaml symphony-task\nid: T-A\nFollowing prose.\n````';
+
+test('round9 F1 readableSource keeps managed-looking YAML whose closer is not exact triple backticks', () => {
+  const { readableSource } = pmDocumentsModule;
+  assert.equal(readableSource(LONGER_CLOSER), LONGER_CLOSER_READABLE, 'four-backtick closer keeps YAML and prose');
+  assert.equal(readableSource(`${NESTED_FIXTURE.replace('order: 1\n```', 'order: 1\n```  ')}`), '## Group one\n- [ ] First task', 'exact triple closer with trailing spaces is still metadata');
+  assert.equal(readableSource('```ts\nconst value = 1;\n````\n<!-- symphony:req=REQ-ABC12345 -->\nAfter'), '```ts\nconst value = 1;\n````\nAfter', 'ordinary fences still close on a longer closer');
+});
+
+test('round9 F1 editor and Design readable views keep YAML with a four-backtick closer', async (t) => {
+  for (const language of ['en', 'ko']) {
+    await t.test(`editor/${language}`, async (context) => {
+      const root = await mountedPm(context, { tab: 'plan', view: 'source', language, apiRequest: documentApi({ tasks: LONGER_CLOSER }) });
+      assert.equal(root.querySelector('.pm-document-preview').textContent, LONGER_CLOSER_READABLE);
+      assert.equal(root.querySelector('textarea').value, LONGER_CLOSER, 'textarea keeps the exact source');
+    });
+    await t.test(`design/${language}`, async (context) => {
+      const design = `# Design\n\n## Architecture\n${LONGER_CLOSER}\n`;
+      const root = await mountedPm(context, { tab: 'design', view: 'architecture', language, apiRequest: documentApi({ design }) });
+      assert.equal(root.querySelector('.pm-design-stack').querySelector('.pm-document-preview').textContent, `## Architecture\n${LONGER_CLOSER_READABLE}\n`);
+    });
+  }
+});
+
+// Round9 F2: UI-owned dependency/placeholder text, without new walker keys.
+const DEPENDENCY_WBS = { findings: [], tasks: [
+  { task_id: 'T-A', parent_id: null, order: 1, kind: 'Feature', title: 'Order only', dependencies: [], requirement_refs: [], storyboard_refs: [], design_refs: [], acceptance: [], verification: [] },
+  { task_id: 'T-B', parent_id: null, order: 2, kind: 'Feature', title: 'Task', dependencies: [{ task_id: 'T-A', kind: 'requires_code', justification: 'Reason' }], requirement_refs: [], storyboard_refs: [], design_refs: [], acceptance: [], verification: [] },
+  { task_id: 'T-C', parent_id: null, order: 3, kind: 'Feature', title: 'Requires code', dependencies: [{ task_id: 'T-B', kind: 'order_only', justification: 'Requires code' }, { task_id: 'T-GONE', kind: 'mystery_kind', justification: 'Order only' }], requirement_refs: [], storyboard_refs: [], design_refs: [], acceptance: [], verification: [] },
+] };
+const DEPENDENCY_TEXT = {
+  en: { headers: ['Task', 'Needs', 'Dependency', 'Reason'], requires: 'Requires code', order: 'Order only', option: (task, need) => `${task} needs ${need}` },
+  ko: { headers: ['작업', '선행 작업', '의존 유형', '사유'], requires: '코드 완료 필요', order: '순서만 지정', option: (task, need) => `${task} — 선행 작업: ${need}` },
+};
+const USER_STRINGS = ['Task', 'Needs', 'Reason', 'Requires code', 'Order only'];
+
+function assertDependencyTable(root, language) {
+  const text = DEPENDENCY_TEXT[language];
+  const table = root.querySelector('.pm-compact-table');
+  assert.deepEqual(table.querySelectorAll('th').map((th) => th.textContent), text.headers);
+  const rows = table.querySelector('tbody').querySelectorAll('tr').map((tr) => tr.querySelectorAll('td'));
+  assert.deepEqual(rows.map((cells) => cells.map((cell) => cell.textContent)), [
+    ['T-B · Task', 'T-A · Order only', text.requires, 'Reason'],
+    ['T-C · Requires code', 'T-B · Task', text.order, 'Requires code'],
+    ['T-C · Requires code', 'T-GONE', 'mystery_kind', 'Order only'],
+  ]);
+  assert.deepEqual(rows.map((cells) => [cells[2].getAttribute('data-kind'), cells[2].getAttribute('title')]), [
+    ['requires_code', 'requires_code'], ['order_only', 'order_only'], ['mystery_kind', 'mystery_kind'],
+  ]);
+}
+
+test('round9 F2 dependency table names both tasks in direction with localized known kinds', async (t) => {
+  for (const language of ['en', 'ko']) await t.test(language, async (context) => {
+    const snapshot = JSON.stringify(DEPENDENCY_WBS);
+    const root = await mountedPm(context, { tab: 'plan', view: 'dependencies', language, apiRequest: documentApi({}, { wbs: DEPENDENCY_WBS }) });
+    assertDependencyTable(root, language);
+    // A later render runs localizePm over the whole tree again; user values and labels stay exact.
+    await findButton(root, pmText('Work breakdown', {}, language)).trigger('click');
+    await findButton(root, pmText('Dependencies', {}, language)).trigger('click');
+    assertDependencyTable(root, language);
+    assert.equal(JSON.stringify(DEPENDENCY_WBS), snapshot, 'payload unchanged');
+  });
+});
+
+test('round9 F2 planning dialog placeholders and dependency options stay localized after rebuilds', async (t) => {
+  const change = { change_id: 'c1', locator: 'team-leave-request', revision: 'rev1', state: 'Draft', workspace_state: 'ATTACHED', storyboard_frames: [],
+    documents: [{ document_id: 'proposal', path: 'proposal.md', editable: true }, { document_id: 'tasks', path: 'tasks.md', editable: true }],
+    planning_sections: [{ document_id: 'proposal', section_id: 'proposal:reason', label: 'Reason' }, { document_id: 'tasks', section_id: 'tasks:task', label: 'Task' }] };
+  for (const language of ['en', 'ko']) await t.test(language, async (context) => {
+    const root = await mountedPm(context, { language, apiRequest: documentApi({ proposal: 'Reason' }, { change, wbs: DEPENDENCY_WBS }) });
+    assert.equal(root.querySelector('.pm-document-preview').textContent, 'Reason', 'user preview paragraph is not translated');
+    await findButton(root, pmText('Planning assistant', {}, language)).trigger('click');
+    const dialog = document.body.querySelector('[role="dialog"]');
+    const [action, artifact, section, dependency] = dialog.querySelectorAll('select');
+    const placeholder = pmText('Choose section', {}, language);
+    assert.deepEqual(section.options.map((item) => item.textContent), [placeholder, 'Reason']);
+    artifact.value = 'tasks'; await artifact.trigger('change');
+    assert.deepEqual(section.options.map((item) => item.textContent), [placeholder, 'Task'], 'document switch rebuild');
+    artifact.value = 'proposal'; await artifact.trigger('change');
+    action.value = 'refine_section'; await action.trigger('change');
+    assert.deepEqual(section.options.map((item) => [item.value, item.textContent]), [['', placeholder], ['proposal:reason', 'Reason']], 'action switch rebuild');
+    const text = DEPENDENCY_TEXT[language];
+    assert.deepEqual(dependency.options.map((item) => [item.value, item.textContent]), [
+      ['', pmText('Choose dependency', {}, language)],
+      ['T-B|T-A', text.option('T-B · Task', 'T-A · Order only')],
+      ['T-C|T-B', text.option('T-C · Requires code', 'T-B · Task')],
+      ['T-C|T-GONE', text.option('T-C · Requires code', 'T-GONE')],
+    ]);
+  });
+});
+
+test('round9 F2 scoped message catalog stays outside the walked KO dictionary', () => {
+  const { pmMessage } = pmIndexModule;
+  assert.equal(typeof pmMessage, 'function');
+  for (const value of USER_STRINGS) assert.equal(pmText(value, {}, 'ko'), value, `${value} must not enter the walked KO map`);
+  for (const key of ['pm.deps.col.task', 'pm.deps.col.needs', 'pm.deps.col.kind', 'pm.deps.col.reason', 'pm.deps.kind.requires_code', 'pm.deps.kind.order_only', 'pm.deps.option']) {
+    for (const language of ['en', 'ko']) assert.notEqual(pmMessage(key, {}, language), key, `${key}/${language}`);
+  }
+  assert.equal(pmMessage('pm.deps.col.task', {}, 'en'), 'Task');
+  assert.equal(pmMessage('pm.deps.col.task', {}, 'ko'), '작업');
+  assert.equal(pmMessage('pm.deps.option', { task: 'B', predecessor: 'A' }, 'ko'), 'B — 선행 작업: A');
+  assert.equal(pmMessage('pm.missing.key', {}, 'ko'), 'pm.missing.key');
+  assert.equal(pmMessage('pm.deps.option', { task: 'T-B · {predecessor}', predecessor: 'T-A' }, 'en'), 'T-B · {predecessor} needs T-A', 'user titles are not re-interpolated');
+  for (const value of Object.values(DEPENDENCY_TEXT.ko).flat().filter((item) => typeof item === 'string')) assert.equal(pmText(value, {}, 'ko'), value);
 });

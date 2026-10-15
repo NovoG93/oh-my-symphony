@@ -1,6 +1,6 @@
 import { createPmApi } from './api.js';
 import { createPmState } from './state.js';
-import { renderDocumentEditor, renderFindings } from './documents.js';
+import { readableSource, renderDocumentEditor, renderFindings } from './documents.js';
 import { disposeWbs, renderWbs } from './wbs.js';
 import { renderExchangePanel } from './exchange.js';
 import { renderDiagram, diagramSummary } from './diagrams.js';
@@ -295,8 +295,7 @@ export function mountArtifacts({ root, projectId, api: hostApi, ui, onDirtyChang
     const convert = limitHostAction(button('Convert legacy plan', convertLegacy), 'handoff');
     return ui.el('header', { class: 'pm-header' }, [
       ui.el('div', { class: 'pm-heading-copy' }, [ui.el('span', { class: 'pm-kicker' }, 'Product planning'), ui.el('h1', null, 'Artifacts'), ui.el('p', null, 'Shape the idea, align requirements, and hand off executable work.')]),
-      ui.el('div', { class: 'pm-header-controls' }, [ui.el('div', { class: 'pm-actions' }, [select, repair, convert, create])]),
-      buildGuide('workspace'),
+      ui.el('div', { class: 'pm-header-controls' }, [ui.el('div', { class: 'pm-actions' }, [select, repair, convert, create]), buildGuide('workspace')]),
     ]);
   }
 
@@ -379,6 +378,8 @@ export function mountArtifacts({ root, projectId, api: hostApi, ui, onDirtyChang
     const ids = requiredDocumentIds();
     if (editingRequirement && ids.includes(editingRequirement)) return ui.el('div', { class: 'pm-card-grid' }, [ui.el('div', { class: 'pm-plan-action-row' }, [button('Back to requirements', () => { if (!guard()) return; editingRequirement = null; render(); })]), buildDocument(editingRequirement)]);
     const create = limitAction(button('Add capability', createCapability, 'btn btn-primary'), 'authoring');
+    // Both sides share one projection so the comparison stays like-for-like; delta and <pre> stay raw.
+    const readable = (source) => ui.renderMarkdown(readableSource(source));
     if (!ids.length) return ui.el('div', { class: 'pm-card-grid' }, [ui.el('div', { class: 'pm-plan-action-row' }, [create]), empty('No requirement specifications are available for this change.')]);
     const cards = ids.map((id) => {
       const doc = state.documents.get(id);
@@ -388,8 +389,8 @@ export function mountArtifacts({ root, projectId, api: hostApi, ui, onDirtyChang
       return ui.el('section', { class: 'pm-readable-card' }, [
         ui.el('div', { class: 'pm-card-heading' }, [ui.el('div', null, [ui.el('h2', null, capability), ui.el('span', { class: 'pm-count' }, `+${delta.added} / −${delta.removed} lines from baseline`)]), ui.el('div', { class: 'pm-actions' }, [ui.el('code', null, doc.path), limitArchivedAction(button('Edit requirements', () => { editingRequirement = id; render(); }))])]),
         ui.el('div', { class: 'pm-requirement-delta' }, [
-          ui.el('article', { class: 'pm-document-preview' }, [ui.el('h3', null, 'Proposed'), ui.renderMarkdown(doc.source)]),
-          ui.el('article', { class: 'pm-document-preview pm-baseline' }, [ui.el('h3', null, baseline?.exists ? 'Current baseline' : 'Current baseline · new capability'), baseline?.exists ? ui.renderMarkdown(baseline.source) : ui.el('p', null, 'No baseline specification exists yet.')]),
+          ui.el('article', { class: 'pm-document-preview' }, [ui.el('h3', null, 'Proposed'), readable(doc.source)]),
+          ui.el('article', { class: 'pm-document-preview pm-baseline' }, [ui.el('h3', null, baseline?.exists ? 'Current baseline' : 'Current baseline · new capability'), baseline?.exists ? readable(baseline.source) : ui.el('p', null, 'No baseline specification exists yet.')]),
         ]),
         ui.el('details', { class: 'pm-source-details' }, [ui.el('summary', null, 'Source'), ui.el('pre', null, doc.source)]),
       ]);
@@ -423,8 +424,12 @@ export function mountArtifacts({ root, projectId, api: hostApi, ui, onDirtyChang
       surface.append(limitArchivedAction(button('Edit source', () => { state.setDesignView('ux'); surface.replaceChildren(selector, buildDocument('ux')); localizePm(surface); })));
       return surface;
     }
+    // Project the full document first so fence context survives section slicing;
+    // diagrams still read the raw section.
     const section = extractSection(doc.source, state.designView);
-    surface.append(ui.el('section', { class: 'pm-readable-card' }, [ui.el('article', { class: 'pm-document-preview' }, ui.renderMarkdown(section || doc.source))]));
+    const readableDoc = readableSource(doc.source);
+    const readableSection = extractSection(readableDoc, state.designView);
+    surface.append(ui.el('section', { class: 'pm-readable-card' }, [ui.el('article', { class: 'pm-document-preview' }, ui.renderMarkdown(readableSection || readableDoc))]));
     for (const diagram of diagramBlocks(section || doc.source)) {
       const target = ui.el('div', { class: 'pm-diagram', role: 'status' }, diagramSummary(diagram).text);
       surface.append(target, ui.el('details', { class: 'pm-source-details' }, [ui.el('summary', null, 'Diagram text alternative'), ui.el('pre', null, diagram)]));
@@ -439,8 +444,9 @@ export function mountArtifacts({ root, projectId, api: hostApi, ui, onDirtyChang
     if (state.planView === 'source') { stack.append(buildDocument('tasks')); return stack; }
     if (!state.wbs) { stack.append(empty('Loading plan…')); return stack; }
     if (state.planView === 'dependencies') {
-      const rows = state.wbs.tasks.flatMap((task) => (task.dependencies || []).map((dep) => [task.task_id, dep.task_id, dep.kind, dep.justification || '—']));
-      stack.append(simpleTable(['Task', 'Needs', 'Dependency', 'Reason'], rows)); return stack;
+      const label = taskLabeler(state.wbs.tasks);
+      const rows = state.wbs.tasks.flatMap((task) => (task.dependencies || []).map((dep) => [label(task.task_id), label(dep.task_id), dependencyKindCell(dep.kind), dep.justification || '—']));
+      stack.append(simpleTable(['pm.deps.col.task', 'pm.deps.col.needs', 'pm.deps.col.kind', 'pm.deps.col.reason'].map((key) => pmMessage(key)), rows)); return stack;
     }
     const handoff = limitAction(button('Preview approved handoff', previewHandoff, 'btn btn-primary'), 'handoff');
     const archive = limitNodeAction(limitAction(button('Preview archive', previewArchive), 'handoff'));
@@ -798,13 +804,14 @@ export function mountArtifacts({ root, projectId, api: hostApi, ui, onDirtyChang
     const documentSelect = ui.el('select', { class: 'input', 'aria-label': 'Artifact' }, documents.map((item) => ui.el('option', { value: item.document_id, selected: item.document_id === docId }, item.document_id)));
     const section = ui.el('select', { class: 'input', 'aria-label': 'Section' });
     const dependencyOptions = (planningWbs?.tasks || []).flatMap((task) => (task.dependencies || []).map((dependency) => ({ task_id: task.task_id, predecessor_id: dependency.task_id })));
-    const dependency = ui.el('select', { class: 'input', 'aria-label': 'Dependency' }, [ui.el('option', { value: '' }, 'Choose dependency'), ...dependencyOptions.map((item) => ui.el('option', { value: `${item.task_id}|${item.predecessor_id}` }, `${item.task_id} needs ${item.predecessor_id}`))]);
+    const label = taskLabeler(planningWbs?.tasks || []);
+    const dependency = ui.el('select', { class: 'input', 'aria-label': 'Dependency' }, [ui.el('option', { value: '' }, pmText('Choose dependency')), ...dependencyOptions.map((item) => ui.el('option', { value: `${item.task_id}|${item.predecessor_id}` }, pmMessage('pm.deps.option', { task: label(item.task_id), predecessor: label(item.predecessor_id) })))]);
     const impacted = ui.el('select', { class: 'input', multiple: true, size: Math.min(6, Math.max(2, documents.length)), 'aria-label': 'Impacted artifacts' }, documents.map((item) => ui.el('option', { value: item.document_id, selected: item.document_id === docId }, item.document_id)));
     const instruction = ui.el('textarea', { class: 'input pm-drawer-textarea', 'aria-label': 'Instructions' });
     const sectionField = field('Section', section), dependencyField = field('Dependency', dependency), impactField = field('Impacted artifacts', impacted);
     const updateSections = () => {
       const prior = section.value;
-      section.replaceChildren(ui.el('option', { value: '' }, 'Choose section'), ...(state.change.planning_sections || []).filter((item) => item.document_id === documentSelect.value).map((item) => ui.el('option', { value: item.section_id }, item.label)));
+      section.replaceChildren(ui.el('option', { value: '' }, pmText('Choose section')), ...(state.change.planning_sections || []).filter((item) => item.document_id === documentSelect.value).map((item) => ui.el('option', { value: item.section_id }, item.label)));
       if ([...section.options].some((item) => item.value === prior)) section.value = prior;
     };
     const updateScope = () => {
@@ -880,7 +887,8 @@ export function mountArtifacts({ root, projectId, api: hostApi, ui, onDirtyChang
     return item;
   }
   function segmented(items, active, handler) { return ui.el('div', { class: 'pm-segmented', role: 'tablist' }, items.map(([value, label]) => { const item = button(label, () => handler(value), `pm-segment ${active === value ? 'active' : ''}`); item.setAttribute('role', 'tab'); item.setAttribute('aria-selected', String(active === value)); return item; })); }
-  function simpleTable(headers, rows) { return ui.el('div', { class: 'pm-table-scroll' }, ui.el('table', { class: 'pm-compact-table' }, [ui.el('thead', null, ui.el('tr', null, headers.map((name) => ui.el('th', { scope: 'col' }, name)))), ui.el('tbody', null, rows.map((row) => ui.el('tr', null, row.map((value) => ui.el('td', null, String(value ?? '—'))))))])); }
+  // A cell is a plain value, or { text, attrs } when it needs cell attributes.
+  function simpleTable(headers, rows) { return ui.el('div', { class: 'pm-table-scroll' }, ui.el('table', { class: 'pm-compact-table' }, [ui.el('thead', null, ui.el('tr', null, headers.map((name) => ui.el('th', { scope: 'col' }, name)))), ui.el('tbody', null, rows.map((row) => ui.el('tr', null, row.map((value) => value !== null && typeof value === 'object' ? ui.el('td', value.attrs || null, String(value.text ?? '—')) : ui.el('td', null, String(value ?? '—'))))))])); }
 
   load().catch((error) => { if (error.name !== 'AbortError') root.replaceChildren(ui.el('div', { class: 'banner banner-danger', role: 'alert' }, error.message)); });
   return { unmount: () => { state.dispose(); overlay.destroy(); disposeWbs(); root.classList.remove('pm-workspace-host'); }, beforeProjectSwitch: () => guard('Discard unsaved PM Workspace edits and switch projects?'), isDirty: () => state.dirty };
@@ -1079,6 +1087,36 @@ export function pmText(value, values = {}, language = globalThis.window?.i18n?.l
   let result = language === 'ko' ? (KO.get(value) || value) : value;
   for (const [key, replacement] of Object.entries(values)) result = result.replaceAll(`{${key}}`, String(replacement));
   return result;
+}
+
+// UI-owned dependency text, applied only where it is created. Kept out of KO so
+// localizePm never rewrites user content that happens to equal 'Task' or 'Reason'.
+const PM_MESSAGES = {
+  'pm.deps.col.task': { en: 'Task', ko: '작업' },
+  'pm.deps.col.needs': { en: 'Needs', ko: '선행 작업' },
+  'pm.deps.col.kind': { en: 'Dependency', ko: '의존 유형' },
+  'pm.deps.col.reason': { en: 'Reason', ko: '사유' },
+  'pm.deps.kind.requires_code': { en: 'Requires code', ko: '코드 완료 필요' },
+  'pm.deps.kind.order_only': { en: 'Order only', ko: '순서만 지정' },
+  'pm.deps.option': { en: '{task} needs {predecessor}', ko: '{task} — 선행 작업: {predecessor}' },
+};
+
+export function pmMessage(key, values = {}, language = globalThis.window?.i18n?.lang || 'en') {
+  const entry = Object.hasOwn(PM_MESSAGES, key) ? PM_MESSAGES[key] : null;
+  const template = entry ? (entry[language] || entry.en) : key;
+  // Single pass: a user title containing '{predecessor}' is never re-interpolated.
+  return template.replace(/\{(\w+)\}/g, (match, name) => (Object.hasOwn(values, name) ? String(values[name]) : match));
+}
+
+function taskLabeler(tasks) {
+  const titles = new Map(tasks.map((task) => [task.task_id, task.title]));
+  return (id) => (titles.get(id) ? `${id} · ${titles.get(id)}` : id);
+}
+
+// Known kinds get a label; unknown kinds stay visible as-is. The raw kind is kept on the cell.
+function dependencyKindCell(kind) {
+  const key = `pm.deps.kind.${kind}`;
+  return { text: Object.hasOwn(PM_MESSAGES, key) ? pmMessage(key) : kind, attrs: { 'data-kind': kind, title: kind } };
 }
 
 function localizePm(scope) {
