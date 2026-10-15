@@ -18,6 +18,7 @@ from ..backends import AgentBackend
 
 if TYPE_CHECKING:
     from .run_registry import ContinuationCheckpoint
+    from ..pm.models import DispatchPermit
 from ..issue import Issue
 
 
@@ -31,6 +32,7 @@ class RunningEntry:
     attempt_kind: str = "initial"
     agent_kind: str = ""
     run_id: str = ""
+    pm_dispatch_permit: "DispatchPermit | None" = None
     # A recovered attempt always owns a new run id. The predecessor link is
     # public history; the private checkpoint is consumed only by the backend
     # startup path and never serialized from this in-memory entry.
@@ -121,6 +123,8 @@ class RunningEntry:
     # before the failing await, so a later idempotent stop cannot confirm that
     # this process group exited and must not erase its force-eject target.
     backend_cleanup_unconfirmed: bool = False
+    agent_process_identity: str | None = None
+    agent_process_identity_captured: bool = False
     last_error: str | None = None
     # Set when a lease heartbeat found a conflicting active holder and
     # re-acquisition failed. The worker is being stopped; the flag keeps the

@@ -156,6 +156,130 @@ def test_build_service_config_parses_local_only_auto_merge_policy(
     assert cfg.agent.auto_merge_push_target is False
 
 
+def test_pm_config_defaults_off_and_uses_separate_workspace_root(tmp_path):
+    cfg = build_service_config(load_workflow(_write(tmp_path, "Prompt")))
+
+    assert cfg.pm.enabled is False
+    assert cfg.pm.authoring is False
+    assert cfg.pm.exchange is False
+    assert cfg.pm.assistance is False
+    assert cfg.pm.handoff is False
+    assert cfg.pm.openspec_executable is None
+    assert cfg.pm.planning_workspace_root == (cfg.workspace_root / "pm-planning").resolve()
+    assert not hasattr(cfg.pm, "planning_model")
+
+
+@pytest.mark.parametrize("value", ["", "null", "''", "'   '"])
+def test_pm_config_blank_openspec_uses_bundle(tmp_path, value):
+    path = _write(tmp_path, f"---\npm:\n  openspec_executable: {value}\n---\nPrompt\n")
+    assert build_service_config(load_workflow(path)).pm.openspec_executable is None
+
+
+def test_pm_config_explicit_openspec_from_path_is_preserved(tmp_path):
+    path = _write(tmp_path, "---\npm:\n  openspec_executable: openspec\n---\nPrompt\n")
+    assert build_service_config(load_workflow(path)).pm.openspec_executable == "openspec"
+
+
+def test_pm_config_parses_capabilities_and_hard_limits(tmp_path):
+    path = _write(
+        tmp_path,
+        textwrap.dedent(
+            """\
+            ---
+            pm:
+              authoring: true
+              exchange: true
+              assistance: true
+              handoff: true
+              openspec_executable: /opt/tools/openspec
+              planning_workspace_root: .pm-workspaces
+              max_encoded_upload_mb: 9
+              max_workbook_mb: 6
+              max_uncompressed_mb: 51
+              max_zip_entries: 1001
+              max_nodes: 5001
+              max_edges: 20001
+              max_text_chars: 17000
+              operation_timeout_ms: 31000
+              exchange_concurrency: 2
+            ---
+            Prompt
+            """
+        ),
+    )
+
+    cfg = build_service_config(load_workflow(path))
+    assert cfg.pm.enabled is True
+    assert cfg.pm.openspec_executable == "/opt/tools/openspec"
+    assert cfg.pm.planning_workspace_root == (tmp_path / ".pm-workspaces").resolve()
+    assert cfg.pm.max_encoded_upload_mb == 9
+    assert cfg.pm.max_workbook_mb == 6
+    assert cfg.pm.max_uncompressed_mb == 51
+    assert cfg.pm.max_zip_entries == 1001
+    assert cfg.pm.max_nodes == 5001
+    assert cfg.pm.max_edges == 20001
+    assert cfg.pm.max_text_chars == 17000
+    assert cfg.pm.operation_timeout_ms == 31000
+    assert cfg.pm.exchange_concurrency == 2
+
+
+def test_pm_config_parses_discriminated_manual_procedure_and_rejects_id_collision(tmp_path):
+    path = _write(tmp_path, """---
+pm:
+  verification_procedures:
+    focused: [/usr/bin/true]
+  manual_verification_procedures:
+    manual-ux:
+      label: Keyboard review
+      instructions: Verify focus and announcements.
+      report: required
+      artifacts: optional
+---
+Prompt
+""")
+    cfg = build_service_config(load_workflow(path))
+    assert cfg.pm.manual_verification_procedures["manual-ux"].instructions == "Verify focus and announcements."
+    collision_root = tmp_path / "collision"
+    collision_root.mkdir()
+    collision = _write(collision_root, """---
+pm:
+  verification_procedures:
+    same: [/usr/bin/true]
+  manual_verification_procedures:
+    same: {instructions: Review, report: required, artifacts: optional}
+---
+Prompt
+""")
+    with pytest.raises(ConfigValidationError, match="unique"):
+        build_service_config(load_workflow(collision))
+
+
+@pytest.mark.parametrize(
+    ("key", "value"),
+    [
+        ("planning_codex_version", "0.161.0"),
+        ("planning_model", "gpt-6.1-sol"),
+        ("planning_reasoning_effort", "high"),
+    ],
+)
+def test_pm_config_rejects_pinned_planning_keys(tmp_path, key, value):
+    # The planning client admits installed controls and pins model/effort; a
+    # WORKFLOW key that looks configurable but is never read must fail loudly.
+    path = _write(tmp_path, f"---\npm:\n  {key}: {value}\n---\nPrompt")
+    with pytest.raises(ConfigValidationError, match=f"pm.{key}") as raised:
+        build_service_config(load_workflow(path))
+    message = str(raised.value)
+    assert "compatible installed Codex CLI" in message
+    assert "gpt-6.1-sol" in message
+    assert "medium" in message
+
+
+def test_pm_config_rejects_non_mapping(tmp_path):
+    path = _write(tmp_path, "---\npm: enabled\n---\nPrompt")
+    with pytest.raises(ConfigValidationError, match="pm must be a mapping"):
+        build_service_config(load_workflow(path))
+
+
 def test_build_service_config_reads_tracker_network_timeout_seconds(tmp_path):
     path = _write(
         tmp_path,

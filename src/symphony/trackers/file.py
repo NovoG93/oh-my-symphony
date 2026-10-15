@@ -54,6 +54,7 @@ from ..errors import LinearUnknownPayload, SymphonyError
 from ..issue import (
     BlockerRef,
     Issue,
+    PlanningRef,
     coerce_priority,
     normalize_labels,
     normalize_state,
@@ -91,6 +92,7 @@ _CANONICAL_FRONT_MATTER_KEYS = {
     "skills",
     "created_at",
     "updated_at",
+    "symphony_pm",
 }
 _LOCK_NAME_RE = re.compile(r"[^A-Za-z0-9_.-]+")
 _TRACKER_TEMP_NAME_RE = re.compile(
@@ -373,6 +375,14 @@ def issue_from_file(path: Path) -> Issue | None:
         or None,
         skills=normalize_skill_names(front.get("skills")),
         request=str(front.get("request") or "").strip() or None,
+        planning_ref=_parse_planning_ref(front.get("symphony_pm")),
+        planning_ref_state=(
+            "absent"
+            if "symphony_pm" not in front
+            else "valid"
+            if _parse_planning_ref(front.get("symphony_pm")) is not None
+            else "invalid"
+        ),
     )
 
 
@@ -386,6 +396,19 @@ def _parse_agent_kind(front: dict[str, Any]) -> str | None:
         return None
     kind = raw.strip().lower()
     return kind or None
+
+
+def _parse_planning_ref(value: Any) -> PlanningRef | None:
+    if not isinstance(value, dict):
+        return None
+    fields = ("change_id", "task_id", "task_revision", "handoff_id", "snapshot_id")
+    normalized: dict[str, str] = {}
+    for field in fields:
+        raw = value.get(field)
+        if not isinstance(raw, str) or not raw.strip():
+            return None
+        normalized[field] = raw.strip()
+    return PlanningRef(**normalized)
 
 
 def _parse_blockers(value: Any) -> list[BlockerRef]:
@@ -458,6 +481,7 @@ def serialize_ticket(front: dict[str, Any], body: str) -> str:
         "labels",
         "blocked_by",
         "request",
+        "symphony_pm",
         "agent",
         "agent_kind",
         "skills",
@@ -507,6 +531,17 @@ _ARTIFACTS_MARKER_RE = re.compile(
         for marker in (_ARTIFACTS_MARKER_OPEN, _ARTIFACTS_MARKER_CLOSE)
     )
 )
+
+
+def without_orchestrator_artifacts(body: str) -> str:
+    """Ticket body minus the orchestrator-owned `## Artifacts` block.
+
+    The block is rewritten after every turn from worker output, so it is not
+    part of the ticket's authored scope. Callers that fingerprint the scope
+    (PM dispatch authority) compare this view, whitespace-normalized the
+    same way `upsert_artifacts_section` rejoins the body.
+    """
+    return _ARTIFACTS_BLOCK_RE.sub("", body or "").strip()
 
 
 def _strip_warning_blocks(body: str) -> str:
@@ -1019,6 +1054,7 @@ class FileBoardTracker:
         skills: list[str] | None = None,
         blocked_by: list[str] | None = None,
         request: str | None = None,
+        planning_ref: PlanningRef | None = None,
     ) -> tuple[str, Path]:
         """Validate the board graph and create the ticket under one lock.
 
@@ -1057,6 +1093,7 @@ class FileBoardTracker:
                         skills=skills,
                         blocked_by=blocked_by,
                         request=request,
+                        planning_ref=planning_ref,
                     )
                 except SymphonyError as exc:
                     last_error = exc
@@ -1079,6 +1116,7 @@ class FileBoardTracker:
         skills: list[str] | None = None,
         blocked_by: list[str] | None = None,
         request: str | None = None,
+        planning_ref: PlanningRef | None = None,
     ) -> tuple[str, Path]:
         with _exclusive_lock(self._allocator_lock_path()):
             last_error: Exception | None = None
@@ -1096,6 +1134,7 @@ class FileBoardTracker:
                         skills=skills,
                         blocked_by=blocked_by,
                         request=request,
+                        planning_ref=planning_ref,
                     )
                 except SymphonyError as exc:
                     last_error = exc
@@ -1116,6 +1155,7 @@ class FileBoardTracker:
         skills: list[str] | None = None,
         blocked_by: list[str] | None = None,
         request: str | None = None,
+        planning_ref: PlanningRef | None = None,
     ) -> Path:
         identifier = validate_identifier(identifier)
         path = self._root / f"{identifier}.md"
@@ -1132,6 +1172,7 @@ class FileBoardTracker:
                 skills=skills,
                 blocked_by=blocked_by,
                 request=request,
+                planning_ref=planning_ref,
             )
             write_ticket_atomic(path, front, description)
             return path
@@ -1148,6 +1189,7 @@ class FileBoardTracker:
         skills: list[str] | None,
         blocked_by: list[str] | None = None,
         request: str | None = None,
+        planning_ref: PlanningRef | None = None,
     ) -> dict[str, Any]:
         now = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
         front: dict[str, Any] = {
@@ -1166,6 +1208,14 @@ class FileBoardTracker:
             front["request"] = request.strip()
         if isinstance(agent_kind, str) and agent_kind.strip():
             front["agent"] = {"kind": agent_kind.strip().lower()}
+        if planning_ref is not None:
+            front["symphony_pm"] = {
+                "change_id": planning_ref.change_id,
+                "task_id": planning_ref.task_id,
+                "task_revision": planning_ref.task_revision,
+                "handoff_id": planning_ref.handoff_id,
+                "snapshot_id": planning_ref.snapshot_id,
+            }
         normalized_skills = normalize_skill_names(list(skills or []))
         if normalized_skills:
             front["skills"] = list(normalized_skills)

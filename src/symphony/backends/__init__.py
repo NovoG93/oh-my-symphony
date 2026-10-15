@@ -23,9 +23,10 @@ backend-specific protocol details.
 
 from __future__ import annotations
 
+from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Awaitable, Callable, Protocol, cast, runtime_checkable
+from typing import Any, AsyncContextManager, Awaitable, Callable, Protocol, cast, runtime_checkable
 
 from ..errors import ConfigValidationError
 from ..workflow import ServiceConfig
@@ -92,6 +93,17 @@ def redact_session_id(value: Any, session_id: str | None) -> Any:
 
 
 EventCallback = Callable[[dict[str, Any]], Awaitable[None]]
+ProcessStartedPublisher = Callable[[int], Awaitable[None]]
+ProcessLaunchGuard = Callable[[], AsyncContextManager[ProcessStartedPublisher]]
+
+
+async def _noop_process_started(pid: int) -> None:
+    del pid
+
+
+@asynccontextmanager
+async def noop_process_launch_guard():
+    yield _noop_process_started
 
 
 @dataclass
@@ -122,6 +134,7 @@ class BackendInit:
     workspace_root: Path
     on_event: EventCallback
     on_process_started: Callable[[int], None] | None = None
+    on_process_identified: Callable[[int, str | None], None] | None = None
     client_tools: list[ToolDescriptor] = field(default_factory=list)
     # Per-dispatch environment overlaid on the inherited process environment
     # when the backend spawns its subprocess (``SYMPHONY_TOKEN_EMA``,
@@ -129,6 +142,7 @@ class BackendInit:
     # instead of mutating ``os.environ`` keeps concurrent dispatches from
     # clobbering each other's values (GitHub issue #29).
     env: dict[str, str] = field(default_factory=dict)
+    process_launch_guard: ProcessLaunchGuard = noop_process_launch_guard
 
 
 @runtime_checkable

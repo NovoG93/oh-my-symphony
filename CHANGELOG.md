@@ -8,6 +8,45 @@ this file is the in-repo summary.
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 Versioning: [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+## [0.27.0] - 2026-10-16 - PM Workspace and portable planning demo
+
+### Added
+- Add the default-off local PM Workspace: five planning artifacts, managed WBS, constrained XLSX exchange, pinned OpenSpec integration, proposal-only assistance, revision approval, native ticket handoff, evidence checks, and fenced actual-process dispatch authority. A trimmed OpenSpec 1.14.2 CLI ships inside Symphony and runs with the host's Node.js 20.19.0 or newer whenever `pm.openspec_executable` is absent; set that key only to use your own OpenSpec 1.14.2.
+- Add `symphony pm demo [--path DIR] [--lang en|ko]`: a disposable, loopback-only PM Workspace with one validated sample change in English or Korean. It never starts an agent; Ctrl-C stops it and keeps the folder. Not verified on Windows. Each planning screen gains a "What do these buttons do?" guide (collapsed by default), `?lang=en|ko` sets the page language, and buttons that need a missing host tool are disabled up front with the reason: Approve revision and Preview archive without Node.js 20.19.0+, the planning assistant without a compatible installed Codex CLI and a Codex login. `symphony pm` now always runs this command, even when a `./pm` directory exists; run a workflow there with `symphony ./pm`.
+- PM approval and handoff remain separate local actions. This change does not enable automatic merge/push, deployment, publication, or real-project archive.
+- PM Workspace storyboard cards use structured server-owned fields and stable frame identities.
+- PM assistance exposes all seven bounded planning actions with per-document diff review.
+- No-run verification supports real host-executed native commands and immutable manual evidence through explicit acceptance.
+- Requirement and scenario coverage shows independent partial states and non-authoritative waiver records.
+- XLSX preview binds a plain `.xlsx` filename to the durable import snapshot and rejects hostile XML, duplicate IDs, active content, and unsupported containers before mutation.
+- XLSX exports include a UTC export time, native execution snapshots/links and leaf-status summary, derived display numbers/dependency summaries/adjacent titles, frozen identifying columns, parent indentation, read-only shading, and advisory controlled-field dropdowns while retaining version 1 import compatibility and custom task values.
+
+### Changed
+- PM planning assistance uses the installed Codex CLI after shared binary-generated schema and strict initialize checks, with executable replacement invalidating compatibility admission. GPT-6.1 Sol at medium reasoning, isolation, read-only/tool-disabled/no-network execution, and no provider fallback remain required. No automatic upgrade or downgrade is performed.
+- PM planning configuration rejects `pm.planning_codex_version`, `pm.planning_model`, and `pm.planning_reasoning_effort`; the dedicated planning client checks installed CLI capabilities and pins model and effort. Other unknown `pm.*` keys are still ignored, so use only documented settings.
+- PM mutations refuse untrusted cross-origin requests with `403 forbidden_origin`. Reverse-proxy operators must declare the browser origin in `SYMPHONY_TRUSTED_ORIGINS`; the disposable demo remains loopback-only and ignores that setting. `X-Symphony-PM-Owner` is an audit claim, not authentication.
+- CI runs the suite in parallel (`pytest-xdist`) and the wall-clock `timing` tests alone afterwards. Plain `python -m pytest -q` still runs everything serially.
+- Every worker prompt and the PM planning assistant now carry one shared writing rule (lead with the result, no filler or repetition, keep every number and warning).
+- Worker process cleanup is now confirmed per process group for every per-turn CLI backend (all backends except the Codex app-server). A turn whose agent leaves a background process running in its process group fails cleanup confirmation, and that backend refuses further turns until a stop confirms the group is gone.
+- The bundled OpenSpec and any configured `pm.openspec_executable` move from 1.14.0 to exactly 1.14.2; Node.js 20.19.0+ and the six commands PM Workspace calls are unchanged. Strict validation treats upstream warnings as invalid, including applicable main-spec and new `ADDED` requirement descriptions over 500 characters and spec text archive does not carry; recognized artifact-output and `apply.tracks` globs nested more than 16 levels are refused. PM containment, ownership, and path refusals are unchanged, and the `symphony-pm` schema and owner or project custom schemas are not edited or migrated. The planning assistant is asked to write within these limits without truncating owner content.
+
+### Fixed
+- PM source drafts compare with saved content, so recovered drafts are immediately savable. Localized discard guards preserve edits on Cancel across planning tabs, nested Design views, and project switching.
+- PM menus and drawers use the existing defined surface colors, narrow layouts wrap content and actions, and one owned overlay manages background interaction, keyboard focus, Escape/close and draft-safe storyboard dismissal. Empty optional assistance-review sections no longer render `nullnull`.
+- PM snapshot/archive operations share stable per-change authority; synchronous PM transactions and manual evidence/report reads run off the event loop with owned registry connections. Read-only Git status disables optional index locking, evidence Git checks use the existing operation timeout, and registry-recognition errors stay within the fail-closed dispatch result.
+- PM atomic writes, semantic-stage publication and recovery preserve existing regular-file modes while keeping new files at 0600. Archive recovery fsyncs its atomic writes and cleans temporary files after failure.
+- Default pytest execution includes the required Node PM UI suite and fails when Node is missing or the suite fails.
+- Korean Design source editors retain translated controls after opening from Storyboard, UX, or API. Repeated source/review toggles keep the selected language, existing source, focus behavior, and event handlers.
+- Failed project and planning-change selection restores the prior selection, content, focus, and announced error instead of leaving mismatched UI state.
+- PM planning assistance admits only a compatible installed Codex CLI, planning drafts are preserved, and planning cancellation is bound across admission, startup, and turn lifetime; further planning work is refused when cleanup is uncertain.
+- PM planning screens put secondary controls in mobile disclosures, keep the active artifact tab visible, serialize WBS refreshes, and manage keyboard focus for overlays.
+
+### Known limitations
+- Remaining PM findings include broad `ValueError` classification (`400 invalid_body`, unchanged pending separate contract approval), the test-only receipt builder, ignored unknown `pm.*` keys, and the runtime origin error omitting `SYMPHONY_TRUSTED_ORIGINS`. See the [finding IDs and operational effects](docs/pm-workspace-operations.md#accepted-findings-and-current-handling).
+- On a host without `ps`, a surviving process-group member that ignores SIGTERM can escape the final SIGKILL after its leader exits; cleanup stays uncertain and `stop()` raises. Native Windows PM behavior and real provider quota fallback remain unverified. The [human review checklist](docs/pm-workspace.md#final-human-review) is separate from automated proof and merge approval.
+
 ## [0.26.0] - 2026-09-22 - First-run experience: demo keeps the generated workflow, project-facing agent files, clean git status
 
 ### Fixed

@@ -487,7 +487,7 @@ def _reclaim_kill_confirm(record: RunRecord) -> str | None:
         outcome = "identity_mismatch"
     else:
         try:
-            killed = kill_process_group(pid)
+            killed = kill_process_group(pid, identity=expected_identity)
         except Exception as exc:
             log.warning(
                 "reclaim_killed_orphan_agent",
@@ -1068,6 +1068,7 @@ class Orchestrator:
         # be garbage-collected mid-flight and its exception vanishes with
         # it. `_spawn_supervised` is the only sanctioned way to fire one.
         self._background_tasks: set[asyncio.Task[None]] = set()
+
         # Continuous-improvement heartbeat (plan §4). Default-off, config
         # re-read per tick from the workflow snapshot. Its own asyncio task
         # — never a worker slot. Due-math uses the monotonic clock so a
@@ -1089,6 +1090,38 @@ class Orchestrator:
         self._improvement_turns_used: int = 0
         self._improvement_cap_warned: bool = False
         self._improvement_status: dict[str, Any] = _initial_improvement_status()
+
+    def _pm_process_launch_guard(
+        self, running_issue_id: str, issue: Issue, cfg: ServiceConfig,
+        workspace_path: Path | None = None,
+    ):
+        from ..backends import noop_process_launch_guard
+        from ..pm.authority import PmAuthority
+
+        running = self._running.get(running_issue_id)
+        permit = running.pm_dispatch_permit if running is not None else None
+        registry = self._run_registry
+        if permit is None or registry is None:
+            return noop_process_launch_guard
+        assert running is not None
+        authority = PmAuthority(
+            registry, cfg.workflow_path.parent / ".symphony" / "pm-locks",
+            successful_states={
+                state for state in cfg.tracker.terminal_states
+                if state.casefold() not in {"cancelled", "blocked", cfg.tracker.archive_state.casefold()}
+            },
+        )
+
+        async def load_issue() -> Issue | None:
+            return await asyncio.to_thread(
+                self._tracker_call_fetch_issue_full_by_id,
+                cfg,
+                issue.identifier,
+            )
+
+        return authority.launch_guard(
+            permit, load_issue, running.run_id, workspace_path=workspace_path
+        )
 
     # ------------------------------------------------------------------
     # dispatch-state views (initiative A). Read-only aliases so the many
@@ -1199,34 +1232,19 @@ class Orchestrator:
             task = entry.worker_task
             if task not in pending:
                 continue
-            killed: bool | None = None
+            cleanup_confirmed = await self._confirm_entry_backend_cleanup_async(
+                issue_id, entry
+            )
+            if entry.run_id and self._run_registry is not None:
+                entry.backend_cleanup_unconfirmed = not cleanup_confirmed
             agent_pgid = _normalize_agent_pid(entry.agent_pgid)
-            if agent_pgid is not None:
-                try:
-                    # win32 kill_process_group shells out to `taskkill /T`;
-                    # keep that subprocess off the event loop so stop()
-                    # drains never stall the service on a slow kill. The
-                    # recorded identity fingerprint gates pid reuse.
-                    killed = await asyncio.to_thread(
-                        kill_process_group,
-                        agent_pgid,
-                        identity=self._agent_pid_identity(entry),
-                    )
-                except Exception as exc:
-                    log.warning(
-                        "worker_process_kill_failed_on_stop",
-                        issue_id=issue_id,
-                        agent_kind=self._entry_agent_kind(entry),
-                        pid=agent_pgid,
-                        error=str(exc),
-                    )
             log.warning(
                 "worker_task_abandoned_on_stop",
                 issue_id=issue_id,
                 identifier=entry.issue.identifier,
                 agent_kind=self._entry_agent_kind(entry),
                 pid=agent_pgid,
-                killed=killed,
+                cleanup_confirmed=cleanup_confirmed,
             )
             self._finish_run_lease(issue_id, entry, "shutdown_abandoned")
 
@@ -2584,6 +2602,8 @@ class Orchestrator:
         *,
         progress: datetime | None = None,
         backend_agent_pid: int | None = None,
+        backend_process_identity: str | None = None,
+        identity_captured: bool = False,
     ) -> bool:
         """Refresh the entry's lease; returns False only on a real conflict.
 
@@ -2592,6 +2612,14 @@ class Orchestrator:
         healthy worker should not keep running leaseless, so try to take a
         fresh lease; only an actual conflicting holder returns False.
         """
+        effective_backend_pid = backend_agent_pid or entry.agent_pgid
+        if (
+            not identity_captured
+            and effective_backend_pid is not None
+            and entry.agent_process_identity_captured
+        ):
+            backend_process_identity = entry.agent_process_identity
+            identity_captured = True
         registry = self._run_registry
         release_required = entry.release_authority_resolved and (
             entry.known_app_release
@@ -2621,7 +2649,9 @@ class Orchestrator:
                     issue_id=issue_id,
                     run_id=entry.run_id,
                     progress_at=progress,
-                    backend_agent_pid=backend_agent_pid or entry.agent_pgid,
+                    backend_agent_pid=effective_backend_pid,
+                    backend_process_identity=backend_process_identity,
+                    backend_process_identity_captured=identity_captured,
                 )
             except Exception as exc:
                 self._registry_error_count += 1
@@ -2641,7 +2671,9 @@ class Orchestrator:
                     issue_id=issue_id,
                     run_id=entry.run_id,
                     progress_at=progress,
-                    backend_agent_pid=backend_agent_pid or entry.agent_pgid,
+                    backend_agent_pid=effective_backend_pid,
+                    backend_process_identity=backend_process_identity,
+                    backend_process_identity_captured=identity_captured,
                 )
             except Exception as exc:
                 self._registry_error_count += 1
@@ -2662,7 +2694,9 @@ class Orchestrator:
                     issue_id=issue_id,
                     run_id=entry.run_id,
                     progress_at=progress,
-                    backend_agent_pid=backend_agent_pid or entry.agent_pgid,
+                    backend_agent_pid=effective_backend_pid,
+                    backend_process_identity=backend_process_identity,
+                    backend_process_identity_captured=identity_captured,
                 ),
                 True,
             )
@@ -2734,18 +2768,36 @@ class Orchestrator:
         return record.backend_process_identity
 
     def _sync_backend_agent_pid(
-        self, issue_id: str, backend_agent_pid: int | None
+        self,
+        issue_id: str,
+        backend_agent_pid: int | None,
+        *,
+        backend_process_identity: str | None = None,
+        identity_captured: bool = False,
     ) -> None:
         """Keep in-memory and persisted backend ownership in lockstep."""
         entry = self._running.get(issue_id)
         if entry is None:
             return
+        if (
+            not identity_captured
+            and backend_agent_pid is not None
+            and entry.agent_pgid == backend_agent_pid
+            and entry.agent_process_identity_captured
+        ):
+            backend_process_identity = entry.agent_process_identity
+            identity_captured = True
         entry.agent_pgid = backend_agent_pid
         if backend_agent_pid is not None:
+            if identity_captured:
+                entry.agent_process_identity = backend_process_identity
+                entry.agent_process_identity_captured = True
             lease_ok = self._heartbeat_run_lease(
                 issue_id,
                 entry,
                 backend_agent_pid=backend_agent_pid,
+                backend_process_identity=backend_process_identity,
+                identity_captured=identity_captured,
             )
             if not lease_ok:
                 task = entry.worker_task
@@ -2758,6 +2810,8 @@ class Orchestrator:
                     task.cancel()
                     entry.cancelled_at = datetime.now(timezone.utc)
             return
+        entry.agent_process_identity = None
+        entry.agent_process_identity_captured = False
         registry = self._run_registry
         if registry is None or not entry.run_id:
             return
@@ -2812,7 +2866,8 @@ class Orchestrator:
                 backend_agent_pid=entry.agent_pgid,
             )
             return
-        self._registry_guard(
+        permit = entry.pm_dispatch_permit
+        completed = bool(self._registry_guard(
             "complete_run",
             lambda: registry.complete_run(
                 issue_id=issue_id,
@@ -2825,9 +2880,145 @@ class Orchestrator:
                 total_tokens=entry.codex_total_tokens,
                 failure_class=(None if status == "normal" else status),
                 failure_message=error,
+                pm_dispatch_permit_id=(permit.permit_id if permit else None),
+                pm_dispatch_fence=(permit.fence if permit else None),
             ),
             None,
+        ))
+        if not completed:
+            log.error(
+                "run_lease_finish_failed",
+                issue_id=issue_id,
+                issue_identifier=entry.issue.identifier,
+                run_id=entry.run_id,
+                permit_id=permit.permit_id if permit else None,
+            )
+
+    def _entry_backend_cleanup_record(
+        self, issue_id: str, entry: RunningEntry
+    ) -> RunRecord | None:
+        registry = self._run_registry
+        if registry is None or not entry.run_id:
+            return None
+        record = self._registry_guard(
+            "get_run_for_backend_cleanup",
+            lambda: registry.get_run(entry.run_id),
+            None,
         )
+        if not isinstance(record, RunRecord) or record.issue_id != issue_id:
+            return None
+        entry_pid = _normalize_agent_pid(entry.agent_pgid)
+        if entry_pid != record.backend_agent_pid:
+            log.warning(
+                "worker_backend_cleanup_identity_unconfirmed",
+                issue_id=issue_id,
+                run_id=entry.run_id,
+                entry_pid=entry_pid,
+                recorded_pid=record.backend_agent_pid,
+            )
+            return None
+        return record
+
+    def _confirm_entry_backend_cleanup(
+        self, issue_id: str, entry: RunningEntry
+    ) -> bool:
+        record = self._entry_backend_cleanup_record(issue_id, entry)
+        if entry.run_id and self._run_registry is not None:
+            outcome = _reclaim_kill_confirm(record) if record is not None else None
+            log.warning(
+                "force_eject_killed_process_group",
+                issue_id=issue_id,
+                identifier=entry.issue.identifier,
+                agent_kind=self._entry_agent_kind(entry),
+                pid=_normalize_agent_pid(entry.agent_pgid),
+                killed=outcome == "killed",
+                cleanup_outcome=outcome or "unconfirmed",
+            )
+            return outcome is not None
+        agent_pgid = _normalize_agent_pid(entry.agent_pgid)
+        if agent_pgid is None:
+            return True
+        try:
+            killed = bool(
+                kill_process_group(
+                    agent_pgid, identity=self._agent_pid_identity(entry)
+                )
+            )
+        except Exception as exc:
+            log.warning(
+                "worker_process_kill_failed",
+                issue_id=issue_id,
+                agent_kind=self._entry_agent_kind(entry),
+                pid=agent_pgid,
+                error=str(exc),
+            )
+            return False
+        log.warning(
+            "force_eject_killed_process_group",
+            issue_id=issue_id,
+            identifier=entry.issue.identifier,
+            agent_kind=self._entry_agent_kind(entry),
+            pid=agent_pgid,
+            killed=killed,
+        )
+        return killed
+
+    async def _confirm_entry_backend_cleanup_async(
+        self, issue_id: str, entry: RunningEntry
+    ) -> bool:
+        record = self._entry_backend_cleanup_record(issue_id, entry)
+        if entry.run_id and self._run_registry is not None:
+            if record is None:
+                log.warning(
+                    "force_eject_killed_process_group",
+                    issue_id=issue_id,
+                    identifier=entry.issue.identifier,
+                    agent_kind=self._entry_agent_kind(entry),
+                    pid=_normalize_agent_pid(entry.agent_pgid),
+                    killed=False,
+                    cleanup_outcome="unconfirmed",
+                )
+                return False
+            outcome = await asyncio.to_thread(_reclaim_kill_confirm, record)
+            log.warning(
+                "force_eject_killed_process_group",
+                issue_id=issue_id,
+                identifier=entry.issue.identifier,
+                agent_kind=self._entry_agent_kind(entry),
+                pid=_normalize_agent_pid(entry.agent_pgid),
+                killed=outcome == "killed",
+                cleanup_outcome=outcome or "unconfirmed",
+            )
+            return outcome is not None
+        agent_pgid = _normalize_agent_pid(entry.agent_pgid)
+        if agent_pgid is None:
+            return True
+        try:
+            killed = bool(
+                await asyncio.to_thread(
+                    kill_process_group,
+                    agent_pgid,
+                    identity=self._agent_pid_identity(entry),
+                )
+            )
+        except Exception as exc:
+            log.warning(
+                "worker_process_kill_failed",
+                issue_id=issue_id,
+                agent_kind=self._entry_agent_kind(entry),
+                pid=agent_pgid,
+                error=str(exc),
+            )
+            return False
+        log.warning(
+            "force_eject_killed_process_group",
+            issue_id=issue_id,
+            identifier=entry.issue.identifier,
+            agent_kind=self._entry_agent_kind(entry),
+            pid=agent_pgid,
+            killed=killed,
+        )
+        return killed
 
     def _try_acquire_run_lease(
         self,
@@ -6804,9 +6995,13 @@ class Orchestrator:
         # a per-ticket pin on later dispatches, which would freeze the
         # first stage's backend and defeat per-state routing.
         try:
-            if cfg.agent.stage_kinds:
-                # Routed board: the pin must stay empty, but the audit value
-                # still belongs on the ticket (F-20).
+            if cfg.agent.stage_kinds or issue.planning_ref is not None:
+                # Routed boards and PM-managed tickets must keep inherited
+                # backend selection out of the authoritative pin.  PM handoff
+                # already persists an explicit task override when one exists;
+                # writing the resolved workflow backend here would mutate an
+                # inherited task after its dispatch permit was reserved.
+                # The audit-only field remains visible without changing scope.
                 self._tracker_call_record_last_agent_kind(
                     cfg, issue.identifier, entry.agent_kind
                 )
@@ -7261,6 +7456,16 @@ class Orchestrator:
         """
         try:
             await old_client.stop()
+        except asyncio.CancelledError:
+            running = self._running.get(running_issue_id)
+            if running is not None:
+                running.backend_cleanup_unconfirmed = True
+            log.warning(
+                "phase_transition_old_stop_cancelled",
+                issue_id=issue.id,
+                identifier=issue.identifier,
+            )
+            raise
         except Exception as stop_exc:
             running = self._running.get(running_issue_id)
             if running is not None:
@@ -7292,8 +7497,19 @@ class Orchestrator:
                 on_process_started=lambda pid, issue_id=running_issue_id: (
                     self._sync_backend_agent_pid(issue_id, pid)
                 ),
+                on_process_identified=lambda pid, identity, issue_id=running_issue_id: (
+                    self._sync_backend_agent_pid(
+                        issue_id,
+                        pid,
+                        backend_process_identity=identity,
+                        identity_captured=True,
+                    )
+                ),
                 client_tools=tools,
                 env=self._dispatch_env_for(issue=issue, cfg=cfg, is_rewind=is_rewind),
+                process_launch_guard=self._pm_process_launch_guard(
+                    running_issue_id, issue, cfg, workspace_path
+                ),
             )
         )
         try:
@@ -7343,6 +7559,16 @@ class Orchestrator:
         except BaseException:
             try:
                 await new_client.stop()
+            except asyncio.CancelledError:
+                running = self._running.get(running_issue_id)
+                if running is not None:
+                    running.backend_cleanup_unconfirmed = True
+                log.warning(
+                    "phase_transition_new_stop_cancelled",
+                    issue_id=issue.id,
+                    identifier=issue.identifier,
+                )
+                raise
             except Exception as stop_exc:
                 running = self._running.get(running_issue_id)
                 if running is not None:
@@ -8319,19 +8545,12 @@ class Orchestrator:
         self._claimed.discard(issue_id)
         try:
             try:
-                agent_pgid = _normalize_agent_pid(entry.agent_pgid)
-                if agent_pgid is not None and not skip_kill:
-                    killed = kill_process_group(
-                        agent_pgid, identity=self._agent_pid_identity(entry)
+                if not skip_kill:
+                    cleanup_confirmed = self._confirm_entry_backend_cleanup(
+                        issue_id, entry
                     )
-                    log.warning(
-                        "force_eject_killed_process_group",
-                        issue_id=issue_id,
-                        identifier=entry.issue.identifier,
-                        agent_kind=self._entry_agent_kind(entry),
-                        pid=agent_pgid,
-                        killed=killed,
-                    )
+                    if entry.run_id and self._run_registry is not None:
+                        entry.backend_cleanup_unconfirmed = not cleanup_confirmed
             finally:
                 self._finish_run_lease(issue_id, entry, "force_ejected_zombie")
         finally:
@@ -8759,30 +8978,14 @@ class Orchestrator:
                 # the eject's finallies release the lease and schedule the
                 # retry, then surfaces to the per-issue reconcile guard —
                 # exactly the pre-M1 containment (AF-07).
-                agent_pgid = _normalize_agent_pid(entry.agent_pgid)
-                kill_failure: Exception | None = None
-                if agent_pgid is not None:
-                    try:
-                        killed = await asyncio.to_thread(
-                            kill_process_group,
-                            agent_pgid,
-                            identity=self._agent_pid_identity(entry),
-                        )
-                        log.warning(
-                            "force_eject_killed_process_group",
-                            issue_id=issue_id,
-                            identifier=entry.issue.identifier,
-                            agent_kind=self._entry_agent_kind(entry),
-                            pid=agent_pgid,
-                            killed=killed,
-                        )
-                    except Exception as exc:
-                        kill_failure = exc
+                cleanup_confirmed = await self._confirm_entry_backend_cleanup_async(
+                    issue_id, entry
+                )
+                if entry.run_id and self._run_registry is not None:
+                    entry.backend_cleanup_unconfirmed = not cleanup_confirmed
                 self._force_eject_zombie(
                     issue_id, entry, cfg, skip_kill=True
                 )
-                if kill_failure is not None:
-                    raise kill_failure
             return
         if self.is_paused(issue_id):
             return

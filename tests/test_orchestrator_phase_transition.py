@@ -989,6 +989,7 @@ def test_persistent_backend_pid_is_registered_before_each_initialize(
     _seed_running_entry(o, issue, tmp_path)
     observed_initialize_pids: list[int | None] = []
     explicit_heartbeat_pids: list[int] = []
+    heartbeat_identities: list[tuple[str | None, bool]] = []
 
     async def _start(self_inst: _FakeBackend) -> None:
         self_inst.process_pid = (11111, 22222)[self_inst.init_id]
@@ -1004,10 +1005,15 @@ def test_persistent_backend_pid_is_registered_before_each_initialize(
         *,
         progress: datetime | None = None,
         backend_agent_pid: int | None = None,
+        backend_process_identity: str | None = None,
+        identity_captured: bool = False,
     ) -> bool:
         del issue_id, entry, progress
         if backend_agent_pid is not None:
             explicit_heartbeat_pids.append(backend_agent_pid)
+            heartbeat_identities.append(
+                (backend_process_identity, identity_captured)
+            )
         return True
 
     monkeypatch.setattr(_FakeBackend, "start", _start)
@@ -1027,6 +1033,7 @@ def test_persistent_backend_pid_is_registered_before_each_initialize(
         22222,  # second run_turn boundary
         22222,  # second run_turn finally
     ]
+    assert heartbeat_identities == [(None, False)] * 6
 
 
 def test_prompt_turn_budget_continues_across_attempts(
