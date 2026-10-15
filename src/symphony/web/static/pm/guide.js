@@ -33,7 +33,7 @@ export const PM_GUIDES = {
     'Work breakdown': 'Shows the plan as a tree of groups and tasks with owner, priority and estimate.',
     'Dependencies': 'Lists which tasks must wait for other tasks, and why.',
     'Add group': 'Adds a group that holds related tasks; a group itself is never handed off as work.',
-    'Add child': 'Adds a new task under the selected item.',
+    'Add child': 'Adds a task under the selected group; with no selection, adds a root task. Executable tasks cannot contain children.',
     'Delete': 'Removes the selected task while the plan is not yet approved; Undo brings it back.',
     'Cancel task': 'Takes the place of Delete after approval: cancels the selected task with a reason you give and keeps its reviewed scope on record.',
     'Undo': 'Reverses your last change to the work breakdown.',

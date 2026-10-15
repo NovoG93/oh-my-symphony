@@ -280,8 +280,9 @@ export function mountArtifacts({ root, projectId, api: hostApi, ui, onDirtyChang
   }
 
   function buildHeader() {
-    const visibleChanges = state.change && !state.changes.some((item) => item.change_id === state.change.change_id)
-      ? [state.change, ...state.changes] : state.changes;
+    const selectedId = state.change?.change_id;
+    const listed = state.changes.map((item) => (item.change_id === selectedId ? state.change : item));
+    const visibleChanges = state.change && !state.changes.some((item) => item.change_id === selectedId) ? [state.change, ...listed] : listed;
     const select = ui.el('select', { class: 'pm-change-select', 'aria-label': 'Planning change' }, [
       ui.el('option', { value: '' }, 'Select a change'),
       ...visibleChanges.map((item) => ui.el('option', { value: item.change_id, selected: state.change?.change_id === item.change_id }, `${item.locator} · ${item.state}`)),
@@ -299,9 +300,9 @@ export function mountArtifacts({ root, projectId, api: hostApi, ui, onDirtyChang
     ]);
   }
 
-  // Collapsed everywhere; open in the demo, where first-time readers land.
+  // Collapsed by default; summaries keep help available on demand.
   function buildGuide(area) {
-    return ui.el('details', { class: 'pm-guide', open: demoActive() }, [
+    return ui.el('details', { class: 'pm-guide' }, [
       ui.el('summary', null, 'What do these buttons do?'),
       ui.el('dl', { class: 'pm-guide-list' }, Object.entries(PM_GUIDES[area]).flatMap(([label, text]) => [ui.el('dt', null, label), ui.el('dd', null, text)])),
     ]);
@@ -1059,7 +1060,7 @@ const KO = new Map(Object.entries({
   'Shows the plan as a tree of groups and tasks with owner, priority and estimate.': '계획을 그룹과 작업의 트리로 보여 주고 담당자, 우선순위, 예상치를 함께 표시합니다.',
   'Lists which tasks must wait for other tasks, and why.': '어떤 작업이 다른 작업을 기다려야 하는지와 그 이유를 보여 줍니다.',
   'Adds a group that holds related tasks; a group itself is never handed off as work.': '관련 작업을 묶는 그룹을 추가합니다. 그룹 자체는 작업으로 전달되지 않습니다.',
-  'Adds a new task under the selected item.': '선택한 항목 아래에 새 작업을 추가합니다.',
+  'Adds a task under the selected group; with no selection, adds a root task. Executable tasks cannot contain children.': '선택한 그룹 아래에 새 작업을 추가합니다. 아무것도 선택하지 않으면 최상위 작업을 추가합니다. 실행 작업 아래에는 하위 작업을 추가할 수 없습니다.',
   'Removes the selected task while the plan is not yet approved; Undo brings it back.': '계획이 승인되기 전에 선택한 작업을 삭제합니다. 실행 취소로 되돌릴 수 있습니다.',
   'Takes the place of Delete after approval: cancels the selected task with a reason you give and keeps its reviewed scope on record.': '승인 후에는 삭제 대신 나타납니다. 입력한 사유로 선택한 작업을 취소하고 검토된 범위는 기록으로 남깁니다.',
   'Reverses your last change to the work breakdown.': '작업 분해에서 마지막으로 바꾼 내용을 되돌립니다.',

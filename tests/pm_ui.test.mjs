@@ -382,6 +382,11 @@ class UiNode {
     this.classList = {
       add: (name) => this.setAttribute('class', `${this.getAttribute('class') || ''} ${name}`.trim()),
       remove: (name) => this.setAttribute('class', (this.getAttribute('class') || '').split(' ').filter((item) => item !== name).join(' ')),
+      toggle: (name, force) => {
+        const present = (this.getAttribute('class') || '').split(' ').includes(name);
+        const enabled = force === undefined ? !present : force;
+        this.classList[enabled ? 'add' : 'remove'](name); return enabled;
+      },
     };
   }
   get textContent() { return this.nodeType === 3 ? this.nodeValue : this.childNodes.map((node) => node.textContent).join(''); }
@@ -410,6 +415,10 @@ class UiNode {
     if (['value', 'title'].includes(key)) this[key] = String(value);
   }
   getAttribute(key) { return this.attributes.get(key) ?? null; }
+  removeAttribute(key) {
+    this.attributes.delete(key);
+    if (['open', 'disabled', 'hidden', 'selected'].includes(key)) this[key] = false;
+  }
   matches(selector) {
     const match = selector.match(/^([\w-]+)?(?:\.([\w-]+))?(?:\[([\w-]+)(?:="([^"]*)")?\])?$/);
     if (!match || this.nodeType !== 1) return false;
@@ -435,7 +444,7 @@ function storageStub() {
   return { getItem: (key) => values.get(key) ?? null, setItem: (key, value) => values.set(key, String(value)), removeItem: (key) => values.delete(key) };
 }
 
-async function mountedPm(t, { tab = 'idea', view = '', demo = false, language = 'en', hostTools = {}, gated = false, archived = false, development = false, demoAssistance = false, dirtyChanges = [], apiRequest = null, draft = null, announcements = [] } = {}) {
+async function mountedPm(t, { tab = 'idea', view = '', requested = '', demo = false, language = 'en', hostTools = {}, gated = false, archived = false, development = false, demoAssistance = false, dirtyChanges = [], apiRequest = null, draft = null, announcements = [] } = {}) {
   const el = (tag, attrs, children) => {
     const node = new UiNode(tag);
     for (const [key, value] of Object.entries(attrs || {})) if (value !== null && value !== undefined && value !== false) node.setAttribute(key, typeof value === 'boolean' ? '' : value);
@@ -445,7 +454,7 @@ async function mountedPm(t, { tab = 'idea', view = '', demo = false, language = 
   };
   const globals = {
     window: { i18n: { lang: language } },
-    location: new URL(`http://127.0.0.1/?pmTab=${tab}&pmView=${view}#/artifacts`),
+    location: new URL(`http://127.0.0.1/?pmTab=${tab}&pmView=${view}&pmChange=${requested}#/artifacts`),
     history: { replaceState() {} }, sessionStorage: storageStub(), localStorage: storageStub(), NodeFilter: { SHOW_TEXT: 4 },
     document: {
       // WBS enhancement stays disconnected; these tests exercise native controls.
@@ -560,7 +569,7 @@ test('Design direct source replacements localize both callbacks and the nested t
   }
 });
 
-test('R9 each area renders visible guide entries and follows demo.active in English and Korean', async (t) => {
+test('R9 each area retains guide entries and starts closed in English and Korean', async (t) => {
   for (const language of ['en', 'ko']) for (const demo of [false, true]) for (const tab of ['idea', 'requirements', 'design', 'plan', 'code']) {
     await t.test(`${tab}, ${language}, demo=${demo}`, async (context) => {
       const root = await mountedPm(context, { tab, language, demo });
@@ -570,7 +579,7 @@ test('R9 each area renders visible guide entries and follows demo.active in Engl
       for (const [area, labels] of [['workspace', GUIDE_LABELS.workspace], [tab, GUIDE_LABELS[tab]]]) {
         const guide = guides.find((node) => labels.every((label) => node.textContent.includes(pmText(label, {}, language))));
         assert.ok(guide, `${area}: missing visible guide labels`);
-        assert.equal(guide.open, demo, `${area}: open must follow capabilities.demo.active`);
+        assert.equal(guide.open, false, `${area}: help starts closed in demo and ordinary mode`);
         assert.equal(guide.querySelector('summary')?.textContent, pmText(GUIDE_SUMMARY, {}, language));
         for (const label of labels) {
           const text = guide.textContent;
@@ -580,6 +589,112 @@ test('R9 each area renders visible guide entries and follows demo.active in Engl
       }
     });
   }
+});
+
+const settlePm = async () => { for (let i = 0; i < 3; i += 1) await new Promise((resolve) => setImmediate(resolve)); };
+
+test('round7 selected option projects authoritative detail after approval/edit without changing list rows', async (t) => {
+  const listed = [{ change_id: 'c1', locator: 'first', state: 'Validated' }, { change_id: 'c2', locator: 'second', state: 'Draft' }];
+  const original = structuredClone(listed), calls = [];
+  let detail = { ...listed[0], revision: 'r1', documents: [{ document_id: 'proposal', editable: true }], storyboard_frames: [] };
+  const root = await mountedPm(t, { apiRequest: async (path, options) => {
+    path = path.split('?')[0];
+    calls.push(path);
+    if (path === '/changes') return { changes: listed };
+    if (path === '/changes/c1') return structuredClone(detail);
+    if (path.endsWith('/approvals')) { detail = { ...detail, state: 'Approved' }; return {}; }
+    if (path.includes('/documents/proposal') && options?.method === 'PATCH') { detail = { ...detail, state: 'Validated', revision: 'r2' }; return {}; }
+  } });
+  window.confirm = () => true;
+  const options = () => root.querySelector('.pm-change-select').options.slice(1).map((node) => [node.value, node.textContent, Boolean(node.selected)]);
+  await findButton(root, 'Approve revision').trigger('click'); await settlePm();
+  assert.deepEqual(options(), [['c1', 'first · Approved', true], ['c2', 'second · Draft', false]]);
+  await findButton(root, 'Edit source').trigger('click');
+  const editor = root.querySelector('textarea'); editor.value += '\nEdited'; await editor.trigger('input');
+  await findButton(root, 'Save draft').trigger('click'); await settlePm();
+  assert.deepEqual(options(), [['c1', 'first · Validated', true], ['c2', 'second · Draft', false]]);
+  assert.deepEqual(listed, original, 'cached list and unrelated row retain their objects and values');
+  assert.equal(calls.filter((path) => path === '/changes').length, 1, 'refresh adds no list API call');
+});
+
+test('round7 header preserves failed-switch rollback and ignores stale aborted detail', async (t) => {
+  const rows = [{ change_id: 'c1', locator: 'first', state: 'Draft' }, { change_id: 'c2', locator: 'second', state: 'Draft' }];
+  const detail = (row, state = row.state) => ({ ...row, state, revision: 'r1', documents: [{ document_id: 'proposal', editable: true }] });
+  let mode = 'fail', finish, pendingSignal;
+  const root = await mountedPm(t, { apiRequest: async (path, options) => {
+    path = path.split('?')[0];
+    if (path === '/changes') return { changes: structuredClone(rows) };
+    if (path === '/changes/c1') return detail(rows[0], 'Validated');
+    if (path === '/changes/c2') {
+      if (mode === 'fail') throw new Error('switch unavailable');
+      pendingSignal = options.signal;
+      return new Promise((resolve) => { finish = resolve; });
+    }
+  } });
+  window.history = history;
+  const choose = async (id) => { const select = root.querySelector('.pm-change-select'); select.value = id; await select.trigger('change'); await settlePm(); };
+  await choose('c2');
+  assert.equal(root.querySelector('.pm-change-select').value, 'c1');
+  assert.match(root.querySelector('.pm-action-error').textContent, /switch unavailable/);
+  assert.equal(root.querySelector('.pm-change-select').selectedOptions[0].textContent, 'first · Validated');
+  mode = 'pending'; await choose('c2'); await choose('c1');
+  assert.equal(pendingSignal.aborted, true);
+  finish(detail(rows[1], 'Approved')); await settlePm();
+  assert.equal(root.querySelector('.pm-change-select').value, 'c1');
+  assert.deepEqual(root.querySelector('.pm-change-select').options.slice(1).map((node) => node.textContent), ['first · Validated', 'second · Draft']);
+});
+
+test('round7 archived detail missing from a multi-change list prepends exactly once', async (t) => {
+  const rows = [{ change_id: 'c1', locator: 'first', state: 'Draft' }, { change_id: 'c2', locator: 'second', state: 'Draft' }];
+  const root = await mountedPm(t, { requested: 'c3', apiRequest: async (path) => {
+    path = path.split('?')[0];
+    if (path === '/changes') return { changes: structuredClone(rows) };
+    if (path === '/changes/c3') return { change_id: 'c3', locator: 'archive', state: 'Archived', workspace_state: 'RELEASED', revision: 'r3', documents: [{ document_id: 'proposal', editable: false }] };
+  } });
+  const assertRows = () => assert.deepEqual(root.querySelector('.pm-change-select').options.slice(1).map((node) => node.value), ['c3', 'c1', 'c2']);
+  assertRows(); await findButton(root, 'Plan').trigger('click'); await settlePm(); assertRows();
+  assert.equal(root.querySelector('.pm-change-select').value, 'c3');
+});
+
+test('round7 native Add child follows restored leaf/group selection and read-only precedence', async (t) => {
+  for (const language of ['en', 'ko']) for (const gated of [false, true]) await t.test(`${language} gated=${gated}`, async (context) => {
+    const tasks = [{ task_id: 'G-1', parent_id: null, order: 10, kind: 'Group', title: 'Group', executable: false }, { task_id: 'T-1', parent_id: 'G-1', order: 10, kind: 'Feature', title: 'Leaf', executable: true }];
+    let refusedParent;
+    const root = await mountedPm(context, { tab: 'plan', language, gated, apiRequest: async (path, options) => {
+      if (!path.split('?')[0].endsWith('/wbs')) return undefined;
+      if (options?.method === 'PATCH') { refusedParent = options.body.payload.operations[0].task.parent_id; throw new Error('missing_parent'); }
+      return { tasks, findings: [] };
+    } });
+    const label = language === 'ko' ? '하위 추가' : 'Add child';
+    const inspect = (leaf) => {
+      const child = findButton(root, label), hint = root.querySelector('[id="pm-add-child-hint"]');
+      assert.equal(child.disabled, gated || leaf);
+      assert.ok(hint, 'a visible reason accompanies the disabled leaf action');
+      assert.equal(hint.hidden, !leaf);
+      assert.equal(child.getAttribute('aria-describedby'), leaf ? 'pm-add-child-hint' : null);
+      assert.equal(child.title, gated ? 'authoring requires G0 and G1.' : leaf ? hint.textContent : '');
+      if (leaf) assert.equal(hint.textContent, language === 'ko' ? '하위 작업을 추가하려면 그룹을 선택하세요.' : 'Select a group to add a child task.');
+    };
+    assert.equal(findButton(root, label).disabled, gated, 'genuine no-selection keeps root creation available');
+    await root.querySelector('[data-task-id="T-1"]').trigger('click'); inspect(true);
+    await root.querySelector('[data-task-id="G-1"]').trigger('click'); inspect(false);
+    sessionStorage.setItem('symphony.pm.p1.c1.selectedTask', 'T-missing');
+    await findButton(root, language === 'ko' ? '아이디어' : 'Idea').trigger('click'); await settlePm();
+    await findButton(root, language === 'ko' ? '계획' : 'Plan').trigger('click'); await settlePm();
+    // Missing persisted IDs remain nonempty; the server still decides missing_parent.
+    // restoreViewState runs on a change reload, so select the current change again.
+    const select = root.querySelector('.pm-change-select'); select.value = 'c1'; await select.trigger('change'); await settlePm();
+    inspect(false);
+    if (!gated) {
+      await findButton(root, label).trigger('click'); await settlePm();
+      assert.equal(refusedParent, 'T-missing');
+      assert.match(root.querySelector('.pm-action-error').textContent, /missing_parent/);
+    }
+    await root.querySelector('[data-task-id="T-1"]').trigger('click'); inspect(true);
+    await findButton(root, language === 'ko' ? '아이디어' : 'Idea').trigger('click'); await settlePm();
+    await findButton(root, language === 'ko' ? '계획' : 'Plan').trigger('click'); await settlePm(); inspect(true);
+    await root.querySelector('[data-task-id="G-1"]').trigger('click'); inspect(false);
+  });
 });
 
 async function loadI18n({ href, stored = null, storageDisabled = false }) {

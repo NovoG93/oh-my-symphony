@@ -282,6 +282,10 @@ def _guides(page, area, lang, matched):
     expect(guides).to_have_count(2)
     for index, key in enumerate(["workspace", area]):
         guide = guides.nth(index)
+        if not guide.evaluate("node => node.open"):
+            expect(guide).to_have_js_property("open", False)
+            guide.locator("summary").focus()
+            page.keyboard.press("Enter")
         expect(guide).to_have_attribute("open", "")
         expect(guide.locator("summary")).to_have_text("이 버튼들은 무엇을 하나요?" if lang == "ko" else "What do these buttons do?")
         expected = [entry[lang == "ko"] for entry in LABELS[key]]
@@ -470,8 +474,14 @@ def _inspect_other_guides(page, lang, matched):
     _tab(page, "design", lang)
     _button(page, "Storyboard", lang).click()
     page.locator(".pm-storyboard-card").first.click()
-    _guides(page, "design", lang, matched)
+    save_storyboard = _button(page, "Save storyboard", lang)
+    expect(save_storyboard).to_be_visible()
+    expect(save_storyboard).to_have_js_property("tagName", "BUTTON")
+    expect(save_storyboard).to_have_text(_label("Save storyboard", lang))
+    matched.add("Save storyboard")
     page.get_by_role("dialog").get_by_role("button", name="취소" if lang == "ko" else "Cancel", exact=True).click()
+    # The drawer renders closed help into an inert background; open it after Cancel.
+    _guides(page, "design", lang, matched)
     # Storyboard replaces its surface directly, separately from UX/API.
     _button(page, "Edit source", lang).click()
     expect(_button(page, "Add storyboard", lang)).to_be_visible()
@@ -1023,6 +1033,149 @@ def test_installed_demo_delayed_preview_stays_on_its_original_view(tmp_path, ins
         assert not page.locator('.app').evaluate('(node) => node.inert')
         assert not writes and _runs(directory) == 0
         page.screenshot(path=str(tmp_path / f'delayed-{kind}-ignored.png'))
+
+
+@pytest.mark.parametrize("lang", ["en", "ko"])
+@pytest.mark.parametrize("oracle", ["status", "help", "child"])
+def test_installed_demo_round7_ui(tmp_path, installed_python, chrome, lang, oracle):
+    """Round7 user actions against a clean wheel, with server data as oracle."""
+    from playwright.sync_api import expect
+    directory = tmp_path / "demo"
+    argv = [str(installed_python.parent / "symphony"), "pm", "demo", "--path", str(directory), "--lang", lang]
+    with _server(argv, tmp_path, _environment(tmp_path)) as (_, url), _page(chrome) as (page, _):
+        page.goto(url)
+        expect(_button(page, "Approve revision", lang)).to_be_visible()
+        base = url.split("/?")[0]
+        selected = page.locator('.pm-change-select').input_value()
+        api = f"{base}/api/v1/pm/changes/{selected}"
+
+        def get(suffix=""):
+            response = page.request.get(api + suffix, params={"project_id": "pm-demo"})
+            assert response.status == 200, response.text()
+            return response.json()
+
+        def status_matches():
+            detail = get()
+            expect(page.locator('.pm-change-select')).to_have_value(selected)
+            expect(page.locator('.pm-change-select option:checked')).to_have_text(f"{detail['locator']} · {detail['state']}")
+            expect(page.locator('.pm-revision-bar .pm-state')).to_have_text(detail['state'])
+
+        if oracle == "status":
+            status_matches()
+            with page.expect_response(lambda response: response.url.endswith('/approvals') and response.request.method == 'POST') as approved:
+                _button(page, "Approve revision", lang).click()
+            assert approved.value.status == 201
+            expect(page.locator('.pm-revision-bar .pm-state')).to_have_text('Approved')
+            status_matches()
+            page.reload()
+            expect(page.locator('.pm-revision-bar .pm-state')).to_have_text('Approved')
+            status_matches()
+            _button(page, "Edit source", lang).click()
+            editor = page.locator('.pm-source-editor')
+            original = editor.input_value()
+            edited = original.replace('## Problem\n', '## Problem\nRound7 regression.\n', 1)
+            assert edited != original
+            editor.fill(edited)
+            with page.expect_response(lambda response: '/documents/proposal' in response.url and response.request.method == 'PATCH') as saved:
+                _button(page, "Save draft", lang).click()
+            assert saved.value.status == 200
+            expect(page.locator('.toast-success').last).to_be_visible()
+            status_matches()
+            page.reload()
+            expect(_button(page, "Edit source", lang)).to_be_visible()
+            status_matches()
+            _button(page, "Edit source", lang).click()
+            expect(page.locator('.pm-source-editor')).to_have_value(edited)
+            page.locator('.pm-source-editor').fill(original)
+            with page.expect_response(lambda response: '/documents/proposal' in response.url and response.request.method == 'PATCH') as restored:
+                _button(page, "Save draft", lang).click()
+            assert restored.value.status == 200
+            expect(page.locator('.toast-success').last).to_be_visible()
+            status_matches()
+            assert (directory / 'planning/openspec/changes/team-leave-request/proposal.md').read_text() == original
+        elif oracle == "help":
+            matched = set()
+            for width, height in [(1440, 1000), (1480, 706)]:
+                page.set_viewport_size({"width": width, "height": height})
+                page.reload()
+                expect(page.locator('details.pm-guide')).to_have_count(2)
+                for guide in page.locator('details.pm-guide').all():
+                    expect(guide).to_have_js_property('open', False)
+                page.screenshot(path=str(tmp_path / f'round7-entry-{lang}-{width}x{height}.png'))
+            _guides(page, 'idea', lang, matched)
+            _guides(page, 'idea', lang, matched)  # Reuse must tolerate already-open details.
+            for area in ['requirements', 'design', 'plan', 'code']:
+                _tab(page, area, lang)
+                for guide in page.locator('details.pm-guide').all():
+                    expect(guide).to_have_js_property('open', False)
+                _guides(page, area, lang, matched)
+        else:
+            _tab(page, 'plan', lang)
+            rows = page.locator('.pm-tabulator .tabulator-row')
+            expect(rows).to_have_count(7)
+            tasks = get('/wbs')['tasks']
+            group = next(task['task_id'] for task in tasks if not task['executable'])
+            leaf = next(task['task_id'] for task in tasks if task['executable'])
+            child = _button(page, 'Add child', lang)
+            hint = page.locator('#pm-add-child-hint')
+
+            def select(task_id, invalid):
+                rows.filter(has=page.locator(f'[tabulator-field="task_id"]:text-is("{task_id}")')).click()
+                page.keyboard.press('Escape')
+                if invalid:
+                    expect(child).to_be_disabled()
+                    expect(hint).to_be_visible()
+                    expect(hint).to_have_text('하위 작업을 추가하려면 그룹을 선택하세요.' if lang == 'ko' else 'Select a group to add a child task.')
+                    expect(child).to_have_attribute('aria-describedby', 'pm-add-child-hint')
+                else:
+                    expect(child).to_be_enabled()
+                    expect(hint).to_be_hidden()
+                    assert child.get_attribute('aria-describedby') is None
+
+            # No selected task means a real root create; Undo must restore every object.
+            expect(child).to_be_enabled()
+            with page.expect_response(lambda response: response.url.endswith('/wbs') and response.request.method == 'PATCH') as root_added:
+                child.click()
+            assert root_added.value.status == 200
+            assert root_added.value.request.post_data_json['payload']['operations'][0]['task']['parent_id'] is None
+            expect(rows).to_have_count(8)
+            with page.expect_response(lambda response: response.url.endswith('/wbs') and response.request.method == 'PATCH'):
+                _button(page, 'Undo', lang).click()
+            expect(rows).to_have_count(7)
+            assert get('/wbs')['tasks'] == tasks
+            select(leaf, True)
+            select(group, False)
+            select(leaf, True)
+            page.reload()
+            expect(rows).to_have_count(7)
+            expect(child).to_be_disabled()  # Restored selection, before any new row click.
+            expect(hint).to_be_visible()
+            select(group, False)
+            with page.expect_response(lambda response: response.url.endswith('/wbs') and response.request.method == 'PATCH') as added:
+                child.click()
+            assert added.value.status == 200
+            assert added.value.request.post_data_json['payload']['operations'][0]['task']['parent_id'] == group
+            expect(rows).to_have_count(8)
+            with page.expect_response(lambda response: response.url.endswith('/wbs') and response.request.method == 'PATCH'):
+                _button(page, 'Undo', lang).click()
+            expect(rows).to_have_count(7)
+            assert get('/wbs')['tasks'] == tasks
+            # UI affordance does not replace server authority or rewrite stale IDs.
+            for parent, finding in [(leaf, 'invalid_parent'), ('T-missing-round7', 'missing_parent')]:
+                before = get()
+                response = page.request.patch(api + '/wbs', data={
+                    'project_id': 'pm-demo', 'change_id': selected, 'expected_revision': before['revision'],
+                    'client_operation_id': f'round7-{parent}', 'payload': {'operations': [{'op': 'create_task', 'task': {
+                        'parent_id': parent, 'order': 999, 'kind': 'Feature', 'title': 'Refused child', 'executable': True,
+                    }}]},
+                })
+                assert response.status == 409, response.text()
+                assert finding in response.text()
+                assert get('/wbs')['tasks'] == tasks
+                assert get()['revision'] == before['revision']
+            page.screenshot(path=str(tmp_path / f'round7-child-{lang}.png'))
+        assert _runs(directory) == 0
+        assert not list((directory / 'project/kanban').glob('*.md'))
 
 
 def _round5_contrast(locator):

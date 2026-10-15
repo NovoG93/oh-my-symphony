@@ -26,10 +26,22 @@ export function renderWbs({ ui, overlay, view, semanticIndex = [], onNavigateRef
     button.addEventListener('click', () => onCommand(command, selected));
     return button;
   };
+  const addChild = action('Add child', 'add-child');
+  const childHint = el('span', { id: 'pm-add-child-hint', class: 'pm-empty', hidden: true }, L('Select a group to add a child task.'));
+  const updateChildAction = () => {
+    const leaf = Boolean(tasks.find((task) => task.task_id === selected)?.executable);
+    addChild.disabled = Boolean(readOnlyReason) || leaf;
+    addChild.title = readOnlyReason || (leaf ? L('Select a group to add a child task.') : '');
+    childHint.hidden = !leaf;
+    if (leaf) addChild.setAttribute('aria-describedby', 'pm-add-child-hint');
+    else addChild.removeAttribute('aria-describedby');
+  };
+  const selectTask = (id) => { selected = id; onSelect(id); updateChildAction(); };
+  updateChildAction();
   const toolbar = el('div', { class: 'pm-plan-toolbar' }, [
     el('div', null, [el('h2', null, L('Work breakdown')), el('span', { class: 'pm-count' }, `${view.tasks.filter((task) => task.executable).length} ${L('executable tasks')}`)]),
     el('div', { class: 'pm-actions', role: 'toolbar', 'aria-label': 'Work breakdown actions' }, [
-      action('Add group', 'add-group'), action('Add root', 'add-root'), action('Add sibling', 'add-sibling'), action('Add child', 'add-child'), action('Indent', 'indent'), action('Outdent', 'outdent'),
+      action('Add group', 'add-group'), action('Add root', 'add-root'), action('Add sibling', 'add-sibling'), addChild, childHint, action('Indent', 'indent'), action('Outdent', 'outdent'),
       search, action('Move up', 'up'), action('Move down', 'down'), action(approved ? 'Cancel task' : 'Delete', 'delete'), action('Undo', 'undo', !canUndo), action('Redo', 'redo', !canRedo),
       action('Copy TSV', 'copy'),
     ]),
@@ -51,7 +63,7 @@ export function renderWbs({ ui, overlay, view, semanticIndex = [], onNavigateRef
       ]);
       title.addEventListener('click', () => openTaskDrawer(ui, task, tasks, semanticIndex, onNavigateReference, onSetField, readOnlyReason, overlay));
       if (selected === task.task_id) row.classList.add('selected');
-      row.addEventListener('click', () => { selected = task.task_id; onSelect(selected); tbody.querySelectorAll('tr').forEach((item) => item.classList.toggle('selected', item === row)); });
+      row.addEventListener('click', () => { selectTask(task.task_id); tbody.querySelectorAll('tr').forEach((item) => item.classList.toggle('selected', item === row)); });
       row.addEventListener('keydown', (event) => {
         if (event.key === 'Enter') title.click();
         if (event.key === 'ArrowDown' && row.nextElementSibling) row.nextElementSibling.focus();
@@ -73,7 +85,7 @@ export function renderWbs({ ui, overlay, view, semanticIndex = [], onNavigateRef
   const scroll = el('div', { class: 'pm-table-scroll' }, table); scroll.scrollTop = scrollTop; scroll.addEventListener('scroll', () => onScroll(scroll.scrollTop), { passive: true });
   root.append(toolbar, scroll);
   root.addEventListener('pm-copy', () => onCopy(view.tasks));
-  enhanceWithTabulator(root, view.tasks, ui, semanticIndex, onNavigateReference, onSetField, onPaste, (id) => { selected = id; onSelect(id); }, filter, search, readOnlyReason, overlay).catch(() => {});
+  enhanceWithTabulator(root, view.tasks, ui, semanticIndex, onNavigateReference, onSetField, onPaste, selectTask, filter, search, readOnlyReason, overlay).catch(() => {});
   return root;
 }
 
@@ -223,5 +235,5 @@ function dependencyPicker(el, task, tasks, onSetField, readOnlyReason = '') {
   return el('label', { class: 'pm-drawer-field' }, [el('span', null, L('Dependencies')), select, el('small', null, L('Choose required predecessor tasks.'))]);
 }
 
-const KO = { 'Filter tasks': '작업 필터', 'Work breakdown': '작업 분해', 'executable tasks': '실행 작업', Task: '작업', Type: '유형', Owner: '담당자', Priority: '우선순위', Estimate: '예상치', 'Add group': '그룹 추가', 'Add root': '최상위 추가', 'Add sibling': '같은 단계 추가', 'Add child': '하위 추가', Indent: '들여쓰기', Outdent: '내어쓰기', 'Move up': '위로', 'Move down': '아래로', Delete: '삭제', 'Cancel task': '작업 취소', Undo: '실행 취소', Redo: '다시 실행', 'Copy TSV': 'TSV 복사', Close: '닫기', Title: '제목', 'Human owner': '담당자', 'Agent override': '에이전트 지정', 'Target date': '목표 날짜', Description: '설명', Acceptance: '인수 조건', Verification: '검증', 'Requirement references': '요구사항 참조', 'Storyboard references': '스토리보드 참조', 'Design references': '설계 참조', Dependencies: '의존성', 'Integration impact': '통합 영향', Risk: '위험', Notes: '메모', 'Source revision': '소스 리비전', 'Choose required predecessor tasks.': '필수 선행 작업을 선택하세요.', 'Reference navigation': '참조 탐색', 'No linked planning items.': '연결된 기획 항목이 없습니다.', Unresolved: '해결되지 않음', 'Collapse or expand': '접기 또는 펼치기' };
+const KO = { 'Filter tasks': '작업 필터', 'Work breakdown': '작업 분해', 'executable tasks': '실행 작업', Task: '작업', Type: '유형', Owner: '담당자', Priority: '우선순위', Estimate: '예상치', 'Add group': '그룹 추가', 'Add root': '최상위 추가', 'Add sibling': '같은 단계 추가', 'Add child': '하위 추가', Indent: '들여쓰기', Outdent: '내어쓰기', 'Move up': '위로', 'Move down': '아래로', Delete: '삭제', 'Cancel task': '작업 취소', Undo: '실행 취소', Redo: '다시 실행', 'Copy TSV': 'TSV 복사', Close: '닫기', Title: '제목', 'Human owner': '담당자', 'Agent override': '에이전트 지정', 'Target date': '목표 날짜', Description: '설명', Acceptance: '인수 조건', Verification: '검증', 'Requirement references': '요구사항 참조', 'Storyboard references': '스토리보드 참조', 'Design references': '설계 참조', Dependencies: '의존성', 'Integration impact': '통합 영향', Risk: '위험', Notes: '메모', 'Source revision': '소스 리비전', 'Choose required predecessor tasks.': '필수 선행 작업을 선택하세요.', 'Reference navigation': '참조 탐색', 'No linked planning items.': '연결된 기획 항목이 없습니다.', Unresolved: '해결되지 않음', 'Collapse or expand': '접기 또는 펼치기', 'Select a group to add a child task.': '하위 작업을 추가하려면 그룹을 선택하세요.' };
 function L(value) { return window.i18n?.lang === 'ko' ? (KO[value] || value) : value; }
