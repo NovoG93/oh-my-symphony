@@ -1,5 +1,5 @@
 .pm-workspace-host { min-height: 0; height: 100%; overflow-y: auto; overscroll-behavior: contain; color: var(--text); background: var(--bg); }
-.pm-workspace-host [hidden] { display: none !important; }
+.pm-workspace-host [hidden], .pm-overlay-backdrop [hidden] { display: none !important; }
 .pm-host-loading { padding: 48px; font-size: 1.0667rem; }
 .pm-header { display: grid; grid-template-columns: minmax(260px, 1fr) auto; gap: 32px; align-items: end; padding: 32px 36px 24px; border-bottom: 1px solid var(--border); }
 .pm-heading-copy h1 { margin: 3px 0 6px; font-size: clamp(28px, 3vw, 42px); letter-spacing: -.04em; }
