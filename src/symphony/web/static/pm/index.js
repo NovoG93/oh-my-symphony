@@ -140,14 +140,15 @@ export function mountArtifacts({ root, projectId, api: hostApi, ui, onDirtyChang
     const demo = demoActive();
     if (!demo && !unavailable.length && !development.length && !tools.length) return null;
     const rows = [...unavailable.map((name) => [name, unavailableReason(name)]), ...tools].map(([name, reason]) => ui.el('li', null, [
-      ui.el('strong', null, `${name}: `), ui.el('span', null, reason),
+      ui.el('strong', null, `${capabilityText(name)}: `), ui.el('span', null, reason),
     ]));
     if (demo) rows.unshift(ui.el('li', null, 'This is a disposable demo. Planning actions are unlocked only on this server; no AI worker starts and nothing leaves this computer.'));
     else if (development.length) rows.push(ui.el('li', null, 'Development verification is active for configured actions. Dependency checks still apply, and release gates are not marked passed.'));
     const heading = demo ? 'Demo workspace' : unavailable.length || tools.length ? 'Some planning actions are unavailable' : 'Development verification context';
+    // The heading and a short summary share the always-visible native summary; the full list folds at every width.
+    const summary = [ui.el('strong', null, heading), ui.el('span', { class: 'pm-status-summary' }, ` · ${pmMessage(demo ? 'pm.status.demoSummary' : 'pm.status.more')}`)];
     return ui.el('section', { id: 'pm-capability-status', class: 'pm-status-card', role: 'status' }, [
-      ui.el('strong', null, heading),
-      ui.el('ul', { class: 'pm-capability-list' }, rows),
+      compactDisclosure('status', summary, [ui.el('ul', { class: 'pm-capability-list' }, rows)]),
     ]);
   }
 
@@ -274,10 +275,89 @@ export function mountArtifacts({ root, projectId, api: hostApi, ui, onDirtyChang
     if (state.disposed) return;
     if (!keepOverlay) overlay.dispose();
     disposeWbs();
+    const active = document.activeElement;
+    const focusedSummary = root.contains(active) && active.matches?.('details.pm-more > summary') ? active.parentElement.className.match(/\bpm-more-(\w+)/)?.[1] : '';
+    planActions = null; compactMoves = [];
     root.replaceChildren(buildHeader(), buildTabs(), buildBody());
+    placePlanActions(); placeCompactMoves();
     localizePm(root);
     revealActiveTab();
     if (!keepOverlay) root.querySelector('[aria-current="page"]')?.focus({ preventScroll: true });
+    // A focused compact summary keeps focus on its rebuilt counterpart after the default tab focus.
+    const summary = focusedSummary && !keepOverlay ? root.querySelector(`details.pm-more-${focusedSummary} > summary`) : null;
+    if (summary && shown(summary)) summary.focus({ preventScroll: true });
+  }
+
+  // Secondary chrome starts closed at every width; only the user's own toggles open it,
+  // and that intent survives renders and breakpoint changes.
+  const compactMedia = window.matchMedia?.('(max-width: 560px)') || null;
+  const compactOpen = new Set();
+  let planActions = null;
+  function compactDisclosure(key, summary, children) {
+    const details = ui.el('details', { class: `pm-more pm-more-${key}` }, [ui.el('summary', null, summary), ...children]);
+    details.open = compactOpen.has(key);
+    details.addEventListener('toggle', () => {
+      if (details.open) compactOpen.add(key); else compactOpen.delete(key);
+    });
+    return details;
+  }
+
+  // Archive/handoff live inside the WBS disclosure at every width; without one they precede the WBS.
+  function placePlanActions() {
+    if (!planActions?.row.isConnected) return;
+    const { row, wbsNode } = planActions;
+    const summary = wbsNode.querySelector('details.pm-more-wbs > summary');
+    if (summary) { if (row.previousElementSibling !== summary) summary.after(row); }
+    else if (row.nextElementSibling !== wbsNode) wbsNode.before(row);
+  }
+
+  // Secondary document controls and tab help fold into the revision disclosure at every
+  // width. Hosts without matchMedia (no responsive layout) keep the same nodes in their original slots.
+  let compactMoves = [];
+  function compactMove(node, restore) { if (node) compactMoves.push({ node, restore }); }
+  function placeCompactMoves() {
+    const host = root.querySelector('details.pm-more-revision');
+    for (const { node, restore } of compactMoves) {
+      if (compactMedia && host) { if (node.parentElement !== host) host.append(node); }
+      else if (node.parentElement === host) restore(node);
+    }
+  }
+
+  // A closed native details renders only its first summary, whatever rectangles layout
+  // still reports, so every closed ancestor is checked before rectangles count.
+  const firstSummary = (details) => [...details.children].find((item) => item.matches('summary')) || null;
+  function closedOwner(node) {
+    let owner = null;
+    for (let child = node, parent = node?.parentElement; parent; child = parent, parent = parent.parentElement) {
+      if (parent.matches('details') && !parent.open && child !== firstSummary(parent)) owner = parent;
+    }
+    return owner;
+  }
+  const shown = (node) => Boolean(node?.isConnected) && !closedOwner(node) && (typeof node.getClientRects !== 'function' || node.getClientRects().length > 0);
+  // Moves focus only when the breakpoint change hid or dropped the owned element that had it.
+  function keepCompactFocus(active) {
+    if (!active || (shown(active) && document.activeElement === active)) return;
+    // The outermost closed ancestor owns the only visible summary on the path.
+    const closed = closedOwner(active);
+    let target = null;
+    if (closed) target = firstSummary(closed);
+    else if (active.matches('details.pm-more > summary')) {
+      const details = active.parentElement;
+      const heading = details.parentElement?.querySelector('h1, h2, strong');
+      target = [...details.querySelectorAll('select, input, textarea, button, a[href]')].find((node) => !node.disabled && shown(node))
+        || [root.querySelector('.pm-tabs .pm-tab[aria-current="page"]')].find(shown)
+        || (shown(heading) ? heading : null);
+      // The heading is a programmatic-only fallback and never joins the Tab order.
+      if (target === heading) heading.setAttribute('tabindex', '-1');
+    } else if (shown(active)) target = active;
+    if (target && shown(target)) target.focus({ preventScroll: true });
+  }
+
+  function syncCompact() {
+    const active = root.contains(document.activeElement) ? document.activeElement : null;
+    // Open state is the user's; a width change only re-places owned nodes and repairs hidden focus.
+    placePlanActions(); placeCompactMoves();
+    keepCompactFocus(active);
   }
 
   // The rebuilt strip starts at scrollLeft 0, so a narrow screen can clip the active tab.
@@ -285,18 +365,19 @@ export function mountArtifacts({ root, projectId, api: hostApi, ui, onDirtyChang
   function revealActiveTab() {
     const nav = root.querySelector('.pm-tabs'), item = nav?.querySelector('[aria-current="page"]')?.getBoundingClientRect?.();
     if (!item) return;
-    const left = nav.getBoundingClientRect().left + nav.clientLeft, right = left + nav.clientWidth;
-    if (item.left < left) nav.scrollLeft += item.left - left;
-    else if (item.right > right) nav.scrollLeft += Math.min(item.right - right, item.left - left);
+    const box = nav.getBoundingClientRect(), left = box.left + nav.clientLeft, right = Math.min(left + nav.clientWidth, box.right ?? Infinity);
+    // scrollLeft moves in whole pixels, so fractional deltas round outward and the tab ends fully inside.
+    if (item.left < left) nav.scrollLeft += Math.floor(item.left - left);
+    else if (item.right > right) nav.scrollLeft += Math.min(Math.ceil(item.right - right), Math.floor(item.left - left));
   }
 
   function buildHeader() {
     const selectedId = state.change?.change_id;
     const listed = state.changes.map((item) => (item.change_id === selectedId ? state.change : item));
     const visibleChanges = state.change && !state.changes.some((item) => item.change_id === selectedId) ? [state.change, ...listed] : listed;
-    const select = ui.el('select', { class: 'pm-change-select', 'aria-label': 'Planning change' }, [
-      ui.el('option', { value: '' }, 'Select a change'),
-      ...visibleChanges.map((item) => ui.el('option', { value: item.change_id, selected: state.change?.change_id === item.change_id }, `${item.locator} · ${item.state}`)),
+    const select = ui.el('select', { class: 'pm-change-select', 'aria-label': pmMessage('pm.header.change') }, [
+      ui.el('option', { value: '' }, pmMessage('pm.header.selectChange')),
+      ...visibleChanges.map((item) => ui.el('option', { value: item.change_id, selected: state.change?.change_id === item.change_id }, `${item.locator} · ${planningStateText(item.state)}`)),
     ]);
     select.addEventListener('change', () => {
       safeAction(() => selectChange(select.value), select)();
@@ -306,7 +387,9 @@ export function mountArtifacts({ root, projectId, api: hostApi, ui, onDirtyChang
     const convert = limitHostAction(button('Convert legacy plan', convertLegacy), 'handoff');
     return ui.el('header', { class: 'pm-header' }, [
       ui.el('div', { class: 'pm-heading-copy' }, [ui.el('span', { class: 'pm-kicker' }, 'Product planning'), ui.el('h1', null, 'Artifacts'), ui.el('p', null, 'Shape the idea, align requirements, and hand off executable work.')]),
-      ui.el('div', { class: 'pm-header-controls' }, [ui.el('div', { class: 'pm-actions' }, [select, repair, convert, create]), buildGuide('workspace')]),
+      compactDisclosure('change', pmMessage('pm.more.change'), [
+        ui.el('div', { class: 'pm-header-controls' }, [ui.el('div', { class: 'pm-actions' }, [select, repair, convert, create]), buildGuide('workspace')]),
+      ]),
     ]);
   }
 
@@ -319,7 +402,7 @@ export function mountArtifacts({ root, projectId, api: hostApi, ui, onDirtyChang
   }
 
   function buildTabs() {
-    return ui.el('nav', { class: 'pm-tabs', 'aria-label': 'Planning artifacts' }, TABS.map(([id, label]) => {
+    return ui.el('nav', { class: 'pm-tabs', 'aria-label': pmMessage('pm.tabs.label') }, TABS.map(([id, label]) => {
       const item = button(label, () => selectTab(id), `pm-tab ${state.tab === id ? 'active' : ''}`);
       if (state.tab === id) item.setAttribute('aria-current', 'page');
       return item;
@@ -329,17 +412,20 @@ export function mountArtifacts({ root, projectId, api: hostApi, ui, onDirtyChang
   function buildBody() {
     const status = capabilityStatus();
     if (!state.change) return ui.el('main', { class: 'pm-body' }, [status, buildWelcome()]);
-    const body = ui.el('main', { class: 'pm-body' }, [status, buildRevisionBar()]);
+    const revisionBar = buildRevisionBar();
+    const body = ui.el('main', { class: 'pm-body' }, [status, revisionBar]);
     if (state.externalEdit) {
       body.append(ui.el('section', { class: 'pm-empty-state', role: 'status' }, [ui.el('h2', null, 'External editing is active'), ui.el('p', null, 'Workspace writes are paused. Finish external editing to reindex, validate, and resume here.') ]));
       return body;
     }
-    body.append(buildGuide(state.tab));
+    const guide = buildGuide(state.tab);
+    body.append(guide);
     if (state.tab === 'plan') body.append(buildPlan());
     else if (state.tab === 'design') body.append(buildDesign());
     else if (state.tab === 'requirements') body.append(buildRequirements());
     else if (state.tab === 'code') body.append(buildCodeFiles());
     else body.append(buildDocument('proposal'));
+    compactMove(guide, (node) => revisionBar.after(node));
     return body;
   }
 
@@ -353,9 +439,10 @@ export function mountArtifacts({ root, projectId, api: hostApi, ui, onDirtyChang
       if (!window.confirm(pmText('Approve this exact planning revision locally?'))) return;
       await api.approve(state.change.change_id, state.change.revision, state.change.approval_confirmation_token); await refreshChange(); ui.announce(pmText('Revision approved.'));
     }, 'btn btn-primary'), 'authoring'));
+    // The selected change identity leads the always-visible native summary; only its actions fold, at every width.
+    const identity = ui.el('span', { class: 'pm-revision-identity' }, [ui.el('strong', null, state.change.locator), ui.el('span', { class: `pm-state ${state.change.state.toLowerCase()}` }, planningStateText(state.change.state)), ui.el('code', { title: state.change.revision }, state.change.revision)]);
     return ui.el('section', { class: 'pm-revision-bar' }, [
-      ui.el('div', null, [ui.el('strong', null, state.change.locator), ui.el('span', { class: `pm-state ${state.change.state.toLowerCase()}` }, state.change.state), ui.el('code', { title: state.change.revision }, state.change.revision)]),
-      ui.el('div', { class: 'pm-actions' }, [external, validate, approve]),
+      compactDisclosure('revision', [identity, ui.el('span', { class: 'pm-more-label' }, pmMessage('pm.more.revision'))], [ui.el('div', { class: 'pm-actions' }, [external, validate, approve])]),
     ]);
   }
 
@@ -374,6 +461,9 @@ export function mountArtifacts({ root, projectId, api: hostApi, ui, onDirtyChang
       authoring: availability('authoring'), assistance: availability('assistance'),
       onError: reportActionError, translate: pmText,
     });
+    // The view toggle folds at every width; a recovered-draft notice keeps it in place.
+    const switcher = editor.querySelector?.('.pm-view-switcher');
+    if (switcher && !switcher.querySelector('.pm-draft-badge')) compactMove(switcher, (node) => editor.prepend(node));
     const kinds = docId === 'proposal' ? ['decision'] : docId === 'ux' ? ['storyboard'] : docId === 'design' ? ['contract'] : docId.startsWith('spec:') ? ['requirement', 'scenario'] : [];
     if (!kinds.length) return editor;
     const actions = kinds.map((kind) => limitAction(button(`Add ${kind}`, async () => {
@@ -382,7 +472,10 @@ export function mountArtifacts({ root, projectId, api: hostApi, ui, onDirtyChang
       const result = await api.createSemantic(state.change.change_id, state.change.revision, docId, kind, title);
       await refreshChange(); ui.announce(`Created ${result.impacted_ids?.[0] || kind}.`);
     }), 'authoring'));
-    return ui.el('div', { class: 'pm-card-grid' }, [ui.el('div', { class: 'pm-plan-action-row' }, actions), editor]);
+    const row = ui.el('div', { class: 'pm-plan-action-row' }, actions);
+    const grid = ui.el('div', { class: 'pm-card-grid' }, [row, editor]);
+    compactMove(row, (node) => grid.prepend(node));
+    return grid;
   }
 
   function buildRequirements() {
@@ -397,16 +490,23 @@ export function mountArtifacts({ root, projectId, api: hostApi, ui, onDirtyChang
       if (!doc) return ui.el('section', { class: 'pm-error-state', role: 'alert' }, state.errors.get(id) || `Could not load ${id}`);
       const capability = id.slice(5); const baseline = state.baselines.get(capability);
       const delta = baseline?.exists ? lineDelta(baseline.source, doc.source) : { added: doc.source.split('\n').length, removed: 0 };
+      // The authored comparison leads its card; capability/path/delta/Edit follow behind a named summary.
       return ui.el('section', { class: 'pm-readable-card' }, [
-        ui.el('div', { class: 'pm-card-heading' }, [ui.el('div', null, [ui.el('h2', null, capability), ui.el('span', { class: 'pm-count' }, `+${delta.added} / −${delta.removed} lines from baseline`)]), ui.el('div', { class: 'pm-actions' }, [ui.el('code', null, doc.path), limitArchivedAction(button('Edit requirements', () => { editingRequirement = id; render(); }))])]),
         ui.el('div', { class: 'pm-requirement-delta' }, [
           ui.el('article', { class: 'pm-document-preview' }, [ui.el('h3', null, 'Proposed'), readable(doc.source)]),
-          ui.el('article', { class: 'pm-document-preview pm-baseline' }, [ui.el('h3', null, baseline?.exists ? 'Current baseline' : 'Current baseline · new capability'), baseline?.exists ? readable(baseline.source) : ui.el('p', null, 'No baseline specification exists yet.')]),
+          ui.el('article', { class: 'pm-document-preview pm-baseline' }, [ui.el('h3', null, baseline?.exists ? 'Current baseline' : pmMessage('pm.requirements.newBaseline')), baseline?.exists ? readable(baseline.source) : ui.el('p', null, pmMessage('pm.requirements.noBaseline'))]),
+        ]),
+        ui.el('details', { class: 'pm-requirement-meta' }, [
+          ui.el('summary', null, pmMessage('pm.requirements.meta', { capability })),
+          ui.el('div', { class: 'pm-card-heading' }, [ui.el('div', null, [ui.el('h2', null, capability), ui.el('span', { class: 'pm-count' }, `+${delta.added} / −${delta.removed} lines from baseline`)]), ui.el('div', { class: 'pm-actions' }, [ui.el('code', { title: doc.path }, doc.path), limitArchivedAction(button('Edit requirements', () => { editingRequirement = id; render(); }))])]),
         ]),
         ui.el('details', { class: 'pm-source-details' }, [ui.el('summary', null, 'Source'), ui.el('pre', null, doc.source)]),
       ]);
     });
-    return ui.el('div', { class: 'pm-card-grid' }, [ui.el('div', { class: 'pm-plan-action-row' }, [create]), ...cards, buildCoverage()]);
+    const row = ui.el('div', { class: 'pm-plan-action-row' }, [create]);
+    const grid = ui.el('div', { class: 'pm-card-grid' }, [row, ...cards, buildCoverage()]);
+    compactMove(row, (node) => grid.prepend(node));
+    return grid;
   }
 
   async function createCapability() {
@@ -419,8 +519,22 @@ export function mountArtifacts({ root, projectId, api: hostApi, ui, onDirtyChang
     const selector = segmented(DESIGN_VIEWS, state.designView, (value) => selectSubview('design', value));
     const docId = state.designView === 'ux' || state.designView === 'storyboard' ? 'ux' : 'design';
     const doc = state.documents.get(docId);
-    const surface = ui.el('div', { class: 'pm-design-stack' }, [selector]);
-    if (!doc) { surface.append(empty(state.errors.get(docId) || 'Loading design document…')); return surface; }
+    // The closed summary names the selected view at every width; the selector and Edit source fold behind it.
+    // Every read and edit branch puts the readable content first and these tools after it in the same stack.
+    const viewName = () => pmText(DESIGN_VIEWS.find(([value]) => value === state.designView)?.[1] || state.designView);
+    const tools = compactDisclosure('design', pmMessage('pm.more.design', { view: viewName() }), [selector]);
+    // One persistent label names the selected view before the content in every branch; the tools stay after it.
+    const current = ui.el('p', { class: 'pm-design-view' }, pmMessage('pm.design.view', { view: viewName() }));
+    const surface = ui.el('div', { class: 'pm-design-stack' }, [current]);
+    const editSource = (view, id) => {
+      const edit = limitArchivedAction(button('Edit source', () => {
+        state.setDesignView(view); edit.remove(); firstSummary(tools).textContent = pmMessage('pm.more.design', { view: viewName() });
+        current.textContent = pmMessage('pm.design.view', { view: viewName() });
+        surface.replaceChildren(current, buildDocument(id), tools); localizePm(surface); placeCompactMoves();
+      }));
+      tools.append(edit);
+    };
+    if (!doc) { surface.append(empty(state.errors.get(docId) || 'Loading design document…'), tools); return surface; }
     if (state.designView === 'storyboard') {
       surface.append(renderStoryboard({
         ui, overlay, localize: localizePm, onDirty: state.setDirty, confirmDiscard: () => guard('Discard unsaved storyboard changes?'), frames: state.change.storyboard_frames || [], selectedId: selectedStoryboardId,
@@ -431,8 +545,8 @@ export function mountArtifacts({ root, projectId, api: hostApi, ui, onDirtyChang
           await api.patchStoryboard(state.change.change_id, state.change.revision, operation);
           selectedStoryboardId = ''; await refreshChange(); ui.announce('Storyboard frame saved.');
         },
-      }));
-      surface.append(limitArchivedAction(button('Edit source', () => { state.setDesignView('ux'); surface.replaceChildren(selector, buildDocument('ux')); localizePm(surface); })));
+      }), tools);
+      editSource('ux', 'ux');
       return surface;
     }
     // Project the full document first so fence context survives section slicing;
@@ -446,7 +560,8 @@ export function mountArtifacts({ root, projectId, api: hostApi, ui, onDirtyChang
       surface.append(target, ui.el('details', { class: 'pm-source-details' }, [ui.el('summary', null, 'Diagram text alternative'), ui.el('pre', null, diagram)]));
       queueMicrotask(() => renderDiagram(target, diagram, diagramSummary(diagram).text));
     }
-    surface.append(limitArchivedAction(button('Edit source', () => { state.setDesignView(docId === 'ux' ? 'ux' : 'architecture'); surface.replaceChildren(selector, buildDocument(docId)); localizePm(surface); })));
+    surface.append(tools);
+    editSource(docId === 'ux' ? 'ux' : 'architecture', docId);
     return surface;
   }
 
@@ -461,8 +576,11 @@ export function mountArtifacts({ root, projectId, api: hostApi, ui, onDirtyChang
     }
     const handoff = limitAction(button('Preview approved handoff', previewHandoff, 'btn btn-primary'), 'handoff');
     const archive = limitNodeAction(limitAction(button('Preview archive', previewArchive), 'handoff'));
-    stack.append(ui.el('div', { class: 'pm-plan-action-row' }, [archive, handoff]));
-    stack.append(renderWbs({ ui, overlay, view: state.wbs, semanticIndex: state.change.semantic_index || [], onNavigateReference: safeAction(navigateSemantic), onSetField: safeAction(setTaskField), onPaste: safeAction(previewPaste), onCommand: safeAction(queueWbsCommand), onCopy: safeAction(copyTsv), onSelect: state.setSelectedTask, onFilter: state.setPlanFilter, onScroll: state.setPlanScroll, selectedTask: state.selectedTask, filter: state.planFilter, scrollTop: state.planScroll, canUndo: history.undo.length > 0, canRedo: history.redo.length > 0, approved: Boolean(state.change.approval_id), readOnlyReason: availability('authoring').effective ? '' : unavailableReason('authoring') }));
+    // render() places this same row after commit inside the WBS disclosure at every width.
+    const row = ui.el('div', { class: 'pm-plan-action-row' }, [archive, handoff]);
+    const wbsNode = renderWbs({ ui, disclose: (key, summary, children) => compactDisclosure(key, key === 'wbs' ? pmMessage('pm.more.planActions') : summary, children), overlay, view: state.wbs, semanticIndex: state.change.semantic_index || [], onNavigateReference: safeAction(navigateSemantic), onSetField: safeAction(setTaskField), onPaste: safeAction(previewPaste), onCommand: safeAction(queueWbsCommand), onCopy: safeAction(copyTsv), onSelect: state.setSelectedTask, onFilter: state.setPlanFilter, onScroll: state.setPlanScroll, selectedTask: state.selectedTask, filter: state.planFilter, scrollTop: state.planScroll, canUndo: history.undo.length > 0, canRedo: history.redo.length > 0, approved: Boolean(state.change.approval_id), readOnlyReason: availability('authoring').effective ? '' : unavailableReason('authoring') });
+    stack.append(row, wbsNode);
+    planActions = { row, wbsNode };
     stack.append(renderExchangePanel({ ui, onExport: exportPlanning, onImport: importWorkbook, onApply: applyImport, workbookAvailability: hostAvailability('exchange'), readOnly: archived(), onError: reportActionError, translate: pmText }), renderFindings(ui, state.wbs.findings));
     return stack;
   }
@@ -486,7 +604,7 @@ export function mountArtifacts({ root, projectId, api: hostApi, ui, onDirtyChang
     const entities = state.coverage.entities || [];
     return ui.el('section', { class: 'pm-readable-card pm-coverage' }, [
       ui.el('h2', null, 'Requirement and scenario coverage'),
-      ui.el('p', null, 'Specified, linked, implemented, tested, accepted, and waived remain independent.'),
+      ui.el('p', null, pmMessage('pm.coverage.independent')),
       ...entities.map((entity) => {
         const states = ['specified', 'linked', 'implemented', 'tested', 'accepted', 'waived'];
         const waiverActions = (entity.waivers || []).filter((item) => item.state === 'ACTIVE').map((item) => limitAction(button('Revoke waiver', () => revokeWaiver(item)), 'authoring'));
@@ -541,7 +659,7 @@ export function mountArtifacts({ root, projectId, api: hostApi, ui, onDirtyChang
   }
 
   function buildCodeFiles() {
-    const files = state.change.documents.map((doc) => [doc.path, doc.state, doc.editable ? 'Planning source' : 'Read only']);
+    const files = state.change.documents.map((doc) => [doc.path, documentStateCell(doc.state), pmMessage(doc.editable ? 'pm.files.role.source' : 'pm.files.role.readOnly')]);
     const ticketCards = state.tickets.map((ticket) => {
       const accept = limitAction(button(ticket.acceptance ? 'Accepted' : 'Review verification', () => reviewAcceptance(ticket), 'btn'), 'handoff');
       accept.disabled = accept.disabled || Boolean(ticket.acceptance || !ticket.verified_commit);
@@ -568,8 +686,8 @@ export function mountArtifacts({ root, projectId, api: hostApi, ui, onDirtyChang
       ]);
     });
     return ui.el('div', { class: 'pm-card-grid' }, [
-      ui.el('section', { class: 'pm-readable-card' }, [ui.el('h2', null, 'Planning files'), simpleTable(['Path', 'State', 'Role'], files)]),
-      ui.el('section', { class: 'pm-readable-card' }, [ui.el('h2', null, 'Handoff tickets'), ui.el('p', null, ticketCards.length ? 'Verification and acceptance are bound to the exact task revision and tested commit.' : 'No managed tickets have been handed off.'), ...ticketCards]),
+      ui.el('section', { class: 'pm-readable-card' }, [ui.el('h2', null, 'Planning files'), simpleTable(['path', 'state', 'role'].map((key) => pmMessage(`pm.files.col.${key}`)), files)]),
+      ui.el('section', { class: 'pm-readable-card' }, [ui.el('h2', null, 'Handoff tickets'), ui.el('p', null, ticketCards.length ? 'Verification and acceptance are bound to the exact task revision and tested commit.' : pmMessage('pm.code.noTickets')), ...ticketCards]),
       buildCoverage(),
     ]);
   }
@@ -915,8 +1033,9 @@ export function mountArtifacts({ root, projectId, api: hostApi, ui, onDirtyChang
   // A cell is a plain value, or { text, attrs } when it needs cell attributes.
   function simpleTable(headers, rows) { return ui.el('div', { class: 'pm-table-scroll' }, ui.el('table', { class: 'pm-compact-table' }, [ui.el('thead', null, ui.el('tr', null, headers.map((name) => ui.el('th', { scope: 'col' }, name)))), ui.el('tbody', null, rows.map((row) => ui.el('tr', null, row.map((value) => value !== null && typeof value === 'object' ? ui.el('td', value.attrs || null, String(value.text ?? '—')) : ui.el('td', null, String(value ?? '—'))))))])); }
 
+  compactMedia?.addEventListener?.('change', syncCompact);
   load().catch((error) => { if (error.name !== 'AbortError') root.replaceChildren(ui.el('div', { class: 'banner banner-danger', role: 'alert' }, error.message)); });
-  return { unmount: () => { state.dispose(); overlay.destroy(); disposeWbs(); root.classList.remove('pm-workspace-host'); }, beforeProjectSwitch: () => guard('Discard unsaved PM Workspace edits and switch projects?'), isDirty: () => state.dirty };
+  return { unmount: () => { state.dispose(); overlay.destroy(); disposeWbs(); compactMedia?.removeEventListener?.('change', syncCompact); planActions = null; compactMoves = []; root.classList.remove('pm-workspace-host'); }, beforeProjectSwitch: () => guard('Discard unsaved PM Workspace edits and switch projects?'), isDirty: () => state.dirty };
 }
 
 const TASK_TO_API_FIELD = { kind: 'type', agent_kind_override: 'agent_kind', dependencies: 'depends_on', requirement_refs: 'requirements', storyboard_refs: 'storyboards' };
@@ -1124,6 +1243,37 @@ const PM_MESSAGES = {
   'pm.deps.kind.requires_code': { en: 'Requires code', ko: '코드 완료 필요' },
   'pm.deps.kind.order_only': { en: 'Order only', ko: '순서만 지정' },
   'pm.deps.option': { en: '{task} needs {predecessor}', ko: '{task} — 선행 작업: {predecessor}' },
+  'pm.header.change': { en: 'Planning change', ko: '기획 변경' },
+  'pm.header.selectChange': { en: 'Select a change', ko: '변경 선택' },
+  'pm.tabs.label': { en: 'Planning artifacts', ko: '기획 산출물 단계' },
+  'pm.files.col.path': { en: 'Path', ko: '경로' },
+  'pm.files.col.state': { en: 'State', ko: '상태' },
+  'pm.files.col.role': { en: 'Role', ko: '역할' },
+  'pm.files.role.source': { en: 'Planning source', ko: '기획 원본' },
+  'pm.files.role.readOnly': { en: 'Read only', ko: '읽기 전용' },
+  'pm.files.state.draft': { en: 'draft', ko: '초안' },
+  'pm.state.draft': { en: 'Draft', ko: '초안' },
+  'pm.state.validated': { en: 'Validated', ko: '검증됨' },
+  'pm.state.needsreview': { en: 'NeedsReview', ko: '검토 필요' },
+  'pm.state.approved': { en: 'Approved', ko: '승인됨' },
+  'pm.state.stale': { en: 'Stale', ko: '오래됨' },
+  'pm.state.archived': { en: 'Archived', ko: '보관됨' },
+  'pm.capability.authoring': { en: 'authoring', ko: '작성' },
+  'pm.capability.exchange': { en: 'exchange', ko: '교환' },
+  'pm.capability.assistance': { en: 'assistance', ko: '기획 지원' },
+  'pm.capability.handoff': { en: 'handoff', ko: '인계' },
+  'pm.more.change': { en: 'Changes', ko: '변경' },
+  'pm.more.revision': { en: 'Revision actions', ko: '리비전 작업' },
+  'pm.more.planActions': { en: 'Plan actions', ko: '계획 작업' },
+  'pm.more.design': { en: '{view} view · switch view & edit source', ko: '{view} 보기 · 보기 전환 및 소스 편집' },
+  'pm.design.view': { en: '{view} view', ko: '{view} 보기' },
+  'pm.status.demoSummary': { en: 'Disposable · no AI worker · stays local', ko: '일회용 · AI 작업자 없음 · 로컬 전용' },
+  'pm.status.more': { en: 'Details', ko: '자세히' },
+  'pm.code.noTickets': { en: 'No managed tickets have been handed off.', ko: '아직 전달된 관리 티켓이 없습니다.' },
+  'pm.coverage.independent': { en: 'Specified, linked, implemented, tested, accepted, and waived remain independent.', ko: '명세, 연결, 구현, 테스트, 인수, 면제는 각각 별도로 판단합니다.' },
+  'pm.requirements.newBaseline': { en: 'Current baseline · new capability', ko: '현재 기준 · 새 기능' },
+  'pm.requirements.noBaseline': { en: 'No baseline specification exists yet.', ko: '아직 기준 명세가 없습니다.' },
+  'pm.requirements.meta': { en: '{capability} · path, changes & edit', ko: '{capability} · 경로, 변경 내역 및 편집' },
 };
 
 export function pmMessage(key, values = {}, language = globalThis.window?.i18n?.lang || 'en') {
@@ -1142,6 +1292,22 @@ function taskLabeler(tasks) {
 function dependencyKindCell(kind) {
   const key = `pm.deps.kind.${kind}`;
   return { text: Object.hasOwn(PM_MESSAGES, key) ? pmMessage(key) : kind, attrs: { 'data-kind': kind, title: kind } };
+}
+
+// Only the six exact PlanningState values get Korean; anything else stays verbatim.
+const PLANNING_STATES = new Set(['Draft', 'Validated', 'NeedsReview', 'Approved', 'Stale', 'Archived']);
+function planningStateText(value) {
+  return globalThis.window?.i18n?.lang === 'ko' && PLANNING_STATES.has(value) ? pmMessage(`pm.state.${value.toLowerCase()}`) : value;
+}
+
+// The planning-files producer emits lowercase draft; other document states stay raw on the cell.
+function documentStateCell(value) {
+  return { text: globalThis.window?.i18n?.lang === 'ko' && value === 'draft' ? pmMessage('pm.files.state.draft') : value, attrs: { 'data-state': value, title: value } };
+}
+
+function capabilityText(name) {
+  const key = `pm.capability.${name}`;
+  return Object.hasOwn(PM_MESSAGES, key) ? pmMessage(key) : name;
 }
 
 function localizePm(scope) {

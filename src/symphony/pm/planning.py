@@ -61,6 +61,14 @@ DEVELOPER_INSTRUCTIONS = (
     "symphony-task' block containing at least id, parent_id, order, type, "
     "depends_on, requirements, storyboards, and design_refs, reviewable detail "
     "sections, then '<!-- /symphony-task -->'. Never emit an unmanaged checkbox. "
+    "For OpenSpec specs, keep each applicable main-spec requirement description "
+    "and each new ADDED delta requirement description at most 500 characters; "
+    "do not apply that ADDED check to MODIFIED requirements. Put requirement "
+    "content and scenarios inside their proper delta, requirement, and scenario "
+    "blocks so archive carries the authored text. Put other explanation in "
+    "proposal.md or design.md only when those document IDs are allowed targets; "
+    "otherwise name the needed target in blocked_instruction or explanation "
+    "without proposing it. Never truncate, discard, or rewrite existing owner content to fit a limit. "
     + DOC_WRITING_RULE["en"]
 )
 

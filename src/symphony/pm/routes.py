@@ -2224,4 +2224,4 @@ def _openspec_readiness(
         findings.append(PmFinding("openspec_incomplete", "OpenSpec planning artifacts are incomplete", severity="blocking"))
     if instructions.total != executable or len(instructions.tasks) != executable:
         findings.append(PmFinding("openspec_task_mismatch", "OpenSpec task count differs from executable PM leaves", severity="blocking"))
-    return ValidationReport(report.valid and not any(item.severity == "blocking" for item in findings), tuple(findings), "openspec+pm", "1.14.0")
+    return ValidationReport(report.valid and not any(item.severity == "blocking" for item in findings), tuple(findings), "openspec+pm", "1.14.2")

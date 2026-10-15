@@ -48,7 +48,7 @@ def test_exact_profile_uses_status_for_artifacts_and_instructions_for_tasks(
     _schema(tmp_path)
     adapter = FakeOpenSpec(
         {
-            ("--version",): "1.14.0",
+            ("--version",): "1.14.2",
             ("schema", "validate", "symphony-pm", "--json"): {
                 "valid": True,
                 "issues": [],
@@ -84,7 +84,7 @@ def test_wrong_version_and_unknown_json_shapes_fail_closed(tmp_path: Path) -> No
 
     adapter = FakeOpenSpec(
         {
-            ("--version",): "1.14.0",
+            ("--version",): "1.14.2",
             ("schema", "validate", "symphony-pm", "--json"): {"valid": True},
             ("status", "--change", "demo", "--json"): {"unexpected": True},
         }
@@ -97,7 +97,7 @@ def test_validate_parses_real_114_item_envelope(tmp_path: Path) -> None:
     _schema(tmp_path)
     adapter = FakeOpenSpec(
         {
-            ("--version",): "1.14.0",
+            ("--version",): "1.14.2",
             ("schema", "validate", "symphony-pm", "--json"): {"valid": True, "issues": []},
             ("validate", "demo", "--type", "change", "--strict", "--json", "--no-interactive"): {
                 "items": [{"id": "demo", "type": "change", "valid": True, "issues": [], "durationMs": 13}],
@@ -115,7 +115,7 @@ def test_validate_preserves_structured_findings_from_invalid_envelope(tmp_path: 
     _schema(tmp_path)
     adapter = FakeOpenSpec(
         {
-            ("--version",): "1.14.0",
+            ("--version",): "1.14.2",
             ("schema", "validate", "symphony-pm", "--json"): {"valid": True, "issues": []},
             ("validate", "demo", "--type", "change", "--strict", "--json", "--no-interactive"): {
                 "items": [{"id": "demo", "type": "change", "valid": False, "issues": [{"code": "missing", "message": "proposal is missing"}]}],
@@ -139,7 +139,7 @@ def test_archive_preview_preserves_already_date_prefixed_locator(tmp_path: Path)
     (change / "tasks.md").write_text("done\n", encoding="utf-8")
     adapter = FakeOpenSpec(
         {
-            ("--version",): "1.14.0",
+            ("--version",): "1.14.2",
             ("schema", "validate", "symphony-pm", "--json"): {"valid": True, "issues": []},
         }
     )
@@ -194,12 +194,12 @@ def test_cli_cleanup_kills_descendant_holding_output_pipes(tmp_path: Path) -> No
         "#!/usr/bin/env python3\n"
         "import subprocess, sys\n"
         "subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(30)'])\n"
-        "print('1.14.0')\n",
+        "print('1.14.2')\n",
         encoding="utf-8",
     )
     os.chmod(script, 0o755)
     started = time.monotonic()
-    assert OpenSpecAdapter(str(script), timeout_seconds=5)._run(tmp_path, "--version") == "1.14.0"
+    assert OpenSpecAdapter(str(script), timeout_seconds=5)._run(tmp_path, "--version") == "1.14.2"
     assert time.monotonic() - started < 4
 
 
@@ -321,7 +321,7 @@ def test_bundled_run_uses_absolute_execpath_and_caches_across_adapters(tmp_path,
     monkeypatch.setattr(subprocess, "run", run)
     monkeypatch.setattr(subprocess, "Popen", popen)
     for _ in range(2):
-        assert OpenSpecAdapter()._run(tmp_path, "--version") == "1.14.0"
+        assert OpenSpecAdapter()._run(tmp_path, "--version") == "1.14.2"
     assert len(probes) == 1
     assert probes[0][0] == [
         openspec_module.shutil.which("node"), "-p",
@@ -350,8 +350,8 @@ def test_explicit_executable_bypasses_node_resolution(tmp_path, monkeypatch):
         return real_popen(command, **kwargs)
 
     monkeypatch.setattr(subprocess, "Popen", popen)
-    args = ["-c", "print('1.14.0')"]
-    assert OpenSpecAdapter(sys.executable)._run(tmp_path, *args) == "1.14.0"
+    args = ["-c", "print('1.14.2')"]
+    assert OpenSpecAdapter(sys.executable)._run(tmp_path, *args) == "1.14.2"
     assert commands == [[sys.executable, *args]]
 
 

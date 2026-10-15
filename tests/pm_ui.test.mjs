@@ -383,6 +383,7 @@ class UiNode {
     this.childNodes = []; this.attributes = new Map(); this.dataset = {};
     this.disabled = false; this.title = ''; this.open = false; this.listeners = new Map();
     this.classList = {
+      contains: (name) => (this.getAttribute('class') || '').split(' ').includes(name),
       add: (name) => this.setAttribute('class', `${this.getAttribute('class') || ''} ${name}`.trim()),
       remove: (name) => this.setAttribute('class', (this.getAttribute('class') || '').split(' ').filter((item) => item !== name).join(' ')),
       toggle: (name, force) => {
@@ -395,39 +396,70 @@ class UiNode {
   get textContent() { return this.nodeType === 3 ? this.nodeValue : this.childNodes.map((node) => node.textContent).join(''); }
   set textContent(value) { this.replaceChildren(String(value)); }
   append(...nodes) {
-    for (const node of nodes) this.childNodes.push(node instanceof UiNode ? node : new UiNode('', String(node)));
-    for (const child of this.childNodes) child.parentNode = this;
+    for (const value of nodes) {
+      const node = value instanceof UiNode ? value : new UiNode('', String(value));
+      node.remove(); this.childNodes.push(node); node.parentNode = this;
+    }
   }
   appendChild(node) { this.append(node); return node; }
-  prepend(...nodes) { const children = this.childNodes; this.childNodes = []; this.append(...nodes); this.childNodes.push(...children); }
+  prepend(...nodes) { const first = this.childNodes[0] || null; for (const node of nodes) this.insertBefore(node, first); }
+  insertBefore(node, reference) {
+    if (node === reference) return node;
+    if (reference !== null && !this.childNodes.includes(reference)) throw new Error('NotFoundError');
+    node.remove(); const index = reference === null ? this.childNodes.length : this.childNodes.indexOf(reference);
+    this.childNodes.splice(index, 0, node); node.parentNode = this; return node;
+  }
+  before(node) { this.parentNode?.insertBefore(node, this); }
+  after(node) { this.parentNode?.insertBefore(node, this.nextSibling); }
   remove() { if (this.parentNode) this.parentNode.childNodes = this.parentNode.childNodes.filter((node) => node !== this); this.parentNode = null; }
+  get parentElement() { return this.parentNode?.nodeType === 1 ? this.parentNode : null; }
+  get firstElementChild() { return this.children[0] || null; }
+  get nextSibling() { return this.parentNode?.childNodes[this.parentNode.childNodes.indexOf(this) + 1] || null; }
+  get nextElementSibling() { return this.parentElement?.children[this.parentElement.children.indexOf(this) + 1] || null; }
+  get previousElementSibling() { return this.parentElement?.children[this.parentElement.children.indexOf(this) - 1] || null; }
   get isConnected() { return this.tag === 'body' || !!this.parentNode?.isConnected; }
   contains(node) { return this === node || this.childNodes.some((child) => child.contains(node)); }
   closest(selector) { return this.matches(selector) ? this : this.parentNode?.closest(selector) || null; }
   get className() { return this.getAttribute('class') || ''; }
   set className(value) { this.setAttribute('class', value); }
+  get open() { return this.attributes.has('open'); }
+  set open(value) { if (value) this.attributes.set('open', ''); else this.attributes.delete('open'); }
   get tabIndex() { const value = this.getAttribute('tabindex'); return value === null ? (['button', 'input', 'textarea', 'select'].includes(this.tag) ? 0 : -1) : Number(value); }
   set tabIndex(value) { this.setAttribute('tabindex', value); }
   get options() { return this.querySelectorAll('option'); }
   get selectedOptions() { return this.options.filter((node) => node.selected); }
   get children() { return this.childNodes.filter((node) => node.nodeType === 1); }
-  replaceChildren(...nodes) { this.childNodes = []; this.append(...nodes); }
+  replaceChildren(...nodes) { for (const child of this.childNodes) child.parentNode = null; this.childNodes = []; this.append(...nodes); }
   setAttribute(key, value) {
     this.attributes.set(key, String(value));
     if (['open', 'disabled', 'hidden', 'selected'].includes(key)) this[key] = true;
     if (['value', 'title'].includes(key)) this[key] = String(value);
   }
   getAttribute(key) { return this.attributes.get(key) ?? null; }
+  hasAttribute(key) { return this.attributes.has(key); }
   removeAttribute(key) {
     this.attributes.delete(key);
     if (['open', 'disabled', 'hidden', 'selected'].includes(key)) this[key] = false;
   }
   matches(selector) {
-    const match = selector.match(/^([\w-]+)?(?:\.([\w-]+))?(?:\[([\w-]+)(?:="([^"]*)")?\])?$/);
-    if (!match || this.nodeType !== 1) return false;
-    const [, tag, className, attr, value] = match;
-    return (!tag || this.tag === tag) && (!className || (this.getAttribute('class') || '').split(' ').includes(className))
-      && (!attr || (this.attributes.has(attr) && (value === undefined || this.getAttribute(attr) === value)));
+    if (this.nodeType !== 1) return false;
+    // Whitespace inside an attribute value belongs to the same selector.
+    const parts = selector.trim().match(/(?:[^\s[\]]+|\[[^\]]*\])+/g) || [];
+    if (parts.length > 1) {
+      const last = parts.pop(); if (!this.matches(last)) return false;
+      if (parts.at(-1) === '>') { parts.pop(); return !!this.parentElement?.matches(parts.join(' ')); }
+      for (let ancestor = this.parentElement; ancestor; ancestor = ancestor.parentElement) if (ancestor.matches(parts.join(' '))) return true;
+      return false;
+    }
+    const negatives = [...selector.matchAll(/:not\(([^)]+)\)/g)].map((match) => match[1]);
+    if (negatives.some((part) => this.matches(part))) return false;
+    const plain = selector.replace(/:not\([^)]+\)/g, '');
+    if (!/^(?:[\w-]+|\*)?(?:\.[\w-]+)*(?:\[[\w-]+(?:=["']?[^\]"']*["']?)?\])*$/.test(plain)) return false;
+    const tag = plain.match(/^[\w-]+/)?.[0];
+    const classes = [...plain.matchAll(/\.([\w-]+)/g)].map((match) => match[1]);
+    const attrs = [...plain.matchAll(/\[([\w-]+)(?:=["']?([^\]"']*)["']?)?\]/g)];
+    return (!tag || this.tag === tag) && classes.every((name) => this.className.split(' ').includes(name))
+      && attrs.every(([, name, value]) => this.attributes.has(name) && (value === undefined || this.getAttribute(name) === value));
   }
   querySelectorAll(selector) {
     const selectors = selector.split(',').map((item) => item.trim());
@@ -438,8 +470,9 @@ class UiNode {
     const listeners = this.listeners.get(type) || [];
     listeners.push(listener); this.listeners.set(type, listeners);
   }
+  removeEventListener(type, listener) { this.listeners.set(type, (this.listeners.get(type) || []).filter((item) => item !== listener)); }
   async trigger(type, extra = {}) { for (const listener of this.listeners.get(type) || []) await listener({ type, target: this, preventDefault() {}, stopPropagation() {}, ...extra }); }
-  focus() { globalThis.document.activeElement = this; }
+  focus(options) { this.focusCalls ??= []; this.focusCalls.push(options); globalThis.document.activeElement = this; }
 }
 
 function storageStub() {
@@ -447,7 +480,7 @@ function storageStub() {
   return { getItem: (key) => values.get(key) ?? null, setItem: (key, value) => values.set(key, String(value)), removeItem: (key) => values.delete(key) };
 }
 
-async function mountedPm(t, { tab = 'idea', view = '', requested = '', demo = false, language = 'en', hostTools = {}, gated = false, archived = false, development = false, demoAssistance = false, dirtyChanges = [], apiRequest = null, draft = null, announcements = [] } = {}) {
+async function mountedPm(t, { tab = 'idea', view = '', requested = '', demo = false, language = 'en', hostTools = {}, gated = false, archived = false, development = false, demoAssistance = false, dirtyChanges = [], apiRequest = null, draft = null, announcements = [], media = null, lifecycle = null } = {}) {
   const el = (tag, attrs, children) => {
     const node = new UiNode(tag);
     for (const [key, value] of Object.entries(attrs || {})) if (value !== null && value !== undefined && value !== false) node.setAttribute(key, typeof value === 'boolean' ? '' : value);
@@ -456,7 +489,7 @@ async function mountedPm(t, { tab = 'idea', view = '', requested = '', demo = fa
     return node;
   };
   const globals = {
-    window: { i18n: { lang: language } },
+    window: { i18n: { lang: language }, ...(media ? { matchMedia: () => media } : {}) },
     location: new URL(`http://127.0.0.1/?pmTab=${tab}&pmView=${view}&pmChange=${requested}#/artifacts`),
     history: { replaceState() {} }, sessionStorage: storageStub(), localStorage: storageStub(), NodeFilter: { SHOW_TEXT: 4 },
     document: {
@@ -503,6 +536,7 @@ async function mountedPm(t, { tab = 'idea', view = '', requested = '', demo = fa
     },
   } });
   await new Promise((resolve) => setImmediate(resolve));
+  if (lifecycle) lifecycle.unmount = () => mount.unmount();
   assert.equal(root.querySelector('.pm-action-error'), null, root.textContent);
   assert.ok(root.querySelector('.pm-revision-bar'), `PM renderer must finish without an error: ${root.textContent}`);
   return root;
@@ -600,13 +634,16 @@ test('round10 workspace guide joins the header controls after actions with uncha
       const root = await mountedPm(context, { tab, language, demo });
       const header = root.querySelector('header.pm-header');
       const controls = header.querySelector('div.pm-header-controls');
-      assert.deepEqual(header.children.map((node) => node.className), ['pm-heading-copy', 'pm-header-controls'], 'The header keeps two columns and no separate guide row');
+      assert.equal(header.children.length, 2, 'The header keeps two columns and no separate guide row');
+      assert.equal(header.children[0].className, 'pm-heading-copy');
+      assert.equal(controls.parentNode, header.children[1], 'Round14 intentionally wraps the existing controls in its native disclosure');
+      assert.equal(controls.parentNode.tag, 'details');
       assert.deepEqual(controls.children.map((node) => `${node.tag}.${node.className}`), ['div.pm-actions', 'details.pm-guide'], 'The workspace guide follows the actions');
       const guides = root.querySelectorAll('details.pm-guide');
       assert.equal(guides.length, 2);
       assert.equal(guides[0], controls.children[1], 'Workspace help stays first among the native disclosures');
       // DOM order is the Tab order; no tabindex is introduced.
-      const focusables = header.querySelectorAll('select, button, summary');
+      const focusables = controls.querySelectorAll('select, button, summary');
       assert.deepEqual(focusables.map((node) => node.tag === 'select' ? 'select' : node.textContent),
         ['select', ...['Repair workspace', 'Convert legacy plan', 'New change', GUIDE_SUMMARY].map((label) => pmText(label, {}, language))]);
       assert.ok(focusables.every((node) => node.getAttribute('tabindex') === null));
@@ -1205,7 +1242,7 @@ test('round5 all six compact-table consumers retain rows, column headings and lo
       if (consumer === 'dependencies') inspect(root, language === 'en' ? headers(['Task', 'Needs', 'Dependency', 'Reason']) : ['작업', '선행 작업', '의존 유형', '사유'], 'Required first');
       if (consumer === 'coverage') inspect(root, headers(['Task', 'Revision', 'Ticket', 'Implemented', 'Tested', 'Accepted', 'Provenance']), 'TICKET-1');
       if (consumer === 'code') inspect(root, headers(['Status', 'Path']), 'src/a-very-long-path.js');
-      if (consumer === 'planning') inspect(root, headers(['Path', 'State', 'Role']), 'proposal.md');
+      if (consumer === 'planning') inspect(root, language === 'ko' ? ['경로', '상태', '역할'] : headers(['Path', 'State', 'Role']), 'proposal.md');
       if (consumer === 'paste') {
         await root.querySelector('.pm-wbs-table').trigger('paste', { clipboardData: { getData: () => 'T-1\ttitle\tChanged title' } });
         const dialog = document.body.querySelector('[role="dialog"]');
@@ -1569,4 +1606,371 @@ test('round9 F2 scoped message catalog stays outside the walked KO dictionary', 
   assert.equal(pmMessage('pm.missing.key', {}, 'ko'), 'pm.missing.key');
   assert.equal(pmMessage('pm.deps.option', { task: 'T-B · {predecessor}', predecessor: 'T-A' }, 'en'), 'T-B · {predecessor} needs T-A', 'user titles are not re-interpolated');
   for (const value of Object.values(DEPENDENCY_TEXT.ko).flat().filter((item) => typeof item === 'string')) assert.equal(pmText(value, {}, 'ko'), value);
+});
+
+// Round14 models media notifications and DOM observations, not CSS layout or
+// native Tab order. Actual visibility, geometry and keyboard behavior need the
+// installed-browser receipt. No product exports or dependency are added.
+function round14Media(matches) {
+  const handlers = new Set();
+  return {
+    matches, media: '(max-width: 560px)', events: 0,
+    addEventListener(type, handler) { if (type === 'change') handlers.add(handler); },
+    removeEventListener(type, handler) { if (type === 'change') handlers.delete(handler); },
+    get listenerCount() { return handlers.size; },
+    async resize(compact) {
+      this.matches = compact; this.events += 1;
+      for (const handler of [...handlers]) await handler({ matches: compact, media: this.media });
+    },
+  };
+}
+function round14Disclosure(root, key) {
+  const node = root.querySelector(`details.pm-more-${key}`);
+  assert.ok(node, `Missing native ${key} disclosure`);
+  assert.ok(node.querySelector('summary'), `${key} needs its native summary`);
+  return node;
+}
+function round14ObserveRects(root, media) {
+  for (const node of [root, ...root.querySelectorAll('*')]) {
+    // Supplied observations isolate routing from CSS: all-width summaries have
+    // rectangles, and native-closed descendants may retain rectangles as observed.
+    // Actual painting, native Tab order and computed geometry remain browser proof.
+    node.getClientRects = () => {
+      if (!node.isConnected || node.hidden) return [];
+      return [{ left: 0, top: 0, right: 44, bottom: 44, width: 44, height: 44 }];
+    };
+  }
+}
+
+test('round16 secondary controls start closed at every width while retaining warning and revision identity', async (t) => {
+  for (const language of ['en', 'ko']) for (const compact of [true, false]) await t.test(`${language}, compact=${compact}`, async (context) => {
+    const media = round14Media(compact);
+    const root = await mountedPm(context, { tab: 'plan', language, demo: true, media });
+    for (const key of ['change', 'status', 'revision', 'wbs']) assert.equal(round14Disclosure(root, key).open, false, `${key} starts closed`);
+    assert.equal(media.events, 0, 'Initial compact layout must not depend on resize');
+    const changes = round14Disclosure(root, 'change'), revision = round14Disclosure(root, 'revision'), status = root.querySelector('.pm-status-card');
+    assert.ok(changes.contains(root.querySelector('.pm-change-select')));
+    assert.ok(revision.contains(findButton(root, pmText('Approve revision', {}, language))));
+    const statusOwner = round14Disclosure(root, 'status'), statusHeading = status.querySelector('strong');
+    assert.notEqual(statusOwner, revision, 'Status and revision retain distinct native disclosure owners');
+    for (let parent = statusHeading.parentElement; parent && root.contains(parent); parent = parent.parentElement) {
+      if (parent.tag === 'details' && !parent.open) assert.ok(parent.children.find((child) => child.tag === 'summary')?.contains(statusHeading), 'Warning heading stays visible outside closed owners or in their native first summary');
+    }
+    assert.equal(status.querySelector('strong').textContent, pmText(DEMO_HEADING, {}, language));
+    assert.equal(round14Disclosure(root, 'status').querySelector('summary').textContent, language === 'ko' ? '데모 작업공간 · 일회용 · AI 작업자 없음 · 로컬 전용' : 'Demo workspace · Disposable · no AI worker · stays local');
+    assert.ok(status.textContent.includes(pmText(DEMO_SENTENCE, {}, language)), 'The full warning remains available');
+    const identity = root.querySelector('.pm-revision-bar');
+    const locator = identity.querySelector('strong'), rawRevision = identity.querySelector('code'), state = identity.querySelector('.pm-state');
+    assert.equal(locator.textContent, 'team-leave-request');
+    assert.equal(rawRevision.title, 'rev1');
+    assert.equal(state.textContent, language === 'ko' ? '초안' : 'Draft');
+    for (const node of [locator, rawRevision, state]) for (let parent = node.parentElement; parent && root.contains(parent); parent = parent.parentElement) {
+      if (parent.tag === 'details' && !parent.open) assert.ok(parent.children.find((child) => child.tag === 'summary')?.contains(node), 'Selected context stays in visible content or the native first summary');
+    }
+    for (const key of ['change', 'status', 'revision', 'wbs']) {
+      const disclosure = round14Disclosure(root, key); disclosure.open = true; await disclosure.trigger('toggle');
+      assert.equal(disclosure.open, true, `${key} can be opened without replacing its controls`);
+    }
+    assert.ok(round14Disclosure(root, 'wbs').contains(root.querySelector('.pm-plan-filter')));
+  });
+});
+
+test('round16 first Plan mount places original archive and handoff inside closed WBS actions at every width', async (t) => {
+  for (const compact of [true, false]) await t.test(`compact=${compact}`, async (context) => {
+    const media = round14Media(compact), root = await mountedPm(context, { tab: 'plan', media });
+    const archive = findButton(root, 'Preview archive'), handoff = findButton(root, 'Preview approved handoff');
+    const row = archive.parentElement, wbs = root.querySelector('.pm-plan-surface'), disclosure = round14Disclosure(root, 'wbs');
+    assert.equal(handoff.parentElement, row);
+    assert.equal(media.events, 0, 'Check the first committed render without resize');
+    assert.equal(disclosure.open, false, 'Secondary WBS actions start closed at every width');
+    assert.ok(wbs.contains(disclosure));
+    assert.ok(disclosure.contains(archive) && disclosure.contains(handoff), 'Both original actions belong inside the WBS disclosure on first mount');
+    assert.equal(row.previousElementSibling, disclosure.querySelector('summary'));
+    disclosure.open = true; await disclosure.trigger('toggle');
+    assert.ok(disclosure.contains(root.querySelector('.pm-plan-filter')), 'Opening exposes the original filter and actions');
+    for (const label of ['Preview archive', 'Preview approved handoff']) assert.equal(root.querySelectorAll('button').filter((node) => node.textContent === label).length, 1);
+  });
+});
+
+test('round16 all-width WBS placement retains open intent action identity handlers and capability guards', async (t) => {
+  for (const gated of [false, true]) await t.test(`gated=${gated}`, async (context) => {
+    const media = round14Media(false), calls = [];
+    const root = await mountedPm(context, { tab: 'plan', media, gated, hostTools: { node: { available: false, reason: 'Node is unavailable.' } }, apiRequest: (path) => {
+      if (path.includes('/handoffs/preview')) { calls.push(path); return { items: [], preview_token: 'p1' }; }
+    } });
+    const buttons = ['Preview archive', 'Preview approved handoff'].map((label) => findButton(root, label));
+    const before = buttons.map((node) => ({ disabled: node.disabled, title: node.title, capability: node.dataset.capability, describedBy: node.getAttribute('aria-describedby'), handlers: [...node.listeners.get('click')] }));
+    const opened = round14Disclosure(root, 'wbs'); opened.open = true; await opened.trigger('toggle');
+    for (const compact of [true, false, true, false]) {
+      await media.resize(compact);
+      const disclosure = round14Disclosure(root, 'wbs');
+      assert.equal(disclosure, opened);
+      assert.equal(disclosure.open, true, 'Changing width preserves the explicit user-open intent');
+      buttons.forEach((node, index) => {
+        assert.equal(findButton(root, node.textContent), node, 'Move the original node');
+        assert.equal(root.querySelectorAll('button').filter((item) => item.textContent === node.textContent).length, 1, 'No duplicate controls');
+        assert.deepEqual({ disabled: node.disabled, title: node.title, capability: node.dataset.capability, describedBy: node.getAttribute('aria-describedby'), handlers: [...node.listeners.get('click')] }, before[index]);
+        assert.equal(disclosure.contains(node), true);
+      });
+    }
+    if (gated) {
+      assert.equal(buttons[1].disabled, true); assert.equal(buttons[1].dataset.capability, 'handoff');
+      assert.match(buttons[1].title, /handoff requires G0 and G1/);
+      assert.equal(calls.length, 0);
+    } else {
+      await buttons[1].trigger('click'); await settlePm();
+      assert.equal(calls.length, 1, 'One click still invokes one original preview handler');
+      assert.ok(document.body.querySelector('[role="dialog"]'));
+    }
+    assert.equal(buttons[0].disabled, true, 'The missing-Node archive guard survives moves');
+  });
+});
+
+test('round16 an opened revision retains user intent and focused control across widths', async (t) => {
+  const media = round14Media(false), root = await mountedPm(t, { media });
+  round14ObserveRects(root, media);
+  const revision = round14Disclosure(root, 'revision'); revision.open = true; await revision.trigger('toggle');
+  const approve = findButton(root, 'Approve revision'); approve.focus();
+  const count = approve.focusCalls.length;
+  for (const compact of [true, false]) {
+    await media.resize(compact);
+    assert.equal(revision.open, true, 'A width change must not close an explicitly opened revision');
+    assert.equal(document.activeElement, approve);
+    assert.equal(approve.focusCalls.length, count, 'Already visible owned focus is not moved');
+  }
+});
+
+test('round16 visible change summary retains focus and closed state when widening', async (t) => {
+  const media = round14Media(true), root = await mountedPm(t, { media });
+  round14ObserveRects(root, media);
+  const disclosure = round14Disclosure(root, 'change'), summary = disclosure.querySelector('summary'); summary.focus();
+  const count = summary.focusCalls.length;
+  await media.resize(false);
+  assert.equal(disclosure.open, false);
+  assert.equal(document.activeElement, summary);
+  assert.equal(summary.focusCalls.length, count, 'The all-width visible summary keeps focus without a forced transfer');
+});
+
+test('round16 control-free status summary remains visible focused and closed across widths', async (t) => {
+  const media = round14Media(true), root = await mountedPm(t, { tab: 'plan', demo: true, media });
+  round14ObserveRects(root, media);
+  const disclosure = round14Disclosure(root, 'status');
+  assert.equal(disclosure.querySelectorAll('select, input, button, a[href]').length, 0);
+  const summary = disclosure.querySelector('summary'); summary.focus();
+  const count = summary.focusCalls.length;
+  for (const compact of [false, true]) {
+    await media.resize(compact);
+    assert.equal(disclosure.open, false);
+    assert.equal(document.activeElement, summary, 'The visible control-free summary does not require a fallback');
+    assert.equal(summary.focusCalls.length, count);
+  }
+});
+
+test('round14 breakpoint changes leave outside-root and already-visible focus alone', async (t) => {
+  const media = round14Media(false), root = await mountedPm(t, { media }); round14ObserveRects(root, media);
+  const outside = new UiNode('button'); document.body.append(outside); outside.focus();
+  await media.resize(true); assert.equal(document.activeElement, outside);
+  await media.resize(false); assert.equal(document.activeElement, outside);
+  const current = root.querySelector('.pm-tabs').querySelector('[aria-current="page"]'); current.focus();
+  const count = current.focusCalls.length;
+  await media.resize(true); assert.equal(document.activeElement, current); assert.equal(current.focusCalls.length, count);
+  await media.resize(false); assert.equal(document.activeElement, current); assert.equal(current.focusCalls.length, count);
+});
+
+test('round16 user-open disclosures and owned summary focus survive approval render at every width', async (t) => {
+  for (const compact of [true, false]) await t.test(`compact=${compact}`, async (context) => {
+    const media = round14Media(compact); let approvals = 0;
+    const root = await mountedPm(context, { media, apiRequest: (path) => { if (path.split('?')[0].endsWith('/approvals')) { approvals += 1; return {}; } } });
+    assert.equal(round14Disclosure(root, 'revision').open, false, 'Every width starts closed');
+    window.confirm = () => true;
+    const disclosure = round14Disclosure(root, 'revision'); disclosure.open = true; await disclosure.trigger('toggle');
+    disclosure.querySelector('summary').focus();
+    await findButton(root, 'Approve revision').trigger('click'); await settlePm();
+    const rebuilt = round14Disclosure(root, 'revision');
+    assert.equal(approvals, 1); assert.notEqual(rebuilt, disclosure, 'Exercise the actual fresh render');
+    assert.equal(rebuilt.open, true, 'Keep the user-open state');
+    assert.equal(document.activeElement, rebuilt.querySelector('summary'), 'Restore the owned summary after the normal current-tab focus');
+    assert.deepEqual(document.activeElement.focusCalls.at(-1), { preventScroll: true });
+  });
+});
+
+test('round14 Plan to non-Plan to Plan has no stale row and unmount releases media handler', async (t) => {
+  const media = round14Media(true), lifecycle = {};
+  const root = await mountedPm(t, { tab: 'plan', media, lifecycle });
+  const original = findButton(root, 'Preview archive');
+  await findButton(root, 'Idea').trigger('click'); await settlePm();
+  assert.equal(root.contains(original), false);
+  assert.equal(root.querySelectorAll('button').some((node) => node.textContent === 'Preview archive'), false);
+  await media.resize(false); await media.resize(true);
+  await findButton(root, 'Plan').trigger('click'); await settlePm();
+  const replacement = findButton(root, 'Preview archive');
+  assert.notEqual(replacement, original);
+  assert.ok(round14Disclosure(root, 'wbs').contains(replacement), 'Place only the current Plan row');
+  assert.equal(media.listenerCount, 1);
+  const current = root.querySelector('.pm-tabs').querySelector('[aria-current="page"]'); current.focus();
+  lifecycle.unmount(); assert.equal(media.listenerCount, 0);
+  const open = round14Disclosure(root, 'wbs').open; await media.resize(false);
+  assert.equal(round14Disclosure(root, 'wbs').open, open, 'Disposed mount must not respond to a later media event');
+  assert.equal(document.activeElement, current);
+});
+
+test('round14 owned PlanningState labels translate six exact values and preserve unknown EN raw and user text', async (t) => {
+  const states = [['Draft', '초안'], ['Validated', '검증됨'], ['NeedsReview', '검토 필요'], ['Approved', '승인됨'], ['Stale', '오래됨'], ['Archived', '보관됨'], ['Mystery', 'Mystery'], ['draft', 'draft']];
+  for (const language of ['ko', 'en']) for (const [raw, korean] of states) await t.test(`${language}/${raw}`, async (context) => {
+    const detail = { change_id: 'c1', locator: 'Archived', revision: 'Draft', state: raw, documents: [{ document_id: 'proposal', path: 'Validated', editable: true }], storyboard_frames: [] };
+    const frozen = JSON.stringify(detail), source = 'Draft\nValidated\nNeedsReview\nApproved\nStale\nArchived\nPath\nRole';
+    const root = await mountedPm(context, { language, apiRequest: (path) => {
+      path = path.split('?')[0];
+      if (path === '/changes') return { changes: [detail] };
+      if (path === '/changes/c1') return detail;
+      if (path.includes('/documents/')) return { document_id: 'proposal', source, path: 'Validated' };
+    } });
+    const expected = language === 'ko' ? korean : raw, option = root.querySelector('.pm-change-select').options.find((node) => node.value === 'c1'), badge = root.querySelector('.pm-revision-bar').querySelector('.pm-state');
+    assert.equal(option.textContent, `Archived · ${expected}`); assert.equal(option.value, 'c1');
+    assert.equal(badge.textContent, expected); assert.equal(badge.className, `pm-state ${raw.toLowerCase()}`);
+    assert.equal(root.querySelector('.pm-revision-bar').querySelector('strong').textContent, 'Archived');
+    assert.equal(root.querySelector('.pm-revision-bar').querySelector('code').title, 'Draft');
+    assert.equal(root.querySelector('textarea').value, source, 'User source is never a state-label consumer');
+    assert.equal(JSON.stringify(detail), frozen, 'No API response mutation');
+  });
+});
+
+test('round14 planning-files draft label is scoped to its owned cell with raw attributes', async (t) => {
+  for (const language of ['ko', 'en']) await t.test(language, async (context) => {
+    const documents = ['draft', 'Mystery', 'Draft'].map((state, index) => ({ document_id: `d${index}`, path: `${state}.md`, state, editable: index === 0 }));
+    const detail = { change_id: 'c1', locator: 'draft', revision: 'draft', state: 'Draft', documents, storyboard_frames: [] }, frozen = JSON.stringify(detail);
+    const root = await mountedPm(context, { tab: 'code', language, apiRequest: (path) => {
+      path = path.split('?')[0]; if (path === '/changes') return { changes: [detail] }; if (path === '/changes/c1') return detail;
+    } });
+    const table = root.querySelector('.pm-card-grid').querySelector('.pm-compact-table'), rows = table.querySelector('tbody').children;
+    assert.deepEqual(table.querySelectorAll('th').map((node) => node.textContent), language === 'ko' ? ['경로', '상태', '역할'] : ['Path', 'State', 'Role']);
+    rows.forEach((row, index) => {
+      const raw = documents[index].state, cell = row.children[1];
+      assert.equal(row.children[0].textContent, `${raw}.md`, 'Path bytes remain raw');
+      assert.equal(cell.textContent, language === 'ko' && raw === 'draft' ? '초안' : raw);
+      assert.equal(cell.getAttribute('data-state'), raw); assert.equal(cell.title, raw);
+      assert.equal(row.children[2].textContent, language === 'ko' ? index === 0 ? '기획 원본' : '읽기 전용' : index === 0 ? 'Planning source' : 'Read only');
+    });
+    assert.equal(JSON.stringify(detail), frozen);
+  });
+});
+
+test('round15 narrowing restores owned summary even when native-closed controls still report rectangles', async (t) => {
+  const media = round14Media(false), root = await mountedPm(t, { media });
+  const revision = round14Disclosure(root, 'revision'), summary = revision.querySelector('summary');
+  const approve = findButton(root, 'Approve revision');
+  // The installed browser retained layout rectangles for this closed native
+  // details descendant. Supply that observation independently of open state;
+  // browser keyboard receipts, not this adapter, establish actual visibility.
+  const rect = { left: 0, top: 0, right: 44, bottom: 44, width: 44, height: 44 };
+  for (const node of [root, ...root.querySelectorAll('*')]) node.getClientRects = () => node.isConnected ? [rect] : [];
+  revision.open = true; await revision.trigger('toggle');
+  assert.equal(revision.open, true, 'Focus starts in an explicitly opened disclosure');
+  approve.focus();
+  // Observe the actual closed-descendant condition before the media lifecycle
+  // recovers it; resizing alone must preserve an explicitly open user intent.
+  revision.open = false; await revision.trigger('toggle');
+  await media.resize(true);
+  assert.equal(revision.open, false, 'The focused action now belongs to a closed native disclosure');
+  assert.equal(approve.getClientRects().length, 1, 'Nonzero layout rectangles do not make a closed descendant a valid focus destination');
+  assert.equal(summary.getClientRects().length, 1, 'The owned summary remains a supplied visible destination');
+  assert.ok(document.activeElement === summary, `Focus must move to its revision summary; actual ${document.activeElement?.tag}: ${document.activeElement?.textContent}`);
+  assert.deepEqual(summary.focusCalls.at(-1), { preventScroll: true });
+});
+
+test('round15 owned Code Files empty and coverage explanations localize without translating raw document data', async (t) => {
+  const messages = ['No managed tickets have been handed off.', 'Specified, linked, implemented, tested, accepted, and waived remain independent.'];
+  for (const language of ['en', 'ko']) await t.test(language, async (context) => {
+    // Unknown document states may equal owned English copy; they remain data.
+    const detail = { change_id: 'c1', locator: 'English fixture', revision: 'Unknown revision', state: 'Draft', storyboard_frames: [], documents: messages.map((state, index) => ({ document_id: `authored-${index}`, path: `English fixture/Unknown-${index}.md`, state, editable: true })) };
+    const frozen = JSON.stringify(detail);
+    const root = await mountedPm(context, { tab: 'code', language, apiRequest: (path) => {
+      path = path.split('?')[0];
+      if (path === '/changes') return { changes: [detail] };
+      if (path === '/changes/c1') return detail;
+    } });
+    const ticketCard = root.querySelectorAll('section.pm-readable-card').find((node) => node.querySelector('h2')?.textContent === pmText('Handoff tickets', {}, language));
+    assert.ok(ticketCard, 'Exercise the actual empty handoff consumer');
+    assert.deepEqual([ticketCard.querySelector('p').textContent, root.querySelector('.pm-coverage').querySelector('p').textContent], language === 'ko'
+      ? ['아직 전달된 관리 티켓이 없습니다.', '명세, 연결, 구현, 테스트, 인수, 면제는 각각 별도로 판단합니다.'] : messages);
+    const rows = root.querySelector('.pm-compact-table').querySelector('tbody').children;
+    rows.forEach((row, index) => {
+      assert.equal(row.children[0].textContent, detail.documents[index].path, 'Authored English path remains raw');
+      assert.equal(row.children[1].textContent, messages[index], 'Unknown document state is not an owned-copy consumer');
+      assert.equal(row.children[1].getAttribute('data-state'), messages[index]);
+    });
+    assert.equal(JSON.stringify(detail), frozen, 'API fixture bytes stay unchanged');
+  });
+});
+
+test('round15 owned missing-baseline explanations localize without translating authored requirement source', async (t) => {
+  const messages = ['Current baseline · new capability', 'No baseline specification exists yet.'];
+  for (const language of ['en', 'ko']) await t.test(language, async (context) => {
+    const documents = messages.map((source, index) => ({ document_id: `spec:english-fixture-${index}`, path: `English fixture/spec-${index}.md`, source, editable: true }));
+    const detail = { change_id: 'c1', locator: 'English fixture', revision: 'Unknown revision', state: 'Draft', storyboard_frames: [], documents };
+    const frozen = JSON.stringify(detail);
+    const root = await mountedPm(context, { tab: 'requirements', language, apiRequest: (path) => {
+      const pathname = path.split('?')[0];
+      if (pathname === '/changes') return { changes: [detail] };
+      if (pathname === '/changes/c1') return detail;
+      if (pathname.includes('/baselines/')) return { exists: false };
+      const id = decodeURIComponent(pathname.split('/documents/')[1] || '');
+      const doc = documents.find((item) => item.document_id === id);
+      if (doc) return { ...doc };
+    } });
+    const comparisons = root.querySelectorAll('.pm-requirement-delta');
+    assert.equal(comparisons.length, 2, 'Exercise the actual missing-baseline comparison consumers');
+    const expected = language === 'ko' ? ['현재 기준 · 새 기능', '아직 기준 명세가 없습니다.'] : messages;
+    assert.deepEqual(comparisons.map((node) => [node.children[1].querySelector('h3').textContent, node.children[1].querySelector('p').textContent]), [expected, expected]);
+    comparisons.forEach((node, index) => assert.equal(node.children[0].querySelector('p').textContent, messages[index], 'Authored source equal to owned English copy remains raw'));
+    assert.deepEqual(root.querySelectorAll('.pm-source-details').map((node) => node.querySelector('pre').textContent), messages);
+    assert.deepEqual(root.querySelectorAll('.pm-card-heading').map((node) => node.querySelector('code').textContent), documents.map((doc) => doc.path));
+    assert.equal(JSON.stringify(detail), frozen, 'API fixture bytes stay unchanged');
+  });
+});
+
+test('round16 Requirements metadata folds at every width without folding authored Proposed or baseline content', async (t) => {
+  const source = '# Authored requirement title\n\nAuthored Proposed text stays raw.\n';
+  const baseline = '# Existing baseline title\n\nAuthored Current baseline text stays raw.\n';
+  const path = 'English fixture/keep-spec.md';
+  for (const language of ['en', 'ko']) for (const compact of [true, false]) await t.test(`${language}, compact=${compact}`, async (context) => {
+    const media = round14Media(compact), writes = [];
+    const detail = { change_id: 'c1', locator: 'English fixture', revision: 'Unknown revision', state: 'Draft', storyboard_frames: [], documents: [{ document_id: 'spec:keep', path, editable: true }] };
+    const frozen = JSON.stringify(detail);
+    const root = await mountedPm(context, { tab: 'requirements', language, media, apiRequest: (requestPath, options) => {
+      const pathname = requestPath.split('?')[0];
+      if (['POST', 'PATCH', 'DELETE'].includes(options?.method)) writes.push(pathname);
+      if (pathname === '/changes') return { changes: [detail] };
+      if (pathname === '/changes/c1') return detail;
+      if (pathname.includes('/baselines/')) return { exists: true, source: baseline };
+      if (pathname.includes('/documents/')) return { document_id: 'spec:keep', source, path };
+    } });
+    const comparison = root.querySelector('.pm-requirement-delta'), metadata = root.querySelector('.pm-card-heading');
+    assert.equal(comparison.children[0].querySelector('h3').textContent, pmText('Proposed', {}, language));
+    assert.equal(comparison.children[1].querySelector('h3').textContent, pmText('Current baseline', {}, language));
+    assert.equal(comparison.children[0].querySelector('p').textContent, source, 'Keep every authored proposed heading and paragraph in order');
+    assert.equal(comparison.children[1].querySelector('p').textContent, baseline, 'Keep the complete baseline readable');
+    assert.equal(root.querySelector('.pm-source-details').querySelector('pre').textContent, source);
+    assert.equal(metadata.querySelector('h2').textContent, 'keep');
+    const code = metadata.querySelector('code'), edit = findButton(metadata, pmText('Edit requirements', {}, language));
+    assert.equal(code.textContent, path); assert.equal(code.title, path);
+    const owner = metadata.closest('details');
+    assert.ok(owner, 'Owned capability/path/delta/Edit metadata belongs to a native secondary disclosure');
+    assert.ok(owner.querySelector('summary')?.textContent.trim(), 'The disclosure has a meaningful native summary');
+    assert.equal(owner.open, false, 'Secondary metadata starts closed at every width');
+    assert.equal(owner.contains(comparison), false, 'Proposed and baseline content stay outside secondary-control closure');
+    const before = { code, edit, delta: metadata.querySelector('.pm-count').textContent, handlers: [...edit.listeners.get('click')] };
+    owner.open = true; await owner.trigger('toggle');
+    await media.resize(!compact);
+    assert.equal(owner.open, true, 'Explicitly opened metadata remains open across width changes');
+    assert.equal(metadata.querySelector('code'), before.code); assert.equal(findButton(metadata, pmText('Edit requirements', {}, language)), before.edit);
+    assert.equal(metadata.querySelector('.pm-count').textContent, before.delta);
+    assert.deepEqual(edit.listeners.get('click'), before.handlers, 'Keep the original Edit handler exactly once');
+    assert.equal(root.querySelectorAll('button').filter((node) => node.textContent === edit.textContent).length, 1);
+    await edit.trigger('click'); await settlePm();
+    assert.equal(root.querySelector('textarea').value, source, 'The existing Edit action still opens the same source');
+    findButton(root, pmText('Back to requirements', {}, language));
+    assert.equal(writes.length, 0, 'Folding and opening an editor do not save or dispatch');
+    assert.equal(JSON.stringify(detail), frozen);
+  });
 });

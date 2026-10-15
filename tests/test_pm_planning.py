@@ -64,6 +64,15 @@ async def test_proposal_contract_uses_exact_restricted_profile(tmp_path: Path) -
     assert turn["sandboxPolicy"] == {"type": "readOnly", "networkAccess": False}
     assert turn["additionalContext"]["planning_snapshot"]["kind"] == "untrusted"
     assert "SYMPHONY_NEW_<KIND>_<NAME>" in thread["developerInstructions"]
+    guidance = thread["developerInstructions"]
+    assert "applicable main-spec requirement description" in guidance
+    assert "new ADDED delta requirement description at most 500 characters" in guidance
+    assert "do not apply that ADDED check to MODIFIED requirements" in guidance
+    assert "content and scenarios inside their proper delta, requirement, and scenario blocks" in guidance
+    assert "so archive carries the authored text" in guidance
+    assert "proposal.md or design.md only when those document IDs are allowed targets" in guidance
+    assert "name the needed target in blocked_instruction or explanation without proposing it" in guidance
+    assert "Never truncate, discard, or rewrite existing owner content to fit a limit" in guidance
     assert {"shell_tool", "unified_exec", "plugins", "multi_agent", "web_search_request"} <= set(DISABLED_FEATURES)
     assert client.stop_calls == 1
 

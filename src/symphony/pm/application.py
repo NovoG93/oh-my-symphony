@@ -88,12 +88,12 @@ class PmApplication:
             "capabilities": capabilities,
             "openspec": {
                 "available": None,
-                "version": "1.14.0 required",
+                "version": "1.14.2 required",
                 "schema_supported": None,
                 "reason": "validated per claimed planning worktree on explicit actions",
             },
             "pins": {
-                "openspec": "1.14.0", "openpyxl": "3.1.5",
+                "openspec": "1.14.2", "openpyxl": "3.1.5",
                 "tabulator": "6.6.1", "mermaid": "12.1.0", "dompurify": "3.4.16",
             },
             "gates": readiness["gates"],
@@ -122,7 +122,7 @@ class PmApplication:
             findings.append(PmFinding(exc.code, exc.message, severity="blocking"))
         else:
             findings.extend(external.findings)
-        return ValidationReport(not any(item.severity == "blocking" for item in findings), tuple(findings), "combined", "1.14.0")
+        return ValidationReport(not any(item.severity == "blocking" for item in findings), tuple(findings), "combined", "1.14.2")
 
     def preview_archive(self, ctx: PmRequestContext, owner: str) -> dict[str, Any]:
         self._require("handoff")

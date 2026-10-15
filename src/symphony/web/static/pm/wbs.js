@@ -9,7 +9,7 @@ function byParent(tasks) {
   return map;
 }
 
-export function renderWbs({ ui, overlay, view, semanticIndex = [], onNavigateReference = () => {}, onSetField, onPaste, onCommand, onCopy, onSelect, onFilter, onScroll, selectedTask = '', filter = '', scrollTop = 0, canUndo = false, canRedo = false, approved = false, readOnlyReason = '' }) {
+export function renderWbs({ ui, overlay, view, semanticIndex = [], onNavigateReference = () => {}, onSetField, onPaste, onCommand, onCopy, onSelect, onFilter, onScroll, selectedTask = '', filter = '', scrollTop = 0, canUndo = false, canRedo = false, approved = false, readOnlyReason = '', disclose = null }) {
   const { el } = ui;
   const tasks = view.tasks;
   const root = el('section', { class: 'pm-plan-surface' });
@@ -38,13 +38,15 @@ export function renderWbs({ ui, overlay, view, semanticIndex = [], onNavigateRef
   };
   const selectTask = (id) => { selected = id; onSelect(id); updateChildAction(); };
   updateChildAction();
+  const actions = el('div', { class: 'pm-actions', role: 'toolbar', 'aria-label': 'Work breakdown actions' }, [
+    action('Add group', 'add-group'), action('Add root', 'add-root'), action('Add sibling', 'add-sibling'), addChild, childHint, action('Indent', 'indent'), action('Outdent', 'outdent'),
+    search, action('Move up', 'up'), action('Move down', 'down'), action(approved ? 'Cancel task' : 'Delete', 'delete'), action('Undo', 'undo', !canUndo), action('Redo', 'redo', !canRedo),
+    action('Copy TSV', 'copy'),
+  ]);
+  // An optional host disclosure folds the same actions on narrow screens.
   const toolbar = el('div', { class: 'pm-plan-toolbar' }, [
     el('div', null, [el('h2', null, L('Work breakdown')), el('span', { class: 'pm-count' }, `${view.tasks.filter((task) => task.executable).length} ${L('executable tasks')}`)]),
-    el('div', { class: 'pm-actions', role: 'toolbar', 'aria-label': 'Work breakdown actions' }, [
-      action('Add group', 'add-group'), action('Add root', 'add-root'), action('Add sibling', 'add-sibling'), addChild, childHint, action('Indent', 'indent'), action('Outdent', 'outdent'),
-      search, action('Move up', 'up'), action('Move down', 'down'), action(approved ? 'Cancel task' : 'Delete', 'delete'), action('Undo', 'undo', !canUndo), action('Redo', 'redo', !canRedo),
-      action('Copy TSV', 'copy'),
-    ]),
+    disclose ? disclose('wbs', L('Work breakdown actions'), [actions]) : actions,
   ]);
   const table = el('table', { class: 'pm-wbs-table', role: 'treegrid', 'aria-label': 'Implementation work breakdown' });
   table.appendChild(el('thead', null, el('tr', null, ['ID', 'Task', 'Type', 'Owner', 'Priority', 'Estimate'].map((name) => el('th', { scope: 'col' }, L(name))))));

@@ -33,6 +33,8 @@ The seven planning actions run in the dedicated tool-disabled proposal client. T
 
 Apply checks the operation digest, selected paths, base hashes, permanent identities, WBS structure, and approved-task cancellation rules. It writes all selected documents under one recovery journal and one revision. An incremental draft may apply while the overall change still has readiness findings; those findings are returned and remain blocking at approval and handoff. If planning process cleanup is uncertain, later assistance remains unavailable until the owned process group is confirmed stopped.
 
+The assistant's existing host developer instructions also ask for OpenSpec 1.14.2-ready drafts: concise requirement descriptions within the [500-character limit](pm-workspace.md#configuration), requirement text and scenarios inside their delta, requirement, and scenario blocks, and other explanation in `proposal.md` or `design.md` only when those documents are allowed targets. Otherwise the proposal names the needed target as blocked instead of proposing an unselected document. It must not truncate, drop, or rewrite existing owner content to fit a limit, and targets are never expanded. The `symphony-pm` schema, owner and project custom schemas, proposal-only review, managed IDs, WBS rules, writing rule, pinned model and effort, strict initialize, isolation, no-tools/no-network execution, and approval controls are unchanged.
+
 ## Project and package identity
 
 PM authority uses the registered host project ID throughout HTTP, repository, handoff, dispatch, and verification records. Tracker slugs remain tracker configuration and may repeat across registered projects; a stale request carrying another project ID is refused. Standalone services retain one deterministic local identity.
@@ -67,7 +69,7 @@ The PM v9 schema is still additive relative to released v1-v8. Use a fresh v8→
 
 ## Archive
 
-Archive is a separate confirmed operation after completion evidence and conflict checks. OpenSpec 1.14.0 writes `openspec/changes/archive/YYYY-MM-DD-<locator>` (or preserves a locator already carrying a date prefix). The adapter accepts only the exact previewed contained destination. Delivery verification archives only disposable fixtures; archiving this repository or another real project requires separate authorization.
+Archive is a separate confirmed operation after completion evidence and conflict checks. OpenSpec 1.14.2 writes `openspec/changes/archive/YYYY-MM-DD-<locator>` (or preserves a locator already carrying a date prefix). The adapter accepts only the exact previewed contained destination. Delivery verification archives only disposable fixtures; archiving this repository or another real project requires separate authorization.
 
 An existing `pmChange=<change-id>` link remains available after archive as read-only history, including its planning documents, WBS, managed tickets, verification evidence, and ArtifactStore links. Archived changes stay out of the active change list, and their original IDs cannot be reclaimed, repaired, edited, approved, handed off, or archived again.
 

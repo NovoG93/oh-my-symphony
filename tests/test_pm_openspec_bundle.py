@@ -84,15 +84,15 @@ def file_bytes(directory):
 def test_d5_minimal_package_and_pinned_build_inputs():
     manifest = json.loads((BUNDLE / "bundle-manifest.json").read_text())
     assert json.loads((BUNDLE / "package.json").read_text()) == {
-        "name": "@fission-ai/openspec", "version": "1.14.0", "license": "MIT", "type": "module",
+        "name": "@fission-ai/openspec", "version": "1.14.2", "license": "MIT", "type": "module",
     }
-    assert manifest["openspec"] == "1.14.0"
+    assert manifest["openspec"] == "1.14.2"
     assert manifest["esbuild"] == "0.25.10"
     assert manifest["node_min"] == "20.19.0"
     package = json.loads((BUILD / "package.json").read_text())
     lock = json.loads((BUILD / "package-lock.json").read_text())
     for section, name, version in (
-        ("dependencies", "@fission-ai/openspec", "1.14.0"),
+        ("dependencies", "@fission-ai/openspec", "1.14.2"),
         ("devDependencies", "esbuild", "0.25.10"),
     ):
         assert package[section][name] == version
@@ -126,7 +126,7 @@ def test_r12_notices_and_no_telemetry():
     packages = manifest["packages"]
     assert len({(item["name"], item["version"]) for item in packages}) == len(packages)
     assert {item["license"] for item in packages} == {"MIT", "ISC"}
-    assert {"name": "@fission-ai/openspec", "version": "1.14.0", "license": "MIT"} in packages
+    assert {"name": "@fission-ai/openspec", "version": "1.14.2", "license": "MIT"} in packages
     for item in packages:
         identity = f"{item['name']} {item['version']} — {item['license']}\n\n"
         assert notices.count(identity) == 1
@@ -165,7 +165,7 @@ def test_r11_checkout_preserves_hashes_and_ignores_build_dependencies():
 def test_d5_version(node):
     result = run_cli(node, "--version")
     assert result.returncode == 0, result.stderr
-    assert result.stdout == "1.14.0\n"
+    assert result.stdout == "1.14.2\n"
 
 
 @pytest.mark.parametrize(("args", "expected"), [

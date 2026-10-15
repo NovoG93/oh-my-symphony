@@ -13,8 +13,8 @@ const require = createRequire(import.meta.url);
 const packageJson = async (dir) => JSON.parse(await readFile(path.join(dir, 'package.json'), 'utf8'));
 const openspec = await packageJson(upstream);
 const commander = await packageJson(path.dirname(require.resolve('commander')));
-if (openspec.version !== '1.14.0' || esbuildVersion !== '0.25.10') {
-  throw new Error('Build requires OpenSpec 1.14.0 and esbuild 0.25.10');
+if (openspec.version !== '1.14.2' || esbuildVersion !== '0.25.10') {
+  throw new Error('Build requires OpenSpec 1.14.2 and esbuild 0.25.10');
 }
 if (commander.version !== '14.0.3') throw new Error('Build requires commander 14.0.3');
 

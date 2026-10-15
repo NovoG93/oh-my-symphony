@@ -146,6 +146,70 @@ def test_storyboard_projection_and_typed_edit_preserve_stable_id(tmp_path: Path)
     assert (edited.ui, edited.user_action, edited.system_response) == ("Card", "Select", "Open drawer")
 
 
+@pytest.mark.parametrize("title", ["", " \t ", None, 42, "First\nSecond", "First\rSecond", "First\u2028Second"])
+def test_storyboard_invalid_title_rejects_patch_without_mutation(tmp_path: Path, title: object) -> None:
+    repo, change_id, workspace = _repository(tmp_path)
+    change = repo.create_change(
+        change_id=change_id, locator="storyboard-title", title="Storyboard", owner="owner"
+    )
+    frame = change.storyboard_frames[0]
+    root = workspace / "openspec" / "changes" / "storyboard-title"
+    before = {name: (root / name).read_bytes() for name in ("ux.md", "symphony.yaml")}
+    with pytest.raises(PmError) as exc:
+        repo.patch_document(
+            PmRequestContext("p1", change_id, change.revision), "ux",
+            (
+                {"op": "set_storyboard_fields", "storyboard_id": frame.storyboard_id,
+                 "fields": {"actor_goal": "Must not be saved"}},
+                {"op": "set_storyboard_fields", "storyboard_id": frame.storyboard_id,
+                 "fields": {"title": title}},
+            ), owner="owner",
+        )
+    assert exc.value.code == "invalid_request"
+    assert exc.value.status == 400
+    assert {name: (root / name).read_bytes() for name in before} == before
+    assert repo.get_change(PmRequestContext("p1", change_id), owner="owner").revision == change.revision
+
+    renamed = repo.patch_document(
+        PmRequestContext("p1", change_id, change.revision), "ux",
+        ({"op": "set_storyboard_fields", "storyboard_id": frame.storyboard_id,
+          "fields": {"title": "  Employee submits a request  "}},), owner="owner",
+    )
+    result = repo.patch_document(
+        PmRequestContext("p1", change_id, renamed.revision), "ux",
+        ({"op": "set_storyboard_fields", "storyboard_id": frame.storyboard_id,
+          "fields": {"actor_goal": "Submit a request"}},), owner="owner",
+    )
+    refreshed = repo.get_change(PmRequestContext("p1", change_id), owner="owner")
+    edited = refreshed.storyboard_frames[0]
+    assert refreshed.revision == result.revision
+    assert edited.storyboard_id == frame.storyboard_id
+    assert edited.title == "Employee submits a request"
+    assert edited.actor_goal == "Submit a request"
+    assert (edited.ui, edited.success, edited.legacy_combined) == (frame.ui, frame.success, frame.legacy_combined)
+
+
+@pytest.mark.parametrize("newline", ["\n", "\r\n"])
+@pytest.mark.parametrize("label", ["Storyboard", "storyboard"])
+def test_storyboard_title_preserves_literal_backslashes_and_heading_format(newline: str, label: str) -> None:
+    from symphony.pm.semantic import set_storyboard_fields, storyboard_frames
+
+    source = newline.join([
+        f"#### {label}: Original", "<!-- symphony:storyboard=SB-12345678 -->",
+        "- Actor/goal: Submit", "- UI: Request card", "",
+    ])
+    title = r"Employee opens C:\new\1"
+    updated = set_storyboard_fields(source, "SB-12345678", {"title": title})
+    assert updated == source.replace(f"{label}: Original", f"{label}: {title}")
+    frame = storyboard_frames(updated)[0]
+    assert frame.title == title
+    assert frame.storyboard_id == "SB-12345678"
+    assert frame.actor_goal == "Submit"
+    assert frame.ui == "Request card"
+    edited = set_storyboard_fields(updated, frame.storyboard_id, {"actor_goal": "Read request"})
+    assert storyboard_frames(edited)[0].title == title
+
+
 def test_real_openspec_second_archive_rename_preserves_req_scenario_ids(
     tmp_path: Path,
 ) -> None:

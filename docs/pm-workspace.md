@@ -6,7 +6,7 @@ The workflow is explicit:
 
 1. Select an isolated Git worktree and create a planning change.
 2. Draft and review Idea, Requirements, Design, Plan, and Code Files. Design contains UX, storyboard, architecture, ERD, API, and integration subviews.
-3. Validate the managed WBS and the pinned OpenSpec 1.14.0 profile.
+3. Validate the managed WBS and the pinned OpenSpec 1.14.2 profile.
 4. Approve one exact revision. Approval creates a local planning commit; it does not dispatch, merge, push, or deploy.
 5. Preview and confirm handoff. Handoff creates ordinary file-board tickets with immutable PM provenance and native dependencies.
 6. Record implementation evidence before an explicit archive operation.
@@ -60,10 +60,12 @@ pm:
   assistance: false
   handoff: false
   planning_workspace_root: /absolute/path/outside/the/protected/checkout
-  # openspec_executable: /path/to/openspec   # optional: your own OpenSpec 1.14.0
+  # openspec_executable: /path/to/openspec   # optional: your own OpenSpec 1.14.2
 ```
 
-Symphony ships a trimmed OpenSpec 1.14.0 CLI that keeps only the commands PM Workspace calls. It is the default: when `openspec_executable` is absent, PM Workspace runs it with the `node` on your PATH, which must be Node.js 20.19.0 or newer. Set `openspec_executable` only to use your own OpenSpec 1.14.0 install. A config copied from an older example with `openspec_executable: openspec` keeps calling that external program; remove the line to use the bundle.
+Symphony ships a trimmed OpenSpec 1.14.2 CLI that keeps only the six commands PM Workspace calls: version, schema validation, status, apply instructions, strict non-interactive validation, and archive. It is the default: when `openspec_executable` is absent, PM Workspace runs it with the `node` on your PATH, which must be Node.js 20.19.0 or newer. Set `openspec_executable` only to use your own OpenSpec install, which must be exactly 1.14.2. A config copied from an older example with `openspec_executable: openspec` keeps calling that external program; remove the line to use the bundle.
+
+Strict validation treats upstream warnings as invalid. Each applicable main-spec requirement description and each new `ADDED` delta requirement description must be 500 characters or fewer; `MODIFIED` requirements skip that `ADDED` check but keep the other normal checks. Spec text that archive does not carry, such as an uncopied preamble or content outside the delta, requirement, and scenario blocks, raises a warning and therefore fails strict validation. Recognized artifact-output and `apply.tracks` globs nested more than 16 levels are refused. PM Workspace's containment, ownership, path refusals, and recovery are unchanged even though upstream accepts more managed symlink leaves. The Symphony PM schema (`symphony-pm`) and owner or project custom schemas are not edited or migrated; only upstream's bundled `spec-driven` instruction text is refreshed by the normal build.
 
 Buttons that need a missing tool are disabled from the start and show the reason. Without a suitable Node.js, Approve revision and Preview archive are disabled; Validate still runs and lists the problems it can find without OpenSpec. With `assistance: true`, the planning assistant is disabled until the installed Codex CLI supports the restricted app-server controls and is logged in.
 

@@ -1,9 +1,9 @@
-// Only the OpenSpec 1.14.0 calls Symphony makes.
+// Only the OpenSpec 1.14.2 calls Symphony makes.
 import { Argument, Command } from 'commander';
 import { createRequire } from 'node:module';
 import { asStatus } from './node_modules/@fission-ai/openspec/dist/commands/shared-output.js';
 import { ArchiveCommand } from './node_modules/@fission-ai/openspec/dist/core/archive.js';
-import { registerSchemaCommand } from './node_modules/@fission-ai/openspec/dist/commands/schema.js';
+import { registerSchemaCommand } from './node_modules/@fission-ai/openspec/dist/cli/commands/schema.js';
 import { ValidateCommand } from './node_modules/@fission-ai/openspec/dist/commands/validate.js';
 import { statusCommand, applyInstructionsCommand } from './node_modules/@fission-ai/openspec/dist/commands/workflow/index.js';
 

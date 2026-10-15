@@ -276,6 +276,30 @@ def _tab(page, area, lang):
     expect(tab).to_have_attribute("aria-current", "page")
 
 
+def _planning_state_label(value, lang):
+    labels = {
+        "Draft": "초안",
+        "Validated": "검증됨",
+        "NeedsReview": "검토 필요",
+        "Approved": "승인됨",
+        "Stale": "오래됨",
+        "Archived": "보관됨",
+    }
+    return labels.get(value, value) if lang == "ko" else value
+
+
+def _open_pm_tools(page, key):
+    from playwright.sync_api import expect
+    assert key in {"change", "revision", "wbs", "design"}
+    owner = page.locator(f"details.pm-more-{key}")
+    expect(owner).to_have_count(1)
+    summary = owner.locator("summary").first
+    expect(summary).to_be_visible()
+    if owner.get_attribute("open") is None:
+        summary.click()
+    expect(owner).to_have_attribute("open", "")
+
+
 def _guides(page, area, lang, matched):
     from playwright.sync_api import expect
     guides = page.locator("details.pm-guide")
@@ -333,6 +357,7 @@ def test_installed_demo_r7_journey(tmp_path, installed_python, chrome, lang):
             expect(banner).to_have_count(0)
             # Connect refreshes the board; revisit PM with the saved tab token.
             page.reload()
+        _open_pm_tools(page, "revision")
         expect(_button(page, "Validate", lang)).to_be_visible()
         assert page.evaluate("window.i18n.lang") == lang
         assert page.evaluate("localStorage.getItem('symphony.lang')") == lang
@@ -340,6 +365,7 @@ def test_installed_demo_r7_journey(tmp_path, installed_python, chrome, lang):
         if token:
             assert page.evaluate("sessionStorage.getItem('symphony.apiToken')") == token
             expect(page.locator(".api-token-banner")).to_have_count(0)
+        _open_pm_tools(page, "change")
         _guides(page, "idea", lang, matched)
         _button(page, "Edit source", lang).click()
         expect(page.locator(".pm-view-switcher button")).to_have_text("문서 검토" if lang == "ko" else "Review document")
@@ -359,6 +385,7 @@ def test_installed_demo_r7_journey(tmp_path, installed_python, chrome, lang):
         expect(page.get_by_role("heading", name="검토 준비 완료" if lang == "ko" else "Ready for review", exact=True)).to_be_visible()
         page.get_by_role("button", name="닫기" if lang == "ko" else "Close", exact=True).click()
         _tab(page, "plan", lang)
+        _open_pm_tools(page, "wbs")
         _guides(page, "plan", lang, matched)
         rows = page.locator(".pm-tabulator .tabulator-row")
         expect(rows).to_have_count(7)
@@ -382,7 +409,7 @@ def test_installed_demo_r7_journey(tmp_path, installed_python, chrome, lang):
         with page.expect_response(lambda response: response.url.endswith("/approvals") and response.request.method == "POST") as approval:
             _button(page, "Approve revision", lang).click()
         assert approval.value.status == 201
-        expect(page.locator(".pm-revision-bar .pm-state")).to_have_text("Approved")
+        expect(page.locator(".pm-revision-bar .pm-state")).to_have_text(_planning_state_label("Approved", lang))
         expect(_button(page, "Cancel task", lang)).to_be_visible()
         expect(_button(page, "Delete", lang)).to_have_count(0)
         git = subprocess.run(["git", "-C", str(directory / "planning"), "show", "-s", "--format=%an <%ae>%n%s", "HEAD"], env=env, capture_output=True, text=True, check=True)
@@ -431,6 +458,7 @@ def test_installed_demo_r7_journey(tmp_path, installed_python, chrome, lang):
             page.reload()
             assert page.evaluate("window.i18n.lang") == "en"
             page.goto(url.split("/?")[0] + "/#/artifacts")
+            _open_pm_tools(page, "revision")
             expect(_button(page, "Validate", "en")).to_be_visible()
         assert len([kind for kind, _ in dialogs if kind == "confirm"]) >= 1
     assert list((tmp_path / "home").iterdir()) == []
@@ -443,7 +471,8 @@ def test_installed_demo_r7_journey(tmp_path, installed_python, chrome, lang):
 def _assert_document_toggle(page, lang):
     from playwright.sync_api import expect
     layout = page.locator(".pm-design-stack .pm-document-layout")
-    toggle = layout.locator(".pm-view-switcher button")
+    _open_pm_tools(page, "revision")
+    toggle = page.locator("details.pm-more-revision .pm-view-switcher button")
     source = layout.locator(".pm-source-editor")
     original = source.input_value()
     for _ in range(2):
@@ -468,10 +497,18 @@ def _inspect_other_guides(page, lang, matched):
     coverage.locator("summary").click()
     expect(coverage).to_have_attribute("open", "")
     expect(_button(page, "Waive coverage", lang).first).to_be_visible()
+    metadata = page.locator(".pm-card-grid > .pm-readable-card").first.locator("details.pm-requirement-meta")
+    expect(metadata).to_have_count(1)
+    metadata_summary = metadata.locator("summary").first
+    expect(metadata_summary).to_be_visible()
+    if metadata.get_attribute("open") is None:
+        metadata_summary.click()
+    expect(metadata).to_have_attribute("open", "")
     _guides(page, "requirements", lang, matched)
     _button(page, "Edit requirements", lang).first.click()
     _guides(page, "requirements", lang, matched)
     _tab(page, "design", lang)
+    _open_pm_tools(page, "design")
     _button(page, "Storyboard", lang).click()
     page.locator(".pm-storyboard-card").first.click()
     save_storyboard = _button(page, "Save storyboard", lang)
@@ -544,10 +581,12 @@ def _inspect_fixture_guides(page, lang, matched, tmp_path):
     try:
         # Fresh navigation resets the requirement editor before fixture reads.
         page.reload()
+        _open_pm_tools(page, "revision")
         expect(_button(page, "Validate", lang)).to_be_visible()
         _tab(page, "requirements", lang)
         page.locator(".pm-coverage-entity").first.locator("summary").click()
         expect(_button(page, "Revoke waiver", lang)).to_be_visible()
+        _open_pm_tools(page, "change")
         _guides(page, "requirements", lang, matched)
         page.screenshot(path=str(tmp_path / f"mocked-reads-requirements-{lang}.png"), full_page=True)
         _tab(page, "code", lang)
@@ -817,6 +856,7 @@ def test_ordinary_server_without_node_r15_context(tmp_path, installed_python, ch
     argv = [executable, str(directory / "project/WORKFLOW.md"), "--port", str(port)]
     with _server(argv, tmp_path, env, url=url), _page(chrome) as (page, _):
         page.goto(url)
+        _open_pm_tools(page, "revision")
         expect(_button(page, "Validate", "en")).to_be_visible()
         payload = page.request.get(url.split("/?")[0] + "/api/v1/pm/capabilities").json()
         assert payload["demo"] == {"active": False}
@@ -844,6 +884,7 @@ def test_ordinary_server_without_node_r15_context(tmp_path, installed_python, ch
         _tab(page, "plan", "en")
         archive_reason = " ".join(payload["capabilities"]["handoff"]["reasons"])
         assert archive_reason
+        _open_pm_tools(page, "wbs")
         expect(_button(page, "Preview archive", "en")).to_be_disabled()
         expect(_button(page, "Preview archive", "en")).to_have_attribute("title", archive_reason + " " + reason)
         assert _runs(directory) == 0
@@ -890,6 +931,7 @@ def test_installed_demo_hardening_surfaces(tmp_path, installed_python, chrome, l
         expect(drawer).to_have_count(0)
         assert not page.locator('.app').evaluate('(node) => node.inert')
         _tab(page, 'design', lang)
+        _open_pm_tools(page, "design")
         _button(page, 'Storyboard', lang).click()
         page.locator('.pm-storyboard-card').first.click()
         drawer = page.locator('.pm-storyboard-drawer')
@@ -909,6 +951,7 @@ def test_installed_demo_hardening_drafts(tmp_path, installed_python, chrome, lan
     discard = False
     with _server(argv, tmp_path, _environment(tmp_path)) as (_, url), _page(chrome, confirm_response=lambda: discard) as (page, dialogs):
         page.goto(url)
+        _open_pm_tools(page, "revision")
         _button(page, 'Edit source', lang).click()
         editor = page.locator('.pm-source-editor')
         original = editor.input_value()
@@ -925,7 +968,9 @@ def test_installed_demo_hardening_drafts(tmp_path, installed_python, chrome, lan
             assert '저장하지 않은' in dialogs[-1][1]
         discard = True
         _tab(page, 'design', lang)
-        page.locator('.pm-design-stack > button').click()
+        _open_pm_tools(page, "design")
+        _button(page, 'Edit source', lang).click()
+        _open_pm_tools(page, "revision")
         page.locator('.pm-view-switcher button').click()
         editor = page.locator('.pm-source-editor')
         ux_source = editor.input_value()
@@ -941,7 +986,8 @@ def test_installed_demo_hardening_drafts(tmp_path, installed_python, chrome, lan
         ux_tab.click()
         expect(ux_tab).to_have_attribute('aria-selected', 'true')
         expect(page.locator('.pm-document-preview').first).to_contain_text('휴가 신청' if lang == 'ko' else 'leave')
-        page.locator('.pm-design-stack > button').click()
+        _open_pm_tools(page, "design")
+        _button(page, 'Edit source', lang).click()
         page.locator('.pm-view-switcher button').click()
         expect(page.locator('.pm-source-editor')).to_have_value(ux_source)
         expect(_button(page, 'Save draft', lang)).to_be_disabled()
@@ -987,6 +1033,7 @@ def test_installed_demo_project_switch_has_one_localized_dirty_guard(tmp_path, i
         page.route('**/api/v1/projects', projects)
         page.route('**/api/v1/projects/fixture-other-project/open', refuse_open)
         page.goto(url)
+        _open_pm_tools(page, "revision")
         _button(page, 'Edit source', lang).click()
         editor = page.locator('.pm-source-editor')
         draft = editor.input_value() + '\nProject switch draft\n'
@@ -1018,6 +1065,7 @@ def test_installed_demo_delayed_preview_stays_on_its_original_view(tmp_path, ins
         page.route(f'**/api/v1/pm/changes/*/{kind}', lambda route: (writes.append(route.request.url), route.abort()))
         page.goto(url)
         _tab(page, 'plan', 'en')
+        _open_pm_tools(page, "wbs")
         with page.expect_request(pattern):
             _button(page, 'Preview approved handoff' if kind == 'handoffs' else 'Preview archive', 'en').click()
         _tab(page, 'code', 'en')
@@ -1044,6 +1092,7 @@ def test_installed_demo_round7_ui(tmp_path, installed_python, chrome, lang, orac
     argv = [str(installed_python.parent / "symphony"), "pm", "demo", "--path", str(directory), "--lang", lang]
     with _server(argv, tmp_path, _environment(tmp_path)) as (_, url), _page(chrome) as (page, _):
         page.goto(url)
+        _open_pm_tools(page, "revision")
         expect(_button(page, "Approve revision", lang)).to_be_visible()
         base = url.split("/?")[0]
         selected = page.locator('.pm-change-select').input_value()
@@ -1057,19 +1106,20 @@ def test_installed_demo_round7_ui(tmp_path, installed_python, chrome, lang, orac
         def status_matches():
             detail = get()
             expect(page.locator('.pm-change-select')).to_have_value(selected)
-            expect(page.locator('.pm-change-select option:checked')).to_have_text(f"{detail['locator']} · {detail['state']}")
-            expect(page.locator('.pm-revision-bar .pm-state')).to_have_text(detail['state'])
+            expect(page.locator('.pm-change-select option:checked')).to_have_text(f"{detail['locator']} · {_planning_state_label(detail['state'], lang)}")
+            expect(page.locator('.pm-revision-bar .pm-state')).to_have_text(_planning_state_label(detail['state'], lang))
 
         if oracle == "status":
             status_matches()
             with page.expect_response(lambda response: response.url.endswith('/approvals') and response.request.method == 'POST') as approved:
                 _button(page, "Approve revision", lang).click()
             assert approved.value.status == 201
-            expect(page.locator('.pm-revision-bar .pm-state')).to_have_text('Approved')
+            expect(page.locator('.pm-revision-bar .pm-state')).to_have_text(_planning_state_label('Approved', lang))
             status_matches()
             page.reload()
-            expect(page.locator('.pm-revision-bar .pm-state')).to_have_text('Approved')
+            expect(page.locator('.pm-revision-bar .pm-state')).to_have_text(_planning_state_label('Approved', lang))
             status_matches()
+            _open_pm_tools(page, "revision")
             _button(page, "Edit source", lang).click()
             editor = page.locator('.pm-source-editor')
             original = editor.input_value()
@@ -1082,6 +1132,7 @@ def test_installed_demo_round7_ui(tmp_path, installed_python, chrome, lang, orac
             expect(page.locator('.toast-success').last).to_be_visible()
             status_matches()
             page.reload()
+            _open_pm_tools(page, "revision")
             expect(_button(page, "Edit source", lang)).to_be_visible()
             status_matches()
             _button(page, "Edit source", lang).click()
@@ -1102,6 +1153,8 @@ def test_installed_demo_round7_ui(tmp_path, installed_python, chrome, lang, orac
                 for guide in page.locator('details.pm-guide').all():
                     expect(guide).to_have_js_property('open', False)
                 page.screenshot(path=str(tmp_path / f'round7-entry-{lang}-{width}x{height}.png'))
+            _open_pm_tools(page, "change")
+            _open_pm_tools(page, "revision")
             _guides(page, 'idea', lang, matched)
             _guides(page, 'idea', lang, matched)  # Reuse must tolerate already-open details.
             for area in ['requirements', 'design', 'plan', 'code']:
@@ -1116,6 +1169,7 @@ def test_installed_demo_round7_ui(tmp_path, installed_python, chrome, lang, orac
             tasks = get('/wbs')['tasks']
             group = next(task['task_id'] for task in tasks if not task['executable'])
             leaf = next(task['task_id'] for task in tasks if task['executable'])
+            _open_pm_tools(page, "wbs")
             child = _button(page, 'Add child', lang)
             hint = page.locator('#pm-add-child-hint')
 
@@ -1148,6 +1202,7 @@ def test_installed_demo_round7_ui(tmp_path, installed_python, chrome, lang, orac
             select(leaf, True)
             page.reload()
             expect(rows).to_have_count(7)
+            _open_pm_tools(page, "wbs")
             expect(child).to_be_disabled()  # Restored selection, before any new row click.
             expect(hint).to_be_visible()
             select(group, False)
@@ -1229,11 +1284,13 @@ def test_installed_demo_round5_rendered_ui(tmp_path, installed_python, chrome, l
     try:
         with _server(argv, tmp_path, _environment(tmp_path)) as (_, url), _page(chrome) as (page, _):
             page.goto(url)
+            _open_pm_tools(page, "revision")
             expect(_button(page, "Validate", lang)).to_be_visible()
             if oracle == 'tables':
                 _button(page, 'Approve revision', lang).click()
-                expect(page.locator('.pm-revision-bar .pm-state')).to_have_text('Approved')
+                expect(page.locator('.pm-revision-bar .pm-state')).to_have_text(_planning_state_label('Approved', lang))
                 _tab(page, 'plan', lang)
+                _open_pm_tools(page, "wbs")
                 _button(page, 'Preview approved handoff', lang).click()
                 with page.expect_response(lambda response: response.url.endswith('/handoffs') and response.request.method == 'POST') as handed_off:
                     page.get_by_role('button', name='네이티브 티켓 생성' if lang == 'ko' else 'Create native tickets', exact=True).click()
@@ -1242,6 +1299,7 @@ def test_installed_demo_round5_rendered_ui(tmp_path, installed_python, chrome, l
                 page.set_viewport_size({"width": width, "height": height})
                 if oracle == "plan":
                     _tab(page, "plan", lang)
+                    _open_pm_tools(page, "wbs")
                     host = page.locator('.pm-workspace-host').bounding_box()
                     actions = page.locator('.pm-plan-action-row button, .pm-plan-toolbar button')
                     assert actions.count() >= 10
@@ -1327,6 +1385,7 @@ def test_installed_demo_round5_archive_failure(tmp_path, installed_python, chrom
     with _server(argv, tmp_path, _environment(tmp_path)) as (_, url), _page(chrome) as (page, _):
         page.goto(url)
         _tab(page, 'plan', lang)
+        _open_pm_tools(page, "wbs")
         with page.expect_response(lambda response: response.url.endswith('/archive/preview')) as refusal:
             _button(page, 'Preview archive', lang).click()
         assert refusal.value.status == 409
@@ -1357,6 +1416,7 @@ def test_installed_demo_round5_problem_recovery(tmp_path, installed_python, chro
     argv = [str(installed_python.parent / "symphony"), "pm", "demo", "--path", str(directory), "--lang", lang]
     with _server(argv, tmp_path, _environment(tmp_path)) as (_, url), _page(chrome) as (page, _):
         page.goto(url)
+        _open_pm_tools(page, "revision")
         _button(page, 'Edit source', lang).click()
         editor = page.locator('.pm-source-editor')
         original = editor.input_value()
@@ -1477,6 +1537,7 @@ def test_installed_round6_reserved_ids_overlay_component(tmp_path, installed_pyt
     with _server(argv, tmp_path, _environment(tmp_path)) as (_, url), _page(chrome) as (page, _):
         page.set_viewport_size({"width": 320, "height": 568})
         page.goto(url)
+        _open_pm_tools(page, "revision")
         expect(_button(page, 'Validate', 'en')).to_be_visible()
         opener = _button(page, 'Validate', 'en')
         opener.focus()
@@ -1531,3 +1592,212 @@ def test_installed_round6_reserved_ids_overlay_component(tmp_path, installed_pyt
         page.evaluate('window.__round6ComponentOverlay.destroy()')
         assert _runs(directory) == 0
         (tmp_path / 'reserved-ids-component.json').write_text(json.dumps({"kind": "real installed overlay and CSS with DOM component fixture", "provider_result": False, "focus": focus, "keyboard_local_scroll": True, "fitting_resize_excluded": True}, indent=2), encoding='utf-8')
+
+
+@pytest.fixture(params=["headless-default", "native-scrollbars"])
+def geometry_chrome(request, chrome):
+    """Geometry-only native scrollbar variant; original Chrome fixture is unchanged."""
+    if request.param == "headless-default":
+        yield chrome, request.param
+        return
+    browser = chrome.browser_type.launch(
+        channel="chrome", headless=True,
+        ignore_default_args=["--hide-scrollbars"],
+    )
+    try:
+        yield browser, request.param
+    finally:
+        browser.close()
+
+
+@pytest.mark.parametrize("lang", ["en", "ko"])
+@pytest.mark.parametrize("width,height", [(320, 568), (375, 667), (440, 956), (1280, 800), (1280, 706)])
+def test_installed_demo_initial_artifact_geometry(tmp_path, installed_python, geometry_chrome, lang, width, height):
+    """Initial complete authored content; measured before raw viewport screenshots."""
+    chrome, scrollbar_mode = geometry_chrome
+    import hashlib
+    import json
+    import struct
+
+    from playwright.sync_api import expect
+
+    # Pinned first authored paragraphs from the unchanged bilingual demo resources.
+    first_paragraph = {
+        "en": {
+            "idea": "Employees ask for leave in chat, and managers lose track of requests. Teammates cannot reliably see who will be away.",
+            "requirements": "The system SHALL store a valid leave request as Pending and MUST refuse dates that overlap the same employee's Pending or Approved requests. The start date MUST be on or before the end date; both dates are included.",
+            "design": "An employee submits leave dates. Their team manager decides the request. Teammates check approved leave before planning work.",
+        },
+        "ko": {
+            "idea": "직원들이 메신저로 휴가를 신청하면 관리자는 요청을 놓치기 쉽습니다. 팀원들도 누가 언제 자리를 비우는지 정확히 확인하기 어렵습니다.",
+            "requirements": "시스템은 유효한 휴가 신청을 Pending(승인 대기)으로 저장해야 합니다(SHALL). 같은 직원의 Pending(승인 대기) 또는 Approved(승인) 신청과 날짜가 겹치면 반드시 거절해야 합니다(MUST). 시작일은 종료일보다 늦을 수 없으며, 시작일과 종료일을 모두 휴가에 포함해야 합니다(MUST).",
+            "design": "직원이 휴가 날짜를 신청하면 소속 팀의 관리자가 처리합니다. 팀원들은 업무를 계획하기 전에 승인된 휴가를 확인합니다.",
+        },
+    }
+    measure = r"""({area}) => {
+      const host = document.querySelector('.pm-workspace-host');
+      const nav = host.querySelector('.pm-tabs');
+      const closed = node => {
+        for (let parent = node.parentElement; parent; parent = parent.parentElement) {
+          if (parent.tagName === 'DETAILS' && !parent.open) {
+            const summary = Array.from(parent.children).find(child => child.tagName === 'SUMMARY');
+            if (!summary || !summary.contains(node)) return true;
+          }
+        }
+        return false;
+      };
+      const rect = node => {
+        if (!node) return null;
+        const r = node.getBoundingClientRect();
+        return {left:r.left, top:r.top, right:r.right, bottom:r.bottom, width:r.width, height:r.height};
+      };
+      const suppressed = node => {
+        const reasons = [];
+        for (let owner = node; owner; owner = owner.parentElement) {
+          const style = getComputedStyle(owner);
+          if (owner.hidden || owner.getAttribute('aria-hidden') === 'true'
+              || style.display === 'none' || style.visibility !== 'visible'
+              || Number(style.opacity) === 0 || style.contentVisibility === 'hidden') reasons.push(owner.tagName);
+          if (style.webkitLineClamp && style.webkitLineClamp !== 'none' && style.webkitLineClamp !== '0') reasons.push('line-clamp');
+          if (style.textOverflow === 'ellipsis') reasons.push('ellipsis');
+        }
+        if (!node.getClientRects().length) reasons.push('no-layout');
+        return reasons;
+      };
+      const clipped = (node, horizontal) => {
+        const r = node.getBoundingClientRect(), failures = [];
+        for (let owner = node.parentElement; owner; owner = owner.parentElement) {
+          const s = getComputedStyle(owner), b = owner.getBoundingClientRect();
+          const top = b.top + owner.clientTop, left = b.left + owner.clientLeft;
+          if (/(auto|scroll|hidden|clip)/.test(s.overflowY)
+              && (r.top < top - 1 || r.bottom > top + owner.clientHeight + 1)) failures.push('vertical:' + owner.className);
+          if (horizontal && /(auto|scroll|hidden|clip)/.test(s.overflowX)
+              && (r.left < left - 1 || r.right > left + owner.clientWidth + 1)) failures.push('horizontal:' + owner.className);
+        }
+        return failures;
+      };
+      const info = node => node && ({
+        tag:node.tagName, text:node.textContent.trim(), rect:rect(node),
+        font:Number.parseFloat(getComputedStyle(node).fontSize),
+        closed:closed(node), suppressed:suppressed(node), clipped:clipped(node, area !== 'plan' && area !== 'code'),
+      });
+      const target = node => {
+        const r = rect(node), off = r.right <= 0 || r.left >= innerWidth || r.bottom <= 0 || r.top >= innerHeight;
+        const full = !off && r.left >= 0 && r.top >= 0 && r.right <= innerWidth && r.bottom <= innerHeight && !clipped(node, true).length;
+        const owned = (x,y) => { const hit = document.elementFromPoint(x,y); return hit === node || node.contains(hit); };
+        return {...info(node), visibility:off ? 'outside' : full ? 'complete' : 'partial',
+          hit:full ? [[r.left+1,(r.top+r.bottom)/2],[r.right-1,(r.top+r.bottom)/2],[(r.left+r.right)/2,r.top+1],[(r.left+r.right)/2,r.bottom-1],[(r.left+r.right)/2,(r.top+r.bottom)/2]].every(([x,y]) => owned(x,y)) : null};
+      };
+      const articles = Array.from(host.querySelectorAll('.pm-document-preview')).filter(node => !closed(node) && !node.closest('.pm-baseline'));
+      const article = articles[0];
+      const first = area === 'plan' ? host.querySelector('.pm-tabulator .tabulator-row')
+        : area === 'code' ? host.querySelector('.pm-readable-card .pm-compact-table tbody tr')
+        : article?.querySelector('p');
+      const heading = article?.querySelector('h1') || article?.querySelector('h2') || article?.querySelector('h3,h4');
+      const authored = Array.from(host.querySelectorAll('.pm-document-preview h1,.pm-document-preview h2,.pm-document-preview h3,.pm-document-preview h4,.pm-document-preview p,.pm-document-preview li,.pm-document-preview blockquote,.pm-document-preview pre')).filter(node => !closed(node));
+      const hostStyle = getComputedStyle(host);
+      const borderWidth = (Number.parseFloat(hostStyle.borderLeftWidth) || 0) + (Number.parseFloat(hostStyle.borderRightWidth) || 0);
+      return {
+        timestamp:new Date().toISOString(), url:location.href, lang:window.i18n.lang,
+        viewport:{width:innerWidth,height:innerHeight,devicePixelRatio},
+        scroll:{x:scrollX,y:scrollY,documentTop:document.scrollingElement.scrollTop,
+          documentLeft:document.scrollingElement.scrollLeft,hostTop:host.scrollTop,hostLeft:host.scrollLeft},
+        overflow:{page:document.documentElement.scrollWidth-document.documentElement.clientWidth,host:host.scrollWidth-host.clientWidth},
+        scrollbar:{offsetWidth:host.offsetWidth, clientWidth:host.clientWidth, borderWidth,
+          width:host.offsetWidth-host.clientWidth-borderWidth,
+          scrollHeight:host.scrollHeight, clientHeight:host.clientHeight},
+        host:rect(host), nav:rect(nav), selected:Array.from(nav.querySelectorAll('[aria-current="page"]')).map(info),
+        first:info(first), heading:info(heading), authored:authored.map(info),
+        tabs:Array.from(nav.querySelectorAll('button')).map(target),
+        coverage:Array.from(host.querySelectorAll('details.pm-coverage-entity > summary')).filter(node => !closed(node)).map(target),
+        enhancedRows:host.querySelectorAll('.pm-tabulator .tabulator-row').length,
+        codeRows:host.querySelectorAll('.pm-readable-card .pm-compact-table tbody tr').length,
+        nonNativeButtons:Array.from(host.querySelectorAll('[role="button"]:not(button)')).map(info),
+      };
+    }"""
+    directory = tmp_path / "demo"
+    argv = [str(installed_python.parent / "symphony"), "pm", "demo", "--path", str(directory), "--lang", lang]
+    failures = []
+    with _server(argv, tmp_path, _environment(tmp_path)) as (_, url):
+        for area in TABS:
+            # Fresh context prevents disclosure, subview and scroll state from leaking between cells.
+            with _page(chrome) as (page, _):
+                page.set_viewport_size({"width": width, "height": height})
+                page.goto(url)
+                expect(page.locator(".pm-tabs")).to_be_visible()
+                _tab(page, area, lang)
+                first = page.locator(".pm-tabulator .tabulator-row").first if area == "plan" else (
+                    page.locator(".pm-readable-card .pm-compact-table tbody tr").first if area == "code"
+                    else page.locator(".pm-document-preview").first.locator("p").first)
+                # Hydrated real content, not a loading card or a later, shorter visible paragraph.
+                if area in first_paragraph[lang]:
+                    expect(first).to_have_text(first_paragraph[lang][area])
+                else:
+                    expect(first).to_contain_text(re.compile(r"\S"))
+                if area == "plan":
+                    expect(page.locator(".pm-tabulator .tabulator-row")).to_have_count(7)
+                page.evaluate("document.fonts.ready")
+                stem = f"initial-{scrollbar_mode}-{area}-{width}x{height}-{lang}"
+                png = tmp_path / f"{stem}.png"
+                receipt = tmp_path / f"{stem}.json"
+                before = page.evaluate(measure, {"area": area})
+                evidence = {"before": before, "screenshot": str(png), "wheel": os.environ.get("SYMPHONY_PM_DEMO_WHEEL"), "scrollbar_mode": scrollbar_mode}
+                # Persist measurement first so a screenshot failure cannot erase the geometry.
+                receipt.write_text(json.dumps(evidence, ensure_ascii=False, indent=2), encoding="utf-8")
+                page.screenshot(path=str(png), full_page=False)
+                after = page.evaluate(measure, {"area": area})
+                raw = png.read_bytes()
+                evidence.update(after=after, png_sha256=hashlib.sha256(raw).hexdigest(),
+                                png_dimensions=list(struct.unpack(">II", raw[16:24])))
+                receipt.write_text(json.dumps(evidence, ensure_ascii=False, indent=2), encoding="utf-8")
+                try:
+                    assert raw[:8] == b"\x89PNG\r\n\x1a\n"
+                    assert evidence["png_dimensions"] == [width, height]
+                    assert before["viewport"] == {"width": width, "height": height, "devicePixelRatio": 1}
+                    assert before["lang"] == lang
+                    scrollbar = before["scrollbar"]
+                    if scrollbar_mode == "native-scrollbars" and scrollbar["scrollHeight"] > scrollbar["clientHeight"] + 1:
+                        assert scrollbar["width"] > 0, ("Native scrollbar admission failed; no reserved gutter", scrollbar)
+                    assert all(value == 0 for value in before["scroll"].values()), before["scroll"]
+                    assert max(before["overflow"].values()) <= 1, before["overflow"]
+                    assert len(before["selected"]) == 1
+                    assert before["selected"][0]["text"] == TABS[area][lang == "ko"]
+                    assert len(before["tabs"]) == 5
+                    selected = before["selected"][0]["rect"]
+                    assert selected["left"] >= before["nav"]["left"] - 1
+                    assert selected["right"] <= before["nav"]["right"] + 1
+                    content = before["first"]
+                    assert content and content["text"] and not content["closed"], content
+                    assert not content["suppressed"] and not content["clipped"], content
+                    bounds = content["rect"]
+                    assert bounds["width"] > 0 and bounds["height"] > 0, content
+                    assert bounds["top"] >= 0 and bounds["bottom"] <= height + 1, content
+                    if area in first_paragraph[lang]:
+                        assert content["text"] == first_paragraph[lang][area], content
+                        assert content["font"] >= 16, content
+                        assert bounds["left"] >= 0 and bounds["right"] <= width + 1, content
+                        heading = before["heading"]
+                        assert heading and heading["text"] and not heading["closed"]
+                        assert not heading["suppressed"] and not heading["clipped"], heading
+                        assert heading["rect"]["top"] >= 0 and heading["rect"]["bottom"] <= height + 1, heading
+                        assert before["authored"], "No authored content inspected"
+                        assert all(not node["suppressed"] for node in before["authored"]), before["authored"]
+                    if area in {"requirements", "code"}:
+                        assert before["coverage"], "Coverage disclosure inventory is empty"
+                    # Measure intersecting native summaries, classify partial targets honestly.
+                    targets = before["tabs"] + [target for target in before["coverage"] if target["visibility"] != "outside"]
+                    assert targets
+                    for target in targets:
+                        assert not target["closed"] and not target["suppressed"], target
+                        assert target["rect"]["width"] >= 44 and target["rect"]["height"] >= 44, target
+                        if target["visibility"] == "complete":
+                            assert target["hit"], target
+                    active = next(target for target in before["tabs"] if target["text"] == TABS[area][lang == "ko"])
+                    assert active["visibility"] == "complete" and active["hit"], active
+                    # Screenshot capture must not change the measured initial state or layout.
+                    for key in ("viewport", "scroll", "overflow", "scrollbar", "host", "nav", "selected", "first", "heading", "tabs", "coverage", "authored"):
+                        assert before[key] == after[key], (key, before[key], after[key])
+                except AssertionError as error:
+                    failures.append(f"{stem}: {error}; evidence={receipt}")
+        assert _runs(directory) == 0
+    assert not failures, "\n".join(failures)

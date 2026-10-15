@@ -266,8 +266,17 @@ def set_storyboard_fields(source: str, storyboard_id: str, fields: dict[str, obj
             next_index = index
             break
     newline = _dominant_newline(source)
-    title = str(fields.get("title", current.title)).strip()
-    lines[heading_index] = re.sub(r"Storyboard:\s*.*?(?:\r?\n)?$", f"Storyboard: {title}{newline}", lines[heading_index])
+    title = fields.get("title", current.title)
+    if not isinstance(title, str):
+        raise PmError("invalid_request", "storyboard title must be text")
+    title = title.strip()
+    if not title or len(title.splitlines()) != 1:
+        raise PmError("invalid_request", "storyboard title must be non-empty single-line text")
+    lines[heading_index] = re.sub(
+        r"(Storyboard:\s*).*?(?:\r?\n)?$",
+        lambda match: f"{match.group(1)}{title}{newline}",
+        lines[heading_index], flags=re.I,
+    )
     key_names = {
         "screen_route": "Screen/route", "actor_goal": "Actor/goal",
         "initial_state": "Initial state", "ui": "UI", "user_action": "User action",

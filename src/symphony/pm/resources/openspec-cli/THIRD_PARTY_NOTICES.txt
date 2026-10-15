@@ -1,4 +1,4 @@
-@fission-ai/openspec 1.14.0 — MIT
+@fission-ai/openspec 1.14.2 — MIT
 
 LICENSE:
 MIT License

@@ -1,4 +1,4 @@
-"""Pinned, fail-closed OpenSpec 1.14.0 adapter."""
+"""Pinned, fail-closed OpenSpec 1.14.2 adapter."""
 
 from __future__ import annotations
 
@@ -25,7 +25,7 @@ from .models import (
     ValidationReport,
 )
 
-SUPPORTED_VERSION = "1.14.0"
+SUPPORTED_VERSION = "1.14.2"
 MAX_OUTPUT_BYTES = 2 * 1024 * 1024
 BUNDLE_ROOT = (Path(__file__).parent / "resources" / "openspec-cli").resolve()
 BUNDLE_CLI = BUNDLE_ROOT / "lib" / "openspec" / "cli" / "openspec.mjs"

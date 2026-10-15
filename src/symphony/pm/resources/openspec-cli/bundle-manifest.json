@@ -1,11 +1,11 @@
 {
-  "openspec": "1.14.0",
+  "openspec": "1.14.2",
   "esbuild": "0.25.10",
   "node_min": "20.19.0",
   "packages": [
     {
       "name": "@fission-ai/openspec",
-      "version": "1.14.0",
+      "version": "1.14.2",
       "license": "MIT"
     },
     {
@@ -128,22 +128,22 @@
     {
       "path": "THIRD_PARTY_NOTICES.txt",
       "bytes": 24845,
-      "sha256": "82586546b50a6613d87180dbe7727fea9eef8001113080b52f45e30c700ac64e"
+      "sha256": "ce1f028638308e8fdb58ec2d7b4d5e7b16c73b774abd8110e392a3ff89cac502"
     },
     {
       "path": "lib/openspec/cli/openspec.mjs",
-      "bytes": 880892,
-      "sha256": "5187d45f897bb0feaf678d16dccbdb9ea878441a6b8d7f497ae614fcea50a4ff"
+      "bytes": 884698,
+      "sha256": "4e3aa5efe1f6f60e47e79a162870a5aacb8a5e50cf1c7f3ed1f27bafe76f307b"
     },
     {
       "path": "package.json",
       "bytes": 100,
-      "sha256": "b34a11ccf2c6a8b708366dc5dacc8b857a19f8a4a924d5e941f706e12871e7ca"
+      "sha256": "f0d6017039964f58b25af88c030e6508535c1511038c8b6199ea620c085ae0ee"
     },
     {
       "path": "schemas/spec-driven/schema.yaml",
-      "bytes": 14444,
-      "sha256": "2d69b13d01739ae3e7dd75cc95df920dbae545e4b51ae3799c9a1785a4b98b86"
+      "bytes": 16167,
+      "sha256": "b6f28f305ab7f33b061949251bba82c79de66c82424cfed60582327db3f888f2"
     },
     {
       "path": "schemas/spec-driven/templates/design.md",
