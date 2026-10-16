@@ -101,9 +101,10 @@ def _bind_port(
             if workflow_path is not None
             else None
         )
+        owner_command = f"Get-NetTCPConnection -LocalPort {port}" if _IS_WIN32 else f"lsof -ti :{port}"
         suffix = hint or (
             "run `symphony service status <workflow>` or "
-            f"`lsof -ti :{port}` to identify the owner"
+            f"`{owner_command}` to identify the owner"
         )
         return CheckResult(
             name, "fail", f"cannot bind {host}:{port} — {exc}; {suffix}"

@@ -193,6 +193,7 @@ def cmd_init(args: argparse.Namespace) -> int:
         return 1
     print(f"initialized autonomous factory at {target}")
     print(f"Next step: {WAYFINDER_NEXT_STEP_PROMPT}")
+    print("For hand-written tickets, create the wayfinder/tickets/ directory first.")
     return 0
 
 
@@ -501,21 +502,26 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="symphony factory")
     sub = parser.add_subparsers(dest="cmd", required=True)
     init = sub.add_parser("init", help="copy the beginner factory bundle")
-    init.add_argument("target", nargs="?", default=".")
-    init.add_argument("--force", action="store_true")
+    init.add_argument("target", nargs="?", default=".", help="product directory (default: current directory)")
+    init.add_argument(
+        "--force", action="store_true",
+        help=("replace generated WORKFLOW.md, prompts, scripts, Wayfinder map and Supergoal skill; "
+              "their customizations are lost; unrelated product files and .gitignore rules are kept"),
+    )
     init.add_argument(
         "--agent", "--agent-kind", dest="agent_kind",
-        choices=sorted(SUPPORTED_AGENT_KINDS), default="opencode"
+        choices=sorted(SUPPORTED_AGENT_KINDS), default="opencode", metavar="BACKEND",
+        help="coding backend (default: opencode); choices: " + ", ".join(sorted(SUPPORTED_AGENT_KINDS)),
     )
     init.set_defaults(func=cmd_init)
     sync = sub.add_parser("sync", help="sync Wayfinder tickets to the file board")
-    sync.add_argument("target", nargs="?", default=".")
-    sync.add_argument("--wayfinder", default=None)
-    sync.add_argument("--prefix", default="TASK")
+    sync.add_argument("target", nargs="?", default=".", help="product or Wayfinder directory (default: current directory)")
+    sync.add_argument("--wayfinder", default=None, help="explicit Wayfinder directory; target then names the product")
+    sync.add_argument("--prefix", default="TASK", help="prefix for new board ticket IDs (default: TASK)")
     sync.add_argument(
         "--force",
         action="store_true",
-        help="replace generated skill copies from the pinned bundle before syncing",
+        help="replace required bundled/custom skill copies from their sources; project skill customizations are lost",
     )
     sync_scope = sync.add_mutually_exclusive_group()
     sync_scope.add_argument(
@@ -532,9 +538,9 @@ def build_parser() -> argparse.ArgumentParser:
     )
     sync.set_defaults(func=cmd_sync, all_tickets=True)
     start = sub.add_parser("start", help="sync, run Doctor, then start managed service")
-    start.add_argument("target", nargs="?", default=".")
-    start.add_argument("--wayfinder", default=None)
-    start.add_argument("--prefix", default="TASK")
+    start.add_argument("target", nargs="?", default=".", help="product or Wayfinder directory (default: current directory)")
+    start.add_argument("--wayfinder", default=None, help="explicit Wayfinder directory; target then names the product")
+    start.add_argument("--prefix", default="TASK", help="prefix for new board ticket IDs (default: TASK)")
     start_scope = start.add_mutually_exclusive_group()
     start_scope.add_argument(
         "--frontier-only",
@@ -548,12 +554,17 @@ def build_parser() -> argparse.ArgumentParser:
         dest="all_tickets",
         help=argparse.SUPPRESS,
     )
-    start.add_argument("--force", action="store_true")
+    start.add_argument(
+        "--force", action="store_true",
+        help=("replace required bundled/custom skill copies, losing project customizations; "
+              "also force init if WORKFLOW.md is missing"),
+    )
     start.add_argument(
         "--agent", "--agent-kind", dest="agent_kind",
-        choices=sorted(SUPPORTED_AGENT_KINDS), default="opencode"
+        choices=sorted(SUPPORTED_AGENT_KINDS), default="opencode", metavar="BACKEND",
+        help="backend for automatic init only (default: opencode); existing workflow is kept",
     )
-    start.add_argument("--port", type=int, default=None)
+    start.add_argument("--port", type=int, default=None, help="override the workflow's service port for this launch")
     start.set_defaults(func=cmd_start, all_tickets=True)
     return parser
 
