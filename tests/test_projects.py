@@ -40,7 +40,12 @@ def init_repo(path: Path) -> Path:
 
 def source_bundle(path: Path) -> Path:
     init_repo(path)
-    for name in ("tui-open.sh", "tui-open.bat", "AGENTS.md", "GEMINI.md"):
+    for name in (
+        "tui-open.sh",
+        "tui-open.bat",
+        "AGENTS.project.md",
+        "GEMINI.project.md",
+    ):
         (path / name).write_text(name + "\n", encoding="utf-8")
     (path / "WORKFLOW.file.example.md").write_text("workflow\n", encoding="utf-8")
     (path / "scripts").mkdir()
@@ -822,6 +827,9 @@ def test_create_excludes_tracker_lock_dir_locally(
     target = tmp_path / "locks-app"
     exclude = (target / ".git" / "info" / "exclude").read_text(encoding="utf-8")
     assert "/kanban/.locks/" in exclude.splitlines()
+    # Runtime state and the live progress mirror stay out of git status too.
+    assert "/.symphony/" in exclude.splitlines()
+    assert "/WORKFLOW-PROGRESS.md" in exclude.splitlines()
 
     # The rule actually silences the runtime directory.
     (target / "kanban" / ".locks").mkdir()

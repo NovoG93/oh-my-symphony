@@ -30,7 +30,12 @@ import uuid
 from collections import deque
 from typing import Any
 
-from .._shell import resolve_bash, safe_proc_wait, terminate_process_tree
+from .._shell import (
+    process_identity,
+    resolve_bash,
+    safe_proc_wait,
+    terminate_process_tree,
+)
 from ..errors import PortExit, ResponseError, TurnFailed, TurnTimeout
 from ..logging import get_logger
 from ..utils.git_sandbox import git_roots_env
@@ -83,11 +88,10 @@ def _stderr_tail_blob(tail: "deque[str]") -> str:
 async def _reap_process(proc: asyncio.subprocess.Process) -> int | None:
     """Tear down a process group or surface ambiguous cleanup.
 
-    Returns the exit status ``terminate_process_tree`` observed (``None``
-    when the transport already recorded it on ``proc.returncode``).
+    Returns the confirmed exit status observed by ``terminate_process_tree``.
     """
     result = await terminate_process_tree(proc)
-    if result is None and proc.returncode is None:
+    if result is None:
         raise RuntimeError("backend process cleanup could not be confirmed")
     return result
 
@@ -170,9 +174,13 @@ class PerTurnCliBackend(BaseAgentBackend):
         self._extra_env = dict(init.env)
         self._on_event = init.on_event
         self._on_process_started = init.on_process_started
+        self._on_process_identified = init.on_process_identified
+        self._process_launch_guard = init.process_launch_guard
         self._session_id: str | None = None
         self._closed = False
         self._active_proc: asyncio.subprocess.Process | None = None
+        self._active_process_identity: str | None = None
+        self._cleanup_unconfirmed = False
         self._latest_usage: dict[str, int] = {
             "input_tokens": 0,
             "output_tokens": 0,
@@ -218,14 +226,20 @@ class PerTurnCliBackend(BaseAgentBackend):
         return None
 
     async def stop(self) -> None:
-        if self._closed:
+        if self._closed and self._active_proc is None:
             return
         self._closed = True
         proc = self._active_proc
-        if proc is not None and proc.returncode is None:
-            result = await terminate_process_tree(proc)
-            if result is None and proc.returncode is None:
+        if proc is not None:
+            result = await terminate_process_tree(
+                proc, identity=self._active_process_identity
+            )
+            if result is None:
+                self._cleanup_unconfirmed = True
                 raise RuntimeError("backend process cleanup could not be confirmed")
+            self._active_proc = None
+            self._active_process_identity = None
+            self._cleanup_unconfirmed = False
 
     @property
     def session_id(self) -> str | None:
@@ -260,20 +274,21 @@ class PerTurnCliBackend(BaseAgentBackend):
     async def run_turn(self, *, prompt: str, is_continuation: bool) -> TurnResult:
         if self._closed:
             raise ResponseError("backend is closed")
+        if self._active_proc is not None:
+            raise ResponseError(
+                "prior backend process cleanup is not confirmed"
+            )
         command = self._command_for_turn(
             prompt=prompt, is_continuation=is_continuation
         )
         stdin_payload = self._stdin_payload(prompt)
         proc = await self._spawn(command, pipe_stdin=stdin_payload is not None)
-        if self._on_process_started is not None:
-            self._on_process_started(proc.pid)
-        self._active_proc = proc
-        # `stop()` may have flipped `_closed` while we awaited spawn — the
-        # process is orphaned because `stop()` only inspects `_active_proc`
-        # and we hadn't published yet. Reap and bail.
+        # `stop()` may have flipped `_closed` while launch publication was
+        # in flight. Ownership was retained before that await; reap and bail.
         if self._closed:
             await self._reap(proc)
             self._active_proc = None
+            self._active_process_identity = None
             raise ResponseError("backend closed during spawn")
         watchers = self._start_watchers(proc)
         try:
@@ -281,17 +296,18 @@ class PerTurnCliBackend(BaseAgentBackend):
             if stdin_payload is not None:
                 await self._write_prompt(proc, stdin_payload)
             return await self._drive_turn(proc)
-        except BaseException:
-            # Prompt writes and stream adapters can fail before the normal
-            # reap. Release the owned process before another turn replaces it.
-            if proc.returncode is None:
-                await self._reap(proc)
-            raise
         finally:
             for watcher in watchers:
                 watcher.cancel()
-            if proc.returncode is not None:
+            try:
+                await self._reap(proc)
+            except BaseException:
+                self._cleanup_unconfirmed = True
+                raise
+            else:
                 self._active_proc = None
+                self._active_process_identity = None
+                self._cleanup_unconfirmed = False
 
     async def _drive_turn(self, proc: asyncio.subprocess.Process) -> TurnResult:
         """Collect the child's output and turn it into a ``TurnResult``.
@@ -330,25 +346,55 @@ class PerTurnCliBackend(BaseAgentBackend):
     async def _spawn(
         self, command: str, *, pipe_stdin: bool
     ) -> asyncio.subprocess.Process:
+        proc: asyncio.subprocess.Process | None = None
         try:
-            return await asyncio.create_subprocess_exec(
-                resolve_bash(),
-                "-lc",
-                command,
-                cwd=str(self._cwd),
-                stdin=asyncio.subprocess.PIPE
-                if pipe_stdin
-                else asyncio.subprocess.DEVNULL,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-                env={**os.environ, **self._git_roots_env(), **self._extra_env},
-                limit=MAX_LINE_BYTES,
-                # Own process group so terminate/kill reaches the agent CLI
-                # behind the bash wrapper (POSIX only).
-                start_new_session=os.name == "posix",
-            )
+            async with self._process_launch_guard() as publish_started:
+                proc = await asyncio.create_subprocess_exec(
+                    resolve_bash(),
+                    "-lc",
+                    command,
+                    cwd=str(self._cwd),
+                    stdin=asyncio.subprocess.PIPE
+                    if pipe_stdin
+                    else asyncio.subprocess.DEVNULL,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
+                    env={**os.environ, **self._git_roots_env(), **self._extra_env},
+                    limit=MAX_LINE_BYTES,
+                    # Own process group so terminate/kill reaches the agent CLI
+                    # behind the bash wrapper (POSIX only).
+                    start_new_session=os.name == "posix",
+                )
+                spawned_identity = process_identity(proc.pid)
+                self._active_proc = proc
+                self._active_process_identity = spawned_identity
+                if self._on_process_identified is not None:
+                    self._on_process_identified(proc.pid, spawned_identity)
+                elif self._on_process_started is not None:
+                    self._on_process_started(proc.pid)
+                await publish_started(proc.pid)
+                return proc
         except FileNotFoundError as exc:
             raise PortExit("bash not available", error=str(exc)) from exc
+        except BaseException as launch_exc:
+            if proc is not None:
+                try:
+                    cleanup = await terminate_process_tree(
+                        proc, identity=self._active_process_identity
+                    )
+                except BaseException:
+                    self._cleanup_unconfirmed = True
+                    raise
+                if cleanup is None:
+                    self._cleanup_unconfirmed = True
+                    if isinstance(launch_exc, asyncio.CancelledError):
+                        raise launch_exc
+                    raise RuntimeError(
+                        "backend process cleanup could not be confirmed"
+                    ) from launch_exc
+                self._active_proc = None
+                self._active_process_identity = None
+            raise
 
     async def _write_prompt(
         self, proc: asyncio.subprocess.Process, prompt: str
@@ -407,7 +453,16 @@ class PerTurnCliBackend(BaseAgentBackend):
 
     async def _reap(self, proc: asyncio.subprocess.Process) -> None:
         """Tear down a process group or surface ambiguous cleanup."""
-        await _reap_process(proc)
+        result = await terminate_process_tree(
+            proc,
+            identity=(
+                self._active_process_identity
+                if proc is self._active_proc
+                else None
+            ),
+        )
+        if result is None:
+            raise RuntimeError("backend process cleanup could not be confirmed")
 
     async def _emit(self, event: str, payload: dict[str, Any]) -> None:
         await _emit_event(

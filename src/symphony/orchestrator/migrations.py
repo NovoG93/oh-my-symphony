@@ -40,6 +40,7 @@ RELEASE_PROVENANCE_VERSION = 5
 RELEASE_CYCLE_AUTHORITY_VERSION = 6
 RUN_EXPLORER_VERSION = 7
 DURABLE_CONTINUATION_VERSION = 8
+PM_WORKSPACE_VERSION = 9
 
 
 @dataclass(frozen=True)
@@ -578,6 +579,279 @@ def _migrate_008_durable_continuation(conn: sqlite3.Connection) -> None:
     )
 
 
+def _migrate_009_pm_workspace(conn: sqlite3.Connection) -> None:
+    """Additive PM workspace coordination and dispatch authority."""
+
+    script = """
+        CREATE TABLE IF NOT EXISTS pm_workspaces (
+            project_id TEXT NOT NULL,
+            change_id TEXT NOT NULL,
+            workspace_path TEXT NOT NULL,
+            base_git_sha TEXT NOT NULL,
+            owner TEXT NOT NULL,
+            fence INTEGER NOT NULL,
+            state TEXT NOT NULL CHECK(
+                state IN ('CLAIMED','ACTIVE','EXTERNAL_EDIT','REPAIR_REQUIRED','RELEASED')
+            ),
+            observed_hashes_json TEXT NOT NULL DEFAULT '{}',
+            updated_at TEXT NOT NULL,
+            PRIMARY KEY(project_id, change_id)
+        );
+
+        CREATE TABLE IF NOT EXISTS pm_operations (
+            operation_id TEXT PRIMARY KEY,
+            project_id TEXT NOT NULL,
+            change_id TEXT NOT NULL,
+            kind TEXT NOT NULL,
+            expected_revision TEXT,
+            input_hash TEXT NOT NULL DEFAULT '',
+            state TEXT NOT NULL,
+            owner_token TEXT NOT NULL DEFAULT '',
+            fence INTEGER NOT NULL DEFAULT 0,
+            result_json TEXT,
+            error_code TEXT,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_pm_operations_change_state
+            ON pm_operations(project_id, change_id, state);
+
+        CREATE TABLE IF NOT EXISTS pm_approvals (
+            approval_id TEXT PRIMARY KEY,
+            project_id TEXT NOT NULL,
+            change_id TEXT NOT NULL,
+            scope_hash TEXT NOT NULL,
+            revision_hash TEXT NOT NULL,
+            manifest_ref TEXT NOT NULL,
+            manifest_hash TEXT NOT NULL,
+            snapshot_commit TEXT NOT NULL,
+            reviewer_label TEXT NOT NULL,
+            approved_at TEXT NOT NULL,
+            superseded_by TEXT
+        );
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_pm_active_approval
+            ON pm_approvals(project_id, change_id, scope_hash)
+            WHERE superseded_by IS NULL;
+
+        CREATE TABLE IF NOT EXISTS pm_handoff_batches (
+            handoff_id TEXT PRIMARY KEY,
+            operation_id TEXT NOT NULL UNIQUE,
+            project_id TEXT NOT NULL,
+            change_id TEXT NOT NULL,
+            scope_hash TEXT NOT NULL,
+            approval_id TEXT NOT NULL,
+            snapshot_id TEXT NOT NULL,
+            state TEXT NOT NULL CHECK(
+                state IN ('PREPARING','STAGING','PUBLISHED','FAILED','RECONCILE')
+            ),
+            created_at TEXT NOT NULL,
+            published_at TEXT,
+            UNIQUE(handoff_id, project_id, change_id)
+        );
+
+        CREATE TABLE IF NOT EXISTS pm_handoff_items (
+            handoff_id TEXT NOT NULL,
+            project_id TEXT NOT NULL,
+            change_id TEXT NOT NULL,
+            task_id TEXT NOT NULL,
+            task_revision TEXT NOT NULL,
+            deterministic_ticket_id TEXT NOT NULL,
+            ticket_identifier TEXT,
+            state TEXT NOT NULL,
+            content_hash TEXT NOT NULL,
+            input_hash TEXT NOT NULL DEFAULT '',
+            input_json TEXT NOT NULL DEFAULT '{}',
+            required_procedures_json TEXT NOT NULL DEFAULT '{}',
+            PRIMARY KEY(handoff_id, task_id, task_revision),
+            UNIQUE(project_id, change_id, task_id, task_revision),
+            UNIQUE(project_id, deterministic_ticket_id),
+            FOREIGN KEY(handoff_id, project_id, change_id)
+                REFERENCES pm_handoff_batches(handoff_id, project_id, change_id)
+        );
+
+        CREATE TABLE IF NOT EXISTS pm_managed_tickets (
+            project_id TEXT NOT NULL,
+            ticket_identifier TEXT NOT NULL,
+            change_id TEXT NOT NULL,
+            task_id TEXT NOT NULL,
+            task_revision TEXT NOT NULL,
+            handoff_id TEXT NOT NULL,
+            state TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            PRIMARY KEY(project_id, ticket_identifier)
+        );
+
+        CREATE TABLE IF NOT EXISTS pm_exchange_records (
+            exchange_id TEXT PRIMARY KEY,
+            kind TEXT NOT NULL CHECK(kind IN ('export','import')),
+            project_id TEXT NOT NULL,
+            change_id TEXT NOT NULL,
+            base_revision TEXT NOT NULL,
+            file_hash TEXT NOT NULL,
+            snapshot_ref TEXT NOT NULL,
+            preview_revision TEXT,
+            state TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            applied_at TEXT
+        );
+
+        CREATE TABLE IF NOT EXISTS pm_journals (
+            journal_id TEXT PRIMARY KEY,
+            operation_id TEXT NOT NULL UNIQUE,
+            kind TEXT NOT NULL,
+            old_revision TEXT NOT NULL,
+            target_revision TEXT NOT NULL,
+            manifest_ref TEXT NOT NULL,
+            phase TEXT NOT NULL,
+            recovery_state TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        );
+
+        CREATE TABLE IF NOT EXISTS pm_dispatch_permits (
+            permit_id TEXT PRIMARY KEY,
+            project_id TEXT NOT NULL,
+            ticket_identifier TEXT NOT NULL,
+            handoff_id TEXT NOT NULL,
+            task_revision TEXT NOT NULL,
+            issue_hash TEXT NOT NULL,
+            scope_hash TEXT NOT NULL,
+            fence INTEGER NOT NULL,
+            state TEXT NOT NULL CHECK(
+                state IN ('RESERVED','STARTING','RUNNING','REVOKED','CONSUMED')
+            ),
+            process_pid INTEGER,
+            run_id TEXT,
+            lease_expires_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        );
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_pm_active_dispatch_permit
+            ON pm_dispatch_permits(project_id, ticket_identifier)
+            WHERE state IN ('RESERVED','STARTING','RUNNING');
+
+        CREATE TABLE IF NOT EXISTS pm_authority_revocations (
+            project_id TEXT NOT NULL,
+            change_id TEXT NOT NULL,
+            handoff_id TEXT NOT NULL,
+            task_revision TEXT NOT NULL,
+            reason TEXT NOT NULL,
+            revoked_at TEXT NOT NULL,
+            PRIMARY KEY(project_id, change_id, handoff_id, task_revision)
+        );
+
+        CREATE TABLE IF NOT EXISTS pm_legacy_conversions (
+            project_id TEXT NOT NULL,
+            change_id TEXT NOT NULL,
+            source_ticket_identifier TEXT NOT NULL,
+            workspace_path TEXT NOT NULL,
+            locator TEXT NOT NULL,
+            state TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            PRIMARY KEY(project_id, change_id),
+            UNIQUE(project_id, source_ticket_identifier)
+        );
+
+        CREATE TABLE IF NOT EXISTS pm_verification_records (
+            receipt_id TEXT PRIMARY KEY,
+            project_id TEXT NOT NULL,
+            ticket_identifier TEXT NOT NULL,
+            task_revision TEXT NOT NULL,
+            operation_id TEXT NOT NULL,
+            run_id TEXT NOT NULL,
+            procedure_id TEXT NOT NULL,
+            command_digest TEXT NOT NULL,
+            tested_commit TEXT NOT NULL,
+            return_code INTEGER,
+            timed_out INTEGER NOT NULL,
+            cancelled INTEGER NOT NULL,
+            stdout_hash TEXT NOT NULL,
+            stderr_hash TEXT NOT NULL,
+            started_at TEXT NOT NULL,
+            completed_at TEXT NOT NULL,
+            artifact_refs_json TEXT NOT NULL,
+            result TEXT NOT NULL
+        );
+
+        CREATE TABLE IF NOT EXISTS pm_acceptances (
+            acceptance_id TEXT PRIMARY KEY,
+            project_id TEXT NOT NULL,
+            ticket_identifier TEXT NOT NULL,
+            task_revision TEXT NOT NULL,
+            tested_commit TEXT NOT NULL,
+            receipt_ids_json TEXT NOT NULL,
+            receipt_set_hash TEXT NOT NULL,
+            accepted_by TEXT NOT NULL,
+            accepted_at TEXT NOT NULL,
+            state TEXT NOT NULL CHECK(state IN ('ACCEPTED','SUPERSEDED'))
+        );
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_pm_active_acceptance
+            ON pm_acceptances(project_id, ticket_identifier, task_revision)
+            WHERE state = 'ACCEPTED';
+
+        CREATE TABLE IF NOT EXISTS pm_manual_verification_records (
+            receipt_id TEXT PRIMARY KEY,
+            operation_id TEXT NOT NULL UNIQUE,
+            project_id TEXT NOT NULL,
+            change_id TEXT NOT NULL,
+            ticket_identifier TEXT NOT NULL,
+            task_id TEXT NOT NULL,
+            task_revision TEXT NOT NULL,
+            procedure_id TEXT NOT NULL,
+            procedure_kind TEXT NOT NULL CHECK(procedure_kind IN ('native','manual')),
+            definition_digest TEXT NOT NULL,
+            tested_commit TEXT NOT NULL,
+            environment_summary TEXT NOT NULL,
+            return_code INTEGER,
+            timed_out INTEGER NOT NULL,
+            cancelled INTEGER NOT NULL,
+            stdout_hash TEXT NOT NULL,
+            stderr_hash TEXT NOT NULL,
+            started_at TEXT NOT NULL,
+            completed_at TEXT NOT NULL,
+            submitted_at TEXT NOT NULL,
+            submitted_by TEXT NOT NULL,
+            report_ref_json TEXT,
+            artifact_refs_json TEXT NOT NULL,
+            result TEXT NOT NULL CHECK(result IN ('passed','failed')),
+            input_hash TEXT NOT NULL
+        );
+
+        CREATE TABLE IF NOT EXISTS pm_coverage_waivers (
+            waiver_id TEXT PRIMARY KEY,
+            operation_id TEXT NOT NULL UNIQUE,
+            project_id TEXT NOT NULL,
+            change_id TEXT NOT NULL,
+            semantic_id TEXT NOT NULL,
+            reason TEXT NOT NULL,
+            reviewer TEXT NOT NULL,
+            revision TEXT NOT NULL,
+            scope_hash TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            state TEXT NOT NULL CHECK(state IN ('ACTIVE','REVOKED')),
+            revoked_at TEXT,
+            revoked_by TEXT,
+            revoke_reason TEXT,
+            revoke_operation_id TEXT UNIQUE
+        );
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_pm_active_coverage_waiver
+            ON pm_coverage_waivers(project_id, change_id, semantic_id)
+            WHERE state = 'ACTIVE';
+
+        CREATE TABLE IF NOT EXISTS pm_planning_reserved_ids (
+            operation_id TEXT NOT NULL,
+            placeholder TEXT NOT NULL,
+            kind TEXT NOT NULL,
+            permanent_id TEXT NOT NULL UNIQUE,
+            state TEXT NOT NULL CHECK(state IN ('RESERVED','ACTIVE','RETIRED')),
+            PRIMARY KEY(operation_id, placeholder)
+        );
+        """
+    # executescript commits implicitly and would break apply_migrations'
+    # BEGIN IMMEDIATE atomicity. PM DDL contains no embedded semicolons.
+    for statement in script.split(";"):
+        if statement.strip():
+            conn.execute(statement)
+
+
 MIGRATIONS: tuple[Migration, ...] = (
     Migration(1, "baseline_runs_and_issue_flags", _migrate_001_baseline),
     # The recorded name stays "governed_workflow_ledger" so existing
@@ -608,6 +882,11 @@ MIGRATIONS: tuple[Migration, ...] = (
         DURABLE_CONTINUATION_VERSION,
         "durable_crash_continuation",
         _migrate_008_durable_continuation,
+    ),
+    Migration(
+        PM_WORKSPACE_VERSION,
+        "human_readable_pm_workspace",
+        _migrate_009_pm_workspace,
     ),
 )
 
