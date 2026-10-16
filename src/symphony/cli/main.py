@@ -250,6 +250,8 @@ async def _run(args: argparse.Namespace) -> int:
     if keep_awake is not None:
         keep_awake.start()
 
+    server_port = args.port if args.port is not None else cfg.server.port
+    progress_writer: ProgressFileWriter | None = None
     # Register the progress writer BEFORE any subsequent `await` so the
     # first tick's `_notify_observers` sees it. CLI flag > WORKFLOW.md
     # `progress.enabled` > default True.
@@ -270,10 +272,11 @@ async def _run(args: argparse.Namespace) -> int:
             progress_path,
             max_transitions=cfg.progress.max_transitions,
         )
+        if server_port is not None:
+            progress_writer.set_server_port(server_port)
         progress_writer.register()
         log.info("progress_md_active", path=str(progress_path))
 
-    server_port = args.port if args.port is not None else cfg.server.port
     runner = None
     if server_port is not None:
         app = build_app(orchestrator)
@@ -302,6 +305,9 @@ async def _run(args: argparse.Namespace) -> int:
                 port=server_port,
                 error=str(exc),
             )
+        if progress_writer is not None:
+            progress_writer.set_server_port(bound)
+            await progress_writer.on_change()
         log.info("http_extension_active", host=args.host, port=bound)
         print(
             f"symphony: board ready at http://{args.host}:{bound}",

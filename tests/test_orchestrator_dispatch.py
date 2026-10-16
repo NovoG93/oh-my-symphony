@@ -5943,6 +5943,22 @@ def test_snapshot_includes_branch_policy_for_admin_ui():
     }
 
 
+@pytest.mark.parametrize("profile", ["factory", "advanced", "deep"])
+def test_branch_policy_merge_timing_matches_factory_verify_boundary(profile):
+    orch = _orch()
+    cfg = replace(_make_config(), raw={"contract_profile": profile})
+    if profile == "factory":
+        cfg = replace(cfg, tracker=replace(cfg.tracker, active_states=("Ready", "Build", "Verify")))
+    orch._workflow_state._config = cfg
+
+    policy = orch.snapshot()["workflow"]["branch_policy"]
+
+    assert policy["merge_timing"] == (
+        "after Verify" if profile == "factory" else "after Document, before Done"
+    )
+    assert policy["auto_merge_enabled"] == cfg.agent.auto_merge_on_done
+
+
 def test_normal_exit_does_not_continue_after_total_turn_budget():
     orch = _orch()
     issue = _issue("MT-1", state="Todo")

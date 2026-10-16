@@ -3437,7 +3437,11 @@ class Orchestrator:
             "feature_branch_pattern": "symphony/<ID>",
             "base_branch": base,
             "merge_target_branch": target,
-            "merge_timing": "after Document, before Done",
+            "merge_timing": (
+                "after Verify"
+                if self._is_factory_profile(cfg)
+                else "after Document, before Done"
+            ),
             "auto_merge_enabled": bool(cfg.agent.auto_merge_on_done),
             "merge_delivery": (
                 "upstream-publishing"
