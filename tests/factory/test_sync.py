@@ -1,4 +1,6 @@
 from pathlib import Path
+from concurrent.futures import ThreadPoolExecutor
+import threading
 
 import pytest
 
@@ -295,3 +297,163 @@ def test_sync_imports_complete_diamond_graph_and_preserves_rerun_bytes(tmp_path:
     assert len(results) == len(rerun) == 4
     assert all(not item.created for item in rerun)
     assert before == {path: path.read_bytes() for path in tracker.board_root.glob("*.md")}
+
+
+def test_concurrent_syncs_share_one_provenance_allocation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import importlib
+
+    sync_module = importlib.import_module("symphony.factory.sync")
+    tickets = tmp_path / "wayfinder/tickets"
+    tickets.mkdir(parents=True)
+    _ticket(tickets / "one.md", "one", "One")
+    board = tmp_path / "kanban"
+    scan_barrier = threading.Barrier(2)
+    scan = sync_module._existing_sources
+
+    def concurrent_scan(tracker):
+        snapshot = scan(tracker)
+        try:
+            # Without the sync lock, both calls return the same empty snapshot.
+            scan_barrier.wait(timeout=2)
+        except threading.BrokenBarrierError:
+            pass
+        return snapshot
+
+    monkeypatch.setattr(sync_module, "_existing_sources", concurrent_scan)
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        runs = [pool.submit(sync_wayfinder, tickets.parent, _tracker(board)) for _ in range(2)]
+        results = [run.result(timeout=10) for run in runs]
+
+    assert [result[0].identifier for result in results] == ["TASK-1", "TASK-1"]
+    assert sum(result[0].created for result in results) == 1
+    assert len(list(board.glob("TASK-*.md"))) == 1
+
+
+def test_sync_rollback_preserves_external_build_transition_after_refresh(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    tickets = tmp_path / "wayfinder/tickets"
+    tickets.mkdir(parents=True)
+    source = tickets / "001-existing.md"
+    _ticket(source, "existing", "Existing")
+    tracker = _tracker(tmp_path / "kanban")
+    sync_wayfinder(tickets.parent, tracker)
+    _ticket(source, "existing", "Refreshed")
+    _ticket(tickets / "002-new.md", "new", "New")
+
+    def fail_after_transition(*_args, **_kwargs):
+        tracker.transition("TASK-1", "Build")
+        raise OSError("disk full")
+
+    monkeypatch.setattr(tracker, "create_with_next_identifier", fail_after_transition)
+    with pytest.raises(OSError, match="disk full"):
+        sync_wayfinder(tickets.parent, tracker)
+
+    front, _ = parse_ticket_file(tracker.board_root / "TASK-1.md")
+    assert front["state"] == "Build"
+    assert front["title"] == "Refreshed"
+
+
+@pytest.mark.parametrize("external_transition", [False, True])
+def test_sync_rollback_removes_only_unchanged_new_cards(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, external_transition: bool
+) -> None:
+    tickets = tmp_path / "wayfinder/tickets"
+    tickets.mkdir(parents=True)
+    for key in ("one", "two", "three"):
+        _ticket(tickets / f"{key}.md", key, key)
+    tracker = _tracker(tmp_path / "kanban")
+    create = tracker.create_with_next_identifier
+    calls = 0
+
+    def fail_on_third(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        if calls == 3:
+            if external_transition:
+                tracker.transition("TASK-1", "Build")
+            raise OSError("disk full")
+        return create(*args, **kwargs)
+
+    monkeypatch.setattr(tracker, "create_with_next_identifier", fail_on_third)
+    with pytest.raises(OSError, match="disk full"):
+        sync_wayfinder(tickets.parent, tracker)
+
+    remaining = list(tracker.board_root.glob("TASK-*.md"))
+    assert len(remaining) == int(external_transition)
+    if external_transition:
+        assert parse_ticket_file(remaining[0])[0]["state"] == "Build"
+
+
+@pytest.mark.parametrize("depth", [2, 3])
+def test_sync_rollback_preserves_transitive_dependencies_of_edited_new_card(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, depth: int,
+) -> None:
+    tickets = tmp_path / "wayfinder/tickets"
+    tickets.mkdir(parents=True)
+    keys = ["a", "b", "c"][:depth]
+    for index, key in enumerate(keys):
+        _ticket(tickets / f"{key}.md", key, key, tuple(keys[index - 1:index]) if index else ())
+    _ticket(tickets / "z.md", "z", "z", (keys[-1],))
+    _ticket(tickets / "unrelated.md", "unrelated", "unrelated")
+    tracker = _tracker(tmp_path / "kanban")
+    create = tracker.create_with_next_identifier
+    created: dict[str, str] = {}
+
+    def fail_after_operator_note(*args, **kwargs):
+        if kwargs["title"] == "z":
+            issue = tracker.fetch_issue_full_by_id(created[keys[-1]])
+            assert issue is not None
+            tracker.append_note(issue, "Operator Note", "Retain this legitimate note.")
+            raise OSError("disk full")
+        result = create(*args, **kwargs)
+        created[kwargs["title"]] = result[0]
+        return result
+
+    monkeypatch.setattr(tracker, "create_with_next_identifier", fail_after_operator_note)
+    with pytest.raises(OSError, match="disk full"):
+        sync_wayfinder(tickets.parent, tracker)
+
+    remaining = {issue.title: issue for issue in tracker.scan_all()}
+    assert set(remaining) == set(keys)
+    assert "Retain this legitimate note." in (remaining[keys[-1]].description or "")
+    assert all(blocker.identifier in {issue.identifier for issue in remaining.values()}
+               for issue in remaining.values() for blocker in issue.blocked_by)
+
+
+def test_sync_rollback_preserves_refreshed_dependency_of_edited_retained_card(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    tickets = tmp_path / "wayfinder/tickets"
+    tickets.mkdir(parents=True)
+    source = tickets / "a.md"
+    _ticket(source, "a", "Original A")
+    tracker = _tracker(tmp_path / "kanban")
+    sync_wayfinder(tickets.parent, tracker)
+    _ticket(tickets / "base.md", "base", "New Base")
+    _ticket(source, "a", "Refreshed A", ("base",))
+    _ticket(tickets / "b.md", "b", "B", ("a",))
+    _ticket(tickets / "z.md", "z", "Z", ("b",))
+    create = tracker.create_with_next_identifier
+
+    def fail_after_note(*args, **kwargs):
+        if kwargs["title"] == "Z":
+            issue = tracker.fetch_issue_full_by_id("TASK-3")
+            assert issue is not None
+            tracker.append_note(issue, "Operator Note", "B must retain its approved prerequisites.")
+            raise OSError("disk full")
+        return create(*args, **kwargs)
+
+    monkeypatch.setattr(tracker, "create_with_next_identifier", fail_after_note)
+    with pytest.raises(OSError, match="disk full"):
+        sync_wayfinder(tickets.parent, tracker)
+
+    first, _ = parse_ticket_file(tracker.board_root / "TASK-1.md")
+    second, body = parse_ticket_file(tracker.board_root / "TASK-3.md")
+    assert first["title"] == "Refreshed A"
+    assert first["blocked_by"] == ["TASK-2"]
+    assert (tracker.board_root / "TASK-2.md").is_file()
+    assert second["blocked_by"] == ["TASK-1"]
+    assert "B must retain its approved prerequisites." in body

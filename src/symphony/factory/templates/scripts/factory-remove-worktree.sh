@@ -23,7 +23,7 @@ if workspace in {host, root} or workspace.parent != root:
 def common_dir(path):
     result = subprocess.run(
         ["git", "-C", str(path), "rev-parse", "--git-common-dir"],
-        check=True, capture_output=True, text=True,
+        check=True, stdout=subprocess.PIPE, text=True,
     )
     return (path / result.stdout.strip()).resolve()
 
@@ -55,7 +55,7 @@ result = subprocess.run(
 if result.returncode:
     listing = subprocess.run(
         ["git", "-C", str(host), "worktree", "list", "--porcelain", "-z"],
-        check=True, capture_output=True, text=True,
+        check=True, stdout=subprocess.PIPE, text=True,
     ).stdout
     registered = any(
         Path(field[len("worktree "):]).resolve() == workspace

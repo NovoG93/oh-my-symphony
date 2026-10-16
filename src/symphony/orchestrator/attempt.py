@@ -291,6 +291,53 @@ async def _start_attempt(
     running = orch._running.get(running_issue_id)
     if running is not None:
         running.agent_kind = cfg.agent.kind
+    if running is not None and orch._run_registry is None and issue.planning_ref is not None:
+        return _AttemptExit(
+            "pm_dispatch_denied",
+            "PM registry authority is unavailable",
+        )
+    if running is not None and orch._run_registry is not None:
+        from ..pm.authority import PmAuthority
+        from ..pm.identity import host_project_identity
+
+        authority = PmAuthority(
+            orch._run_registry, cfg.workflow_path.parent / ".symphony" / "pm-locks",
+            successful_states={
+                state for state in cfg.tracker.terminal_states
+                if state.casefold() not in {"cancelled", "blocked", cfg.tracker.archive_state.casefold()}
+            },
+        )
+        from ..pm.models import PmError
+
+        try:
+            try:
+                pm_project_id = host_project_identity(
+                    cfg.workflow_path, standalone_id=cfg.tracker.project_slug
+                )
+            except PmError as exc:
+                # Without the host identity, PM authority would be looked up under
+                # the wrong key. Refuse anything that may be PM-managed; work with
+                # no PM trace and no PM handoff configured keeps running.
+                if (
+                    issue.planning_ref is not None
+                    or cfg.pm.handoff
+                    or orch._run_registry.pm_ticket_identifier_known(issue.identifier)
+                ):
+                    return _AttemptExit("pm_dispatch_denied", exc.message)
+                pm_project_id = cfg.tracker.project_slug
+            membership = authority.recognize(issue, pm_project_id)
+            if membership.managed and (
+                cfg.agent.auto_merge_on_done or cfg.agent.auto_merge_push_target
+            ):
+                return _AttemptExit(
+                    "pm_delivery_policy_conflict",
+                    "PM handoff refuses automatic merge or push delivery policy",
+                )
+            running.pm_dispatch_permit = authority.reserve_dispatch(
+                issue, pm_project_id
+            )
+        except Exception as exc:
+            return _AttemptExit("pm_dispatch_denied", str(exc))
     assert orch._workspace_manager is not None
     workspace = await orch._workspace_manager.create_or_reuse(issue.identifier)
     running = orch._running.get(running_issue_id)
@@ -409,8 +456,19 @@ def _build_attempt_backend(
             on_process_started=lambda pid, issue_id=running_issue_id: (
                 orch._sync_backend_agent_pid(issue_id, pid)
             ),
+            on_process_identified=lambda pid, identity, issue_id=running_issue_id: (
+                orch._sync_backend_agent_pid(
+                    issue_id,
+                    pid,
+                    backend_process_identity=identity,
+                    identity_captured=True,
+                )
+            ),
             client_tools=tools,
             env=orch._dispatch_env_for(issue=issue, cfg=cfg, is_rewind=False),
+            process_launch_guard=orch._pm_process_launch_guard(
+                running_issue_id, issue, cfg, workspace.path
+            ),
         )
     )
 
@@ -1116,6 +1174,16 @@ async def _cleanup_backend(orch: Orchestrator, st: _AttemptState) -> None:
     # state, so swallow stop() errors here too.
     try:
         await st.client.stop()
+    except asyncio.CancelledError:
+        running = orch._running.get(st.running_issue_id)
+        if running is not None:
+            running.backend_cleanup_unconfirmed = True
+        log.warning(
+            "worker_final_stop_cancelled",
+            issue_id=st.issue.id,
+            identifier=st.issue.identifier,
+        )
+        raise
     except Exception as stop_exc:
         running = orch._running.get(st.running_issue_id)
         if running is not None:

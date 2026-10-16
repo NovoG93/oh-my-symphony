@@ -62,6 +62,7 @@ SUBCOMMAND_KO = {
     "board": "파일 칸반 보드 관리 (init/ls/new/mv/update/show/graph)",
     "service": "오케스트레이터를 백그라운드 서비스로 실행",
     "project": "독립 프로젝트 서비스 등록·실행",
+    "pm": "일회용 PM Workspace 데모 생성·실행",
     "hub": "여러 프로젝트를 모아 보는 허브 서버",
     "runs": "최근 실행 기록 출력",
     "release": "애플리케이션 릴리스 증빙 검증",

@@ -97,6 +97,8 @@
     'nav.chat': 'Chat',
     'nav.preview': 'Preview',
     'nav.settings': 'Settings',
+    'nav.artifacts': 'Artifacts',
+    'pm.discardRoute': 'Discard unsaved PM Workspace edits and leave?',
     'conn.connecting': 'Connecting…',
     'conn.unreachable': 'Orchestrator unreachable',
     'conn.summary': '{running} running · {retrying} retrying',
@@ -720,6 +722,8 @@
     'nav.chat': '채팅',
     'nav.preview': '프리뷰',
     'nav.settings': '설정',
+    'nav.artifacts': '기획 산출물',
+    'pm.discardRoute': '저장하지 않은 기획 변경사항을 버리고 나가시겠습니까?',
     'conn.connecting': '연결 중…',
     'conn.unreachable': '오케스트레이터에 연결할 수 없음',
     'conn.summary': '{running}개 실행 중 · {retrying}개 재시도 중',
@@ -1280,7 +1284,24 @@
     return normalize(stored) || DEFAULT_LANG;
   }
 
-  let current = detectInitialLang();
+  // A link may carry `?lang=en|ko` (exact values only). It is stored like a
+  // switch choice and then removed from the address, so a later manual switch
+  // still wins on reload. Any other value is ignored.
+  function consumeUrlLang() {
+    const url = new URL(window.location.href);
+    const code = url.searchParams.get('lang');
+    if (!LANGUAGES.some((item) => item.code === code)) return null;
+    try {
+      localStorage.setItem(STORAGE_KEY, code);
+    } catch (_err) {
+      /* storage disabled — the language applies to this page only */
+    }
+    url.searchParams.delete('lang');
+    window.history.replaceState(window.history.state, '', url.href);
+    return code;
+  }
+
+  let current = consumeUrlLang() || detectInitialLang();
   const listeners = new Set();
 
   function interpolate(template, params) {

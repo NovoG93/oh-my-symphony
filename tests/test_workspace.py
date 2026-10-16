@@ -2313,3 +2313,162 @@ async def test_commit_workspace_on_done_commits_artifacts_without_excludes(
 
     committed = _git(ws, "show", "--pretty=", "--name-only", "HEAD").stdout
     assert ".symphony-artifacts/screenshot.png" in committed
+
+
+@pytest.mark.skipif(not _HAS_GIT, reason="git CLI required")
+@pytest.mark.asyncio
+async def test_commit_workspace_on_done_excludes_paths_from_prior_wip_commit(
+    tmp_path, monkeypatch
+):
+    """Excluded files from prior wip commits stay on disk, outside the squash."""
+    _git_id_env(monkeypatch, tmp_path)
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _git(repo, "init", "-q", "-b", "main")
+    (repo / "seed.txt").write_text("base")
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-q", "-m", "base commit")
+    base_sha = _git(repo, "rev-parse", "HEAD").stdout.strip()
+    _git(repo, "config", "symphony.basesha", base_sha)
+    _git(repo, "config", "--add", "symphony.autocommitExclude", "vendor/secret.txt")
+
+    (repo / "vendor").mkdir()
+    secret = repo / "vendor/secret.txt"
+    secret.write_bytes(b"do not ship\n")
+    (repo / "work.txt").write_text("ticket work")
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-q", "-m", "wip: turn 1")
+    (repo / "more.txt").write_text("more ticket work")
+
+    outcome = await commit_workspace_on_done(
+        repo, identifier="OLV-EX", title="exclude vendor"
+    )
+
+    assert outcome.status == workspace_module.COMMIT_OK
+    files = _git(repo, "ls-tree", "-r", "--name-only", "HEAD").stdout.splitlines()
+    assert "vendor/secret.txt" not in files
+    assert {"seed.txt", "work.txt", "more.txt"}.issubset(files)
+    assert _git(repo, "ls-files", "--", "vendor/secret.txt").stdout == ""
+    assert secret.read_bytes() == b"do not ship\n"
+    assert _git(repo, "rev-parse", "HEAD^").stdout.strip() == base_sha
+    assert _git(repo, "rev-list", "--count", "HEAD").stdout.strip() == "2"
+
+
+@pytest.mark.skipif(not _HAS_GIT, reason="git CLI required")
+@pytest.mark.asyncio
+async def test_commit_workspace_on_done_noops_when_prior_wip_only_contains_excluded_paths(
+    tmp_path, monkeypatch
+):
+    _git_id_env(monkeypatch, tmp_path)
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _git(repo, "init", "-q", "-b", "main")
+    (repo / "seed.txt").write_text("base")
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-q", "-m", "base commit")
+    base_sha = _git(repo, "rev-parse", "HEAD").stdout.strip()
+    _git(repo, "config", "symphony.basesha", base_sha)
+    _git(repo, "config", "--add", "symphony.autocommitExclude", "vendor/secret.txt")
+    (repo / "vendor").mkdir()
+    secret = repo / "vendor/secret.txt"
+    secret.write_bytes(b"excluded-only wip\n")
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-q", "-m", "wip: excluded only")
+
+    outcome = await commit_workspace_on_done(
+        repo, identifier="OLV-EX-ONLY", title="excluded-only snapshot"
+    )
+
+    assert outcome.status == workspace_module.COMMIT_NOOP
+    assert "auto_commit: nothing to commit" in outcome.detail
+    assert _git(repo, "rev-parse", "HEAD").stdout.strip() == base_sha
+    assert _git(repo, "ls-tree", "-r", "--name-only", "HEAD", "vendor/secret.txt").stdout == ""
+    assert _git(repo, "ls-files", "--", "vendor/secret.txt").stdout == ""
+    assert secret.read_bytes() == b"excluded-only wip\n"
+
+
+@pytest.mark.skipif(not _HAS_GIT, reason="git CLI required")
+@pytest.mark.asyncio
+async def test_commit_workspace_on_done_preserves_staged_host_edit_while_excluding_prior_wip(
+    tmp_path, monkeypatch
+):
+    _git_id_env(monkeypatch, tmp_path)
+    repo = tmp_path / "repo"
+    nested = repo / "nested"
+    nested.mkdir(parents=True)
+    _git(repo, "init", "-q", "-b", "main")
+    (repo / "outside.txt").write_bytes(b"outside baseline\n")
+    (nested / "seed.txt").write_text("base")
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-q", "-m", "base commit")
+    base_sha = _git(repo, "rev-parse", "HEAD").stdout.strip()
+    _git(repo, "config", "symphony.basesha", base_sha)
+    _git(repo, "config", "--add", "symphony.autocommitExclude", "vendor")
+    (nested / "vendor").mkdir()
+    secret = nested / "vendor/secret.txt"
+    secret.write_bytes(b"excluded nested wip\n")
+    (nested / "work.txt").write_text("ticket work")
+    _git(repo, "add", "nested")
+    _git(repo, "commit", "-q", "-m", "wip: nested work")
+    outside = b"outside deliberately staged\n"
+    (repo / "outside.txt").write_bytes(outside)
+    _git(repo, "add", "outside.txt")
+    (nested / "more.txt").write_text("more ticket work")
+
+    outcome = await commit_workspace_on_done(
+        nested, identifier="OLV-NESTED", title="preserve staged host edit"
+    )
+
+    assert outcome.status == workspace_module.COMMIT_OK
+    files = _git(repo, "ls-tree", "-r", "--name-only", "HEAD").stdout.splitlines()
+    assert "nested/vendor/secret.txt" not in files
+    assert {"nested/seed.txt", "nested/work.txt", "nested/more.txt"}.issubset(files)
+    assert _git(repo, "rev-parse", "HEAD^").stdout.strip() == base_sha
+    assert _git(repo, "show", "HEAD:outside.txt").stdout.encode() == outside
+    assert _git(repo, "show", ":outside.txt").stdout.encode() == outside
+    assert (repo / "outside.txt").read_bytes() == outside
+    assert _git(repo, "ls-files", "--", "nested/vendor/secret.txt").stdout == ""
+    assert secret.read_bytes() == b"excluded nested wip\n"
+
+
+@pytest.mark.skipif(not _HAS_GIT, reason="git CLI required")
+@pytest.mark.asyncio
+async def test_commit_workspace_on_done_noops_with_excluded_only_wip_and_staged_host_edit(
+    tmp_path, monkeypatch
+):
+    _git_id_env(monkeypatch, tmp_path)
+    repo = tmp_path / "repo"
+    nested = repo / "nested"
+    nested.mkdir(parents=True)
+    _git(repo, "init", "-q", "-b", "main")
+    (repo / "outside.txt").write_bytes(b"outside baseline\n")
+    (nested / "seed.txt").write_text("base")
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-q", "-m", "base commit")
+    base_sha = _git(repo, "rev-parse", "HEAD").stdout.strip()
+    _git(repo, "config", "symphony.basesha", base_sha)
+    _git(repo, "config", "--add", "symphony.autocommitExclude", "vendor/secret.txt")
+    (nested / "vendor").mkdir()
+    secret = nested / "vendor/secret.txt"
+    secret.write_bytes(b"excluded-only nested wip\n")
+    _git(repo, "add", "nested/vendor/secret.txt")
+    _git(repo, "commit", "-q", "-m", "wip: excluded only")
+    outside = b"outside deliberately staged\n"
+    (repo / "outside.txt").write_bytes(outside)
+    _git(repo, "add", "outside.txt")
+    outside_blob = _git(repo, "rev-parse", ":outside.txt").stdout.strip()
+
+    outcome = await commit_workspace_on_done(
+        nested, identifier="OLV-NESTED-ONLY", title="excluded-only nested snapshot"
+    )
+
+    assert outcome.status == workspace_module.COMMIT_NOOP
+    assert "auto_commit: nothing to commit" in outcome.detail
+    assert _git(repo, "rev-parse", "HEAD").stdout.strip() == base_sha
+    assert _git(repo, "show", "HEAD:outside.txt").stdout == "outside baseline\n"
+    assert _git(repo, "rev-parse", ":outside.txt").stdout.strip() == outside_blob
+    assert _git(repo, "show", ":outside.txt").stdout.encode() == outside
+    assert (repo / "outside.txt").read_bytes() == outside
+    assert _git(repo, "ls-tree", "-r", "--name-only", "HEAD", "nested/vendor/secret.txt").stdout == ""
+    assert _git(repo, "ls-files", "--", "nested/vendor/secret.txt").stdout == ""
+    assert secret.read_bytes() == b"excluded-only nested wip\n"

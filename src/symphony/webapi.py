@@ -158,6 +158,9 @@ API_TOKEN_ENV = "SYMPHONY_API_TOKEN"
 # the part of a URL most likely to end up in access logs.
 _CHAT_WS_PATH = "/api/v1/chat/ws"
 _HEALTH_PATH = "/api/v1/health"
+# PM Workspace routes refuse cross-origin mutations in `_api_guard`; the rest
+# of the board keeps its narrower per-route origin checks (projects, chat ws).
+_PM_API_PREFIX = "/api/v1/pm/"
 _CI_EDITABLE_KEYS = {"enabled", "interval_ms", "max_turns", "agent_kind", "modes"}
 BIND_HOST_KEY: web.AppKey[str] = web.AppKey("symphony.bind_host", str)
 CHAT_MANAGER_KEY: web.AppKey[ChatManager] = web.AppKey("symphony.chat", ChatManager)
@@ -273,9 +276,14 @@ def _host_is_declared_trusted(host: str) -> bool:
     bare = _bare_host(host)
     if not bare:
         return False
-    return any(
-        bare == _bare_host(urlsplit(entry).hostname or entry) for entry in trusted
-    )
+    for entry in trusted:
+        try:
+            candidate = urlsplit(entry).hostname or entry
+        except ValueError:
+            continue
+        if bare == _bare_host(candidate):
+            return True
+    return False
 
 
 def _origin_is_trusted(request: web.Request, origin: str) -> bool:
@@ -294,7 +302,10 @@ def _origin_is_trusted(request: web.Request, origin: str) -> bool:
     normalized = origin.strip().lower().rstrip("/")
     if normalized in trusted:
         return True
-    host = _bare_host(urlsplit(origin).hostname or "")
+    try:
+        host = _bare_host(urlsplit(origin).hostname or "")
+    except ValueError:
+        return False
     if not host:
         # `Origin: null` — sandboxed iframe, file://, or a redirected form post.
         return False
@@ -401,6 +412,29 @@ async def _api_guard(request: web.Request, handler):
             return _json_error(
                 403, "forbidden_host", f"host {request.host!r} not allowed"
             )
+        if request.method in {
+            "POST", "PUT", "PATCH", "DELETE"
+        } and request.path.startswith(_PM_API_PREFIX):
+            origin = request.headers.get("Origin", "")
+            referer = request.headers.get("Referer", "")
+            malformed_referer = False
+            if not origin and referer:
+                try:
+                    parsed_referer = urlsplit(referer)
+                except ValueError:
+                    malformed_referer = True
+                else:
+                    if parsed_referer.scheme and parsed_referer.netloc:
+                        origin = f"{parsed_referer.scheme}://{parsed_referer.netloc}"
+            fetch_site = request.headers.get("Sec-Fetch-Site", "").strip().lower()
+            if (
+                malformed_referer
+                or (origin and not _origin_is_trusted(request, origin))
+                or (fetch_site == "cross-site" and not origin)
+            ):
+                return _json_error(
+                    403, "forbidden_origin", "cross-origin mutation is not allowed"
+                )
         # A JSON content type is what forces the CORS preflight, so it is
         # required on every mutation a browser sends, including a body-less
         # POST from an HTML form. A request with no browser provenance
@@ -3392,5 +3426,8 @@ def register_web_routes(app: web.Application, orchestrator: Orchestrator) -> Non
     _register_git_routes(app, ctx, orchestrator)
     _register_chat_routes(app, ctx, orchestrator)
     _register_preview_routes(app, ctx, orchestrator)
+    from .pm.routes import register_pm_routes
+
+    register_pm_routes(app, ctx, orchestrator)
     _register_project_routes(app, ctx)
     _register_meta_routes(app, ctx, orchestrator)

@@ -41,7 +41,9 @@ from .config import (
     GeminiConfig,
     HooksConfig,
     KiroConfig,
+    ManualVerificationProcedure,
     OpenCodeConfig,
+    PmConfig,
     PiConfig,
     PrimeAgentConfig,
     ArtifactsConfig,
@@ -148,8 +150,15 @@ def _canonical_agent_kind(kind: str) -> str:
     return kind
 
 
-def build_service_config(workflow: WorkflowDefinition) -> ServiceConfig:
-    """§6.1 — apply defaults and resolve typed values."""
+def build_service_config(
+    workflow: WorkflowDefinition, *, log_decisions: bool = True
+) -> ServiceConfig:
+    """§6.1 — apply defaults and resolve typed values.
+
+    ``log_decisions=False`` keeps read-only lookups (project registry
+    resource resolution) from emitting operator-facing decision logs about
+    *other* projects' workflows.
+    """
     cfg = workflow.config
     base_dir = workflow.base_dir()
 
@@ -734,6 +743,112 @@ def build_service_config(workflow: WorkflowDefinition) -> ServiceConfig:
         ),
     )
 
+    pm_raw = cfg.get("pm") or {}
+    if not isinstance(pm_raw, dict):
+        raise ConfigValidationError("pm must be a mapping", value=pm_raw)
+    pm_defaults = PmConfig()
+    pinned_planning_keys = [
+        key
+        for key in (
+            "planning_codex_version",
+            "planning_model",
+            "planning_reasoning_effort",
+        )
+        if key in pm_raw
+    ]
+    if pinned_planning_keys:
+        # The installed runtime and fixed model/effort have no workflow overrides;
+        # accepting these keys would
+        # suggest an effect they never have.
+        from ..pm.planning import EFFORT, MODEL
+
+        raise ConfigValidationError(
+            f"pm.{pinned_planning_keys[0]} is not configurable; the PM planning "
+            "assistant uses the compatible installed Codex CLI, pinned model "
+            f"{MODEL}, reasoning effort {EFFORT}. Remove "
+            + ", ".join(f"pm.{key}" for key in pinned_planning_keys)
+            + " from WORKFLOW.md",
+            value={key: pm_raw[key] for key in pinned_planning_keys},
+        )
+    raw_pm_workspace = pm_raw.get("planning_workspace_root")
+    if isinstance(raw_pm_workspace, str) and raw_pm_workspace.strip():
+        pm_workspace_root = _resolve_config_path(base_dir, raw_pm_workspace.strip())
+    elif raw_pm_workspace is None:
+        # Planning worktrees must not live inside the protected project checkout.
+        pm_workspace_root = (workspace_root / "pm-planning").resolve()
+    else:
+        raise ConfigValidationError(
+            "pm.planning_workspace_root must be a non-empty path string",
+            value=raw_pm_workspace,
+        )
+    pm = PmConfig(
+        authoring=_validated_bool(
+            pm_raw.get("authoring"), False, name="pm.authoring"
+        ),
+        exchange=_validated_bool(
+            pm_raw.get("exchange"), False, name="pm.exchange"
+        ),
+        assistance=_validated_bool(
+            pm_raw.get("assistance"), False, name="pm.assistance"
+        ),
+        handoff=_validated_bool(pm_raw.get("handoff"), False, name="pm.handoff"),
+        openspec_executable=_as_str(
+            pm_raw.get("openspec_executable")
+        ).strip()
+        or pm_defaults.openspec_executable,
+        planning_workspace_root=pm_workspace_root,
+        max_encoded_upload_mb=_validated_positive_or_default(
+            pm_raw.get("max_encoded_upload_mb"),
+            pm_defaults.max_encoded_upload_mb,
+            name="pm.max_encoded_upload_mb",
+        ),
+        max_workbook_mb=_validated_positive_or_default(
+            pm_raw.get("max_workbook_mb"),
+            pm_defaults.max_workbook_mb,
+            name="pm.max_workbook_mb",
+        ),
+        max_uncompressed_mb=_validated_positive_or_default(
+            pm_raw.get("max_uncompressed_mb"),
+            pm_defaults.max_uncompressed_mb,
+            name="pm.max_uncompressed_mb",
+        ),
+        max_zip_entries=_validated_positive_or_default(
+            pm_raw.get("max_zip_entries"),
+            pm_defaults.max_zip_entries,
+            name="pm.max_zip_entries",
+        ),
+        max_nodes=_validated_positive_or_default(
+            pm_raw.get("max_nodes"), pm_defaults.max_nodes, name="pm.max_nodes"
+        ),
+        max_edges=_validated_positive_or_default(
+            pm_raw.get("max_edges"), pm_defaults.max_edges, name="pm.max_edges"
+        ),
+        max_text_chars=_validated_positive_or_default(
+            pm_raw.get("max_text_chars"),
+            pm_defaults.max_text_chars,
+            name="pm.max_text_chars",
+        ),
+        operation_timeout_ms=_validated_positive_or_default(
+            pm_raw.get("operation_timeout_ms"),
+            pm_defaults.operation_timeout_ms,
+            name="pm.operation_timeout_ms",
+        ),
+        exchange_concurrency=_validated_positive_or_default(
+            pm_raw.get("exchange_concurrency"),
+            pm_defaults.exchange_concurrency,
+            name="pm.exchange_concurrency",
+        ),
+        verification_procedures=_parse_pm_verification_procedures(
+            pm_raw.get("verification_procedures")
+        ),
+        manual_verification_procedures=_parse_pm_manual_verification_procedures(
+            pm_raw.get("manual_verification_procedures"),
+            native_ids=set(_parse_pm_verification_procedures(
+                pm_raw.get("verification_procedures")
+            )),
+        ),
+    )
+
     tui_raw = cfg.get("tui") or {}
     if not isinstance(tui_raw, dict):
         tui_raw = {}
@@ -846,7 +961,7 @@ def build_service_config(workflow: WorkflowDefinition) -> ServiceConfig:
         cfg.get("continuous_improvement")
     )
 
-    if str(cfg.get("contract_profile", "")).strip().lower() != "factory":
+    if log_decisions and str(cfg.get("contract_profile", "")).strip().lower() != "factory":
         _log_stage_contracts_decision(agent, tracker)
 
     return ServiceConfig(
@@ -877,6 +992,7 @@ def build_service_config(workflow: WorkflowDefinition) -> ServiceConfig:
         workspace_reuse_policy=workspace_reuse_policy,
         preview=preview,
         artifacts=artifacts,
+        pm=pm,
     )
 
 
@@ -1135,6 +1251,67 @@ def _validated_bool(value: Any, default: bool, *, name: str) -> bool:
     if not isinstance(value, bool):
         raise ConfigValidationError(f"{name} must be a boolean", value=value)
     return value
+
+
+def _parse_pm_verification_procedures(value: Any) -> dict[str, tuple[str, ...]]:
+    if value is None:
+        return {}
+    if not isinstance(value, dict):
+        raise ConfigValidationError(
+            "pm.verification_procedures must be a mapping of ids to argv lists",
+            value=value,
+        )
+    result: dict[str, tuple[str, ...]] = {}
+    for key, command in value.items():
+        if (
+            not isinstance(key, str)
+            or not key.strip()
+            or not isinstance(command, list)
+            or not command
+            or not all(isinstance(part, str) and part for part in command)
+        ):
+            raise ConfigValidationError(
+                "each pm.verification_procedures entry must be a non-empty argv list",
+                value={key: command},
+            )
+        result[key.strip()] = tuple(command)
+    return result
+
+
+def _parse_pm_manual_verification_procedures(
+    value: Any, *, native_ids: set[str]
+) -> dict[str, ManualVerificationProcedure]:
+    if value is None:
+        return {}
+    if not isinstance(value, dict):
+        raise ConfigValidationError(
+            "pm.manual_verification_procedures must be a mapping", value=value
+        )
+    result: dict[str, ManualVerificationProcedure] = {}
+    for key, definition in value.items():
+        if not isinstance(key, str) or not key.strip() or not isinstance(definition, dict):
+            raise ConfigValidationError("manual verification procedure is invalid", value={key: definition})
+        procedure_id = key.strip()
+        if procedure_id in native_ids:
+            raise ConfigValidationError("verification procedure ids must be unique across native and manual kinds", value=procedure_id)
+        if set(definition) - {"label", "instructions", "report", "artifacts"}:
+            raise ConfigValidationError("manual verification procedure has unknown keys", value=definition)
+        instructions = definition.get("instructions")
+        report = definition.get("report", "required")
+        artifacts = definition.get("artifacts", "optional")
+        label = definition.get("label")
+        if (
+            not isinstance(instructions, str) or not instructions.strip()
+            or report != "required"
+            or artifacts not in {"optional", "required"}
+            or (label is not None and not isinstance(label, str))
+        ):
+            raise ConfigValidationError("manual verification procedure definition is invalid", value=definition)
+        result[procedure_id] = ManualVerificationProcedure(
+            instructions.strip(), report, artifacts,
+            label.strip() if isinstance(label, str) and label.strip() else None,
+        )
+    return result
 
 
 def _validated_strict_int(

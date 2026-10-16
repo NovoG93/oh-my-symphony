@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "oh-my-symphony"
-version = "0.25.0"
+version = "0.27.0"
 description = "Multi-agent fork of OpenAI Symphony — supports Codex CLI, Claude Code CLI, Gemini CLI, AGY/Antigravity CLI, Kiro CLI, OpenCode CLI, Pi CLI, and Prime Agent CLI behind one local Kanban orchestrator with TUI and web board."
 readme = "README.md"
 requires-python = ">=3.12"
@@ -26,6 +26,9 @@ dev = [
     "pytest>=8.0",
     "pytest-asyncio>=0.23",
     "pytest-cov>=5.0",
+    "pytest-xdist>=3.6",
+    # The test suite exercises the PM workbook exchange.
+    "oh-my-symphony[pm-exchange]",
     "ruff>=0.8",
     "pyright>=1.1.390",
     # The full-source type gate includes the bundled SuperQA runtime.
@@ -34,6 +37,11 @@ dev = [
 ]
 browser = [
     "playwright>=1.48",
+]
+pm-exchange = [
+    "openpyxl==3.1.5",
+    "defusedxml==0.7.1",
+    "et-xmlfile==2.0.0",
 ]
 
 [project.scripts]
@@ -49,7 +57,6 @@ include-package-data = false
 [tool.setuptools.package-data]
 symphony = [
     "web/static/*",
-    "web/static/*/*",
     "factory/templates/*.md",
     "factory/templates/docs/symphony-prompts/file/*.md",
     "factory/templates/docs/symphony-prompts/file/stages/*.md",
@@ -77,6 +84,8 @@ symphony = [
     "factory/bundled_skills/*/superqa_tui/*.py",
     "factory/bundled_skills/*/superqa_tui/*.js",
     "factory/bundled_skills/*/superqa_tui/*.tcss",
+    "web/static/**/*",
+    "pm/resources/**/*",
 ]
 
 [tool.ruff]
@@ -104,4 +113,5 @@ asyncio_mode = "auto"
 testpaths = ["tests"]
 markers = [
     "browser_e2e: browser-driven web UI tests; requires SYMPHONY_BROWSER_E2E=1 and Playwright browser binaries",
+    "timing: wall-clock budget checks; run them serially (-n0), never beside parallel workers",
 ]

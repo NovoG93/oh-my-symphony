@@ -56,7 +56,9 @@
 
   let authBannerState = { open: false, dismissed: false };
 
-  function handleApiUnauthorized() {
+  function handleApiUnauthorized(requestAuthorization) {
+    // A late 401 must not reject a token saved after this request started.
+    if (requestAuthorization !== withAuthHeaders({}).Authorization) return;
     const hadToken = Boolean(storedApiToken());
     if (hadToken) {
       // The stored token was rejected — drop it so the next save is the
@@ -69,6 +71,8 @@
 
   function showApiTokenBanner(rejected) {
     let root = document.getElementById('api-token-banner-root');
+    // Another bootstrap 401 must keep the user's unsent input and focus.
+    if (root && authBannerState.open && !rejected) return;
     if (!root) {
       root = el('div', { id: 'api-token-banner-root' });
       const main = document.querySelector('.main');
@@ -140,8 +144,8 @@
 
   const MUTATING_METHODS = new Set(['POST', 'PUT', 'PATCH', 'DELETE']);
 
-  async function apiRequest(path, { method = 'GET', body, headers = {} } = {}) {
-    const init = { method, headers: withAuthHeaders(headers) };
+  async function apiRequest(path, { method = 'GET', body, headers = {}, signal } = {}) {
+    const init = { method, headers: withAuthHeaders(headers), signal };
     // The API answers 415 to any mutation without a JSON content type, body
     // or not (CSRF: the JSON type is what forces a CORS preflight), so
     // body-less mutations send an empty object.
@@ -163,7 +167,7 @@
       }
     }
     if (!res.ok) {
-      if (res.status === 401) handleApiUnauthorized();
+      if (res.status === 401) handleApiUnauthorized(init.headers.Authorization);
       const err = data && data.error;
       throw new ApiError(
         (err && err.message) || t('api.requestFailed', { status: res.status }),
@@ -202,11 +206,12 @@
     },
     getRunDetail: (runId) => apiRequest(`/runs/${encodeURIComponent(runId)}`),
     downloadRunDiagnostic: async (runId) => {
+      const headers = withAuthHeaders({});
       const res = await fetch(`${API_BASE}/runs/${encodeURIComponent(runId)}/diagnostic`, {
-        headers: withAuthHeaders({}),
+        headers,
       });
       if (!res.ok) {
-        if (res.status === 401) handleApiUnauthorized();
+        if (res.status === 401) handleApiUnauthorized(headers.Authorization);
         let message = t('api.requestFailed', { status: res.status });
         try {
           const payload = await res.json();
@@ -311,7 +316,9 @@
   // State store
   // ------------------------------------------------------------------
 
-  const ROUTES = ['board', 'runs', 'stats', 'workflow', 'git', 'chat', 'preview', 'settings'];
+  const ROUTES = ['board', 'runs', 'stats', 'workflow', 'git', 'chat', 'preview', 'artifacts', 'settings'];
+  let pmMount = null;
+  let pmDirty = false;
 
   const PRIORITY_META = {
     0: { label: t('priority.urgent'), short: 'P0', className: 'p0' },
@@ -330,6 +337,7 @@
     branches: [],
     // Remotes + gh availability decide which Git page actions are usable.
     gitRemote: null,
+    pmGitCommit: null,
     connected: false,
     // Timestamp of the last successful /board fetch. While polls fail,
     // the age of this stamp drives the "updated Ns ago" label and the
@@ -695,10 +703,10 @@
   // Toast system
   // ------------------------------------------------------------------
 
-  function showToast(message, type = 'info') {
+  function showToast(message, type = 'info', role = type === 'error' ? 'alert' : 'status') {
     const container = document.getElementById('toast-container');
     // Errors are assertive (role=alert); success/info are polite status.
-    const toast = el('div', { class: `toast toast-${type}`, role: type === 'error' ? 'alert' : 'status' }, message);
+    const toast = el('div', { class: `toast toast-${type}`, role }, message);
     const dismiss = () => {
       toast.classList.add('toast-out');
       setTimeout(() => toast.remove(), 160);
@@ -709,6 +717,7 @@
       dismiss();
     });
     container.appendChild(toast);
+    return toast;
   }
 
   // ------------------------------------------------------------------
@@ -1069,6 +1078,14 @@
 
   async function switchProject(projectId) {
     if (!projectId || projectId === (state.currentProject && state.currentProject.id)) return;
+    const previousProjectId = state.currentProject && state.currentProject.id;
+    const maySwitch = pmMount && pmMount.beforeProjectSwitch
+      ? pmMount.beforeProjectSwitch()
+      : !pmDirty || window.confirm(t('pm.discardRoute'));
+    if (!maySwitch) {
+      renderProjectSwitcher();
+      return;
+    }
     const selector = document.getElementById('project-selector');
     if (selector) selector.disabled = true;
     try {
@@ -1077,6 +1094,8 @@
     } catch (err) {
       showToast(err.message, 'error');
       renderProjectSwitcher();
+      const restored = document.getElementById('project-selector');
+      if (restored) { restored.value = previousProjectId || ''; restored.focus({ preventScroll: true }); }
     }
   }
 
@@ -1161,6 +1180,11 @@
     closeChatSocket();
     cancelPreviewPoll();
     cancelRunsPoll();
+    if (pmMount) {
+      pmMount.unmount();
+      pmMount = null;
+      pmDirty = false;
+    }
     switch (state.route) {
       case 'board':
         renderBoardPage(view);
@@ -1183,6 +1207,9 @@
       case 'preview':
         renderPreviewPage(view);
         break;
+      case 'artifacts':
+        renderArtifactsPage(view);
+        break;
       case 'settings':
         renderSettingsPage(view);
         break;
@@ -1191,8 +1218,64 @@
     }
   }
 
+  async function renderArtifactsPage(view) {
+    view.appendChild(el('div', { class: 'pm-host-loading', role: 'status' }, 'Loading PM Workspace…'));
+    try {
+      const module = await import('/static/pm/index.js');
+      clearNode(view);
+      pmMount = module.mountArtifacts({
+        root: view,
+        projectId: (state.currentProject && state.currentProject.id) || '',
+        api: {
+          request: (path, options = {}) => apiRequest(`/pm${path}`, {
+            ...options,
+            body: options.body && typeof options.body !== 'string' ? JSON.stringify(options.body) : options.body,
+          }),
+          download: (path, filename) => authenticatedDownload(`/pm${path}`, filename),
+        },
+        ui: {
+          el, renderMarkdown, t, navigate,
+          openRun: (runId) => { state.selectedRunId = runId; navigate('runs'); },
+          openGitCommit: (commit) => { state.pmGitCommit = commit; navigate('git'); },
+          downloadArtifact: (path, filename) => authenticatedDownload(path, filename),
+          announce: (message, type = 'success') => {
+            // The persistent PM error banner already owns the live announcement.
+            const toast = showToast(message, type, type === 'error' ? null : 'status');
+            toast.classList.add('pm-toast');
+          },
+        },
+        onDirtyChange: (dirty) => { pmDirty = Boolean(dirty); },
+      });
+    } catch (err) {
+      clearNode(view);
+      view.appendChild(el('div', { class: 'banner banner-danger', role: 'alert' }, err.message || 'PM Workspace unavailable'));
+    }
+  }
+
+  async function authenticatedDownload(path, filename) {
+    const target = String(path).startsWith(API_BASE) ? String(path) : `${API_BASE}${path}`;
+    const headers = withAuthHeaders({});
+    const response = await fetch(target, { headers });
+    if (!response.ok) {
+      if (response.status === 401) handleApiUnauthorized(headers.Authorization);
+      throw new ApiError(t('api.requestFailed', { status: response.status }), 'download_failed', response.status);
+    }
+    const blob = await response.blob();
+    const link = document.createElement('a');
+    link.href = URL.createObjectURL(blob);
+    link.download = filename || 'artifact';
+    link.click();
+    setTimeout(() => URL.revokeObjectURL(link.href), 1000);
+  }
+
   function handleRouteChange() {
-    state.route = currentRoute();
+    const nextRoute = currentRoute();
+    if (pmDirty && state.route === 'artifacts' && nextRoute !== 'artifacts'
+        && !window.confirm(t('pm.discardRoute'))) {
+      history.replaceState(null, '', `#/${state.route}`);
+      return;
+    }
+    state.route = nextRoute;
     updateSidebarActive();
     renderRoute();
   }
@@ -3126,6 +3209,11 @@
         compareCard.node,
       ]));
       body.appendChild(diffPanel.node);
+      if (state.pmGitCommit) {
+        const commit = state.pmGitCommit;
+        state.pmGitCommit = null;
+        diffPanel.showCommit({ sha: commit, short_sha: commit.slice(0, 10), subject: '' });
+      }
     } catch (err) {
       clearNode(body);
       body.appendChild(el('div', { class: 'empty-state' }, t('git.loadFailed', { error: err.message })));
@@ -5408,7 +5496,7 @@
     });
     wireGlobalShortcuts();
     const selector = document.getElementById('project-selector');
-    if (selector) selector.addEventListener('change', () => switchProject(selector.value));
+    if (selector) selector.addEventListener('change', async () => { await switchProject(selector.value); });
     const manageButton = document.getElementById('manage-projects');
     if (manageButton) manageButton.addEventListener('click', openManageProjectsDialog);
     handleRouteChange();

@@ -330,3 +330,43 @@ def test_existing_directory_token_is_still_a_workflow_path(
     (tmp_path / "myproj").mkdir()
     assert cli_main_mod.main(["myproj"]) == 0
     assert str(captured["workflow"]).endswith("myproj")
+
+
+def test_pm_routes_before_existing_directory(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    import importlib
+
+    pm = importlib.import_module("symphony.cli.pm")
+    captured = {}
+
+    def fake_pm_main(argv):
+        captured["argv"] = argv
+        return 8
+
+    monkeypatch.setattr(pm, "main", fake_pm_main)
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "pm").mkdir()
+    assert cli_main_mod.main(["pm", "demo", "--lang", "ko"]) == 8
+    assert captured["argv"] == ["demo", "--lang", "ko"]
+
+
+def test_explicit_pm_directory_remains_workflow_path(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    captured = {}
+
+    async def fake_run(args):
+        captured["workflow"] = args.workflow
+        return 0
+
+    monkeypatch.setattr(cli_main_mod, "_run", fake_run)
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "pm").mkdir()
+    assert cli_main_mod.main(["./pm"]) == 0
+    assert str(captured["workflow"]).endswith("pm")
+
+
+def test_pm_help_caption_and_order(capsys: pytest.CaptureFixture[str]) -> None:
+    names = [name for name, _ in cli_main_mod.SUBCOMMANDS]
+    assert names[names.index("project") + 1] == "pm"
+    with pytest.raises(SystemExit) as exc:
+        cli_main_mod.main(["--help"])
+    assert exc.value.code == 0
+    assert "create and serve a disposable PM Workspace demo" in capsys.readouterr().out

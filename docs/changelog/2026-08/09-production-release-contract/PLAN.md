@@ -7,7 +7,7 @@ dated `## Amendment`.
 ## Approval
 
 - Status: approved-by-user
-- Record: 2026-08-08T22:40:35Z; user confirmed the Jira clone target, all app-delivery scope, and autonomous fix-ticket creation: "1 was made /Users/danny/Documents/PARA/Resource/jira-dev-factory/jira-clone 2 yes all 3 symphony can issue new tickets to fix the low quality untill all pass (done autnomously)"
+- Record: 2026-08-08T22:40:35Z; user confirmed the Jira clone target, all app-delivery scope, and autonomous fix-ticket creation: "1 was made /Users/<user>/Documents/PARA/Resource/jira-dev-factory/jira-clone 2 yes all 3 symphony can issue new tickets to fix the low quality untill all pass (done autnomously)"
 
 ## Intent
 
@@ -49,7 +49,7 @@ dated `## Amendment`.
    - Run targeted tests while building, then the trusted aggregate, Ruff, Pyright, `git diff --check`, and a fresh-context audit. No test/gate weakening.
 
 6. Real acceptance after the Symphony code is independently green
-   - Use a disposable clone of `/Users/danny/Documents/PARA/Resource/jira-dev-factory`, preserving its real domain/tickets but never contaminating the source during the run. Configure one serialized OpenCode worker with command `/Users/danny/.opencode/bin/opencode run --format json --auto --model zai-coding-plan/glm-5.2` and a separate service port/workspace root.
+   - Use a disposable clone of `/Users/<user>/Documents/PARA/Resource/jira-dev-factory`, preserving its real domain/tickets but never contaminating the source during the run. Configure one serialized OpenCode worker with command `~/.opencode/bin/opencode run --format json --auto --model zai-coding-plan/glm-5.2` and a separate service port/workspace root.
    - Seed a grounded Jira `release-contract.yaml` covering all visible controls and audited missing/broken behavior. Create an `app-release-finalizer` and an `app-release` negative-control verifier on a target SHA with one deliberately broken real menu. Prove RED, programmatic repair tickets, GLM-5.2 repair execution/merge, fresh verifier, and GREEN on the new exact target SHA. Continue bounded repair cycles until all checks pass.
    - Capture authoritative API, board, run-registry, log, provider/model/session, target history, artifact, and process-cleanup evidence. Run independent Ego Lite desktop/mobile/control/a11y QA on the final merged clone. After all green, integrate the proven commits into the clean real Jira `main` with a recoverable backup ref; do not push.
 
@@ -73,19 +73,19 @@ dated `## Amendment`.
 - `supergoal`: isolated builder -> evidence-only tester -> independent auditor loop, max 3.
 - UI authority for the Jira repair run: Expressive baseline plus dense/admin completeness overlay, Atlassian/Jira design-system direction, dials `3/2/8`.
 - Browser: Ego Lite (`ego-browser`) for independent final proof; worker-native browser runner is evidence input, not operator authority.
-- Tests: `/Users/danny/Documents/PARA/Resource/symphony-multi-agent/.venv/bin/pytest`, `.venv/bin/ruff`, `.venv/bin/symphony-pyright`; run with `PYTHONPATH=/private/tmp/symphony-release-contract-LuIfCN/src` when using the original venv.
+- Tests: `~/Documents/PARA/Resource/symphony-multi-agent/.venv/bin/pytest`, `.venv/bin/ruff`, `.venv/bin/symphony-pyright`; run with `PYTHONPATH=/private/tmp/symphony-release-contract-LuIfCN/src` when using the original venv.
 
 ## Verification strategy
 
 - Before proof: current JIRA-010 claims production readiness while `git merge-base --is-ancestor symphony/JIRA-003 main` is non-zero; `main` lacks JIRA-003 form files; visible controls are inert; current deep and OneShot gates accept prompt/ledger evidence without target-SHA binding.
 - Step -> GOAL.md criterion: 1-2 -> 1,2; 3 -> 3,4,5; 4 -> 6,7; 5 -> 8; 6 -> 9,10,11.
-- Trusted commands: `PYTHONPATH=/private/tmp/symphony-release-contract-LuIfCN/src /Users/danny/Documents/PARA/Resource/symphony-multi-agent/.venv/bin/pytest -q tests/test_release_contracts.py tests/test_orchestrator_release_contract_integration.py tests/test_orchestrator_contract_integration.py tests/test_workflow_pipeline_prompt.py tests/test_workflow_presets.py tests/skills/test_symphony_oneshot_bootstrap.py tests/test_doctor.py tests/test_workflow.py` (frozen_repo)
-- Trusted commands: `PYTHONPATH=/private/tmp/symphony-release-contract-LuIfCN/src /Users/danny/Documents/PARA/Resource/symphony-multi-agent/.venv/bin/ruff check src tests` and `PATH=/Users/danny/Documents/PARA/Resource/symphony-multi-agent/.venv/bin:$PATH PYTHONPATH=/private/tmp/symphony-release-contract-LuIfCN/src /Users/danny/Documents/PARA/Resource/symphony-multi-agent/.venv/bin/symphony-pyright` (frozen_repo)
+- Trusted commands: `PYTHONPATH=/private/tmp/symphony-release-contract-LuIfCN/src ~/Documents/PARA/Resource/symphony-multi-agent/.venv/bin/pytest -q tests/test_release_contracts.py tests/test_orchestrator_release_contract_integration.py tests/test_orchestrator_contract_integration.py tests/test_workflow_pipeline_prompt.py tests/test_workflow_presets.py tests/skills/test_symphony_oneshot_bootstrap.py tests/test_doctor.py tests/test_workflow.py` (frozen_repo)
+- Trusted commands: `PYTHONPATH=/private/tmp/symphony-release-contract-LuIfCN/src ~/Documents/PARA/Resource/symphony-multi-agent/.venv/bin/ruff check src tests` and `PATH=$HOME/Documents/PARA/Resource/symphony-multi-agent/.venv/bin:$PATH PYTHONPATH=/private/tmp/symphony-release-contract-LuIfCN/src ~/Documents/PARA/Resource/symphony-multi-agent/.venv/bin/symphony-pyright` (frozen_repo)
 - Trusted commands: evaluator-owned negative-control script and final Ego Lite task-space execution against the exact merged target SHA (evaluator_owned)
 
 ## Grounding ledger
 
-- Which app/target? -> `/Users/danny/Documents/PARA/Resource/jira-dev-factory/jira-clone`, clean local `main` at audit time -> use a disposable clone for the destructive red-to-green run, integrate only after proof.
+- Which app/target? -> `/Users/<user>/Documents/PARA/Resource/jira-dev-factory/jira-clone`, clean local `main` at audit time -> use a disposable clone for the destructive red-to-green run, integrate only after proof.
 - Why target ancestry? -> JIRA-003 implementation branch exists but is not an ancestor of main; JIRA-010 passed anyway -> ancestry is a hard host fact.
 - What is broken? -> Backlog/Issues fall through to Board; header search/Filters inert; initial theme icon blank; three-field form omits requested fields; mouse-only cards; silent storage failure; clipped/overlapping UI -> contract inventory and repair groups are grounded, not speculative.
 - How autonomous? -> user explicitly authorized new fix tickets until all pass -> core creates idempotent grouped repairs plus a fresh verifier; bounded at three conductor iterations.

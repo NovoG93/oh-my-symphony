@@ -6,6 +6,7 @@ __pycache__/
 build/
 dist/
 .coverage
+.coverage.*
 htmlcov/
 /tmp_workspaces/
 .claude/
@@ -40,6 +41,8 @@ WORKFLOW.demo.*.md
 
 # Rendered at Pages deploy time by scripts/build_manual_pdf.py
 /docs/manual/pdf/
+/node_modules/
+scripts/openspec-bundle/node_modules/
 .sdlc/archive/*/scratch/
 .sdlc/work/*/progress.md
 .sdlc/archive/*/progress.md

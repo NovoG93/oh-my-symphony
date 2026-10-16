@@ -163,11 +163,31 @@ DOC_LANG_PREAMBLE: Final[dict[str, str]] = {
 }
 
 
+# The one writing rule for every generated artefact. It rides on the same
+# preamble so it applies to any WORKFLOW.md prompt set without depending on
+# an operator's personal agent instructions; the PM planning assistant reads
+# the English entry. Edit here only.
+DOC_WRITING_RULE: Final[dict[str, str]] = {
+    "en": (
+        "Say the least that fully answers: lead with the result, one idea per "
+        "line, no filler or restated context, nothing repeated across sections; "
+        "never drop a number, warning, or condition a reader needs to act."
+    ),
+    "ko": (
+        "필요한 만큼만 쓰세요: 결론을 먼저, 한 줄에 하나, 군더더기와 맥락 반복 없이, "
+        "섹션 간 중복 없이 씁니다. 읽는 사람이 행동하는 데 필요한 숫자·경고·조건은 "
+        "빼지 않습니다."
+    ),
+}
+
+
 def doc_language_preamble(language: str | None) -> str:
-    """Return the doc-language directive for `language`, falling back to EN.
+    """Return the doc-language directive plus the writing rule, falling back to EN.
 
     Unknown / blank language codes resolve to English so a misconfigured
     operator still gets a coherent prompt instead of a silent no-op.
     """
     lang = normalize_language(language)
-    return DOC_LANG_PREAMBLE.get(lang, DOC_LANG_PREAMBLE[DEFAULT_LANGUAGE])
+    if lang not in DOC_LANG_PREAMBLE:
+        lang = DEFAULT_LANGUAGE
+    return f"{DOC_LANG_PREAMBLE[lang]} {DOC_WRITING_RULE[lang]}"

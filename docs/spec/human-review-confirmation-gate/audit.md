@@ -109,7 +109,7 @@ Result:
 - PASS: port 9999 free.
 - PASS: shell, configured Claude agent, prompt files, customized
   `after_create`, tracker board root, and standalone viewer script.
-- FAIL: `/Users/danny/symphony_workspaces` not writable in this sandbox
+- FAIL: `/Users/<user>/symphony_workspaces` not writable in this sandbox
   (`Operation not permitted`).
 
 Interpretation: the workflow shape is readable and relevant checks pass; the

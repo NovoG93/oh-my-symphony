@@ -10,6 +10,7 @@ Subcommands:
     symphony service ...           managed background orchestrator
     symphony wiki-sweep ...        scan docs/llm-wiki/ for dup/orphan/stale rows
     symphony runs [WORKFLOW]       recent run-registry attempts
+    symphony pm demo ...           create and serve a disposable PM Workspace demo
 """
 
 from __future__ import annotations
@@ -47,6 +48,7 @@ SUBCOMMANDS: tuple[tuple[str, str], ...] = (
     ("factory", "initialize, sync, and start an autonomous development factory"),
     ("service", "run the orchestrator as a managed background service"),
     ("project", "register and run independent project services"),
+    ("pm", "create and serve a disposable PM Workspace demo"),
     ("hub", "serve the multi-project hub"),
     ("runs", "print recent run-registry attempts"),
     ("release", "validate application release evidence"),
@@ -80,7 +82,10 @@ def _looks_like_mistyped_subcommand(token: str) -> bool:
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="symphony",
-        description="Symphony multi-agent — Codex / Claude Code / Gemini orchestration.",
+        description=(
+            "Symphony multi-agent — Codex / Claude Code / Gemini / AGY / Kiro / "
+            "OpenCode / Pi / Prime Agent orchestration."
+        ),
         epilog=_subcommand_epilog(),
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
@@ -227,23 +232,23 @@ async def _run(args: argparse.Namespace) -> int:
         args.keep_awake if args.keep_awake is not None else cfg.system.keep_awake
     )
     keep_awake = KeepAwake() if keep_awake_enabled else None
-    if keep_awake is not None:
-        keep_awake.start()
 
     orchestrator = Orchestrator(state)
     try:
         await orchestrator.start()
     except SymphonyError as exc:
-        if keep_awake is not None:
-            keep_awake.stop()
         return _fail_startup(
             log,
             "startup_failed",
-            f"orchestrator startup failed: {exc}. "
+            f"orchestrator startup failed: {str(exc).rstrip('.')}. "
             f"`symphony doctor {workflow_path}` checks ports, the agent "
             "CLI, and tracker configuration.",
             error=str(exc),
         )
+    # Only hold the host awake once startup succeeded; a refused start
+    # (protected source repo, port in use) must not toggle caffeinate.
+    if keep_awake is not None:
+        keep_awake.start()
 
     # Register the progress writer BEFORE any subsequent `await` so the
     # first tick's `_notify_observers` sees it. CLI flag > WORKFLOW.md
@@ -466,6 +471,10 @@ def main(argv: list[str] | None = None) -> int:
         from . import project
 
         return project.main(raw_argv[1:])
+    if raw_argv and raw_argv[0] == "pm":
+        from . import pm
+
+        return pm.main(raw_argv[1:])
     if raw_argv and raw_argv[0] == "hub":
         from .. import hub
 

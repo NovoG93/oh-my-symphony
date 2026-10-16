@@ -4,11 +4,18 @@ from __future__ import annotations
 
 import re
 import hashlib
+import os
+import tempfile
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 
-from ..trackers.file import FileBoardTracker, parse_ticket_file
+from ..trackers.file import (
+    FileBoardTracker,
+    _exclusive_lock,
+    parse_ticket_file,
+    serialize_ticket,
+)
 from .wayfinder import WayfinderTicket, parse_wayfinder_ticket
 
 _SOURCE_RE = re.compile(
@@ -36,11 +43,22 @@ def sync_wayfinder(
     all_tickets: bool = True,
 ) -> list[SyncResult]:
     order = _load_ordered_graph(wayfinder_root, prefix)
+    # Sync owns a separate lock: allocation still takes its normal board lock.
+    with _exclusive_lock(tracker.board_root / ".locks" / ".factory-sync.lock"):
+        return _sync_locked(wayfinder_root, tracker, order, prefix, all_tickets)
+
+
+def _sync_locked(
+    wayfinder_root: Path,
+    tracker: FileBoardTracker,
+    order: list[WayfinderTicket],
+    prefix: str,
+    all_tickets: bool,
+) -> list[SyncResult]:
     existing = _existing_sources(tracker)
     identifiers = {key: value[0] for key, value in existing.items()}
     results: list[SyncResult] = []
-    created_paths: list[Path] = []
-    refreshed_files: dict[Path, bytes] = {}
+    writes: dict[str, tuple[Path, bytes | None, bytes]] = {}
     issues = {key: tracker.fetch_issue_full_by_id(identifier) for key, identifier in identifiers.items()}
     states = {key: issue.state.lower() if issue else "" for key, issue in issues.items()}
     selected = [
@@ -54,8 +72,9 @@ def sync_wayfinder(
                 path = tracker.find_path(identifier)
                 if path is None:
                     raise ValueError(f"provenance points to missing ticket {identifier}")
-                refreshed_files[path] = path.read_bytes()
-                _refresh_ready_ticket(tracker, identifier, ticket, identifiers, wayfinder_root)
+                refreshed = _refresh_ready_ticket(tracker, identifier, ticket, identifiers, wayfinder_root)
+                if refreshed is not None:
+                    writes[identifier] = (path, *refreshed)
                 results.append(SyncResult(ticket.key, identifier, path, False))
                 continue
             description = _managed_body(ticket, identifiers, wayfinder_root)
@@ -70,15 +89,86 @@ def sync_wayfinder(
                 blocked_by=dependencies,
             )
             identifiers[ticket.key] = identifier
-            created_paths.append(path)
+            with _exclusive_lock(tracker._ticket_lock_path(identifier)):
+                front, body = parse_ticket_file(path)
+                expected_front = tracker._new_ticket_front(
+                    identifier=identifier, title=ticket.title, state="Ready",
+                    priority=None, labels=["factory", f"route:{ticket.route.lower()}"],
+                    agent_kind=None, skills=list(ticket.skills), blocked_by=dependencies,
+                )
+                expected_front["created_at"] = front.get("created_at")
+                expected_front["updated_at"] = front.get("created_at")
+                expected = _ticket_bytes(expected_front, description)
+                if path.read_bytes() == expected:
+                    writes[identifier] = (path, None, expected)
             results.append(SyncResult(ticket.key, identifier, path, True))
     except Exception:
-        for path, content in refreshed_files.items():
-            path.write_bytes(content)
-        for path in reversed(created_paths):
-            path.unlink(missing_ok=True)
+        retained = {issue.identifier for issue in tracker.scan_all() if issue.identifier not in writes}
+        for identifier, (path, _before, expected) in writes.items():
+            with _exclusive_lock(tracker._ticket_lock_path(identifier)):
+                if path.is_file() and path.read_bytes() != expected:
+                    retained.add(identifier)
+        protected = _retained_dependency_closure(tracker, retained, writes)
+        for identifier, (path, before, expected) in reversed(list(writes.items())):
+            with _exclusive_lock(tracker._ticket_lock_path(identifier)):
+                if not path.is_file():
+                    continue
+                if path.read_bytes() != expected:
+                    retained.add(identifier)
+                    protected |= _retained_dependency_closure(tracker, retained, writes)
+                    continue
+                if identifier in protected:
+                    continue
+                if before is None:
+                    path.unlink()
+                else:
+                    _restore_bytes_atomic(path, before)
         raise
     return results
+
+
+
+def _retained_dependency_closure(
+    tracker: FileBoardTracker,
+    retained: set[str],
+    writes: dict[str, tuple[Path, bytes | None, bytes]],
+) -> set[str]:
+    graph = {
+        issue.identifier: {
+            dependency for blocker in issue.blocked_by
+            if (dependency := blocker.identifier or blocker.id)
+        }
+        for issue in tracker.scan_all()
+    }
+    protected: set[str] = set()
+    pending = list(retained)
+    while pending:
+        identifier = pending.pop()
+        if identifier in protected:
+            continue
+        protected.add(identifier)
+        if identifier not in graph:
+            # An externally edited card may be unparseable; do not remove its prerequisites.
+            return set(writes)
+        pending.extend(graph[identifier] - protected)
+    return protected
+
+
+def _ticket_bytes(front: dict, body: str) -> bytes:
+    # Match write_ticket_atomic's native newline translation exactly.
+    return serialize_ticket(front, body).replace("\n", os.linesep).encode("utf-8")
+
+
+def _restore_bytes_atomic(path: Path, content: bytes) -> None:
+    fd, temporary = tempfile.mkstemp(
+        prefix=".tmp-symphony-ticket-", suffix=".tmp", dir=path.parent
+    )
+    try:
+        with os.fdopen(fd, "wb") as handle:
+            handle.write(content)
+        os.replace(temporary, path)
+    finally:
+        Path(temporary).unlink(missing_ok=True)
 
 
 def _load_ordered_graph(root: Path, prefix: str) -> list[WayfinderTicket]:
@@ -204,8 +294,11 @@ def _refresh_ready_ticket(
     ticket: WayfinderTicket,
     identifiers: dict[str, str],
     root: Path,
-) -> None:
+) -> tuple[bytes, bytes] | None:
+    snapshot: tuple[bytes, bytes] | None = None
+
     def mutate(front: dict, body: str):
+        nonlocal snapshot
         if str(front.get("state", "")).lower() != "ready":
             return None
         if _END_MARKER not in body:
@@ -227,6 +320,10 @@ def _refresh_ready_ticket(
             and body.strip() == refreshed_body
         ):
             return None
+        path = tracker.find_path(identifier)
+        if path is None:
+            raise ValueError(f"provenance points to missing ticket {identifier}")
+        before = path.read_bytes()
         front["title"] = ticket.title
         front["labels"] = labels
         front["skills"] = skills
@@ -235,6 +332,8 @@ def _refresh_ready_ticket(
         else:
             front.pop("blocked_by", None)
         front["updated_at"] = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        snapshot = (before, _ticket_bytes(front, refreshed_body))
         return front, refreshed_body
 
     tracker._mutate_ticket(identifier, mutate)  # type: ignore[attr-defined]
+    return snapshot
