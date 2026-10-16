@@ -116,7 +116,16 @@ def installed_python(tmp_path_factory):
     else:
         wheels = folder / "wheel"
         wheels.mkdir()
-        _command([builder, "-m", "pip", "wheel", ".", "--no-deps", "--wheel-dir", str(wheels)], ROOT, folder / "wheel.log")
+        # setuptools builds in place; parallel workers need separate source trees.
+        source = folder / "source"
+        source.mkdir()
+        for name in ("pyproject.toml", "README.md", "LICENSE", "NOTICE"):
+            shutil.copy2(ROOT / name, source / name)
+        shutil.copytree(
+            ROOT / "src", source / "src",
+            ignore=shutil.ignore_patterns("*.egg-info", "__pycache__"),
+        )
+        _command([builder, "-m", "pip", "wheel", ".", "--no-deps", "--wheel-dir", str(wheels)], source, folder / "wheel.log")
         wheel, = wheels.glob("oh_my_symphony-*.whl")
     _command([builder, "-m", "venv", str(folder / "venv")], folder, folder / "venv.log")
     executable = folder / "venv/bin/python"
