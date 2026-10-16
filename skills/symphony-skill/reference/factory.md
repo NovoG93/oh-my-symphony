@@ -68,6 +68,15 @@ not create automatic repair tickets. Fix the named blocker, then use
 to retry proof, or `--state Build` when product work remains. Existing turn and
 token budgets still apply; inspect the ticket's budget diagnostics before retrying.
 
+If a Git snapshot fails (for example, an index lock or permission error), Symphony
+keeps the product worktree and pauses the ticket instead of merging or removing
+it. Inspect the `## Blocker` diagnostic and fix the named Git problem without
+deleting the retained worktree. Return the ticket to `Verify` with the command
+above, then clear its pause with the TUI's `P` control or
+`POST /api/v1/<ID>/resume` on the running service. Moving the card alone does not
+clear a persisted pause. Verify runs again before delivery; remote publishing
+remains opt-in.
+
 `factory init` prints the exact Supergoal WAYFINDER prompt to use next.
 It merges runtime ignore rules into `.gitignore` without replacing user rules:
 board cards, worktrees, logs, and `WORKFLOW-PROGRESS.md` stay local runtime

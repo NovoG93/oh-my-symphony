@@ -374,7 +374,7 @@ async def _complete_release_verifier_handoff(
     orch._clear_issue_flags(issue_id, retry_attempt=True)
     cleanup_started = entry.workspace_cleanup_started
     if cfg is not None and cfg.agent.auto_commit_on_done and not cleanup_started:
-        await _core().commit_workspace_on_done(
+        snapshot = await _core().commit_workspace_on_done(
             entry.workspace_path,
             identifier=entry.issue.identifier,
             title=entry.issue.title,
@@ -382,6 +382,11 @@ async def _complete_release_verifier_handoff(
             state=entry.issue.state,
             extra_excludes=orch._artifact_commit_excludes(cfg),
         )
+        if not snapshot.durable:
+            entry.issue = await orch._preserve_history_failure(
+                cfg, entry.issue, entry.workspace_path, snapshot
+            )
+            return
     if cfg is not None and not cleanup_started and orch._workspace_manager is not None:
         await orch._workspace_manager.remove(entry.workspace_path)
     log.info(
@@ -586,7 +591,7 @@ async def _finalize_clean_exit(
         or entry.known_release_cycle_verifier
         or entry.known_app_release_finalizer
     )
-    history_unpublished = await _record_delivery_history(
+    history_blocked = await _record_delivery_history(
         orch,
         cfg,
         entry,
@@ -610,6 +615,9 @@ async def _finalize_clean_exit(
     is_terminal = normalize_state(entry.issue.state) in terminal_states
     if cleanup_started:
         pass
+    elif history_blocked:
+        # Failed snapshots and unpublished history must retain the worktree.
+        pass
     elif (
         release_evidence_only
         and is_terminal
@@ -623,12 +631,6 @@ async def _finalize_clean_exit(
             if not await _guard_release_finalizer_before_cleanup(orch, cfg, entry):
                 return False
         await orch._workspace_manager.remove(entry.workspace_path)
-    elif history_unpublished:
-        # Commit exists, remote does not have it. The card is now in
-        # `Human Review`; keep the workspace so an operator can finish
-        # the push by hand, and skip the Done post-processing that
-        # would merge and reap it.
-        pass
     elif is_done and cfg is not None and orch._workspace_manager is not None:
         await _post_process_done(orch, cfg, entry, debug)
         # Don't schedule a continuation — a Done ticket has nothing
@@ -649,7 +651,7 @@ async def _record_delivery_history(
     cleanup_started: bool,
     release_evidence_only: bool,
 ) -> bool:
-    """Return ``True`` when the delivery commit exists locally but not remotely."""
+    """Return ``True`` when history failure must stop delivery and cleanup."""
     core = _core()
     # Final History Gate, host-side. The agent cannot be the one to
     # prove delivery: it runs sandboxed and may not reach the object
@@ -665,7 +667,7 @@ async def _record_delivery_history(
         and cfg.agent.auto_commit_on_done
         and not cleanup_started
     ):
-        await core.commit_workspace_on_done(
+        snapshot = await core.commit_workspace_on_done(
             # Release evidence is an audit snapshot of an already
             # host-authorized target; keep this path local-only even
             # when normal tickets publish their history.
@@ -676,6 +678,11 @@ async def _record_delivery_history(
             state=entry.issue.state,
             extra_excludes=orch._artifact_commit_excludes(cfg),
         )
+        if not snapshot.durable:
+            entry.issue = await orch._preserve_history_failure(
+                cfg, entry.issue, entry.workspace_path, snapshot
+            )
+            return True
     elif (
         cfg is not None
         and cfg.agent.auto_commit_on_done
@@ -689,6 +696,11 @@ async def _record_delivery_history(
             state=entry.issue.state,
             push=cfg.agent.auto_merge_push_target,
         )
+        if not history.durable:
+            entry.issue = await orch._preserve_history_failure(
+                cfg, entry.issue, entry.workspace_path, history
+            )
+            return True
         if history.status == HISTORY_PUSH_FAILED:
             history_unpublished = True
             await _flag_unpublished_history(orch, cfg, entry.issue, history)
@@ -697,9 +709,9 @@ async def _record_delivery_history(
         # the ticket isn't strictly at Done. The worker stopped
         # cleanly (`reason == "normal"`); any subsequent reconcile or
         # operator cleanup would `git worktree remove --force` and
-        # discard uncommitted work otherwise. Lenient — failures only
-        # warn; a missed snapshot must not block the queue.
-        await core.commit_workspace_on_done(
+        # discard uncommitted work otherwise. Failed snapshots pause
+        # the ticket and retain its workspace for operator recovery.
+        snapshot = await core.commit_workspace_on_done(
             entry.workspace_path,
             identifier=entry.issue.identifier,
             title=entry.issue.title,
@@ -707,6 +719,11 @@ async def _record_delivery_history(
             state=entry.issue.state,
             extra_excludes=orch._artifact_commit_excludes(cfg),
         )
+        if not snapshot.durable:
+            entry.issue = await orch._preserve_history_failure(
+                cfg, entry.issue, entry.workspace_path, snapshot
+            )
+            return True
     return history_unpublished
 
 

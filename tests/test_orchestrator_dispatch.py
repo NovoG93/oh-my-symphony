@@ -39,6 +39,8 @@ from symphony.orchestrator.run_registry import (
     RunRegistry,
 )
 from symphony.workspace import (
+    COMMIT_NOOP,
+    CommitOutcome,
     HISTORY_LOCAL_ONLY,
     HistoryGateResult,
     WorkspaceManager,
@@ -3574,6 +3576,7 @@ def _stub_workflow_state_returning(
 
     async def _capture(path, *, identifier, title, **_):
         captured.append({"path": path, "identifier": identifier, "title": title})
+        return CommitOutcome(COMMIT_NOOP)
 
     async def _capture_gate(path, *, identifier, title, **kwargs):
         await _capture(path, identifier=identifier, title=title)
@@ -4668,7 +4671,7 @@ def test_on_worker_exit_hit_max_turns_blocks_ticket_when_blocked_state_exists(
     asyncio.run(_run())
 
 
-def test_on_worker_exit_normal_non_terminal_still_continues_when_no_max_turns():
+def test_on_worker_exit_normal_non_terminal_still_continues_when_no_max_turns(monkeypatch):
     """Sanity: the existing continuation path is preserved when `hit_max_turns`
     is False — only the new flag should suppress auto-continuation."""
     cfg = _make_config(max_concurrent=1)
@@ -4680,9 +4683,7 @@ def test_on_worker_exit_normal_non_terminal_still_continues_when_no_max_turns():
         entry = _install_running_entry(orch, issue)
         assert entry.hit_max_turns is False  # default
 
-        # Monkey-patch workflow_state.current() so _on_worker_exit can read
-        # cfg.agent.max_total_turns without exploding on None.
-        orch._workflow_state.current = lambda: cfg  # type: ignore[assignment]
+        _stub_workflow_state_returning(orch, cfg, monkeypatch)
 
         try:
             await orch._on_worker_exit(issue.id, reason="normal", error=None)
@@ -5344,6 +5345,7 @@ def test_reconcile_terminate_terminal_commits_before_remove(monkeypatch):
 
             async def _capture_commit(path, *, identifier, title, **_):
                 calls.append(f"commit:{identifier}")
+                return CommitOutcome(COMMIT_NOOP)
 
             class _StubWS:
                 async def remove(self, p):
@@ -5429,6 +5431,7 @@ def test_reconcile_terminal_grace_expires_despite_recent_heartbeat(monkeypatch):
 
             async def _capture_commit(path, *, identifier, title, **_):
                 calls.append(f"commit:{identifier}")
+                return CommitOutcome(COMMIT_NOOP)
 
             class _StubWS:
                 async def remove(self, p):
@@ -5529,6 +5532,7 @@ def test_reconcile_terminate_terminal_skips_commit_when_auto_off(monkeypatch):
 
             async def _capture_commit(path, *, identifier, title, **_):
                 commit_calls.append(identifier)
+                return CommitOutcome(COMMIT_NOOP)
 
             class _StubWS:
                 async def remove(self, p):
@@ -5679,6 +5683,7 @@ def test_startup_terminal_cleanup_removes_cancelled_but_preserves_blocked(
         snapshots.append(
             (identifier, (Path(path) / "diagnostic.txt").read_text(encoding="utf-8"))
         )
+        return CommitOutcome(COMMIT_NOOP)
 
     orch = _orch()
     monkeypatch.setattr(
@@ -5694,8 +5699,9 @@ def test_startup_terminal_cleanup_removes_cancelled_but_preserves_blocked(
     assert snapshots == [("MT-CANCELLED", "cancelled evidence\n")]
 
 
+@pytest.mark.parametrize("residue", ["clean", "untracked", "tracked", "unreadable"])
 def test_startup_terminal_cleanup_skips_done_workspace_when_branch_already_merged(
-    tmp_path: Path, monkeypatch
+    tmp_path: Path, monkeypatch, residue: str,
 ):
     """A service restart must not resurrect stale Done workspaces whose
     feature branch has already been folded into the target branch.
@@ -5718,7 +5724,13 @@ def test_startup_terminal_cleanup_skips_done_workspace_when_branch_already_merge
     _git(repo, "merge", "--no-ff", "-m", "merge feature", "symphony/MT-DONE")
 
     workspace = tmp_path / "ws" / "MT-DONE"
-    workspace.mkdir(parents=True)
+    _git(repo, "worktree", "add", str(workspace), "symphony/MT-DONE")
+    if residue == "untracked":
+        (workspace / "product.py").write_text("uncommitted product\n", encoding="utf-8")
+    elif residue == "tracked":
+        (workspace / "feature.txt").write_text("uncommitted update\n", encoding="utf-8")
+    elif residue == "unreadable":
+        monkeypatch.setattr(core_module, "_worktree_status_snapshot", lambda _path: None)
 
     cfg = _make_config(max_concurrent=1)
     cfg = replace(
@@ -5734,6 +5746,7 @@ def test_startup_terminal_cleanup_skips_done_workspace_when_branch_already_merge
 
     async def _capture_commit(path, *, identifier, title, **_):
         calls.append(f"commit:{identifier}")
+        return CommitOutcome(COMMIT_NOOP)
 
     async def _capture_merge(**kwargs):
         calls.append(f"merge:{kwargs['identifier']}")
@@ -5753,9 +5766,26 @@ def test_startup_terminal_cleanup_skips_done_workspace_when_branch_already_merge
     monkeypatch.setattr(core_module, "auto_merge_on_done_best_effort", _capture_merge)
     orch._workspace_manager = _StubWS()  # type: ignore[assignment]
 
+    monkeypatch.setattr(
+        orch, "_tracker_call_update_state",
+        lambda _cfg, _issue, target: calls.append(f"update:{target}"),
+    )
+    monkeypatch.setattr(
+        orch, "_tracker_call_append_note",
+        lambda _cfg, _issue, heading, body: calls.append(f"note:{heading}"),
+    )
     asyncio.run(orch._startup_terminal_cleanup(cfg))
 
-    assert calls == ["remove:MT-DONE"]
+    if residue == "clean":
+        assert calls == ["remove:MT-DONE"]
+    else:
+        assert calls == [f"update:{cfg.tracker.active_states[-1]}", "note:Blocker"]
+        assert orch.is_paused(issue.id)
+        assert (workspace / ".git").is_file()
+        if residue == "untracked":
+            assert (workspace / "product.py").read_text() == "uncommitted product\n"
+        elif residue == "tracked":
+            assert (workspace / "feature.txt").read_text() == "uncommitted update\n"
 
 
 def test_startup_terminal_cleanup_preserves_unmerged_done_workspace_without_replay(
@@ -5796,6 +5826,7 @@ def test_startup_terminal_cleanup_preserves_unmerged_done_workspace_without_repl
 
     async def _capture_commit(path, *, identifier, title, **_):
         calls.append(f"commit:{identifier}")
+        return CommitOutcome(COMMIT_NOOP)
 
     async def _capture_merge(**kwargs):
         calls.append(f"merge:{kwargs['identifier']}")
@@ -12427,6 +12458,7 @@ def test_factory_reconcile_rewinds_invalid_terminal_before_cleanup(monkeypatch):
 
             async def _capture_commit(*_args, **_kwargs):
                 cleanup.append("commit")
+                return CommitOutcome(COMMIT_NOOP)
 
             async def _capture_merge(*_args, **_kwargs):
                 cleanup.append("merge")
@@ -12493,3 +12525,134 @@ def test_pm_dispatch_fails_closed_when_host_project_identity_is_unreadable(
     assert not (tmp_path / "ws").exists()
     assert registry.pm_ticket_identifier_known(markerless.identifier)
     assert not registry.pm_ticket_identifier_known("ORDINARY-1")
+
+
+@pytest.mark.parametrize("delivery_path", ["worker_exit", "reconcile", "startup", "release_handoff"])
+def test_git_index_failure_preserves_factory_product_and_registered_worktree(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, delivery_path: str,
+) -> None:
+    import symphony.workspace as workspace_module
+    from symphony.trackers.file import FileBoardTracker
+    from tests.test_orchestrator_contract_integration import _FACTORY_VERIFY_BODY
+
+    host = tmp_path / "host"
+    host.mkdir()
+    _git(host, "init", "-q", "-b", "main")
+    _git(host, "config", "user.name", "test")
+    _git(host, "config", "user.email", "test@example.invalid")
+    (host / "README.md").write_text("seed", encoding="utf-8")
+    _git(host, "add", "README.md")
+    _git(host, "commit", "-q", "-m", "seed")
+    workspace_root = tmp_path / "workspaces"
+    workspace = workspace_root / "TASK-1"
+    _git(host, "worktree", "add", "-b", "symphony/TASK-1", str(workspace))
+    product = workspace / "product_task_1.py"
+    test_file = workspace / "test_task_1.py"
+    product.write_text("def total(values): return sum(values)\n", encoding="utf-8")
+    test_file.write_text(
+        "from product_task_1 import total\nassert total([]) == 0\n", encoding="utf-8"
+    )
+    before_files = {path: path.read_bytes() for path in (product, test_file)}
+    cfg = _make_config(
+        tracker_kind="file",
+        active_states=("Ready", "Build", "Verify"),
+        terminal_states=("Done", "Blocked", "Cancelled"),
+        workflow_path=host / "WORKFLOW.md",
+        workspace_root=workspace_root,
+    )
+    cfg = replace(
+        cfg,
+        raw={"contract_profile": "factory"},
+        tracker=replace(cfg.tracker, board_root=tmp_path / "kanban"),
+        agent=replace(
+            cfg.agent,
+            auto_commit_on_done=True,
+            auto_merge_on_done=True,
+            auto_merge_push_target=False,
+        ),
+    )
+    tracker = FileBoardTracker(cfg.tracker)
+    tracker.create(
+        identifier="TASK-1",
+        title="Product",
+        state="Cancelled" if delivery_path == "startup" else "Done",
+        description=_FACTORY_VERIFY_BODY,
+    )
+    issue = tracker.fetch_issue_full_by_id("TASK-1")
+    assert issue is not None
+    orch = _orch()
+    monkeypatch.setattr(orch._workflow_state, "current", lambda: cfg)
+    orch._workspace_manager = WorkspaceManager(workspace_root, cfg.hooks)
+    calls: list[str] = []
+    failures: list[str] = []
+    run = workspace_module.subprocess.run
+
+    def deny_index_write(args, *positional, **keywords):
+        if len(args) >= 3 and args[1] == "-lc" and "git add -A -- ." in str(args[2]):
+            failures.append("git add")
+            return subprocess.CompletedProcess(
+                args,
+                42,
+                b"",
+                b"error: open(product_task_1.py): Permission denied\nfatal: adding files failed\n",
+            )
+        return run(args, *positional, **keywords)
+
+    async def merge(*_args, **_kwargs):
+        calls.append("merge")
+        return True
+
+    async def remove(*_args, **_kwargs):
+        calls.append("remove")
+
+    monkeypatch.setattr(workspace_module.subprocess, "run", deny_index_write)
+    monkeypatch.setattr(orch, "_auto_merge_done_gate_or_block", merge)
+    monkeypatch.setattr(orch._workspace_manager, "remove", remove)
+
+    async def exercise() -> None:
+        orch._loop = asyncio.get_running_loop()
+        entry = RunningEntry(
+            issue=issue,
+            started_at=datetime.now(timezone.utc),
+            retry_attempt=None,
+            worker_task=None,
+            workspace_path=workspace,
+            state_at_turn_start="verify",
+            factory_verification_baseline="",
+            factory_verify_completed=True,
+            terminal_seen_at=datetime(2000, 1, 1, tzinfo=timezone.utc),
+        )
+        orch._running[issue.id] = entry
+        entry.release_verifier_handoff_complete = delivery_path == "release_handoff"
+        if delivery_path in {"worker_exit", "release_handoff"}:
+            await orch._on_worker_exit_impl(issue.id, "normal", None)
+        elif delivery_path == "reconcile":
+            await orch._reconcile_running(cfg)
+        else:
+            orch._running.clear()
+            await orch._startup_terminal_cleanup(cfg)
+        await orch._startup_terminal_cleanup(cfg)
+        await orch._auto_recover_blocked_sources(cfg)
+
+    asyncio.run(exercise())
+    current = tracker.fetch_issue_full_by_id("TASK-1")
+    assert current is not None and current.state == "Blocked"
+    assert "## Blocker" in (current.description or "")
+    assert "Permission denied" in (current.description or "")
+    assert "workspace and its product files were preserved" in (
+        current.description or ""
+    )
+    assert orch.is_paused(issue.id)
+    assert failures == ["git add"]
+    assert calls == [], "failed history cannot merge or invoke cleanup"
+    assert {path: path.read_bytes() for path in before_files} == before_files
+    assert (workspace / ".git").is_file()
+    worktrees = subprocess.run(
+        ["git", "-C", str(host), "worktree", "list", "--porcelain"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout
+    assert workspace.as_posix().lower() in worktrees.lower()
+    assert not (host / "product_task_1.py").exists()
+    assert len(tracker.scan_all()) == 1

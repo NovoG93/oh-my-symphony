@@ -86,7 +86,10 @@ from ..workflow.presets import guess_lane_preset
 from ..utils.auto_merge import AutoMergeResult, auto_merge_on_done_best_effort
 from ..utils.git_sandbox import SANDBOX_WRITE_DENIED, classify_history_failure
 from ..workspace import (
+    COMMIT_FAILED,
     HISTORY_PUSH_FAILED,
+    CommitOutcome,
+    HistoryGateResult,
     WorkspaceManager,
     commit_workspace_on_done,
     # Only `worker_exit` calls this now, and it reads it through this
@@ -157,6 +160,7 @@ from .helpers import (
     _requested_agent_kind,
     _sort_for_dispatch_fifo,
     _task_debug,
+    _terminal_state_matching,
     _to_iso,
     _utc_iso_z,
 )
@@ -4034,6 +4038,65 @@ class Orchestrator:
             return
         await self._workspace_manager.remove(path)
 
+    async def _preserve_history_failure(
+        self,
+        cfg: ServiceConfig,
+        issue: Issue,
+        workspace_path: Path,
+        outcome: CommitOutcome | HistoryGateResult,
+    ) -> Issue:
+        """Stop delivery and cleanup when the host could not snapshot this work."""
+        message = (
+            "Git history snapshot failed; workspace preserved; operator action required"
+        )
+        debug = self._issue_debug.setdefault(issue.id, _IssueDebug())
+        debug.last_workspace = workspace_path
+        debug.last_error = message
+        self._paused_issue_ids.add(issue.id)
+        self._pause_reasons[issue.id] = message
+        self._set_issue_flags(issue.id, paused=True, pause_reason=message)
+        target = _terminal_state_matching(cfg, "block", "human")
+        if not target and cfg.tracker.active_states:
+            target = cfg.tracker.active_states[-1]
+        note = (
+            f"{message}.\n\n"
+            "The host could not record this workspace in Git. Delivery and cleanup "
+            "were stopped, and the workspace and its product files were preserved.\n\n"
+            f"- status: `{outcome.status}`\n"
+            f"- classification: `{outcome.failure_kind}`\n"
+            f"- workspace: `{workspace_path}`\n"
+            f"- detail: {outcome.detail[:1000]}\n\n"
+            "Fix the reported Git/index problem without deleting the workspace. "
+            "Then return this ticket to its verification lane and resume it through "
+            "the operator resume control. Do not treat this ticket as delivered."
+        )
+        try:
+            if target:
+                await asyncio.to_thread(
+                    self._tracker_call_update_state, cfg, issue, target
+                )
+                issue = replace(issue, state=target)
+            await asyncio.to_thread(
+                self._tracker_call_append_note, cfg, issue, "Blocker", note
+            )
+        except Exception as exc:
+            self._record_tracker_error(issue.id, exc)
+            log.error(
+                "history_failure_persist_failed",
+                identifier=issue.identifier,
+                error=str(exc),
+            )
+        self._record_stats_gate(
+            issue.identifier, issue.state, "history_commit_failed", (outcome.detail,)
+        )
+        log.error(
+            "history_commit_failed_workspace_preserved",
+            identifier=issue.identifier,
+            path=str(workspace_path),
+            detail=outcome.detail,
+        )
+        return issue
+
     async def _block_done_ticket_for_merge_gate(
         self,
         cfg: "ServiceConfig",
@@ -5504,6 +5567,8 @@ class Orchestrator:
 
         opened = 0
         for issue in _sort_for_dispatch_fifo(terminal_issues, cfg):
+            if issue.id in self._paused_issue_ids:
+                continue
             if opened >= slots:
                 break
             if normalize_state(issue.state) != "blocked":
@@ -9517,7 +9582,7 @@ class Orchestrator:
                         # Snapshot before remove — `git worktree remove
                         # --force` would otherwise discard whatever the
                         # agent left uncommitted in the worktree.
-                        await commit_workspace_on_done(
+                        outcome = await commit_workspace_on_done(
                             entry.workspace_path,
                             identifier=entry.issue.identifier,
                             title=entry.issue.title,
@@ -9525,6 +9590,11 @@ class Orchestrator:
                             state=issue.state,
                             extra_excludes=self._artifact_commit_excludes(cfg),
                         )
+                        if not outcome.durable:
+                            entry.issue = await self._preserve_history_failure(
+                                cfg, entry.issue, entry.workspace_path, outcome
+                            )
+                            return
                     if release_evidence_only:
                         if entry.known_app_release_finalizer:
                             try:
@@ -9645,7 +9715,7 @@ class Orchestrator:
                 entry.workspace_cleanup_started = True
                 try:
                     if cfg.agent.auto_commit_on_done:
-                        await commit_workspace_on_done(
+                        outcome = await commit_workspace_on_done(
                             entry.workspace_path,
                             identifier=entry.issue.identifier,
                             title=entry.issue.title,
@@ -9653,6 +9723,11 @@ class Orchestrator:
                             state=issue.state,
                             extra_excludes=self._artifact_commit_excludes(cfg),
                         )
+                        if not outcome.durable:
+                            entry.issue = await self._preserve_history_failure(
+                                cfg, entry.issue, entry.workspace_path, outcome
+                            )
+                            return
                     await self._workspace_manager.remove(entry.workspace_path)
                 finally:
                     entry.workspace_cleanup_finished.set()
@@ -10038,6 +10113,8 @@ class Orchestrator:
         if self._workspace_manager is None:
             return
         for issue in terminals:
+            if issue.id in self._paused_issue_ids:
+                continue
             (
                 issue,
                 release_evidence_only,
@@ -10079,13 +10156,16 @@ class Orchestrator:
                         if release_stopped:
                             continue
                         if cfg.agent.auto_commit_on_done:
-                            await commit_workspace_on_done(
+                            outcome = await commit_workspace_on_done(
                                 path,
                                 identifier=issue.identifier,
                                 title=issue.title,
                                 exit_reason="startup_release_evidence_cleanup",
                                 state=issue.state,
                             )
+                            if not outcome.durable:
+                                await self._preserve_history_failure(cfg, issue, path, outcome)
+                                continue
                         await self._workspace_manager.remove(path)
                     finally:
                         try:
@@ -10123,6 +10203,18 @@ class Orchestrator:
                             target_branch=cfg.agent.auto_merge_target_branch,
                         )
                     if already_merged:
+                        status = await asyncio.to_thread(_worktree_status_snapshot, path)
+                        if status is None or status:
+                            detail = (
+                                "Startup cleanup could not inspect Git worktree status."
+                                if status is None
+                                else "Startup cleanup found unrecorded work despite merged branch ancestry: "
+                                + ", ".join(status)
+                            )
+                            await self._preserve_history_failure(
+                                cfg, issue, path, CommitOutcome(COMMIT_FAILED, detail=detail)
+                            )
+                            continue
                         log.info(
                             "startup_terminal_cleanup_skipped_already_merged",
                             identifier=issue.identifier,
@@ -10165,11 +10257,14 @@ class Orchestrator:
                     # hold the last in-progress changes the agent never got
                     # to commit. Snapshot before remove so a force-prune
                     # doesn't lose them.
-                    await commit_workspace_on_done(
+                    outcome = await commit_workspace_on_done(
                         path,
                         identifier=issue.identifier,
                         title=issue.title,
                         exit_reason="startup_terminal_cleanup",
                         state=issue.state,
                     )
+                    if not outcome.durable:
+                        await self._preserve_history_failure(cfg, issue, path, outcome)
+                        continue
                 await self._workspace_manager.remove(path)
