@@ -10,19 +10,24 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
+import shutil
 import signal
 import shlex
+import subprocess
+import sys
 import uuid
 from dataclasses import replace
 from pathlib import Path
+from typing import Any
 
 import pytest
 
+from tests._win_skips import requires_symlink_privilege
+
 import symphony._shell as shell_module
-import symphony.backends.claude_code as claude_module
 import symphony.backends.codex as codex_module
 import symphony.backends.opencode as opencode_module
-import symphony.backends.pi as pi_module
 import symphony.backends.per_turn as per_turn_module
 from symphony.backends import (
     EVENT_OTHER_MESSAGE,
@@ -34,9 +39,15 @@ from symphony.backends import (
     BaseAgentBackend,
     build_backend,
 )
-from symphony.backends.claude_code import ClaudeCodeBackend, _extract_text, _is_error_result
+from symphony.backends.claude_code import (
+    ClaudeCodeBackend,
+    _extract_text,
+    _inject_add_dirs,
+    _is_error_result,
+)
 from symphony.backends.codex import (
     CodexAppServerBackend,
+    NOTIF_AGENT_MESSAGE_DELTA,
     NOTIF_ITEM_COMPLETED,
     NOTIF_TURN_COMPLETED,
     NOTIF_THREAD_TOKEN_USAGE,
@@ -55,6 +66,7 @@ from symphony.backends.pi import (
     _extract_failure_reason,
     _extract_text as _pi_extract_text,
 )
+from symphony.backends.prime_agent import PrimeAgentBackend
 from symphony.errors import ConfigValidationError, ResponseError, TurnFailed
 from symphony.workflow import (
     AgentConfig,
@@ -66,6 +78,7 @@ from symphony.workflow import (
     KiroConfig,
     OpenCodeConfig,
     PiConfig,
+    PrimeAgentConfig,
     ServerConfig,
     ServiceConfig,
     TrackerConfig,
@@ -117,7 +130,7 @@ def _make_cfg(kind: str, *, workspace_root: Path) -> ServiceConfig:
             stall_timeout_ms=30_000,
         ),
         agy=AgyConfig(
-            command="agy --print -",
+            command='agy --print "$(cat)"',
             turn_timeout_ms=60_000,
             read_timeout_ms=5_000,
             stall_timeout_ms=30_000,
@@ -139,6 +152,13 @@ def _make_cfg(kind: str, *, workspace_root: Path) -> ServiceConfig:
         ),
         pi=PiConfig(
             command='pi --mode json -p ""',
+            turn_timeout_ms=60_000,
+            read_timeout_ms=5_000,
+            stall_timeout_ms=30_000,
+            resume_across_turns=True,
+        ),
+        prime_agent=PrimeAgentConfig(
+            command='prime-agent -p --mode json',
             turn_timeout_ms=60_000,
             read_timeout_ms=5_000,
             stall_timeout_ms=30_000,
@@ -368,6 +388,7 @@ def test_factory_rejects_unknown_kind(tmp_path: Path) -> None:
         kiro=cfg.kiro,
         opencode=cfg.opencode,
         pi=cfg.pi,
+        prime_agent=cfg.prime_agent,
         server=cfg.server,
         prompt_template="hi",
     )
@@ -394,6 +415,7 @@ async def test_codex_stop_reaps_with_safe_proc_wait(
     backend._process = proc  # type: ignore[assignment]
     calls: list[int] = []
     signals: list[tuple[int, int]] = []
+    taskkills: list[int] = []
 
     async def fake_safe_proc_wait(process, *, timeout=None):
         calls.append(process.pid)
@@ -406,13 +428,24 @@ async def test_codex_stop_reaps_with_safe_proc_wait(
         "_signal_process_group",
         lambda pid, sig: signals.append((pid, sig)) or True,
     )
+    if sys.platform == "win32":
+        # Stop the unit test from taskkill-ing an unrelated real pid.
+        monkeypatch.setattr(
+            shell_module,
+            "_taskkill_tree",
+            lambda pid, *, force=True: taskkills.append(pid) or True,
+        )
 
     await backend.stop()
 
-    assert proc.terminated is False
-    assert proc.killed is False
-    assert signals == [(proc.pid, signal.SIGTERM)]
     assert calls == [proc.pid]
+    if sys.platform == "win32":
+        assert taskkills == [proc.pid]
+        assert signals == []
+    else:
+        assert proc.terminated is False
+        assert proc.killed is False
+        assert signals == [(proc.pid, signal.SIGTERM)]
 
 
 @pytest.mark.asyncio
@@ -430,6 +463,7 @@ async def test_gemini_stop_reaps_with_safe_proc_wait(
     backend._active_proc = proc  # type: ignore[assignment]
     calls: list[int] = []
     signals: list[tuple[int, int]] = []
+    taskkills: list[int] = []
 
     async def fake_safe_proc_wait(process, *, timeout=None):
         calls.append(process.pid)
@@ -442,13 +476,24 @@ async def test_gemini_stop_reaps_with_safe_proc_wait(
         "_signal_process_group",
         lambda pid, sig: signals.append((pid, sig)) or True,
     )
+    if sys.platform == "win32":
+        # Stop the unit test from taskkill-ing an unrelated real pid.
+        monkeypatch.setattr(
+            shell_module,
+            "_taskkill_tree",
+            lambda pid, *, force=True: taskkills.append(pid) or True,
+        )
 
     await backend.stop()
 
-    assert proc.terminated is False
-    assert proc.killed is False
-    assert signals == [(proc.pid, signal.SIGTERM)]
     assert calls == [proc.pid]
+    if sys.platform == "win32":
+        assert taskkills == [proc.pid]
+        assert signals == []
+    else:
+        assert proc.terminated is False
+        assert proc.killed is False
+        assert signals == [(proc.pid, signal.SIGTERM)]
 
 
 @pytest.mark.asyncio
@@ -466,6 +511,7 @@ async def test_pi_stop_reaps_with_safe_proc_wait(
     backend._active_proc = proc  # type: ignore[assignment]
     calls: list[int] = []
     signals: list[tuple[int, int]] = []
+    taskkills: list[int] = []
 
     async def fake_safe_proc_wait(process, *, timeout=None):
         calls.append(process.pid)
@@ -478,13 +524,62 @@ async def test_pi_stop_reaps_with_safe_proc_wait(
         "_signal_process_group",
         lambda pid, sig: signals.append((pid, sig)) or True,
     )
+    if sys.platform == "win32":
+        # Stop the unit test from taskkill-ing an unrelated real pid.
+        monkeypatch.setattr(
+            shell_module,
+            "_taskkill_tree",
+            lambda pid, *, force=True: taskkills.append(pid) or True,
+        )
 
     await backend.stop()
 
-    assert proc.terminated is False
-    assert proc.killed is False
-    assert signals == [(proc.pid, signal.SIGTERM)]
     assert calls == [proc.pid]
+    if sys.platform == "win32":
+        assert taskkills == [proc.pid]
+        assert signals == []
+    else:
+        assert proc.terminated is False
+        assert proc.killed is False
+        assert signals == [(proc.pid, signal.SIGTERM)]
+
+
+@pytest.mark.parametrize(
+    ("kind", "backend_cls", "module", "process_attr"),
+    [
+        ("codex", CodexAppServerBackend, codex_module, "_process"),
+        ("claude", ClaudeCodeBackend, per_turn_module, "_active_proc"),
+        ("gemini", GeminiBackend, per_turn_module, "_active_proc"),
+        ("pi", PiBackend, per_turn_module, "_active_proc"),
+    ],
+)
+@pytest.mark.asyncio
+async def test_backend_stop_raises_when_process_cleanup_is_unconfirmed(
+    kind: str,
+    backend_cls: type,
+    module: object,
+    process_attr: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    cfg = _make_cfg(kind, workspace_root=tmp_path)
+    cwd = tmp_path / "ws"
+    cwd.mkdir()
+    backend = backend_cls(
+        BackendInit(cfg=cfg, cwd=cwd, workspace_root=tmp_path, on_event=_noop_event)
+    )
+    proc = _FakeProcess()
+    setattr(backend, process_attr, proc)
+
+    async def _unconfirmed(_proc):
+        return None
+
+    monkeypatch.setattr(module, "terminate_process_tree", _unconfirmed)
+
+    with pytest.raises(RuntimeError, match="cleanup could not be confirmed"):
+        await backend.stop()
+    assert getattr(backend, process_attr) is proc
+    assert proc.returncode is None
 
 
 def test_codex_event_name_normalization() -> None:
@@ -563,7 +658,7 @@ async def test_claude_success_subtype_with_is_error_true_fails_turn(
     events: list[dict] = []
     _install_subprocess_double(
         monkeypatch,
-        claude_module,
+        per_turn_module,
         [
             _FakeSubprocess(
                 stdout_lines=[
@@ -615,12 +710,12 @@ async def test_claude_run_turn_cancellation_terminates_active_subprocess(
         return -15
 
     monkeypatch.setattr(
-        claude_module.asyncio,
+        per_turn_module.asyncio,
         "create_subprocess_exec",
         fake_create_subprocess_exec,
     )
     monkeypatch.setattr(
-        claude_module, "terminate_process_tree", fake_terminate_process_tree
+        per_turn_module, "terminate_process_tree", fake_terminate_process_tree
     )
     backend = ClaudeCodeBackend(
         BackendInit(cfg=cfg, cwd=cwd, workspace_root=tmp_path, on_event=_noop_event)
@@ -636,6 +731,67 @@ async def test_claude_run_turn_cancellation_terminates_active_subprocess(
     assert terminated == [proc]
 
 
+@pytest.mark.parametrize(
+    ("kind", "module", "backend_cls", "stdout_lines"),
+    [
+        (
+            "claude",
+            per_turn_module,
+            ClaudeCodeBackend,
+            [
+                b'{"type":"system","subtype":"init","session_id":"s1"}\n',
+                b'{"type":"result","subtype":"success","result":"done",'
+                b'"session_id":"s1","usage":{}}\n',
+            ],
+        ),
+        (
+            "pi",
+            per_turn_module,
+            PiBackend,
+            [
+                b'{"type":"session","id":"s1"}\n',
+                b'{"type":"agent_end","messages":[{"role":"assistant",'
+                b'"content":[{"type":"text","text":"done"}]}]}\n',
+            ],
+        ),
+    ],
+)
+@pytest.mark.asyncio
+async def test_terminal_success_does_not_complete_when_inline_reap_is_unconfirmed(
+    kind: str,
+    module: object,
+    backend_cls: type,
+    stdout_lines: list[bytes],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    cfg = _make_cfg(kind, workspace_root=tmp_path)
+    cwd = tmp_path / "ws"
+    cwd.mkdir()
+    proc = _FakeSubprocess(stdout_lines=stdout_lines, returncode=None)
+    _install_subprocess_double(monkeypatch, module, [proc])
+    events: list[dict[str, Any]] = []
+
+    async def _unconfirmed(wait_proc):  # noqa: ANN001
+        assert wait_proc is proc
+        return None
+
+    async def _capture(event: dict[str, Any]) -> None:
+        events.append(event)
+
+    monkeypatch.setattr(module, "terminate_process_tree", _unconfirmed)
+    backend = backend_cls(
+        BackendInit(cfg=cfg, cwd=cwd, workspace_root=tmp_path, on_event=_capture)
+    )
+
+    await backend.start_session(initial_prompt="hi", issue_title="Fix login")
+    with pytest.raises(RuntimeError, match="cleanup could not be confirmed"):
+        await backend.run_turn(prompt="first", is_continuation=False)
+
+    assert EVENT_TURN_COMPLETED not in [event["event"] for event in events]
+    assert backend.pid == proc.pid
+
+
 @pytest.mark.asyncio
 async def test_claude_same_state_continuation_adds_resume_flag(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
@@ -645,7 +801,7 @@ async def test_claude_same_state_continuation_adds_resume_flag(
     cwd.mkdir()
     commands = _install_subprocess_double(
         monkeypatch,
-        claude_module,
+        per_turn_module,
         [
             _FakeSubprocess(
                 stdout_lines=[
@@ -683,7 +839,7 @@ async def test_claude_fresh_backend_first_turn_does_not_resume(
     cwd.mkdir()
     commands = _install_subprocess_double(
         monkeypatch,
-        claude_module,
+        per_turn_module,
         [
             _FakeSubprocess(
                 stdout_lines=[
@@ -762,7 +918,7 @@ async def test_pi_same_state_continuation_adds_session_flag(
     cwd.mkdir()
     commands = _install_subprocess_double(
         monkeypatch,
-        pi_module,
+        per_turn_module,
         [
             _FakeSubprocess(
                 stdout_lines=[
@@ -799,7 +955,7 @@ async def test_pi_fresh_backend_first_turn_does_not_reuse_session(
     cwd.mkdir()
     commands = _install_subprocess_double(
         monkeypatch,
-        pi_module,
+        per_turn_module,
         [
             _FakeSubprocess(
                 stdout_lines=[
@@ -817,6 +973,153 @@ async def test_pi_fresh_backend_first_turn_does_not_reuse_session(
     await backend.run_turn(prompt="phase prompt", is_continuation=False)
 
     assert "--session" not in commands[0]
+
+
+@pytest.mark.parametrize(
+    ("kind", "backend_cls", "agent_label"),
+    [
+        ("pi", PiBackend, "pi"),
+        ("prime-agent", PrimeAgentBackend, "prime-agent"),
+    ],
+)
+@pytest.mark.asyncio
+async def test_json_backend_missing_agent_end_uses_only_current_turn_message(
+    kind: str,
+    backend_cls: type[PiBackend],
+    agent_label: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A clean stream without ``agent_end`` may fall back once, but must not
+    reuse that response to mark a later empty turn successful."""
+    cfg = _make_cfg(kind, workspace_root=tmp_path)
+    cwd = tmp_path / "ws"
+    cwd.mkdir()
+    events: list[dict] = []
+
+    async def collect(event: dict) -> None:
+        events.append(event)
+
+    commands = _install_subprocess_double(
+        monkeypatch,
+        per_turn_module,
+        [
+            _FakeSubprocess(
+                stdout_lines=[
+                    b'{"type":"session","id":"s1"}\n',
+                    b'{"type":"message_end","message":{"role":"assistant",'
+                    b'"content":[{"type":"text","text":"first answer"}]}}\n',
+                ]
+            ),
+            _FakeSubprocess(stdout_lines=[b'{"type":"session","id":"s1"}\n']),
+        ],
+    )
+    backend = backend_cls(
+        BackendInit(cfg=cfg, cwd=cwd, workspace_root=tmp_path, on_event=collect)
+    )
+
+    await backend.start_session(initial_prompt="hi", issue_title="Fix login")
+    first = await backend.run_turn(prompt="first", is_continuation=False)
+    assert first.last_message == "first answer"
+
+    with pytest.raises(TurnFailed) as exc_info:
+        await backend.run_turn(prompt="second", is_continuation=True)
+    assert "no agent_end event" in str(exc_info.value)
+    assert agent_label in str(exc_info.value)
+    assert "first answer" not in str(exc_info.value)
+    assert len(commands) == 2
+    assert any(event["event"] == EVENT_TURN_COMPLETED for event in events)
+    assert any(event["event"] == EVENT_TURN_FAILED for event in events)
+
+
+@pytest.mark.parametrize(
+    ("kind", "backend_cls", "agent_label"),
+    [
+        ("pi", PiBackend, "pi"),
+        ("prime-agent", PrimeAgentBackend, "prime-agent"),
+    ],
+)
+@pytest.mark.asyncio
+async def test_json_backend_nonzero_exit_fails_with_backend_diagnostics(
+    kind: str,
+    backend_cls: type[PiBackend],
+    agent_label: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A clean ``agent_end`` cannot hide a failed CLI process."""
+    cfg = _make_cfg(kind, workspace_root=tmp_path)
+    cwd = tmp_path / "ws"
+    cwd.mkdir()
+    events: list[dict] = []
+
+    async def collect(event: dict) -> None:
+        events.append(event)
+
+    _install_subprocess_double(
+        monkeypatch,
+        per_turn_module,
+        [
+            _FakeSubprocess(
+                stdout_lines=[
+                    b'{"type":"session","id":"s1"}\n',
+                    b'{"type":"agent_end","messages":[] }\n',
+                ],
+                stderr_blob=b"credential rejected\n",
+                returncode=23,
+            )
+        ],
+    )
+    backend = backend_cls(
+        BackendInit(cfg=cfg, cwd=cwd, workspace_root=tmp_path, on_event=collect)
+    )
+
+    await backend.start_session(initial_prompt="hi", issue_title="Fix login")
+    with pytest.raises(TurnFailed) as exc_info:
+        await backend.run_turn(prompt="fail", is_continuation=False)
+
+    reason = str(exc_info.value)
+    assert f"{agent_label} exited with code 23" in reason
+    assert "credential rejected" in reason
+    failed = [event for event in events if event["event"] == EVENT_TURN_FAILED]
+    assert failed and failed[-1]["payload"]["exit_code"] == 23
+    assert not [event for event in events if event["event"] == EVENT_TURN_COMPLETED]
+
+
+@pytest.mark.parametrize(
+    ("kind", "backend_cls"),
+    [("pi", PiBackend), ("prime-agent", PrimeAgentBackend)],
+)
+@pytest.mark.asyncio
+async def test_json_backend_reads_assistant_message_from_agent_end(
+    kind: str,
+    backend_cls: type[PiBackend],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    cfg = _make_cfg(kind, workspace_root=tmp_path)
+    cwd = tmp_path / "ws"
+    cwd.mkdir()
+    _install_subprocess_double(
+        monkeypatch,
+        per_turn_module,
+        [
+            _FakeSubprocess(
+                stdout_lines=[
+                    b'{"type":"session","id":"s1"}\n',
+                    b'{"type":"agent_end","messages":[{"role":"assistant",'
+                    b'"content":[{"type":"text","text":"terminal answer"}]}]}\n',
+                ]
+            )
+        ],
+    )
+    backend = backend_cls(
+        BackendInit(cfg=cfg, cwd=cwd, workspace_root=tmp_path, on_event=_noop_event)
+    )
+
+    await backend.start_session(initial_prompt="hi", issue_title="Fix login")
+    result = await backend.run_turn(prompt="answer", is_continuation=False)
+    assert result.last_message == "terminal answer"
 
 
 @pytest.mark.asyncio
@@ -841,11 +1144,13 @@ async def test_pi_run_turn_cancellation_terminates_active_subprocess(
         return -15
 
     monkeypatch.setattr(
-        pi_module.asyncio,
+        per_turn_module.asyncio,
         "create_subprocess_exec",
         fake_create_subprocess_exec,
     )
-    monkeypatch.setattr(pi_module, "terminate_process_tree", fake_terminate_process_tree)
+    monkeypatch.setattr(
+        per_turn_module, "terminate_process_tree", fake_terminate_process_tree
+    )
     backend = PiBackend(
         BackendInit(cfg=cfg, cwd=cwd, workspace_root=tmp_path, on_event=_noop_event)
     )
@@ -1513,7 +1818,7 @@ async def test_agy_plain_text_stdout_is_completed_and_appends_permissions(
     assert backend.session_id == sid
     assert result.turn_id == sid
     assert result.last_message == "agy result"
-    assert commands == ["agy --print - --dangerously-skip-permissions"]
+    assert commands == ['agy --print "$(cat)" --dangerously-skip-permissions']
     assert proc.stdin.data == b"first"
     assert proc.stdin.closed is True
 
@@ -1525,7 +1830,7 @@ async def test_agy_continuation_adds_continue_without_duplicate_permissions(
     cfg = replace(
         _make_cfg("agy", workspace_root=tmp_path),
         agy=AgyConfig(
-            command="agy --print - --dangerously-skip-permissions",
+            command='agy --print "$(cat)" --dangerously-skip-permissions',
             turn_timeout_ms=60_000,
             read_timeout_ms=5_000,
             stall_timeout_ms=30_000,
@@ -1551,8 +1856,8 @@ async def test_agy_continuation_adds_continue_without_duplicate_permissions(
     await backend.run_turn(prompt="second", is_continuation=True)
 
     assert commands == [
-        "agy --print - --dangerously-skip-permissions",
-        "agy --print - --dangerously-skip-permissions --continue",
+        'agy --print "$(cat)" --dangerously-skip-permissions',
+        'agy --print "$(cat)" --dangerously-skip-permissions --continue',
     ]
 
 
@@ -1580,8 +1885,8 @@ async def test_agy_default_continuation_starts_fresh_turn(
     await backend.run_turn(prompt="second", is_continuation=True)
 
     assert commands == [
-        "agy --print - --dangerously-skip-permissions",
-        "agy --print - --dangerously-skip-permissions",
+        'agy --print "$(cat)" --dangerously-skip-permissions',
+        'agy --print "$(cat)" --dangerously-skip-permissions',
     ]
 
 
@@ -1776,6 +2081,7 @@ def test_sandbox_uses_workspace_write_negatives() -> None:
     assert _sandbox_uses_workspace_write() is False
 
 
+@requires_symlink_privilege
 def test_scan_workspace_symlinks_collects_resolved_targets(tmp_path: Path) -> None:
     host = tmp_path / "host"
     host.mkdir()
@@ -1800,6 +2106,7 @@ def test_scan_workspace_symlinks_empty_when_no_symlinks(tmp_path: Path) -> None:
     assert _scan_workspace_symlinks(tmp_path) == []
 
 
+@requires_symlink_privilege
 def test_scan_workspace_symlinks_dedupes_across_roots(tmp_path: Path) -> None:
     host = tmp_path / "host_docs"
     host.mkdir()
@@ -1854,6 +2161,86 @@ def test_scan_workspace_symlinks_skips_directory_dot_git(tmp_path: Path) -> None
     assert _scan_workspace_symlinks(workspace) == []
 
 
+def test_scan_workspace_symlinks_includes_object_database_of_a_real_worktree(
+    tmp_path: Path,
+) -> None:
+    """The gitdir alone is not enough — blobs go to the shared common dir.
+
+    Built against a real `git worktree add` because the fabricated-pointer
+    tests above cannot show the split: git only writes the `commondir` file
+    that reveals the object database when it creates the worktree itself.
+    """
+    if shutil.which("git") is None:
+        pytest.skip("git CLI required")
+    env = {
+        "HOME": str(tmp_path),
+        "GIT_AUTHOR_NAME": "Test",
+        "GIT_AUTHOR_EMAIL": "test@example.com",
+        "GIT_COMMITTER_NAME": "Test",
+        "GIT_COMMITTER_EMAIL": "test@example.com",
+        "PATH": os.environ.get("PATH", ""),
+    }
+
+    def git(cwd: Path, *args: str) -> None:
+        subprocess.run(
+            ["git", *args], cwd=str(cwd), env=env, check=True, capture_output=True
+        )
+
+    host = tmp_path / "host"
+    host.mkdir()
+    git(host, "init", "-q", "-b", "main")
+    (host / "seed.txt").write_text("seed")
+    git(host, "add", "seed.txt")
+    git(host, "commit", "-qm", "seed")
+    workspace = tmp_path / "ws"
+    git(host, "worktree", "add", "-q", str(workspace), "-b", "symphony/T-1")
+
+    roots = _scan_workspace_symlinks(workspace)
+
+    common_dir = (host / ".git").resolve()
+    gitdir = (host / ".git" / "worktrees" / "ws").resolve()
+    assert str(gitdir) in roots, "index.lock lives here"
+    assert str(common_dir) in roots, "objects/ lives here — the missing grant"
+
+
+def test_scan_workspace_symlinks_omits_git_dir_inside_the_workspace(
+    tmp_path: Path,
+) -> None:
+    """A plain repo workspace needs no extra grant; `.git` is already inside."""
+    if shutil.which("git") is None:
+        pytest.skip("git CLI required")
+    workspace = tmp_path / "ws"
+    workspace.mkdir()
+    subprocess.run(
+        ["git", "init", "-q"],
+        cwd=str(workspace),
+        env={"HOME": str(tmp_path), "PATH": os.environ.get("PATH", "")},
+        check=True,
+        capture_output=True,
+    )
+
+    assert _scan_workspace_symlinks(workspace) == []
+
+
+def test_inject_add_dirs_grants_git_roots_to_a_direct_claude_command() -> None:
+    out = _inject_add_dirs("claude -p --verbose", ["/host/.git"])
+
+    assert out == "claude --add-dir /host/.git -p --verbose"
+    assert shlex.split(out) == ["claude", "--add-dir", "/host/.git", "-p", "--verbose"]
+
+
+def test_inject_add_dirs_quotes_paths_and_preserves_pipelines() -> None:
+    out = _inject_add_dirs("claude -p | tee log.txt", ["/a b/.git"])
+
+    assert out == "claude --add-dir '/a b/.git' -p | tee log.txt"
+
+
+def test_inject_add_dirs_leaves_wrapper_scripts_alone() -> None:
+    """A wrapper hides the CLI token; it reads the env var instead."""
+    assert _inject_add_dirs("./run-claude.sh", ["/host/.git"]) == "./run-claude.sh"
+    assert _inject_add_dirs("claude -p", []) == "claude -p"
+
+
 def test_inject_writable_roots_modifies_direct_codex_command() -> None:
     out = _inject_writable_roots("codex app-server", ["/a", "/b"])
     assert out == (
@@ -1895,6 +2282,7 @@ def test_inject_writable_roots_only_substitutes_first_codex_token() -> None:
     assert _inject_writable_roots(cmd, ["/a"]) == cmd
 
 
+@requires_symlink_privilege
 def test_codex_start_command_prep_injects_when_symlinks_exist(
     tmp_path: Path,
 ) -> None:
@@ -1925,6 +2313,7 @@ def test_codex_start_command_prep_injects_when_symlinks_exist(
         claude=cfg.claude,
         gemini=cfg.gemini,
         pi=cfg.pi,
+        prime_agent=cfg.prime_agent,
         server=cfg.server,
         prompt_template=cfg.prompt_template,
     )
@@ -1939,6 +2328,7 @@ def test_codex_start_command_prep_injects_when_symlinks_exist(
     assert str(host_docs.resolve()) in env["SYMPHONY_CODEX_WRITABLE_ROOTS"]
 
 
+@requires_symlink_privilege
 def test_codex_turn_payload_carries_symlink_writable_roots(tmp_path: Path) -> None:
     host_docs = tmp_path / "host_docs"
     host_docs.mkdir()
@@ -1966,6 +2356,7 @@ def test_codex_turn_payload_carries_symlink_writable_roots(tmp_path: Path) -> No
         claude=cfg.claude,
         gemini=cfg.gemini,
         pi=cfg.pi,
+        prime_agent=cfg.prime_agent,
         server=cfg.server,
         prompt_template=cfg.prompt_template,
     )
@@ -1981,6 +2372,7 @@ def test_codex_turn_payload_carries_symlink_writable_roots(tmp_path: Path) -> No
     assert params["sandboxPolicy"]["writableRoots"] == [str(host_docs.resolve())]
 
 
+@requires_symlink_privilege
 def test_codex_start_command_prep_noop_when_not_workspace_write(
     tmp_path: Path,
 ) -> None:
@@ -2026,6 +2418,7 @@ def test_codex_start_command_prep_noop_when_no_symlinks(tmp_path: Path) -> None:
         claude=cfg.claude,
         gemini=cfg.gemini,
         pi=cfg.pi,
+        prime_agent=cfg.prime_agent,
         server=cfg.server,
         prompt_template=cfg.prompt_template,
     )
@@ -2038,6 +2431,7 @@ def test_codex_start_command_prep_noop_when_no_symlinks(tmp_path: Path) -> None:
     assert "SYMPHONY_CODEX_WRITABLE_ROOTS" not in env
 
 
+@requires_symlink_privilege
 def test_codex_start_command_prep_uses_env_var_for_wrapper(tmp_path: Path) -> None:
     """Wrapper script case: -c arg injection can't reach codex, so the env
     var is the only signal the wrapper has to honor."""
@@ -2067,6 +2461,7 @@ def test_codex_start_command_prep_uses_env_var_for_wrapper(tmp_path: Path) -> No
         claude=cfg.claude,
         gemini=cfg.gemini,
         pi=cfg.pi,
+        prime_agent=cfg.prime_agent,
         server=cfg.server,
         prompt_template=cfg.prompt_template,
     )
@@ -2109,6 +2504,50 @@ async def test_codex_handles_v2_token_usage_notification(tmp_path: Path) -> None
 
 
 @pytest.mark.asyncio
+async def test_codex_emits_agent_message_deltas_for_chat(tmp_path: Path) -> None:
+    cfg = _make_cfg("codex", workspace_root=tmp_path)
+    cwd = tmp_path / "ws"
+    cwd.mkdir()
+    events: list[dict[str, object]] = []
+
+    async def capture(event: dict[str, object]) -> None:
+        events.append(event)
+
+    backend = CodexAppServerBackend(
+        BackendInit(cfg=cfg, cwd=cwd, workspace_root=tmp_path, on_event=capture)
+    )
+    await backend._handle_notification(
+        {
+            "method": NOTIF_AGENT_MESSAGE_DELTA,
+            "params": {
+                "threadId": "t1",
+                "turnId": "tn1",
+                "itemId": "i1",
+                "delta": "streamed text",
+            },
+        }
+    )
+
+    assert events == [
+        {
+            "event": EVENT_OTHER_MESSAGE,
+            "timestamp": events[0]["timestamp"],
+            "payload": {
+                "type": "agent_delta",
+                "text": "streamed text",
+                "item_id": "i1",
+            },
+            "usage": {
+                "input_tokens": 0,
+                "output_tokens": 0,
+                "total_tokens": 0,
+            },
+            "rate_limits": None,
+            "agent_pid": None,
+        }
+    ]
+
+
 async def test_codex_captures_agent_message_from_item_completed(tmp_path: Path) -> None:
     cfg = _make_cfg("codex", workspace_root=tmp_path)
     cwd = tmp_path / "ws"
@@ -2419,8 +2858,13 @@ async def test_codex_handle_notification_truncates_long_agent_message(
     cfg = _make_cfg("codex", workspace_root=tmp_path)
     cwd = tmp_path / "ws"
     cwd.mkdir()
+    events: list[dict[str, Any]] = []
+
+    async def _capture(event: dict[str, Any]) -> None:
+        events.append(event)
+
     backend = CodexAppServerBackend(
-        BackendInit(cfg=cfg, cwd=cwd, workspace_root=tmp_path, on_event=_noop_event)
+        BackendInit(cfg=cfg, cwd=cwd, workspace_root=tmp_path, on_event=_capture)
     )
     long_text = "x" * (_ASSISTANT_MESSAGE_PREVIEW_CAP + 200)
     await backend._handle_notification(
@@ -2433,6 +2877,7 @@ async def test_codex_handle_notification_truncates_long_agent_message(
     )
     assert backend._latest_assistant_message.endswith("…")
     assert len(backend._latest_assistant_message) == _ASSISTANT_MESSAGE_PREVIEW_CAP + 1
+    assert events[-1]["payload"]["message"] == long_text
 
 
 # ---- Pi backend ---------------------------------------------------------
@@ -2576,14 +3021,14 @@ prompt body
     wf = parse_workflow_text(default_text, tmp_path / "WORKFLOW.md")
     cfg = build_service_config(wf)
     assert cfg.agent.kind == "agy"
-    assert cfg.agy.command == "agy --print -"
+    assert cfg.agy.command == 'agy --print "$(cat)"'
     assert cfg.agy.resume_across_turns is False
 
     alias_text = """---
 tracker: {kind: file, board_root: ./board}
 agent: {kind: antigravity}
 antigravity:
-  command: agy --print - --model gemini-test
+  command: agy --print "$(cat)" --model gemini-test
   resume_across_turns: false
 ---
 prompt body
@@ -2783,21 +3228,13 @@ async def test_codex_handles_v2_token_usage_camelcase_shape(tmp_path: Path) -> N
             },
         }
     )
-    # cachedInputTokens folds into input_tokens; reasoningOutputTokens folds
-    # into output_tokens. total_tokens is recomputed as folded_in + folded_out
-    # so the invariant `total_tokens == input_tokens + output_tokens` holds
-    # — codex's own narrower `totalTokens` (32595, which excludes cache and
-    # reasoning) is intentionally ignored.
+    # Cache and reasoning are subsets of input/output, not extra traffic.
     assert backend.latest_usage == {
-        "input_tokens": 32325 + 3456,             # 35781
-        "output_tokens": 270 + 170,               # 440
-        "total_tokens": (32325 + 3456) + (270 + 170),  # 36221, NOT 32595
+        "input_tokens": 32325,
+        "cache_input_tokens": 3456,
+        "output_tokens": 270,
+        "total_tokens": 32595,
     }
-    # Three-bucket invariant.
-    assert (
-        backend.latest_usage["total_tokens"]
-        == backend.latest_usage["input_tokens"] + backend.latest_usage["output_tokens"]
-    )
 
 
 @pytest.mark.asyncio
@@ -2809,6 +3246,8 @@ async def test_codex_v2_falls_back_to_last_when_total_absent(tmp_path: Path) -> 
     backend = CodexAppServerBackend(
         BackendInit(cfg=cfg, cwd=cwd, workspace_root=tmp_path, on_event=_noop_event)
     )
+    # A later payload that omits cache must not retain an earlier subset.
+    backend._update_tokens_from_v2_block({"inputTokens": 90, "cachedInputTokens": 80})
     await backend._handle_notification(
         {
             "method": NOTIF_THREAD_TOKEN_USAGE,
@@ -2950,3 +3389,504 @@ def test_codex_backend_is_progress_event_filters_to_assistant(tmp_path: Path) ->
     assert backend.is_progress_event({"type": "toolCall"}) is False
     assert backend.is_progress_event({"item": {"type": "agentMessage"}}) is False
     assert backend.is_progress_event({}) is False
+
+
+# ---------------------------------------------------------------------------
+# Durable crash-continuation backend seam
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("kind", ["gemini", "agy", "kiro"])
+@pytest.mark.asyncio
+async def test_resume_session_support_matrix_defaults_to_unsupported(
+    kind: str, tmp_path: Path
+) -> None:
+    cfg = _make_cfg(kind, workspace_root=tmp_path)
+    cwd = tmp_path / "ws"
+    cwd.mkdir()
+    backend = build_backend(
+        BackendInit(cfg=cfg, cwd=cwd, workspace_root=tmp_path, on_event=_noop_event)
+    )
+
+    assert await backend.resume_session("checkpoint-session") is False
+    assert backend.session_id is None
+
+
+@pytest.mark.parametrize(
+    "invalid_id", ["", "   ", "bad\nvalue", "bad\x7fvalue", "x" * 513]
+)
+@pytest.mark.asyncio
+async def test_resume_session_rejects_invalid_ids_without_mutating_state(
+    invalid_id: str, tmp_path: Path
+) -> None:
+    cfg = _make_cfg("claude", workspace_root=tmp_path)
+    cwd = tmp_path / "ws"
+    cwd.mkdir()
+    backend = ClaudeCodeBackend(
+        BackendInit(cfg=cfg, cwd=cwd, workspace_root=tmp_path, on_event=_noop_event)
+    )
+
+    assert await backend.resume_session(invalid_id) is False
+    assert backend.session_id is None
+
+
+@pytest.mark.asyncio
+async def test_resume_session_accepts_id_at_length_bound(tmp_path: Path) -> None:
+    cfg = _make_cfg("claude", workspace_root=tmp_path)
+    cwd = tmp_path / "ws"
+    cwd.mkdir()
+    backend = ClaudeCodeBackend(
+        BackendInit(cfg=cfg, cwd=cwd, workspace_root=tmp_path, on_event=_noop_event)
+    )
+    bounded_id = "x" * 512
+
+    assert await backend.resume_session(bounded_id) is True
+    assert backend.session_id == bounded_id
+
+
+@pytest.mark.asyncio
+async def test_claude_resume_session_uses_exact_id_on_next_turn(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    cfg = _make_cfg("claude", workspace_root=tmp_path)
+    cfg = replace(cfg, claude=replace(cfg.claude, resume_across_turns=False))
+    cwd = tmp_path / "ws"
+    cwd.mkdir()
+    exact_id = "claude session;$(literal)"
+    commands = _install_subprocess_double(
+        monkeypatch,
+        per_turn_module,
+        [
+            _FakeSubprocess(
+                stdout_lines=[
+                    (
+                        json.dumps(
+                            {
+                                "type": "system",
+                                "subtype": "init",
+                                "session_id": exact_id,
+                            }
+                        )
+                        + "\n"
+                    ).encode(),
+                    (
+                        json.dumps(
+                            {
+                                "type": "result",
+                                "subtype": "success",
+                                "is_error": False,
+                                "result": "resumed",
+                                "session_id": exact_id,
+                                "usage": {},
+                            }
+                        )
+                        + "\n"
+                    ).encode(),
+                ]
+            )
+        ],
+    )
+    backend = ClaudeCodeBackend(
+        BackendInit(cfg=cfg, cwd=cwd, workspace_root=tmp_path, on_event=_noop_event)
+    )
+
+    assert await backend.resume_session(exact_id) is True
+    assert backend.session_id == exact_id
+    await backend.run_turn(prompt="recover", is_continuation=False)
+
+    assert f"--resume {shlex.quote(exact_id)}" in commands[0]
+
+
+@pytest.mark.parametrize(
+    ("kind", "backend_cls", "flag"),
+    [
+        ("pi", PiBackend, "--session"),
+        ("prime-agent", PrimeAgentBackend, "--resume"),
+    ],
+)
+@pytest.mark.asyncio
+async def test_pi_family_resume_session_uses_exact_id_on_next_turn(
+    kind: str,
+    backend_cls: type[PiBackend],
+    flag: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    cfg = _make_cfg(kind, workspace_root=tmp_path)
+    if kind == "pi":
+        cfg = replace(cfg, pi=replace(cfg.pi, resume_across_turns=False))
+    else:
+        cfg = replace(
+            cfg,
+            prime_agent=replace(cfg.prime_agent, resume_across_turns=False),
+        )
+    cwd = tmp_path / "ws"
+    cwd.mkdir()
+    exact_id = f"{kind} session;$(literal)"
+    commands = _install_subprocess_double(
+        monkeypatch,
+        per_turn_module,
+        [
+            _FakeSubprocess(
+                stdout_lines=[
+                    (
+                        json.dumps({"type": "session", "version": 3, "id": exact_id})
+                        + "\n"
+                    ).encode(),
+                    b'{"type":"agent_end","messages":[]}\n',
+                ]
+            )
+        ],
+    )
+    backend = backend_cls(
+        BackendInit(cfg=cfg, cwd=cwd, workspace_root=tmp_path, on_event=_noop_event)
+    )
+
+    assert await backend.resume_session(exact_id) is True
+    assert backend.session_id == exact_id
+    await backend.run_turn(prompt="recover", is_continuation=False)
+
+    assert f"{flag} {shlex.quote(exact_id)}" in commands[0]
+
+
+@pytest.mark.asyncio
+async def test_opencode_resume_session_uses_exact_id_on_next_turn(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    cfg = _make_cfg("opencode", workspace_root=tmp_path)
+    cfg = replace(cfg, opencode=replace(cfg.opencode, resume_across_turns=False))
+    cwd = tmp_path / "ws"
+    cwd.mkdir()
+    exact_id = "opencode session;$(literal)"
+    commands = _install_subprocess_double(
+        monkeypatch,
+        per_turn_module,
+        [
+            _FakeSubprocess(
+                stdout_blob=(
+                    json.dumps(
+                        {
+                            "type": "text",
+                            "sessionID": exact_id,
+                            "part": {"type": "text", "text": "resumed"},
+                        }
+                    )
+                    + "\n"
+                ).encode()
+            )
+        ],
+    )
+    lifecycle: list[tuple[str, object]] = []
+
+    async def _capture(event: dict[str, Any]) -> None:
+        lifecycle.append(("event", event["event"]))
+
+    backend = OpenCodeBackend(
+        BackendInit(
+            cfg=cfg,
+            cwd=cwd,
+            workspace_root=tmp_path,
+            on_event=_capture,
+            on_process_started=lambda pid: lifecycle.append(("pid", pid)),
+        )
+    )
+
+    assert await backend.resume_session(exact_id) is True
+    assert backend.session_id == exact_id
+    await backend.run_turn(prompt="recover", is_continuation=False)
+
+    assert f"--session {shlex.quote(exact_id)}" in commands[0]
+    assert lifecycle[0] == ("pid", 98765)
+    assert lifecycle[1][0] == "event"
+
+
+@pytest.mark.parametrize(
+    ("kind", "backend_cls", "spawn_module"),
+    [
+        ("claude", ClaudeCodeBackend, per_turn_module),
+        ("pi", PiBackend, per_turn_module),
+        ("prime-agent", PrimeAgentBackend, per_turn_module),
+        ("opencode", OpenCodeBackend, per_turn_module),
+    ],
+)
+@pytest.mark.asyncio
+async def test_resumed_cli_rejects_mismatched_reported_session_id(
+    kind: str,
+    backend_cls: type,
+    spawn_module: object,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    requested = f"private-requested-{kind}"
+    emitted = f"private-emitted-{kind}"
+    if kind == "claude":
+        proc = _FakeSubprocess(
+            stdout_lines=[
+                (
+                    json.dumps(
+                        {
+                            "type": "system",
+                            "subtype": "init",
+                            "session_id": requested,
+                        }
+                    )
+                    + "\n"
+                ).encode(),
+                (
+                    json.dumps(
+                        {
+                            "type": "result",
+                            "subtype": "success",
+                            "result": "wrong session",
+                            "session_id": emitted,
+                            "usage": {},
+                        }
+                    )
+                    + "\n"
+                ).encode(),
+            ]
+        )
+    elif kind in {"pi", "prime-agent"}:
+        proc = _FakeSubprocess(
+            stdout_lines=[
+                (json.dumps({"type": "session", "id": requested}) + "\n").encode(),
+                (json.dumps({"type": "session", "id": emitted}) + "\n").encode(),
+                b'{"type":"agent_end","messages":[]}\n',
+            ]
+        )
+    else:
+        proc = _FakeSubprocess(
+            stdout_blob=(
+                (
+                    json.dumps(
+                        {
+                            "type": "step_start",
+                            "sessionID": requested,
+                            "part": {"type": "step-start"},
+                        }
+                    )
+                    + "\n"
+                    + json.dumps(
+                        {
+                            "type": "text",
+                            "sessionID": emitted,
+                            "part": {"type": "text", "text": "wrong session"},
+                        }
+                    )
+                    + "\n"
+                ).encode()
+            )
+        )
+    _install_subprocess_double(monkeypatch, spawn_module, [proc])
+    cfg = _make_cfg(kind, workspace_root=tmp_path)
+    cwd = tmp_path / "ws"
+    cwd.mkdir()
+    events: list[dict[str, Any]] = []
+
+    async def _capture(event: dict[str, Any]) -> None:
+        events.append(event)
+
+    backend = backend_cls(
+        BackendInit(cfg=cfg, cwd=cwd, workspace_root=tmp_path, on_event=_capture)
+    )
+    assert await backend.resume_session(requested) is True
+
+    with pytest.raises(TurnFailed, match="different recovered session"):
+        await backend.run_turn(prompt="recover", is_continuation=False)
+
+    assert backend.session_id == requested
+    assert EVENT_TURN_COMPLETED not in [event["event"] for event in events]
+    assert requested not in str(events)
+    assert emitted not in str(events)
+
+
+@pytest.mark.parametrize(
+    ("kind", "backend_cls"),
+    [("pi", PiBackend), ("prime-agent", PrimeAgentBackend)],
+)
+@pytest.mark.asyncio
+async def test_pi_family_synthetic_success_requires_resume_confirmation(
+    kind: str,
+    backend_cls: type[PiBackend],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    requested = f"private-requested-{kind}"
+    proc = _FakeSubprocess(
+        stdout_lines=[
+            (
+                json.dumps(
+                    {
+                        "type": "message_end",
+                        "message": {
+                            "role": "assistant",
+                            "content": [{"type": "text", "text": "done"}],
+                            "usage": {},
+                        },
+                    }
+                )
+                + "\n"
+            ).encode()
+        ],
+        returncode=0,
+    )
+    _install_subprocess_double(monkeypatch, per_turn_module, [proc])
+    cfg = _make_cfg(kind, workspace_root=tmp_path)
+    cwd = tmp_path / "ws"
+    cwd.mkdir()
+    events: list[dict[str, Any]] = []
+
+    async def _capture(event: dict[str, Any]) -> None:
+        events.append(event)
+
+    backend = backend_cls(
+        BackendInit(cfg=cfg, cwd=cwd, workspace_root=tmp_path, on_event=_capture)
+    )
+    assert await backend.resume_session(requested) is True
+
+    with pytest.raises(TurnFailed, match="did not confirm"):
+        await backend.run_turn(prompt="recover", is_continuation=False)
+
+    assert EVENT_TURN_COMPLETED not in [event["event"] for event in events]
+    assert requested not in str(events)
+
+
+@pytest.mark.parametrize("kind", ["claude", "pi", "opencode"])
+@pytest.mark.asyncio
+async def test_resumed_cli_failure_redacts_private_session_id(
+    kind: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    exact_id = f"private-{kind}-session"
+    stderr = f"rejected session {exact_id}\n".encode()
+    events: list[dict[str, Any]] = []
+
+    async def _capture(event: dict[str, Any]) -> None:
+        events.append(event)
+
+    cfg = _make_cfg(kind, workspace_root=tmp_path)
+    cwd = tmp_path / "ws"
+    cwd.mkdir()
+    if kind == "claude":
+        module = per_turn_module
+        backend = ClaudeCodeBackend(
+            BackendInit(cfg=cfg, cwd=cwd, workspace_root=tmp_path, on_event=_capture)
+        )
+        process = _FakeSubprocess(stderr_blob=stderr, returncode=1)
+    elif kind == "pi":
+        module = per_turn_module
+        backend = PiBackend(
+            BackendInit(cfg=cfg, cwd=cwd, workspace_root=tmp_path, on_event=_capture)
+        )
+        process = _FakeSubprocess(stderr_blob=stderr, returncode=1)
+    else:
+        module = per_turn_module
+        backend = OpenCodeBackend(
+            BackendInit(cfg=cfg, cwd=cwd, workspace_root=tmp_path, on_event=_capture)
+        )
+        process = _FakeSubprocess(
+            stdout_blob=b"", stderr_blob=stderr, returncode=1
+        )
+    _install_subprocess_double(monkeypatch, module, [process])
+
+    assert await backend.resume_session(exact_id) is True
+    with pytest.raises(TurnFailed) as caught:
+        await backend.run_turn(prompt="recover", is_continuation=False)
+
+    evidence = json.dumps(events) + str(caught.value)
+    assert exact_id not in evidence
+
+
+@pytest.mark.asyncio
+async def test_codex_resume_session_uses_thread_resume_and_verified_exact_id(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    cfg = _make_cfg("codex", workspace_root=tmp_path)
+    cwd = tmp_path / "ws"
+    cwd.mkdir()
+    backend = CodexAppServerBackend(
+        BackendInit(cfg=cfg, cwd=cwd, workspace_root=tmp_path, on_event=_noop_event)
+    )
+    calls: list[tuple[str, dict[str, Any]]] = []
+    exact_id = "codex-thread-exact"
+
+    async def fake_request(method: str, params: dict[str, Any]) -> dict[str, Any]:
+        calls.append((method, params))
+        return {"thread": {"id": exact_id}}
+
+    monkeypatch.setattr(backend, "_request", fake_request)
+
+    assert await backend.resume_session(exact_id) is True
+    assert calls == [("thread/resume", {"threadId": exact_id})]
+    assert backend.session_id == exact_id
+
+
+@pytest.mark.parametrize(
+    "response",
+    [{}, {"thread": {}}, {"thread": {"id": "different-thread"}}],
+)
+@pytest.mark.asyncio
+async def test_codex_resume_session_unverified_response_falls_back_without_mutation(
+    response: dict[str, Any], tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    cfg = _make_cfg("codex", workspace_root=tmp_path)
+    cwd = tmp_path / "ws"
+    cwd.mkdir()
+    backend = CodexAppServerBackend(
+        BackendInit(cfg=cfg, cwd=cwd, workspace_root=tmp_path, on_event=_noop_event)
+    )
+    backend._thread_id = "existing-thread"
+
+    async def fake_request(method: str, params: dict[str, Any]) -> dict[str, Any]:
+        del method, params
+        return response
+
+    monkeypatch.setattr(backend, "_request", fake_request)
+
+    assert await backend.resume_session("checkpoint-thread") is False
+    assert backend.session_id == "existing-thread"
+
+
+@pytest.mark.asyncio
+async def test_codex_resume_session_rpc_rejection_falls_back_without_mutation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    cfg = _make_cfg("codex", workspace_root=tmp_path)
+    cwd = tmp_path / "ws"
+    cwd.mkdir()
+    backend = CodexAppServerBackend(
+        BackendInit(cfg=cfg, cwd=cwd, workspace_root=tmp_path, on_event=_noop_event)
+    )
+    backend._thread_id = "existing-thread"
+
+    async def fake_request(method: str, params: dict[str, Any]) -> dict[str, Any]:
+        del method, params
+        raise ResponseError("resume unavailable")
+
+    monkeypatch.setattr(backend, "_request", fake_request)
+
+    assert await backend.resume_session("checkpoint-thread") is False
+    assert backend.session_id == "existing-thread"
+
+
+@pytest.mark.asyncio
+async def test_codex_replays_live_usage_without_counting_cached_input_twice(tmp_path):
+    # Actual GPT-6 Astra low session, 2026-09-12: total=31,349, cache=12,928.
+    cfg = _make_cfg("codex", workspace_root=tmp_path)
+    cwd = tmp_path / "ws"
+    cwd.mkdir()
+    backend = CodexAppServerBackend(
+        BackendInit(cfg=cfg, cwd=cwd, workspace_root=tmp_path, on_event=_noop_event)
+    )
+    event = {
+        "method": NOTIF_THREAD_TOKEN_USAGE,
+        "params": {"tokenUsage": {"total": {
+            "inputTokens": 31080, "cachedInputTokens": 12928,
+            "outputTokens": 269, "reasoningOutputTokens": 0, "totalTokens": 31349,
+        }}},
+    }
+    for _ in range(2):
+        await backend._handle_notification(event)
+        assert backend.latest_usage == {
+            "input_tokens": 31080, "output_tokens": 269, "total_tokens": 31349,
+            "cache_input_tokens": 12928,
+        }

@@ -444,6 +444,8 @@ def build_prompt_env(
     rewind_scope: list[dict[str, Any]] | None = None,
     compact_issue_context: bool = False,
     full_ticket_path: str | None = None,
+    artifacts_dir: str = "",
+    board_health: str = "",
 ) -> dict[str, Any]:
     """§12.1 — input variables for prompt rendering.
 
@@ -454,7 +456,7 @@ def build_prompt_env(
 
     `is_rewind` is True when this prompt is being rendered for a phase
     transition that moves *backwards* in the pipeline (Verify→In Progress
-    or Learn→In Progress). The orchestrator's `attempt` counter only fires on
+    or Document→In Progress). The orchestrator's `attempt` counter only fires on
     full worker re-dispatch from the retry path, so an in-flight rewind
     inside a single worker run otherwise has no signal to give the agent.
     Always present in the env (default False) so strict templates that
@@ -472,6 +474,15 @@ def build_prompt_env(
     list when no rewind / parsing failed. Available to templates as
     `{{ rewind_scope }}` (typically iterated with `{% for row in
     rewind_scope %}…{% endfor %}`).
+
+    `artifacts_dir` is the workspace directory workers drop board
+    deliverables into (`artifacts.dir`), or "" when artifact collection is
+    disabled — so templates can guard with `{% if artifacts_dir %}`.
+
+    `board_health` is the few-line `stats.board_health_summary` of the last
+    30 days (rewinds, contract failures, recurring misses), passed only to
+    the write-back lane so it can turn repeat failures into lessons; ""
+    elsewhere and on healthy boards (`{% if board_health %}`).
     """
     if hasattr(issue_obj, "to_template_dict"):
         issue_dict = issue_obj.to_template_dict()
@@ -501,6 +512,8 @@ def build_prompt_env(
         "token_ema": int(token_ema or 0),
         "token_budget": int(token_budget or 0),
         "rewind_scope": list(rewind_scope) if rewind_scope else [],
+        "artifacts_dir": artifacts_dir or "",
+        "board_health": board_health or "",
     }
 
 
@@ -520,7 +533,9 @@ def build_first_turn_prompt(
     rewind_scope: list[dict[str, Any]] | None = None,
     compact_issue_context: bool = False,
     full_ticket_path: str | None = None,
+    artifacts_dir: str = "",
     extra_context: str = "",
+    board_health: str = "",
 ) -> tuple[str, dict[str, Any]]:
     """Construct the first-turn prompt sent to a worker.
 
@@ -531,7 +546,7 @@ def build_first_turn_prompt(
 
     `is_rewind=True` is forwarded to the template env so WORKFLOW.md
     authors can branch the retry-preamble block on rewind specifically
-    (in-flight `Verify→In Progress` / `Learn→In Progress` handoffs that
+    (in-flight `Verify→In Progress` / `Document→In Progress` handoffs that
     don't trip the dispatch-level retry counter).
 
     `token_ema` / `token_budget` / `rewind_scope` plumb the C3 + A2
@@ -560,6 +575,8 @@ def build_first_turn_prompt(
         rewind_scope=rewind_scope,
         compact_issue_context=compact_issue_context,
         full_ticket_path=full_ticket_path,
+        artifacts_dir=artifacts_dir,
+        board_health=board_health,
     )
     env["turn_number"] = turn_number
     env["max_turns"] = max_turns

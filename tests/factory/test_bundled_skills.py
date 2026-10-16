@@ -1,11 +1,25 @@
 from importlib.resources import files
 import json
+import os
+import subprocess
 from pathlib import Path
 import re
 
 import pytest
 
 from symphony.cli import factory as factory_cli
+from symphony._shell import resolve_bash
+
+
+def _directory_link(destination: Path, target: Path) -> None:
+    if os.name == "nt":
+        subprocess.run(
+            ["cmd", "/c", "mklink", "/J", str(destination), str(target)],
+            check=True, capture_output=True,
+        )
+        assert destination.is_junction()
+    else:
+        destination.symlink_to(target, target_is_directory=True)
 
 
 STANDARD_SKILLS = ("supergoal", "superdesign", "superpm", "superqa")
@@ -147,12 +161,13 @@ def test_force_replaces_non_directory_project_skill_destinations(
             (link_target / "agents/executor.md").write_text(
                 "custom executor\n", encoding="utf-8"
             )
-        destination.symlink_to(link_target, target_is_directory=True)
+        _directory_link(destination, link_target)
 
     factory_cli._install_skills(target, {"supergoal"}, force=True)
 
     assert destination.is_dir()
     assert not destination.is_symlink()
+    assert not destination.is_junction()
     assert "custom" not in (destination / "SKILL.md").read_text(encoding="utf-8")
     if destination_kind == "symlink":
         assert (link_target / "SKILL.md").read_text(encoding="utf-8") == "custom\n"
@@ -162,7 +177,7 @@ def test_broken_project_skill_symlink_requires_force(tmp_path: Path) -> None:
     target = tmp_path / "project"
     destination = target / "skills/supergoal"
     destination.parent.mkdir(parents=True)
-    destination.symlink_to(tmp_path / "missing-supergoal", target_is_directory=True)
+    _directory_link(destination, tmp_path / "missing-supergoal")
 
     with pytest.raises(FileExistsError, match="factory sync.*--force"):
         factory_cli._install_skills(target, {"supergoal"}, force=False)
@@ -174,11 +189,11 @@ def test_init_preflights_broken_skill_symlink_before_copying_assets(
     target = tmp_path / "project"
     destination = target / "skills/supergoal"
     destination.parent.mkdir(parents=True)
-    destination.symlink_to(tmp_path / "missing-supergoal", target_is_directory=True)
+    _directory_link(destination, tmp_path / "missing-supergoal")
 
     assert factory_cli.main(["init", str(target)]) == 1
 
-    assert destination.is_symlink()
+    assert destination.is_symlink() or destination.is_junction()
     assert not (target / "WORKFLOW.md").exists()
 
 
@@ -251,8 +266,17 @@ def test_all_source_and_generated_shell_assets_are_executable(tmp_path: Path) ->
     for source in bundled.rglob("*.sh"):
         relative = source.relative_to(bundled)
         generated = target / "skills" / relative
-        assert source.stat().st_mode & 0o111, f"source is not executable: {relative}"
-        assert generated.stat().st_mode & 0o111, f"generated is not executable: {relative}"
+        if os.name == "nt":
+            # Windows chmod cannot represent POSIX execute bits; Git preserves the mode.
+            index = subprocess.run(
+                ["git", "ls-files", "--stage", "--", source.relative_to(Path.cwd()).as_posix()],
+                check=True, capture_output=True, text=True,
+            ).stdout
+            assert index.startswith("100755 "), f"source mode is not executable: {relative}"
+            subprocess.run([resolve_bash(), "-n", str(generated)], check=True)
+        else:
+            assert source.stat().st_mode & 0o111, f"source is not executable: {relative}"
+            assert generated.stat().st_mode & 0o111, f"generated is not executable: {relative}"
 
 
 def test_superqa_editable_install_metadata_has_its_readme() -> None:
@@ -338,3 +362,78 @@ def test_unknown_custom_skill_has_actionable_failure(
     message = str(exc_info.value)
     assert "missing-check" in message
     assert str(home / ".agents/skills") in message
+
+
+def test_skill_install_preflights_all_destinations_before_copy(tmp_path: Path) -> None:
+    target = tmp_path / "project"
+    incomplete = target / "skills/superqa"
+    incomplete.mkdir(parents=True)
+    (incomplete / "SKILL.md").write_text("operator version", encoding="utf-8")
+
+    with pytest.raises(FileExistsError, match="incomplete"):
+        factory_cli._install_skills(target, {"supergoal", "superqa"}, force=False)
+
+    assert not (target / "skills/supergoal").exists()
+    assert (incomplete / "SKILL.md").read_text(encoding="utf-8") == "operator version"
+
+
+@pytest.mark.parametrize("force", [False, True])
+def test_init_refuses_linked_asset_parent_without_touching_target(
+    tmp_path: Path, force: bool,
+) -> None:
+    target = tmp_path / "project"
+    target.mkdir()
+    external = tmp_path / "external-docs"
+    external.mkdir()
+    _directory_link(target / "docs", external)
+
+    argv = ["init", str(target)] + (["--force"] if force else [])
+    assert factory_cli.main(argv) == 1
+    assert not (target / "WORKFLOW.md").exists()
+    assert list(external.iterdir()) == []
+
+
+def test_copied_skill_shell_scripts_restore_execute_bits(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    root = tmp_path / "installed"
+    source = root / "custom-shell"
+    source.mkdir(parents=True)
+    (source / "SKILL.md").write_text("# Custom shell\n", encoding="utf-8")
+    script = source / "check.sh"
+    script.write_text("#!/usr/bin/env bash\nprintf 'copied script ran'\n", encoding="utf-8")
+    script.chmod(0o644)
+    monkeypatch.setattr(factory_cli, "_SKILL_SEARCH_ROOTS", (root,))
+    target = tmp_path / "project"
+
+    factory_cli._install_skills(target, {"custom-shell"}, force=False)
+    generated = target / "skills/custom-shell/check.sh"
+    if os.name != "nt":
+        assert not script.stat().st_mode & 0o111
+        assert generated.stat().st_mode & 0o111
+    result = subprocess.run(
+        [resolve_bash(), "-c", 'exec "$1"', "bash", str(generated)],
+        check=True, capture_output=True, text=True,
+    )
+    assert result.stdout == "copied script ran"
+
+
+def test_bundled_visual_diff_preserves_pixel_threshold_and_overlay(tmp_path: Path) -> None:
+    from PIL import Image
+    from symphony.factory.bundled_skills.superqa.superqa_tui.visual import compare_images
+
+    baseline = tmp_path / "baseline.png"
+    current = tmp_path / "current.png"
+    overlay = tmp_path / "overlay.png"
+    Image.new("RGB", (4, 1), (0, 0, 0)).save(baseline)
+    image = Image.new("RGB", (4, 1))
+    image.putdata([(value, value, value) for value in (0, 24, 25, 255)])
+    image.save(current)
+
+    assert compare_images(baseline, current, overlay) == 50.0
+    with Image.open(overlay) as actual:
+        assert actual.getpixel((1, 0)) == (24, 24, 24)
+        assert actual.getpixel((2, 0)) == (220, 38, 38)
+    unchanged_overlay = tmp_path / "unchanged.png"
+    assert compare_images(baseline, baseline, unchanged_overlay) == 0.0
+    assert not unchanged_overlay.exists()

@@ -19,18 +19,23 @@ through this module's globals, so tests patch
 from __future__ import annotations
 
 import asyncio
+import copy
 import json
 import os
 import re
+import subprocess
+import threading
 import time
-import traceback
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from datetime import datetime, timedelta, timezone
-from pathlib import Path
-from typing import Any, Awaitable, Callable, Coroutine
+from enum import Enum
+from functools import partial
+from pathlib import Path, PurePosixPath
+from typing import Any, Awaitable, Callable, Coroutine, TypeVar, cast
 
 from .. import __version__
-from .._shell import kill_process_group
+from .._shell import kill_process_group, process_group_exists, process_identity
+from ..artifacts import ArtifactRecord, ArtifactStore, format_bytes
 from ..backends import (
     EVENT_AGENT_RETRY,
     EVENT_APPROVAL_DENIED,
@@ -41,45 +46,59 @@ from ..backends import (
     EVENT_TURN_COMPLETED,
     AgentBackend,
     BackendInit,
+    redact_session_id,
 )
 from ..backends import build_backend
+from ..chat import cfg_for_mode
+from ..utils import git_inspect
 from ..utils.archive import select_archivable
+from ..utils.atomic_json import state_file_name, write_json_atomic
 from ..backends.codex import linear_graphql_tool
-from ..errors import (
-    SymphonyError,
-    TurnFailed,
-    TurnInputRequired,
-    TurnTimeout,
-    TurnCancelled,
-)
+from ..errors import SymphonyError
 from ..continuous_improvement import (
+    AgentTask,
     FileLease,
+    any_mode_due,
     ImprovementRunner,
     Lease,
     default_improvement_runner,
     lease_path_for,
 )
+from ..factory.wayfinder import factory_proof_commands
 from ..issue import BlockerRef, Issue, normalize_state
 from ..logging import get_logger
-from ..prompt import build_continuation_prompt, build_first_turn_prompt
+from ..prompt import build_first_turn_prompt
+from ..runtime_safety import ensure_workflow_repo_is_safe
+from ..service_identity import SERVICE_INSTANCE_ENV, normalize_service_instance_id
 from ..skills import render_skill_block, select_skills_for_stage
-from ..stats import StatsStore, stats_store_for
-from ..trackers import build_tracker_client
+from ..stats import StatsStore, board_health_summary, stats_store_for
+from ..trackers import TrackerClient, build_tracker_client
 from ..utils.wiki_sweep import sweep as _wiki_sweep_run
 from ..workflow import (
     DEFAULT_TERMINAL_STATES,
     ServiceConfig,
     SUPPORTED_AGENT_KINDS,
+    SYMPHONY_BRANCH_PREFIX,
     WorkflowState,
     validate_for_dispatch,
 )
+from ..workflow.presets import guess_lane_preset
 from ..utils.auto_merge import AutoMergeResult, auto_merge_on_done_best_effort
-from ..workspace import WorkspaceManager, commit_workspace_on_done
+from ..utils.git_sandbox import SANDBOX_WRITE_DENIED, classify_history_failure
+from ..workspace import (
+    HISTORY_PUSH_FAILED,
+    WorkspaceManager,
+    commit_workspace_on_done,
+    # Only `worker_exit` calls this now, and it reads it through this
+    # module's globals so `symphony.orchestrator.core.finalize_delivery_history`
+    # stays the documented monkeypatch seam (see module docstring).
+    finalize_delivery_history,  # noqa: F401
+    verify_branch_history,
+)
 from .constants import (
     ARCHIVE_SWEEP_INTERVAL_SEC,
     AUTO_TRIAGE_NOTE,
     AUTO_TRIAGE_TARGET_STATE,
-    CONTINUATION_RETRY_DELAY_MS,
     EMPTY_TURN_LOOP_THRESHOLD,
     ESCALATION_MAX_ATTEMPTS,
     ESCALATION_RETRY_DELAY_MS,
@@ -93,17 +112,47 @@ from .constants import (
     WAIT_AGE_BUMP_MIN,
     _TOKEN_EMA_ALPHA,
 )
-from .contracts import evaluate_contract
+from .contracts import _build_result, contract_producing_states, evaluate_contract
+from .factory_contracts import (
+    factory_browser_failures,
+    factory_verification_text,
+)
+from .release_contracts import (
+    ReleaseValidationResult,
+    release_workspace_target_errors,
+    resolve_target_release_identity,
+    # Only `release_transition` calls this now, through this module's
+    # globals, so `symphony.orchestrator.core.validate_release_contract`
+    # stays the documented monkeypatch seam (see that module's docstring).
+    validate_release_contract,  # noqa: F401
+)
+from .release_cycle import (
+    ReleaseCycleService,
+    ReleaseCycleWriteResult as _ReleaseCycleWriteResult,
+    has_active_verify_lane as _has_active_release_verify_lane,
+    has_release_finalizer_lane as _has_release_finalizer_lane,
+    initial_release_gate_fingerprint as _initial_release_gate_fingerprint,
+    is_release_success_state as _is_release_success_state,
+    is_release_evidence_issue as _is_release_evidence_issue,
+    is_release_finalizer as _is_release_finalizer,
+    release_ticket_version_token as _release_ticket_version_token,
+    release_verifier_state as _release_verifier_state,
+)
 from .dispatch_state import DispatchState
 from .entries import RetryEntry, RunningEntry, _CodexTotals, _IssueDebug
+from .executors import LegacyStageExecutor, TicketExecutor, TicketRunContext
 from .helpers import (
     _branch_hook_env,
+    _is_successful_terminal_state,
     _branch_already_merged_into_target,
+    _canonical_state_label,
     _config_for_issue_agent,
+    resolve_symphony_cli,
     _from_monotonic_to_iso,
     _is_auto_triage_todo_candidate,
     _is_rewind_transition,
-    _max_turns_exhausted_target_state,
+    _human_review_target_state,
+    _rewind_budget_target_state,
     _notify_state_transition,
     _requested_agent_kind,
     _sort_for_dispatch_fifo,
@@ -112,7 +161,24 @@ from .helpers import (
     _utc_iso_z,
 )
 from .parsing import _parse_findings_rows, _parse_touched_files
-from .run_registry import RunRecord, RunRegistry, registry_path_for_workflow
+from .scheduler import (
+    MAX_DEPENDENCY_EDGES,
+    MAX_DEPENDENCY_NODES,
+    DependencyAnalysis,
+    analyze_dependencies,
+    sort_candidates,
+)
+from .run_registry import (
+    ContinuationCheckpoint,
+    ReleaseEvidenceIdentity,
+    ReleaseGate,
+    RunRecord,
+    RunRegistry,
+    registry_path_for_workflow,
+)
+from . import attempt as agent_attempt
+from . import release_transition
+from . import worker_exit
 
 
 # Initiative D — the former ``_pkg.<name>`` parent-package indirection is
@@ -146,18 +212,186 @@ _RETRYABLE_WORKER_ERROR_MARKERS = (
     "temporarily overloaded",
     "overloaded",
     "service unavailable",
+    # Google-backed CLIs (agy) report a transient 503 as
+    # "UNAVAILABLE (code 503): The service is currently unavailable.",
+    # which the "service unavailable" substring above does not match.
+    "service is currently unavailable",
+    "unavailable (code 503)",
     "connection error",
     "network error",
     "connection reset",
     "connection timed out",
     "try again later",
+    # Transient backend stream faults (acceptance finding 3). The strings
+    # below are emitted verbatim by the backends; `test_backend_contract.py`
+    # pins them so the two lists cannot drift apart.
+    "stream unreadable",  # claude_code.py / codex.py / pi.py
+    "no result event",  # claude_code.py — rc!=0 with no result frame
 )
+
+
+class _EligibilityDisposition(str, Enum):
+    READY = "ready"
+    WAIT_SLOT = "wait_slot"
+    WAIT_NON_SLOT = "wait_non_slot"
+    REJECT = "reject"
+
+
+@dataclass(frozen=True)
+class _EligibilityDecision:
+    disposition: _EligibilityDisposition
+    code: str
+    reason: str
+
+
+@dataclass(frozen=True)
+class _RunLeaseAcquisition:
+    """One new lease and an optional predecessor checkpoint."""
+
+    run_id: str
+    continued_from_run_id: str = ""
+    checkpoint: ContinuationCheckpoint | None = None
+
+
+@dataclass(frozen=True)
+class _ReleaseDispatchAuthority:
+    """Monotonic release role resolved before a worker lease is acquired."""
+
+    issue: Issue
+    gate: ReleaseGate | None = None
+    app_release: bool = False
+    cycle_verifier: bool = False
+    finalizer: bool = False
+
+
+@dataclass(frozen=True)
+class _AgentPhaseState:
+    issue: Issue
+    cfg: ServiceConfig
+    client: AgentBackend
+    first_prompt: str
+    current_state: str
+    known_app_release: bool
+
+
+@dataclass(frozen=True)
+class _AgentPhaseTransition:
+    state: _AgentPhaseState
+    is_rewind: bool
+
+
+@dataclass(frozen=True)
+class _StageContractOutcome:
+    """Result of `Orchestrator._enforce_stage_contract`."""
+
+    issue: Issue
+    current_state: str
+    known_app_release: bool
+    rewound: bool
+
+
+class _ReleaseTransitionAuthorityLost(SymphonyError):
+    """A stale release worker must exit without mutating its replacement."""
+
+
+_T = TypeVar("_T")
+
+
+class _TrackerClientUnavailable(SymphonyError):
+    """The shared tracker client is closed or closing (stop() raced a poll).
+
+    Raised by `_checkout_shared_tracker_client` and by bridge invocations
+    that observe the pool closing mid-call. Callers already treat tracker
+    bridge failures as retryable (next tick rebuilds or skips), so this is
+    a clean, loggable dead-end rather than a thread-killing RuntimeError.
+    """
+
+
+# httpx raises a bare RuntimeError with this message from `Client.send`
+# once `close()` has run — the exact text is its only stable contract.
+_HTTPX_CLIENT_CLOSED_MARKERS = (
+    "client has been closed",
+    "client has already been closed",
+)
+
+
+def _is_closed_client_runtime_error(exc: BaseException) -> bool:
+    return isinstance(exc, RuntimeError) and any(
+        marker in str(exc) for marker in _HTTPX_CLIENT_CLOSED_MARKERS
+    )
+
+
+# The one path a continuous-improvement agent turn may write in the host
+# worktree. Mirrors `continuous_improvement.AGENT_OUTPUT_DIR`.
+CI_AGENT_OUTPUT_PREFIX = ".symphony/continuous-improvement/proposals/"
+
+
+def _worktree_status_snapshot(cwd: Path) -> dict[str, str] | None:
+    """`path -> porcelain status code` for a worktree, or None when not git.
+
+    Untracked files are listed individually (`-uall`) so a new file in a
+    previously-clean directory is visible as its own path.
+    """
+    try:
+        result = subprocess.run(
+            ["git", "status", "--porcelain=v1", "-uall", "-z"],
+            cwd=str(cwd),
+            capture_output=True,
+            text=True,
+            timeout=60,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if result.returncode != 0:
+        return None
+    snapshot: dict[str, str] = {}
+    for record in result.stdout.split("\0"):
+        if len(record) < 4:
+            continue
+        code, path = record[:2], record[3:]
+        if path:
+            snapshot[path] = code
+    return snapshot
 
 
 def _clean_board_error_message(message: str) -> str:
     without_ansi = _ANSI_ESCAPE_RE.sub("", message)
     without_controls = _CONTROL_CHAR_RE.sub("", without_ansi)
     return " ".join(without_controls.split())
+
+
+# Errors that mean "this backend's account is out of budget for now": a
+# retry with backoff on the same backend cannot help, but another backend
+# can (2026-09-05 E2E: codex usage limit paused the worker until an operator
+# re-pinned the ticket by hand). Distinct from the transient
+# `_RETRYABLE_WORKER_ERROR_MARKERS` (429 / rate limit), which retry in place.
+_QUOTA_WORKER_ERROR_MARKERS = (
+    "usage limit",
+    "usage_limit",
+    "session limit",
+    "quota",
+    "insufficient_quota",
+    "insufficient credits",
+    "out of credits",
+    "credit balance",
+    "billing",
+    "plan limit",
+    "weekly limit",
+    "monthly limit",
+)
+
+
+def _is_quota_worker_error(reason: str, error: str | None) -> bool:
+    detail = f"{reason}: {error}" if error else reason
+    clean = _clean_board_error_message(detail).lower()
+    if any(marker in clean for marker in _QUOTA_WORKER_ERROR_MARKERS):
+        return True
+    # Generic limit wording also appears in transient rate-limit errors.
+    # Explicit account/quota markers above still win when both are present.
+    return not _has_retryable_worker_marker(clean) and any(
+        marker in clean for marker in ("limit reached", "limit exceeded")
+    )
 
 
 def _worker_error_pause_reason(reason: str, error: str | None) -> str:
@@ -191,9 +425,7 @@ def _is_retryable_auto_pause_reason(pause_reason: str | None) -> bool:
     clean = _clean_board_error_message(pause_reason).lower()
     if "worker error:" not in clean or "paused for operator inspection" not in clean:
         return False
-    return _has_retryable_worker_marker(clean) or _is_opencode_sigterm_retry(
-        "", clean
-    )
+    return _has_retryable_worker_marker(clean) or _is_opencode_sigterm_retry("", clean)
 
 
 def _update_state_turn_counter(debug: _IssueDebug, state: str) -> int:
@@ -215,6 +447,103 @@ def _normalize_agent_pid(value: object) -> int | None:
     return None
 
 
+def _reclaim_kill_confirm(record: RunRecord) -> str | None:
+    """Prove-and-kill one reclaimed run's recorded backend process.
+
+    Pure OS work — identity probe, process-group kill, and the bounded
+    gone-confirm poll — with no registry access, so callers can run it
+    inside ``asyncio.to_thread`` without breaking the registry's
+    thread-affine SQLite connection. Returns the outcome label
+    ("killed" / "not_found" / "identity_mismatch"), or ``None`` when the
+    incarnation could not be proven and the caller must NOT finalize.
+    """
+    pid = record.backend_agent_pid
+    if pid is not None and pid <= 0:
+        log.warning(
+            "reclaim_invalid_orphan_agent_pid",
+            issue_id=record.issue_id,
+            identifier=record.identifier,
+            pid=pid,
+        )
+        return None
+    if pid is None:
+        return "no_backend_pid"
+    expected_identity = record.backend_process_identity
+    current_identity = process_identity(pid)
+    group_exists = process_group_exists(pid)
+    if current_identity is None:
+        if group_exists is not False:
+            log.warning(
+                "reclaim_backend_identity_ambiguous",
+                issue_id=record.issue_id,
+                identifier=record.identifier,
+                pid=pid,
+            )
+            return None
+        outcome = "not_found"
+    elif expected_identity is None:
+        # Pre-v8 or failed identity capture: never signal a reusable
+        # numeric pid without proving it is the recorded incarnation.
+        log.warning(
+            "reclaim_backend_identity_missing",
+            issue_id=record.issue_id,
+            identifier=record.identifier,
+            pid=pid,
+        )
+        return None
+    elif current_identity != expected_identity:
+        # The recorded process incarnation is gone and this pid was
+        # reused. Do not signal the unrelated replacement.
+        outcome = "identity_mismatch"
+    else:
+        try:
+            killed = kill_process_group(pid)
+        except Exception as exc:
+            log.warning(
+                "reclaim_killed_orphan_agent",
+                issue_id=record.issue_id,
+                identifier=record.identifier,
+                pid=pid,
+                outcome=f"error: {type(exc).__name__}",
+            )
+            return None
+        if killed:
+            deadline = time.monotonic() + 1.0
+            confirmed_gone = process_group_exists(pid) is False
+            while not confirmed_gone and time.monotonic() < deadline:
+                time.sleep(0.05)
+                confirmed_gone = process_group_exists(pid) is False
+            if not confirmed_gone:
+                log.warning(
+                    "reclaim_killed_orphan_agent",
+                    issue_id=record.issue_id,
+                    identifier=record.identifier,
+                    pid=pid,
+                    outcome="unconfirmed",
+                )
+                return None
+            outcome = "killed"
+        elif process_group_exists(pid) is False:
+            outcome = "not_found"
+        else:
+            log.warning(
+                "reclaim_killed_orphan_agent",
+                issue_id=record.issue_id,
+                identifier=record.identifier,
+                pid=pid,
+                outcome="ambiguous",
+            )
+            return None
+    log.warning(
+        "reclaim_killed_orphan_agent",
+        issue_id=record.issue_id,
+        identifier=record.identifier,
+        pid=pid,
+        outcome=outcome,
+    )
+    return outcome
+
+
 def _backend_agent_pid(backend: AgentBackend) -> int | None:
     return _normalize_agent_pid(getattr(backend, "pid", None))
 
@@ -230,6 +559,7 @@ def _initial_improvement_status() -> dict[str, Any]:
         "interval_ms": 0,
         "max_turns": 0,
         "agent_kind": "",
+        "modes": [],
         "in_flight": False,
         "current_phase": None,
         "last_started_at": None,
@@ -240,6 +570,8 @@ def _initial_improvement_status() -> dict[str, Any]:
         "skipped_reason": None,
         "last_verified_branch": None,
         "last_verified_sha": None,
+        "last_mode_results": [],
+        "last_request_id": None,
     }
 
 
@@ -248,15 +580,41 @@ def _run_record_payload(record: RunRecord) -> dict[str, Any]:
         "run_id": record.run_id,
         "issue_id": record.issue_id,
         "identifier": record.identifier,
+        "title": record.title,
+        "state": record.state,
         "attempt": record.attempt,
         "attempt_kind": record.attempt_kind,
         "agent_kind": record.agent_kind,
         "status": record.status,
         "started_at": record.started_at.isoformat() if record.started_at else None,
-        "completed_at": (
-            record.completed_at.isoformat() if record.completed_at else None
-        ),
+        "updated_at": record.updated_at.isoformat() if record.updated_at else None,
+        "completed_at": record.completed_at.isoformat() if record.completed_at else None,
         "workspace_path": str(record.workspace_path) if record.workspace_path else None,
+        "branch_name": record.branch_name or f"{SYMPHONY_BRANCH_PREFIX}{record.identifier}",
+        "commit_sha": record.commit_sha,
+        "continued_from_run_id": record.continued_from_run_id,
+        "checkpoint": (
+            {
+                "state": record.checkpoint_state,
+                "turn": record.checkpoint_turn,
+                "checkpointed_at": (
+                    record.checkpointed_at.isoformat()
+                    if record.checkpointed_at is not None
+                    else None
+                ),
+            }
+            if record.checkpoint_state is not None
+            and record.checkpoint_turn is not None
+            else None
+        ),
+        "tokens": {
+            "input": record.input_tokens,
+            "cache": record.cache_input_tokens,
+            "output": record.output_tokens,
+            "total": record.total_tokens,
+        },
+        "failure_class": record.failure_class,
+        "failure_message": record.failure_message,
     }
 
 
@@ -314,7 +672,7 @@ def _blocked_source_reopen_state(cfg: ServiceConfig) -> str:
 
 def _blocked_rca_labels(issue: Issue) -> list[str]:
     labels: list[str] = []
-    for label in ("blocked-rca", f"source-{issue.identifier.lower()}"):
+    for label in ("blocked-fix", f"source-{issue.identifier.lower()}"):
         normalized = re.sub(r"[^a-z0-9_.-]+", "-", label.lower()).strip("-")
         if normalized and normalized not in labels:
             labels.append(normalized)
@@ -324,17 +682,35 @@ def _blocked_rca_labels(issue: Issue) -> list[str]:
     return labels
 
 
+_BOARD_HEALTH_LANES = frozenset({"document", "learn"})
+_REOPEN_APPROVED_RE = re.compile(r"^##\s+Reopen Approved\b", re.MULTILINE)
+
+
+def _has_app_release_label(issue: Issue) -> bool:
+    return any(label.strip().lower() == "app-release" for label in issue.labels)
+
+
+_APP_RELEASE_FILE_TRACKER_ONLY = (
+    "app-release verifier execution requires tracker.kind=file; remote labeled "
+    "tickets are refused before agent execution"
+)
+
+
 def _blocked_rca_identifier_prefix(issue: Issue) -> str:
     source = re.sub(r"[^A-Za-z0-9]+", "-", issue.identifier).strip("-")
-    return f"RCA-{source or 'SOURCE'}"
+    return f"FIX-{source or 'SOURCE'}"
 
 
 _BLOCKED_RCA_HEADING_RE = re.compile(
-    r"^##\s+Blocked\s+RCA\s*$",
+    r"^##\s+Blocked\s+(?:Fix|RCA)\s*$",
     re.IGNORECASE | re.MULTILINE,
 )
 _BLOCKED_RCA_RESOLVED_HEADING_RE = re.compile(
-    r"^##\s+Blocked\s+RCA\s+Resolved\s*$",
+    r"^##\s+(?:Blocked\s+(?:Fix|RCA)\s+Resolved|(?:Fix|RCA)\s+Resolution)\s*$",
+    re.IGNORECASE | re.MULTILINE,
+)
+_BLOCKED_RCA_HOST_RESOLVED_HEADING_RE = re.compile(
+    r"^##\s+Blocked\s+(?:Fix|RCA)\s+Resolved\s*$",
     re.IGNORECASE | re.MULTILINE,
 )
 _BLOCKED_RCA_SOURCE_IDENTIFIER_RE = re.compile(
@@ -342,11 +718,11 @@ _BLOCKED_RCA_SOURCE_IDENTIFIER_RE = re.compile(
     re.IGNORECASE | re.MULTILINE,
 )
 _BLOCKED_RCA_TITLE_RE = re.compile(
-    r"^RCA\s+unblock\s+(?P<identifier>[^:]+):",
+    r"^(?:RCA\s+unblock|Fix\s+and\s+unblock)\s+(?P<identifier>[^:]+):",
     re.IGNORECASE,
 )
 _BLOCKED_RCA_OPERATOR_BLOCKER_RE = re.compile(
-    r"^##\s+(RCA\s+Blocker|Operator\s+Action|Intervention\s+Required)\s*$",
+    r"^##\s+((?:Fix|RCA)\s+Blocker|Operator\s+Action|Intervention\s+Required)\s*$",
     re.IGNORECASE | re.MULTILINE,
 )
 _HUMAN_REVIEW_INTERVENTION_RE = re.compile(
@@ -372,12 +748,56 @@ _HUMAN_REVIEW_MERGE_FAILURE_RE = re.compile(
 )
 
 
+_HISTORY_FAILURE_HEADING_RE = re.compile(
+    r"^##\s+History\s+Failure\s*$",
+    re.IGNORECASE | re.MULTILINE,
+)
+_HISTORY_RECOVERY_HEADING_RE = re.compile(
+    r"^##\s+History\s+Recovery\s*$",
+    re.IGNORECASE | re.MULTILINE,
+)
+_NEXT_H2_RE = re.compile(r"^##\s+", re.MULTILINE)
+
+
+def _markdown_section(description: str, heading_re: re.Pattern[str]) -> str:
+    """Body under the first heading matching ``heading_re``, up to the next `## `.
+
+    Scoping the read to one section matters for failure classification: a
+    ticket description also carries QA logs and prior-run notes, and matching
+    a phrase like `permission denied` anywhere in the body would mislabel
+    unrelated tickets.
+    """
+    match = heading_re.search(description or "")
+    if match is None:
+        return ""
+    rest = description[match.end() :]
+    nxt = _NEXT_H2_RE.search(rest)
+    return (rest[: nxt.start()] if nxt else rest).strip()
+
+
 def _blocked_rca_already_requested(issue: Issue) -> bool:
-    return bool(_BLOCKED_RCA_HEADING_RE.search(issue.description or ""))
+    """Whether the current Blocked episode already requested an RCA.
+
+    Resolution notes close the preceding request.  A source that later blocks
+    again is a new episode and may open a new RCA, provided no RCA for that
+    source is currently active on the board.
+    """
+    description = issue.description or ""
+    requested = list(_BLOCKED_RCA_HEADING_RE.finditer(description))
+    if not requested:
+        return False
+    resolved = list(_BLOCKED_RCA_RESOLVED_HEADING_RE.finditer(description))
+    return not resolved or requested[-1].start() > resolved[-1].start()
 
 
 def _is_blocked_rca_ticket(issue: Issue) -> bool:
-    return any(label.lower() == "blocked-rca" for label in issue.labels)
+    return any(
+        label.lower() in {"blocked-fix", "blocked-rca"} for label in issue.labels
+    )
+
+
+def _is_blocked_fix_ticket(issue: Issue) -> bool:
+    return any(label.lower() == "blocked-fix" for label in issue.labels)
 
 
 def _looks_like_blocked_rca_ticket(issue: Issue) -> bool:
@@ -405,8 +825,22 @@ def _blocked_rca_resolution_already_recorded(issue: Issue) -> bool:
     return bool(_BLOCKED_RCA_RESOLVED_HEADING_RE.search(issue.description or ""))
 
 
+def _blocked_rca_current_episode_resolved(issue: Issue) -> bool:
+    body = issue.description or ""
+    resolutions = list(_BLOCKED_RCA_RESOLVED_HEADING_RE.finditer(body))
+    if not resolutions:
+        return False
+    requests = list(_BLOCKED_RCA_HEADING_RE.finditer(body))
+    return not requests or resolutions[-1].start() > requests[-1].start()
+
+
 def _blocked_rca_requires_operator_intervention(issue: Issue) -> bool:
-    return bool(_BLOCKED_RCA_OPERATOR_BLOCKER_RE.search(issue.description or ""))
+    body = issue.description or ""
+    blockers = list(_BLOCKED_RCA_OPERATOR_BLOCKER_RE.finditer(body))
+    if not blockers:
+        return False
+    resolutions = list(_BLOCKED_RCA_RESOLVED_HEADING_RE.finditer(body))
+    return not resolutions or blockers[-1].start() > resolutions[-1].start()
 
 
 def _human_review_done_state(cfg: ServiceConfig) -> str | None:
@@ -452,31 +886,46 @@ def _blocked_rca_description(
 ) -> str:
     return (
         "## Goal\n\n"
-        f"Resolve the root cause keeping `{issue.identifier}` in `Blocked`.\n\n"
+        f"Make `{issue.identifier}` actionable again and remove the verified blocker "
+        "so automated delivery can continue.\n\n"
         "## Source Ticket\n\n"
         f"- Identifier: `{issue.identifier}`\n"
         f"- Title: {issue.title}\n"
         f"- Current state: `{issue.state}`\n"
-        f"- Reopen target after proven RCA: `{reopen_state}`\n\n"
+        f"- Reopen target after proven fix: `{reopen_state}`\n\n"
         "## Required Sequence\n\n"
-        f"1. Read the source ticket `{issue.identifier}` first, including the latest "
-        "`## Blocker`, `## Budget Exceeded`, `## QA Failure`, "
-        "`## Review Findings`, or `## Blocked RCA` sections.\n"
-        "2. Identify the real root cause with evidence. Do not treat the "
-        "Blocked state itself as the problem.\n"
-        "3. If the root cause is safe for an agent to resolve, fix it and "
-        "verify the fix with concrete commands or artifacts.\n"
-        f"4. Only after the RCA is resolved and verified, append `## RCA Resolution` "
-        f"to `{issue.identifier}` and move that source ticket to `{reopen_state}`.\n"
-        "5. Do not skip the source ticket's normal workflow. Once it is back "
-        "in Todo, it must pass through the configured Todo/In Progress/Verify/"
-        "Learn review path like any other ticket.\n"
-        "6. If the root cause requires credentials, host worktree cleanup, "
-        "destructive operations, or external approval, leave the source ticket "
-        "Blocked and append `## RCA Blocker` with exact operator action.\n\n"
+        f"1. Read the source ticket `{issue.identifier}` first, including its title, "
+        "request, description, acceptance criteria, and latest `## Blocker`, "
+        "`## Budget Exceeded`, `## QA Failure`, `## Review Findings`, or "
+        "legacy `## Blocked RCA` sections.\n"
+        "2. Compare the requested outcome and acceptance criteria with the failure "
+        "evidence. Ambiguity in the request or acceptance criteria is itself a blocker; "
+        "do not merely restate it.\n"
+        f"3. When instructions are vague, incomplete, or not testable, append "
+        f"`## Clarified Request` to `{issue.identifier}` with the intended outcome, "
+        "in-scope work, non-goals, constraints, assumptions, concrete, testable "
+        "acceptance criteria, and exact verification commands or artifacts. Preserve "
+        "the operator's intent; do not invent consequential product decisions.\n"
+        "4. Resolve any code, configuration, environment, or process defect that is "
+        "safe for an agent to change, then verify the fix with concrete commands or "
+        "artifacts. If clarification is the only blocker, the improved source "
+        "instructions are the fix.\n"
+        f"5. Only after the blocker is resolved and the source ticket is actionable, "
+        f"append `## Fix Resolution` to both `{issue.identifier}` and this fix ticket, "
+        f"then move that source ticket to `{reopen_state}`. Do not move the fix ticket "
+        "to Done before both updates are persisted.\n"
+        "6. Do not skip the source ticket's normal workflow. Once it is back in Todo, "
+        "it must pass through the configured Todo/In Progress/Verify/Document review "
+        "path like any other ticket.\n"
+        "7. If the blocker requires credentials, destructive operations, external "
+        "approval, or a consequential product decision, leave the source ticket "
+        "Blocked and append `## Fix Blocker` with the exact operator action or "
+        "decision required.\n\n"
         "## Done Evidence\n\n"
         "- Root cause category and evidence.\n"
-        "- Fix or operator action taken.\n"
+        "- Source instructions changed: yes/no, with the resulting acceptance criteria "
+        "or the reason no clarification was needed.\n"
+        "- Fix and verification evidence, or exact operator action required.\n"
         f"- Final state decision for `{issue.identifier}`.\n"
     )
 
@@ -490,6 +939,9 @@ class Orchestrator:
         improvement_runner: ImprovementRunner | None = None,
         improvement_lease: Lease | None = None,
     ) -> None:
+        self._service_instance_id = normalize_service_instance_id(
+            os.environ.pop(SERVICE_INSTANCE_ENV, None)
+        )
         self._workflow_state = workflow_state
         # Initiative D — backend factory via constructor injection. None
         # falls back to the module-level `build_backend`, looked up at call
@@ -512,6 +964,22 @@ class Orchestrator:
         self._last_archive_sweep_monotonic: float | None = None
         self._lease_blocked: dict[str, str] = {}
         self._blocked_rca_source_ids: set[str] = set()
+        # Serialize the board check + create sequence.  The in-memory source
+        # set is only a cache; concurrent manual/automatic recovery requests
+        # must re-check the persisted board before either creates an RCA.
+        self._blocked_rca_creation_lock = asyncio.Lock()
+        # A worker's post-turn path and the reconciliation loop can observe
+        # the same Verify transition before either has finished persisting
+        # release authority. Keep one lock per live RunningEntry so the
+        # validator, GREEN CAS, and RED repair lifecycle are one serialized
+        # host decision for that verifier run.
+        self._app_release_transition_locks: dict[
+            str, tuple[RunningEntry, asyncio.Lock]
+        ] = {}
+        # Tickets the host already re-checked for a sandbox-denied history
+        # write. Bounds the extra description fetch to one per ticket per
+        # process instead of one per sweep.
+        self._history_recovery_attempted: set[str] = set()
         # Tickets whose worker-exit handler is mid-flight. `_on_worker_exit`
         # adds the id on entry and clears it in a `finally`, so from the moment
         # a worker leaves `_running` until its terminal-state persist (or retry
@@ -526,6 +994,12 @@ class Orchestrator:
         # are dropped as soon as the ticket dispatches (so a fresh
         # registration doesn't keep inheriting a stale wait-age bonus).
         self._claim_released_at: dict[str, datetime] = {}
+        self._schedule_snapshot: dict[str, Any] = {
+            "schema_version": 1,
+            "available": False,
+            "reason": "not_evaluated",
+            "entries": [],
+        }
         self._totals = _CodexTotals()
         self._latest_rate_limits: dict[str, Any] | None = None
         self._issue_debug: dict[str, _IssueDebug] = {}
@@ -533,6 +1007,23 @@ class Orchestrator:
         self._tick_task: asyncio.Task[None] | None = None
         self._tick_event = asyncio.Event()
         self._stopping = False
+        # One cached tracker client per orchestrator lifetime for the
+        # `_tracker_call_*` bridge helpers below — the Jira/Linear adapters
+        # wrap an httpx connection pool per client, so building one per
+        # call threw away connection reuse on every poll tick. Built
+        # lazily on first use, closed in `stop()`. Guarded by a lock
+        # because the bridges run on `asyncio.to_thread` worker threads.
+        # The lock is reentrant: checkout delegates may re-enter guarded
+        # helpers on the same thread.
+        self._tracker_client: TrackerClient | None = None
+        self._tracker_client_cfg: ServiceConfig | None = None
+        self._tracker_client_closed = False
+        # `closing` covers the window while stop() is closing the pool:
+        # new checkouts fail fast instead of rebuilding into a pool that
+        # is about to disappear (or leaking a fresh client past stop()).
+        self._tracker_client_closing = False
+        self._tracker_client_close_race_logged = False
+        self._tracker_client_lock = threading.RLock()
         self._refresh_pending = False
         self._observers: list[Callable[[], Awaitable[None]]] = []
         # Operator-driven pause is split into two pieces:
@@ -561,7 +1052,12 @@ class Orchestrator:
         # once the workflow dir is known; every record call is failure-
         # tolerant inside StatsStore, so hooks never guard beyond None.
         self._stats: StatsStore | None = None
+        # Ticket artifact store (`.symphony/artifacts/`). Bound in start()
+        # alongside `self._stats`; stays None when `artifacts.enabled: false`.
+        self._artifact_store: ArtifactStore | None = None
+        self._last_artifact_sweep_monotonic: float | None = None
         self._run_registry: RunRegistry | None = None
+        self._run_registry_initialized = False
         # R1/A1 — supervision + health counters. One bad tick must degrade
         # the tick, never kill the loop; these counters make the difference
         # between "idle and healthy" and "silently dead" observable.
@@ -587,7 +1083,14 @@ class Orchestrator:
         # — never a worker slot. Due-math uses the monotonic clock so a
         # wall-clock jump can't wedge it. Runner + lease are injectable so
         # tests never spawn real subprocesses or touch a shared lockfile.
-        self._improvement_runner = improvement_runner or default_improvement_runner
+        # Agent-driven improvement modes need a real backend turn. The CI
+        # module must stay orchestrator-free, so the capability is injected:
+        # binding it as a keyword partial keeps the 3-positional
+        # `ImprovementRunner` signature every injected test fake implements.
+        self._improvement_runner: ImprovementRunner = improvement_runner or partial(
+            default_improvement_runner,
+            agent_runner=self._run_improvement_agent,
+        )
         self._improvement_lease = improvement_lease
         self._improvement_task: asyncio.Task[None] | None = None
         self._improvement_run_timeout_s: float = DEFAULT_IMPROVEMENT_RUN_TIMEOUT_S
@@ -710,7 +1213,15 @@ class Orchestrator:
             agent_pgid = _normalize_agent_pid(entry.agent_pgid)
             if agent_pgid is not None:
                 try:
-                    killed = kill_process_group(agent_pgid)
+                    # win32 kill_process_group shells out to `taskkill /T`;
+                    # keep that subprocess off the event loop so stop()
+                    # drains never stall the service on a slow kill. The
+                    # recorded identity fingerprint gates pid reuse.
+                    killed = await asyncio.to_thread(
+                        kill_process_group,
+                        agent_pgid,
+                        identity=self._agent_pid_identity(entry),
+                    )
                 except Exception as exc:
                     log.warning(
                         "worker_process_kill_failed_on_stop",
@@ -738,6 +1249,11 @@ class Orchestrator:
         return self._workflow_state
 
     @property
+    def service_instance_id(self) -> str | None:
+        """Per-launch managed-service capability, absent for foreground runs."""
+        return self._service_instance_id
+
+    @property
     def stats(self) -> StatsStore | None:
         return self._stats
 
@@ -758,10 +1274,20 @@ class Orchestrator:
         self._last_registry_error = None
         return result
 
-    def _ensure_run_registry(self, cfg: ServiceConfig) -> None:
+    def _open_run_registry(self, cfg: ServiceConfig) -> tuple[RunRegistry | None, bool]:
+        """Open (or reuse) the run registry connection.
+
+        Returns ``(registry, fresh)``. ``fresh`` is True only when a NEW
+        connection was opened (callers run reclaim + open-maintenance
+        then); an existing path-matched registry returns ``(registry,
+        False)`` so maintenance is skipped, mirroring the historical
+        early return. Open failures log, bump the error counters, and
+        return ``(None, False)``.
+        """
+        self._run_registry_initialized = True
         path = registry_path_for_workflow(cfg.workflow_path)
         if self._run_registry is not None and self._run_registry.path == path:
-            return
+            return self._run_registry, False
         if self._run_registry is not None:
             self._run_registry.close()
         try:
@@ -771,61 +1297,991 @@ class Orchestrator:
             self._registry_error_count += 1
             self._last_registry_error = f"open: {exc}"
             log.error("run_registry_open_failed", path=str(path), error=str(exc))
-            return
-        registry = self._run_registry
-        reclaimed = self._registry_guard(
-            "reclaim_dead_owner", registry.reclaim_dead_owner_leases, []
-        )
-        if reclaimed:
-            finalized = [
-                record
-                for record in reclaimed
-                if self._reap_and_finalize_reclaimed_run(registry, record)
-            ]
-            log.info(
-                "run_leases_reclaimed_dead_owner",
-                count=len(finalized),
-                pending_count=len(reclaimed) - len(finalized),
-                identifiers=[r.identifier for r in finalized],
-                path=str(path),
-            )
+            return None, False
+        return self._run_registry, True
+
+    def _finish_run_registry_open(
+        self, registry: RunRegistry, cfg: ServiceConfig, path: Path
+    ) -> None:
+        """Post-open maintenance: expire stale leases, rehydrate flags."""
         expired = self._registry_guard("expire_stale", registry.expire_stale, 0)
         if expired:
             log.info("run_leases_expired_on_start", count=expired, path=str(path))
         flags = self._registry_guard("list_issue_flags", registry.list_issue_flags, [])
-        self._rehydrate_issue_flags(flags)
+        self._rehydrate_issue_flags(flags, cfg=cfg, registry=registry)
+
+    def _ensure_run_registry(self, cfg: ServiceConfig) -> None:
+        """Open the registry and reclaim dead-owner leases (blocking form).
+
+        The per-record kill+confirm (taskkill / SIGKILL plus the bounded
+        gone-confirm poll) runs inline on the calling thread, completing
+        before this returns. Event-loop callers must use
+        `_ensure_run_registry_async` instead so the OS kill never stalls
+        the tick loop.
+        """
+        registry, fresh = self._open_run_registry(cfg)
+        if not fresh or registry is None:
+            return
+        self._reclaim_dead_owner_runs(registry, path=registry.path)
+        self._finish_run_registry_open(registry, cfg, registry.path)
+
+    async def _ensure_run_registry_async(self, cfg: ServiceConfig) -> None:
+        """Event-loop form of `_ensure_run_registry`.
+
+        Identical semantics — open, reclaim dead owners (kill+confirm
+        completed before return, 'reclaiming' fence observable mid-kill),
+        expire, rehydrate — except each record's blocking kill+confirm
+        runs in a worker thread, so the tick loop keeps servicing ticks
+        while a slow taskkill drains.
+        """
+        registry, fresh = self._open_run_registry(cfg)
+        if not fresh or registry is None:
+            return
+        await self._reclaim_dead_owner_runs_async(registry, path=registry.path)
+        self._finish_run_registry_open(registry, cfg, registry.path)
+
+    def _ensure_run_registry_open_only(self, cfg: ServiceConfig) -> None:
+        """Open + maintenance for sync callers that must never block.
+
+        Same as `_ensure_run_registry` minus the OS-level dead-owner
+        reclaim: the release-gate fallback runs on the event loop and a
+        taskkill there would stall ticks. Dead-owner leases are still
+        honored (they block acquisition) and reclaimed by the next tick's
+        off-loop pass, so correctness never depends on this side effect.
+        """
+        registry, fresh = self._open_run_registry(cfg)
+        if not fresh or registry is None:
+            return
+        self._finish_run_registry_open(registry, cfg, registry.path)
+
+    def _reclaim_dead_owner_runs(
+        self, registry: RunRegistry, *, path: Path | None = None
+    ) -> None:
+        reclaimed = self._registry_guard(
+            "reclaim_dead_owner", registry.reclaim_dead_owner_leases, []
+        )
+        if not reclaimed:
+            return
+        finalized = [
+            record
+            for record in reclaimed
+            if self._reap_and_finalize_reclaimed_run(registry, record)
+        ]
+        log.info(
+            "run_leases_reclaimed_dead_owner",
+            count=len(finalized),
+            pending_count=len(reclaimed) - len(finalized),
+            identifiers=[record.identifier for record in finalized],
+            path=str(path or registry.path),
+        )
+
+    async def _reclaim_dead_owner_runs_async(
+        self, registry: RunRegistry, *, path: Path | None = None
+    ) -> None:
+        """`_reclaim_dead_owner_runs` with each kill+confirm off the loop."""
+        reclaimed = self._registry_guard(
+            "reclaim_dead_owner", registry.reclaim_dead_owner_leases, []
+        )
+        if not reclaimed:
+            return
+        finalized = []
+        for record in reclaimed:
+            if await self._reap_and_finalize_reclaimed_run_async(registry, record):
+                finalized.append(record)
+        log.info(
+            "run_leases_reclaimed_dead_owner",
+            count=len(finalized),
+            pending_count=len(reclaimed) - len(finalized),
+            identifiers=[record.identifier for record in finalized],
+            path=str(path or registry.path),
+        )
+
+    def _release_registry_required(self, cfg: ServiceConfig) -> RunRegistry:
+        """Return the release authority store or fail closed.
+
+        Ordinary lease bookkeeping intentionally degrades when SQLite is
+        unavailable. Application release authority cannot: a missing read
+        must never turn a pending verifier or finalizer into a normal ticket.
+
+        Opens without the OS-level reclaim (see
+        `_ensure_run_registry_open_only`) — this fallback can run on the
+        event loop, and dead-owner cleanup is covered by the per-tick
+        off-loop reclaim pass.
+        """
+        self._ensure_run_registry_open_only(cfg)
+        registry = self._run_registry
+        if registry is None:
+            raise SymphonyError(
+                "application release authority registry is unavailable",
+                workflow=str(cfg.workflow_path),
+            )
+        return registry
+
+    def _release_registry_call(
+        self,
+        cfg: ServiceConfig,
+        op: str,
+        fn: Callable[[RunRegistry], Any],
+    ) -> Any:
+        registry = self._release_registry_required(cfg)
+        try:
+            result = fn(registry)
+        except Exception as exc:
+            self._registry_error_count += 1
+            self._last_registry_error = f"release_{op}: {exc}"
+            log.error("release_registry_error", op=op, error=str(exc))
+            raise SymphonyError(
+                "application release authority operation failed",
+                operation=op,
+                error=str(exc),
+            ) from exc
+        self._last_registry_error = None
+        return result
+
+    @staticmethod
+    def _pending_release_gate(
+        *, issue: Issue, finalizer: str, contract_sha256: str
+    ) -> ReleaseGate:
+        return ReleaseGate(
+            finalizer_identifier=finalizer,
+            verifier_issue_id=issue.id,
+            verifier_identifier=issue.identifier,
+            expected_contract_sha256=contract_sha256,
+            cycle_fingerprint=_initial_release_gate_fingerprint(
+                verifier_identifier=issue.identifier,
+                finalizer_identifier=finalizer,
+                contract_sha256=contract_sha256,
+            ),
+            approved_fingerprint=None,
+            status="pending",
+            target_branch=None,
+            approved_target_sha=None,
+            verifier_run_id=None,
+            finalizer_run_id=None,
+            finalizer_completed_at=None,
+            finalizer_completion_token=None,
+            updated_at=datetime.now(timezone.utc),
+        )
+
+    def _persist_pending_release_gate(
+        self,
+        *,
+        cfg: ServiceConfig,
+        gate: ReleaseGate,
+        operation: str,
+        invalidating_finalizer_run_id: str | None = None,
+    ) -> ReleaseGate:
+        """Replace approval with PENDING and prove the authoritative tuple."""
+        written = cast(
+            ReleaseGate,
+            self._release_registry_call(
+                cfg,
+                operation,
+                lambda registry: registry.replace_pending_release_gate(
+                    gate,
+                    invalidating_finalizer_run_id=(invalidating_finalizer_run_id),
+                ),
+            ),
+        )
+        persisted = cast(
+            ReleaseGate | None,
+            self._release_registry_call(
+                cfg,
+                f"{operation}_readback",
+                lambda registry: registry.get_release_gate(gate.finalizer_identifier),
+            ),
+        )
+        expected = (
+            gate.finalizer_identifier,
+            gate.verifier_issue_id,
+            gate.verifier_identifier,
+            gate.expected_contract_sha256,
+            gate.cycle_fingerprint,
+            written.generation,
+            "pending",
+        )
+        actual = (
+            (
+                persisted.finalizer_identifier,
+                persisted.verifier_issue_id,
+                persisted.verifier_identifier,
+                persisted.expected_contract_sha256,
+                persisted.cycle_fingerprint,
+                persisted.generation,
+                persisted.status,
+            )
+            if persisted is not None
+            else None
+        )
+        if actual != expected:
+            raise SymphonyError(
+                "application release authority was not durably persisted",
+                verifier=gate.verifier_identifier,
+                finalizer=gate.finalizer_identifier,
+            )
+        if not written.generation:
+            raise SymphonyError(
+                "application release authority lacks a durable cycle generation",
+                verifier=gate.verifier_identifier,
+            )
+        return cast(ReleaseGate, persisted)
+
+    def _create_initial_release_gate(
+        self, cfg: ServiceConfig, issue: Issue
+    ) -> tuple[Issue, ReleaseGate]:
+        if not _has_active_release_verify_lane(cfg) or not _has_release_finalizer_lane(
+            cfg
+        ):
+            raise SymphonyError(
+                "app-release requires active Verify and finalizer lanes before dispatch"
+            )
+        identity = resolve_target_release_identity(
+            repository_root=cfg.workflow_path.parent,
+            configured_target_branch=cfg.agent.auto_merge_target_branch,
+        )
+        if identity.errors:
+            raise SymphonyError(
+                "cannot bind initial application release verifier",
+                errors=list(identity.errors),
+            )
+        finalizer = self._tracker_call_fetch_issue_full_by_id(
+            cfg, identity.finalizer_ticket
+        )
+        if finalizer is None or not _is_release_finalizer(finalizer):
+            raise SymphonyError(
+                "release contract finalizer is missing or lacks app-release-finalizer",
+                verifier=issue.identifier,
+                finalizer=identity.finalizer_ticket,
+            )
+        blocker_ids = {
+            blocker.identifier or blocker.id
+            for blocker in finalizer.blocked_by
+            if blocker.identifier or blocker.id
+        }
+        if issue.identifier not in blocker_ids:
+            raise SymphonyError(
+                "release finalizer must be blocked by its verifier before dispatch",
+                verifier=issue.identifier,
+                finalizer=identity.finalizer_ticket,
+            )
+        gate = self._pending_release_gate(
+            issue=issue,
+            finalizer=identity.finalizer_ticket,
+            contract_sha256=identity.contract_sha256,
+        )
+        persisted = self._persist_pending_release_gate(
+            cfg=cfg,
+            gate=gate,
+            operation="replace_initial_pending_gate",
+        )
+        if normalize_state(finalizer.state) in {
+            normalize_state(state) for state in cfg.tracker.terminal_states
+        }:
+            ReleaseCycleService(cfg).reopen_after_target_change(
+                finalizer=finalizer,
+                gate=persisted,
+                expected_contract_sha256=persisted.expected_contract_sha256,
+                reason="initial release verification has not yet been approved",
+                finalizer_state=next(
+                    (
+                        state
+                        for state in reversed(cfg.tracker.active_states)
+                        if normalize_state(state) != "verify"
+                    ),
+                    None,
+                ),
+            )
+        restored = ReleaseCycleService(cfg).restore_verifier_gate_labels(
+            issue=issue,
+            gate=persisted,
+            verifier_state=_release_verifier_state(cfg),
+        )
+        return restored, persisted
+
+    def _reopen_stale_release_gate(
+        self,
+        *,
+        cfg: ServiceConfig,
+        finalizer: Issue,
+        gate: ReleaseGate,
+        reason: str,
+        current_contract_sha256: str = "",
+        finalizer_state: str | None = None,
+        invalidating_finalizer_run_id: str | None = None,
+    ) -> None:
+        expected_hash = current_contract_sha256 or gate.expected_contract_sha256
+        pending = replace(
+            gate,
+            expected_contract_sha256=expected_hash,
+            cycle_fingerprint=_initial_release_gate_fingerprint(
+                verifier_identifier=gate.verifier_identifier,
+                finalizer_identifier=gate.finalizer_identifier,
+                contract_sha256=expected_hash,
+            ),
+            approved_fingerprint=None,
+            status="pending",
+            target_branch=None,
+            approved_target_sha=None,
+            verifier_run_id=None,
+            updated_at=datetime.now(timezone.utc),
+        )
+        pending = self._persist_pending_release_gate(
+            cfg=cfg,
+            gate=pending,
+            operation="invalidate_stale_approval",
+            invalidating_finalizer_run_id=invalidating_finalizer_run_id,
+        )
+        ReleaseCycleService(cfg).reopen_after_target_change(
+            finalizer=finalizer,
+            gate=pending,
+            expected_contract_sha256=expected_hash,
+            reason=reason,
+            finalizer_state=finalizer_state,
+        )
+
+    def _guard_release_finalizer(
+        self,
+        *,
+        cfg: ServiceConfig,
+        issue: Issue,
+        gate: ReleaseGate,
+        rewind_state: str | None = None,
+        expected_run_id: str | None = None,
+        allow_active_run: bool = True,
+        require_run_authority: bool = False,
+    ) -> Issue:
+        persisted_issue = self._tracker_call_fetch_issue_full_by_id(
+            cfg, issue.identifier
+        )
+        if persisted_issue is None:
+            raise SymphonyError(
+                "application release finalizer could not be read",
+                finalizer=issue.identifier,
+            )
+        issue = persisted_issue
+        terminal_states = {
+            normalize_state(state) for state in cfg.tracker.terminal_states
+        }
+        if normalize_state(
+            issue.state
+        ) in terminal_states and not _is_release_success_state(cfg, issue.state):
+            raise SymphonyError(
+                "application release finalizer is in a non-success terminal state",
+                finalizer=issue.identifier,
+                state=issue.state,
+            )
+        if gate.status != "approved":
+            raise SymphonyError(
+                "application release finalizer is waiting for GREEN verification",
+                finalizer=issue.identifier,
+                verifier=gate.verifier_identifier,
+                status=gate.status,
+            )
+        blocker_ids = {
+            blocker.identifier or blocker.id
+            for blocker in issue.blocked_by
+            if blocker.identifier or blocker.id
+        }
+        if gate.verifier_identifier not in blocker_ids:
+            raise SymphonyError(
+                "application release finalizer is not bound to its approved verifier",
+                finalizer=issue.identifier,
+                verifier=gate.verifier_identifier,
+            )
+        verifier = self._tracker_call_fetch_issue_full_by_id(
+            cfg, gate.verifier_identifier
+        )
+        if (
+            verifier is None
+            or verifier.id != gate.verifier_issue_id
+            or not _is_release_success_state(cfg, verifier.state)
+        ):
+            raise SymphonyError(
+                "application release finalizer verifier is not successfully terminal",
+                finalizer=issue.identifier,
+                verifier=gate.verifier_identifier,
+                verifier_state=verifier.state if verifier is not None else "missing",
+            )
+        peer_active = bool(
+            self._release_registry_call(
+                cfg,
+                "check_verifier_lease",
+                lambda registry: registry.has_active_lease(gate.verifier_issue_id),
+            )
+        )
+        if peer_active:
+            raise SymphonyError(
+                "application release verifier is still in flight",
+                verifier=gate.verifier_identifier,
+            )
+        if require_run_authority:
+            if expected_run_id is not None and gate.finalizer_run_id != expected_run_id:
+                raise SymphonyError(
+                    "application release finalizer run is not bound to this gate cycle",
+                    finalizer=issue.identifier,
+                    expected_run_id=expected_run_id,
+                    bound_run_id=gate.finalizer_run_id or "missing",
+                )
+            authorized = bool(
+                self._release_registry_call(
+                    cfg,
+                    "check_finalizer_run_authority",
+                    lambda registry: registry.release_finalizer_run_is_authorized(
+                        gate=gate,
+                        finalizer_issue_id=issue.id,
+                        allow_active=allow_active_run,
+                    ),
+                )
+            )
+            if not authorized:
+                raise SymphonyError(
+                    "application release finalizer lacks exact run completion authority",
+                    finalizer=issue.identifier,
+                    run_id=gate.finalizer_run_id or "missing",
+                )
+        identity = resolve_target_release_identity(
+            repository_root=cfg.workflow_path.parent,
+            configured_target_branch=cfg.agent.auto_merge_target_branch,
+        )
+        mismatches = list(identity.errors)
+        if gate.target_branch != identity.target_branch:
+            mismatches.append("approved target branch changed")
+        if gate.approved_target_sha != identity.target_sha:
+            mismatches.append("approved target SHA changed")
+        if gate.expected_contract_sha256 != identity.contract_sha256:
+            mismatches.append("approved release contract changed")
+        if gate.finalizer_identifier != identity.finalizer_ticket:
+            mismatches.append("release contract finalizer changed")
+        if gate.finalizer_completed_at is not None:
+            completion_token = _release_ticket_version_token(cfg, issue.identifier)
+            if not gate.finalizer_completion_token:
+                mismatches.append(
+                    "completed finalizer lacks a host-observed board transition token"
+                )
+            elif gate.finalizer_completion_token != completion_token:
+                mismatches.append(
+                    "completed finalizer board transition changed after delivery"
+                )
+        if mismatches:
+            reason = "; ".join(dict.fromkeys(mismatches))
+            self._reopen_stale_release_gate(
+                cfg=cfg,
+                finalizer=issue,
+                gate=gate,
+                reason=reason,
+                current_contract_sha256=identity.contract_sha256,
+                finalizer_state=rewind_state,
+                invalidating_finalizer_run_id=(
+                    expected_run_id if require_run_authority else None
+                ),
+            )
+            raise SymphonyError(
+                "application release approval became stale; fresh verification required",
+                finalizer=issue.identifier,
+                reason=reason,
+            )
+        return issue
+
+    def _mark_release_finalizer_completed(
+        self,
+        *,
+        cfg: ServiceConfig,
+        issue: Issue,
+        gate: ReleaseGate,
+        completion_token: str,
+        rewind_state: str | None,
+    ) -> ReleaseGate:
+        current_issue = self._tracker_call_fetch_issue_full_by_id(cfg, issue.identifier)
+        current_token = _release_ticket_version_token(cfg, issue.identifier)
+        if (
+            current_issue is None
+            or current_issue.id != issue.id
+            or not _is_release_success_state(cfg, current_issue.state)
+            or current_token != completion_token
+        ):
+            self._invalidate_release_finalizer_version(
+                cfg=cfg,
+                issue=current_issue or issue,
+                gate=gate,
+                rewind_state=rewind_state,
+                reason=(
+                    "finalizer ticket changed between terminal approval and "
+                    "completion persistence"
+                ),
+            )
+            raise SymphonyError(
+                "application release finalizer changed before completion proof",
+                finalizer=issue.identifier,
+            )
+        completed = bool(
+            self._release_registry_call(
+                cfg,
+                "mark_finalizer_completed",
+                lambda registry: registry.mark_release_finalizer_completed(
+                    gate=gate,
+                    finalizer_issue_id=issue.id,
+                    completion_token=completion_token,
+                ),
+            )
+        )
+        persisted = cast(
+            ReleaseGate | None,
+            self._release_registry_call(
+                cfg,
+                "read_finalizer_completion",
+                lambda registry: registry.get_release_gate(gate.finalizer_identifier),
+            ),
+        )
+        if (
+            not completed
+            or persisted is None
+            or persisted.generation != gate.generation
+            or persisted.finalizer_run_id != gate.finalizer_run_id
+            or persisted.finalizer_completed_at is None
+            or persisted.finalizer_completion_token != completion_token
+        ):
+            raise SymphonyError(
+                "application release finalizer completion proof could not be persisted",
+                finalizer=issue.identifier,
+            )
+        confirmed_issue = self._tracker_call_fetch_issue_full_by_id(
+            cfg, issue.identifier
+        )
+        confirmed_token = _release_ticket_version_token(cfg, issue.identifier)
+        if (
+            confirmed_issue is None
+            or confirmed_issue.id != issue.id
+            or not _is_release_success_state(cfg, confirmed_issue.state)
+            or confirmed_token != completion_token
+        ):
+            self._invalidate_release_finalizer_version(
+                cfg=cfg,
+                issue=confirmed_issue or issue,
+                gate=persisted,
+                rewind_state=rewind_state,
+                reason=(
+                    "finalizer ticket changed while completion proof was "
+                    "being persisted"
+                ),
+            )
+            raise SymphonyError(
+                "application release finalizer changed during completion proof",
+                finalizer=issue.identifier,
+            )
+        return persisted
+
+    def _invalidate_release_finalizer_version(
+        self,
+        *,
+        cfg: ServiceConfig,
+        issue: Issue,
+        gate: ReleaseGate,
+        rewind_state: str | None,
+        reason: str,
+    ) -> None:
+        identity = resolve_target_release_identity(
+            repository_root=cfg.workflow_path.parent,
+            configured_target_branch=cfg.agent.auto_merge_target_branch,
+        )
+        self._reopen_stale_release_gate(
+            cfg=cfg,
+            finalizer=issue,
+            gate=gate,
+            reason=reason,
+            current_contract_sha256=(
+                identity.contract_sha256
+                if not identity.errors
+                else gate.expected_contract_sha256
+            ),
+            finalizer_state=rewind_state,
+            invalidating_finalizer_run_id=gate.finalizer_run_id,
+        )
+
+    def _guard_release_finalizer_with_version(
+        self,
+        *,
+        cfg: ServiceConfig,
+        issue: Issue,
+        gate: ReleaseGate,
+        rewind_state: str | None,
+        expected_run_id: str | None,
+        require_run_authority: bool,
+    ) -> tuple[Issue, str]:
+        """Guard one finalizer and pin the exact board version it approved."""
+        before_token = _release_ticket_version_token(cfg, issue.identifier)
+        guarded = self._guard_release_finalizer(
+            cfg=cfg,
+            issue=issue,
+            gate=gate,
+            rewind_state=rewind_state,
+            expected_run_id=expected_run_id,
+            require_run_authority=require_run_authority,
+        )
+        after_token = _release_ticket_version_token(cfg, guarded.identifier)
+        if before_token != after_token:
+            self._invalidate_release_finalizer_version(
+                cfg=cfg,
+                issue=guarded,
+                gate=gate,
+                rewind_state=rewind_state,
+                reason=(
+                    "finalizer ticket changed while terminal authority was "
+                    "being checked"
+                ),
+            )
+            raise SymphonyError(
+                "application release finalizer changed during terminal guard",
+                finalizer=guarded.identifier,
+            )
+        return guarded, after_token
+
+    def _require_running_release_authority(
+        self,
+        *,
+        cfg: ServiceConfig,
+        entry: RunningEntry,
+        workspace_path: Path | None = None,
+    ) -> Issue:
+        """Revalidate the exact host-owned gate generation for one live run."""
+        if not (
+            entry.known_app_release
+            or entry.known_release_cycle_verifier
+            or entry.known_app_release_finalizer
+        ):
+            return entry.issue
+        if not entry.run_id or not entry.release_gate_finalizer:
+            raise SymphonyError(
+                "application release run lacks cached host authority",
+                identifier=entry.issue.identifier,
+            )
+        gate = cast(
+            ReleaseGate | None,
+            self._release_registry_call(
+                cfg,
+                "revalidate_running_gate",
+                lambda registry: registry.get_release_gate(
+                    entry.release_gate_finalizer
+                ),
+            ),
+        )
+        if gate is None:
+            raise SymphonyError(
+                "application release gate disappeared during execution",
+                identifier=entry.issue.identifier,
+            )
+        expected = (
+            entry.release_gate_finalizer,
+            entry.release_gate_expected_contract_sha256,
+            entry.release_gate_cycle_fingerprint,
+            entry.release_gate_generation,
+        )
+        actual = (
+            gate.finalizer_identifier,
+            gate.expected_contract_sha256,
+            gate.cycle_fingerprint,
+            gate.generation,
+        )
+        if actual != expected or not gate.generation:
+            raise SymphonyError(
+                "application release gate generation changed during execution",
+                identifier=entry.issue.identifier,
+            )
+        if entry.known_app_release_finalizer:
+            if gate.finalizer_run_id != entry.run_id:
+                raise SymphonyError(
+                    "application release finalizer lost its exact run binding",
+                    finalizer=entry.issue.identifier,
+                )
+            guarded = self._guard_release_finalizer(
+                cfg=cfg,
+                issue=entry.issue,
+                gate=gate,
+                expected_run_id=entry.run_id,
+                require_run_authority=True,
+            )
+            if workspace_path is not None:
+                if not gate.approved_target_sha:
+                    raise SymphonyError(
+                        "application release finalizer has no approved target SHA"
+                    )
+                workspace_errors = release_workspace_target_errors(
+                    workspace_root=workspace_path,
+                    repository_root=cfg.workflow_path.parent,
+                    target_sha=gate.approved_target_sha,
+                    board_root=cfg.tracker.board_root,
+                    allowed_roots=(PurePosixPath("docs") / entry.issue.identifier,),
+                    role="finalizer",
+                )
+                if workspace_errors:
+                    raise SymphonyError(
+                        "application release finalizer workspace is stale",
+                        errors=list(workspace_errors),
+                    )
+            return guarded
+        if (
+            gate.verifier_issue_id != entry.issue.id
+            or gate.verifier_identifier != entry.issue.identifier
+            or gate.verifier_run_id != entry.run_id
+        ):
+            raise SymphonyError(
+                "application release verifier lost its exact run binding",
+                verifier=entry.issue.identifier,
+            )
+        authorized = bool(
+            self._release_registry_call(
+                cfg,
+                "check_verifier_run_authority",
+                lambda registry: registry.release_verifier_run_is_authorized(
+                    gate=gate,
+                    verifier_issue_id=entry.issue.id,
+                ),
+            )
+        )
+        if not authorized:
+            raise SymphonyError(
+                "application release verifier run is no longer authorized",
+                verifier=entry.issue.identifier,
+            )
+        return entry.issue
+
+    def _require_release_transition_verifier_authority(
+        self,
+        *,
+        cfg: ServiceConfig,
+        issue: Issue,
+        entry: RunningEntry,
+    ) -> None:
+        """Fence transition writes behind this verifier's exact live run."""
+        if not self._heartbeat_run_lease(issue.id, entry):
+            raise _ReleaseTransitionAuthorityLost(
+                "application release verifier lost its active run lease before "
+                "transition enforcement",
+                verifier=issue.identifier,
+                run_id=entry.run_id,
+            )
+        try:
+            self._require_running_release_authority(
+                cfg=cfg,
+                entry=entry,
+            )
+        except SymphonyError as exc:
+            raise _ReleaseTransitionAuthorityLost(
+                "application release verifier no longer owns the exact gate "
+                "generation and role",
+                verifier=issue.identifier,
+                run_id=entry.run_id,
+                reason=str(exc),
+            ) from exc
+
+    def _prepare_release_dispatch(
+        self, issue: Issue, cfg: ServiceConfig
+    ) -> _ReleaseDispatchAuthority:
+        app_label = _has_app_release_label(issue)
+        finalizer_label = _is_release_finalizer(issue)
+        if cfg.tracker.kind != "file":
+            if app_label or finalizer_label:
+                raise SymphonyError(
+                    _APP_RELEASE_FILE_TRACKER_ONLY,
+                    tracker_kind=cfg.tracker.kind,
+                )
+            return _ReleaseDispatchAuthority(issue=issue)
+
+        try:
+            gate_for_verifier = cast(
+                ReleaseGate | None,
+                self._release_registry_call(
+                    cfg,
+                    "find_verifier_gate",
+                    lambda registry: registry.get_release_gate_for_verifier(
+                        issue.identifier
+                    ),
+                ),
+            )
+            gate_for_finalizer = cast(
+                ReleaseGate | None,
+                self._release_registry_call(
+                    cfg,
+                    "find_finalizer_gate",
+                    lambda registry: registry.get_release_gate(issue.identifier),
+                ),
+            )
+            evidence_identity = cast(
+                ReleaseEvidenceIdentity | None,
+                self._release_registry_call(
+                    cfg,
+                    "find_release_evidence_identity",
+                    lambda registry: registry.get_release_evidence_identity(
+                        issue.identifier
+                    ),
+                ),
+            )
+        except SymphonyError:
+            identity = resolve_target_release_identity(
+                repository_root=cfg.workflow_path.parent,
+                configured_target_branch=cfg.agent.auto_merge_target_branch,
+            )
+            if app_label or finalizer_label or not identity.errors:
+                raise
+            return _ReleaseDispatchAuthority(issue=issue)
+
+        if evidence_identity is not None and gate_for_verifier is None:
+            if evidence_identity.retired:
+                raise SymphonyError(
+                    "historical release verifier is evidence-only and cannot be "
+                    "redispatched",
+                    verifier=issue.identifier,
+                    finalizer=evidence_identity.finalizer_identifier,
+                )
+            raise SymphonyError(
+                "current release verifier identity has no host-owned gate",
+                verifier=issue.identifier,
+                finalizer=evidence_identity.finalizer_identifier,
+            )
+
+        if (
+            app_label
+            or finalizer_label
+            or gate_for_verifier is not None
+            or gate_for_finalizer is not None
+        ) and (
+            not _has_active_release_verify_lane(cfg)
+            or not _has_release_finalizer_lane(cfg)
+        ):
+            raise SymphonyError(
+                "app-release requires active Verify and finalizer lanes before dispatch"
+            )
+
+        if gate_for_finalizer is not None or finalizer_label:
+            if gate_for_finalizer is None:
+                raise SymphonyError(
+                    "application release finalizer has no host-owned authority",
+                    finalizer=issue.identifier,
+                )
+            guarded = self._guard_release_finalizer(
+                cfg=cfg,
+                issue=issue,
+                gate=gate_for_finalizer,
+            )
+            return _ReleaseDispatchAuthority(
+                issue=guarded,
+                gate=gate_for_finalizer,
+                finalizer=True,
+            )
+
+        if gate_for_verifier is None and app_label:
+            if normalize_state(issue.state) == "verify":
+                issue, gate_for_verifier = self._create_initial_release_gate(cfg, issue)
+            else:
+                raise SymphonyError(
+                    "app-release ticket outside Verify has no host-owned authority",
+                    verifier=issue.identifier,
+                    state=issue.state,
+                )
+        elif gate_for_verifier is not None:
+            verifier_state: str | None = _release_verifier_state(cfg)
+            if gate_for_verifier.status == "pending":
+                pending_finalizer = self._tracker_call_fetch_issue_full_by_id(
+                    cfg, gate_for_verifier.finalizer_identifier
+                )
+                if pending_finalizer is None:
+                    raise SymphonyError(
+                        "release finalizer disappeared while verifier was pending",
+                        finalizer=gate_for_verifier.finalizer_identifier,
+                    )
+                if normalize_state(pending_finalizer.state) in {
+                    normalize_state(state) for state in cfg.tracker.terminal_states
+                }:
+                    ReleaseCycleService(cfg).reopen_after_target_change(
+                        finalizer=pending_finalizer,
+                        gate=gate_for_verifier,
+                        expected_contract_sha256=(
+                            gate_for_verifier.expected_contract_sha256
+                        ),
+                        reason=(
+                            "release finalizer became terminal before its verifier "
+                            "received durable GREEN approval"
+                        ),
+                        finalizer_state=next(
+                            (
+                                state
+                                for state in reversed(cfg.tracker.active_states)
+                                if normalize_state(state) != "verify"
+                            ),
+                            None,
+                        ),
+                    )
+            if gate_for_verifier.status == "approved" and normalize_state(
+                issue.state
+            ) in {normalize_state(state) for state in cfg.tracker.active_states}:
+                finalizer = self._tracker_call_fetch_issue_full_by_id(
+                    cfg, gate_for_verifier.finalizer_identifier
+                )
+                if finalizer is None:
+                    raise SymphonyError(
+                        "release finalizer disappeared while reopening verifier",
+                        finalizer=gate_for_verifier.finalizer_identifier,
+                    )
+                self._reopen_stale_release_gate(
+                    cfg=cfg,
+                    finalizer=finalizer,
+                    gate=gate_for_verifier,
+                    reason=(
+                        "approved verifier requires a new host-bound run after "
+                        f"returning in active state {issue.state}"
+                    ),
+                    finalizer_state=next(
+                        (
+                            state
+                            for state in reversed(cfg.tracker.active_states)
+                            if normalize_state(state) != "verify"
+                        ),
+                        None,
+                    ),
+                )
+                gate_for_verifier = cast(
+                    ReleaseGate | None,
+                    self._release_registry_call(
+                        cfg,
+                        "read_reopened_verifier_gate",
+                        lambda registry: registry.get_release_gate_for_verifier(
+                            issue.identifier
+                        ),
+                    ),
+                )
+                if gate_for_verifier is None:
+                    raise SymphonyError(
+                        "reopened release verifier authority disappeared",
+                        verifier=issue.identifier,
+                    )
+            elif gate_for_verifier.status == "approved":
+                verifier_state = None
+            issue = ReleaseCycleService(cfg).restore_verifier_gate_labels(
+                issue=issue,
+                gate=gate_for_verifier,
+                verifier_state=verifier_state,
+            )
+
+        app_release = app_label or gate_for_verifier is not None
+        return _ReleaseDispatchAuthority(
+            issue=issue,
+            gate=gate_for_verifier,
+            app_release=app_release,
+            cycle_verifier=gate_for_verifier is not None,
+        )
 
     def _reap_and_finalize_reclaimed_run(
         self, registry: RunRegistry, record: RunRecord
     ) -> bool:
-        """Kill outside SQLite, then release the persisted reclaim fence."""
-        pid = record.backend_agent_pid
-        if pid is not None and pid <= 0:
-            log.warning(
-                "reclaim_invalid_orphan_agent_pid",
-                issue_id=record.issue_id,
-                identifier=record.identifier,
-                pid=pid,
-            )
-        elif pid is not None:
-            try:
-                killed = kill_process_group(pid)
-            except Exception as exc:
-                log.warning(
-                    "reclaim_killed_orphan_agent",
-                    issue_id=record.issue_id,
-                    identifier=record.identifier,
-                    pid=pid,
-                    outcome=f"error: {exc}",
-                )
-                return False
-            log.warning(
-                "reclaim_killed_orphan_agent",
-                issue_id=record.issue_id,
-                identifier=record.identifier,
-                pid=pid,
-                outcome="killed" if killed else "not_found",
-            )
+        """Verify process incarnation, reap it, then release the SQLite fence.
+
+        Blocking form for synchronous callers (tests, the sync ensure
+        fallback): the OS-level kill+confirm runs inline on this thread.
+        The registry finalize below stays on the caller's thread so the
+        SQLite connection never crosses threads.
+        """
+        outcome = _reclaim_kill_confirm(record)
+        if outcome is None:
+            return False
         return bool(
             self._registry_guard(
                 "finalize_reclaimed_lease",
@@ -834,38 +2290,237 @@ class Orchestrator:
             )
         )
 
-    def recent_runs(
-        self, issue_id: str | None = None, limit: int = 50
+    async def _reap_and_finalize_reclaimed_run_async(
+        self, registry: RunRegistry, record: RunRecord
+    ) -> bool:
+        """Off-event-loop form of `_reap_and_finalize_reclaimed_run`.
+
+        The blocking kill+confirm (taskkill + bounded gone-confirm poll)
+        runs in a worker thread; the SQLite claim state and the finalize
+        below stay on the event-loop thread, preserving the registry's
+        thread-affine connection. The kill still completes before this
+        coroutine returns, so the 'reclaiming' fence is observable
+        mid-kill and finalized only afterwards.
+        """
+        outcome = await asyncio.to_thread(_reclaim_kill_confirm, record)
+        if outcome is None:
+            return False
+        return bool(
+            self._registry_guard(
+                "finalize_reclaimed_lease",
+                lambda: registry.finalize_reclaimed_lease(record.run_id),
+                False,
+            )
+        )
+
+
+    async def recent_runs(
+        self,
+        issue_id: str | None = None,
+        limit: int = 50,
+        *,
+        query: str | None = None,
+        status: str | None = None,
+        agent: str | None = None,
     ) -> tuple[list[dict[str, Any]], str | None]:
         registry = self._run_registry
         if registry is None:
             cfg = self._workflow_state.current()
             if cfg is not None:
-                self._ensure_run_registry(cfg)
+                # Async: the fallback open's dead-owner reclaim (taskkill)
+                # must not block the web loop this handler runs on.
+                await self._ensure_run_registry_async(cfg)
                 registry = self._run_registry
         if registry is None:
             return [], "run registry unavailable"
 
         rows = self._registry_guard(
             "recent_runs",
-            lambda: registry.recent_runs(issue_id=issue_id, limit=limit),
+            lambda: registry.recent_runs(
+                issue_id=issue_id,
+                limit=limit,
+                query=query,
+                status=status,
+                agent=agent,
+            ),
             None,
         )
         if rows is None:
             return [], self._last_registry_error
         return [_run_record_payload(row) for row in rows], None
 
-    def _rehydrate_issue_flags(self, flags: list[Any]) -> None:
+    async def run_detail(self, run_id: str) -> tuple[dict[str, Any] | None, str | None]:
+        registry = self._run_registry
+        if registry is None:
+            cfg = self._workflow_state.current()
+            if cfg is not None:
+                await self._ensure_run_registry_async(cfg)
+                registry = self._run_registry
+        if registry is None:
+            return None, "run registry unavailable"
+        try:
+            return registry.run_detail(run_id), None
+        except KeyError:
+            return None, None
+        except Exception as exc:
+            self._registry_error_count += 1
+            self._last_registry_error = f"run_detail: {exc}"
+            return None, self._last_registry_error
+
+    async def run_diagnostic(self, run_id: str) -> tuple[dict[str, Any] | None, str | None]:
+        registry = self._run_registry
+        if registry is None:
+            cfg = self._workflow_state.current()
+            if cfg is not None:
+                await self._ensure_run_registry_async(cfg)
+                registry = self._run_registry
+        if registry is None:
+            return None, "run registry unavailable"
+        try:
+            return registry.diagnostic_json(run_id), None
+        except KeyError:
+            return None, None
+        except Exception as exc:
+            self._registry_error_count += 1
+            self._last_registry_error = f"run_diagnostic: {exc}"
+            return None, self._last_registry_error
+
+    def _append_run_event(
+        self,
+        entry: RunningEntry,
+        event_type: str,
+        payload: dict[str, Any] | None = None,
+    ) -> None:
+        registry = self._run_registry
+        if registry is None or not entry.run_id:
+            return
+        self._registry_guard(
+            "append_attempt_event",
+            lambda: registry.append_attempt_event(
+                run_id=entry.run_id,
+                event_type=event_type,
+                payload=payload,
+            ),
+            False,
+        )
+
+    def _release_verifier_handoff_is_durable(
+        self,
+        *,
+        cfg: ServiceConfig,
+        registry: RunRegistry,
+        identity: ReleaseEvidenceIdentity,
+    ) -> bool:
+        """Prove that one retired verifier was replaced and durably relinked."""
+        if (
+            not identity.retired
+            or identity.role != "verifier"
+            or not identity.issue_id
+            or not identity.identifier
+            or not identity.finalizer_identifier
+            or not identity.cycle_generation
+            or registry.has_active_lease(identity.issue_id)
+        ):
+            return False
+        gate = registry.get_release_gate(identity.finalizer_identifier)
+        if (
+            gate is None
+            or not gate.generation
+            or gate.generation == identity.cycle_generation
+            or gate.verifier_issue_id == identity.issue_id
+            or gate.verifier_identifier == identity.identifier
+        ):
+            return False
+        current_identity = registry.get_release_evidence_identity_by_issue_id(
+            gate.verifier_issue_id
+        )
+        if current_identity is None or (
+            current_identity.issue_id,
+            current_identity.identifier,
+            current_identity.finalizer_identifier,
+            current_identity.role,
+            current_identity.cycle_generation,
+            current_identity.retired,
+        ) != (
+            gate.verifier_issue_id,
+            gate.verifier_identifier,
+            gate.finalizer_identifier,
+            "verifier",
+            gate.generation,
+            False,
+        ):
+            return False
+        finalizer = self._tracker_call_fetch_issue_full_by_id(
+            cfg, identity.finalizer_identifier
+        )
+        if finalizer is None or finalizer.identifier != identity.finalizer_identifier:
+            return False
+        blocker_identifiers = {
+            blocker.identifier for blocker in finalizer.blocked_by if blocker.identifier
+        }
+        return (
+            gate.verifier_identifier in blocker_identifiers
+            and identity.identifier not in blocker_identifiers
+        )
+
+    def _rehydrate_issue_flags(
+        self,
+        flags: list[Any],
+        *,
+        cfg: ServiceConfig,
+        registry: RunRegistry,
+    ) -> None:
         self._persisted_retry_attempts.clear()
         for flag in flags:
             issue_id = flag.issue_id
             if flag.budget_exhausted:
                 self._turn_budget_exhausted.add(issue_id)
+            identity: ReleaseEvidenceIdentity | None = None
+            handoff_complete = False
+            if flag.retry_attempt is not None:
+                try:
+                    identity = registry.get_release_evidence_identity_by_issue_id(
+                        issue_id
+                    )
+                    handoff_complete = bool(
+                        identity is not None
+                        and self._release_verifier_handoff_is_durable(
+                            cfg=cfg,
+                            registry=registry,
+                            identity=identity,
+                        )
+                    )
+                except Exception as exc:
+                    # Recovery is an allow-list: unreadable authority keeps the
+                    # existing retry/pause rather than forgiving it.
+                    log.warning(
+                        "historical_release_verifier_handoff_recovery_deferred",
+                        issue_id=issue_id,
+                        error=str(exc),
+                    )
+            if handoff_complete:
+                assert identity is not None
+                self._dispatch_state.cancel_pending_retry(issue_id)
+                self._persisted_retry_attempts.pop(issue_id, None)
+                self._paused_issue_ids.discard(issue_id)
+                self._pause_reasons.pop(issue_id, None)
+                self._clear_issue_flags(
+                    issue_id,
+                    retry_attempt=True,
+                    paused=True,
+                )
+                log.info(
+                    "historical_release_verifier_handoff_recovered",
+                    issue_id=issue_id,
+                    identifier=identity.identifier,
+                    finalizer=identity.finalizer_identifier,
+                    generation=identity.cycle_generation,
+                )
+                continue
             if flag.paused:
                 pause_reason = str(flag.pause_reason) if flag.pause_reason else None
-                if (
-                    flag.retry_attempt is not None
-                    and _is_retryable_auto_pause_reason(pause_reason)
+                if flag.retry_attempt is not None and _is_retryable_auto_pause_reason(
+                    pause_reason
                 ):
                     self._paused_issue_ids.discard(issue_id)
                     self._pause_reasons.pop(issue_id, None)
@@ -948,21 +2603,90 @@ class Orchestrator:
         fresh lease; only an actual conflicting holder returns False.
         """
         registry = self._run_registry
-        if registry is None or not entry.run_id:
-            return True
-        ok = self._registry_guard(
-            "heartbeat",
-            lambda: registry.heartbeat(
-                issue_id=issue_id,
-                run_id=entry.run_id,
-                progress_at=progress,
-                backend_agent_pid=backend_agent_pid or entry.agent_pgid,
-            ),
-            True,
+        release_required = entry.release_authority_resolved and (
+            entry.known_app_release
+            or entry.known_release_cycle_verifier
+            or entry.known_app_release_finalizer
         )
+        current_cfg = self._workflow_state.current()
+        continuation_authority_required = bool(
+            current_cfg is not None and current_cfg.agent.crash_continuation
+        )
+        if registry is None or not entry.run_id:
+            if release_required or (
+                continuation_authority_required and self._run_registry_initialized
+            ):
+                entry.lease_lost = True
+                log.error(
+                    "run_lease_authority_unavailable",
+                    issue_id=issue_id,
+                    issue_identifier=entry.issue.identifier,
+                    release_required=release_required,
+                )
+                return False
+            return True
+        if release_required:
+            try:
+                ok = registry.heartbeat(
+                    issue_id=issue_id,
+                    run_id=entry.run_id,
+                    progress_at=progress,
+                    backend_agent_pid=backend_agent_pid or entry.agent_pgid,
+                )
+            except Exception as exc:
+                self._registry_error_count += 1
+                self._last_registry_error = f"release_heartbeat: {exc}"
+                entry.lease_lost = True
+                log.error(
+                    "release_registry_error",
+                    op="heartbeat",
+                    issue_id=issue_id,
+                    error=str(exc),
+                )
+                return False
+            self._last_registry_error = None
+        elif continuation_authority_required:
+            try:
+                ok = registry.heartbeat(
+                    issue_id=issue_id,
+                    run_id=entry.run_id,
+                    progress_at=progress,
+                    backend_agent_pid=backend_agent_pid or entry.agent_pgid,
+                )
+            except Exception as exc:
+                self._registry_error_count += 1
+                self._last_registry_error = f"continuation_heartbeat: {exc}"
+                entry.lease_lost = True
+                log.error(
+                    "continuation_registry_error",
+                    op="heartbeat",
+                    issue_id=issue_id,
+                    error=str(exc),
+                )
+                return False
+            self._last_registry_error = None
+        else:
+            ok = self._registry_guard(
+                "heartbeat",
+                lambda: registry.heartbeat(
+                    issue_id=issue_id,
+                    run_id=entry.run_id,
+                    progress_at=progress,
+                    backend_agent_pid=backend_agent_pid or entry.agent_pgid,
+                ),
+                True,
+            )
         if ok:
             return True
         if entry.lease_lost:
+            return False
+        if release_required:
+            entry.lease_lost = True
+            log.error(
+                "release_run_lease_lost",
+                issue_id=issue_id,
+                issue_identifier=entry.issue.identifier,
+            )
             return False
         new_run_id = self._registry_guard(
             "reacquire",
@@ -996,6 +2720,29 @@ class Orchestrator:
         )
         return False
 
+    def _agent_pid_identity(self, entry: RunningEntry) -> str | None:
+        """Return the identity fingerprint recorded with this entry's pid.
+
+        The registry's heartbeat persists ``process_identity(pid)`` as
+        ``backend_process_identity`` at the moment `_sync_backend_agent_pid`
+        first records the pid, so the fingerprint survives restarts. None
+        when no registry/run row backs the entry, or when the platform
+        cannot prove identity (win32) — callers pass ``identity=None``
+        through, which keeps the ungated kill-with-warn-once behavior.
+        Lookup failures degrade to None rather than blocking a legitimate
+        kill: the fingerprint is hardening, not authority.
+        """
+        registry = self._run_registry
+        if registry is None or not entry.run_id:
+            return None
+        try:
+            record = registry.get_run(entry.run_id)
+        except KeyError:
+            return None
+        except Exception:
+            return None
+        return record.backend_process_identity
+
     def _sync_backend_agent_pid(
         self, issue_id: str, backend_agent_pid: int | None
     ) -> None:
@@ -1005,11 +2752,21 @@ class Orchestrator:
             return
         entry.agent_pgid = backend_agent_pid
         if backend_agent_pid is not None:
-            self._heartbeat_run_lease(
+            lease_ok = self._heartbeat_run_lease(
                 issue_id,
                 entry,
                 backend_agent_pid=backend_agent_pid,
             )
+            if not lease_ok:
+                task = entry.worker_task
+                if task is not None and not task.done() and entry.cancelled_at is None:
+                    log.error(
+                        "worker_cancelled_lease_conflict",
+                        issue_id=issue_id,
+                        issue_identifier=entry.issue.identifier,
+                    )
+                    task.cancel()
+                    entry.cancelled_at = datetime.now(timezone.utc)
             return
         registry = self._run_registry
         if registry is None or not entry.run_id:
@@ -1044,10 +2801,26 @@ class Orchestrator:
                 entry.cancelled_at = datetime.now(timezone.utc)
 
     def _finish_run_lease(
-        self, issue_id: str, entry: RunningEntry, status: str
+        self,
+        issue_id: str,
+        entry: RunningEntry,
+        status: str,
+        error: str | None = None,
     ) -> None:
         registry = self._run_registry
         if registry is None or not entry.run_id:
+            return
+        if entry.backend_cleanup_unconfirmed:
+            # Preserve the active owner/backend fence. The next service
+            # instance must reclaim, kill/not-found the recorded process
+            # group, and only then finalize the predecessor.
+            log.warning(
+                "run_lease_finish_deferred_for_backend_reap",
+                issue_id=issue_id,
+                issue_identifier=entry.issue.identifier,
+                status=status,
+                backend_agent_pid=entry.agent_pgid,
+            )
             return
         self._registry_guard(
             "complete_run",
@@ -1055,6 +2828,13 @@ class Orchestrator:
                 issue_id=issue_id,
                 run_id=entry.run_id,
                 status=status,
+                state=entry.issue.state,
+                input_tokens=entry.codex_input_tokens,
+                cache_input_tokens=entry.codex_cache_input_tokens,
+                output_tokens=entry.codex_output_tokens,
+                total_tokens=entry.codex_total_tokens,
+                failure_class=(None if status == "normal" else status),
+                failure_message=error,
             ),
             None,
         )
@@ -1062,15 +2842,84 @@ class Orchestrator:
     def _try_acquire_run_lease(
         self,
         *,
+        cfg: ServiceConfig,
         issue: Issue,
         workspace_path: Path,
         attempt: int | None,
         attempt_kind: str,
         agent_kind: str,
-    ) -> str | None:
+        release_required: bool = False,
+    ) -> _RunLeaseAcquisition | None:
+        if release_required:
+            try:
+                run_id = self._release_registry_call(
+                    cfg,
+                    "acquire_release_run",
+                    lambda registry: registry.acquire_run(
+                        issue,
+                        workspace_path=workspace_path,
+                        attempt=attempt,
+                        attempt_kind=attempt_kind,
+                        agent_kind=agent_kind,
+                    ),
+                )
+            except SymphonyError:
+                return None
+            if run_id:
+                return _RunLeaseAcquisition(run_id=cast(str, run_id))
+            log.info(
+                "dispatch_lease_held",
+                issue_id=issue.id,
+                issue_identifier=issue.identifier,
+            )
+            return None
         registry = self._run_registry
         if registry is None:
-            return ""
+            if cfg.agent.crash_continuation and self._run_registry_initialized:
+                return None
+            return _RunLeaseAcquisition(run_id="")
+
+        if cfg.agent.crash_continuation:
+            try:
+                source_run_id = registry.latest_continuation_source(
+                    issue_id=issue.id,
+                    agent_kind=agent_kind,
+                    state=issue.state,
+                    issue_updated_at=issue.updated_at,
+                )
+                if source_run_id is not None:
+                    recovered = registry.acquire_continuation_run(
+                        issue,
+                        continued_from_run_id=source_run_id,
+                        workspace_path=workspace_path,
+                        attempt=attempt,
+                        attempt_kind="recovery",
+                        agent_kind=agent_kind,
+                    )
+                    if recovered is None:
+                        # Discovery raced or the source became ineligible. Do
+                        # not degrade an authoritative continuation decision
+                        # into a second fresh writer on this tick.
+                        return None
+                    self._last_registry_error = None
+                    return _RunLeaseAcquisition(
+                        run_id=recovered.run_id,
+                        continued_from_run_id=recovered.continued_from_run_id,
+                        checkpoint=recovered.checkpoint,
+                    )
+            except Exception as exc:
+                # Session continuation is authority, not telemetry. A broken
+                # read/claim fails closed even though ordinary lease
+                # bookkeeping retains its historical fail-open behavior.
+                self._registry_error_count += 1
+                self._last_registry_error = f"acquire_continuation: {exc}"
+                log.error(
+                    "run_registry_error",
+                    op="acquire_continuation",
+                    error=str(exc),
+                )
+                return None
+
         run_id = self._registry_guard(
             "acquire_run",
             lambda: registry.acquire_run(
@@ -1083,11 +2932,13 @@ class Orchestrator:
             "",
         )
         if run_id == "":
-            # Registry error: dispatch proceeds leaseless (same as
-            # registry-disabled) and health reports degraded.
-            return ""
+            if cfg.agent.crash_continuation:
+                # Recovery authority cannot degrade into a leaseless writer.
+                return None
+            # Explicit opt-out preserves the historical fail-open lease path.
+            return _RunLeaseAcquisition(run_id="")
         if run_id:
-            return run_id
+            return _RunLeaseAcquisition(run_id=run_id)
         log.info(
             "dispatch_lease_held",
             issue_id=issue.id,
@@ -1106,14 +2957,18 @@ class Orchestrator:
             cfg, err = self._workflow_state.reload()
             if err is not None or cfg is None:
                 raise err or SymphonyError("workflow not loaded")
+        ensure_workflow_repo_is_safe(cfg.workflow_path)
         validate_for_dispatch(cfg)
         # Surface the workflow dir to every subprocess spawned afterwards
         # (hooks and agent backends inherit via os.environ). WORKFLOW.md
         # authors can then reference it from `claude.command` etc., e.g.
         # `--add-dir "$SYMPHONY_WORKFLOW_DIR/kanban"` so Claude Code accepts
         # writes through the host-board junction installed by after_create.
-        import os as _os
-        _os.environ["SYMPHONY_WORKFLOW_DIR"] = str(cfg.workflow_path.parent)
+        os.environ["SYMPHONY_WORKFLOW_DIR"] = str(cfg.workflow_path.parent)
+        # The board-tool protocol in the stage prompts and the chat preamble
+        # requires the `symphony` CLI; a venv install is not necessarily on
+        # the worker's PATH. Prompts reference `${SYMPHONY_CLI:-symphony}`.
+        os.environ["SYMPHONY_CLI"] = resolve_symphony_cli()
         self._workspace_manager = WorkspaceManager(
             cfg.workspace_root,
             cfg.hooks,
@@ -1127,7 +2982,14 @@ class Orchestrator:
         self._stats = stats_store_for(
             cfg.workflow_path.parent / ".symphony" / "stats.jsonl"
         )
-        self._ensure_run_registry(cfg)
+        if cfg.artifacts.enabled:
+            self._artifact_store = ArtifactStore(
+                cfg.workflow_path.parent / ".symphony" / "artifacts",
+                max_file_bytes=cfg.artifacts.max_file_mb * 1024 * 1024,
+                max_ticket_bytes=cfg.artifacts.max_ticket_mb * 1024 * 1024,
+            )
+            self._ensure_artifact_dir_git_excluded(cfg)
+        await self._ensure_run_registry_async(cfg)
         await self._startup_terminal_cleanup(cfg)
         self._spawn_tick_loop()
 
@@ -1196,6 +3058,7 @@ class Orchestrator:
         # the registry; cancel anything still stuck after the bound.
         await self._drain_background_tasks()
         self._running.clear()
+        self._app_release_transition_locks.clear()
         self._retry.clear()
         self._paused_issue_ids.clear()
         self._pause_reasons.clear()
@@ -1203,10 +3066,25 @@ class Orchestrator:
         self._turn_budget_exhausted.clear()
         self._lease_blocked.clear()
         self._blocked_rca_source_ids.clear()
+        self._history_recovery_attempted.clear()
         self._issue_debug.clear()
         if self._run_registry is not None:
             self._run_registry.close()
             self._run_registry = None
+        # Close the per-lifetime tracker client AFTER the drains above so
+        # in-flight `asyncio.to_thread` bridges finish first. Bridges that
+        # still slip through afterwards raise a clean retryable
+        # `TrackerClientUnavailable` (see `_invoke_shared_tracker_client`)
+        # instead of touching the closed pool or rebuilding past shutdown.
+        with self._tracker_client_lock:
+            # New checkouts must fail fast while the pool is closing; a
+            # rebuild here would race the close and leak a fresh client.
+            self._tracker_client_closing = True
+            if self._tracker_client is not None:
+                self._tracker_client.close()
+                self._tracker_client = None
+                self._tracker_client_cfg = None
+                self._tracker_client_closed = True
 
     # ------------------------------------------------------------------
     # observers (§13)
@@ -1240,7 +3118,9 @@ class Orchestrator:
 
     def snapshot(self) -> dict[str, Any]:
         cfg = self._workflow_state.current()
-        running_rows = [self._running_row(eid, entry) for eid, entry in self._running.items()]
+        running_rows = [
+            self._running_row(eid, entry) for eid, entry in self._running.items()
+        ]
         retry_rows = [self._retry_row(entry) for entry in self._retry.values()]
         active_seconds = sum(
             (datetime.now(timezone.utc) - entry.started_at).total_seconds()
@@ -1256,7 +3136,9 @@ class Orchestrator:
                 "cache_input_tokens": self._totals.cache_input_tokens,
                 "output_tokens": self._totals.output_tokens,
                 "total_tokens": self._totals.total_tokens,
-                "seconds_running": round(self._totals.seconds_running + active_seconds, 1),
+                "seconds_running": round(
+                    self._totals.seconds_running + active_seconds, 1
+                ),
             },
             "rate_limits": self._latest_rate_limits,
             "workflow": {
@@ -1265,6 +3147,17 @@ class Orchestrator:
             },
             "health": self._health_summary(),
         }
+
+    def schedule_snapshot(self) -> dict[str, Any]:
+        """Immutable projection authored by the last completed scheduler pass."""
+
+        return copy.deepcopy(self._schedule_snapshot)
+
+    def dependency_state_resolved(self, state: str | None) -> bool:
+        """Use the dispatcher's dependency-success contract for projections."""
+
+        cfg = self._workflow_state.current()
+        return _blocker_dependency_is_resolved(state, cfg)
 
     def health(self) -> dict[str, Any]:
         """A1 — liveness/degradation surface for /api/v1/health.
@@ -1289,13 +3182,17 @@ class Orchestrator:
             degraded_reasons.append("tracker_fetch_failures")
         if self._last_registry_error is not None:
             degraded_reasons.append("run_registry_error")
-        status = "degraded" if degraded_reasons else ("starting" if last is None else "ok")
+        status = (
+            "degraded" if degraded_reasons else ("starting" if last is None else "ok")
+        )
         return {
             "status": status,
             "degraded_reasons": degraded_reasons,
             "version": __version__,
             "generated_at": _utc_iso_z(),
             "workflow_path": str(self._workflow_state.path),
+            "service_instance_id": self._service_instance_id,
+            "orchestrator_pid": os.getpid(),
             "tick": {
                 "alive": tick_alive,
                 "started": tick_started,
@@ -1334,8 +3231,9 @@ class Orchestrator:
                 "feature_branch_pattern": "symphony/<ID>",
                 "base_branch": "current branch",
                 "merge_target_branch": "current branch",
-                "merge_timing": "after Learn, before Done",
+                "merge_timing": "after Document, before Done",
                 "auto_merge_enabled": False,
+                "merge_delivery": "disabled",
             }
         base = cfg.agent.feature_base_branch or "current branch"
         target = cfg.agent.auto_merge_target_branch or base
@@ -1343,8 +3241,13 @@ class Orchestrator:
             "feature_branch_pattern": "symphony/<ID>",
             "base_branch": base,
             "merge_target_branch": target,
-            "merge_timing": "after Learn, before Done",
+            "merge_timing": "after Document, before Done",
             "auto_merge_enabled": bool(cfg.agent.auto_merge_on_done),
+            "merge_delivery": (
+                "upstream-publishing"
+                if cfg.agent.auto_merge_push_target
+                else "local-only"
+            ),
         }
 
     def issue_snapshot(self, identifier: str) -> dict[str, Any] | None:
@@ -1377,7 +3280,9 @@ class Orchestrator:
                     "issue_id": issue_id,
                     "status": "retrying",
                     "workspace": {
-                        "path": str(debug.last_workspace) if debug.last_workspace else None
+                        "path": str(debug.last_workspace)
+                        if debug.last_workspace
+                        else None
                     },
                     "attempts": {
                         "restart_count": debug.restart_count,
@@ -1394,6 +3299,78 @@ class Orchestrator:
                 }
         return None
 
+    async def issue_budget_snapshot(self, issue: Issue) -> dict[str, Any]:
+        """Read current guard counters; missing or truncated history is unknown."""
+        cfg = self._workflow_state.current()
+        if cfg is None:
+            return {"available": False, "items": []}
+        entry = self._running.get(issue.id)
+        debug = self._issue_debug.get(issue.id)
+        generated_at = _utc_iso_z()
+        current_state = (entry.state_at_turn_start or issue.state) if entry else issue.state
+        attempt_turns = entry.turn_count if entry else None
+        total_turns = (
+            (debug.completed_turn_count if debug else 0) + entry.turn_count
+            if entry else debug.completed_turn_count if debug else None
+        )
+        state_tokens = (
+            entry.codex_state_total_tokens
+            if entry and entry.last_reported_total_tokens > 0 else None
+        )
+        rewinds = debug.rewind_count if debug else None
+        retry_used = self._persisted_retry_attempts.get(issue.id)
+        if entry is not None and entry.attempt_kind == "retry":
+            retry_used = entry.retry_attempt
+        elif entry is not None and entry.retry_attempt is None:
+            retry_used = 0
+
+        def item(name: str, limit: int, used: int | None) -> dict[str, Any]:
+            status = "disabled" if limit <= 0 else (
+                "unknown" if used is None else "exhausted" if used >= limit else "remaining"
+            )
+            return {
+                "name": name, "limit": limit, "used": used,
+                "remaining": max(limit - used, 0) if limit > 0 and used is not None else None,
+                "status": status,
+            }
+
+        reopen_used = None
+        registry = self._run_registry
+        if registry is not None:
+            records = await asyncio.to_thread(
+                self._registry_guard,
+                "budget_reopen_history",
+                lambda: registry.recent_runs(issue.id, limit=200, status="normal"),
+                None,
+            )
+            # A full page may omit older runs. Never infer an exact count from it.
+            if (
+                records is not None and len(records) < 200
+                and self._running.get(issue.id) is entry
+            ):
+                prior_done = sum(
+                    1 for record in records if _is_successful_terminal_state(record.state)
+                )
+                reopen_used = max(prior_done - 1, 0)
+                if entry is not None and prior_done:
+                    reopen_used += 1
+        reopen_limit = cfg.agent.max_reopens
+        if reopen_limit > 0:
+            reopen_limit += len(_REOPEN_APPROVED_RE.findall(issue.description or ""))
+        return {
+            "available": True,
+            "generated_at": generated_at,
+            "state": current_state,
+            "items": [
+                item("attempt_turns", cfg.agent.max_turns, attempt_turns),
+                item("total_turns", cfg.agent.max_total_turns, total_turns),
+                item("state_tokens", self._token_budget_for_state(cfg, current_state), state_tokens),
+                item("retries", cfg.agent.max_retries, retry_used),
+                item("rewinds", cfg.agent.max_attempts, rewinds),
+                item("reopens", reopen_limit, reopen_used),
+            ],
+        }
+
     def issue_attention(self, issue: Issue) -> dict[str, str | None] | None:
         if self._issue_is_terminal(issue):
             if normalize_state(issue.state) == "blocked":
@@ -1403,14 +3380,14 @@ class Orchestrator:
                 ):
                     return _attention_signal(
                         "blocked_recovery_pending",
-                        "RCA pending",
-                        "RCA ticket already opened; source stays Blocked until RCA resolves",
+                        "Fix pending",
+                        "Fix ticket already opened; source stays Blocked until the fix resolves",
                         "info",
                     )
                 return _attention_signal(
                     "blocked_recovery_available",
-                    "Blocked RCA",
-                    "RCA ticket will open automatically before this issue returns to an active lane",
+                    "Blocked fix",
+                    "A fix ticket will open automatically before this issue returns to an active lane",
                     "warning",
                 )
             return None
@@ -1465,6 +3442,19 @@ class Orchestrator:
                 if _blocker_dependency_is_resolved(blocker.state, cfg):
                     continue
                 identifier = blocker.identifier or blocker.id or "unknown"
+                # F-13: a blocker id that is not on the board hydrates to
+                # `state=None` and deadlocks the ticket forever. "waiting on
+                # unresolved dependency" reads like normal queueing, so say
+                # what actually happened.
+                if not normalize_state(blocker.state).strip():
+                    return _attention_signal(
+                        "dangling_dependency",
+                        "Unknown blocker",
+                        f"blocker {identifier} is not on the board — fix the id "
+                        f"with `symphony board update {issue.identifier} "
+                        "--blocked-by <ID>` or clear it",
+                        "error",
+                    )
                 return _attention_signal(
                     "blocked_dependency",
                     "Blocked dependency",
@@ -1485,9 +3475,7 @@ class Orchestrator:
             return state in {normalize_state(s) for s in cfg.tracker.terminal_states}
         return state in {"done", "cancelled", "canceled", "blocked", "archive"}
 
-    def _stalled_attention(
-        self, entry: RunningEntry
-    ) -> dict[str, str | None] | None:
+    def _stalled_attention(self, entry: RunningEntry) -> dict[str, str | None] | None:
         if entry.cancelled_at is None:
             return None
         seconds = int(
@@ -1518,7 +3506,6 @@ class Orchestrator:
             "issue_identifier": entry.issue.identifier,
             "state": entry.issue.state,
             "agent_kind": self._entry_agent_kind(entry),
-            "session_id": entry.session_id,
             "turn_count": total_turn_count,
             "total_turn_count": total_turn_count,
             "attempt_turn_count": entry.turn_count,
@@ -1548,10 +3535,10 @@ class Orchestrator:
         if entry.agent_kind:
             return entry.agent_kind
         requested = _requested_agent_kind(entry.issue)
-        if requested is not None:
-            return requested
         cfg = self._workflow_state.current()
-        return cfg.agent.kind if cfg is not None else ""
+        if cfg is None:
+            return requested or ""
+        return cfg.agent.kind_for_state(entry.issue.state, requested)
 
     # ------------------------------------------------------------------
     # operator-driven pause / resume
@@ -1668,8 +3655,12 @@ class Orchestrator:
             return identifier
         return None
 
-    async def skip_learn(self, identifier: str) -> tuple[bool, str]:
-        """Move an idle Learn ticket to Human Review with an audit note."""
+    async def skip_document(self, identifier: str) -> tuple[bool, str]:
+        """Move an idle Document ticket to Human Review with an audit note.
+
+        Accepts the legacy `Learn` lane name so pre-rename boards keep the
+        skip control without migration.
+        """
         cfg = self._workflow_state.current()
         if cfg is None:
             cfg, err = self._workflow_state.reload()
@@ -1684,26 +3675,38 @@ class Orchestrator:
         )
         if issue is None:
             return False, f"unknown issue {identifier}"
-        if normalize_state(issue.state) != "learn":
-            return False, f"only Learn tickets can be skipped (state={issue.state})"
+        if normalize_state(issue.state) not in {"document", "learn"}:
+            return False, (
+                f"only Document tickets can be skipped (state={issue.state})"
+            )
         if self.find_running_issue_id(identifier) is not None:
             return False, f"{identifier} started running; retry after it stops"
 
+        target_state = _human_review_target_state(cfg)
+        if not target_state:
+            return False, (
+                "this board declares no terminal lane to skip into; add a "
+                "`Human Review`-style terminal state to tracker.terminal_states"
+            )
         await asyncio.to_thread(
             self._tracker_call_append_note,
             cfg,
             issue,
-            "Learn Skipped",
-            "Operator skipped wiki write-back from the Learn lane.",
+            "Document Skipped",
+            f"Operator skipped documentation write-back from the {issue.state} lane.",
         )
         await asyncio.to_thread(
             self._tracker_call_update_state,
             cfg,
             issue,
-            "Human Review",
+            target_state,
         )
         self.request_refresh()
         return True, f"moved {identifier} to Human Review"
+
+    # Deprecated alias — the lane was renamed Learn -> Document; external
+    # callers using the old method name keep working.
+    skip_learn = skip_document
 
     def _retry_row(self, entry: RetryEntry) -> dict[str, Any]:
         return {
@@ -1721,7 +3724,11 @@ class Orchestrator:
 
     def _done_count_path(self, cfg: ServiceConfig) -> Path:
         """On-disk location for the persisted Done counter."""
-        return cfg.workflow_path.parent / ".symphony" / "done_count.json"
+        return (
+            cfg.workflow_path.parent
+            / ".symphony"
+            / state_file_name(cfg.workflow_path, "done_count")
+        )
 
     def _load_done_count(self, cfg: ServiceConfig) -> None:
         """Restore the Done counter across orchestrator restarts.
@@ -1748,26 +3755,22 @@ class Orchestrator:
         """Best-effort flush; mirrors `_persist_token_ema`."""
         path = self._done_count_path(cfg)
         try:
-            path.parent.mkdir(parents=True, exist_ok=True)
-            tmp = path.with_suffix(".json.tmp")
-            tmp.write_text(
-                json.dumps({"done_count": self._done_count}, indent=2),
-                encoding="utf-8",
-            )
-            tmp.replace(path)
+            write_json_atomic(path, {"done_count": self._done_count})
         except OSError as exc:
             log.warning("done_count_persist_failed", path=str(path), error=str(exc))
 
-    def _maybe_run_wiki_sweep(self, cfg: ServiceConfig, *, identifier: str) -> None:
+    async def _maybe_run_wiki_sweep(self, cfg: ServiceConfig, *, identifier: str) -> None:
         """C5 — bump the Done counter and run wiki-sweep every Nth time.
 
-        Called from the two Done-transition sites (`_on_worker_exit` and
-        the reconcile-driven path). `sweep_every_n: 0` disables the
-        auto-sweep entirely. The sweep is intentionally synchronous and
-        best-effort: it runs in-process for simplicity (the typical wiki
-        is small), failures only log a warning, and never block the
-        Done transition. The counter is persisted after every Done so
-        sweep cadence survives orchestrator restarts.
+        Called (awaited) from the two Done-transition sites
+        (`_on_worker_exit` and the reconcile-driven path). `sweep_every_n:
+        0` disables the auto-sweep entirely. The sweep is best-effort and
+        runs in-process for simplicity (the typical wiki is small), but
+        off the event loop via `asyncio.to_thread` so a slow filesystem
+        scan cannot stall ticks or delay shutdown. Failures only log a
+        warning and never block the Done transition. The counter is
+        persisted after every Done so sweep cadence survives
+        orchestrator restarts.
         """
         every = cfg.wiki.sweep_every_n
         if every <= 0:
@@ -1780,7 +3783,7 @@ class Orchestrator:
         if root is None:
             return
         try:
-            report = _wiki_sweep_run(root, dry_run=False)
+            report = await asyncio.to_thread(_wiki_sweep_run, root, dry_run=False)
         except Exception as exc:
             log.warning(
                 "wiki_sweep_failed",
@@ -1849,7 +3852,7 @@ class Orchestrator:
         result: AutoMergeResult,
         debug_target: "_IssueDebug | None",
     ) -> None:
-        branch = f"symphony/{issue.identifier}"
+        branch = f"{SYMPHONY_BRANCH_PREFIX}{issue.identifier}"
         target = cfg.agent.auto_merge_target_branch or "(current branch)"
         detail = result.detail.strip()
         note_body = (
@@ -1911,12 +3914,13 @@ class Orchestrator:
             return True
         result = await auto_merge_on_done_best_effort(
             workflow_dir=cfg.workflow_path.parent,
-            branch=f"symphony/{issue.identifier}",
+            branch=f"{SYMPHONY_BRANCH_PREFIX}{issue.identifier}",
             identifier=issue.identifier,
             title=issue.title,
             target_branch=cfg.agent.auto_merge_target_branch,
             exclude_paths=cfg.agent.auto_merge_exclude_paths,
             capture_untracked=cfg.agent.auto_merge_capture_untracked,
+            push_target=cfg.agent.auto_merge_push_target,
         )
         if result is None or result.ok:
             return True
@@ -1964,13 +3968,18 @@ class Orchestrator:
             cfg = self._workflow_state.current()
             poll_ms = cfg.poll_interval_ms if cfg is not None else 30_000
             try:
-                await asyncio.wait_for(self._tick_event.wait(), timeout=poll_ms / 1000.0)
+                await asyncio.wait_for(
+                    self._tick_event.wait(), timeout=poll_ms / 1000.0
+                )
             except asyncio.TimeoutError:
                 pass
             self._tick_event.clear()
             self._refresh_pending = False
 
     async def _on_tick(self) -> None:
+        if self._schedule_snapshot.get("generated_at"):
+            self._schedule_snapshot["stale"] = True
+            self._schedule_snapshot["reason"] = "scheduler_pass_incomplete"
         cfg, err = self._workflow_state.reload()
         if err is not None and cfg is None:
             cfg = self._workflow_state.current()
@@ -1981,7 +3990,10 @@ class Orchestrator:
             log.warning("workflow_reload_failed", error=str(err))
         assert cfg is not None
         # Apply hot-reloadable settings.
-        if self._workspace_manager is not None and self._workspace_manager.root != cfg.workspace_root.resolve():
+        if (
+            self._workspace_manager is not None
+            and self._workspace_manager.root != cfg.workspace_root.resolve()
+        ):
             log.info("workspace_root_changed", new=str(cfg.workspace_root))
             self._workspace_manager = WorkspaceManager(
                 cfg.workspace_root,
@@ -1999,10 +4011,11 @@ class Orchestrator:
             )
             self._workspace_manager.update_reuse_policy(cfg.workspace_reuse_policy)
             self._workspace_manager.update_hook_env(_branch_hook_env(cfg))
-        self._ensure_run_registry(cfg)
+        await self._ensure_run_registry_async(cfg)
         self._heartbeat_running_leases()
         if self._run_registry is not None:
             registry = self._run_registry
+            await self._reclaim_dead_owner_runs_async(registry)
             expired = self._registry_guard("expire_stale", registry.expire_stale, 0)
             if expired:
                 log.info("run_leases_expired", count=expired)
@@ -2041,12 +4054,23 @@ class Orchestrator:
             return
 
         await self._auto_normalize_legacy_human_review_done(cfg)
+        # Validate terminal FIX outcomes before fetching active candidates. A
+        # source whose dependency only looks Done must never dispatch first.
+        try:
+            await self._auto_reopen_sources_from_resolved_rcas(cfg)
+        except Exception as exc:
+            log.warning("blocked_fix_safety_sweep_failed", error=str(exc))
+            await self._notify_observers()
+            return
 
         # Fetch candidates.
         try:
             candidates = await self._fetch_candidates(cfg)
         except Exception as exc:
             self._consecutive_candidate_fetch_failures += 1
+            if self._schedule_snapshot.get("generated_at"):
+                self._schedule_snapshot["stale"] = True
+                self._schedule_snapshot["reason"] = "candidate_fetch_failed"
             log.warning(
                 "candidate_fetch_failed",
                 error=str(exc),
@@ -2058,21 +4082,352 @@ class Orchestrator:
 
         for issue in candidates:
             self._blocked_rca_source_ids.discard(issue.id)
+            self._history_recovery_attempted.discard(issue.id)
 
-        for issue in self._sort_with_wait_age_bump(candidates, cfg):
+        dependency_edge_count = sum(len(issue.blocked_by) for issue in candidates)
+        dependency_graph_within_bounds = (
+            len(candidates) <= MAX_DEPENDENCY_NODES
+            and dependency_edge_count <= MAX_DEPENDENCY_EDGES
+        )
+        if not dependency_graph_within_bounds:
+            log.error(
+                "dependency_graph_too_large",
+                nodes=len(candidates),
+                edges=dependency_edge_count,
+                policy=cfg.agent.scheduling_policy,
+            )
+            if cfg.agent.scheduling_policy == "dag":
+                self._schedule_snapshot = {
+                    "schema_version": 1,
+                    "available": False,
+                    "reason": "schedule_graph_too_large",
+                    "generated_at": _utc_iso_z(),
+                    "stale": False,
+                    "policy": "dag",
+                    "policy_order": (
+                        "starvation, priority, critical_path, registration"
+                    ),
+                    "slots": {},
+                    "entries": [],
+                }
+                await self._notify_observers()
+                return
+        if (
+            not dependency_graph_within_bounds
+            and cfg.agent.scheduling_policy == "fifo"
+        ):
+            slots_before = self._available_slots(cfg)
+            await self._dispatch_fifo_without_schedule_projection(candidates, cfg)
+            self._schedule_snapshot = {
+                "schema_version": 1,
+                "available": False,
+                "reason": "schedule_graph_too_large",
+                "generated_at": _utc_iso_z(),
+                "stale": False,
+                "policy": "fifo",
+                "policy_order": "starvation, registration",
+                "slots": {
+                    "running": len(self._running),
+                    "maximum": cfg.agent.max_concurrent_agents,
+                    "available_before": slots_before,
+                    "available_after": self._available_slots(cfg),
+                },
+                "entries": [],
+            }
+            if self._available_slots(cfg) > 0:
+                await self._auto_recover_blocked_sources(cfg)
+            now_monotonic = time.monotonic()
+            if (
+                self._last_archive_sweep_monotonic is None
+                or now_monotonic - self._last_archive_sweep_monotonic
+                >= ARCHIVE_SWEEP_INTERVAL_SEC
+            ):
+                self._last_archive_sweep_monotonic = now_monotonic
+                await self._archive_sweep(cfg)
+            if (
+                self._last_artifact_sweep_monotonic is None
+                or now_monotonic - self._last_artifact_sweep_monotonic
+                >= ARCHIVE_SWEEP_INTERVAL_SEC
+            ):
+                self._last_artifact_sweep_monotonic = now_monotonic
+                await self._artifact_sweep(cfg)
+            self._maybe_schedule_continuous_improvement(cfg)
+            await self._notify_observers()
+            return
+
+        dependency_analysis = (
+            await asyncio.to_thread(analyze_dependencies, candidates)
+            if dependency_graph_within_bounds
+            and (
+                cfg.agent.scheduling_policy == "dag"
+                or cfg.tracker.kind == "file"
+            )
+            else DependencyAnalysis({}, {})
+        )
+        ordered_candidates = self._sort_with_wait_age_bump(
+            candidates, cfg, analysis=dependency_analysis
+        )
+        path_lengths = dependency_analysis.critical_path_lengths
+        waves = dependency_analysis.waves
+        schedule_entries: list[dict[str, Any]] = []
+        ready_rank = 0
+        slots_before = self._available_slots(cfg)
+        evaluated_at = datetime.now(timezone.utc)
+        mutating_scan_open = True
+        for scan_position, issue in enumerate(ordered_candidates, start=1):
+            released_at = self._claim_released_at.get(issue.id)
+            starvation_promoted = bool(
+                released_at is not None
+                and (evaluated_at - released_at).total_seconds() / 60.0
+                >= WAIT_AGE_BUMP_MIN
+            )
+            entry: dict[str, Any] = {
+                "issue_id": issue.id,
+                "identifier": issue.identifier,
+                "request": (issue.request or "").strip() or None,
+                "state": issue.state,
+                "evaluated_state": issue.state,
+                "evaluated_updated_at": (
+                    issue.updated_at.isoformat() if issue.updated_at else None
+                ),
+                "evaluated_priority": issue.priority,
+                "evaluated_request": (issue.request or "").strip() or None,
+                "evaluated_blocked_by": [
+                    {
+                        "id": blocker.id,
+                        "identifier": blocker.identifier,
+                        "state": blocker.state,
+                    }
+                    for blocker in issue.blocked_by
+                ],
+                "priority": issue.priority,
+                "critical_path_length": path_lengths.get(issue.id, 0),
+                "wave": waves.get(issue.id, 0),
+                "scan_position": scan_position,
+                "queue_rank": None,
+                "starvation_promoted": starvation_promoted,
+                "status": "waiting",
+                "code": "not_evaluated",
+                "reason": "not evaluated",
+                "dispatch_outcome": None,
+                "retry": None,
+            }
+            if dependency_graph_within_bounds:
+                schedule_entries.append(entry)
+
+            if mutating_scan_open and await self._auto_triage_todo_if_actionable(
+                issue, cfg
+            ):
+                entry.update(
+                    status="waiting",
+                    code="auto_triage",
+                    reason="ticket was advanced by automatic triage",
+                    dispatch_outcome="state_changed",
+                )
+                continue
+            running = self._running.get(issue.id)
+            if running is not None:
+                entry.update(
+                    status="running",
+                    code="running",
+                    reason="worker is running",
+                    dispatch_outcome="running",
+                )
+                if mutating_scan_open and self._available_slots(cfg) <= 0:
+                    mutating_scan_open = False
+                continue
+            retry = self._retry.get(issue.id)
+            if retry is not None:
+                entry.update(
+                    status="retrying",
+                    code="retry_scheduled",
+                    reason="owned by the retry timer",
+                    retry={
+                        "attempt": retry.attempt,
+                        "kind": retry.kind,
+                        "due_at": _from_monotonic_to_iso(retry.due_at_ms),
+                        "holds_slot": retry.holds_slot,
+                    },
+                )
+                if mutating_scan_open and self._available_slots(cfg) <= 0:
+                    mutating_scan_open = False
+                continue
+
+            if mutating_scan_open and self._available_slots(cfg) <= 0:
+                # Preserve the legacy loop's first capacity break. Remaining
+                # rows are projected without tracker writes or dispatch checks.
+                mutating_scan_open = False
+
+            decision = self._eligibility_decision(
+                issue,
+                cfg,
+                owning_retry=False,
+                include_global_slots=False,
+            )
+            entry.update(
+                status=(
+                    "ready"
+                    if decision.disposition is _EligibilityDisposition.READY
+                    else (
+                        "waiting"
+                        if decision.disposition
+                        in {
+                            _EligibilityDisposition.WAIT_SLOT,
+                            _EligibilityDisposition.WAIT_NON_SLOT,
+                        }
+                        else "needs_action"
+                    )
+                ),
+                code=decision.code,
+                reason=decision.reason,
+            )
+            if decision.disposition is not _EligibilityDisposition.READY:
+                continue
+
+            if await self._auto_promote_factory_ready(issue, cfg):
+                entry.update(
+                    status="waiting",
+                    code="factory_ready_promotion",
+                    reason="factory dependency gate advanced to Build",
+                    dispatch_outcome="state_changed",
+                )
+                continue
+
+            ready_rank += 1
+            entry["queue_rank"] = ready_rank
+            if not mutating_scan_open or self._available_slots(cfg) <= 0:
+                mutating_scan_open = False
+                entry.update(
+                    status="ready",
+                    code="waiting_global_capacity",
+                    reason="ready; waiting for an orchestrator slot",
+                    dispatch_outcome="queued",
+                )
+                continue
+
+            if await self._hold_reopened_ticket_over_budget(issue, cfg):
+                entry.update(
+                    status="needs_action",
+                    code="reopen_budget",
+                    reason="ticket exceeded agent.max_reopens and was parked",
+                    dispatch_outcome="state_changed",
+                )
+                continue
+
+            # C1 — this final pre-dispatch check can still invalidate a
+            # forecast because touched-file ownership changes with live runs.
+            conflict = self._conflict_blocker(issue)
+            if conflict is not None:
+                other_identifier, overlap = conflict
+                await self._block_ticket_for_conflict(
+                    cfg, issue, other_identifier, overlap
+                )
+                entry.update(
+                    status="needs_action",
+                    code="refused_conflict",
+                    reason=f"touched files overlap with {other_identifier}",
+                    dispatch_outcome="blocked",
+                )
+                continue
+            persisted_attempt = self._persisted_retry_attempts.get(issue.id)
+            started = self._dispatch(
+                issue,
+                cfg,
+                attempt=persisted_attempt,
+                attempt_kind="retry" if persisted_attempt is not None else None,
+            )
+            entry.update(
+                status="running" if started else "needs_action",
+                code="dispatched" if started else "refused_dispatch_authority",
+                reason=(
+                    "selected and dispatched"
+                    if started
+                    else "selected but final dispatch authority refused the run"
+                ),
+                dispatch_outcome="started" if started else "refused",
+            )
+
+        self._schedule_snapshot = {
+            "schema_version": 1,
+            "available": (
+                cfg.tracker.kind == "file" and dependency_graph_within_bounds
+            ),
+            "reason": (
+                "unsupported_tracker"
+                if cfg.tracker.kind != "file"
+                else (
+                    None
+                    if dependency_graph_within_bounds
+                    else "schedule_graph_too_large"
+                )
+            ),
+            "generated_at": _utc_iso_z(),
+            "stale": False,
+            "policy": cfg.agent.scheduling_policy,
+            "policy_order": (
+                "starvation, priority, critical_path, registration"
+                if cfg.agent.scheduling_policy == "dag"
+                else "starvation, registration"
+            ),
+            "slots": {
+                "running": len(self._running),
+                "maximum": cfg.agent.max_concurrent_agents,
+                "available_before": slots_before,
+                "available_after": self._available_slots(cfg),
+            },
+            "entries": schedule_entries if cfg.tracker.kind == "file" else [],
+        }
+
+        if self._available_slots(cfg) > 0:
+            await self._auto_recover_blocked_sources(cfg)
+
+        now_monotonic = time.monotonic()
+        if (
+            self._last_archive_sweep_monotonic is None
+            or now_monotonic - self._last_archive_sweep_monotonic
+            >= ARCHIVE_SWEEP_INTERVAL_SEC
+        ):
+            self._last_archive_sweep_monotonic = now_monotonic
+            await self._archive_sweep(cfg)
+        if (
+            self._last_artifact_sweep_monotonic is None
+            or now_monotonic - self._last_artifact_sweep_monotonic
+            >= ARCHIVE_SWEEP_INTERVAL_SEC
+        ):
+            self._last_artifact_sweep_monotonic = now_monotonic
+            await self._artifact_sweep(cfg)
+
+        # Continuous-improvement heartbeat (plan §4). Cheap, non-blocking:
+        # evaluates due-math + guards and, at most, fires one background task.
+        self._maybe_schedule_continuous_improvement(cfg)
+
+        await self._notify_observers()
+
+    async def _dispatch_fifo_without_schedule_projection(
+        self, candidates: list[Issue], cfg: ServiceConfig
+    ) -> None:
+        """Preserve the legacy bounded loop when explanation limits are exceeded."""
+
+        empty_analysis = DependencyAnalysis({}, {})
+        for issue in self._sort_with_wait_age_bump(
+            candidates, cfg, analysis=empty_analysis
+        ):
             if await self._auto_triage_todo_if_actionable(issue, cfg):
                 continue
-            if not self._should_dispatch(issue, cfg):
-                continue
-            if await self._auto_promote_factory_ready(issue, cfg):
-                continue
+            if self._is_factory_profile(cfg):
+                decision = self._eligibility_decision(
+                    issue, cfg, owning_retry=False, include_global_slots=False
+                )
+                if decision.disposition is not _EligibilityDisposition.READY:
+                    continue
+                if await self._auto_promote_factory_ready(issue, cfg):
+                    continue
             if self._available_slots(cfg) <= 0:
                 break
-            # C1 — system-level pre-check. An overlap with any in-flight
-            # ticket's `## Touched Files` would race two workers against
-            # the same paths. Move the candidate to Blocked instead of
-            # claiming the slot; the agent prompt no longer carries this
-            # check itself (workflow-v0.5.2 § C1).
+            if not self._should_dispatch(issue, cfg):
+                continue
+            if await self._hold_reopened_ticket_over_budget(issue, cfg):
+                continue
             conflict = self._conflict_blocker(issue)
             if conflict is not None:
                 other_identifier, overlap = conflict
@@ -2085,39 +4440,20 @@ class Orchestrator:
                 issue,
                 cfg,
                 attempt=persisted_attempt,
-                attempt_kind="retry" if persisted_attempt is not None else None,
+                attempt_kind=("retry" if persisted_attempt is not None else None),
             )
-
-        await self._auto_reopen_sources_from_resolved_rcas(cfg)
-        if self._available_slots(cfg) > 0:
-            await self._auto_recover_blocked_sources(cfg)
-
-        now_monotonic = time.monotonic()
-        if (
-            self._last_archive_sweep_monotonic is None
-            or now_monotonic - self._last_archive_sweep_monotonic
-            >= ARCHIVE_SWEEP_INTERVAL_SEC
-        ):
-            self._last_archive_sweep_monotonic = now_monotonic
-            await self._archive_sweep(cfg)
-
-        # Continuous-improvement heartbeat (plan §4). Cheap, non-blocking:
-        # evaluates due-math + guards and, at most, fires one background task.
-        self._maybe_schedule_continuous_improvement(cfg)
-
-        await self._notify_observers()
 
     async def _auto_promote_factory_ready(
         self, issue: Issue, cfg: ServiceConfig
     ) -> bool:
-        """Advance the factory dependency gate without starting a worker."""
-        profile = str(cfg.raw.get("contract_profile", "advanced")).strip().lower()
-        if profile != "factory" or normalize_state(issue.state) != "ready":
+        """Advance an eligible dependency gate without starting an agent."""
+        if not self._is_factory_profile(cfg) or normalize_state(issue.state) != "ready":
             return False
         try:
             await asyncio.to_thread(
                 self._tracker_call_update_state, cfg, issue, "Build"
             )
+            self._clear_tracker_error(issue.id)
         except Exception as exc:
             self._record_tracker_error(issue.id, exc)
             log.warning(
@@ -2125,17 +4461,14 @@ class Orchestrator:
                 identifier=issue.identifier,
                 error=str(exc),
             )
-            return True
-        self._clear_tracker_error(issue.id)
-        log.info(
-            "factory_ready_promoted",
-            identifier=issue.identifier,
-            target="Build",
-        )
         return True
 
     def _sort_with_wait_age_bump(
-        self, candidates: list[Issue], cfg: ServiceConfig
+        self,
+        candidates: list[Issue],
+        cfg: ServiceConfig,
+        *,
+        analysis: DependencyAnalysis | None = None,
     ) -> list[Issue]:
         """G3 — promote candidates whose recovered wait age crossed the
         threshold ahead of registration-order FIFO. Candidates with no
@@ -2144,7 +4477,9 @@ class Orchestrator:
         wins so the most-starved ticket dispatches first.
         """
         if not self._claim_released_at:
-            return _sort_for_dispatch_fifo(candidates, cfg)
+            return sort_candidates(
+                candidates, cfg.agent.scheduling_policy, analysis=analysis
+            )
         now = datetime.now(timezone.utc)
         bumped: list[Issue] = []
         normal: list[Issue] = []
@@ -2158,10 +4493,245 @@ class Orchestrator:
                 bumped.append(issue)
             else:
                 normal.append(issue)
-        bumped.sort(
-            key=lambda i: self._claim_released_at.get(i.id) or now
+        bumped.sort(key=lambda i: self._claim_released_at.get(i.id) or now)
+        return bumped + sort_candidates(
+            normal, cfg.agent.scheduling_policy, analysis=analysis
         )
-        return bumped + _sort_for_dispatch_fifo(normal, cfg)
+
+    @staticmethod
+    def _artifact_commit_excludes(cfg: "ServiceConfig | None") -> tuple[str, ...]:
+        """Pathspecs keeping collected deliverables out of the Done commit.
+
+        Belt to `_ensure_artifact_dir_git_excluded`'s braces: that writes
+        `.git/info/exclude` in the *workflow* repo, but a custom
+        `after_create` hook can build the worktree in a different repo (the
+        shipped monorepo template does), where the rule would not apply.
+        This exclusion travels with the commit call, so it holds either way.
+        """
+        if cfg is None or not cfg.artifacts.enabled:
+            return ()
+        return (cfg.artifacts.dir,)
+
+    def _prompt_artifacts_dir(self, cfg: ServiceConfig) -> str:
+        """`artifacts.dir` for templates, or "" when collection is off.
+
+        The empty string is what lets `{% if artifacts_dir %}` drop the
+        instruction entirely — a disabled board must not tell workers to
+        write into a directory nothing will ever read.
+        """
+        if not cfg.artifacts.enabled or self._artifact_store is None:
+            return ""
+        return cfg.artifacts.dir
+
+    async def _collect_ticket_artifacts(
+        self,
+        cfg: ServiceConfig,
+        *,
+        identifier: str,
+        workspace_path: Path,
+        run_id: str,
+        turn: int | None,
+    ) -> None:
+        """Copy new workspace deliverables into the host-owned store.
+
+        Runs after every completed turn so a deliverable outlives the
+        workspace (removed at Done) and is visible on the board while the
+        run is still going. Idempotent by content hash, so re-scanning an
+        unchanged directory writes nothing. Best-effort throughout: a
+        failed collection must never fail the turn.
+        """
+        store = self._artifact_store
+        if store is None:
+            return
+        try:
+            result = await asyncio.to_thread(
+                store.collect_from_workspace,
+                workspace_path,
+                identifier=identifier,
+                magic_dir_name=cfg.artifacts.dir,
+                run_id=run_id or None,
+                turn=turn,
+            )
+        except Exception as exc:
+            log.warning(
+                "artifact_collect_failed", identifier=identifier, error=str(exc)
+            )
+            return
+        for name, reason in result.skipped:
+            if reason in ("duplicate", "hidden"):
+                continue
+            log.warning(
+                "artifact_skipped", identifier=identifier, name=name, reason=reason
+            )
+        if not result.collected:
+            return
+        try:
+            records = await asyncio.to_thread(store.list_for, identifier)
+            await asyncio.to_thread(
+                self._tracker_call_upsert_artifacts_section,
+                cfg,
+                identifier,
+                self._artifact_section_body(cfg, identifier, records),
+            )
+        except Exception as exc:
+            log.warning(
+                "artifact_section_write_failed",
+                identifier=identifier,
+                error=str(exc),
+            )
+
+    def _artifact_section_body(
+        self, cfg: ServiceConfig, identifier: str, records: list[ArtifactRecord]
+    ) -> str:
+        """Render the ticket's `## Artifacts` list.
+
+        File-board tickets get a relative link that resolves in any local
+        Markdown viewer; remote trackers (Jira, Linear) have no ticket file
+        to be relative to, so they get the file name only. Today only the
+        file board implements `upsert_artifacts_section`, so the remote
+        rendering is written but not yet reachable — see
+        `_tracker_call_upsert_artifacts_section`.
+        """
+        store = self._artifact_store
+        if store is None:
+            return ""
+        is_file_board = (cfg.tracker.kind or "").strip().lower() == "file"
+        board_root = cfg.tracker.board_root if is_file_board else None
+        lines: list[str] = []
+        for record in records:
+            title = record.title or record.name
+            size = format_bytes(record.byte_size)
+            link: str | None = None
+            if board_root is not None:
+                try:
+                    link = os.path.relpath(
+                        store.root / identifier / "files" / record.name, board_root
+                    )
+                except (OSError, ValueError):
+                    link = None
+            # Angle brackets keep names with spaces a valid CommonMark link.
+            head = (
+                f"- [{title}](<{link}>) — `{record.name}` ({size})"
+                if link
+                else f"- {title} — `{record.name}` ({size})"
+            )
+            lines.append(head)
+            if record.summary:
+                lines.append(f"  - {record.summary}")
+        return "\n".join(lines)
+
+    @staticmethod
+    def _tracker_call_upsert_artifacts_section(
+        cfg: ServiceConfig, identifier: str, section_body: str
+    ) -> None:
+        client = build_tracker_client(cfg)
+        try:
+            upsert = getattr(client, "upsert_artifacts_section", None)
+            if upsert is not None:
+                upsert(identifier, section_body)
+        finally:
+            client.close()
+
+    async def _artifact_sweep(self, cfg: ServiceConfig) -> None:
+        """Drop artifact directories for tickets that left the board.
+
+        Disabled when `artifacts.ttl_days <= 0`. Only directories whose
+        ticket is no longer visible to the tracker AND untouched for the
+        TTL are removed, so a live ticket never loses its deliverables.
+        """
+        store = self._artifact_store
+        if store is None or cfg.artifacts.ttl_days <= 0:
+            return
+        try:
+            known = await asyncio.to_thread(self._tracker_call_retained_identifiers, cfg)
+        except Exception as exc:
+            log.warning("artifact_sweep_fetch_failed", error=str(exc))
+            return
+        if not known:
+            # None = tracker cannot enumerate; empty = it enumerated nothing.
+            # A board directory that was renamed, unmounted, or lost to an I/O
+            # error also globs to empty, and treating that as "every ticket is
+            # gone" would delete artifacts nobody can regenerate. A genuinely
+            # empty board has no artifacts to sweep either way.
+            return
+        try:
+            await asyncio.to_thread(
+                store.sweep,
+                known_identifiers=known,
+                ttl_days=cfg.artifacts.ttl_days,
+            )
+        except Exception as exc:
+            log.warning("artifact_sweep_failed", error=str(exc))
+
+    @staticmethod
+    def _tracker_call_retained_identifiers(cfg: ServiceConfig) -> set[str] | None:
+        """Tickets whose artifacts the sweep must keep: present, not archived.
+
+        Returns None when the tracker cannot enumerate the whole board —
+        the sweep then does nothing rather than risk deleting artifacts for
+        tickets it simply could not see.
+        """
+        client = build_tracker_client(cfg)
+        try:
+            list_all = getattr(client, "list_all_identifiers", None)
+            if list_all is None:
+                return None
+            known = {str(item) for item in list_all()}
+            archive_state = (cfg.tracker.archive_state or "").strip()
+            if archive_state:
+                archived = client.fetch_issues_by_states([archive_state])
+                known -= {issue.identifier for issue in archived}
+            return known
+        finally:
+            client.close()
+
+    def _ensure_artifact_dir_git_excluded(self, cfg: ServiceConfig) -> None:
+        """Best-effort: keep the workspace artifact magic dir out of git.
+
+        `commit_workspace_on_done` stages the whole worktree, so without an
+        ignore rule every collected deliverable would land in the feature
+        branch and merge into the target branch. `.git/info/exclude` lives
+        in the shared common dir — one line covers the host checkout and
+        every linked worktree — and stays local, unlike editing the user's
+        checked-in .gitignore.
+        """
+        common_dir = git_inspect.git_common_dir(cfg.workflow_path.parent)
+        if common_dir is None:
+            # Custom `after_create` hooks may build worktrees in a different
+            # repository (the shipped monorepo template does). Say so: without
+            # the ignore rule `commit_workspace_on_done` stages deliverables
+            # into the feature branch and the Done merge carries them.
+            log.warning(
+                "artifact_dir_git_exclude_skipped",
+                reason="workflow dir is not inside a git repository",
+                workflow_dir=str(cfg.workflow_path.parent),
+            )
+            return
+        exclude_path = common_dir / "info" / "exclude"
+        # Leading slash anchors to each working tree's root, where the magic
+        # directory actually lives. An unanchored `output/` would match at any
+        # depth and silently untrack an unrelated `web/output/` for good.
+        pattern = f"/{cfg.artifacts.dir}/"
+        try:
+            existing = (
+                exclude_path.read_text(encoding="utf-8")
+                if exclude_path.exists()
+                else ""
+            )
+            if pattern in existing.splitlines():
+                return
+            exclude_path.parent.mkdir(parents=True, exist_ok=True)
+            with exclude_path.open("a", encoding="utf-8") as handle:
+                if existing and not existing.endswith("\n"):
+                    handle.write("\n")
+                handle.write(f"{pattern}\n")
+            log.info(
+                "artifact_dir_git_excluded",
+                exclude=str(exclude_path),
+                pattern=pattern,
+            )
+        except OSError as exc:
+            log.warning("artifact_dir_git_exclude_failed", error=str(exc))
 
     async def _archive_sweep(self, cfg: ServiceConfig) -> None:
         """Auto-archive terminal-state issues older than `archive_after_days`.
@@ -2204,9 +4774,7 @@ class Orchestrator:
                     error=str(exc),
                 )
 
-    async def _auto_normalize_legacy_human_review_done(
-        self, cfg: ServiceConfig
-    ) -> int:
+    async def _auto_normalize_legacy_human_review_done(self, cfg: ServiceConfig) -> int:
         """Move legacy completion handoffs out of Human Review.
 
         Current prompts reserve Human Review for real manual intervention.
@@ -2294,6 +4862,40 @@ class Orchestrator:
             client.close()
 
     @staticmethod
+    def _tracker_call_link_blocked_fix(
+        cfg: ServiceConfig, source_issue: Issue, fix_identifier: str
+    ) -> bool:
+        client = build_tracker_client(cfg)
+        try:
+            update_fields = getattr(client, "update_fields", None)
+            if not callable(update_fields):
+                return False
+            persisted = client.fetch_issue_full_by_id(source_issue.identifier)
+            if persisted is None:
+                return False
+            current = [
+                blocker.identifier or blocker.id
+                for blocker in persisted.blocked_by
+                if blocker.identifier or blocker.id
+            ]
+            if fix_identifier not in current:
+                update_fields(
+                    source_issue.identifier,
+                    blocked_by=[*current, fix_identifier],
+                )
+            return True
+        except Exception as exc:
+            log.warning(
+                "blocked_fix_dependency_link_failed",
+                source_identifier=source_issue.identifier,
+                fix_identifier=fix_identifier,
+                error=str(exc),
+            )
+            return False
+        finally:
+            client.close()
+
+    @staticmethod
     def _tracker_call_fetch_issue_full_by_id(
         cfg: ServiceConfig, identifier: str
     ) -> Issue | None:
@@ -2302,6 +4904,22 @@ class Orchestrator:
             return client.fetch_issue_full_by_id(identifier)
         finally:
             client.close()
+
+    @staticmethod
+    def _tracker_call_reconcile_release_cycle(
+        cfg: ServiceConfig,
+        source_issue: Issue,
+        validation: ReleaseValidationResult,
+        source_agent_kind: str,
+        *,
+        before_finalizer_relink: Callable[[Issue], None] | None = None,
+    ) -> _ReleaseCycleWriteResult:
+        return ReleaseCycleService(cfg).reconcile(
+            source_issue,
+            validation,
+            source_agent_kind,
+            before_finalizer_relink=before_finalizer_relink,
+        )
 
     @staticmethod
     def _tracker_call_set_agent_kind(
@@ -2316,6 +4934,39 @@ class Orchestrator:
             return True
         finally:
             client.close()
+
+    @staticmethod
+    def _tracker_call_active_rca_for_source(
+        cfg: ServiceConfig, source_identifier: str
+    ) -> str | None:
+        """Return the persisted active RCA for a source, if one exists."""
+        client = build_tracker_client(cfg)
+        try:
+            # Blocked/Human Review RCA cards are still unresolved work even
+            # when the workflow models those parking lanes as terminal. Only
+            # completed/discarded RCA states stop suppressing duplicates.
+            resolved_states = {"done", "archive", "cancelled"}
+            scan_states = tuple(
+                dict.fromkeys(
+                    (*cfg.tracker.active_states, *cfg.tracker.terminal_states)
+                )
+            )
+            unresolved_states = tuple(
+                state
+                for state in scan_states
+                if normalize_state(state) not in resolved_states
+            )
+            issues = client.fetch_issues_by_states(unresolved_states)
+        finally:
+            client.close()
+        source_key = source_identifier.casefold()
+        for candidate in issues:
+            if not _looks_like_blocked_rca_ticket(candidate):
+                continue
+            candidate_source = _blocked_rca_source_identifier(candidate)
+            if candidate_source and candidate_source.casefold() == source_key:
+                return candidate.identifier
+        return None
 
     @staticmethod
     def _tracker_call_create_blocked_rca_issue(
@@ -2334,7 +4985,7 @@ class Orchestrator:
                 return None
             created = create_with_next_identifier(
                 _blocked_rca_identifier_prefix(issue),
-                title=f"RCA unblock {issue.identifier}: {issue.title}",
+                title=f"Fix and unblock {issue.identifier}: {issue.title}",
                 state=rca_state,
                 priority=issue.priority,
                 labels=_blocked_rca_labels(issue),
@@ -2397,6 +5048,106 @@ class Orchestrator:
             manual=True,
         )
 
+    async def _recover_blocked_history_gate(
+        self, cfg: ServiceConfig, issue: Issue
+    ) -> bool:
+        """Rescue a ticket blocked on a git write its sandbox never allowed.
+
+        The agent runs the Final History Gate from inside a sandbox that may
+        not reach the object database (``utils.git_sandbox``), so a finished
+        ticket could self-park in ``Blocked`` on a housekeeping commit —
+        while the host's own snapshot commit, running unsandboxed moments
+        later, had already recorded the same work. Opening an RCA ticket for
+        that is worse than useless: the RCA worker inherits the identical
+        sandbox, blocks the same way, and cannot spawn a further RCA, which
+        is where the board stops moving entirely.
+
+        So before any RCA, the host re-checks the claim against real git
+        state. Returns True when the ticket was moved and no RCA is needed.
+        """
+        description = issue.description or ""
+        blocker = _markdown_section(description, _HISTORY_FAILURE_HEADING_RE)
+        if not blocker or classify_history_failure(blocker) != SANDBOX_WRITE_DENIED:
+            return False
+
+        branch = f"{SYMPHONY_BRANCH_PREFIX}{issue.identifier}"
+        # One rescue per ticket. A second identical block means the retry did
+        # not help, and looping a ticket through the pipeline forever is a
+        # worse failure mode than handing it to a human.
+        already_recovered = bool(_HISTORY_RECOVERY_HEADING_RE.search(description))
+        result = await verify_branch_history(
+            cfg.workflow_path.parent,
+            branch=branch,
+            push=cfg.agent.auto_merge_push_target,
+        )
+
+        if not result.durable:
+            log.info(
+                "history_recovery_declined",
+                identifier=issue.identifier,
+                branch=branch,
+                status=result.status,
+            )
+            return False
+
+        published = (
+            f"remote `{result.remote_sha[:12]}`"
+            if result.remote_sha
+            else "no upstream configured (local history only)"
+        )
+        note = (
+            "Symphony re-checked this ticket's git history from the host repo, "
+            "outside the agent sandbox that produced the failure.\n\n"
+            f"- branch: `{branch}`\n"
+            f"- local commit: `{result.local_sha[:12] or 'none'}`\n"
+            f"- published: {published}\n"
+            f"- host gate status: `{result.status}`\n\n"
+            "The delivery record is in git history, so the reported "
+            "`git add` failure was a sandbox permission limit, not lost work."
+        )
+
+        if result.status == HISTORY_PUSH_FAILED or already_recovered:
+            reason = (
+                "the remote tip could not be verified"
+                if result.status == HISTORY_PUSH_FAILED
+                else "this ticket was already rescued once and blocked again"
+            )
+            target = "Human Review"
+            note = f"{note}\n\nMoved to `Human Review` because {reason}."
+        else:
+            target = _blocked_source_reopen_state(cfg)
+            note = (
+                f"{note}\n\nReopened into `{target}` for one automated retry; "
+                "the history gate now runs on the host, so the same sandbox "
+                "limit cannot block it again."
+            )
+
+        try:
+            await asyncio.to_thread(
+                self._tracker_call_append_note, cfg, issue, "History Recovery", note
+            )
+            await asyncio.to_thread(self._tracker_call_update_state, cfg, issue, target)
+        except Exception as exc:
+            log.warning(
+                "history_recovery_persist_failed",
+                identifier=issue.identifier,
+                branch=branch,
+                error=str(exc),
+            )
+            return False
+
+        log.info(
+            "history_recovery_applied",
+            identifier=issue.identifier,
+            branch=branch,
+            status=result.status,
+            target_state=target,
+            local_sha=result.local_sha,
+            remote_sha=result.remote_sha,
+        )
+        self.request_refresh()
+        return True
+
     async def _open_blocked_rca_for_issue(
         self,
         cfg: ServiceConfig,
@@ -2407,16 +5158,7 @@ class Orchestrator:
         manual: bool = False,
     ) -> tuple[bool, str, dict[str, str]]:
         if _is_blocked_rca_ticket(issue):
-            return False, f"{issue.identifier} is already an RCA ticket", {}
-        if (
-            _blocked_rca_already_requested(issue)
-            or issue.id in self._blocked_rca_source_ids
-        ):
-            return (
-                False,
-                f"blocked RCA already opened for {issue.identifier}",
-                {},
-            )
+            return False, f"{issue.identifier} is already a fix ticket", {}
 
         reopen_state = _blocked_source_reopen_state(cfg)
         rca_state = _blocked_rca_work_state(cfg)
@@ -2433,45 +5175,109 @@ class Orchestrator:
                 )
             rca_state = requested_rca_state
 
-        requested_agent = (agent_kind or issue.agent_kind or cfg.agent.kind).strip().lower()
+        requested_agent = (
+            agent_kind or ""
+        ).strip().lower() or cfg.agent.kind_for_state(rca_state, issue.agent_kind)
         if requested_agent not in SUPPORTED_AGENT_KINDS:
             requested_agent = cfg.agent.kind
 
-        rca_identifier = await asyncio.to_thread(
-            self._tracker_call_create_blocked_rca_issue,
-            cfg,
-            issue,
-            rca_state,
-            reopen_state,
-            requested_agent,
-        )
-        if rca_identifier is None:
-            return (
-                False,
-                "blocked RCA creation requires a tracker that can create tickets",
-                {},
+        async with self._blocked_rca_creation_lock:
+            # The board is authoritative. If a previous create succeeded but
+            # its source edge/note did not, reconcile that partial write rather
+            # than suppressing the retry or creating a second FIX ticket.
+            active_rca = await asyncio.to_thread(
+                self._tracker_call_active_rca_for_source,
+                cfg,
+                issue.identifier,
             )
+            if active_rca is not None:
+                await asyncio.to_thread(
+                    self._tracker_call_link_blocked_fix,
+                    cfg,
+                    issue,
+                    active_rca,
+                )
+                if not _blocked_rca_already_requested(issue):
+                    try:
+                        await asyncio.to_thread(
+                            self._tracker_call_append_note,
+                            cfg,
+                            issue,
+                            "Blocked Fix",
+                            f"Fix ticket `{active_rca}` is already open. Symphony "
+                            "reconciled the source dependency after an interrupted "
+                            "recovery write; the source remains Blocked until the "
+                            "fix is proven.",
+                        )
+                    except Exception as exc:
+                        # Keep deduplication authoritative even if the source was
+                        # concurrently removed or its note cannot yet be repaired.
+                        log.warning(
+                            "blocked_fix_source_note_reconcile_failed",
+                            source_identifier=issue.identifier,
+                            fix_identifier=active_rca,
+                            error=str(exc),
+                        )
+                self._blocked_rca_source_ids.add(issue.id)
+                return (
+                    False,
+                    f"blocked fix already opened for {issue.identifier}",
+                    {},
+                )
+            if (
+                _blocked_rca_already_requested(issue)
+                or issue.id in self._blocked_rca_source_ids
+            ):
+                self._blocked_rca_source_ids.add(issue.id)
+                return (
+                    False,
+                    f"blocked fix already opened for {issue.identifier}",
+                    {},
+                )
+            rca_identifier = await asyncio.to_thread(
+                self._tracker_call_create_blocked_rca_issue,
+                cfg,
+                issue,
+                rca_state,
+                reopen_state,
+                requested_agent,
+            )
+            if rca_identifier is None:
+                return (
+                    False,
+                    "blocked fix creation requires a tracker that can create tickets",
+                    {},
+                )
 
-        body = (
-            f"RCA ticket `{rca_identifier}` opened in `{rca_state}` for "
-            f"`{requested_agent}` worker dispatch.\n\n"
-            f"This source ticket remains `{issue.state}`. The RCA worker must "
-            "resolve and verify the root cause before moving this ticket back "
-            f"to `{reopen_state}`. After that reopen, the source ticket still "
-            "must pass the normal configured workflow. If the root cause cannot "
-            "be resolved safely by an agent, the RCA worker should leave this "
-            "ticket Blocked with exact operator action."
-        )
-        if not manual:
-            body = "Opened automatically by the orchestrator.\n\n" + body
-        await asyncio.to_thread(
-            self._tracker_call_append_note,
-            cfg,
-            issue,
-            "Blocked RCA",
-            body,
-        )
-        self._blocked_rca_source_ids.add(issue.id)
+            body = (
+                f"Fix ticket `{rca_identifier}` opened in `{rca_state}` for "
+                f"`{requested_agent}` worker dispatch.\n\n"
+                f"This source ticket remains `{issue.state}`. The fix worker must "
+                "resolve and verify the root cause before moving this ticket back "
+                f"to `{reopen_state}`. After that reopen, the source ticket still "
+                "must pass the normal configured workflow. If the root cause cannot "
+                "be resolved safely by an agent, the fix worker should leave this "
+                "ticket Blocked with exact operator action."
+            )
+            if not manual:
+                body = "Opened automatically by the orchestrator.\n\n" + body
+            await asyncio.to_thread(
+                self._tracker_call_link_blocked_fix,
+                cfg,
+                issue,
+                rca_identifier,
+            )
+            await asyncio.to_thread(
+                self._tracker_call_append_note,
+                cfg,
+                issue,
+                "Blocked Fix",
+                body,
+            )
+            # Only mark the in-process episode after its durable source note is
+            # present. Partial creates are repaired by the active-board path.
+            self._blocked_rca_source_ids.add(issue.id)
+
         self._record_stats_transition(rca_identifier, "", rca_state)
         self.request_refresh()
         return (
@@ -2482,6 +5288,9 @@ class Orchestrator:
                 "original_state": issue.state,
                 "target_state": reopen_state,
                 "source_reopen_state": reopen_state,
+                "fix_identifier": rca_identifier,
+                "fix_state": rca_state,
+                # Deprecated response aliases retained for API compatibility.
                 "rca_identifier": rca_identifier,
                 "rca_state": rca_state,
                 "agent_kind": requested_agent,
@@ -2508,10 +5317,10 @@ class Orchestrator:
                 break
             if normalize_state(issue.state) != "blocked":
                 self._blocked_rca_source_ids.discard(issue.id)
+                self._history_recovery_attempted.discard(issue.id)
                 continue
-            if _is_blocked_rca_ticket(issue):
-                continue
-            if issue.id in self._blocked_rca_source_ids:
+            recovery_pending = issue.id not in self._history_recovery_attempted
+            if not recovery_pending and _is_blocked_rca_ticket(issue):
                 continue
 
             full_issue = issue
@@ -2523,8 +5332,23 @@ class Orchestrator:
                 )
                 if fetched is not None:
                     full_issue = fetched
-            if _blocked_rca_already_requested(full_issue):
-                self._blocked_rca_source_ids.add(issue.id)
+
+            # Host-side rescue runs before any RCA, and deliberately also runs
+            # for RCA tickets: an RCA blocked by the same sandbox limit is the
+            # dead end, because it cannot open a further RCA of its own.
+            if recovery_pending:
+                self._history_recovery_attempted.add(issue.id)
+                try:
+                    if await self._recover_blocked_history_gate(cfg, full_issue):
+                        self._clear_tracker_error(issue.id)
+                        continue
+                except Exception as exc:
+                    log.warning(
+                        "history_recovery_errored",
+                        identifier=issue.identifier,
+                        error=str(exc),
+                    )
+            if _is_blocked_rca_ticket(issue):
                 continue
 
             try:
@@ -2608,14 +5432,12 @@ class Orchestrator:
         self, cfg: ServiceConfig, rca_issue: Issue, source_issue: Issue
     ) -> bool:
         if normalize_state(source_issue.state) != "blocked":
-            self._blocked_rca_source_ids.discard(source_issue.id)
             return False
         if _is_blocked_rca_ticket(source_issue):
             return False
-        if (
-            _blocked_rca_requires_operator_intervention(rca_issue)
-            or _blocked_rca_requires_operator_intervention(source_issue)
-        ):
+        if _blocked_rca_requires_operator_intervention(
+            rca_issue
+        ) or _blocked_rca_requires_operator_intervention(source_issue):
             log.info(
                 "blocked_rca_source_kept_blocked",
                 rca_identifier=rca_issue.identifier,
@@ -2625,17 +5447,19 @@ class Orchestrator:
             return False
         target_state = _blocked_source_reopen_state(cfg)
         body = (
-            f"RCA ticket `{rca_issue.identifier}` reached `{rca_issue.state}`. "
+            f"Fix ticket `{rca_issue.identifier}` reached `{rca_issue.state}`. "
             f"Symphony is moving `{source_issue.identifier}` back to "
             f"`{target_state}` so it can continue through the configured workflow."
         )
         try:
-            if not _blocked_rca_resolution_already_recorded(source_issue):
+            if not _BLOCKED_RCA_HOST_RESOLVED_HEADING_RE.search(
+                source_issue.description or ""
+            ):
                 await asyncio.to_thread(
                     self._tracker_call_append_note,
                     cfg,
                     source_issue,
-                    "Blocked RCA Resolved",
+                    "Blocked Fix Resolved",
                     body,
                 )
             await asyncio.to_thread(
@@ -2653,7 +5477,10 @@ class Orchestrator:
             )
             self._record_tracker_error(source_issue.id, exc)
             return False
-        self._blocked_rca_source_ids.discard(source_issue.id)
+        # Keep the episode guard until the freshly reopened source appears in
+        # the active candidate fetch, which prunes it. This prevents the same
+        # tick's terminal snapshot from opening a second FIX.
+        self._blocked_rca_source_ids.add(source_issue.id)
         self._clear_tracker_error(source_issue.id)
         log.info(
             "blocked_rca_source_reopened",
@@ -2663,18 +5490,134 @@ class Orchestrator:
         )
         return True
 
-    async def _auto_reopen_sources_from_resolved_rcas(
-        self, cfg: ServiceConfig
-    ) -> int:
-        if not cfg.agent.auto_recover_blocked:
-            return 0
+    async def _move_blocked_fix_out_of_done(
+        self,
+        cfg: ServiceConfig,
+        fix_issue: Issue,
+        source_issue: Issue,
+        *,
+        reason: str,
+        reason_code: str,
+    ) -> bool:
+        target_state = next(
+            (
+                state
+                for state in cfg.tracker.terminal_states
+                if normalize_state(state) == "human review"
+            ),
+            next(
+                (
+                    state
+                    for state in cfg.tracker.terminal_states
+                    if normalize_state(state) == "blocked"
+                ),
+                "Blocked",
+            ),
+        )
+        body = (
+            f"`{fix_issue.identifier}` cannot remain `Done` because {reason}. "
+            f"Moved to `{target_state}`; the source ticket remains Blocked. "
+            "Clarify the source request and acceptance criteria, verify the fix, "
+            "then append `## Fix Resolution` before completing this ticket."
+        )
+        # Demotion is the safety boundary: perform it before best-effort notes,
+        # and fail the whole tick closed if it cannot be persisted.
+        try:
+            await asyncio.to_thread(
+                self._tracker_call_update_state,
+                cfg,
+                fix_issue,
+                target_state,
+            )
+        except Exception as exc:
+            log.warning(
+                "blocked_fix_completion_hold_failed",
+                fix_identifier=fix_issue.identifier,
+                error=str(exc),
+            )
+            self._record_tracker_error(fix_issue.id, exc)
+            raise
+
+        if normalize_state(source_issue.state) != "blocked":
+            try:
+                await asyncio.to_thread(
+                    self._tracker_call_update_state,
+                    cfg,
+                    source_issue,
+                    "Blocked",
+                )
+            except Exception as exc:
+                # The now-unresolved FIX dependency still prevents dispatch.
+                log.warning(
+                    "blocked_fix_source_reblock_failed",
+                    fix_identifier=fix_issue.identifier,
+                    source_identifier=source_issue.identifier,
+                    error=str(exc),
+                )
+                self._record_tracker_error(source_issue.id, exc)
+
+        try:
+            await asyncio.to_thread(
+                self._tracker_call_append_note,
+                cfg,
+                fix_issue,
+                "Fix Completion Blocked",
+                body,
+            )
+        except Exception as exc:
+            log.warning(
+                "blocked_fix_completion_note_failed",
+                fix_identifier=fix_issue.identifier,
+                error=str(exc),
+            )
+
+        self._clear_tracker_error(fix_issue.id)
+        log.warning(
+            "blocked_fix_completion_held",
+            fix_identifier=fix_issue.identifier,
+            target_state=target_state,
+            reason=reason_code,
+        )
+        return True
+
+    async def _hold_unproven_blocked_fix(
+        self, cfg: ServiceConfig, fix_issue: Issue, source_issue: Issue
+    ) -> bool:
+        """Keep a new FIX ticket out of Done until both records prove recovery."""
+        if not _is_blocked_fix_ticket(fix_issue):
+            return False
+        fix_has_resolution = _blocked_rca_current_episode_resolved(fix_issue)
+        source_has_resolution = _blocked_rca_current_episode_resolved(source_issue)
+        needs_operator = _blocked_rca_requires_operator_intervention(
+            fix_issue
+        ) or _blocked_rca_requires_operator_intervention(source_issue)
+        if fix_has_resolution and source_has_resolution and not needs_operator:
+            return False
+        if needs_operator:
+            reason = "it still requires operator action"
+            reason_code = "operator_action"
+        elif not fix_has_resolution:
+            reason = "the FIX ticket has no current `## Fix Resolution`"
+            reason_code = "missing_fix_resolution"
+        else:
+            reason = "the linked source has no current `## Fix Resolution`"
+            reason_code = "missing_source_resolution"
+        return await self._move_blocked_fix_out_of_done(
+            cfg,
+            fix_issue,
+            source_issue,
+            reason=reason,
+            reason_code=reason_code,
+        )
+
+    async def _auto_reopen_sources_from_resolved_rcas(self, cfg: ServiceConfig) -> int:
         try:
             terminal_issues = await asyncio.to_thread(
                 self._tracker_call_terminal_issues, cfg
             )
         except Exception as exc:
             log.warning("blocked_rca_resolution_fetch_failed", error=str(exc))
-            return 0
+            raise
         terminal_by_identifier = {
             issue.identifier.casefold(): issue
             for issue in terminal_issues
@@ -2690,11 +5633,102 @@ class Orchestrator:
             )
             if source_issue is None:
                 continue
-            if await self._reopen_source_for_resolved_rca(
-                cfg, rca_issue, source_issue
-            ):
+            if await self._hold_unproven_blocked_fix(cfg, rca_issue, source_issue):
+                continue
+            source_was_blocked = normalize_state(source_issue.state) == "blocked"
+            if await self._reopen_source_for_resolved_rca(cfg, rca_issue, source_issue):
                 reopened += 1
+            elif source_was_blocked and _is_blocked_fix_ticket(rca_issue):
+                await self._move_blocked_fix_out_of_done(
+                    cfg,
+                    rca_issue,
+                    source_issue,
+                    reason="Symphony could not persist the linked source reopen",
+                    reason_code="source_reopen_failed",
+                )
         return reopened
+
+    def _prior_done_run_count(self, issue: Issue) -> int:
+        """How many completed runs already carried this ticket to Done."""
+        registry = self._run_registry
+        if registry is None:
+            return 0
+        records = self._registry_guard(
+            "reopen_history",
+            lambda: registry.recent_runs(issue.id, limit=200, status="normal"),
+            [],
+        )
+        return sum(
+            1 for record in records if _is_successful_terminal_state(record.state)
+        )
+
+    async def _hold_reopened_ticket_over_budget(
+        self, issue: Issue, cfg: ServiceConfig
+    ) -> bool:
+        """Block a ticket that keeps coming back from Done; True when held.
+
+        A rewind inside one run is capped by `agent.max_attempts`, but a
+        reopen is a *new* run with a fresh counter: the deep preset's Verify
+        RED / QA BLOCKED reopen a merged Build slice by moving it from Done
+        back to Build, and nothing bounded that loop. Count the ticket's
+        prior Done runs in the registry; past `agent.max_reopens` (plus one
+        per `## Reopen Approved` section an operator appended) append
+        `## Reopen Budget` and park the ticket in Blocked.
+        """
+        cap = cfg.agent.max_reopens
+        if cap <= 0:
+            return False
+        prior_done = self._prior_done_run_count(issue)
+        if prior_done == 0:
+            return False
+        approvals = len(_REOPEN_APPROVED_RE.findall(issue.description or ""))
+        allowed = cap + approvals
+        if prior_done <= allowed:
+            return False
+        target = _rewind_budget_target_state(cfg)
+        if not target:
+            log.warning(
+                "reopen_budget_exceeded",
+                identifier=issue.identifier,
+                prior_done_runs=prior_done,
+                max_reopens=cap,
+                approvals=approvals,
+                target_state="(none)",
+            )
+            return False
+        note = (
+            f"This ticket reached Done {prior_done} time(s) and was reopened "
+            f"again (agent.max_reopens: {cap}, approvals: {approvals}). Symphony "
+            f"moved it to {target} instead of dispatching another cycle: an "
+            "operator must decide whether the latest Verify/QA findings are "
+            "real or the verifier is wrong. To allow one more cycle, append a "
+            "`## Reopen Approved` section here and move the ticket back to its "
+            "lane; raise `agent.max_reopens` (0 disables) for more."
+        )
+        try:
+            await asyncio.to_thread(
+                self._tracker_call_append_note, cfg, issue, "Reopen Budget", note
+            )
+            await asyncio.to_thread(self._tracker_call_update_state, cfg, issue, target)
+        except Exception as exc:
+            log.warning(
+                "reopen_budget_hold_failed",
+                identifier=issue.identifier,
+                error=str(exc),
+            )
+            self._record_tracker_error(issue.id, exc)
+            return False
+        self._clear_tracker_error(issue.id)
+        self._record_stats_gate(issue.identifier, issue.state, "reopen_budget")
+        log.warning(
+            "reopen_budget_exceeded",
+            identifier=issue.identifier,
+            prior_done_runs=prior_done,
+            max_reopens=cap,
+            approvals=approvals,
+            target_state=target,
+        )
+        return True
 
     async def _auto_triage_todo_if_actionable(
         self, issue: Issue, cfg: ServiceConfig
@@ -2734,47 +5768,111 @@ class Orchestrator:
     def _eligible(
         self, issue: Issue, cfg: ServiceConfig, *, owning_retry: bool
     ) -> bool:
-        """Shared eligibility logic.
+        """Compatibility seam for callers that only need a yes/no answer."""
+        return (
+            self._eligibility_decision(
+                issue, cfg, owning_retry=owning_retry
+            ).disposition
+            is _EligibilityDisposition.READY
+        )
 
-        `owning_retry=True` is set by the retry handler — it already owns the
-        issue's claim (§7.1: `Claimed = Running or RetryQueued`), so the
-        `_claimed`/`_running` self-membership checks would otherwise create a
-        false-negative loop where the retry timer keeps rescheduling itself.
-        """
+    def _eligibility_ownership_decision(
+        self, issue: Issue, cfg: ServiceConfig, *, owning_retry: bool
+    ) -> _EligibilityDecision | None:
         if issue.id in self._running:
-            return False
+            return _EligibilityDecision(
+                _EligibilityDisposition.REJECT,
+                "running",
+                "duplicate running ownership",
+            )
         ci_task = self._improvement_task
         if (
             cfg.continuous_improvement.require_idle_board
             and ci_task is not None
             and not ci_task.done()
         ):
-            return False
-        if self._has_active_run_lease(issue.id):
-            self._lease_blocked[issue.id] = (
-                "another active run lease exists for this issue"
+            return _EligibilityDecision(
+                _EligibilityDisposition.WAIT_NON_SLOT,
+                "continuous_improvement",
+                "continuous improvement is using the idle board",
             )
-            return False
+        if self._has_active_run_lease(issue.id):
+            reason = "another active run lease exists for this issue"
+            self._lease_blocked[issue.id] = reason
+            return _EligibilityDecision(
+                _EligibilityDisposition.WAIT_NON_SLOT, "leased_elsewhere", reason
+            )
         self._lease_blocked.pop(issue.id, None)
+        registry = self._run_registry
+        if registry is None and self._last_registry_error is not None:
+            return _EligibilityDecision(
+                _EligibilityDisposition.WAIT_NON_SLOT,
+                "registry_unavailable",
+                "release evidence authority registry is unavailable",
+            )
+        if registry is not None:
+            unavailable = object()
+            identity = self._registry_guard(
+                "release_evidence_identity_by_issue_id",
+                lambda: registry.get_release_evidence_identity_by_issue_id(issue.id),
+                unavailable,
+            )
+            if identity is unavailable:
+                return _EligibilityDecision(
+                    _EligibilityDisposition.WAIT_NON_SLOT,
+                    "registry_unavailable",
+                    "release evidence authority could not be read",
+                )
+            if identity is not None and identity.retired:
+                return _EligibilityDecision(
+                    _EligibilityDisposition.REJECT,
+                    "historical_release_verifier",
+                    "historical release verifier is evidence-only",
+                )
         if not owning_retry and issue.id in self._claimed:
-            return False
-        # Paused tickets hold their slot but never start a fresh worker
-        # until the operator resumes. Without this, a worker that exits
-        # (turn_error, max_turns, reconcile cancel, …) would silently
-        # re-dispatch via `_on_retry_timer` and look like an auto-unpause.
+            return _EligibilityDecision(
+                _EligibilityDisposition.REJECT,
+                "claimed",
+                "issue already has a claim",
+            )
         if issue.id in self._paused_issue_ids:
-            return False
+            return _EligibilityDecision(
+                _EligibilityDisposition.WAIT_SLOT,
+                "paused",
+                self._pause_reasons.get(issue.id, "paused"),
+            )
         if issue.id in self._turn_budget_exhausted:
-            return False
+            return _EligibilityDecision(
+                _EligibilityDisposition.REJECT,
+                "budget_exhausted",
+                "turn budget exhausted",
+            )
         if issue.id in self._terminal_persist_pending:
-            return False
+            return _EligibilityDecision(
+                _EligibilityDisposition.REJECT,
+                "finalizing",
+                "finalization already owns issue",
+            )
+        return None
+
+    def _eligibility_contract_decision(
+        self, issue: Issue, cfg: ServiceConfig
+    ) -> _EligibilityDecision | None:
         active = {s.lower() for s in cfg.tracker.active_states}
         terminal = {s.lower() for s in cfg.tracker.terminal_states}
         state = normalize_state(issue.state)
         if state in terminal or state not in active:
-            return False
+            return _EligibilityDecision(
+                _EligibilityDisposition.REJECT,
+                "inactive",
+                f"inactive state: {issue.state}",
+            )
         if not (issue.id and issue.identifier and issue.title and issue.state):
-            return False
+            return _EligibilityDecision(
+                _EligibilityDisposition.REJECT,
+                "incomplete_identity",
+                "incomplete issue identity",
+            )
         requested_agent = _requested_agent_kind(issue)
         if requested_agent is not None and requested_agent not in SUPPORTED_AGENT_KINDS:
             log.warning(
@@ -2784,8 +5882,21 @@ class Orchestrator:
                 agent_kind=requested_agent,
                 supported=sorted(SUPPORTED_AGENT_KINDS),
             )
-            return False
-        # Per-state limit (§8.3).
+            return _EligibilityDecision(
+                _EligibilityDisposition.REJECT,
+                "unsupported_agent",
+                f"unsupported agent kind: {requested_agent}",
+            )
+        return None
+
+    def _eligibility_contention_decision(
+        self,
+        issue: Issue,
+        cfg: ServiceConfig,
+        *,
+        include_global_slots: bool = True,
+    ) -> _EligibilityDecision | None:
+        state = normalize_state(issue.state)
         per_state_cap = cfg.agent.max_concurrent_agents_by_state.get(state)
         if per_state_cap is not None:
             current_in_state = sum(
@@ -2794,17 +5905,52 @@ class Orchestrator:
                 if normalize_state(entry.issue.state) == state
             )
             if current_in_state >= per_state_cap:
-                return False
-        # Blockers apply to every active state; downstream work must wait
-        # if an upstream dependency regresses, is unknown, or still has a
-        # worker/finalizer that can change the shared base branch.
-        if issue.blocked_by:
-            for blocker in issue.blocked_by:
-                if self._blocker_is_in_flight(blocker):
-                    return False
-                if not _blocker_dependency_is_resolved(blocker.state, cfg):
-                    return False
-        return True
+                return _EligibilityDecision(
+                    _EligibilityDisposition.WAIT_NON_SLOT,
+                    "waiting_state_capacity",
+                    f"per-state capacity reached for {issue.state}",
+                )
+        for blocker in issue.blocked_by:
+            if self._blocker_is_in_flight(blocker):
+                return _EligibilityDecision(
+                    _EligibilityDisposition.WAIT_NON_SLOT,
+                    "waiting_dependency",
+                    f"blocker still in flight: {blocker.identifier}",
+                )
+            if not _blocker_dependency_is_resolved(blocker.state, cfg):
+                return _EligibilityDecision(
+                    _EligibilityDisposition.WAIT_NON_SLOT,
+                    "waiting_dependency",
+                    f"blocker unresolved: {blocker.identifier}",
+                )
+        if include_global_slots and self._available_slots(cfg) == 0:
+            return _EligibilityDecision(
+                _EligibilityDisposition.WAIT_NON_SLOT,
+                "waiting_global_capacity",
+                "no available orchestrator slots",
+            )
+        return None
+
+    def _eligibility_decision(
+        self,
+        issue: Issue,
+        cfg: ServiceConfig,
+        *,
+        owning_retry: bool,
+        include_global_slots: bool = True,
+    ) -> _EligibilityDecision:
+        decision = self._eligibility_ownership_decision(
+            issue, cfg, owning_retry=owning_retry
+        )
+        if decision is None:
+            decision = self._eligibility_contract_decision(issue, cfg)
+        if decision is None:
+            decision = self._eligibility_contention_decision(
+                issue, cfg, include_global_slots=include_global_slots
+            )
+        return decision or _EligibilityDecision(
+            _EligibilityDisposition.READY, "ready", "eligible"
+        )
 
     def _blocker_is_in_flight(self, blocker: BlockerRef) -> bool:
         """Keep dependents idle until the upstream run is fully finalized."""
@@ -2838,6 +5984,7 @@ class Orchestrator:
             interval_ms=ci.interval_ms,
             max_turns=ci.max_turns,
             agent_kind=ci.agent_kind,
+            modes=list(ci.resolved_modes()),
         )
         if not ci.enabled:
             return
@@ -2872,6 +6019,12 @@ class Orchestrator:
             self._running or self._retry or self._terminal_persist_pending
         ):
             self._improvement_status["skipped_reason"] = "board_busy"
+            return
+        # Per-mode cadence (`mode_interval_hours`): when every enabled mode is
+        # still cooling down, re-arm the heartbeat without spending a turn.
+        if not any_mode_due(cfg, cfg.workflow_path.parent):
+            self._improvement_status["skipped_reason"] = "no_modes_due"
+            self._next_improvement_due_monotonic = now + interval_s
             return
 
         self._improvement_status["skipped_reason"] = None
@@ -2922,6 +6075,16 @@ class Orchestrator:
                 tickets_created=result.tickets_created,
                 last_verified_branch=result.verified_branch,
                 last_verified_sha=result.verified_sha,
+                last_mode_results=[
+                    {
+                        "mode": outcome.mode,
+                        "status": outcome.status,
+                        "summary": outcome.summary,
+                        "ticket_ids": list(outcome.ticket_ids),
+                    }
+                    for outcome in result.modes
+                ],
+                last_request_id=result.request_id,
             )
             consumed = True
         except asyncio.CancelledError:
@@ -2941,9 +6104,7 @@ class Orchestrator:
             )
             consumed = True
         except Exception as exc:  # noqa: BLE001 — runner failure must not kill the loop
-            self._improvement_status.update(
-                last_result="failed", last_error=str(exc)
-            )
+            self._improvement_status.update(last_result="failed", last_error=str(exc))
             log.error(
                 "continuous_improvement_run_failed",
                 error=str(exc),
@@ -2958,6 +6119,87 @@ class Orchestrator:
                 self._improvement_turns_used += 1
                 self._improvement_status["last_finished_at"] = _utc_iso_z()
             self._improvement_status.update(in_flight=False, current_phase=None)
+
+    async def _run_improvement_agent(self, task: AgentTask) -> str:
+        """Give an agent-driven improvement mode one backend turn.
+
+        This is the orchestrator-side capability the continuous-improvement
+        module is handed (it must not import the orchestrator). The turn runs
+        against the host repo with `cwd == workspace_root == workflow_dir`,
+        exactly like a chat turn, and outside the dispatch slot accounting —
+        the heartbeat already holds the idle board. The backend stays in its
+        normal editing mode so the agent can write its one proposal file.
+
+        F-12: "read only except the proposal file" used to be prompt text
+        only, in the *host* tree. It is now also mechanical — the working
+        tree is snapshotted before and after the turn, and a write outside
+        `.symphony/continuous-improvement/proposals/` discards the mode's
+        proposals (the caller records `not_proven`) and logs the paths.
+        """
+        cfg = self._workflow_state.current()
+        if cfg is None:
+            raise SymphonyError("no workflow configuration loaded")
+        ci = cfg.continuous_improvement
+        agent_cfg, _ = cfg_for_mode(cfg, "edit", ci.agent_kind or cfg.agent.kind)
+
+        async def _ignore_event(_event: dict[str, Any]) -> None:
+            return None
+
+        backend = self._build_agent_backend(
+            BackendInit(
+                cfg=agent_cfg,
+                cwd=task.cwd,
+                workspace_root=task.cwd,
+                on_event=_ignore_event,
+            )
+        )
+        before = await asyncio.to_thread(_worktree_status_snapshot, task.cwd)
+        await backend.start()
+        try:
+            await backend.initialize()
+            await backend.start_session(initial_prompt="", issue_title=None)
+            result = await backend.run_turn(prompt=task.prompt, is_continuation=False)
+        finally:
+            await backend.stop()
+        after = await asyncio.to_thread(_worktree_status_snapshot, task.cwd)
+        self._enforce_improvement_write_contract(task, before, after)
+        return result.last_message or ""
+
+    def _enforce_improvement_write_contract(
+        self,
+        task: AgentTask,
+        before: dict[str, str] | None,
+        after: dict[str, str] | None,
+    ) -> None:
+        """Discard a CI agent turn that wrote outside its contract."""
+        if before is None or after is None:
+            # Not a git worktree (or git unavailable): nothing to compare
+            # against. The prompt remains the only gate, as before.
+            return
+        allowed = CI_AGENT_OUTPUT_PREFIX
+        offending = sorted(
+            path
+            for path, code in after.items()
+            if before.get(path) != code and not path.startswith(allowed)
+        )
+        if not offending:
+            return
+        try:
+            task.output_path.unlink()
+        except OSError:
+            pass
+        log.error(
+            "ci_agent_wrote_outside_contract",
+            mode=task.mode,
+            cwd=str(task.cwd),
+            paths=offending[:20],
+            path_count=len(offending),
+        )
+        raise SymphonyError(
+            "continuous-improvement agent wrote outside its contract; "
+            f"proposals discarded: {', '.join(offending[:5])}",
+            mode=task.mode,
+        )
 
     def _report_improvement_phase(self, phase: str) -> None:
         self._improvement_status["current_phase"] = phase
@@ -2988,6 +6230,7 @@ class Orchestrator:
                 interval_ms=ci.interval_ms,
                 max_turns=ci.max_turns,
                 agent_kind=ci.agent_kind,
+                modes=list(ci.resolved_modes()),
             )
         status["turns_used"] = self._improvement_turns_used
         status["in_flight"] = (
@@ -3017,9 +6260,7 @@ class Orchestrator:
         """
         return _parse_touched_files(issue.description)
 
-    def _conflict_blocker(
-        self, candidate: Issue
-    ) -> tuple[str, set[str]] | None:
+    def _conflict_blocker(self, candidate: Issue) -> tuple[str, set[str]] | None:
         """Return `(other_identifier, overlapping_paths)` when claiming
         ``candidate`` would conflict with an in-flight ticket.
 
@@ -3041,14 +6282,15 @@ class Orchestrator:
         for other_id, retry_entry in self._retry.items():
             if other_id == candidate.id:
                 continue
-            # Retry entries don't carry the full Issue. Look up the
-            # last-known body via running history when present; the
-            # common case (retry of an exited ticket) leaves no body to
-            # inspect, and the retry path re-evaluates on its own tick.
+            # A retry entry carries a snapshot of the exited ticket's
+            # `## Touched Files` taken when the retry was scheduled (#28);
+            # prefer the live body when the ticket is still running.
             running_entry = self._running.get(other_id)
-            if running_entry is None:
-                continue
-            other_files = self._touched_files_for(running_entry.issue)
+            other_files = (
+                self._touched_files_for(running_entry.issue)
+                if running_entry is not None
+                else set(retry_entry.touched_files)
+            )
             overlap = candidate_files & other_files
             if overlap:
                 return retry_entry.identifier, overlap
@@ -3074,8 +6316,7 @@ class Orchestrator:
         sorted_overlap = sorted(overlap)
         note_body = (
             f"Conflicts with `{other_identifier}` on overlapping "
-            f"`## Touched Files`:\n"
-            + "\n".join(f"- `{p}`" for p in sorted_overlap)
+            f"`## Touched Files`:\n" + "\n".join(f"- `{p}`" for p in sorted_overlap)
         )
         try:
             await asyncio.to_thread(
@@ -3124,7 +6365,11 @@ class Orchestrator:
 
     def _token_ema_path(self, cfg: ServiceConfig) -> Path:
         """Return the on-disk location for the persisted EMA snapshot."""
-        return cfg.workflow_path.parent / ".symphony" / "token_ema.json"
+        return (
+            cfg.workflow_path.parent
+            / ".symphony"
+            / state_file_name(cfg.workflow_path, "token_ema")
+        )
 
     def _load_token_ema(self, cfg: ServiceConfig) -> None:
         """Load `_token_ema` from disk on `start()`. Missing file = empty.
@@ -3165,13 +6410,7 @@ class Orchestrator:
         """Best-effort flush to disk via tmp+rename. Failures only log."""
         path = self._token_ema_path(cfg)
         try:
-            path.parent.mkdir(parents=True, exist_ok=True)
-            tmp = path.with_suffix(".json.tmp")
-            tmp.write_text(
-                json.dumps(self._token_ema, sort_keys=True, indent=2),
-                encoding="utf-8",
-            )
-            tmp.replace(path)
+            write_json_atomic(path, self._token_ema)
         except OSError as exc:
             log.warning(
                 "token_ema_persist_failed",
@@ -3195,8 +6434,7 @@ class Orchestrator:
             return
         prev = self._token_ema.get(key, 0.0)
         self._token_ema[key] = (
-            _TOKEN_EMA_ALPHA * float(total_tokens)
-            + (1.0 - _TOKEN_EMA_ALPHA) * prev
+            _TOKEN_EMA_ALPHA * float(total_tokens) + (1.0 - _TOKEN_EMA_ALPHA) * prev
         )
         if cfg is not None:
             self._persist_token_ema(cfg)
@@ -3206,9 +6444,7 @@ class Orchestrator:
         key = (state or "").lower()
         return int(round(self._token_ema.get(key, 0.0)))
 
-    def _token_budget_for_state(
-        self, cfg: ServiceConfig, state: str
-    ) -> int:
+    def _token_budget_for_state(self, cfg: ServiceConfig, state: str) -> int:
         """Hard cap from `agent.max_total_tokens_by_state` w/ fallback."""
         key = (state or "").lower()
         by_state = cfg.agent.max_total_tokens_by_state
@@ -3219,9 +6455,7 @@ class Orchestrator:
             cap = by_state.get("learn")
         return cap if cap is not None else cfg.agent.max_total_tokens
 
-    def _max_state_turns_for_state(
-        self, cfg: ServiceConfig, state: str
-    ) -> int:
+    def _max_state_turns_for_state(self, cfg: ServiceConfig, state: str) -> int:
         """Same-state turn cap from per-state config w/ global fallback."""
         key = (state or "").lower()
         by_state = cfg.agent.max_state_turns_by_state
@@ -3246,24 +6480,19 @@ class Orchestrator:
         return threshold or 0
 
     def _ticket_prompt_path(
-        self,
-        cfg: ServiceConfig,
-        issue: Issue,
-        workspace_path: Path | None = None,
+        self, cfg: ServiceConfig, issue: Issue, workspace_path: Path | None = None
     ) -> str | None:
         if cfg.tracker.kind != "file":
             return None
-        profile = str(cfg.raw.get("contract_profile", "advanced")).strip().lower()
-        if profile == "factory" and workspace_path is not None:
+        if self._is_factory_profile(cfg) and workspace_path is not None:
             host_board = cfg.tracker.board_root
             if host_board is None:
                 return None
             local_path = workspace_path / "kanban" / f"{issue.identifier}.md"
-            shared_board = (
-                local_path.parent.exists()
-                and local_path.parent.resolve() == host_board.resolve()
-            )
-            if shared_board and local_path.is_file():
+            if (
+                local_path.parent.resolve() == host_board.resolve()
+                and local_path.is_file()
+            ):
                 return str(local_path.relative_to(workspace_path))
             host_path = host_board / f"{issue.identifier}.md"
             return str(host_path) if host_path.is_file() else None
@@ -3273,6 +6502,73 @@ class Orchestrator:
             return None
         path = find_path(issue.identifier)
         return str(path) if path is not None else None
+
+    @staticmethod
+    def _is_factory_profile(cfg: ServiceConfig) -> bool:
+        return (
+            str(cfg.raw.get("contract_profile", "advanced")).strip().lower()
+            == "factory"
+        )
+
+    def _render_stage_skills(
+        self, cfg: ServiceConfig, issue: Issue, workspace_path: Path
+    ) -> str:
+        factory = self._is_factory_profile(cfg)
+        return render_skill_block(
+            cfg.workflow_path.parent,
+            select_skills_for_stage(
+                str(cfg.raw.get("contract_profile", "advanced")),
+                issue.state,
+                issue.skills,
+            ),
+            runtime_dir=workspace_path if factory else None,
+            inline_body=not factory,
+        )
+
+    def _start_factory_verify_phase(
+        self, cfg: ServiceConfig, issue: Issue, entry: RunningEntry
+    ) -> None:
+        entry.factory_verification_baseline = None
+        entry.factory_verify_completed = False
+        entry.factory_verify_started_at = 0.0
+        if self._is_factory_profile(cfg) and entry.factory_declared_proof is None:
+            entry.factory_declared_proof = tuple(
+                factory_proof_commands(issue.description or "")
+            )
+        if self._is_factory_profile(cfg) and normalize_state(issue.state) == "verify":
+            entry.factory_verification_baseline = factory_verification_text(
+                issue.description or ""
+            )
+            entry.factory_verify_started_at = datetime.now(timezone.utc).timestamp()
+
+    async def _enforce_factory_exit_contract(
+        self, cfg: ServiceConfig, entry: RunningEntry
+    ) -> bool:
+        """Use the same gate when a worker exit/reconcile skips the phase loop."""
+        producing = normalize_state(entry.state_at_turn_start)
+        if not self._is_factory_profile(cfg) or producing not in {"build", "verify"}:
+            return True
+        latest = await self._refresh_issue_full(cfg, entry.issue.id)
+        if latest is not None:
+            entry.issue = latest
+        current = normalize_state(entry.issue.state)
+        if current == producing or _is_rewind_transition(
+            producing, current, cfg.tracker.active_states
+        ):
+            return True
+        outcome = await self._enforce_stage_contract(
+            cfg=cfg,
+            running_issue_id=entry.issue.id,
+            issue=entry.issue,
+            producing_state=producing,
+            producing_state_raw=_canonical_state_label(cfg, producing),
+            current_state=current,
+            workspace_path=entry.workspace_path,
+            known_app_release=entry.known_app_release,
+            running_entry=entry,
+        )
+        entry.issue = outcome.issue
+        return not outcome.rewound
 
     def _record_token_attention_for_turn(
         self, entry: RunningEntry, cfg: ServiceConfig | None
@@ -3311,10 +6607,7 @@ class Orchestrator:
             debug.token_attention = _attention_signal(
                 "token_attention_threshold",
                 "Token threshold",
-                (
-                    f"turn used {turn_total}/{threshold} total tokens "
-                    f"in {state}"
-                ),
+                (f"turn used {turn_total}/{threshold} total tokens in {state}"),
                 "warning",
             )
             log.warning(
@@ -3333,53 +6626,55 @@ class Orchestrator:
     # A2-orch + C3 — backend subprocess env injection
     # ------------------------------------------------------------------
 
-    def _apply_dispatch_env(
+    def _dispatch_env_for(
         self,
         *,
         issue: Issue,
         cfg: ServiceConfig,
         is_rewind: bool,
-    ) -> None:
-        """Set per-dispatch env vars consumed by the backend subprocess.
+    ) -> dict[str, str]:
+        """Return the per-dispatch env vars for the backend subprocess.
 
-        Always sets:
+        Always includes:
           * ``SYMPHONY_TOKEN_EMA`` — rolling EMA of total tokens for the
             current state (rounded int), 0 when unseen.
           * ``SYMPHONY_TOKEN_BUDGET`` — hard cap for the current state
             (max_total_tokens_by_state with fallback to max_total_tokens).
 
-        On rewind dispatches also sets:
+        Rewind dispatches also include:
           * ``SYMPHONY_REWIND_SCOPE`` — JSON list of finding rows parsed
             from the latest applicable failure section (`## Review Findings`,
             `## QA Failure`, or `## Contract Failure`). Empty list when
             parsing fails (the env var is informational; an empty list
-            signals "rewind, no machine-readable scope" without unsetting).
+            signals "rewind, no machine-readable scope").
 
-        On forward dispatches the rewind scope env var is UNSET so a
-        previous-turn value can't bleed across.
-
-        Backends inherit `os.environ`, so this mutates process-global
-        state. Concurrent dispatches in the same tick are serialised by
-        the orchestrator's single event loop, and each backend spawns
-        its subprocess before the next dispatch lands.
+        Forward dispatches omit the rewind scope so a previous-turn value
+        cannot bleed across. The mapping travels in ``BackendInit.env`` and
+        is overlaid on the inherited environment at spawn time; nothing here
+        touches ``os.environ`` (GitHub issue #29).
         """
         ema_value = self._token_ema_for_state(issue.state)
         budget_value = self._token_budget_for_state(cfg, issue.state)
-        os.environ["SYMPHONY_TOKEN_EMA"] = str(ema_value)
-        os.environ["SYMPHONY_TOKEN_BUDGET"] = str(budget_value)
+        env = {
+            "SYMPHONY_TOKEN_EMA": str(ema_value),
+            "SYMPHONY_TOKEN_BUDGET": str(budget_value),
+        }
         if is_rewind:
             rows = _parse_findings_rows(issue.description)
             try:
                 payload = json.dumps(rows, ensure_ascii=False)
             except (TypeError, ValueError):
                 payload = "[]"
-            os.environ["SYMPHONY_REWIND_SCOPE"] = payload
-        else:
-            os.environ.pop("SYMPHONY_REWIND_SCOPE", None)
+            env["SYMPHONY_REWIND_SCOPE"] = payload
+        return env
 
     # ------------------------------------------------------------------
     # dispatch (§16.4)
     # ------------------------------------------------------------------
+
+    def _executor_for(self, cfg: ServiceConfig) -> TicketExecutor:
+        """Pick the execution strategy for one dispatch."""
+        return LegacyStageExecutor(self)
 
     def _dispatch(
         self,
@@ -3388,7 +6683,19 @@ class Orchestrator:
         *,
         attempt: int | None,
         attempt_kind: str | None = None,
-    ) -> None:
+    ) -> bool:
+        try:
+            release_authority = self._prepare_release_dispatch(issue, cfg)
+        except SymphonyError as exc:
+            log.error(
+                "release_dispatch_refused",
+                issue_id=issue.id,
+                identifier=issue.identifier,
+                tracker_kind=cfg.tracker.kind,
+                error=str(exc),
+            )
+            return False
+        issue = release_authority.issue
         self._dispatch_state.cancel_pending_retry(issue.id)
 
         workspace_path = (
@@ -3399,16 +6706,139 @@ class Orchestrator:
         resolved_attempt_kind = attempt_kind or (
             "retry" if attempt is not None else "initial"
         )
-        agent_kind = _requested_agent_kind(issue) or cfg.agent.kind
-        run_id = self._try_acquire_run_lease(
+        agent_kind = cfg.agent.kind_for_state(issue.state, _requested_agent_kind(issue))
+        acquisition = self._try_acquire_run_lease(
+            cfg=cfg,
             issue=issue,
             workspace_path=workspace_path,
             attempt=attempt,
             attempt_kind=resolved_attempt_kind,
             agent_kind=agent_kind,
+            release_required=(
+                release_authority.gate is not None
+                or release_authority.app_release
+                or release_authority.finalizer
+            ),
         )
-        if run_id is None:
-            return
+        if acquisition is None:
+            return False
+        run_id = acquisition.run_id
+        if acquisition.checkpoint is not None:
+            resolved_attempt_kind = "recovery"
+        if release_authority.gate is not None:
+            try:
+                gate = release_authority.gate
+                if release_authority.finalizer:
+                    bound = bool(
+                        self._release_registry_call(
+                            cfg,
+                            "bind_release_finalizer_run",
+                            lambda registry: registry.bind_release_finalizer_run(
+                                gate=gate,
+                                finalizer_issue_id=issue.id,
+                                finalizer_run_id=run_id,
+                            ),
+                        )
+                    )
+                    current_gate = cast(
+                        ReleaseGate | None,
+                        self._release_registry_call(
+                            cfg,
+                            "read_bound_finalizer_gate",
+                            lambda registry: registry.get_release_gate(
+                                gate.finalizer_identifier
+                            ),
+                        ),
+                    )
+                    if not bound or current_gate is None:
+                        raise SymphonyError(
+                            "application release finalizer lease could not be "
+                            "bound to the approved gate"
+                        )
+                    issue = self._guard_release_finalizer(
+                        cfg=cfg,
+                        issue=issue,
+                        gate=current_gate,
+                        expected_run_id=run_id,
+                        require_run_authority=True,
+                    )
+                elif gate.status == "pending":
+                    bound = bool(
+                        self._release_registry_call(
+                            cfg,
+                            "bind_release_verifier_run",
+                            lambda registry: registry.bind_release_verifier_run(
+                                gate=gate,
+                                verifier_run_id=run_id,
+                            ),
+                        )
+                    )
+                    current_gate = cast(
+                        ReleaseGate | None,
+                        self._release_registry_call(
+                            cfg,
+                            "read_bound_verifier_gate",
+                            lambda registry: registry.get_release_gate_for_verifier(
+                                issue.identifier
+                            ),
+                        ),
+                    )
+                    if not bound or current_gate is None:
+                        raise SymphonyError(
+                            "application release verifier lease could not be bound "
+                            "to the pending gate"
+                        )
+                else:
+                    current_gate = cast(
+                        ReleaseGate | None,
+                        self._release_registry_call(
+                            cfg,
+                            "reread_release_gate_after_lease",
+                            lambda registry: registry.get_release_gate_for_verifier(
+                                issue.identifier
+                            ),
+                        ),
+                    )
+                    if current_gate is None:
+                        raise SymphonyError(
+                            "application release verifier authority disappeared "
+                            "after lease acquisition"
+                        )
+                if (
+                    current_gate.verifier_issue_id != gate.verifier_issue_id
+                    or current_gate.verifier_identifier != gate.verifier_identifier
+                    or current_gate.expected_contract_sha256
+                    != gate.expected_contract_sha256
+                    or current_gate.cycle_fingerprint != gate.cycle_fingerprint
+                ):
+                    raise SymphonyError(
+                        "application release gate changed during lease acquisition"
+                    )
+                release_authority = replace(
+                    release_authority,
+                    issue=issue,
+                    gate=current_gate,
+                )
+            except Exception as exc:
+                try:
+                    self._release_registry_call(
+                        cfg,
+                        "release_failed_acquired_run",
+                        lambda registry: registry.complete_run(
+                            issue_id=issue.id,
+                            run_id=run_id,
+                            status="release_authority_lost",
+                        ),
+                    )
+                except Exception:
+                    pass
+                log.error(
+                    "release_dispatch_refused_after_lease",
+                    issue_id=issue.id,
+                    identifier=issue.identifier,
+                    error=str(exc),
+                )
+                return False
         entry = RunningEntry(
             issue=issue,
             started_at=datetime.now(timezone.utc),
@@ -3418,11 +6848,53 @@ class Orchestrator:
             attempt_kind=resolved_attempt_kind,
             agent_kind=agent_kind,
             run_id=run_id,
+            continued_from_run_id=acquisition.continued_from_run_id,
+            continuation_checkpoint=acquisition.checkpoint,
+            known_app_release=release_authority.app_release,
+            known_release_cycle_verifier=release_authority.cycle_verifier,
+            known_app_release_finalizer=release_authority.finalizer,
+            release_gate_finalizer=(
+                release_authority.gate.finalizer_identifier
+                if release_authority.gate is not None
+                else ""
+            ),
+            release_gate_expected_contract_sha256=(
+                release_authority.gate.expected_contract_sha256
+                if release_authority.gate is not None
+                else ""
+            ),
+            release_gate_cycle_fingerprint=(
+                release_authority.gate.cycle_fingerprint
+                if release_authority.gate is not None
+                else ""
+            ),
+            release_gate_generation=(
+                release_authority.gate.generation
+                if release_authority.gate is not None
+                else ""
+            ),
+            release_finalizer_rewind_state=(
+                issue.state if release_authority.finalizer else ""
+            ),
+            release_authority_resolved=True,
         )
         self._dispatch_state.begin_run(issue.id, entry)
+        # Execution mode is chosen once, here, and fixed for the run's
+        # lifetime. Deciding later would let a mid-run config reload switch
+        # a ticket between the stage loop and a DAG.
+        executor = self._executor_for(cfg)
+        run_context = TicketRunContext(
+            issue=issue,
+            attempt=attempt,
+            cfg=cfg,
+            run_id=run_id,
+            workspace_path=workspace_path,
+            agent_kind=agent_kind,
+            attempt_kind=resolved_attempt_kind,
+        )
         try:
             worker_task = asyncio.create_task(
-                self._run_agent_attempt(issue, attempt, cfg),
+                executor.execute(run_context),
                 name=f"symphony-worker-{issue.identifier}",
             )
         except Exception:
@@ -3433,8 +6905,14 @@ class Orchestrator:
         worker_task.add_done_callback(
             lambda task, issue_id=issue.id: self._on_worker_task_done(issue_id, task)
         )
+        self._append_run_event(entry, "run_started", {"state": issue.state})
         debug = self._issue_debug.setdefault(issue.id, _IssueDebug())
-        if attempt is not None:
+        if acquisition.checkpoint is not None:
+            debug.completed_turn_count = max(
+                debug.completed_turn_count, acquisition.checkpoint.turn
+            )
+            debug.restart_count += 1
+        elif attempt is not None:
             debug.restart_count += 1
         debug.current_attempt_kind = entry.attempt_kind
         log.info(
@@ -3447,9 +6925,21 @@ class Orchestrator:
         # Persist the resolved backend onto the ticket so downstream
         # consumers (board UIs, audits, Done-state history) can see who
         # ran which ticket without inferring from logs. Idempotent —
-        # adapter preserves any existing override.
+        # adapter preserves any existing override. Skipped when
+        # `agent.stage_kinds` routing is active: the stamp is read back as
+        # a per-ticket pin on later dispatches, which would freeze the
+        # first stage's backend and defeat per-state routing.
         try:
-            self._tracker_call_record_agent_kind(cfg, issue.identifier, entry.agent_kind)
+            if cfg.agent.stage_kinds:
+                # Routed board: the pin must stay empty, but the audit value
+                # still belongs on the ticket (F-20).
+                self._tracker_call_record_last_agent_kind(
+                    cfg, issue.identifier, entry.agent_kind
+                )
+            else:
+                self._tracker_call_record_agent_kind(
+                    cfg, issue.identifier, entry.agent_kind
+                )
         except Exception as exc:
             log.warning(
                 "record_agent_kind_failed",
@@ -3458,6 +6948,7 @@ class Orchestrator:
                 agent_kind=entry.agent_kind,
                 error=str(exc),
             )
+        return True
 
     def _on_worker_task_done(self, issue_id: str, task: asyncio.Task[None]) -> None:
         """Clean a registered worker whose coroutine never ran its cleanup.
@@ -3509,12 +7000,19 @@ class Orchestrator:
                 exit_started_at=entry.exit_started_at.isoformat(),
             )
             return
-        if cancelled_before_start:
+        if cancelled_before_start and self._stopping:
+            reason = "shutdown_interrupted"
+            error = None
+        elif cancelled_before_start:
             reason = "worker_task_cancelled_before_start"
             error = "asyncio task was cancelled before worker cleanup ran"
         else:
             reason = "worker_task_finished_without_cleanup"
-            error = str(exc) if exc is not None else "worker task completed without exit cleanup"
+            error = (
+                str(exc)
+                if exc is not None
+                else "worker task completed without exit cleanup"
+            )
         exc_repr = f"{type(exc).__name__}: {exc!r}" if exc is not None else None
         # Diagnostic fields for hunting the leftover path that leaves an
         # entry in `_running` after the worker task is `done`. If this
@@ -3549,667 +7047,375 @@ class Orchestrator:
     # worker (§16.5)
     # ------------------------------------------------------------------
 
+    async def run_legacy_stage_loop(
+        self, issue: Issue, attempt: int | None, cfg: ServiceConfig
+    ) -> None:
+        """Public entry point for `LegacyStageExecutor`.
+
+        A one-line forward so the execution-mode seam does not have to
+        reach into a private method across modules.
+        """
+        await self._run_agent_attempt(issue, attempt, cfg)
+
     async def _run_agent_attempt(
         self, issue: Issue, attempt: int | None, cfg: ServiceConfig
     ) -> None:
-        running_issue_id = issue.id
-        outcome: str = "normal"
-        error: str | None = None
-        try:
-            cfg = _config_for_issue_agent(cfg, issue)
-            running = self._running.get(running_issue_id)
-            if running is not None:
-                running.agent_kind = cfg.agent.kind
-            assert self._workspace_manager is not None
-            workspace = await self._workspace_manager.create_or_reuse(issue.identifier)
-            running = self._running.get(running_issue_id)
-            if running is None:
-                # Slot was reclaimed externally between dispatch and the
-                # first await completing. Surface the orphan path instead
-                # of crashing on `KeyError(running_issue_id)` — that crash
-                # was the source of the worker_task_finished_without_cleanup
-                # cascade observed on OLV-002.
-                outcome = "orphaned"
-                error = "running entry vanished before workspace bind"
-                log.warning(
-                    "worker_running_entry_vanished",
-                    issue_id=running_issue_id,
-                    site="workspace_bind",
-                )
-                return
-            running.workspace_path = workspace.path
-            try:
-                await self._workspace_manager.before_run(workspace.path)
-            except Exception as exc:
-                outcome = "before_run_error"
-                error = str(exc)
-                return
+        return await agent_attempt.run_agent_attempt(self, issue, attempt, cfg)
 
-            tools = []
-            if cfg.tracker.kind == "linear" and cfg.agent.kind == "codex":
-                tools.append(linear_graphql_tool())
+    async def _transition_agent_phase(
+        self,
+        *,
+        phase_state: _AgentPhaseState,
+        running_issue_id: str,
+        base_cfg: ServiceConfig,
+        workspace_path: Path,
+        attempt: int | None,
+        doc_language: str,
+        producing_state: str,
+        producing_state_raw: str,
+        turn_number: int,
+    ) -> _AgentPhaseTransition | None:
+        issue = phase_state.issue
+        cfg = phase_state.cfg
+        client = phase_state.client
+        first_prompt = phase_state.first_prompt
+        current_state = phase_state.current_state
+        known_app_release = phase_state.known_app_release
+        debug = self._issue_debug.setdefault(running_issue_id, _IssueDebug())
+        # Defensive: the raw label must denote `producing_state`. If a caller
+        # hands us the advanced state's casing, a contract rewind would write
+        # the state the ticket is already in (a silent no-op). Fall back to
+        # the workflow's own spelling of the producing state.
+        if normalize_state(producing_state_raw) != producing_state:
+            producing_state_raw = _canonical_state_label(cfg, producing_state)
 
-            client = self._build_agent_backend(
-                BackendInit(
-                    cfg=cfg,
-                    cwd=workspace.path,
-                    workspace_root=cfg.workspace_root,
-                    on_event=lambda ev, issue_id=running_issue_id: self._on_codex_event(
-                        issue_id, ev
-                    ),
-                    client_tools=tools,
-                )
+        is_rewind = _is_rewind_transition(
+            producing_state,
+            current_state,
+            cfg.tracker.active_states,
+        )
+        # v0.6.7 — contract validator. When the agent moved forward (not a
+        # rewind), check that the producing stage actually wrote the outputs
+        # its prompt promised; a failure writes the state back to the
+        # producing stage and counts as a forced rewind below. The same
+        # method gates the move into Done from the worker loop
+        # (`attempt._post_turn_refresh`), where terminal transitions never
+        # reach this phase handler.
+        if not is_rewind and (
+            self._is_factory_profile(cfg)
+            or cfg.agent.stage_contracts_enabled(cfg.tracker.active_states)
+        ):
+            outcome = await self._enforce_stage_contract(
+                cfg=cfg,
+                running_issue_id=running_issue_id,
+                issue=issue,
+                producing_state=producing_state,
+                producing_state_raw=producing_state_raw,
+                current_state=current_state,
+                workspace_path=workspace_path,
+                known_app_release=known_app_release,
             )
-            # Expose the live backend to `_on_codex_event` so the stall-progress
-            # predicate routes through `client.is_progress_event(...)`.
-            running.client = client
-            after_run_pending = False
-            # Initial dispatch is always forward (no rewind); the env
-            # mutation MUST land before `client.start()` because the
-            # backend subprocess inherits os.environ at fork time.
-            self._apply_dispatch_env(issue=issue, cfg=cfg, is_rewind=False)
-            try:
-                self._sync_backend_agent_pid(
-                    running_issue_id, _backend_agent_pid(client)
-                )
-                try:
-                    await client.start()
-                finally:
-                    self._sync_backend_agent_pid(
-                        running_issue_id, _backend_agent_pid(client)
+            issue = outcome.issue
+            current_state = outcome.current_state
+            known_app_release = outcome.known_app_release
+            if outcome.rewound:
+                is_rewind = True
+        if is_rewind:
+            debug.rewind_count += 1
+            if (
+                cfg.agent.max_attempts > 0
+                and debug.rewind_count > cfg.agent.max_attempts
+            ):
+                rewind_target = _rewind_budget_target_state(cfg)
+                if rewind_target:
+                    await asyncio.to_thread(
+                        self._tracker_call_update_state,
+                        cfg,
+                        issue,
+                        rewind_target,
                     )
-                await client.initialize()
-
-                turn_number = 1
-                debug = self._issue_debug.setdefault(
-                    running_issue_id, _IssueDebug()
-                )
-                # `cfg.tui.language` is the operator-chosen language for
-                # both TUI chrome AND artefact docs. Resolution already
-                # honours `SYMPHONY_LANG` (build_service_config call).
-                doc_language = cfg.tui.language
-                # Skill files are read off-loop; dispatch shares the event
-                # loop with every other running worker.
-                skill_context = await asyncio.to_thread(
-                    render_skill_block,
-                    cfg.workflow_path.parent,
-                    select_skills_for_stage(
-                        str(cfg.raw.get("contract_profile", "advanced")),
-                        issue.state,
-                        issue.skills,
-                    ),
-                    runtime_dir=(
-                        workspace.path
-                        if str(cfg.raw.get("contract_profile", "advanced"))
-                        .strip()
-                        .lower()
-                        == "factory"
-                        else None
-                    ),
-                    inline_body=(
-                        str(cfg.raw.get("contract_profile", "advanced"))
-                        .strip()
-                        .lower()
-                        != "factory"
-                    ),
-                )
-                first_prompt, _ = build_first_turn_prompt(
-                    prompt_template=cfg.prompt_template_for_state(issue.state),
-                    issue=issue,
-                    attempt=attempt,
-                    language=doc_language,
-                    turn_number=debug.completed_turn_count + turn_number,
-                    max_turns=cfg.agent.max_total_turns,
+                    issue = replace(issue, state=rewind_target)
+                running_entry = self._running.get(running_issue_id)
+                if running_entry is not None:
+                    running_entry.issue = issue
+                log.warning(
+                    "rewind_budget_exceeded",
+                    issue_id=issue.id,
+                    identifier=issue.identifier,
+                    from_state=producing_state,
+                    to_state=current_state,
+                    rewind_count=debug.rewind_count,
                     max_attempts=cfg.agent.max_attempts,
-                    auto_merge_on_done=cfg.agent.auto_merge_on_done,
-                    token_ema=self._token_ema_for_state(issue.state),
-                    token_budget=self._token_budget_for_state(cfg, issue.state),
-                    rewind_scope=None,
-                    compact_issue_context=cfg.agent.compact_issue_context,
-                    full_ticket_path=self._ticket_prompt_path(
-                        cfg, issue, workspace.path
-                    ),
-                    extra_context=skill_context,
+                    # F-32: a board with no block/human
+                    # terminal lane keeps its state; the
+                    # worker still stops.
+                    target_state=rewind_target or "(none)",
                 )
-                await client.start_session(
-                    initial_prompt=first_prompt,
-                    issue_title=f"{issue.identifier}: {issue.title}",
-                )
-
-                # Track which kanban state the backend is currently
-                # operating on. When the issue moves to a new state mid-run
-                # we tear the backend down and rebuild it so the next phase
-                # starts with a fresh context — shared knowledge flows only
-                # through the markdown artefacts under
-                # `docs/<identifier>/<stage>/` plus the ticket body.
-                prev_phase_state = normalize_state(issue.state)
-                # Canonical-cased mirror of `prev_phase_state`. Trackers
-                # like Linear and Jira match state names case-sensitively
-                # on writes, so a contract-failure rewind needs the
-                # original casing rather than the lowercased form.
-                prev_phase_state_raw = issue.state or ""
-
-                while True:
-                    # Operator pause gate — `pause_worker` clears the event,
-                    # `resume_worker` sets it. Honoured at the turn boundary
-                    # so we never tear down a turn the model is mid-way
-                    # through. On resume, re-fetch issue state because the
-                    # operator may have moved the ticket while it was held.
-                    pause_event = self._pause_events.get(running_issue_id)
-                    if pause_event is not None and not pause_event.is_set():
-                        log.info(
-                            "worker_paused",
-                            issue_id=running_issue_id,
-                            identifier=issue.identifier,
-                            turn=turn_number,
-                        )
-                        await pause_event.wait()
-                        log.info(
-                            "worker_resumed",
-                            issue_id=running_issue_id,
-                            identifier=issue.identifier,
-                            turn=turn_number,
-                        )
-                        refreshed = await self._refresh_issue_state(
-                            cfg, running_issue_id
-                        )
-                        if refreshed is not None:
-                            issue = refreshed
-                            running_entry = self._running.get(running_issue_id)
-                            if running_entry is not None:
-                                running_entry.issue = issue
-
-                    current_state = normalize_state(issue.state)
-                    debug = self._issue_debug.setdefault(
-                        running_issue_id, _IssueDebug()
-                    )
-                    if (
-                        cfg.agent.max_total_turns > 0
-                        and debug.completed_turn_count + turn_number
-                        > cfg.agent.max_total_turns
-                    ):
-                        log.warning(
-                            "worker_total_turn_budget_boundary",
-                            issue_id=running_issue_id,
-                            issue_identifier=issue.identifier,
-                            completed_turns=debug.completed_turn_count,
-                            next_turn=turn_number,
-                            max_total_turns=cfg.agent.max_total_turns,
-                        )
-                        break
-                    is_phase_transition = (
-                        turn_number > 1 and current_state != prev_phase_state
-                    )
-
-                    if is_phase_transition:
-                        try:
-                            is_rewind = _is_rewind_transition(
-                                prev_phase_state,
-                                current_state,
-                                cfg.tracker.active_states,
-                            )
-                            # v0.6.7 — contract validator. When the agent
-                            # moved forward (not a rewind), check that
-                            # the producing stage actually wrote the
-                            # sections its prompt promised. On failure:
-                            # write the tracker state back to the
-                            # producing stage, append a ## Contract
-                            # Failure note, and treat the situation as
-                            # a forced rewind so the rebuild + budget
-                            # bookkeeping below still apply.
-                            if not is_rewind:
-                                if prev_phase_state in {
-                                    "build",
-                                    "in progress",
-                                    "verify",
-                                    "learn",
-                                    "done",
-                                }:
-                                    # IMPORTANT: contract eval reads
-                                    # `issue.description`, so we MUST use
-                                    # the full-body refresh — not the
-                                    # minimal `_refresh_issue_state`, which
-                                    # returns description=None for every
-                                    # tracker adapter and would falsely
-                                    # fail every forward transition. See
-                                    # tests/test_orchestrator_contract_
-                                    # integration.py for the regression
-                                    # the v0.6.7 release surfaced.
-                                    refreshed_for_contract = (
-                                        await self._refresh_issue_full(
-                                            cfg, running_issue_id
-                                        )
-                                    )
-                                    if refreshed_for_contract is not None:
-                                        issue = refreshed_for_contract
-                                        running_entry = self._running.get(
-                                            running_issue_id
-                                        )
-                                        if running_entry is not None:
-                                            running_entry.issue = issue
-                                        current_state = normalize_state(issue.state)
-                                contract = evaluate_contract(
-                                    producing_state=prev_phase_state,
-                                    ticket_body=issue.description or "",
-                                    identifier=issue.identifier,
-                                    docs_root=workspace.path / "docs",
-                                    profile=str(cfg.raw.get("contract_profile", "advanced")),
-                                )
-                                if not contract.passed:
-                                    log.warning(
-                                        "stage_contract_failed",
-                                        issue_id=issue.id,
-                                        identifier=issue.identifier,
-                                        producing_state=prev_phase_state,
-                                        advanced_to=current_state,
-                                        missing=contract.missing,
-                                    )
-                                    await asyncio.to_thread(
-                                        self._tracker_call_append_note,
-                                        cfg,
-                                        issue,
-                                        contract.note_heading,
-                                        contract.note_body,
-                                    )
-                                    await asyncio.to_thread(
-                                        self._tracker_call_update_state,
-                                        cfg,
-                                        issue,
-                                        prev_phase_state_raw
-                                        or prev_phase_state,
-                                    )
-                                    # Pull the freshly-rewound body so the
-                                    # next backend rebuild's first prompt
-                                    # sees the ## Contract Failure note we
-                                    # just appended (full-body fetch — see
-                                    # the comment above the preflight
-                                    # refresh for why minimal would erase
-                                    # description).
-                                    refreshed = await self._refresh_issue_full(
-                                        cfg, running_issue_id
-                                    )
-                                    if refreshed is not None:
-                                        issue = refreshed
-                                    issue = replace(
-                                        issue,
-                                        state=(
-                                            prev_phase_state_raw
-                                            or prev_phase_state
-                                        ),
-                                    )
-                                    running_entry = self._running.get(
-                                        running_issue_id
-                                    )
-                                    if running_entry is not None:
-                                        running_entry.issue = issue
-                                    current_state = normalize_state(issue.state)
-                                    is_rewind = True
-                                elif contract.warnings:
-                                    # Soft S2 advisories (e.g. a non-passing AC
-                                    # Scorecard row): surface as a ticket note
-                                    # without rewinding so the pipeline proceeds.
-                                    log.warning(
-                                        "stage_contract_warn",
-                                        issue_id=issue.id,
-                                        identifier=issue.identifier,
-                                        producing_state=prev_phase_state,
-                                        advanced_to=current_state,
-                                        warnings=contract.warnings,
-                                    )
-                                    await asyncio.to_thread(
-                                        self._tracker_call_append_note,
-                                        cfg,
-                                        issue,
-                                        "Contract Warning",
-                                        contract.warning_note.split("\n", 1)[1],
-                                    )
-                            if is_rewind:
-                                debug = self._issue_debug.setdefault(
-                                    running_issue_id, _IssueDebug()
-                                )
-                                debug.rewind_count += 1
-                                if (
-                                    cfg.agent.max_attempts > 0
-                                    and debug.rewind_count > cfg.agent.max_attempts
-                                ):
-                                    await asyncio.to_thread(
-                                        self._tracker_call_update_state,
-                                        cfg,
-                                        issue,
-                                        "Blocked",
-                                    )
-                                    issue = replace(issue, state="Blocked")
-                                    running_entry = self._running.get(
-                                        running_issue_id
-                                    )
-                                    if running_entry is not None:
-                                        running_entry.issue = issue
-                                    log.warning(
-                                        "rewind_budget_exceeded",
-                                        issue_id=issue.id,
-                                        identifier=issue.identifier,
-                                        from_state=prev_phase_state,
-                                        to_state=current_state,
-                                        rewind_count=debug.rewind_count,
-                                        max_attempts=cfg.agent.max_attempts,
-                                    )
-                                    break
-                            running_entry = self._running.get(running_issue_id)
-                            if running_entry is not None:
-                                running_entry.consecutive_empty_turns = 0
-                                running_entry.hit_empty_response_loop = False
-                            client, first_prompt = await self._rebuild_backend_for_phase(
-                                issue=issue,
-                                running_issue_id=running_issue_id,
-                                cfg=cfg,
-                                workspace_path=workspace.path,
-                                attempt=attempt,
-                                doc_language=doc_language,
-                                old_client=client,
-                                is_rewind=is_rewind,
-                                turn_number=debug.completed_turn_count + turn_number,
-                            )
-                            running_entry = self._running.get(running_issue_id)
-                            if running_entry is not None:
-                                # New backend instance — refresh the
-                                # `_on_codex_event` reference so the stall
-                                # predicate keeps routing to the live driver.
-                                running_entry.client = client
-                                running_entry.thread_id = None
-                                running_entry.session_id = None
-                                running_entry.turn_id = None
-                            log.info(
-                                "worker_phase_transition",
-                                issue_id=issue.id,
-                                identifier=issue.identifier,
-                                from_state=prev_phase_state,
-                                to_state=current_state,
-                                turn=turn_number,
-                                attempt=attempt,
-                                is_rewind=is_rewind,
-                                workspace=str(workspace.path),
-                            )
-                            self._record_stats_transition(
-                                issue.identifier, prev_phase_state, current_state
-                            )
-                        except Exception as exc:
-                            outcome = "phase_transition_error"
-                            error = str(exc)
-                            return
-
-                    running_entry = self._running.get(running_issue_id)
-                    if (
-                        running_entry is not None
-                        and running_entry.hit_empty_response_loop
-                    ):
-                        await self._escalate_empty_response_loop(
-                            cfg=cfg,
-                            entry=running_entry,
-                            issue_id=running_issue_id,
-                            cancel_worker=False,
-                        )
-                        break
-
-                    is_continuation = turn_number > 1 and not is_phase_transition
-                    if is_continuation:
-                        debug = self._issue_debug.setdefault(running_issue_id, _IssueDebug())
-                        prompt = build_continuation_prompt(
-                            language=doc_language,
-                            turn_number=debug.completed_turn_count + turn_number,
-                            max_turns=cfg.agent.max_total_turns,
-                        )
-                    else:
-                        prompt = first_prompt
-
-                    running = self._running.get(running_issue_id)
-                    if running is None:
-                        outcome = "orphaned"
-                        error = "running entry vanished before turn start"
-                        log.warning(
-                            "worker_running_entry_vanished",
-                            issue_id=running_issue_id,
-                            site="turn_start",
-                        )
-                        return
-                    running.turn_count = turn_number
-                    # Capture the state THIS turn is starting in. C3 EMA
-                    # samples need the source state, not the destination
-                    # the agent flips to mid-turn — without this, every
-                    # stage's tokens get attributed to the next stage.
-                    running.state_at_turn_start = (
-                        running.issue.state or ""
-                    ).lower()
-                    # Symmetry with worker_turn_completed — a single line per
-                    # turn-start so multi-turn runs (especially slow ones
-                    # like gemini -p where a single turn can take 60-90s)
-                    # don't look stuck between turns.
-                    log.info(
-                        "worker_turn_started",
-                        issue_id=running_issue_id,
-                        identifier=running.issue.identifier,
-                        turn=turn_number,
-                        max_turns=cfg.agent.max_turns,
-                        is_continuation=is_continuation,
-                    )
-                    if turn_number > 1:
-                        try:
-                            await self._workspace_manager.before_run(workspace.path)
-                        except Exception as exc:
-                            outcome = "before_run_error"
-                            error = str(exc)
-                            return
-                    self._sync_backend_agent_pid(
-                        running_issue_id, _backend_agent_pid(client)
-                    )
-                    after_run_pending = True
-                    try:
-                        await client.run_turn(prompt=prompt, is_continuation=is_continuation)
-                    except (TurnTimeout, TurnFailed, TurnCancelled, TurnInputRequired) as exc:
-                        outcome = "turn_error"
-                        error = str(exc)
-                        return
-                    finally:
-                        self._sync_backend_agent_pid(
-                            running_issue_id, _backend_agent_pid(client)
-                        )
-
-                    # Synchronous log on the worker's hot path — the
-                    # listener-side `agent_turn_completed` log fires from
-                    # `_on_codex_event` via the EVENT_TURN_COMPLETED emit,
-                    # but reconcile can cancel the worker between the emit
-                    # and the listener running, swallowing the visibility
-                    # signal. Logging here guarantees one line per
-                    # successful turn even when reconcile races us.
-                    running_entry = self._running.get(running_issue_id)
-                    if running_entry is not None:
-                        log.info(
-                            "worker_turn_completed",
-                            issue_id=running_issue_id,
-                            identifier=running_entry.issue.identifier,
-                            turn=turn_number,
-                            input_tokens=running_entry.codex_input_tokens,
-                            cache_input_tokens=running_entry.codex_cache_input_tokens,
-                            output_tokens=running_entry.codex_output_tokens,
-                            total_tokens=running_entry.codex_total_tokens,
-                        )
-
-                    await self._workspace_manager.after_run_best_effort(workspace.path)
-                    after_run_pending = False
-
-                    # Record the state the backend just operated on so the
-                    # next iteration can detect a phase transition against
-                    # the freshly refreshed state below.
-                    prev_phase_state = current_state
-                    prev_phase_state_raw = (
-                        running.issue.state if running is not None else issue.state
-                    ) or ""
-
-                    # Refresh issue state.
-                    refreshed = await self._refresh_issue_state(cfg, running_issue_id)
-                    if refreshed is None:
-                        outcome = "issue_state_refresh_failed"
-                        error = "could not refresh issue state"
-                        return
-                    issue = refreshed
-                    running = self._running.get(running_issue_id)
-                    if running is None:
-                        outcome = "orphaned"
-                        error = "running entry vanished after issue refresh"
-                        log.warning(
-                            "worker_running_entry_vanished",
-                            issue_id=running_issue_id,
-                            site="post_refresh",
-                        )
-                        return
-                    running.issue = issue
-                    state = normalize_state(issue.state)
-                    active = {s.lower() for s in cfg.tracker.active_states}
-                    profile = str(cfg.raw.get("contract_profile", "advanced"))
-                    contract_states = (
-                        {"build", "verify"}
-                        if profile == "factory"
-                        else {"in progress", "verify", "learn", "done"}
-                    )
-                    if (
-                        state not in active
-                        and state != prev_phase_state
-                        and prev_phase_state in contract_states
-                    ):
-                        issue, contract_passed = await self._enforce_transition_contract(
-                            cfg=cfg,
-                            issue=issue,
-                            issue_id=running_issue_id,
-                            producing_state=prev_phase_state,
-                            producing_state_raw=prev_phase_state_raw,
-                            advanced_to=state,
-                            workspace_path=workspace.path,
-                        )
-                        running.issue = issue
-                        state = normalize_state(issue.state)
-                        if not contract_passed:
-                            active = {s.lower() for s in cfg.tracker.active_states}
-                    if state not in active:
-                        break
-                    state_turn_count = _update_state_turn_counter(debug, state)
-                    max_state_turns = self._max_state_turns_for_state(cfg, state)
-                    if (
-                        max_state_turns > 0
-                        and state_turn_count >= max_state_turns
-                    ):
-                        running.hit_no_stage_change = True
-                        log.warning(
-                            "no_stage_change_watchdog",
-                            issue_id=running_issue_id,
-                            issue_identifier=running.issue.identifier,
-                            state=running.issue.state,
-                            state_turn_count=state_turn_count,
-                            effective_max_state_turns=max_state_turns,
-                            global_max_state_turns=cfg.agent.max_state_turns,
-                        )
-                        break
-                    if turn_number >= cfg.agent.max_turns:
-                        # Per-attempt ceiling reached without a terminal
-                        # transition. Mark explicitly so `_on_worker_exit`
-                        # doesn't auto-schedule a continuation — the ticket
-                        # waits for operator action instead of looping
-                        # silently against the ceiling.
-                        running.hit_max_turns = True
-                        log.warning(
-                            "worker_max_turns_exhausted",
-                            issue_id=running_issue_id,
-                            issue_identifier=running.issue.identifier,
-                            turns=turn_number,
-                            max_turns=cfg.agent.max_turns,
-                        )
-                        break
-                    turn_number += 1
-            finally:
-                # Defensive: a phase transition may have left `client`
-                # pointing to a half-initialized backend, or to one whose
-                # earlier `stop()` already failed. Either way, exiting the
-                # worker without after_run_best_effort would leak workspace
-                # state, so swallow stop() errors here too.
-                try:
-                    await client.stop()
-                except Exception as stop_exc:
-                    log.warning(
-                        "worker_final_stop_failed",
-                        issue_id=issue.id,
-                        identifier=issue.identifier,
-                        error=str(stop_exc),
-                    )
-                else:
-                    running = self._running.get(running_issue_id)
-                    if running is not None and running.backend_cleanup_unconfirmed:
-                        log.warning(
-                            "worker_final_stop_cleanup_unconfirmed",
-                            issue_id=issue.id,
-                            identifier=issue.identifier,
-                            pid=running.agent_pgid,
-                        )
-                    else:
-                        self._sync_backend_agent_pid(running_issue_id, None)
-                if after_run_pending:
-                    await self._workspace_manager.after_run_best_effort(workspace.path)
-        except SymphonyError as exc:
-            outcome = "error"
-            error = str(exc)
-        except Exception as exc:
-            outcome = "error"
-            error = str(exc)
-            log.error(
-                "worker_unhandled_error",
-                issue_id=running_issue_id,
-                error=str(exc),
-                exc_type=type(exc).__name__,
-                traceback=traceback.format_exc(),
-            )
-        finally:
-            # Diagnostic marker — pairs with `worker_task_done_without_cleanup`
-            # to localize the path that leaves entries in `_running`. If
-            # this line is missing from the log right before that error,
-            # the outer finally never ran (Python contract violation =
-            # interpreter shutdown / OS-level kill). If it IS present,
-            # the bypass is inside `_on_worker_exit` itself.
+                return None
+        running_entry = self._running.get(running_issue_id)
+        if running_entry is not None:
+            running_entry.consecutive_empty_turns = 0
+            running_entry.hit_empty_response_loop = False
+        # F-01: route the *new* lane's backend. The ticket
+        # walks several states inside one dispatch, so the
+        # kind must be re-resolved from the unrouted config
+        # here — not reused from the lane we started in.
+        phase_cfg = _config_for_issue_agent(base_cfg, issue)
+        if phase_cfg.agent.kind != cfg.agent.kind:
             log.info(
-                "worker_finally_entered",
-                issue_id=running_issue_id,
-                outcome=outcome,
-                error=error,
+                "stage_backend_rerouted",
+                issue_id=issue.id,
+                identifier=issue.identifier,
+                from_state=producing_state,
+                to_state=current_state,
+                from_kind=cfg.agent.kind,
+                to_kind=phase_cfg.agent.kind,
             )
-            # AF-01 — a force-ejected zombie's `finally` can run after a
-            # retry already installed a fresh entry under this issue id
-            # (the zombie task is never cancelled by force-eject, only its
-            # bookkeeping is dropped). Only the task that actually owns the
-            # current entry may stamp `exit_started_at` or enter
-            # `_on_worker_exit`; a foreign owner must not touch either.
-            # The handler keeps its own identity check as the single guard
-            # around the eventual pop.
-            # `entry.worker_task is None` counts as owned — many existing
-            # tests drive this coroutine directly against a hand-installed
-            # entry that never went through `_dispatch`.
-            owning_task = asyncio.current_task()
-            entry = self._running.get(running_issue_id)
-            stale_entry = (
-                entry is not None
-                and owning_task is not None
-                and self._dispatch_state.entry_foreign_to(
-                    running_issue_id, owning_task
-                )
+        cfg = phase_cfg
+        if running_entry is not None:
+            running_entry.agent_kind = cfg.agent.kind
+        client, first_prompt = await self._rebuild_backend_for_phase(
+            issue=issue,
+            running_issue_id=running_issue_id,
+            cfg=cfg,
+            workspace_path=workspace_path,
+            attempt=attempt,
+            doc_language=doc_language,
+            old_client=client,
+            is_rewind=is_rewind,
+            turn_number=debug.completed_turn_count + turn_number,
+        )
+        running_entry = self._running.get(running_issue_id)
+        if running_entry is not None:
+            # New backend instance — refresh the
+            # `_on_codex_event` reference so the stall
+            # predicate keeps routing to the live driver.
+            running_entry.client = client
+            running_entry.thread_id = None
+            running_entry.session_id = None
+            running_entry.turn_id = None
+            running_entry.resume_session_id = None
+            running_entry.last_completed_turn_event = 0
+        return _AgentPhaseTransition(
+            state=_AgentPhaseState(
+                issue=issue,
+                cfg=cfg,
+                client=client,
+                first_prompt=first_prompt,
+                current_state=current_state,
+                known_app_release=known_app_release,
+            ),
+            is_rewind=is_rewind,
+        )
+
+    async def _enforce_stage_contract(
+        self,
+        *,
+        cfg: ServiceConfig,
+        running_issue_id: str,
+        issue: Issue,
+        producing_state: str,
+        producing_state_raw: str,
+        current_state: str,
+        workspace_path: Path,
+        known_app_release: bool,
+        running_entry: RunningEntry | None = None,
+    ) -> _StageContractOutcome:
+        """Evaluate the producing lane's stage contract after a forward move.
+
+        Refreshes the full ticket body, evaluates the preset's contract set,
+        and on failure appends `## Contract Failure` and writes the tracker
+        state back to the producing lane. Returns the (possibly refreshed
+        and rewound) issue, its normalized state, and whether it rewound.
+        Producing states outside the preset's contract set pass through
+        without the full-body refresh.
+        """
+        # Defensive: the raw label must denote `producing_state`; a caller
+        # that hands us the advanced state's casing would make the rewind
+        # write the state the ticket is already in (a silent no-op).
+        if normalize_state(producing_state_raw) != producing_state:
+            producing_state_raw = _canonical_state_label(cfg, producing_state)
+        # The deep preset carries its own contract set (vault files +
+        # verdict lines); anything else gets the default section set.
+        factory = self._is_factory_profile(cfg)
+        lane_preset = (
+            "factory" if factory else guess_lane_preset(cfg.tracker.active_states)
+        )
+        if producing_state not in contract_producing_states(lane_preset):
+            return _StageContractOutcome(
+                issue=issue,
+                current_state=current_state,
+                known_app_release=known_app_release,
+                rewound=False,
             )
-            if stale_entry:
-                log.warning(
-                    "worker_finally_stale_entry",
-                    issue_id=running_issue_id,
-                    reason=outcome,
+        # IMPORTANT: contract eval reads `issue.description`, so we MUST use
+        # the full-body refresh — not the minimal `_refresh_issue_state`,
+        # which returns description=None for every tracker adapter and
+        # would falsely fail every forward transition. See
+        # tests/test_orchestrator_contract_integration.py for the
+        # regression the v0.6.7 release surfaced.
+        refreshed_for_contract = await self._refresh_issue_full(cfg, running_issue_id)
+        authority_entry = running_entry or self._running.get(running_issue_id)
+        if refreshed_for_contract is not None:
+            issue = refreshed_for_contract
+            known_app_release = known_app_release or _has_app_release_label(issue)
+            running_entry = self._running.get(running_issue_id)
+            if running_entry is not None:
+                running_entry.issue = issue
+            current_state = normalize_state(issue.state)
+        contract = evaluate_contract(
+            producing_state=producing_state,
+            ticket_body=issue.description or "",
+            identifier=issue.identifier,
+            docs_root=workspace_path / "docs",
+            artifact_store_root=(
+                self._artifact_store.root
+                if (cfg.artifacts.require_for_done and self._artifact_store is not None)
+                else None
+            ),
+            preset=lane_preset,
+            request=issue.request,
+            advanced_state=current_state,
+            app_release=known_app_release,
+            profile="factory" if factory else "advanced",
+        )
+        if (
+            factory
+            and current_state in {"verify", "done", "completed"}
+            and authority_entry is not None
+        ):
+            if (
+                authority_entry.factory_declared_proof is not None
+                and tuple(factory_proof_commands(issue.description or ""))
+                != authority_entry.factory_declared_proof
+            ):
+                contract = _build_result(
+                    producing_state,
+                    list(contract.missing)
+                    + [
+                        "declared proof commands changed after this worker started; preserve the approved proof"
+                    ],
                 )
-            elif entry is not None:
-                entry.exit_started_at = datetime.now(timezone.utc)
-                await asyncio.shield(
-                    self._on_worker_exit(
-                        running_issue_id, outcome, error, owning_task=owning_task
+        if factory and _is_successful_terminal_state(current_state):
+            missing = list(contract.missing)
+            if refreshed_for_contract is None:
+                missing.append("the authoritative full ticket could not be refreshed")
+            if producing_state == "verify":
+                if (
+                    authority_entry is None
+                    or not authority_entry.factory_verify_completed
+                ):
+                    missing.append("Done requires a completed independent Verify turn")
+                elif (
+                    factory_verification_text(issue.description or "")
+                    == authority_entry.factory_verification_baseline
+                ):
+                    missing.append(
+                        "Verification is unchanged from before this Verify phase; record fresh output and a UTC timestamp"
+                    )
+                browser = "superqa" in issue.skills or bool(
+                    re.search(
+                        r"\bbrowser\b|## Browser Verification",
+                        issue.description or "",
+                        re.IGNORECASE,
                     )
                 )
+                if browser:
+                    missing.extend(
+                        factory_browser_failures(
+                            issue.description or "",
+                            workspace_path,
+                            authority_entry.factory_verify_started_at
+                            if authority_entry
+                            else 0.0,
+                        )
+                    )
+            if missing:
+                contract = _build_result(producing_state, missing)
+        if not contract.passed:
+            log.warning(
+                "stage_contract_failed",
+                issue_id=issue.id,
+                identifier=issue.identifier,
+                producing_state=producing_state,
+                advanced_to=current_state,
+                missing=contract.missing,
+            )
+            await asyncio.to_thread(
+                self._tracker_call_append_note,
+                cfg,
+                issue,
+                contract.note_heading,
+                contract.note_body,
+            )
+            await asyncio.to_thread(
+                self._tracker_call_update_state,
+                cfg,
+                issue,
+                producing_state_raw or producing_state,
+            )
+            self._record_stats_gate(
+                issue.identifier, producing_state, "contract_failure", contract.missing
+            )
+            # Pull the freshly-rewound body so the next prompt sees the
+            # `## Contract Failure` note we just appended (full-body fetch).
+            refreshed = await self._refresh_issue_full(cfg, running_issue_id)
+            if refreshed is not None:
+                issue = refreshed
+            issue = replace(issue, state=(producing_state_raw or producing_state))
+            running_entry = self._running.get(running_issue_id)
+            if running_entry is not None:
+                running_entry.issue = issue
+            return _StageContractOutcome(
+                issue=issue,
+                current_state=normalize_state(issue.state),
+                known_app_release=known_app_release,
+                rewound=True,
+            )
+        if contract.warnings:
+            # Soft S2 advisories (e.g. a non-passing AC Scorecard row):
+            # surface as a ticket note without rewinding.
+            log.warning(
+                "stage_contract_warn",
+                issue_id=issue.id,
+                identifier=issue.identifier,
+                producing_state=producing_state,
+                advanced_to=current_state,
+                warnings=contract.warnings,
+            )
+            await asyncio.to_thread(
+                self._tracker_call_append_note,
+                cfg,
+                issue,
+                "Contract Warning",
+                contract.warning_note.split("\n", 1)[1],
+            )
+        return _StageContractOutcome(
+            issue=issue,
+            current_state=current_state,
+            known_app_release=known_app_release,
+            rewound=False,
+        )
+
+    @staticmethod
+    def _reset_phase_accounting(
+        entry: RunningEntry, state: str, debug: _IssueDebug
+    ) -> None:
+        """Start one backend phase without erasing ticket-lifetime totals."""
+        entry.last_reported_input_tokens = 0
+        entry.last_reported_cache_input_tokens = 0
+        entry.last_reported_output_tokens = 0
+        entry.last_reported_total_tokens = 0
+        entry.codex_state_input_tokens = 0
+        entry.codex_state_cache_input_tokens = 0
+        entry.codex_state_output_tokens = 0
+        entry.codex_state_total_tokens = 0
+        entry.last_ema_state_total_tokens = 0
+        entry.hit_token_budget = False
+        entry.token_budget_cap = 0
+        entry.state_at_turn_start = normalize_state(state)
+        debug.state_turn_state = normalize_state(state)
+        debug.state_turn_count = 0
 
     async def _rebuild_backend_for_phase(
         self,
@@ -4227,8 +7433,8 @@ class Orchestrator:
         """Tear down `old_client` and rebuild a fresh-context backend.
 
         Returns `(new_client, new_first_prompt)` so the worker loop can
-        rebind both. Phase-local accounting resets after the old backend
-        stops and before the replacement can emit session-start usage.
+        rebind both. Phase-local usage resets before the new backend can
+        emit startup telemetry; ticket-lifetime counters are preserved.
         """
         try:
             await old_client.stop()
@@ -4249,9 +7455,14 @@ class Orchestrator:
         if running is not None:
             debug = self._issue_debug.setdefault(running_issue_id, _IssueDebug())
             self._reset_phase_accounting(running, issue.state, debug)
+            self._start_factory_verify_phase(cfg, issue, running)
         tools: list[Any] = []
         if cfg.tracker.kind == "linear" and cfg.agent.kind == "codex":
             tools.append(linear_graphql_tool())
+        # Per-dispatch env rides in BackendInit so the new backend's
+        # subprocess sees it. Forward phase transitions omit
+        # SYMPHONY_REWIND_SCOPE; rewinds carry the JSON of the latest
+        # finding rows.
         new_client = self._build_agent_backend(
             BackendInit(
                 cfg=cfg,
@@ -4260,13 +7471,13 @@ class Orchestrator:
                 on_event=lambda ev, issue_id=running_issue_id: self._on_codex_event(
                     issue_id, ev
                 ),
+                on_process_started=lambda pid, issue_id=running_issue_id: (
+                    self._sync_backend_agent_pid(issue_id, pid)
+                ),
                 client_tools=tools,
+                env=self._dispatch_env_for(issue=issue, cfg=cfg, is_rewind=is_rewind),
             )
         )
-        # Reset per-dispatch env BEFORE the new backend's subprocess spawns.
-        # Forward phase transitions unset SYMPHONY_REWIND_SCOPE; rewinds
-        # set it to the JSON of the latest finding rows.
-        self._apply_dispatch_env(issue=issue, cfg=cfg, is_rewind=is_rewind)
         try:
             self._sync_backend_agent_pid(
                 running_issue_id, _backend_agent_pid(new_client)
@@ -4279,28 +7490,13 @@ class Orchestrator:
                 )
             await new_client.initialize()
             skill_context = await asyncio.to_thread(
-                render_skill_block,
-                cfg.workflow_path.parent,
-                select_skills_for_stage(
-                    str(cfg.raw.get("contract_profile", "advanced")),
-                    issue.state,
-                    issue.skills,
-                ),
-                runtime_dir=(
-                    workspace_path
-                    if str(cfg.raw.get("contract_profile", "advanced"))
-                    .strip()
-                    .lower()
-                    == "factory"
-                    else None
-                ),
-                inline_body=(
-                    str(cfg.raw.get("contract_profile", "advanced"))
-                    .strip()
-                    .lower()
-                    != "factory"
-                ),
+                self._render_stage_skills, cfg, issue, workspace_path
             )
+            board_health = ""
+            if self._board_health_wanted(issue.state):
+                board_health = await asyncio.to_thread(
+                    self._board_health_for_prompt, cfg, issue.state
+                )
             first_prompt, _ = build_first_turn_prompt(
                 prompt_template=cfg.prompt_template_for_state(issue.state),
                 issue=issue,
@@ -4317,10 +7513,10 @@ class Orchestrator:
                     _parse_findings_rows(issue.description) if is_rewind else None
                 ),
                 compact_issue_context=cfg.agent.compact_issue_context,
-                full_ticket_path=self._ticket_prompt_path(
-                    cfg, issue, workspace_path
-                ),
+                full_ticket_path=self._ticket_prompt_path(cfg, issue, workspace_path),
+                artifacts_dir=self._prompt_artifacts_dir(cfg),
                 extra_context=skill_context,
+                board_health=board_health,
             )
             await new_client.start_session(
                 initial_prompt=first_prompt,
@@ -4343,26 +7539,6 @@ class Orchestrator:
                 self._sync_backend_agent_pid(running_issue_id, None)
             raise
         return new_client, first_prompt
-
-    @staticmethod
-    def _reset_phase_accounting(
-        entry: RunningEntry, state: str, debug: _IssueDebug
-    ) -> None:
-        """Start one backend phase without erasing ticket-lifetime totals."""
-        entry.last_reported_input_tokens = 0
-        entry.last_reported_cache_input_tokens = 0
-        entry.last_reported_output_tokens = 0
-        entry.last_reported_total_tokens = 0
-        entry.codex_state_input_tokens = 0
-        entry.codex_state_cache_input_tokens = 0
-        entry.codex_state_output_tokens = 0
-        entry.codex_state_total_tokens = 0
-        entry.last_ema_state_total_tokens = 0
-        entry.hit_token_budget = False
-        entry.token_budget_cap = 0
-        entry.state_at_turn_start = normalize_state(state)
-        debug.state_turn_state = normalize_state(state)
-        debug.state_turn_count = 0
 
     async def _refresh_issue_state(
         self, cfg: ServiceConfig, issue_id: str
@@ -4400,64 +7576,157 @@ class Orchestrator:
             self._clear_tracker_error(issue_id)
             return issue
         except Exception as exc:
-            log.warning(
-                "issue_full_refresh_failed", issue_id=issue_id, error=str(exc)
-            )
+            log.warning("issue_full_refresh_failed", issue_id=issue_id, error=str(exc))
             self._record_tracker_error(issue_id, exc)
             return None
 
-    async def _enforce_transition_contract(
+    async def _rewind_app_release_transition(
         self,
         *,
         cfg: ServiceConfig,
         issue: Issue,
-        issue_id: str,
         producing_state: str,
-        producing_state_raw: str,
-        advanced_to: str,
+        note_body: str,
+    ) -> Issue:
+        """Persist a release-gate rewind on the local file board."""
+        return await asyncio.to_thread(
+            ReleaseCycleService(cfg).rewind_transition,
+            issue=issue,
+            producing_state=producing_state,
+            note_body=note_body,
+        )
+
+    def _app_release_transition_lock(self, issue_id: str) -> asyncio.Lock | None:
+        """Return the lock owned by the current live run for ``issue_id``."""
+        running = self._running.get(issue_id)
+        if running is None:
+            return None
+        owned = self._app_release_transition_locks.get(issue_id)
+        if owned is None or owned[0] is not running:
+            lock = asyncio.Lock()
+            self._app_release_transition_locks[issue_id] = (running, lock)
+            return lock
+        return owned[1]
+
+    async def _enforce_app_release_transition(
+        self,
+        *,
+        cfg: ServiceConfig,
+        issue: Issue,
         workspace_path: Path,
+        producing_state: str,
+        known_app_release: bool,
+        running_entry: RunningEntry | None = None,
     ) -> tuple[Issue, bool]:
-        latest = await self._refresh_issue_full(cfg, issue_id)
-        if latest is not None:
-            issue = latest
-        contract = evaluate_contract(
-            producing_state=producing_state,
-            ticket_body=issue.description or "",
-            identifier=issue.identifier,
-            docs_root=workspace_path / "docs",
-            profile=str(cfg.raw.get("contract_profile", "advanced")),
+        """Fail closed around every post-transition release authority check."""
+        authority_entry = running_entry or self._running.get(issue.id)
+        transition_lock = (
+            self._app_release_transition_lock(issue.id)
+            if self._running.get(issue.id) is authority_entry
+            else None
         )
-        if contract.passed:
-            if contract.warnings:
-                await asyncio.to_thread(
-                    self._tracker_call_append_note,
-                    cfg,
-                    issue,
-                    "Contract Warning",
-                    contract.warning_note.split("\n", 1)[1],
+        if transition_lock is not None:
+            async with transition_lock:
+                return await self._enforce_app_release_transition_guarded(
+                    cfg=cfg,
+                    issue=issue,
+                    workspace_path=workspace_path,
+                    producing_state=producing_state,
+                    known_app_release=known_app_release,
+                    running_entry=authority_entry,
                 )
-            return issue, True
-        log.warning(
-            "stage_contract_failed",
-            issue_id=issue.id,
-            identifier=issue.identifier,
+        return await self._enforce_app_release_transition_guarded(
+            cfg=cfg,
+            issue=issue,
+            workspace_path=workspace_path,
             producing_state=producing_state,
-            advanced_to=advanced_to,
-            missing=contract.missing,
+            known_app_release=known_app_release,
+            running_entry=authority_entry,
         )
-        await asyncio.to_thread(
-            self._tracker_call_append_note,
-            cfg,
-            issue,
-            contract.note_heading,
-            contract.note_body,
+
+    async def _enforce_app_release_transition_guarded(
+        self,
+        *,
+        cfg: ServiceConfig,
+        issue: Issue,
+        workspace_path: Path,
+        producing_state: str,
+        known_app_release: bool,
+        running_entry: RunningEntry | None,
+    ) -> tuple[Issue, bool]:
+        """Run one serialized release decision and persist a safe rewind on error."""
+        try:
+            return await self._enforce_app_release_transition_inner(
+                cfg=cfg,
+                issue=issue,
+                workspace_path=workspace_path,
+                producing_state=producing_state,
+                known_app_release=known_app_release,
+                running_entry=running_entry,
+            )
+        except _ReleaseTransitionAuthorityLost:
+            # The board and current gate now belong to a newer run. Rewinding
+            # here would let the stale worker mutate (or retire) its peer's
+            # release cycle, so ownership loss is a side-effect-free abort.
+            raise
+        except Exception as exc:
+            try:
+                rewound = await self._rewind_app_release_transition(
+                    cfg=cfg,
+                    issue=issue,
+                    producing_state=producing_state,
+                    note_body=(
+                        "Release authority failed closed before delivery.\n\n"
+                        f"Infrastructure error: {exc}"
+                    ),
+                )
+            except Exception as rewind_exc:
+                log.error(
+                    "app_release_authority_rewind_failed",
+                    issue_id=issue.id,
+                    identifier=issue.identifier,
+                    authority_error=str(exc),
+                    rewind_error=str(rewind_exc),
+                )
+                raise SymphonyError(
+                    "application release authority failed and its Verify rewind "
+                    "could not be persisted",
+                    authority_error=str(exc),
+                    rewind_error=str(rewind_exc),
+                ) from rewind_exc
+            log.error(
+                "app_release_authority_rewound",
+                issue_id=issue.id,
+                identifier=issue.identifier,
+                error=str(exc),
+            )
+            return rewound, True
+
+    async def _enforce_app_release_transition_inner(
+        self,
+        *,
+        cfg: ServiceConfig,
+        issue: Issue,
+        workspace_path: Path,
+        producing_state: str,
+        known_app_release: bool,
+        running_entry: RunningEntry | None,
+    ) -> tuple[Issue, bool]:
+        """Gate a local-file-board transition out of Verify.
+
+        Body lives in ``release_transition.enforce_app_release_transition_inner``
+        (see that module's docstring); this forward keeps the call site and
+        the test seam on the orchestrator.
+        """
+        return await release_transition.enforce_app_release_transition_inner(
+            self,
+            cfg=cfg,
+            issue=issue,
+            workspace_path=workspace_path,
+            producing_state=producing_state,
+            known_app_release=known_app_release,
+            running_entry=running_entry,
         )
-        rewind_state = producing_state_raw or producing_state
-        await asyncio.to_thread(
-            self._tracker_call_update_state, cfg, issue, rewind_state
-        )
-        refreshed = await self._refresh_issue_full(cfg, issue_id)
-        return (refreshed or replace(issue, state=rewind_state)), False
 
     async def _persist_budget_exhausted_state(
         self,
@@ -4494,10 +7763,7 @@ class Orchestrator:
                 if state_turn_limit is not None
                 else self._max_state_turns_for_state(cfg, state_name)
             )
-            budget_detail = (
-                f"(state_turns={count}, "
-                f"effective_max_state_turns={limit})"
-            )
+            budget_detail = f"(state_turns={count}, effective_max_state_turns={limit})"
         else:
             budget_detail = f"(max_total_turns={cfg.agent.max_total_turns})"
         note_body = (
@@ -4541,39 +7807,6 @@ class Orchestrator:
             )
             self._record_tracker_error(issue_id, persist_exc)
             return False
-
-    async def _persist_token_budget_stop(
-        self,
-        *,
-        cfg: ServiceConfig,
-        entry: RunningEntry,
-        issue_id: str,
-        debug: _IssueDebug,
-    ) -> None:
-        self._mark_budget_exhausted(issue_id)
-        self._claimed.add(issue_id)
-        cap = entry.token_budget_cap or self._token_cap_for_entry(cfg, entry)
-        debug.last_error = (
-            f"max_total_tokens reached "
-            f"({entry.codex_state_total_tokens}/{cap} in {entry.issue.state}); "
-            f"state still {entry.issue.state}"
-        )
-        log.warning(
-            "worker_token_budget_exhausted",
-            issue_id=issue_id,
-            issue_identifier=entry.issue.identifier,
-            state_total_tokens=entry.codex_state_total_tokens,
-            total_tokens=entry.codex_total_tokens,
-            max_total_tokens=cap,
-            state=entry.issue.state,
-        )
-        await self._persist_budget_exhausted_state(
-            cfg=cfg,
-            entry=entry,
-            issue_id=issue_id,
-            target_state=cfg.agent.budget_exhausted_state,
-            budget_kind="tokens",
-        )
 
     async def _escalate_empty_response_loop(
         self,
@@ -4637,49 +7870,6 @@ class Orchestrator:
             entry.worker_task.cancel()
         entry.cancelled_at = datetime.now(timezone.utc)
 
-    async def _persist_no_stage_change_handoff(
-        self,
-        *,
-        cfg: ServiceConfig,
-        entry: RunningEntry,
-        issue_id: str,
-        target_state: str,
-        turn_count: int,
-        state_name: str,
-    ) -> bool:
-        note_body = (
-            f"Symphony stopped this worker: no stage change after {turn_count} "
-            f"turns in {state_name}. "
-            f"The workflow is configured to hand off to {target_state}, so "
-            "Symphony moved the ticket there for the next stage."
-        )
-        try:
-            await asyncio.to_thread(
-                self._tracker_call_update_state,
-                cfg,
-                entry.issue,
-                target_state,
-            )
-            await asyncio.to_thread(
-                self._tracker_call_append_note,
-                cfg,
-                entry.issue,
-                "Stage Watchdog Handoff",
-                note_body,
-            )
-            self._clear_tracker_error(issue_id)
-            return True
-        except Exception as exc:
-            log.warning(
-                "no_stage_change_handoff_failed",
-                issue_id=issue_id,
-                identifier=entry.issue.identifier,
-                target_state=target_state,
-                error=str(exc),
-            )
-            self._record_tracker_error(issue_id, exc)
-            return False
-
     # ------------------------------------------------------------------
     # codex events
     # ------------------------------------------------------------------
@@ -4703,6 +7893,58 @@ class Orchestrator:
             value = payload.get(key)
             if isinstance(value, str) and value.strip():
                 return value.strip()
+
+        def assistant_message_preview(message: Any) -> str:
+            """Extract text only from an assistant message.
+
+            Pi and Prime wrap response text in a message object.  The same
+            stream also contains user messages and tool results, so requiring
+            an assistant role here keeps those echoes from looking like model
+            output to the empty-turn guard.
+            """
+            if not isinstance(message, dict):
+                return ""
+            kind = str(message.get("role") or message.get("type") or "").lower()
+            if kind != "assistant":
+                return ""
+            content = message.get("content")
+            if isinstance(content, str) and content.strip():
+                return content.strip()
+            if isinstance(content, list):
+                for block in reversed(content):
+                    if isinstance(block, dict):
+                        text = block.get("text")
+                    else:
+                        text = block
+                    if isinstance(text, str) and text.strip():
+                        return text.strip()
+            elif isinstance(content, dict):
+                text = content.get("text")
+                if isinstance(text, str) and text.strip():
+                    return text.strip()
+            text = message.get("text")
+            if isinstance(text, str) and text.strip():
+                return text.strip()
+            return ""
+
+        # Pi/Prime `message_end` and `turn_end` payloads nest the assistant
+        # message under `message`.
+        message = payload.get("message")
+        preview = assistant_message_preview(message)
+        if preview:
+            return preview
+
+        # Their terminal `agent_end` payload carries all messages.  Walk
+        # backwards so the preview reflects the final assistant response,
+        # while skipping user messages and tool-result entries.
+        if str(payload.get("type") or "").lower() == "agent_end":
+            messages = payload.get("messages")
+            if isinstance(messages, list):
+                for message in reversed(messages):
+                    preview = assistant_message_preview(message)
+                    if preview:
+                        return preview
+
         item = payload.get("item")
         if isinstance(item, dict):
             item_type = str(item.get("type") or "").lower()
@@ -4726,6 +7968,10 @@ class Orchestrator:
         if entry is None:
             return
         ev_name = str(event.get("event") or "")
+        if ev_name != EVENT_SESSION_STARTED and entry.resume_session_id:
+            sanitized = redact_session_id(event, entry.resume_session_id)
+            if isinstance(sanitized, dict):
+                event = sanitized
         entry.last_codex_event = ev_name
         ts_text = event.get("timestamp")
         if isinstance(ts_text, str):
@@ -4762,6 +8008,9 @@ class Orchestrator:
                     debug.last_error = f"approval denied: {reason} ({command})"
                 else:
                     debug.last_error = f"approval denied: {reason}"
+                self._append_run_event(
+                    entry, "approval_denied", {"reason": reason}
+                )
                 log.warning(
                     "approval_denied",
                     issue_id=issue_id,
@@ -4865,20 +8114,28 @@ class Orchestrator:
         # never set `turn_id`, so the suffix is silently skipped for them.
         if ev_name == EVENT_SESSION_STARTED:
             sid = (
-                payload.get("session_id")
-                or payload.get("thread_id")
-                or payload.get("threadId")
-            ) if isinstance(payload, dict) else None
+                (
+                    payload.get("session_id")
+                    or payload.get("thread_id")
+                    or payload.get("threadId")
+                )
+                if isinstance(payload, dict)
+                else None
+            )
             if sid:
                 entry.thread_id = str(sid)
                 entry.session_id = entry.thread_id
+                entry.resume_session_id = entry.thread_id
             log.info(
                 "agent_session_started",
                 issue_id=issue_id,
                 identifier=entry.issue.identifier,
-                session_id=entry.session_id,
             )
+            self._append_run_event(entry, "session_started")
         if ev_name == EVENT_TURN_COMPLETED:
+            entry.last_completed_turn_event = max(
+                entry.last_completed_turn_event, entry.turn_count
+            )
             turn_id = payload.get("turnId") or payload.get("turn_id")
             if turn_id and entry.thread_id:
                 entry.turn_id = str(turn_id)
@@ -4894,6 +8151,17 @@ class Orchestrator:
                 total_tokens=entry.codex_total_tokens,
                 last_message=(entry.last_codex_message or "")[:160],
             )
+            self._append_run_event(
+                entry,
+                "turn_completed",
+                {
+                    "turn": entry.turn_count,
+                    "input_tokens": entry.codex_input_tokens,
+                    "cache_input_tokens": entry.codex_cache_input_tokens,
+                    "output_tokens": entry.codex_output_tokens,
+                    "total_tokens": entry.codex_total_tokens,
+                },
+            )
             self._record_token_attention_for_turn(entry, cfg)
             self._record_stats_turn(entry)
             # C3 — adaptive token budget. Sample = per-turn state-local
@@ -4902,8 +8170,7 @@ class Orchestrator:
             # that fires before any usage is reported) is skipped
             # silently rather than dragging the EMA toward zero.
             turn_sample = max(
-                entry.codex_state_total_tokens
-                - entry.last_ema_state_total_tokens,
+                entry.codex_state_total_tokens - entry.last_ema_state_total_tokens,
                 0,
             )
             if turn_sample > 0:
@@ -4911,15 +8178,9 @@ class Orchestrator:
                 # so a stage that flipped the ticket mid-turn still has its
                 # cost attributed correctly. Fall back to current state for
                 # event-injection unit tests that bypass turn_started.
-                target_state = (
-                    entry.state_at_turn_start or entry.issue.state
-                )
-                self._update_token_ema(
-                    target_state, turn_sample, cfg
-                )
-                entry.last_ema_state_total_tokens = (
-                    entry.codex_state_total_tokens
-                )
+                target_state = entry.state_at_turn_start or entry.issue.state
+                self._update_token_ema(target_state, turn_sample, cfg)
+                entry.last_ema_state_total_tokens = entry.codex_state_total_tokens
             # G2 — empty-response loop guard. A turn whose `current_turn_message`
             # stayed empty produced no fresh preview text. Counter resets on a
             # turn with real preview; crossing the threshold cancels the worker
@@ -4953,7 +8214,9 @@ class Orchestrator:
                     )
         if ev_name == EVENT_TURN_FAILED:
             reason = payload.get("reason") if isinstance(payload, dict) else None
-            stderr_tail = payload.get("stderr_tail") if isinstance(payload, dict) else None
+            stderr_tail = (
+                payload.get("stderr_tail") if isinstance(payload, dict) else None
+            )
             log.warning(
                 "agent_turn_failed",
                 issue_id=issue_id,
@@ -4962,28 +8225,64 @@ class Orchestrator:
                 reason=str(reason) if reason else "",
                 stderr_tail=stderr_tail if isinstance(stderr_tail, list) else None,
             )
+            self._append_run_event(
+                entry,
+                "turn_failed",
+                {
+                    "turn": entry.turn_count,
+                    "reason": reason,
+                    "stderr_lines": stderr_tail,
+                },
+            )
         if ev_name == EVENT_COMPACTION:
             phase = payload.get("phase") if isinstance(payload, dict) else None
+            compaction_reason = (
+                payload.get("reason") if isinstance(payload, dict) else None
+            )
+            tokens_before = (
+                payload.get("tokens_before") if isinstance(payload, dict) else None
+            )
             log.info(
                 "agent_compaction",
                 issue_id=issue_id,
                 identifier=entry.issue.identifier,
                 phase=str(phase) if phase else "",
-                reason=str(payload.get("reason") or "")
-                if isinstance(payload, dict) else "",
-                tokens_before=payload.get("tokens_before")
-                if isinstance(payload, dict) else None,
+                reason=str(compaction_reason or ""),
+                tokens_before=tokens_before,
+            )
+            self._append_run_event(
+                entry,
+                "compaction",
+                {
+                    "phase": phase,
+                    "reason": compaction_reason,
+                    "tokens_before": tokens_before,
+                },
             )
         if ev_name == EVENT_AGENT_RETRY:
             phase = payload.get("phase") if isinstance(payload, dict) else None
+            retry_attempt = payload.get("attempt") if isinstance(payload, dict) else None
+            retry_error = (
+                payload.get("error") or payload.get("final_error")
+                if isinstance(payload, dict)
+                else None
+            )
             log.info(
                 "agent_internal_retry",
                 issue_id=issue_id,
                 identifier=entry.issue.identifier,
                 phase=str(phase) if phase else "",
-                attempt=payload.get("attempt") if isinstance(payload, dict) else None,
-                error=str(payload.get("error") or payload.get("final_error") or "")
-                if isinstance(payload, dict) else "",
+                attempt=retry_attempt,
+                error=str(retry_error or ""),
+            )
+            self._append_run_event(
+                entry,
+                "retry",
+                {
+                    "phase": phase,
+                    "attempt": retry_attempt,
+                    "error": retry_error,
+                },
             )
 
         # Track recent events.
@@ -5064,6 +8363,47 @@ class Orchestrator:
             to_state=normalize_state(to_state),
         )
 
+    def _record_stats_gate(
+        self, identifier: str, state: str, kind: str, items: list[str] | tuple[str, ...] = ()
+    ) -> None:
+        """A gate decision (contract failure / reopen hold / backend fallback)."""
+        if self._stats is None:
+            return
+        self._stats.record_gate(
+            issue=identifier, state=normalize_state(state), kind=kind, items=items
+        )
+
+    def _board_health_wanted(self, state: str | None) -> bool:
+        """Cheap synchronous pre-check so non-Document lanes never pay a thread hop.
+
+        `_open_session` runs on the worker's first turn; an unconditional
+        `asyncio.to_thread` there changed the dispatch timing enough to
+        break the eager-task dispatch test, so only the write-back lane
+        crosses into a thread to aggregate `stats.jsonl`.
+        """
+        return self._stats is not None and normalize_state(state) in _BOARD_HEALTH_LANES
+
+    def _board_health_for_prompt(self, cfg: ServiceConfig, state: str | None) -> str:
+        """`{{ board_health }}` for the write-back lane; "" elsewhere.
+
+        Only the Document lane (and its legacy `learn` name) receives the
+        summary: it is the lane that turns repeat failures into wiki
+        lessons, and every other lane would just pay tokens for it.
+        """
+        stats = self._stats
+        if stats is None or not self._board_health_wanted(state):
+            return ""
+        try:
+            terminal = {s.lower() for s in cfg.tracker.terminal_states}
+            done_states = {"done"} if "done" in terminal else terminal
+            aggregate = stats.aggregate(
+                30, done_states, active_states=cfg.tracker.active_states
+            )
+            return board_health_summary(aggregate)
+        except Exception as exc:
+            log.warning("board_health_failed", error=str(exc))
+            return ""
+
     # ------------------------------------------------------------------
     # worker exit handling (§16.6)
     # ------------------------------------------------------------------
@@ -5083,12 +8423,28 @@ class Orchestrator:
         # that would otherwise prune the in-tick `_claimed` lock and re-dispatch
         # the still-active ticket. See docs/improvements/
         # dispatch-double-dispatch-race-2026-06-28.md.
+        owned_entry = self._running.get(issue_id)
         self._terminal_persist_pending.add(issue_id)
         try:
             await self._on_worker_exit_impl(
-                issue_id, reason, error, owning_task=owning_task
+                issue_id,
+                reason,
+                error,
+                owning_task=owning_task,
+                defer_lease_finish=True,
             )
         finally:
+            if (
+                owned_entry is not None
+                and owned_entry.workspace_cleanup_started
+                and not owned_entry.workspace_cleanup_finished.is_set()
+            ):
+                await owned_entry.workspace_cleanup_finished.wait()
+            if (
+                owned_entry is not None
+                and self._running.get(issue_id) is not owned_entry
+            ):
+                self._finish_run_lease(issue_id, owned_entry, reason, error)
             self._terminal_persist_pending.discard(issue_id)
 
     async def _on_worker_exit_impl(
@@ -5098,367 +8454,24 @@ class Orchestrator:
         error: str | None,
         *,
         owning_task: asyncio.Task[None] | None = None,
+        defer_lease_finish: bool = False,
     ) -> None:
-        # AF-01 — identity gate before the pop. `owning_task` is only passed
-        # by the two real callers (the worker's own `finally` and
-        # `_on_worker_task_done`); direct-call test sites and other internal
-        # callers omit it, which is treated as "no check" (pre-AF-01
-        # behavior) rather than "owned by nobody" — many existing tests
-        # exercise this method against entries with `worker_task=None`.
-        if owning_task is not None and (
-            self._running.get(issue_id) is None
-            or self._dispatch_state.entry_foreign_to(issue_id, owning_task)
-        ):
-            log.warning(
-                "worker_exit_stale_task",
-                issue_id=issue_id,
-                reason=reason,
-            )
-            return
-        # INFO-level entry marker — pairs with `worker_finally_entered`.
-        # If `worker_finally_entered` is in the log but this is missing,
-        # the outer finally's `await self._on_worker_exit(...)` was
-        # cancelled before the coroutine body started executing.
-        log.info(
-            "worker_exit_entered",
-            issue_id=issue_id,
-            reason=reason,
-            running_keys_before_pop=list(self._running.keys()),
+        return await worker_exit.handle_worker_exit(
+            self,
+            issue_id,
+            reason,
+            error,
+            owning_task=owning_task,
+            defer_lease_finish=defer_lease_finish,
         )
-        entry = self._running.pop(issue_id, None)
-        # G3 — clear any stale wait-age bonus once the worker exits. The
-        # next entry into `_claimed` (conflict, budget, etc.) will record
-        # a fresh release timestamp, so leaving the old one behind would
-        # falsely promote the ticket on its next candidate-list appearance.
-        self._claim_released_at.pop(issue_id, None)
-        # The wakeup event is per-worker — pop it so a fresh worker (if
-        # any) starts with a clean gate. `_paused_issue_ids` is per-issue
-        # and is intentionally preserved: it's what lets `_eligible`
-        # refuse to re-dispatch a ticket the operator chose to hold.
-        pause_event = self._pause_events.pop(issue_id, None)
-        if pause_event is not None and not pause_event.is_set():
-            # Unblock anything still awaiting the event so the worker's
-            # cancellation path can run to completion.
-            pause_event.set()
-        log.info(
-            "worker_exit_pop",
-            issue_id=issue_id,
-            reason=reason,
-            popped=entry is not None,
-            running_keys_after_pop=list(self._running.keys()),
-        )
-        if entry is None:
-            return
-        self._finish_run_lease(issue_id, entry, reason)
-        elapsed = (datetime.now(timezone.utc) - entry.started_at).total_seconds()
-        self._totals.seconds_running += elapsed
-        debug = self._issue_debug.setdefault(issue_id, _IssueDebug())
-        debug.last_workspace = entry.workspace_path
-        debug.last_error = error
-        debug.completed_turn_count += entry.turn_count
-        if self._stats is not None:
-            self._stats.record_run_end(
-                issue=entry.issue.identifier,
-                state=normalize_state(entry.issue.state),
-                agent=self._entry_agent_kind(entry),
-                outcome=reason,
-                turns=entry.turn_count,
-                seconds=elapsed,
-            )
-
-        if reason == "normal":
-            cfg = self._workflow_state.current()
-            self._persisted_retry_attempts.pop(issue_id, None)
-            self._clear_issue_flags(issue_id, retry_attempt=True)
-            if entry.hit_token_budget:
-                if cfg is not None:
-                    before_state = normalize_state(
-                        entry.state_at_turn_start or entry.issue.state
-                    )
-                    refreshed = await self._refresh_issue_state(cfg, issue_id)
-                    if refreshed is not None:
-                        entry.issue = refreshed
-                    after_state = normalize_state(entry.issue.state)
-                    if refreshed is not None and after_state != before_state:
-                        producing_raw = next(
-                            (
-                                state
-                                for state in cfg.tracker.active_states
-                                if normalize_state(state) == before_state
-                            ),
-                            entry.state_at_turn_start or before_state,
-                        )
-                        entry.issue, contract_passed = (
-                            await self._enforce_transition_contract(
-                                cfg=cfg,
-                                issue=entry.issue,
-                                issue_id=issue_id,
-                                producing_state=before_state,
-                                producing_state_raw=producing_raw,
-                                advanced_to=after_state,
-                                workspace_path=entry.workspace_path,
-                            )
-                        )
-                        if contract_passed:
-                            log.info(
-                                "token_budget_stage_advanced",
-                                issue_id=issue_id,
-                                issue_identifier=entry.issue.identifier,
-                                from_state=before_state,
-                                to_state=after_state,
-                            )
-                            after_state = normalize_state(entry.issue.state)
-                    if refreshed is None or after_state == before_state or not contract_passed:
-                        await self._persist_token_budget_stop(
-                            cfg=cfg,
-                            entry=entry,
-                            issue_id=issue_id,
-                            debug=debug,
-                        )
-                        return
-                else:
-                    self._mark_budget_exhausted(issue_id)
-                    self._claimed.add(issue_id)
-                    debug.last_error = (
-                        "max_total_tokens reached; workflow config unavailable"
-                    )
-                    return
-
-            if entry.hit_no_stage_change:
-                count = debug.state_turn_count
-                state_name = entry.issue.state or debug.state_turn_state
-                action = cfg.agent.no_stage_change_action if cfg is not None else "block"
-                if cfg is not None and action != "block":
-                    persisted = await self._persist_no_stage_change_handoff(
-                        cfg=cfg,
-                        entry=entry,
-                        issue_id=issue_id,
-                        target_state=action,
-                        turn_count=count,
-                        state_name=state_name,
-                    )
-                    if persisted:
-                        entry.issue = replace(entry.issue, state=action)
-                    debug.last_error = (
-                        f"no stage change after {count} turns in {state_name}; "
-                        f"moved to {action}"
-                    )
-                    return
-                self._claimed.add(issue_id)
-                target_state = (
-                    cfg.agent.budget_exhausted_state if cfg is not None else ""
-                )
-                if cfg is not None and target_state:
-                    state_turn_limit = self._max_state_turns_for_state(
-                        cfg, state_name
-                    )
-                    persisted = await self._persist_budget_exhausted_state(
-                        cfg=cfg,
-                        entry=entry,
-                        issue_id=issue_id,
-                        target_state=target_state,
-                        budget_kind="no_stage_change",
-                        state_turn_limit=state_turn_limit,
-                    )
-                    if persisted:
-                        entry.issue = replace(entry.issue, state=target_state)
-                pause_reason = (
-                    f"no stage change after {count} turns in {state_name} - "
-                    "operator action required"
-                )
-                debug.last_error = pause_reason
-                self._paused_issue_ids.add(issue_id)
-                self._pause_reasons[issue_id] = pause_reason
-                self._set_issue_flags(
-                    issue_id,
-                    paused=True,
-                    pause_reason=pause_reason,
-                )
-                return
-
-            max_total_turns = cfg.agent.max_total_turns if cfg is not None else 60
-            if debug.completed_turn_count >= max_total_turns:
-                self._mark_budget_exhausted(issue_id)
-                self._claimed.add(issue_id)
-                debug.last_error = (
-                    f"max_total_turns reached "
-                    f"({debug.completed_turn_count}/{max_total_turns})"
-                )
-                log.warning(
-                    "worker_total_turn_budget_exhausted",
-                    issue_id=issue_id,
-                    issue_identifier=entry.issue.identifier,
-                    total_turns=debug.completed_turn_count,
-                    max_total_turns=max_total_turns,
-                )
-                # Persistence: in-memory `_turn_budget_exhausted` clears on
-                # service restart, so without an explicit transition the
-                # same ticket runs again next boot. When the operator opted
-                # in via `agent.budget_exhausted_state`, write the new
-                # state through the tracker so the decision survives
-                # restart and reaches anyone reviewing the board.
-                target_state = (
-                    cfg.agent.budget_exhausted_state if cfg is not None else ""
-                )
-                if target_state and cfg is not None:
-                    await self._persist_budget_exhausted_state(
-                        cfg=cfg,
-                        entry=entry,
-                        issue_id=issue_id,
-                        target_state=target_state,
-                        budget_kind="turns",
-                    )
-                return
-            cleanup_started = entry.workspace_cleanup_started
-            if (
-                cfg is not None
-                and cfg.agent.auto_commit_on_done
-                and not cleanup_started
-            ):
-                # Snapshot whatever the agent left in the worktree, even if
-                # the ticket isn't strictly at Done. The worker stopped
-                # cleanly (`reason == "normal"`); any subsequent reconcile or
-                # operator cleanup would `git worktree remove --force` and
-                # discard uncommitted work otherwise. Lenient — failures only
-                # warn; a missed snapshot must not block the queue.
-                await commit_workspace_on_done(
-                    entry.workspace_path,
-                    identifier=entry.issue.identifier,
-                    title=entry.issue.title,
-                    exit_reason=reason,
-                    state=entry.issue.state,
-                )
-            # When the worker ran the ticket all the way to Done, the
-            # reconcile path that normally fires after_done/auto_merge/remove
-            # will *not* fire here: this entry was just popped from
-            # `_running` and `_reconcile_running` only iterates entries it
-            # finds there. Run the same terminal-state post-processing
-            # inline so a clean win produces the same artefacts as a
-            # reconcile-driven termination.
-            is_done = (entry.issue.state or "").strip().lower() == "done"
-            terminal_states = (
-                {normalize_state(s) for s in cfg.tracker.terminal_states}
-                if cfg is not None
-                else set()
-            )
-            is_terminal = normalize_state(entry.issue.state) in terminal_states
-            if cleanup_started:
-                pass
-            elif is_done and cfg is not None and self._workspace_manager is not None:
-                merge_ok = await self._auto_merge_done_gate_or_block(
-                    cfg,
-                    entry.issue,
-                    entry.workspace_path,
-                    debug_target=debug,
-                )
-                if merge_ok:
-                    await self._after_done_then_remove_per_policy(
-                        cfg,
-                        entry.workspace_path,
-                        identifier=entry.issue.identifier,
-                        title=entry.issue.title,
-                        debug_target=debug,
-                    )
-                    # C5 — count this Done and run wiki-sweep if the cadence
-                    # configured by `wiki.sweep_every_n` is up. Failures are
-                    # absorbed inside the helper so we never block the
-                    # Done transition on a wiki housekeeping nudge.
-                    self._maybe_run_wiki_sweep(
-                        cfg, identifier=entry.issue.identifier
-                    )
-                # Don't schedule a continuation — a Done ticket has nothing
-                # to continue. Skip straight to the worker_exit emit below.
-            elif not is_terminal and not entry.hit_max_turns:
-                self._schedule_retry(
-                    issue_id,
-                    identifier=entry.issue.identifier,
-                    attempt=1,
-                    delay_ms=CONTINUATION_RETRY_DELAY_MS,
-                    error=None,
-                    kind="continuation",
-                )
-            elif entry.hit_max_turns:
-                # `max_turns` exhausted without a terminal transition: stop
-                # auto-continuation and, when the workflow exposes a Blocked
-                # terminal state, persist that state so the web/TUI boards do
-                # not look idle while the ticket is actually operator-blocked.
-                self._claimed.add(issue_id)
-                attempt_cap = cfg.agent.max_turns if cfg is not None else 0
-                target_state = (
-                    _max_turns_exhausted_target_state(cfg) if cfg is not None else ""
-                )
-                persisted = False
-                if cfg is not None and target_state:
-                    persisted = await self._persist_budget_exhausted_state(
-                        cfg=cfg,
-                        entry=entry,
-                        issue_id=issue_id,
-                        target_state=target_state,
-                        budget_kind="max_turns",
-                    )
-                    if persisted:
-                        entry.issue = replace(entry.issue, state=target_state)
-                suffix = (
-                    f"; moved to {target_state}"
-                    if persisted
-                    else " — operator action required"
-                )
-                debug.last_error = f"max_turns reached ({attempt_cap}/attempt){suffix}"
-        else:
-            failure_reason = f"{reason}: {error}" if error else reason
-            cleaned_failure = _clean_board_error_message(failure_reason)
-            if _is_retryable_worker_error(
-                self._entry_agent_kind(entry), reason, error
-            ):
-                debug.last_error = cleaned_failure
-                log.warning(
-                    "worker_error_retry_scheduled",
-                    issue_id=issue_id,
-                    issue_identifier=entry.issue.identifier,
-                    reason=reason,
-                    error=error,
-                )
-            else:
-                pause_reason = _worker_error_pause_reason(reason, error)
-                debug.last_error = pause_reason
-                self._paused_issue_ids.add(issue_id)
-                self._pause_reasons[issue_id] = pause_reason
-                self._set_issue_flags(
-                    issue_id,
-                    paused=True,
-                    pause_reason=pause_reason,
-                )
-                log.warning(
-                    "worker_error_auto_paused",
-                    issue_id=issue_id,
-                    issue_identifier=entry.issue.identifier,
-                    reason=reason,
-                    error=error,
-                    pause_reason=pause_reason,
-                )
-            next_attempt = (entry.retry_attempt or 0) + 1
-            cfg = self._workflow_state.current()
-            cap = cfg.agent.max_retry_backoff_ms if cfg is not None else 300_000
-            delay_ms = min(RETRY_BASE_MS * (2 ** (next_attempt - 1)), cap)
-            self._schedule_retry(
-                issue_id,
-                identifier=entry.issue.identifier,
-                attempt=next_attempt,
-                delay_ms=delay_ms,
-                error=cleaned_failure,
-                kind="retry",
-            )
-        log.info(
-            "worker_exit",
-            issue_id=issue_id,
-            issue_identifier=entry.issue.identifier,
-            reason=reason,
-            error=error,
-        )
-        await self._notify_observers()
 
     def _force_eject_zombie(
-        self, issue_id: str, entry: RunningEntry, cfg: ServiceConfig
+        self,
+        issue_id: str,
+        entry: RunningEntry,
+        cfg: ServiceConfig,
+        *,
+        skip_kill: bool = False,
     ) -> None:
         """Forcibly free a worker slot when cancellation didn't propagate.
 
@@ -5472,14 +8485,28 @@ class Orchestrator:
         own `finally` and `_on_worker_exit_impl` both gate on task identity
         (`entry_foreign_to`) before touching `_running`, so a foreign exit
         skips the live replacement entry instead of ejecting it.
+
+        `skip_kill=True` marks that the caller already performed (and
+        logged) the process-group kill for this entry — used by the async
+        reconcile path, which runs the kill off the event loop via
+        `asyncio.to_thread` (M1) before dropping bookkeeping here.
         """
-        self._running.pop(issue_id, None)
+        removed_entry = self._running.pop(issue_id, None)
+        owned_transition = self._app_release_transition_locks.get(issue_id)
+        if (
+            removed_entry is entry
+            and owned_transition is not None
+            and owned_transition[0] is entry
+        ):
+            self._app_release_transition_locks.pop(issue_id, None)
         self._claimed.discard(issue_id)
         try:
             try:
                 agent_pgid = _normalize_agent_pid(entry.agent_pgid)
-                if agent_pgid is not None:
-                    killed = kill_process_group(agent_pgid)
+                if agent_pgid is not None and not skip_kill:
+                    killed = kill_process_group(
+                        agent_pgid, identity=self._agent_pid_identity(entry)
+                    )
                     log.warning(
                         "force_eject_killed_process_group",
                         issue_id=issue_id,
@@ -5503,6 +8530,7 @@ class Orchestrator:
                 attempt=next_attempt,
                 delay_ms=delay_ms,
                 error="force_ejected_zombie",
+                touched_files=frozenset(self._touched_files_for(entry.issue)),
             )
             debug = self._issue_debug.setdefault(issue_id, _IssueDebug())
             debug.last_workspace = entry.workspace_path
@@ -5521,25 +8549,36 @@ class Orchestrator:
         delay_ms: int,
         error: str | None,
         kind: str | None = None,
+        holds_slot: bool = True,
+        touched_files: frozenset[str] = frozenset(),
     ) -> None:
         if self._loop is None:
             return
-        # v0.6.7 — cap auto-retries scheduled after a failure (kind
-        # other than "continuation"). When the cap is set (>0) and we
-        # would otherwise schedule attempt N where N exceeds the cap,
-        # escalate the ticket to a terminal state instead so the
-        # operator gets a board-level signal rather than a silent
-        # retry storm. Continuations (turn-to-turn / stage-to-stage
-        # success rescheduling) are exempt — they aren't failure
-        # retries and reset the attempt counter to 1.
+        retry_kind = kind or ("continuation" if error is None else "retry")
+        if self._retry_cap_exceeded(issue_id, identifier, attempt, error, retry_kind):
+            return
+        self._install_retry(
+            issue_id=issue_id,
+            identifier=identifier,
+            attempt=attempt,
+            delay_ms=delay_ms,
+            error=error,
+            kind=retry_kind,
+            holds_slot=holds_slot,
+            touched_files=touched_files,
+        )
+
+    def _retry_cap_exceeded(
+        self,
+        issue_id: str,
+        identifier: str,
+        attempt: int,
+        error: str | None,
+        retry_kind: str,
+    ) -> bool:
         cfg = self._workflow_state.current()
         max_retries = cfg.agent.max_retries if cfg is not None else 0
-        retry_kind = kind or ("continuation" if error is None else "retry")
-        if (
-            max_retries > 0
-            and retry_kind != "continuation"
-            and attempt > max_retries
-        ):
+        if max_retries > 0 and retry_kind != "continuation" and attempt > max_retries:
             log.error(
                 "agent_retry_cap_exhausted",
                 issue_id=issue_id,
@@ -5564,7 +8603,22 @@ class Orchestrator:
             )
             self._persisted_retry_attempts.pop(issue_id, None)
             self._clear_issue_flags(issue_id, retry_attempt=True)
-            return
+            return True
+        return False
+
+    def _install_retry(
+        self,
+        *,
+        issue_id: str,
+        identifier: str,
+        attempt: int,
+        delay_ms: int,
+        error: str | None,
+        kind: str,
+        holds_slot: bool,
+        touched_files: frozenset[str] = frozenset(),
+    ) -> None:
+        assert self._loop is not None
         due = self._loop.time() + delay_ms / 1000.0
         handle = self._loop.call_later(
             delay_ms / 1000.0,
@@ -5582,13 +8636,15 @@ class Orchestrator:
                 due_at_ms=due * 1000.0,
                 timer_handle=handle,
                 error=error,
-                kind=kind or ("continuation" if error is None else "retry"),
+                kind=kind,
+                holds_slot=holds_slot,
+                touched_files=touched_files,
             ),
         )
         debug = self._issue_debug.setdefault(issue_id, _IssueDebug())
         debug.current_retry_attempt = attempt
-        debug.current_attempt_kind = self._retry[issue_id].kind
-        if self._retry[issue_id].kind == "continuation":
+        debug.current_attempt_kind = kind
+        if kind == "continuation":
             self._persisted_retry_attempts.pop(issue_id, None)
             self._clear_issue_flags(issue_id, retry_attempt=True)
         else:
@@ -5614,8 +8670,8 @@ class Orchestrator:
         """Move a ticket whose retry budget is exhausted to a terminal state.
 
         Surfaces a board-level ``## Escalation`` note and updates the
-        tracker state to ``Blocked`` (or whichever configured terminal
-        state mentions ``block``/``human``). The ticket no longer cycles
+        tracker state to ``Blocked``, then another block-named terminal,
+        then a human-named terminal if no failure lane exists. The ticket no longer cycles
         through ``_schedule_retry``; an operator inspecting the board
         sees both the state change and the explanatory comment.
 
@@ -5632,11 +8688,23 @@ class Orchestrator:
             self._retry.pop(issue_id, None)
             self._pending_escalations.pop(issue_id, None)
             return
-        target_state = ""
-        for terminal in cfg.tracker.terminal_states:
-            if "block" in terminal.lower() or "human" in terminal.lower():
-                target_state = terminal
+        target_state = next(
+            (
+                state for state in cfg.tracker.terminal_states
+                if normalize_state(state) == "blocked"
+            ),
+            "",
+        )
+        for keyword in ("block", "human"):
+            if target_state:
                 break
+            target_state = next(
+                (
+                    state for state in cfg.tracker.terminal_states
+                    if keyword in state.lower()
+                ),
+                "",
+            )
         if not target_state and cfg.tracker.terminal_states:
             target_state = cfg.tracker.terminal_states[0]
         if not target_state:
@@ -5725,88 +8793,130 @@ class Orchestrator:
         retry = self._retry.pop(issue_id, None)
         if retry is None:
             return
-        # Paused tickets re-park the retry on a fixed short hold without
-        # consuming a retry attempt. `resume_worker` cancels the timer
-        # and re-fires this coroutine, so unpause is immediate. Without
-        # this we'd reach `_eligible` → "not eligible at retry time" and
-        # silently burn through the backoff schedule.
         if issue_id in self._paused_issue_ids:
-            paused_error = (
-                self._pause_reasons.get(issue_id)
-                or retry.error
-                or "paused"
-            )
-            self._schedule_retry(
-                issue_id,
-                identifier=retry.identifier,
-                attempt=retry.attempt,
-                delay_ms=PAUSED_RETRY_HOLD_MS,
-                error=paused_error,
-                kind=retry.kind,
-            )
+            self._repark_paused_retry(retry)
             return
         cfg = self._workflow_state.current()
         if cfg is None:
-            self._claimed.discard(issue_id)
-            self._paused_issue_ids.discard(issue_id)
-            self._pause_reasons.pop(issue_id, None)
-            self._persisted_retry_attempts.pop(issue_id, None)
-            self._clear_issue_flags(issue_id, retry_attempt=True, paused=True)
+            self._release_retry_ownership(
+                retry, clear_pause=True, reason="workflow config unavailable"
+            )
             return
+        await self._process_retry(retry, cfg)
+
+    def _repark_paused_retry(self, retry: RetryEntry) -> None:
+        error = self._pause_reasons.get(retry.issue_id) or retry.error or "paused"
+        self._schedule_retry(
+            retry.issue_id,
+            identifier=retry.identifier,
+            attempt=retry.attempt,
+            delay_ms=PAUSED_RETRY_HOLD_MS,
+            error=error,
+            kind=retry.kind,
+            holds_slot=True,
+            touched_files=retry.touched_files,
+        )
+
+    async def _process_retry(self, retry: RetryEntry, cfg: ServiceConfig) -> None:
         try:
             candidates = await self._fetch_candidates(cfg)
         except Exception as exc:
-            self._schedule_retry(
-                issue_id,
+            self._repark_retry(
+                retry,
+                cfg,
                 identifier=retry.identifier,
-                attempt=retry.attempt + 1,
-                delay_ms=min(
-                    RETRY_BASE_MS * (2 ** retry.attempt), cfg.agent.max_retry_backoff_ms
-                ),
-                error=f"retry poll failed: {exc}",
+                reason=f"retry poll failed: {exc}",
+                holds_slot=retry.holds_slot,
             )
             return
-        match = next((i for i in candidates if i.id == issue_id), None)
+        match = next(
+            (issue for issue in candidates if issue.id == retry.issue_id), None
+        )
         if match is None:
-            self._claimed.discard(issue_id)
-            # Ticket left the orchestrator's view (terminal, archived,
-            # filtered out by workflow change); drop any pause flag so
-            # we don't leak it across the resurrection of the same id.
-            self._paused_issue_ids.discard(issue_id)
-            self._pause_reasons.pop(issue_id, None)
-            self._persisted_retry_attempts.pop(issue_id, None)
-            self._clear_issue_flags(issue_id, retry_attempt=True, paused=True)
-            log.info("retry_release", issue_id=issue_id, identifier=retry.identifier)
-            return
-        if not self._eligible(match, cfg, owning_retry=True):
-            self._schedule_retry(
-                issue_id,
-                identifier=match.identifier,
-                attempt=retry.attempt + 1,
-                delay_ms=min(
-                    RETRY_BASE_MS * (2 ** retry.attempt), cfg.agent.max_retry_backoff_ms
-                ),
-                error="not eligible at retry time",
+            self._release_retry_ownership(
+                retry, clear_pause=True, reason="issue left active tracker view"
             )
             return
-        if self._available_slots(cfg) == 0:
-            self._schedule_retry(
-                issue_id,
-                identifier=match.identifier,
-                attempt=retry.attempt + 1,
-                delay_ms=min(
-                    RETRY_BASE_MS * (2 ** retry.attempt), cfg.agent.max_retry_backoff_ms
-                ),
-                error="no available orchestrator slots",
-            )
+        decision = self._eligibility_decision(match, cfg, owning_retry=True)
+        if self._handle_retry_decision(retry, match, cfg, decision):
             return
         self._dispatch(match, cfg, attempt=retry.attempt, attempt_kind=retry.kind)
+
+    def _handle_retry_decision(
+        self,
+        retry: RetryEntry,
+        issue: Issue,
+        cfg: ServiceConfig,
+        decision: _EligibilityDecision,
+    ) -> bool:
+        if decision.disposition is _EligibilityDisposition.READY:
+            return False
+        if decision.disposition is _EligibilityDisposition.REJECT:
+            self._release_retry_ownership(
+                retry, clear_pause=False, reason=decision.reason
+            )
+            return True
+        self._repark_retry(
+            retry,
+            cfg,
+            identifier=issue.identifier,
+            reason=decision.reason,
+            holds_slot=decision.disposition is _EligibilityDisposition.WAIT_SLOT,
+        )
+        return True
+
+    def _repark_retry(
+        self,
+        retry: RetryEntry,
+        cfg: ServiceConfig,
+        *,
+        identifier: str,
+        reason: str,
+        holds_slot: bool,
+    ) -> None:
+        delay_ms = min(
+            RETRY_BASE_MS * (2**retry.attempt), cfg.agent.max_retry_backoff_ms
+        )
+        self._schedule_retry(
+            retry.issue_id,
+            identifier=identifier,
+            attempt=retry.attempt,
+            delay_ms=delay_ms,
+            error=_clean_board_error_message(reason)[:300],
+            kind=retry.kind,
+            holds_slot=holds_slot,
+            touched_files=retry.touched_files,
+        )
+
+    def _release_retry_ownership(
+        self, retry: RetryEntry, *, clear_pause: bool, reason: str
+    ) -> None:
+        issue_id = retry.issue_id
+        active_owner = (
+            issue_id in self._running
+            or issue_id in self._terminal_persist_pending
+            or issue_id in self._pending_escalations
+        )
+        if not active_owner:
+            self._claimed.discard(issue_id)
+        self._persisted_retry_attempts.pop(issue_id, None)
+        if clear_pause:
+            self._paused_issue_ids.discard(issue_id)
+            self._pause_reasons.pop(issue_id, None)
+        self._clear_issue_flags(issue_id, retry_attempt=True, paused=clear_pause)
+        log.info(
+            "retry_release",
+            issue_id=issue_id,
+            identifier=retry.identifier,
+            reason=reason,
+            active_owner=active_owner,
+        )
 
     # ------------------------------------------------------------------
     # reconciliation (§16.3)
     # ------------------------------------------------------------------
 
-    def _reconcile_stall_state(
+    async def _reconcile_stall_state(
         self,
         issue_id: str,
         entry: RunningEntry,
@@ -5825,7 +8935,37 @@ class Orchestrator:
                     identifier=entry.issue.identifier,
                     elapsed_since_cancel_s=round(since_cancel, 1),
                 )
-                self._force_eject_zombie(issue_id, entry, cfg)
+                # M1: win32 kill_process_group shells out to `taskkill /T`.
+                # This coroutine runs on the tick loop, so the kill must go
+                # through a worker thread before the (synchronous) eject
+                # bookkeeping drops the entry. A kill failure still lets
+                # the eject's finallies release the lease and schedule the
+                # retry, then surfaces to the per-issue reconcile guard —
+                # exactly the pre-M1 containment (AF-07).
+                agent_pgid = _normalize_agent_pid(entry.agent_pgid)
+                kill_failure: Exception | None = None
+                if agent_pgid is not None:
+                    try:
+                        killed = await asyncio.to_thread(
+                            kill_process_group,
+                            agent_pgid,
+                            identity=self._agent_pid_identity(entry),
+                        )
+                        log.warning(
+                            "force_eject_killed_process_group",
+                            issue_id=issue_id,
+                            identifier=entry.issue.identifier,
+                            agent_kind=self._entry_agent_kind(entry),
+                            pid=agent_pgid,
+                            killed=killed,
+                        )
+                    except Exception as exc:
+                        kill_failure = exc
+                self._force_eject_zombie(
+                    issue_id, entry, cfg, skip_kill=True
+                )
+                if kill_failure is not None:
+                    raise kill_failure
             return
         if self.is_paused(issue_id):
             return
@@ -5851,15 +8991,33 @@ class Orchestrator:
             entry.worker_task.cancel()
         entry.cancelled_at = now
 
+    def _stall_timeout_ms_for_entry(
+        self, cfg: ServiceConfig, entry: RunningEntry
+    ) -> int:
+        """Stall budget for one running worker.
+
+        F-02: `cfg.backend_timeouts()` keys off the *workflow default*
+        backend, so a ticket pinned (or stage-routed) to another backend was
+        cancelled on the wrong backend's clock — a claude worker configured
+        for 900 s died at codex's 300 s. Resolve per entry, then let
+        `agent.stall_timeout_ms_by_state` widen it for heavy lanes.
+        """
+        entry_cfg = _config_for_issue_agent(cfg, entry.issue)
+        kind = entry.agent_kind or entry_cfg.agent.kind
+        if kind != entry_cfg.agent.kind:
+            entry_cfg = replace(entry_cfg, agent=replace(entry_cfg.agent, kind=kind))
+        _, _, stall_timeout_ms = entry_cfg.backend_timeouts()
+        return cfg.agent.stall_timeout_ms_for_state(entry.issue.state, stall_timeout_ms)
+
     async def _reconcile_running(self, cfg: ServiceConfig) -> None:
         # Part A: isolate each heartbeat/stall/eject lifecycle.
-        _, _, stall_timeout_ms = cfg.backend_timeouts()
         now = datetime.now(timezone.utc)
         for issue_id, entry in list(self._running.items()):
             try:
                 self._heartbeat_run_lease(issue_id, entry)
+                stall_timeout_ms = self._stall_timeout_ms_for_entry(cfg, entry)
                 if stall_timeout_ms > 0:
-                    self._reconcile_stall_state(
+                    await self._reconcile_stall_state(
                         issue_id,
                         entry,
                         cfg,
@@ -5892,8 +9050,7 @@ class Orchestrator:
             if entry is None:
                 continue
             detail = (
-                "tracker state refresh omitted running issue "
-                f"{entry.issue.identifier}"
+                f"tracker state refresh omitted running issue {entry.issue.identifier}"
             )
             log.warning(
                 "reconciliation_running_issue_missing",
@@ -5959,6 +9116,119 @@ class Orchestrator:
     ) -> None:
         state = normalize_state(issue.state)
         if state in terminal:
+            prior_state = normalize_state(entry.issue.state)
+            refreshed_full = await self._refresh_issue_full(cfg, issue.id)
+            if refreshed_full is not None:
+                issue = refreshed_full
+                state = normalize_state(issue.state)
+            if (
+                not entry.known_app_release
+                and not entry.known_release_cycle_verifier
+                and not entry.known_app_release_finalizer
+                and _has_app_release_label(issue)
+            ):
+                entry.known_app_release = True
+                try:
+                    authority = self._prepare_release_dispatch(
+                        replace(issue, state=entry.issue.state or "Verify"),
+                        cfg,
+                    )
+                    if authority.gate is None:
+                        raise SymphonyError(
+                            "late app-release label did not create host authority"
+                        )
+                    entry.known_release_cycle_verifier = True
+                    entry.release_gate_finalizer = authority.gate.finalizer_identifier
+                    entry.release_gate_expected_contract_sha256 = (
+                        authority.gate.expected_contract_sha256
+                    )
+                    entry.release_gate_cycle_fingerprint = (
+                        authority.gate.cycle_fingerprint
+                    )
+                    entry.release_gate_generation = authority.gate.generation
+                    note = (
+                        "The app-release label was added after this run acquired "
+                        "an ordinary lease. Fresh host-bound verification is required."
+                    )
+                except Exception as exc:
+                    note = (
+                        "The app-release label was added after dispatch and release "
+                        f"authority could not be established: {exc}"
+                    )
+                entry.issue = await self._rewind_app_release_transition(
+                    cfg=cfg,
+                    issue=issue,
+                    producing_state=entry.issue.state or "Verify",
+                    note_body=note,
+                )
+                return
+            if entry.known_app_release_finalizer:
+                try:
+                    finalizer_gate = cast(
+                        ReleaseGate | None,
+                        self._release_registry_call(
+                            cfg,
+                            "read_finalizer_gate_during_reconcile",
+                            lambda registry: registry.get_release_gate(
+                                entry.release_gate_finalizer or issue.identifier
+                            ),
+                        ),
+                    )
+                    if finalizer_gate is None:
+                        raise SymphonyError(
+                            "application release finalizer authority disappeared",
+                            finalizer=issue.identifier,
+                        )
+                    issue, completion_token = (
+                        self._guard_release_finalizer_with_version(
+                            cfg=cfg,
+                            issue=issue,
+                            gate=finalizer_gate,
+                            rewind_state=(
+                                entry.release_finalizer_rewind_state
+                                or entry.issue.state
+                            ),
+                            expected_run_id=entry.run_id,
+                            require_run_authority=True,
+                        )
+                    )
+                    if _is_release_success_state(cfg, issue.state):
+                        finalizer_gate = self._mark_release_finalizer_completed(
+                            cfg=cfg,
+                            issue=issue,
+                            gate=finalizer_gate,
+                            completion_token=completion_token,
+                            rewind_state=(
+                                entry.release_finalizer_rewind_state
+                                or entry.issue.state
+                            ),
+                        )
+                except Exception as exc:
+                    entry.issue = await self._rewind_app_release_transition(
+                        cfg=cfg,
+                        issue=issue,
+                        producing_state=(
+                            entry.release_finalizer_rewind_state or entry.issue.state
+                        ),
+                        note_body=(
+                            "Final delivery was stopped during reconciliation "
+                            f"because the release approval is invalid: {exc}"
+                        ),
+                    )
+                    return
+            elif entry.known_app_release and prior_state == "verify":
+                issue, release_rewound = await self._enforce_app_release_transition(
+                    cfg=cfg,
+                    issue=issue,
+                    workspace_path=entry.workspace_path,
+                    producing_state=entry.issue.state or "Verify",
+                    known_app_release=True,
+                    running_entry=entry,
+                )
+                entry.issue = issue
+                state = normalize_state(issue.state)
+                if release_rewound or state not in terminal:
+                    return
             if entry.terminal_seen_at is None:
                 entry.terminal_seen_at = now
             entry.issue = Issue(
@@ -5992,8 +9262,7 @@ class Orchestrator:
             )
             terminal_age = (now - entry.terminal_seen_at).total_seconds()
             if terminal_age < recent_grace_s or (
-                last_progress_age is not None
-                and last_progress_age < recent_grace_s
+                last_progress_age is not None and last_progress_age < recent_grace_s
             ):
                 log.info(
                     "reconcile_skip_active_worker",
@@ -6001,9 +9270,7 @@ class Orchestrator:
                     identifier=issue.identifier,
                     state=issue.state,
                     last_event_age_s=(
-                        round(last_event_age, 1)
-                        if last_event_age is not None
-                        else None
+                        round(last_event_age, 1) if last_event_age is not None else None
                     ),
                     last_progress_age_s=(
                         round(last_progress_age, 1)
@@ -6013,43 +9280,18 @@ class Orchestrator:
                     terminal_age_s=round(terminal_age, 1),
                 )
                 return
-            profile = str(cfg.raw.get("contract_profile", "advanced")).strip().lower()
-            producing_state = normalize_state(entry.state_at_turn_start)
-            if (
-                profile == "factory"
-                and producing_state in {"build", "verify"}
-                and producing_state != state
-            ):
-                producing_state_raw = next(
-                    (
-                        candidate
-                        for candidate in cfg.tracker.active_states
-                        if normalize_state(candidate) == producing_state
-                    ),
-                    entry.state_at_turn_start,
-                )
-                checked_issue, contract_passed = await self._enforce_transition_contract(
-                    cfg=cfg,
-                    issue=issue,
-                    issue_id=issue.id,
-                    producing_state=producing_state,
-                    producing_state_raw=producing_state_raw,
-                    advanced_to=state,
-                    workspace_path=entry.workspace_path,
-                )
-                entry.issue = checked_issue
-                if not contract_passed:
-                    entry.terminal_seen_at = None
-                    return
+            if not await self._enforce_factory_exit_contract(cfg, entry):
+                entry.terminal_seen_at = None
+                return
+            issue = entry.issue
+            state = normalize_state(issue.state)
             log.info(
                 "reconcile_terminate_terminal",
                 issue_id=issue.id,
                 identifier=issue.identifier,
                 state=issue.state,
                 last_event_age_s=(
-                    round(last_event_age, 1)
-                    if last_event_age is not None
-                    else None
+                    round(last_event_age, 1) if last_event_age is not None else None
                 ),
                 last_progress_age_s=(
                     round(last_progress_age, 1)
@@ -6062,40 +9304,95 @@ class Orchestrator:
                 entry.worker_task.cancel()
             if self._workspace_manager is not None:
                 entry.workspace_cleanup_started = True
-                if cfg.agent.auto_commit_on_done:
-                    # Snapshot before remove — `git worktree remove
-                    # --force` would otherwise discard whatever the
-                    # agent left uncommitted in the worktree.
-                    await commit_workspace_on_done(
-                        entry.workspace_path,
-                        identifier=entry.issue.identifier,
-                        title=entry.issue.title,
-                        exit_reason="reconcile_terminate_terminal",
-                        state=issue.state,
+                try:
+                    release_evidence_only = (
+                        entry.known_app_release
+                        or entry.known_release_cycle_verifier
+                        or entry.known_app_release_finalizer
                     )
-                if (issue.state or "").strip().lower() == "done":
-                    merge_ok = await self._auto_merge_done_gate_or_block(
-                        cfg,
-                        issue,
-                        entry.workspace_path,
-                        debug_target=self._issue_debug.get(issue.id),
-                    )
-                    if merge_ok:
-                        await self._after_done_then_remove_per_policy(
-                            cfg,
+                    if cfg.agent.auto_commit_on_done:
+                        # Snapshot before remove — `git worktree remove
+                        # --force` would otherwise discard whatever the
+                        # agent left uncommitted in the worktree.
+                        await commit_workspace_on_done(
                             entry.workspace_path,
                             identifier=entry.issue.identifier,
                             title=entry.issue.title,
+                            exit_reason="reconcile_terminate_terminal",
+                            state=issue.state,
+                            extra_excludes=self._artifact_commit_excludes(cfg),
+                        )
+                    if release_evidence_only:
+                        if entry.known_app_release_finalizer:
+                            try:
+                                finalizer_gate = cast(
+                                    ReleaseGate | None,
+                                    self._release_registry_call(
+                                        cfg,
+                                        "reconcile_finalizer_pre_cleanup_gate",
+                                        lambda registry: registry.get_release_gate(
+                                            entry.release_gate_finalizer
+                                            or issue.identifier
+                                        ),
+                                    ),
+                                )
+                                if finalizer_gate is None:
+                                    raise SymphonyError(
+                                        "application release finalizer authority disappeared",
+                                        finalizer=issue.identifier,
+                                    )
+                                entry.issue = self._guard_release_finalizer(
+                                    cfg=cfg,
+                                    issue=issue,
+                                    gate=finalizer_gate,
+                                    rewind_state=(
+                                        entry.release_finalizer_rewind_state
+                                        or entry.issue.state
+                                    ),
+                                    expected_run_id=entry.run_id,
+                                    require_run_authority=True,
+                                )
+                            except Exception as exc:
+                                entry.issue = await self._rewind_app_release_transition(
+                                    cfg=cfg,
+                                    issue=issue,
+                                    producing_state=(
+                                        entry.release_finalizer_rewind_state
+                                        or entry.issue.state
+                                    ),
+                                    note_body=(
+                                        "Final delivery was stopped immediately before "
+                                        "reconciliation cleanup because the approval "
+                                        f"is invalid: {exc}"
+                                    ),
+                                )
+                                return
+                        await self._workspace_manager.remove(entry.workspace_path)
+                    elif (issue.state or "").strip().lower() == "done":
+                        merge_ok = await self._auto_merge_done_gate_or_block(
+                            cfg,
+                            issue,
+                            entry.workspace_path,
                             debug_target=self._issue_debug.get(issue.id),
                         )
-                        # C5 — see _on_worker_exit for the rationale.
-                        self._maybe_run_wiki_sweep(
-                            cfg, identifier=entry.issue.identifier
-                        )
-                else:
-                    # Non-Done terminal state (e.g. Cancelled, Blocked):
-                    # no after_done hook, just reap the workspace.
-                    await self._workspace_manager.remove(entry.workspace_path)
+                        if merge_ok:
+                            await self._after_done_then_remove_per_policy(
+                                cfg,
+                                entry.workspace_path,
+                                identifier=entry.issue.identifier,
+                                title=entry.issue.title,
+                                debug_target=self._issue_debug.get(issue.id),
+                            )
+                            # C5 — see _on_worker_exit for the rationale.
+                            await self._maybe_run_wiki_sweep(
+                                cfg, identifier=entry.issue.identifier
+                            )
+                    else:
+                        # Non-Done terminal state (e.g. Cancelled, Blocked):
+                        # no after_done hook, just reap the workspace.
+                        await self._workspace_manager.remove(entry.workspace_path)
+                finally:
+                    entry.workspace_cleanup_finished.set()
         elif state in active:
             entry.terminal_seen_at = None
             # Update in-memory issue snapshot.
@@ -6143,15 +9440,19 @@ class Orchestrator:
                 entry.worker_task.cancel()
             if self._workspace_manager is not None:
                 entry.workspace_cleanup_started = True
-                if cfg.agent.auto_commit_on_done:
-                    await commit_workspace_on_done(
-                        entry.workspace_path,
-                        identifier=entry.issue.identifier,
-                        title=entry.issue.title,
-                        exit_reason="reconcile_terminate_inactive",
-                        state=issue.state,
-                    )
-                await self._workspace_manager.remove(entry.workspace_path)
+                try:
+                    if cfg.agent.auto_commit_on_done:
+                        await commit_workspace_on_done(
+                            entry.workspace_path,
+                            identifier=entry.issue.identifier,
+                            title=entry.issue.title,
+                            exit_reason="reconcile_terminate_inactive",
+                            state=issue.state,
+                            extra_excludes=self._artifact_commit_excludes(cfg),
+                        )
+                    await self._workspace_manager.remove(entry.workspace_path)
+                finally:
+                    entry.workspace_cleanup_finished.set()
 
     # ------------------------------------------------------------------
     # tracker access
@@ -6172,62 +9473,358 @@ class Orchestrator:
         if debug is not None:
             debug.tracker_error = None
 
-    @staticmethod
-    def _tracker_call_candidates(cfg: ServiceConfig) -> list[Issue]:
-        client = build_tracker_client(cfg)
-        try:
-            return client.fetch_candidate_issues()
-        finally:
-            client.close()
+    def _shared_tracker_client(self, cfg: ServiceConfig) -> TrackerClient:
+        """Lazily built, per-lifetime tracker client for the poll bridges.
 
-    @staticmethod
-    def _tracker_call_states_by_ids(cfg: ServiceConfig, ids: list[str]) -> list[Issue]:
-        client = build_tracker_client(cfg)
-        try:
-            return client.fetch_issue_states_by_ids(ids)
-        finally:
-            client.close()
+        The `_tracker_call_*` helpers below used to open (and close) a
+        fresh client per call — for Jira/Linear that meant a new httpx
+        connection pool on every poll tick. One client is built on first
+        use and reused across calls; `stop()` closes it. It is rebuilt
+        when the live config object changes (hot reload swaps the
+        `ServiceConfig` instance). Once `stop()` starts closing the pool
+        (or has finished closing it) checkouts raise
+        `_TrackerClientUnavailable` instead of rebuilding — a rebuild
+        would race the close, leak a client past shutdown, or hand the
+        caller a pool that is about to be closed under it.
+        """
+        with self._tracker_client_lock:
+            if self._tracker_client_closing or self._tracker_client_closed:
+                raise _TrackerClientUnavailable(
+                    "tracker client is closed for this orchestrator lifetime"
+                )
+            client = self._tracker_client
+            if client is None or cfg is not self._tracker_client_cfg:
+                client = build_tracker_client(cfg)
+                self._tracker_client = client
+                self._tracker_client_cfg = cfg
+                self._tracker_client_closed = False
+            return client
 
-    @staticmethod
-    def _tracker_call_full_by_id(
-        cfg: ServiceConfig, issue_id: str
-    ) -> Issue | None:
+    def _invoke_shared_tracker_client(
+        self, cfg: ServiceConfig, op: Callable[[TrackerClient], _T]
+    ) -> _T:
+        """Run one tracker call on the shared client, closing-race safe.
+
+        A `stop()` racing this call on another thread can close the httpx
+        pool between checkout and use; httpx then raises a bare
+        `RuntimeError`. Convert it (logged once) into the retryable
+        `_TrackerClientUnavailable` so the `asyncio.to_thread` bridge
+        surfaces a clean failure the next tick can retry instead of an
+        opaque RuntimeError from a dying context.
+        """
+        try:
+            client = self._shared_tracker_client(cfg)
+        except _TrackerClientUnavailable:
+            self._log_tracker_close_race()
+            raise
+        try:
+            return op(client)
+        except _TrackerClientUnavailable:
+            raise
+        except Exception as exc:
+            if not _is_closed_client_runtime_error(exc):
+                raise
+            self._log_tracker_close_race()
+            raise _TrackerClientUnavailable(
+                "tracker client closed during call"
+            ) from exc
+
+    def _log_tracker_close_race(self) -> None:
+        if self._tracker_client_close_race_logged:
+            return
+        self._tracker_client_close_race_logged = True
+        log.warning(
+            "tracker_client_close_race",
+            detail=(
+                "shared tracker client closed while a bridge call was in "
+                "flight; failing this poll retryably"
+            ),
+        )
+
+    def _tracker_call_candidates(self, cfg: ServiceConfig) -> list[Issue]:
+        return self._invoke_shared_tracker_client(
+            cfg, lambda client: client.fetch_candidate_issues()
+        )
+
+    def _tracker_call_states_by_ids(self, cfg: ServiceConfig, ids: list[str]) -> list[Issue]:
+        return self._invoke_shared_tracker_client(
+            cfg, lambda client: client.fetch_issue_states_by_ids(ids)
+        )
+
+    def _tracker_call_full_by_id(self, cfg: ServiceConfig, issue_id: str) -> Issue | None:
         """Single-issue fetch with full body — used by contract validation."""
-        client = build_tracker_client(cfg)
-        try:
-            return client.fetch_issue_full_by_id(issue_id)
-        finally:
-            client.close()
+        return self._invoke_shared_tracker_client(
+            cfg, lambda client: client.fetch_issue_full_by_id(issue_id)
+        )
 
-    @staticmethod
-    def _tracker_call_terminal_issues(cfg: ServiceConfig) -> list[Issue]:
-        client = build_tracker_client(cfg)
-        try:
-            return client.fetch_issues_by_states(cfg.tracker.terminal_states)
-        finally:
-            client.close()
+    def _tracker_call_terminal_issues(self, cfg: ServiceConfig) -> list[Issue]:
+        return self._invoke_shared_tracker_client(
+            cfg,
+            lambda client: client.fetch_issues_by_states(
+                cfg.tracker.terminal_states
+            ),
+        )
 
-    @staticmethod
     def _tracker_call_record_agent_kind(
-        cfg: ServiceConfig, identifier: str, agent_kind: str
+        self, cfg: ServiceConfig, identifier: str, agent_kind: str
     ) -> None:
         """Best-effort: persist the resolved backend onto the ticket.
 
         Adapters that don't implement ``record_agent_kind`` (e.g. Linear,
-        where the field has no remote analogue) are silently skipped.
+        where the field has no remote analogue) are silently skipped, and
+        so is a call that races `stop()` closing the shared client.
         """
-        client = build_tracker_client(cfg)
+
+        def _record(client: TrackerClient) -> None:
+            record = getattr(client, "record_agent_kind", None)
+            if record is not None:
+                record(identifier, agent_kind)
+
         try:
+            self._invoke_shared_tracker_client(cfg, _record)
+        except _TrackerClientUnavailable:
+            return
+
+    def _pin_fallback_agent_kind(
+        self, cfg: ServiceConfig, identifier: str, agent_kind: str
+    ) -> bool:
+        """Replace the ticket's backend pin; False when the tracker cannot.
+
+        Only adapters with ``record_agent_kind`` (the file board) can carry
+        the pin, so a remote tracker keeps the pause-for-operator path.
+        """
+        pinned = False
+
+        def _record(client: TrackerClient) -> None:
+            nonlocal pinned
             record = getattr(client, "record_agent_kind", None)
             if record is None:
                 return
-            record(identifier, agent_kind)
-        finally:
-            client.close()
+            record(identifier, agent_kind, force=True)
+            pinned = True
+
+        try:
+            self._invoke_shared_tracker_client(cfg, _record)
+        except _TrackerClientUnavailable:
+            return False
+        except Exception as exc:
+            log.warning(
+                "backend_fallback_pin_failed",
+                identifier=identifier,
+                agent_kind=agent_kind,
+                error=str(exc),
+            )
+            return False
+        return pinned
+
+    def _next_fallback_agent_kind(
+        self, cfg: ServiceConfig, entry: RunningEntry, debug: _IssueDebug
+    ) -> str | None:
+        """First `agent.fallback_kinds` entry this ticket has not exhausted."""
+        current = self._entry_agent_kind(entry)
+        exhausted = set(debug.quota_exhausted_kinds) | {current}
+        for kind in cfg.agent.fallback_kinds:
+            if kind not in exhausted:
+                return kind
+        return None
+
+    def _tracker_call_record_last_agent_kind(
+        self, cfg: ServiceConfig, identifier: str, agent_kind: str
+    ) -> None:
+        """Best-effort: persist the audit-only `last_agent_kind` stamp.
+
+        Used instead of the pin on `stage_kinds`-routed boards, where writing
+        the pin would freeze the first lane's backend for the whole ticket.
+        Races with `stop()` closing the shared client are silently skipped.
+        """
+
+        def _record(client: TrackerClient) -> None:
+            record = getattr(client, "record_last_agent_kind", None)
+            if record is not None:
+                record(identifier, agent_kind)
+
+        try:
+            self._invoke_shared_tracker_client(cfg, _record)
+        except _TrackerClientUnavailable:
+            return
 
     # ------------------------------------------------------------------
     # startup cleanup (§8.6)
     # ------------------------------------------------------------------
+
+    async def _startup_release_terminal_guard(
+        self,
+        cfg: ServiceConfig,
+        issue: Issue,
+        *,
+        owned_cleanup_run_id: str | None = None,
+    ) -> tuple[Issue, bool, bool]:
+        """Reconcile terminal release authority even when no workspace remains.
+
+        Returns ``(issue, evidence_only, stopped)``. ``stopped`` means the
+        ticket was rewound or registry authority could not be proven, so
+        ordinary terminal cleanup must not continue.
+        """
+        if cfg.tracker.kind != "file":
+            return issue, False, False
+        try:
+            verifier_gate = cast(
+                ReleaseGate | None,
+                self._release_registry_call(
+                    cfg,
+                    "startup_read_verifier_gate",
+                    lambda registry: registry.get_release_gate_for_verifier(
+                        issue.identifier
+                    ),
+                ),
+            )
+            finalizer_gate = cast(
+                ReleaseGate | None,
+                self._release_registry_call(
+                    cfg,
+                    "startup_read_finalizer_gate",
+                    lambda registry: registry.get_release_gate(issue.identifier),
+                ),
+            )
+            evidence_identity = cast(
+                ReleaseEvidenceIdentity | None,
+                self._release_registry_call(
+                    cfg,
+                    "startup_read_release_evidence_identity",
+                    lambda registry: registry.get_release_evidence_identity(
+                        issue.identifier
+                    ),
+                ),
+            )
+        except SymphonyError as exc:
+            identity = resolve_target_release_identity(
+                repository_root=cfg.workflow_path.parent,
+                configured_target_branch=cfg.agent.auto_merge_target_branch,
+            )
+            if _is_release_evidence_issue(issue) or not identity.errors:
+                log.error(
+                    "startup_release_cleanup_refused",
+                    identifier=issue.identifier,
+                    error=str(exc),
+                )
+                return issue, True, True
+            return issue, False, False
+
+        evidence_only = (
+            verifier_gate is not None
+            or finalizer_gate is not None
+            or evidence_identity is not None
+            or _is_release_evidence_issue(issue)
+        )
+        if not evidence_only:
+            return issue, False, False
+        if owned_cleanup_run_id is not None:
+            owns_cleanup = bool(
+                self._release_registry_call(
+                    cfg,
+                    "startup_heartbeat_release_cleanup",
+                    lambda registry: registry.heartbeat(
+                        issue_id=issue.id,
+                        run_id=owned_cleanup_run_id,
+                    ),
+                )
+            )
+            peer_active = not owns_cleanup
+        else:
+            peer_active = bool(
+                self._release_registry_call(
+                    cfg,
+                    "startup_check_release_issue_lease",
+                    lambda registry: registry.has_active_lease(issue.id),
+                )
+            )
+        if peer_active:
+            log.info(
+                "startup_release_cleanup_skipped_live_peer",
+                identifier=issue.identifier,
+            )
+            return issue, True, True
+        finalizer_rewind_state = next(
+            (
+                state
+                for state in reversed(cfg.tracker.active_states)
+                if normalize_state(state) != "verify"
+            ),
+            _release_verifier_state(cfg),
+        )
+        if finalizer_gate is not None:
+            try:
+                guarded = self._guard_release_finalizer(
+                    cfg=cfg,
+                    issue=issue,
+                    gate=finalizer_gate,
+                    rewind_state=finalizer_rewind_state,
+                    allow_active_run=False,
+                    require_run_authority=True,
+                )
+            except SymphonyError as exc:
+                rewound = await self._rewind_app_release_transition(
+                    cfg=cfg,
+                    issue=issue,
+                    producing_state=finalizer_rewind_state,
+                    note_body=(
+                        "Startup stopped final delivery because the release "
+                        f"approval is invalid: {exc}"
+                    ),
+                )
+                return rewound, True, True
+            return guarded, True, False
+        if _is_release_finalizer(issue):
+            rewound = await self._rewind_app_release_transition(
+                cfg=cfg,
+                issue=issue,
+                producing_state=finalizer_rewind_state,
+                note_body=(
+                    "Startup found a terminal release finalizer without "
+                    "host-owned approval."
+                ),
+            )
+            return rewound, True, True
+        if verifier_gate is not None:
+            if verifier_gate.status == "approved" and _is_release_success_state(
+                cfg, issue.state
+            ):
+                return issue, True, False
+            rewound = await self._rewind_app_release_transition(
+                cfg=cfg,
+                issue=issue,
+                producing_state=_release_verifier_state(cfg),
+                note_body=(
+                    "Startup found a terminal release verifier without a "
+                    "durable GREEN approval in an explicit success state."
+                ),
+            )
+            return rewound, True, True
+        if evidence_identity is not None and evidence_identity.retired:
+            return issue, True, False
+        if evidence_identity is not None:
+            rewound = await self._rewind_app_release_transition(
+                cfg=cfg,
+                issue=issue,
+                producing_state=_release_verifier_state(cfg),
+                note_body=(
+                    "Startup found current release evidence whose host-owned "
+                    "gate is missing."
+                ),
+            )
+            return rewound, True, True
+        if _has_app_release_label(issue):
+            rewound = await self._rewind_app_release_transition(
+                cfg=cfg,
+                issue=issue,
+                producing_state=_release_verifier_state(cfg),
+                note_body=(
+                    "Startup found terminal app-release evidence without "
+                    "host-owned authority."
+                ),
+            )
+            return rewound, True, True
+        return issue, True, False
 
     async def _startup_terminal_cleanup(self, cfg: ServiceConfig) -> None:
         try:
@@ -6238,11 +9835,83 @@ class Orchestrator:
         if self._workspace_manager is None:
             return
         for issue in terminals:
+            (
+                issue,
+                release_evidence_only,
+                release_stopped,
+            ) = await self._startup_release_terminal_guard(cfg, issue)
+            if release_stopped:
+                continue
             path = self._workspace_manager.path_for(issue.identifier)
             if path.exists():
-                is_done = (issue.state or "").strip().lower() == "done"
-                if is_done:
-                    branch = f"symphony/{issue.identifier}"
+                if release_evidence_only:
+                    cleanup_acquisition = self._try_acquire_run_lease(
+                        cfg=cfg,
+                        issue=issue,
+                        workspace_path=path,
+                        attempt=None,
+                        attempt_kind="startup-release-evidence-cleanup",
+                        agent_kind=cfg.agent.kind_for_state(
+                            issue.state, _requested_agent_kind(issue)
+                        ),
+                        release_required=True,
+                    )
+                    if cleanup_acquisition is None:
+                        log.info(
+                            "startup_release_cleanup_claim_refused",
+                            identifier=issue.identifier,
+                        )
+                        continue
+                    claimed_run_id = cleanup_acquisition.run_id
+                    try:
+                        (
+                            issue,
+                            _evidence_only,
+                            release_stopped,
+                        ) = await self._startup_release_terminal_guard(
+                            cfg,
+                            issue,
+                            owned_cleanup_run_id=claimed_run_id,
+                        )
+                        if release_stopped:
+                            continue
+                        if cfg.agent.auto_commit_on_done:
+                            await commit_workspace_on_done(
+                                path,
+                                identifier=issue.identifier,
+                                title=issue.title,
+                                exit_reason="startup_release_evidence_cleanup",
+                                state=issue.state,
+                            )
+                        await self._workspace_manager.remove(path)
+                    finally:
+                        try:
+                            self._release_registry_call(
+                                cfg,
+                                "finish_startup_release_cleanup",
+                                lambda registry: registry.complete_run(
+                                    issue_id=issue.id,
+                                    run_id=claimed_run_id,
+                                    status="startup_release_cleanup",
+                                ),
+                            )
+                        except SymphonyError as exc:
+                            log.error(
+                                "startup_release_cleanup_finish_failed",
+                                identifier=issue.identifier,
+                                error=str(exc),
+                            )
+                    continue
+                state = (issue.state or "").strip().lower()
+                if state in {"blocked", "human review"}:
+                    log.warning(
+                        f"startup_terminal_cleanup_preserved_{state.replace(' ', '_')}_workspace",
+                        identifier=issue.identifier,
+                        path=str(path),
+                    )
+                    continue
+                if state == "done":
+                    branch = f"{SYMPHONY_BRANCH_PREFIX}{issue.identifier}"
                     already_merged = False
                     if cfg.agent.auto_merge_on_done:
                         already_merged = await _branch_already_merged_into_target(

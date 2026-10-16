@@ -10,11 +10,18 @@
 # Env vars consumed (Symphony injects these before invoking the hook):
 #   SYMPHONY_WORKFLOW_DIR        Path to the host repo containing WORKFLOW.md.
 #   SYMPHONY_FEATURE_BASE_BRANCH Optional override for the new branch's start point.
-#   SYMPHONY_MERGE_TARGET_BRANCH Optional override for the Learn-gate merge target.
+#   SYMPHONY_MERGE_TARGET_BRANCH Optional override for the Document-gate merge target.
+#   SYMPHONY_BOARD_ROOT_NAME     Board root relative to SYMPHONY_WORKFLOW_DIR
+#                                (e.g. `kanban`, `board`). Defaults to `kanban`
+#                                for hand-written configs that predate it. A
+#                                board that is not linked here leaves the worker
+#                                writing a private board copy the orchestrator
+#                                never sees.
 set -euo pipefail
 ISSUE_ID="$(basename "$PWD")"
 HOST_REPO="${SYMPHONY_WORKFLOW_DIR:?SYMPHONY_WORKFLOW_DIR not set}"
 WORKTREE_PATH="$PWD"
+# Prefix mirrors SYMPHONY_BRANCH_PREFIX in src/symphony/workflow/constants.py.
 BRANCH="symphony/${ISSUE_ID}"
 # Symphony pre-creates the workspace dir; git worktree add refuses to
 # populate an existing path, so drop the empty dir first.
@@ -99,8 +106,57 @@ trap _symphony_release_worktree_lock EXIT
 _symphony_acquire_worktree_lock
 git worktree remove --force "$WORKTREE_PATH" 2>/dev/null || true
 git worktree prune 2>/dev/null || true
+
+# A prior worktree may have been reaped after its branch was merged into the
+# configured target. Reusing that old tip is unsafe: the next after_run hook
+# can amend it into a new parallel history, and the eventual merge sees an
+# evidence-only conflict. Refresh only the feature ref when it is already
+# contained by the target. `git update-ref`'s expected-old argument makes this
+# a compare-and-swap, so a concurrent writer cannot silently overwrite work.
+_symphony_refresh_merged_branch() {
+  local branch_sha target_sha target_ref attempt branch_after
+  # A configured merge target is a local branch name, never a tag, SHA, or
+  # revision expression. Resolve only refs/heads/<name> so a tag with the
+  # same spelling cannot silently drive a branch refresh.
+  case "$MERGE_TARGET_BRANCH" in
+    ""|refs/*) return 0 ;;
+  esac
+  git check-ref-format --branch "$MERGE_TARGET_BRANCH" >/dev/null 2>&1 || return 0
+  target_ref="refs/heads/$MERGE_TARGET_BRANCH"
+  # Keep the host-side ref update bounded. The lock serializes Symphony's own
+  # setup hooks and the expected-old CAS protects against an external branch
+  # writer. A target branch may advance after its SHA is captured; the
+  # reopened ticket remains at that immutable captured ancestor and the later
+  # delivery gate evaluates the new target tip.
+  for attempt in 1 2 3; do
+    branch_sha="$(git rev-parse --verify --quiet "refs/heads/$BRANCH^{commit}" 2>/dev/null || true)"
+    target_sha="$(git rev-parse --verify --quiet "${target_ref}^{commit}" 2>/dev/null || true)"
+    [ -n "$branch_sha" ] || return 0
+    [ -n "$target_sha" ] || return 0
+    [ "$branch_sha" = "$target_sha" ] && return 0
+    if ! git merge-base --is-ancestor "$branch_sha" "$target_sha" 2>/dev/null; then
+      return 0
+    fi
+    if ! git update-ref --no-deref "refs/heads/$BRANCH" "$target_sha" "$branch_sha"; then
+      if [ "$attempt" -lt 3 ]; then
+        continue
+      fi
+      echo "after_create: failed to refresh already-merged branch $BRANCH; ref changed concurrently" >&2
+      exit 1
+    fi
+    branch_after="$(git rev-parse --verify --quiet "refs/heads/$BRANCH^{commit}" 2>/dev/null || true)"
+    if [ "$branch_after" != "$target_sha" ]; then
+      echo "after_create: feature branch changed during refresh; refusing to attach $BRANCH" >&2
+      exit 1
+    fi
+    echo "after_create: refreshing already-merged branch $BRANCH $branch_sha -> $target_sha (target $MERGE_TARGET_BRANCH)"
+    return 0
+  done
+}
+
+_symphony_refresh_merged_branch
 # Reuse the branch if a prior worktree was reaped without prune.
-if git rev-parse --verify "$BRANCH" >/dev/null 2>&1; then
+if git show-ref --verify --quiet "refs/heads/$BRANCH"; then
   git worktree add "$WORKTREE_PATH" "$BRANCH"
 elif [ -n "$FEATURE_BASE_BRANCH" ]; then
   git worktree add "$WORKTREE_PATH" -b "$BRANCH" "$FEATURE_BASE_BRANCH"
@@ -117,7 +173,9 @@ git config extensions.worktreeConfig true
 git config --worktree symphony.basesha "$(git rev-parse HEAD)"
 git config --worktree symphony.basebranch "${FEATURE_BASE_BRANCH:-${BASE_BRANCH:-}}"
 git config --worktree symphony.mergetargetbranch "${MERGE_TARGET_BRANCH:-}"
-_symphony_release_worktree_lock
+# Keep the Git-admin lock through host-index updates below. Concurrent ticket
+# creation otherwise races on the host index and can leave tracked board files
+# visible as dirty even though they are live orchestration state.
 # Link shared board directories back to host so agent state changes are
 # visible to Symphony's file tracker (which reads host board_root).
 #
@@ -148,12 +206,20 @@ _symphony_link_dir() {
     ln -s "$source" "$target"
   fi
 }
-for dir in kanban; do
+for dir in ${SYMPHONY_BOARD_ROOT_NAME:-kanban}; do
   [ -e "$HOST_REPO/$dir" ] || continue
   tracked_file="$(git rev-parse --git-path "symphony-${dir}-tracked")"
   git ls-files -z -- "$dir" > "$tracked_file" || true
   if [ -s "$tracked_file" ]; then
     xargs -0 git update-index --skip-worktree -- < "$tracked_file" || true
+  fi
+  # The symlink writes this ticket card into the host checkout, whose main
+  # worktree has a separate index. Hide only the active card while its workspace
+  # exists; before_remove clears the bit so normal host review is restored.
+  # The shared info/exclude entry below already hides new operational cards.
+  git -C "$HOST_REPO" ls-files -z -- "$dir/$ISSUE_ID.md" > "$tracked_file" || true
+  if [ -s "$tracked_file" ]; then
+    xargs -0 git -C "$HOST_REPO" update-index --skip-worktree -- < "$tracked_file" || true
   fi
   rm -f "$tracked_file"
   exclude_file="$(git rev-parse --git-path info/exclude)"
@@ -161,6 +227,7 @@ for dir in kanban; do
   grep -qxF "$dir" "$exclude_file" 2>/dev/null || echo "$dir" >> "$exclude_file"
   _symphony_link_dir "$dir" "$HOST_REPO/$dir"
 done
+_symphony_release_worktree_lock
 # Pick the first available Python interpreter that satisfies pyproject first.
 # The package currently requires >=3.12; keep 3.11 only as a last fallback so
 # older clones fail in pip with a clear reason instead of skipping venv setup.

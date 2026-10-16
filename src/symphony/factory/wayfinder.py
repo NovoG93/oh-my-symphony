@@ -21,6 +21,10 @@ _KIND_OVERLAYS = {
 }
 _KEY_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
 _SKILL_RE = re.compile(r"^[a-z0-9][a-z0-9._-]*$")
+_CRITERION_ITEM_RE = re.compile(
+    r"^\s*(?:[-+*]|\d+[.)])\s+(?:\[[ xX]\]\s+)?(?P<text>\S(?:.*\S)?)\s*$"
+)
+_INLINE_CODE_SPAN_RE = re.compile(r"`([^`]+)`")
 
 
 @dataclass(frozen=True)
@@ -58,6 +62,10 @@ def parse_wayfinder_ticket(path: Path) -> WayfinderTicket:
     for alternatives, label in required_sections:
         if not any(name in headings for name in alternatives):
             raise ValueError(f"{path}: missing {label}")
+    if not factory_acceptance_items(body):
+        raise ValueError(f"{path}: Acceptance criteria must contain a nonempty list item")
+    if not factory_proof_commands(body):
+        raise ValueError(f"{path}: Proof commands must declare an exact command in inline code")
     blockers = _string_list(front.get("blocked_by"), "blocked_by", path)
     invalid_blockers = [item for item in blockers if not _KEY_RE.fullmatch(item)]
     if invalid_blockers:
@@ -122,3 +130,46 @@ def _string_list(value: object, key: str, path: Path) -> tuple[str, ...]:
     if not isinstance(value, list) or any(not isinstance(item, str) for item in value):
         raise ValueError(f"{path}: {key} must be a YAML string list")
     return tuple(dict.fromkeys(item.strip() for item in value if item.strip()))
+
+
+def _section_text(body: str, heading: str) -> str:
+    match = re.search(
+        r"^##\s+" + re.escape(heading[3:].strip()) + r"\s*:?\s*$",
+        body, re.IGNORECASE | re.MULTILINE,
+    )
+    if match is None:
+        return ""
+    after = body[match.end():]
+    next_heading = re.search(r"^##\s+\S", after, re.MULTILINE)
+    return after if next_heading is None else after[:next_heading.start()]
+
+
+def factory_proof_commands(body: str) -> list[str]:
+    """Read literal commands without changing shell-sensitive casing or spacing."""
+    section = _section_text(body, "## Proof commands") or _section_text(body, "## Proof")
+    return [
+        command for match in _INLINE_CODE_SPAN_RE.finditer(section)
+        if (command := match.group(1).strip())
+    ]
+
+
+def factory_acceptance_items(body: str, heading: str = "## Acceptance criteria") -> list[str]:
+    """Read nonempty list items, including their indented continuation lines."""
+    items: list[str] = []
+    current: list[str] = []
+    for line in _section_text(body, heading).splitlines():
+        match = _CRITERION_ITEM_RE.match(line)
+        if match:
+            if current:
+                items.append(" ".join(current))
+            text = match.group("text").strip()
+            current = [] if re.fullmatch(r"\[[ xX]\]", text) else [text]
+        elif current and line[:1].isspace() and line.strip():
+            current.append(line.strip())
+        else:
+            if current:
+                items.append(" ".join(current))
+            current = []
+    if current:
+        items.append(" ".join(current))
+    return items

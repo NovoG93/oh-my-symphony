@@ -44,3 +44,12 @@ authoritative license texts available during this audit. This is not legal appro
 Before a public release, a maintainer should obtain legal review,
 independently verify unversioned lineage statements and confirm whether any additional NOTICE or
 attribution material is required.
+
+## Local runtime adaptations
+
+The SuperQA source commit remains pinned as recorded above. Symphony locally
+splits argparse statements, replaces assigned lambdas with named functions,
+types report effect lists, replaces the pixel-threshold callback with an
+equivalent lookup table, and removes an unused scheduler import to satisfy
+repository lint and type checks. These behavior-preserving changes are listed
+by path in `MANIFEST.json`; all upstream licenses and runtime assets remain.

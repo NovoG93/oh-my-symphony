@@ -21,10 +21,10 @@ import asyncio
 import json
 import os
 import shlex
-import time
 from pathlib import Path
 from typing import Any, Sequence
 
+from .. import __version__
 from .._shell import resolve_bash, terminate_process_tree
 from ..errors import (
     CodexNotFound,
@@ -36,6 +36,7 @@ from ..errors import (
     TurnTimeout,
 )
 from ..logging import get_logger
+from ..utils.git_sandbox import git_roots_env, git_roots_outside
 from ..workspace import validate_agent_cwd
 from . import (
     EVENT_APPROVAL_AUTO_APPROVED,
@@ -54,19 +55,20 @@ from . import (
     BaseAgentBackend,
     ToolDescriptor,
     TurnResult,
+    _is_valid_session_id,
 )
 from .approval_policy import dangerous_command_reason
+from .per_turn import MAX_LINE_BYTES, _emit_event
 
 
 log = get_logger()
-
-MAX_LINE_BYTES = 10 * 1024 * 1024  # upstream §10.1 — 10 MB
 
 # Codex app-server protocol (v2 of `codex app-server`, codex-cli ≥ 0.39).
 # Older releases used `v2/initialize`, `v2/threads.start`, `v2/threads.runTurn`
 # — see commit history if you need to support a legacy app-server.
 METHOD_INITIALIZE = "initialize"
 METHOD_THREAD_START = "thread/start"
+METHOD_THREAD_RESUME = "thread/resume"
 METHOD_TURN_START = "turn/start"
 METHOD_THREAD_ARCHIVE = "thread/archive"
 # `thread/approveGuardianDeniedAction` is the rough equivalent of the legacy
@@ -77,16 +79,13 @@ METHOD_APPROVAL_RESPOND = "thread/approveGuardianDeniedAction"
 NOTIF_TURN_COMPLETED = "turn/completed"
 NOTIF_TURN_STARTED = "turn/started"
 NOTIF_ITEM_COMPLETED = "item/completed"
+NOTIF_AGENT_MESSAGE_DELTA = "item/agentMessage/delta"
 NOTIF_THREAD_TOKEN_USAGE = "thread/tokenUsage/updated"
 NOTIF_RATE_LIMITS = "account/rateLimits/updated"
 
 # Last-message preview is rendered in the dashboard / passed back as
 # `TurnResult.last_message`. 1000 chars matches what the legacy backend used.
 _ASSISTANT_MESSAGE_PREVIEW_CAP = 1000
-
-
-def _utc_iso() -> str:
-    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
 
 
 # v2 turn/start `sandboxPolicy` is a tagged enum object, not a kebab-case
@@ -158,15 +157,20 @@ def _scan_workspace_symlinks(*roots: Path) -> list[str]:
        silently fail and the worker burns turns repeating "쓰기 불가".
 
     2. ``after_create`` attaches the workspace as a git worktree of the host
-       repo (the default Symphony hook), which stores the worktree's
-       admin state in ``<host_repo>/.git/worktrees/<ID>/``. The worktree's
-       ``.git`` file is a one-liner pointer (``gitdir: <abspath>``), not a
-       directory. Every ``git`` invocation inside the worktree writes
-       ``index.lock``, ``HEAD.lock``, etc. under that admin dir, and the
-       merge-gate's ``git merge-tree`` writes objects to it too. Without
-       the gitdir in ``writable_roots`` the merge gate dies with
-       ``unable to create temporary file: Operation not permitted`` and
-       Symphony surfaces the worker as ``Blocked``.
+       repo (the default Symphony hook), which splits git's writable state
+       across *two* directories outside the workspace: the per-worktree
+       admin dir ``<host_repo>/.git/worktrees/<ID>/`` (index and ref locks)
+       and the shared common dir ``<host_repo>/.git/`` that owns
+       ``objects/``. Granting only the admin dir covers the index lock but
+       not the blob write, which fails with ``unable to create temporary
+       file: Operation not permitted`` / ``failed to insert into database``
+       on any sandbox that does not grant the common dir itself.
+
+       Measured 2026-08-06: codex 0.146.0 grants a linked worktree's git
+       dirs on its own, so this injection is belt-and-braces there — it
+       closes the gap for versions and configurations that do not.
+       ``writable_git_roots`` returns both directories; see
+       ``utils.git_sandbox``.
 
     The scan returns resolved targets that the backend passes to codex as
     ``sandbox_workspace_write.writable_roots``, preserving the safer
@@ -191,22 +195,14 @@ def _scan_workspace_symlinks(*roots: Path) -> list[str]:
             except OSError:
                 continue
             seen.add(str(target))
-        # Git-worktree pointer file. Resolving the gitdir target by reading
-        # `.git` is safe: the file is plain text owned by the same user that
-        # ran `git worktree add`, and the worst case is a missing/garbled
-        # pointer (treated as "no extra writable root").
-        git_file = root / ".git"
-        try:
-            if git_file.is_file():
-                content = git_file.read_text(encoding="utf-8", errors="replace")
-                for line in content.splitlines():
-                    if line.startswith("gitdir:"):
-                        target = line[len("gitdir:"):].strip()
-                        if target:
-                            seen.add(target)
-                        break
-        except OSError:
-            pass
+    # Git admin dirs: the per-worktree gitdir *and* the common dir that owns
+    # the object database. Both are needed for `git add`/`commit` and for the
+    # merge gate's `git merge-tree --write-tree`. Computed once against the
+    # first root (the agent cwd, the only directory codex already grants) so
+    # a git dir that happens to sit under the workspace *root* is still
+    # granted explicitly. A plain repo workspace adds nothing here.
+    if roots:
+        seen.update(git_roots_outside(*roots))
     return sorted(seen)
 
 
@@ -266,7 +262,9 @@ class CodexAppServerBackend(BaseAgentBackend):
         self._codex = codex
         self._cwd = init.cwd
         self._workspace_root = init.workspace_root
+        self._extra_env = dict(init.env)
         self._on_event = init.on_event
+        self._on_process_started = init.on_process_started
         self._client_tools = init.client_tools
         self._approval_policy = codex.approval_policy
         self._sandbox_policy = codex.turn_sandbox_policy
@@ -315,6 +313,8 @@ class CodexAppServerBackend(BaseAgentBackend):
             )
         except FileNotFoundError as exc:
             raise CodexNotFound("bash not available", error=str(exc)) from exc
+        if self._on_process_started is not None:
+            self._on_process_started(self._process.pid)
         if self._process.stdout is None or self._process.stdin is None:
             raise CodexNotFound("subprocess pipes not available")
         self._reader_task = asyncio.create_task(self._stdout_reader())
@@ -336,6 +336,10 @@ class CodexAppServerBackend(BaseAgentBackend):
         No-op when sandbox is not workspace-write or no symlinks exist.
         """
         env = os.environ.copy()
+        # Backend-neutral grant, exported by every Symphony backend so any
+        # wrapper script can widen its own sandbox the same way.
+        env.update(git_roots_env(self._cwd, self._workspace_root))
+        env.update(self._extra_env)
         command = self._codex.command
         if not _sandbox_uses_workspace_write(self._thread_sandbox, self._sandbox_policy):
             self._writable_roots = []
@@ -371,9 +375,10 @@ class CodexAppServerBackend(BaseAgentBackend):
         # v2 has no `thread/stop` — `thread/archive` exists but only
         # finalizes server-side bookkeeping. Symphony already terminates
         # the subprocess below, which is sufficient for cleanup.
-        if self._process is not None:
-            if self._process.returncode is None:
-                await terminate_process_tree(self._process)
+        cleanup_unconfirmed = False
+        if self._process is not None and self._process.returncode is None:
+            result = await terminate_process_tree(self._process)
+            cleanup_unconfirmed = result is None and self._process.returncode is None
         for task in (self._reader_task, self._stderr_task):
             if task is not None:
                 task.cancel()
@@ -381,6 +386,8 @@ class CodexAppServerBackend(BaseAgentBackend):
                     await task
                 except (asyncio.CancelledError, Exception):
                     pass
+        if cleanup_unconfirmed:
+            raise RuntimeError("backend process cleanup could not be confirmed")
 
     @property
     def session_id(self) -> str | None:
@@ -403,7 +410,7 @@ class CodexAppServerBackend(BaseAgentBackend):
         # plus optional `capabilities`. Tools are no longer declared at
         # initialize time — they're handled per-thread / per-turn now.
         params = {
-            "clientInfo": {"name": "symphony", "version": "0.2.0"},
+            "clientInfo": {"name": "symphony", "version": __version__},
         }
         return await self._request(METHOD_INITIALIZE, params)
 
@@ -441,6 +448,36 @@ class CodexAppServerBackend(BaseAgentBackend):
             {"thread_id": self._thread_id, "session_id": self._thread_id},
         )
         return self._thread_id
+
+    async def resume_session(self, session_id: str) -> bool:
+        """Resume an exact Codex thread when the app-server verifies it.
+
+        RPC rejection, transport failure, or a response that does not echo the
+        requested thread id is an unsupported recovery attempt. Leave the
+        current thread untouched so the caller can fall back to
+        :meth:`start_session` without inheriting unverified state.
+        """
+        if not _is_valid_session_id(session_id):
+            return False
+        try:
+            result = await self._request(
+                METHOD_THREAD_RESUME,
+                {"threadId": session_id},
+            )
+        except (ResponseError, ResponseTimeout, PortExit):
+            return False
+
+        thread = result.get("thread")
+        resumed_id = thread.get("id") if isinstance(thread, dict) else None
+        if resumed_id != session_id:
+            return False
+
+        self._thread_id = session_id
+        await self._emit(
+            EVENT_SESSION_STARTED,
+            {"thread_id": session_id, "session_id": session_id},
+        )
+        return True
 
     async def run_turn(self, *, prompt: str, is_continuation: bool) -> TurnResult:
         if self._thread_id is None:
@@ -736,6 +773,18 @@ class CodexAppServerBackend(BaseAgentBackend):
                 waiter.set_result(params if isinstance(params, dict) else {})
             return
         # ----- streamed thread items (assistant text, tool calls, etc.) -----
+        if method == NOTIF_AGENT_MESSAGE_DELTA:
+            delta = params.get("delta") if isinstance(params, dict) else None
+            if isinstance(delta, str) and delta:
+                await self._emit(
+                    EVENT_OTHER_MESSAGE,
+                    {
+                        "type": "agent_delta",
+                        "text": delta,
+                        "item_id": params.get("itemId"),
+                    },
+                )
+            return
         if method == NOTIF_ITEM_COMPLETED:
             item = params.get("item") if isinstance(params, dict) else None
             if isinstance(item, dict) and item.get("type") == "agentMessage":
@@ -753,7 +802,9 @@ class CodexAppServerBackend(BaseAgentBackend):
                         EVENT_OTHER_MESSAGE,
                         {
                             "type": "assistant",
-                            "message": self._latest_assistant_message,
+                            # Chat consumers need the complete final answer;
+                            # only the dashboard metadata preview is capped.
+                            "message": text,
                             "item": item,
                         },
                     )
@@ -865,41 +916,25 @@ class CodexAppServerBackend(BaseAgentBackend):
                 self._latest_usage[key] = int(payload[key])
 
     def _update_tokens_from_v2_block(self, usage: dict[str, Any]) -> None:
-        """Codex 0.130+ thread/tokenUsage/updated.tokenUsage.total shape.
+        """Read absolute cumulative totals from Codex app-server v2.
 
-        Fields seen in the wild (camelCase, captured from a real run):
-          inputTokens, cachedInputTokens, outputTokens,
-          reasoningOutputTokens, totalTokens
-
-        Symphony's three-bucket model has no separate cache or reasoning
-        buckets, so cached input is folded into input_tokens and reasoning
-        output is folded into output_tokens.
-
-        Codex's own `totalTokens` field excludes both cache reads and
-        reasoning output (it counts only `inputTokens + outputTokens`),
-        which would make symphony's three-bucket invariant fail —
-        `input_tokens + output_tokens > total_tokens`. To preserve that
-        invariant and stay unit-comparable with the other backends,
-        symphony recomputes `total_tokens` as `folded_in + folded_out`
-        rather than copying codex's narrower value.
-
-        These notifications report ABSOLUTE cumulative totals (not deltas),
-        so we overwrite rather than accumulate.
+        cachedInputTokens is a subset of inputTokens; reasoningOutputTokens
+        is a subset of outputTokens. Adding either subset again inflates
+        the dashboard and token budgets. Preserve those inclusive totals and
+        expose cache only as the existing optional subset telemetry field.
+        Overwrite, rather than accumulate, each notification.
         """
         if not isinstance(usage, dict):
             return
         in_t = int(usage.get("inputTokens") or 0)
-        cached = int(usage.get("cachedInputTokens") or 0)
         out_t = int(usage.get("outputTokens") or 0)
-        reasoning = int(usage.get("reasoningOutputTokens") or 0)
-        folded_in = in_t + cached
-        folded_out = out_t + reasoning
-        # Always compute total = folded_in + folded_out so the invariant
-        # `total_tokens == input_tokens + output_tokens` holds. Codex's
-        # narrower `totalTokens` is intentionally ignored.
-        self._latest_usage["input_tokens"] = folded_in
-        self._latest_usage["output_tokens"] = folded_out
-        self._latest_usage["total_tokens"] = folded_in + folded_out
+        self._latest_usage["input_tokens"] = in_t
+        self._latest_usage["output_tokens"] = out_t
+        self._latest_usage["total_tokens"] = in_t + out_t
+        if "cachedInputTokens" in usage:
+            self._latest_usage["cache_input_tokens"] = int(usage["cachedInputTokens"] or 0)
+        else:
+            self._latest_usage.pop("cache_input_tokens", None)
 
     async def _handle_approval(self, params: dict[str, Any]) -> None:
         # Best-effort auto-approve. The legacy `respondToApproval` method is
@@ -930,22 +965,17 @@ class CodexAppServerBackend(BaseAgentBackend):
         )
 
     async def _emit(self, event: str, payload: dict[str, Any]) -> None:
-        ev_payload = payload if isinstance(payload, dict) else {"data": payload}
-        try:
-            await self._on_event(
-                {
-                    "event": event,
-                    "timestamp": _utc_iso(),
-                    "payload": ev_payload,
-                    "usage": dict(self._latest_usage),
-                    "rate_limits": dict(self._latest_rate_limits)
-                    if self._latest_rate_limits
-                    else None,
-                    "agent_pid": self.pid,
-                }
-            )
-        except Exception as exc:
-            log.warning("event_callback_failed", error=str(exc))
+        # No session redaction on the app-server protocol (thread ids are
+        # opaque handles, not secrets carried in evidence) — passing no
+        # `redact_session` is an identity in the shared helper.
+        await _emit_event(
+            self._on_event,
+            event,
+            payload,
+            usage=self._latest_usage,
+            rate_limits=self._latest_rate_limits,
+            agent_pid=self.pid,
+        )
 
 
 def _normalize_event_name(method: str) -> str:

@@ -36,7 +36,7 @@ skills: []
 
 ## Proof
 
-- lifecycle check
+- `pytest tests/factory/test_lifecycle.py -q`
 
 ## Non-goals
 
@@ -46,7 +46,9 @@ skills: []
     )
 
 
-def test_starter_lifecycle_persists_rewind_done_dependency_and_blocked(tmp_path: Path) -> None:
+def test_starter_lifecycle_persists_rewind_done_dependency_and_blocked(
+    tmp_path: Path,
+) -> None:
     ticket_dir = tmp_path / "wayfinder/tickets"
     ticket_dir.mkdir(parents=True)
     _source(ticket_dir / "001-base.md", "base")
@@ -61,7 +63,9 @@ def test_starter_lifecycle_persists_rewind_done_dependency_and_blocked(tmp_path:
 
     tracker.transition("TASK-1", "Build")
     tracker.transition("TASK-1", "Verify")
-    failed = evaluate_contract("Verify", "## QA Failure\n\nred", "TASK-1", profile="factory")
+    failed = evaluate_contract(
+        "Verify", "## QA Failure\n\nred", "TASK-1", profile="factory"
+    )
     assert not failed.passed
     tracker.transition("TASK-1", "Build")
     tracker.transition("TASK-1", "Verify")
@@ -69,6 +73,7 @@ def test_starter_lifecycle_persists_rewind_done_dependency_and_blocked(tmp_path:
         "Verify",
         "## Acceptance criteria\n\n"
         "- verified\n\n"
+        "## Proof commands\n\n- `pytest tests/factory/test_lifecycle.py -q`\n\n"
         "## Verification\n\n"
         "| criterion | command | result |\n"
         "| --- | --- | --- |\n"
@@ -84,4 +89,7 @@ def test_starter_lifecycle_persists_rewind_done_dependency_and_blocked(tmp_path:
     dependent = reloaded.fetch_issue_full_by_id("TASK-2")
     assert dependent is not None and dependent.blocked_by[0].state == "Done"
     reloaded.transition("TASK-2", "Blocked")
-    assert _tracker(tmp_path / "kanban").fetch_issue_full_by_id("TASK-2").state == "Blocked"  # type: ignore[union-attr]
+    assert (
+        _tracker(tmp_path / "kanban").fetch_issue_full_by_id("TASK-2").state
+        == "Blocked"
+    )  # type: ignore[union-attr]

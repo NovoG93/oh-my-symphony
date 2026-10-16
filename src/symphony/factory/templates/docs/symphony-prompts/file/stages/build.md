@@ -42,4 +42,9 @@ rather than deferring the whole ledger until the end; every section is nonempty:
   and the outcome after any required fix and re-review.
 - `## Test Evidence`: Exact local QA commands and results.
 
-Then set state to `Verify`. Do not mark Done from Build.
+Then set state to `Verify` for a new independent worker context. Build cannot
+mark Done even if it has written a passing Verification table. Leave the exact
+approved `## Proof commands` (or `## Proof`) unchanged. Missing environment or
+authority requires a nonempty `## Blocker` and state `Blocked`.
+The Verify stage may save the required SuperQA report inside this worktree;
+link it from the ticket instead of copying its entire contents into the ledger.

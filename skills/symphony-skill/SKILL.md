@@ -1,15 +1,15 @@
 ---
 name: symphony-skill
-description: Single Symphony operator router for Kanban tickets, service/TUI runs, workflow prompts, delegation, production-ready app delivery planning, OneShot runs, monorepo bootstrap, and worker failure triage.
+description: Single Symphony operator router for Kanban tickets, service/TUI runs, WORKFLOW.md and prompt config, lane customization, delegation, production-ready app delivery planning, OneShot runs, repo and monorepo bootstrap, and worker failure triage.
 ---
 
 # Using Symphony
 
 Symphony is a polling orchestrator that reads Kanban tickets and runs a
 coding-agent CLI (Codex, Claude Code, Gemini, AGY/Antigravity, Kiro, OpenCode,
-or Pi) against each ticket in an isolated workspace. This file is the single
-operator router: classify the request, load only the matching reference, then
-act.
+Pi, or Prime Agent) against each ticket in an isolated workspace. This file is
+the single operator router: classify the request, load only the matching
+reference, then act.
 
 Start by reading the target `WORKFLOW.md` and one or two real `kanban/*.md`
 files. Symphony behavior is workflow-specific, and forks commonly customize
@@ -21,7 +21,7 @@ State the route in one line, then open only the reference that route needs.
 
 | Signal | Route | Read |
 | --- | --- | --- |
-| add/list/show/move tickets, start service/TUI/API, inspect state | OPERATE | `reference/operations.md` |
+| create/register projects, open hub, add/list/show/move tickets, start service/TUI/API | OPERATE | `reference/operations.md` |
 | edit `WORKFLOW.md`, agent kind, hooks, prompts, workspace, Slack hooks | CONFIGURE | `reference/workflow-config.md` |
 | rename lanes, add state prompts, change pipeline shape | CUSTOMIZE | `reference/customization.md` |
 | break a large request into Symphony board tickets | DELEGATE | `reference/delegation.md` |
@@ -30,7 +30,9 @@ State the route in one line, then open only the reference that route needs.
 | bootstrap Symphony into another repo | BOOTSTRAP | `reference/bootstrapping.md` |
 | initialize or run the beginner autonomous development factory | FACTORY | `reference/factory.md` |
 | bootstrap isolated worktrees for a monorepo/polyrepo | MONOREPO | `monorepo/references/workflow-template.md` and `monorepo/scripts/setup-monorepo.sh` |
-| worker exit, auth stall, blank TUI, stuck service, platform issue | TRIAGE | `reference/troubleshooting.md` or `reference/platform-compat.md` |
+| `worker_exit`, `hook_failed`, auth stall, blank TUI, stuck service | TRIAGE | `reference/troubleshooting.md` |
+| set up or debug Windows, macOS, Linux behavior | PLATFORM | `reference/platform-compat.md` |
+| `.gitignore` for Symphony-generated docs and logs | GITIGNORE | `reference/gitignore-recommendations.md` |
 
 Branch-specific subfolders under `oneshot/` and `monorepo/` intentionally do
 not have their own `SKILL.md`. They provide templates, scripts, and deep
@@ -38,6 +40,10 @@ references for this router.
 
 ## Core Model
 
+- Keep the `oh-my-symphony` source checkout as the control plane, not a worker
+  project. Create or register a separate Git repository with `symphony project
+  create` / `symphony project add`, then operate it from the hub. Runtime and
+  doctor refuse a workflow in Symphony's own canonical Git repository.
 - The orchestrator reads ticket files and dispatches eligible work; the worker
   agent edits the ticket file to move state and append reports.
 - Each ticket runs in its own workspace under `workspace.root` (default
@@ -46,14 +52,15 @@ references for this router.
 - Ticket IDs are an ordering contract. For multi-ticket work, create
   `TASK-001`, then `TASK-002`, then `TASK-003` in task-list order; Symphony
   sorts by stable numeric suffix before mutable fields like priority.
-- The default Verify prompt expects the `symphony/<ID>` branch to be merged or
-  proven ready against the configured target branch before the ticket moves to
-  `Learn`.
+- The default Verify prompt proves the `symphony/<ID>` branch would merge
+  cleanly into the configured target branch. The orchestrator performs the one
+  merge itself when the ticket reaches `Done`
+  (`agent.auto_merge_on_done`, default true).
 
 ## Board Ticket Quality Gate
 
-Before registering more than one ticket, write the task list first and reject
-bad slices:
+Before registering more than one ticket, write the task list first, then check
+every entry against every rule below before you create any ticket file:
 
 - Work-type route: classify the request before ticket creation. Use the bugfix
   shape for defects, feature/enhancement shape for bounded behavior changes,
@@ -86,6 +93,27 @@ bad slices:
 Ticket descriptions are worker prompts. Do not register vague tickets like
 `implement frontend`; register a bounded slice with observable checks.
 
+### Machine app-release gate
+
+Applies only to production application delivery:
+
+- Write repository-root `release-contract.yaml`, label the verifier
+  `app-release`, and label the named delivery ticket `app-release-finalizer`.
+- The verifier writes strict `docs/<verifier>/qa/release-evidence.json` for the
+  exact current target and runs `symphony release check`; historical GREEN text
+  is never approval.
+- The target is the local branch tip. Synchronize it explicitly, because Symphony
+  does not fetch.
+- Labels opt in, while the host-owned SQLite generation and exact
+  verifier/finalizer run bindings remain authority across label loss.
+- A continuation in the same live run may proceed after approval; a restarted
+  approved verifier is reset to pending Verify and must produce fresh evidence.
+- Repairable file-board failures create grouped repairs plus a fresh verifier,
+  and startup cleanup uses a peer-fenced lease.
+- Remote tracker lifecycle mutation is unsupported: a labeled transition stops
+  before repair creation and an operator must rewind an already-advanced remote
+  card. Doctor neither warns about nor changes unselected remote workflows.
+
 ## Non-Negotiable Preflight
 
 Run this before launching or debugging a workflow:
@@ -105,8 +133,12 @@ unwritable workspaces, and missing board directories.
   leave the operator with only a bare `WORKFLOW.md`; read
   `reference/bootstrapping.md` for the exact bundle.
 - Preserve the shipped four active lanes (`Todo`, `In Progress`, `Verify`,
-  `Learn`) unless the user explicitly requests a custom workflow. If you change
-  lanes, update both `tracker.active_states` and `prompts.stages`.
+  `Document`) unless the user explicitly requests a custom workflow or the deep
+  pipeline. For the 8-lane deep preset (`Intake → Research → Plan → Review →
+  Build → QA → Verify → Document`), apply it via the settings page or
+  `POST /api/v1/workflow/presets/apply` instead of hand-editing lanes. If you
+  change lanes by hand, update both `tracker.active_states` and
+  `prompts.stages`.
 - Pick the prompt flavor that matches the tracker:
   `tracker.kind: file` uses `docs/symphony-prompts/file/...`;
   `tracker.kind: linear` uses `docs/symphony-prompts/linear/...`.
@@ -117,18 +149,25 @@ unwritable workspaces, and missing board directories.
 
 ## Common Starts
 
-Beginner autonomous factory:
+Beginner autonomous factory in a separate product repository:
 
 ```bash
-symphony factory init . --agent opencode
-symphony factory sync ./wayfinder
-symphony factory start ./wayfinder
+symphony factory init ../my-app --agent opencode
 ```
 
-Use the FACTORY route for new file-board projects. The former production file
-workflow remains at `examples/advanced/WORKFLOW.file.example.md`.
+Continue with the FACTORY route for graph creation, Git initialization, and
+Doctor-gated startup. The advanced file workflow is available at
+`examples/advanced/WORKFLOW.file.example.md`.
 
-Add one file-board ticket and open the managed TUI launcher:
+Create a separate project or register an existing repository, then use the hub:
+
+```bash
+symphony project create "My App" --path ../my-app
+symphony project add /path/to/existing-repo
+symphony hub
+```
+
+Add one file-board ticket and open the managed TUI launcher from that project:
 
 ```bash
 symphony board init ./kanban
@@ -136,19 +175,24 @@ symphony board new TASK-001 "<title>" --description "<spec>"
 ./tui-open.sh ./WORKFLOW.md
 ```
 
-Run headless with service state and browser viewer:
+For dependent multi-ticket work, use the validated flags: `--blocked-by`
+(repeatable), `--request REQ-<n>` grouping, and `--description-file PATH|-`.
+and inspect the DAG with `symphony board graph [--request REQ-n]`. Creation
+rejects unknown states, missing blockers, and dependency cycles.
+
+Run headless with service state:
 
 ```bash
-symphony service start ./WORKFLOW.md --port 9999 --viewer-port 8765
+symphony service start ./WORKFLOW.md --port 9999
 symphony service status ./WORKFLOW.md
 curl -s http://127.0.0.1:9999/api/v1/state | jq
 ```
 
-The `--port` (9999) root serves a browsable web app (`oh-my-symphony`), not
-just the JSON API. **"Open the orchestrator" defaults to opening
-`http://127.0.0.1:9999/`** (`open`/`xdg-open`/`start`); the `--viewer-port`
-board (8765) is the secondary card board — open it only when asked for the
-board view.
+The `--port` (9999) root serves the built-in browsable admin web app
+(board, workflow editor, chat, stats, settings), not just the JSON API.
+**"Open the orchestrator" defaults to opening `http://127.0.0.1:9999/`**
+(`open`/`xdg-open`/`start`). There is no separate board viewer. The admin
+UI on the orchestrator port is the only board.
 
 Use `symphony service ...` for normal headless operation. It writes
 per-workflow run state under `.symphony/run/` and refuses duplicate starts for
@@ -158,36 +202,9 @@ board.
 For smoke demos without an installed agent CLI, set `codex.command: python -m
 symphony.mock_codex`; see `reference/operations.md`.
 
-### Offer Slack notifications during bootstrap
+### Optional Slack notifications
 
-When initializing or rewriting a `WORKFLOW.md`, ask the operator whether
-they want each state transition broadcast to Slack — it is the cheapest
-hook for PMs to follow a board without opening the TUI. Make it a
-question, not a default:
-
-> "Optional: post each ticket transition to Slack? If yes I need an
-> incoming-webhook URL (or env-var name) and either 'every stage' or a
-> filtered subset like Done + Blocked."
-
-If they accept, add the block from `reference/workflow-config.md`
-(`Notifications (Slack)` section). If they decline, omit it. The feature
-is off whenever the block is absent — no extra cleanup needed.
-
-## What To Read Next
-
-| Need | Read |
-| --- | --- |
-| Bootstrap Symphony into a project | `reference/bootstrapping.md` |
-| Add/list/show/move tickets, run TUI/API/service | `reference/operations.md` |
-| Edit `WORKFLOW.md`, agent kind, hooks, tracker, workspace | `reference/workflow-config.md` |
-| Rename lanes, add per-state prompts, customize pipelines | `reference/customization.md` |
-| Delegate independent sub-tasks to Symphony workers | `reference/delegation.md` |
-| Run a single prompt through the OneShot pipeline | `oneshot/reference/operations.md` |
-| Improve OneShot issue decomposition | `oneshot/reference/decomposition.md` |
-| Bootstrap a monorepo worktree workflow | `monorepo/references/workflow-template.md` |
-| Diagnose `worker_exit`, `hook_failed`, blank TUI, auth stalls | `reference/troubleshooting.md` |
-| Set up/debug Windows, macOS, Linux behavior | `reference/platform-compat.md` |
-| Configure `.gitignore` for Symphony-generated docs/logs | `reference/gitignore-recommendations.md` |
+Configure transition notifications when the operator requests them. Read `reference/workflow-config.md` for the Slack block, obtain the destination and selected states, and retain explicit authorization for posting. Omit the block when notifications are outside the requested setup.
 
 ## Headless Triage Signals
 

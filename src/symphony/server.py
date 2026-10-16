@@ -9,19 +9,27 @@ endpoints below predate the web app and remain for scripts and the TUI:
     POST /api/v1/refresh         — trigger immediate poll/reconcile
     POST /api/v1/<id>/pause|resume
     POST /api/v1/<id>/recover-blocked
-    POST /api/v1/<id>/skip-learn
+    POST /api/v1/<id>/skip-document  (deprecated alias: /skip-learn)
 """
 
 from __future__ import annotations
 
 import asyncio
 import json
+import time
 
 from aiohttp import web
 
 from .logging import get_logger
 from .orchestrator import Orchestrator
-from .webapi import register_web_routes
+from .webapi import (
+    _LOOPBACK_BINDS,
+    API_TOKEN_ENV,
+    BIND_HOST_KEY,
+    _configured_api_token,
+    _request_is_loopback,
+    register_web_routes,
+)
 
 
 log = get_logger()
@@ -101,12 +109,12 @@ def build_app(orchestrator: Orchestrator) -> web.Application:
             }
         )
 
-    async def handle_skip_learn(request: web.Request) -> web.Response:
+    async def handle_skip_document(request: web.Request) -> web.Response:
         identifier = request.match_info.get("identifier", "")
-        changed, message = await orchestrator.skip_learn(identifier)
+        changed, message = await orchestrator.skip_document(identifier)
         if not changed:
             status = 404 if message.startswith("unknown issue") else 409
-            return _error_response(status, "learn_skip_rejected", message)
+            return _error_response(status, "document_skip_rejected", message)
         return web.json_response(
             {
                 "issue_identifier": identifier,
@@ -124,14 +132,14 @@ def build_app(orchestrator: Orchestrator) -> web.Application:
         if body and not isinstance(body, dict):
             return _error_response(400, "invalid_body", "request body must be an object")
         target_state = (
-            body.get("rca_state", body.get("target_state"))
+            body.get("fix_state", body.get("rca_state", body.get("target_state")))
             if isinstance(body, dict)
             else None
         )
         agent_kind = body.get("agent_kind") if isinstance(body, dict) else None
         if target_state is not None and not isinstance(target_state, str):
             return _error_response(
-                400, "invalid_body", "rca_state must be a string"
+                400, "invalid_body", "fix_state must be a string"
             )
         if agent_kind is not None and not isinstance(agent_kind, str):
             return _error_response(400, "invalid_body", "agent_kind must be a string")
@@ -146,6 +154,8 @@ def build_app(orchestrator: Orchestrator) -> web.Application:
         return web.json_response(
             {
                 "issue_identifier": identifier,
+                "fix_created": True,
+                # Deprecated alias retained for API compatibility.
                 "rca_created": True,
                 "message": message,
                 **details,
@@ -155,10 +165,18 @@ def build_app(orchestrator: Orchestrator) -> web.Application:
     async def handle_method_not_allowed(request: web.Request) -> web.Response:
         return _error_response(405, "method_not_allowed", request.method)
 
-    async def handle_debug_tasks(_request: web.Request) -> web.Response:
+    async def handle_debug_tasks(request: web.Request) -> web.Response:
         # Dump every live asyncio task with its suspended coroutine stack.
         # `Task.get_stack()` returns the deepest frame the task is parked
         # at — exactly what py-spy can't show us across the await boundary.
+        # Live stacks and coroutine reprs can name local paths and prompt
+        # text, so this stays loopback-only like the run diagnostics.
+        if not _request_is_loopback(request):
+            return _error_response(
+                403,
+                "debug_tasks_local_only",
+                "task diagnostics are available only from the local machine",
+            )
         out = []
         for t in asyncio.all_tasks():
             stack_frames = []
@@ -192,15 +210,15 @@ def build_app(orchestrator: Orchestrator) -> web.Application:
     app.router.add_post("/api/v1/{identifier}/pause", handle_pause)
     app.router.add_post("/api/v1/{identifier}/resume", handle_resume)
     app.router.add_post("/api/v1/{identifier}/recover-blocked", handle_recover_blocked)
-    app.router.add_post("/api/v1/{identifier}/skip-learn", handle_skip_learn)
+    app.router.add_post("/api/v1/{identifier}/skip-document", handle_skip_document)
+    # Deprecated alias — lane renamed Learn -> Document; old scripts keep working.
+    app.router.add_post("/api/v1/{identifier}/skip-learn", handle_skip_document)
     app.router.add_get("/api/v1/{identifier}", handle_issue)
 
     return app
 
 
 def _now_iso() -> str:
-    import time
-
     return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
 
 
@@ -209,7 +227,13 @@ async def run_server(
 ) -> tuple[web.AppRunner, int]:
     # The API guard middleware only enforces the loopback Host allowlist
     # when the server itself is loopback-bound; record the bind address.
-    app["bind_host"] = host
+    app[BIND_HOST_KEY] = host
+    if host.lower() not in _LOOPBACK_BINDS and _configured_api_token() is None:
+        log.warning(
+            "http_server_unauthenticated_on_network_bind",
+            host=host,
+            hint=f"set {API_TOKEN_ENV} or bind to 127.0.0.1",
+        )
     runner = web.AppRunner(app)
     await runner.setup()
     site = web.TCPSite(runner, host=host, port=port)

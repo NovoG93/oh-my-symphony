@@ -9,7 +9,7 @@ import html
 import time
 from pathlib import Path
 
-from .engine import RunResult
+from .engine import RunResult, SideEffect
 from .i18n import t
 from .store import Store
 
@@ -92,7 +92,7 @@ def _render_md(r: RunResult, lang: str, secrets: list[str],
         err = f" ({_mask_all(sr.error, secrets)})" if sr.error else ""
         shot = f"[{sr.screenshot}]({sr.screenshot})" if sr.screenshot else "-"
         lines.append(f"| {sr.index + 1} | {desc} | {status}{err} | {shot} |")
-    def effect_rows(effects) -> list[str]:
+    def effect_rows(effects: list[SideEffect]) -> list[str]:
         rows = [f"| {t('step', lang)} | 종류 | 심각도 | {t('effect_count', lang)} | 내용 |"
                 if lang == "ko"
                 else f"| Step | Type | Severity | {t('effect_count', lang)} | Message |",
@@ -148,7 +148,8 @@ h2{font-size:18px;margin:28px 0 6px}
 def _render_html(r: RunResult, lang: str, secrets: list[str],
                  diff_lines: list[str] | None = None) -> str:
     sc = r.scenario
-    esc = lambda s: html.escape(_mask_all(str(s), secrets))
+    def esc(s: object) -> str:
+        return html.escape(_mask_all(str(s), secrets))
     badge = "pass" if r.status == "pass" else "fail"
     rows = []
     for sr in r.step_results:
@@ -162,7 +163,7 @@ def _render_html(r: RunResult, lang: str, secrets: list[str],
         cls = "pass" if sr.status == "pass" else ("" if sr.status == "skipped" else "fail")
         rows.append(f"<tr><td>{sr.index + 1}</td><td>{esc(desc)}{err}</td>"
                     f"<td><span class='badge {cls}'>{esc(status)}</span></td><td>{shot}</td></tr>")
-    def effect_table(effects) -> str:
+    def effect_table(effects: list[SideEffect]) -> str:
         eff_rows = []
         for e in effects:
             kind = t(_EFFECT_KEYS.get(e.type, e.type), lang)

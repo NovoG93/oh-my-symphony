@@ -10,8 +10,7 @@ from importlib.resources.abc import Traversable
 from pathlib import Path
 from typing import Any
 
-from ..factory.sync import sync_wayfinder
-from ..factory.wayfinder import parse_wayfinder_ticket
+from ..factory.sync import _load_ordered_graph, sync_wayfinder
 from ..trackers.file import FileBoardTracker
 from ..workflow import SUPPORTED_AGENT_KINDS, build_service_config, load_workflow
 
@@ -27,7 +26,8 @@ _BACKEND_BLOCKS = {
     "agy": "agy:\n  command: agy --print -\n  resume_across_turns: true\n",
     "claude": (
         "claude:\n"
-        "  command: claude -p --output-format stream-json --verbose --permission-mode acceptEdits\n"
+        "  command: claude -p --output-format stream-json --verbose --permission-mode acceptEdits"
+        ' --add-dir "$SYMPHONY_WORKFLOW_DIR/kanban"\n'
     ),
     "codex": (
         "codex:\n"
@@ -44,6 +44,11 @@ _BACKEND_BLOCKS = {
     "opencode": (
         "opencode:\n"
         "  command: opencode run --format json --auto\n"
+        "  resume_across_turns: true\n"
+    ),
+    "prime-agent": (
+        "prime-agent:\n"
+        "  command: prime-agent -p --mode json\n"
         "  resume_across_turns: true\n"
     ),
     "pi": "pi:\n  command: 'pi --mode json -p \"\"'\n",
@@ -98,22 +103,32 @@ _RUNTIME_GITIGNORE_RULES = (
 
 
 def _copy_assets(target: Path, *, force: bool, agent_kind: str) -> None:
+    if agent_kind not in _BACKEND_BLOCKS:
+        raise ValueError(f"unsupported factory agent kind: {agent_kind}")
     root = files("symphony.factory.templates")
-    conflicts = [path for path in _asset_paths(root) if (target / path).exists()]
+    conflicts = [
+        path for path in _asset_paths(root)
+        if (target / path).exists() or (target / path).is_symlink()
+    ]
     if conflicts and not force:
         raise FileExistsError(f"refusing to overwrite {target / conflicts[0]}; pass --force")
+    assets: dict[Path, bytes] = {}
     for relative in _asset_paths(root):
-        source = root.joinpath(str(relative))
-        destination = target / relative
-        destination.parent.mkdir(parents=True, exist_ok=True)
+        source = root.joinpath(*relative.parts)
         data = source.read_bytes()
         if relative == Path("WORKFLOW.md"):
             text = data.decode("utf-8").replace("kind: opencode", f"kind: {agent_kind}")
             text = text.replace(_BACKEND_MARKER, _BACKEND_BLOCKS[agent_kind].rstrip())
             data = text.encode("utf-8")
+        assets[relative] = data
+    for relative, data in assets.items():
+        destination = target / relative
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        if destination.is_symlink():
+            destination.unlink()
         destination.write_bytes(data)
-    setup = target / "scripts/factory-setup-worktree.sh"
-    setup.chmod(setup.stat().st_mode | 0o111)
+    for script in (target / "scripts").glob("*.sh"):
+        script.chmod(script.stat().st_mode | 0o111)
     (target / "kanban").mkdir(exist_ok=True)
 
 
@@ -161,6 +176,8 @@ def _skill_asset_paths(root: Any, prefix: Path = Path()) -> list[Path]:
 def cmd_init(args: argparse.Namespace) -> int:
     target = Path(args.target).resolve()
     try:
+        if args.agent_kind not in _BACKEND_BLOCKS:
+            raise ValueError(f"unsupported factory agent kind: {args.agent_kind}")
         skill_sources = _skill_sources({"supergoal"})
         _preflight_init(target, skill_sources, force=args.force)
         _copy_assets(target, force=args.force, agent_kind=args.agent_kind)
@@ -171,7 +188,7 @@ def cmd_init(args: argparse.Namespace) -> int:
             force=args.force,
             recovery="rerun 'symphony factory init <project> --force'",
         )
-    except (FileExistsError, OSError) as exc:
+    except (ValueError, OSError) as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 1
     print(f"initialized autonomous factory at {target}")
@@ -182,15 +199,37 @@ def cmd_init(args: argparse.Namespace) -> int:
 def _preflight_init(
     target: Path, sources: dict[str, Traversable], *, force: bool
 ) -> None:
+    root = files("symphony.factory.templates")
+    for directory in (target / "skills", target / "kanban"):
+        if directory.exists() and not directory.is_dir():
+            raise FileExistsError(f"expected a directory, found file {directory}")
+    skill_root = target / "skills"
+    if skill_root.is_symlink() or skill_root.is_junction():
+        raise FileExistsError(f"refusing to write through linked directory {skill_root}")
+    for relative in [*_asset_paths(root), Path(".gitignore")]:
+        destination = target / relative
+        for parent in (target, *destination.parents):
+            if parent == target.parent:
+                break
+            if parent.exists() and not parent.is_dir():
+                raise FileExistsError(f"expected a directory, found file {parent}")
+            if parent.is_symlink() or parent.is_junction():
+                raise FileExistsError(f"refusing to write through linked directory {parent}")
+        if destination.is_dir() or destination.is_junction():
+            raise FileExistsError(f"expected a file, found directory {destination}")
+        if relative == Path(".gitignore") and destination.is_symlink():
+            raise FileExistsError(f"refusing to write through linked file {destination}")
     if force:
         return
-    root = files("symphony.factory.templates")
-    conflicts = [path for path in _asset_paths(root) if (target / path).exists()]
+    conflicts = [
+        path for path in _asset_paths(root)
+        if (target / path).exists() or (target / path).is_symlink()
+    ]
     if conflicts:
         raise FileExistsError(f"refusing to overwrite {target / conflicts[0]}; pass --force")
     for name in sources:
         destination = target / "skills" / name
-        if destination.exists() or destination.is_symlink():
+        if destination.exists() or destination.is_symlink() or destination.is_junction():
             try:
                 _validate_skill_runtime(name, destination)
             except FileNotFoundError as exc:
@@ -208,14 +247,21 @@ def _sync(
     all_tickets: bool = True,
     force_skills: bool = False,
 ) -> int:
+    tickets = _load_ordered_graph(wayfinder, prefix)
     requested = {"supergoal"}
-    for path in sorted((wayfinder / "tickets").glob("*.md")):
-        requested.update(parse_wayfinder_ticket(path).skills)
-    _install_skills(target, requested, force=force_skills)
+    for ticket in tickets:
+        requested.update(ticket.skills)
+    sources = _skill_sources(requested)
     workflow = target / "WORKFLOW.md"
     cfg = build_service_config(load_workflow(workflow))
     if cfg.tracker.kind != "file":
         raise ValueError("factory requires tracker.kind: file")
+    _copy_skills(
+        target,
+        sources,
+        force=force_skills,
+        recovery="rerun 'symphony factory sync <project> --force'",
+    )
     results = sync_wayfinder(
         wayfinder, FileBoardTracker(cfg.tracker), prefix=prefix, all_tickets=all_tickets
     )
@@ -283,16 +329,23 @@ def _copy_skills(
     force: bool,
     recovery: str,
 ) -> None:
+    skill_root = target / "skills"
+    if skill_root.is_symlink() or skill_root.is_junction():
+        raise FileExistsError(f"refusing to write through linked directory {skill_root}")
+    if not force:
+        for name in sources:
+            destination = skill_root / name
+            if destination.exists() or destination.is_symlink() or destination.is_junction():
+                try:
+                    _validate_skill_runtime(name, destination)
+                except FileNotFoundError as exc:
+                    raise FileExistsError(f"{destination} is incomplete; {recovery}") from exc
     for name, source in sources.items():
         destination = target / "skills" / name
-        destination_present = destination.exists() or destination.is_symlink()
+        destination_present = (
+            destination.exists() or destination.is_symlink() or destination.is_junction()
+        )
         if destination_present and not force:
-            try:
-                _validate_skill_runtime(name, destination)
-            except FileNotFoundError as exc:
-                raise FileExistsError(
-                    f"{destination} is incomplete; {recovery}"
-                ) from exc
             continue
         if destination_present:
             _remove_skill_destination(destination)
@@ -300,10 +353,16 @@ def _copy_skills(
             shutil.copytree(source, destination, ignore=_skill_copy_ignore(name, source))
         else:
             _copy_resource_tree(source, destination)
+        # Wheel extraction may discard source execute bits, especially for Windows-built wheels.
+        for script in destination.rglob("*.sh"):
+            if script.is_file():
+                script.chmod(script.stat().st_mode | 0o111)
 
 
 def _remove_skill_destination(destination: Path) -> None:
-    if destination.is_symlink() or not destination.is_dir():
+    if destination.is_junction():
+        destination.rmdir()
+    elif destination.is_symlink() or not destination.is_dir():
         destination.unlink()
     else:
         shutil.rmtree(destination)

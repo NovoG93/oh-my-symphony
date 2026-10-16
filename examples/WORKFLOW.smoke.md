@@ -2,15 +2,15 @@
 tracker:
   kind: file
   board_root: ./kanban_smoke
-  active_states: [Todo, "In Progress", Verify, Learn]
+  active_states: [Todo, "In Progress", Verify, Document]
   terminal_states: ["Human Review", Done, Blocked, Archive]
   archive_state: Archive
   archive_after_days: 0
   state_descriptions:
     Todo: "Triage; route to In Progress"
     "In Progress": "Implement; transition to Verify"
-    Verify: "Check the result; transition to Learn"
-    Learn: "Capture reusable knowledge; transition to Done unless intervention"
+    Verify: "Check the result; transition to Document"
+    Document: "Capture reusable knowledge; transition to Done unless intervention"
     "Human Review": "Manual intervention or explicit review before Done"
     Done: "Verified complete"
 
@@ -73,7 +73,7 @@ claude:
   command: 'claude -p --output-format stream-json --verbose --permission-mode acceptEdits --add-dir "$SYMPHONY_WORKFLOW_DIR/kanban_smoke"'
   resume_across_turns: true
   turn_timeout_ms: 600000
-  read_timeout_ms: 5000
+  read_timeout_ms: 20000
   stall_timeout_ms: 300000
 
 server:

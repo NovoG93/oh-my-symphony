@@ -7,15 +7,14 @@ The App owns:
   - all key bindings + actions (zoom, pagination, density, filter, archive,
     pause/resume, language toggle, scroll).
 
-`_fetch_candidates` / `_fetch_terminals` are imported directly and
-resolved through this module's globals at call time, so tests patch
-`symphony.tui.app._fetch_candidates` — the consumer's reference
-(initiative D; the former parent-package indirection is gone).
+`_fetch_tracker_snapshot` is imported directly and resolved through this
+module's globals at call time, so tests patch the consumer's reference.
 """
 
 from __future__ import annotations
 
 import asyncio
+import time
 from dataclasses import replace
 from typing import Any, Iterable
 
@@ -44,18 +43,36 @@ from .helpers import (
     _CardStatus,
     _build_runtime_index,
     _card_sort_key,
-    _fetch_candidates,
-    _fetch_terminals,
+    _fetch_tracker_snapshot,
     _matches_filter,
     _ordered_column_states,
     _stage_position,
 )
-from .screens import EditIssueScreen, NewIssueScreen, StatsScreen, _RefreshNow
+from .screens import (
+    EditIssueScreen,
+    HelpScreen,
+    NewIssueScreen,
+    StatsScreen,
+    _RefreshNow,
+)
 from .widgets import DetailPane, FilterBar, IssueCard, Lane, StatsBar
 
 
 log = get_logger()
 
+# Seconds the quit confirmation stays armed after a first `q` on a busy
+# board. A second `q` inside this window quits; outside it, `q` re-arms.
+QUIT_CONFIRM_WINDOW_S = 5.0
+
+
+_ORCH_ERROR_REPEAT_S = 10.0
+_EMPTY_SNAPSHOT: dict[str, Any] = {
+    "counts": {"running": 0, "retrying": 0},
+    "codex_totals": {},
+    "running": [],
+    "retrying": [],
+    "generated_at": "",
+}
 
 
 class KanbanApp(App):
@@ -107,7 +124,7 @@ class KanbanApp(App):
         Binding("L", "toggle_language", "Language"),
         Binding("a", "archive_focused", "Archive"),
         Binding("c", "confirm_done_focused", "Confirm done"),
-        Binding("S", "skip_learn_focused", "Skip Learn"),
+        Binding("S", "skip_document_focused", "Skip Document"),
         Binding("P", "toggle_pause_focused", "Pause/resume"),
         Binding("n", "new_issue", "New issue"),
         Binding("e", "edit_focused", "Edit issue"),
@@ -157,6 +174,16 @@ class KanbanApp(App):
         # restarting the TUI. Reset on relaunch — persistence belongs in
         # WORKFLOW.md / SYMPHONY_LANG, not in TUI state.
         self._language_override: str | None = None
+        # H1 — quit guard. `q` is the reflexive "close the viewer" key, but
+        # exiting the TUI stops the orchestrator and every in-flight agent.
+        # While workers are live the first press only arms a short
+        # confirmation window; see `action_quit`.
+        self._quit_armed: bool = False
+        # Orchestrator queries run on the 0.5 s heartbeat. A raise there
+        # must not tear the app down: keep the last good snapshot and toast
+        # each distinct failure once instead of every tick.
+        self._last_snapshot: dict[str, Any] = _EMPTY_SNAPSHOT
+        self._orch_error_seen: dict[str, float] = {}
 
     # ----- composition -------------------------------------------------
 
@@ -236,8 +263,9 @@ class KanbanApp(App):
 
     async def _refresh_tracker(self, cfg: ServiceConfig) -> None:
         try:
-            candidates = await asyncio.to_thread(_fetch_candidates, cfg)
-            terminals = await asyncio.to_thread(_fetch_terminals, cfg)
+            candidates, terminals = await asyncio.to_thread(
+                _fetch_tracker_snapshot, cfg
+            )
         except Exception as exc:
             log.debug("tui_tracker_fetch_failed", error=str(exc))
             return
@@ -250,7 +278,7 @@ class KanbanApp(App):
         cfg = self._ws.current()
         if cfg is None:
             return
-        snapshot = self._orch.snapshot()
+        snapshot = self._safe_snapshot()
         try:
             stats = self.query_one(StatsBar)
         except (NoMatches, ScreenStackError):
@@ -289,12 +317,38 @@ class KanbanApp(App):
         self._apply_lane_widths()
         self._refresh_detail_pane()
 
+    def _safe_snapshot(self) -> dict[str, Any]:
+        try:
+            self._last_snapshot = self._orch.snapshot()
+        except Exception as exc:
+            self._notify_orch_error("orchestrator snapshot failed", exc)
+        return self._last_snapshot
+
+    def _safe_running_issues(self) -> list[Issue]:
+        try:
+            return list(self._orch.iter_running_issues())
+        except Exception as exc:
+            self._notify_orch_error("orchestrator running-issues failed", exc)
+            return []
+
+    def _notify_orch_error(self, what: str, exc: Exception) -> None:
+        # Heartbeat calls this every 0.5 s while the fault persists; surface
+        # each distinct message at most once per window.
+        message = f"{what}: {exc}"
+        now = time.monotonic()
+        last = self._orch_error_seen.get(message)
+        if last is not None and now - last < _ORCH_ERROR_REPEAT_S:
+            return
+        self._orch_error_seen[message] = now
+        log.warning("tui_orchestrator_query_failed", what=what, error=str(exc))
+        self.notify(message, severity="error", timeout=4)
+
     def _all_known_issues(self) -> Iterable[Issue]:
         seen: set[str] = set()
         for source in (
             self._candidates,
             self._terminal_issues,
-            list(self._orch.iter_running_issues()),
+            self._safe_running_issues(),
         ):
             for issue in source:
                 if issue.id in seen:
@@ -326,26 +380,64 @@ class KanbanApp(App):
 
     # ----- actions -----------------------------------------------------
 
+    def action_quit(self) -> None:
+        """Quit — with a guard rail while workers are live.
+
+        An idle board quits immediately, exactly as before. A board with
+        running or retrying workers requires a second `q` within
+        `QUIT_CONFIRM_WINDOW_S`: the first press only arms the
+        confirmation and says how many agents would be stopped, because
+        exiting the TUI tears down the orchestrator and aborts those
+        runs mid-turn.
+        """
+        busy = self._busy_worker_count()
+        if busy == 0 or self._quit_armed:
+            self.exit()
+            return
+        self._quit_armed = True
+        self.set_timer(QUIT_CONFIRM_WINDOW_S, self._disarm_quit)
+        plural = "" if busy == 1 else "s"
+        self.notify(
+            f"{busy} agent{plural} running — press q again to stop them and quit",
+            severity="warning",
+            timeout=QUIT_CONFIRM_WINDOW_S,
+        )
+
+    def _disarm_quit(self) -> None:
+        self._quit_armed = False
+
+    def _busy_worker_count(self) -> int:
+        """Running + retrying workers from the orchestrator snapshot.
+
+        A snapshot failure degrades to "idle" so a broken observer can
+        never trap the operator in the app — quitting then matches the
+        historical single-press behavior.
+        """
+        try:
+            counts = self._orch.snapshot().get("counts", {}) or {}
+        except Exception:
+            return 0
+        return int(counts.get("running", 0) or 0) + int(
+            counts.get("retrying", 0) or 0
+        )
+
     def action_refresh(self) -> None:
         self._kick_tracker_refresh()
         self._refresh_runtime()
         self.notify("refreshed")
 
     def action_help(self) -> None:
-        lang = self._effective_language()
-        page = self._current_page_index() + 1
-        total_pages = self._page_count()
-        msg = (
-            "q quit · r refresh · enter details · "
-            "1-9 zoom lane · 0/esc reset · "
-            f"t/T page lanes ({page}/{total_pages}) · +/- resize window · "
-            "d density · p detail-pane · ]/[ focus detail/board · "
-            "L language · a archive · c confirm done · S skip Learn · "
-            "P pause/resume · n new · e edit · / filter · "
-            "tab focus · j/k scroll · g/G top/bottom · "
-            f"lang={lang}"
+        """Open the grouped key-binding modal (`?` again, esc, or q closes)."""
+        if isinstance(self.screen, HelpScreen):
+            self.pop_screen()
+            return
+        self.push_screen(
+            HelpScreen(
+                language=self._effective_language(),
+                page=self._current_page_index() + 1,
+                total_pages=self._page_count(),
+            )
         )
-        self.notify(msg, timeout=8)
 
     def action_open_details(self) -> None:
         focused = self.focused
@@ -617,32 +709,32 @@ class KanbanApp(App):
         self.notify(f"confirmed {issue.identifier} as Done", timeout=2)
         self._kick_tracker_refresh()
 
-    def action_skip_learn_focused(self) -> None:
-        """Move a Learn card to Human Review without running Learn."""
+    def action_skip_document_focused(self) -> None:
+        """Move a Document card to Human Review without running Document."""
         focused = self.focused
         if not isinstance(focused, IssueCard):
             self.notify("focus a card first", timeout=2)
             return
         issue = focused.issue
-        if normalize_state(issue.state) != "learn":
+        if normalize_state(issue.state) not in {"document", "learn"}:
             self.notify(
-                f"only Learn cards can be skipped (state={issue.state})",
+                f"only Document cards can be skipped (state={issue.state})",
                 timeout=3,
             )
             return
         self.run_worker(
-            self._skip_learn_issue(issue),
+            self._skip_document_issue(issue),
             thread=False,
             exclusive=False,
-            group="skip_learn",
+            group="skip_document",
         )
 
-    async def _skip_learn_issue(self, issue: Issue) -> None:
+    async def _skip_document_issue(self, issue: Issue) -> None:
         try:
-            changed, message = await self._orch.skip_learn(issue.identifier)
+            changed, message = await self._orch.skip_document(issue.identifier)
         except Exception as exc:
             log.warning(
-                "tui_skip_learn_failed", identifier=issue.identifier, error=str(exc)
+                "tui_skip_document_failed", identifier=issue.identifier, error=str(exc)
             )
             self.notify(f"skip failed: {exc}", timeout=4, severity="error")
             return
@@ -748,7 +840,15 @@ class KanbanApp(App):
             )
             return
         issue = focused.issue
-        if self._orch.find_running_issue_id(issue.identifier) is not None:
+        try:
+            running_id = self._orch.find_running_issue_id(issue.identifier)
+        except Exception as exc:
+            log.warning(
+                "tui_find_running_failed", identifier=issue.identifier, error=str(exc)
+            )
+            self.notify(f"edit check failed: {exc}", severity="error", timeout=4)
+            return
+        if running_id is not None:
             self.notify(
                 f"{issue.identifier} is running; wait before editing",
                 timeout=3,
@@ -830,7 +930,14 @@ class KanbanApp(App):
         )
         terminal = {s.lower() for s in cfg.tracker.terminal_states}
         done_states = {"done"} if "done" in terminal else terminal
-        aggregate = await asyncio.to_thread(store.aggregate, 30, done_states)
+        try:
+            aggregate = await asyncio.to_thread(
+                store.aggregate, 30, done_states, cfg.tracker.active_states
+            )
+        except Exception as exc:
+            log.warning("tui_stats_failed", error=str(exc))
+            self.notify(f"stats failed: {exc}", timeout=4, severity="error")
+            return
         casing = {
             s.lower(): s
             for s in (*cfg.tracker.active_states, *cfg.tracker.terminal_states)
@@ -854,7 +961,13 @@ class KanbanApp(App):
             self.notify("focus a card first", timeout=2)
             return
         issue_id = focused.issue.id
-        if self._orch.is_paused(issue_id):
+        try:
+            paused = self._orch.is_paused(issue_id)
+        except Exception as exc:
+            log.warning("tui_is_paused_failed", issue_id=issue_id, error=str(exc))
+            self.notify(f"pause check failed: {exc}", severity="error", timeout=4)
+            return
+        if paused:
             if self._orch.resume_worker(issue_id):
                 self.notify(f"resumed {focused.issue.identifier}", timeout=2)
             else:

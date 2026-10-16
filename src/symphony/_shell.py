@@ -20,12 +20,17 @@ from __future__ import annotations
 
 import asyncio
 import errno
+import hashlib
 import os
 import shutil
 import signal
+import subprocess
 import sys
 from functools import lru_cache
-from typing import Any
+from pathlib import Path
+from typing import Any, Callable
+
+from .logging import get_logger
 
 
 # Common Git for Windows install locations. Scoop and Winget installs land
@@ -45,6 +50,20 @@ _WSL_LAUNCHER_FRAGMENTS = (
     r"\windows\system32\bash.exe",
     r"\microsoft\windowsapps\bash.exe",
 )
+
+# POSIX-only signal API resolved once so this module imports and type-checks
+# on win32 too; every caller guards with a platform check before reaching it.
+# On POSIX `os.killpg` always exists, so the runtime behavior is unchanged.
+_killpg: Callable[[int, int], None] | None = getattr(os, "killpg", None)
+
+# Bounded so `terminate_process_tree`'s documented bounded-wait contract
+# holds for its first Windows step too (taskkill itself can hang when a
+# child refuses to die).
+_TASKKILL_TIMEOUT_S = 10.0
+
+log = get_logger()
+
+_warned_kill_without_identity = False
 
 
 def _is_wsl_launcher(path: str) -> bool:
@@ -176,9 +195,13 @@ def _signal_process_group(pid: int, sig: int) -> bool:
     Requires the child to have been spawned with ``start_new_session=True``
     so it leads its own group — otherwise ``killpg`` raises and we fall back
     to signalling only the direct child (the pre-R2 behavior).
+
+    POSIX-only: every caller reaches here behind a ``sys.platform`` gate,
+    and the ``_killpg`` binding is only ``None`` on win32.
     """
+    assert _killpg is not None
     try:
-        os.killpg(pid, sig)
+        _killpg(pid, sig)
         return True
     except ProcessLookupError:
         return False
@@ -190,16 +213,153 @@ def _signal_process_group(pid: int, sig: int) -> bool:
             return False
 
 
-def kill_process_group(pid: int) -> bool:
+@lru_cache(maxsize=1)
+def _host_boot_token() -> str | None:
+    """Return a stable token for the current OS boot when available."""
+    if sys.platform.startswith("linux"):
+        try:
+            return Path("/proc/sys/kernel/random/boot_id").read_text(encoding="utf-8").strip()
+        except OSError:
+            return None
+    if sys.platform == "darwin":
+        try:
+            result = subprocess.run(
+                ["sysctl", "-n", "kern.boottime"],
+                capture_output=True,
+                check=False,
+                text=True,
+                timeout=1,
+            )
+        except (OSError, subprocess.SubprocessError):
+            return None
+        return result.stdout.strip() or None
+    return None
+
+
+def process_identity(pid: int) -> str | None:
+    """Fingerprint one process incarnation, not merely its reusable pid."""
+    if pid <= 0:
+        return None
+    boot = _host_boot_token()
+    if not boot:
+        return None
+    started: str | None = None
+    if sys.platform.startswith("linux"):
+        try:
+            raw = Path(f"/proc/{pid}/stat").read_text(encoding="utf-8")
+            # Field 2 is parenthesized and may contain spaces. Fields after its
+            # final ')' start at process state; starttime is field 22 => index 19.
+            fields = raw.rsplit(")", 1)[1].split()
+            started = fields[19]
+        except (OSError, IndexError):
+            return None
+    elif sys.platform == "darwin":
+        try:
+            result = subprocess.run(
+                ["ps", "-o", "lstart=", "-p", str(pid)],
+                capture_output=True,
+                check=False,
+                text=True,
+                timeout=1,
+            )
+        except (OSError, subprocess.SubprocessError):
+            return None
+        if result.returncode == 0:
+            started = result.stdout.strip() or None
+    if not started:
+        return None
+    return hashlib.sha256(f"{boot}\0{pid}\0{started}".encode()).hexdigest()
+
+
+def process_group_exists(pid: int) -> bool | None:
+    """Return whether a process group has a non-zombie member."""
+    if pid <= 0 or sys.platform == "win32":
+        return None
+    try:
+        os.killpg(pid, 0)
+    except ProcessLookupError:
+        return False
+    except (PermissionError, OSError):
+        return None
+    try:
+        group_flag = "--pgroup" if sys.platform.startswith("linux") else "-g"
+        result = subprocess.run(
+            ["ps", "-o", "stat=", group_flag, str(pid)],
+            capture_output=True,
+            check=False,
+            text=True,
+            timeout=1,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if result.returncode not in (0, 1):
+        return None
+    statuses = [line.strip() for line in result.stdout.splitlines() if line.strip()]
+    if not statuses:
+        return False if result.returncode == 1 else None
+    return any(not status.upper().startswith("Z") for status in statuses)
+
+
+def _taskkill_tree(pid: int, *, force: bool = True) -> bool:
+    """Windows process-tree termination via ``taskkill /PID <pid> /T [/F]``.
+
+    ``/T`` walks the whole descendant tree, so a ``bash -lc <agent cli>``
+    wrapper and the real agent CLI grandchildren go down together — the
+    Windows equivalent of SIGKILLing a POSIX process group. Output is
+    discarded and every failure mode (missing taskkill, dead pid, access
+    denied, taskkill hanging past ``_TASKKILL_TIMEOUT_S``) collapses to
+    ``False`` so callers can fall back to their own ladders.
+    """
+    cmd = ["taskkill", "/PID", str(pid), "/T"]
+    if force:
+        cmd.append("/F")
+    try:
+        completed = subprocess.run(
+            cmd,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            check=False,
+            timeout=_TASKKILL_TIMEOUT_S,
+        )
+    except subprocess.TimeoutExpired:
+        return False
+    except OSError:
+        return False
+    return completed.returncode == 0
+
+
+def kill_process_group(pid: int, *, identity: str | None = None) -> bool:
     """Sync best-effort SIGKILL of a process group by pid.
 
     For force-eject paths that hold only a recorded pid (no proc object to
     reap through). The killed children are reaped by the asyncio child
     watcher or become inherited zombies until process exit — still strictly
     better than a live agent CLI burning tokens in a reused worktree.
+
+    ``identity`` is an optional :func:`process_identity` fingerprint
+    captured when the pid was recorded. When provided and the live pid's
+    fingerprint no longer matches (the process died and the OS reused its
+    pid), the kill is skipped: signalling would hit an unrelated process
+    tree. Without an identity the kill proceeds as before — recorded pids
+    predate the fingerprint machinery — but the hazard is logged once per
+    process. Callers that can capture an identity should pass it; wiring
+    the orchestrator call sites to do so is tracked for the core.py lane.
     """
-    if sys.platform == "win32":
+    global _warned_kill_without_identity
+    if identity is not None and process_identity(pid) != identity:
+        log.warning("kill_process_group_identity_mismatch", pid=pid)
         return False
+    if identity is None and not _warned_kill_without_identity:
+        _warned_kill_without_identity = True
+        get_logger().warning(
+            "kill_process_group_without_identity",
+            pid=pid,
+            hint="pid reuse could kill an unrelated process tree; "
+            "capture process_identity() when the pid is recorded",
+        )
+    if sys.platform == "win32":
+        # No process groups — taskkill /T is the closest tree-wide analog.
+        return _taskkill_tree(pid)
     return _signal_process_group(pid, signal.SIGKILL)
 
 
@@ -213,12 +373,39 @@ async def terminate_process_tree(
     children, which keep running and burning tokens. Both waits are bounded
     so a caller can never hang on an unreapable child; returns the exit
     code, or ``None`` if the process could not be reaped in time.
+
+    On Windows there are no process groups or signals; the tree is taken
+    down with ``taskkill /T /F`` first (itself bounded at
+    ``_TASKKILL_TIMEOUT_S`` — ``_taskkill_tree`` converts a hang into
+    ``False``), with the single-process terminate/kill ladder kept as a
+    fallback for taskkill-less hosts.
     """
     if proc.returncode is not None:
         return proc.returncode
     pid = proc.pid
-    if sys.platform == "win32" or pid is None:
-        # No POSIX process groups — single-process ladder.
+    if sys.platform == "win32":
+        if pid is not None:
+            # `_taskkill_tree` never raises (OSError/timeout collapse to
+            # False internally), so there is nothing to guard here.
+            await asyncio.to_thread(_taskkill_tree, pid)
+        try:
+            proc.terminate()
+        except OSError:
+            # ProcessLookupError (already gone) or PermissionError
+            # (already terminated but not yet reaped) — both are fine;
+            # safe_proc_wait below is the source of truth.
+            pass
+        rc = await safe_proc_wait(proc, timeout=term_timeout)
+        if rc is None and proc.returncode is None:
+            try:
+                proc.kill()
+            except OSError:
+                pass
+            rc = await safe_proc_wait(proc, timeout=kill_timeout)
+        return proc.returncode if proc.returncode is not None else rc
+
+    if pid is None:
+        # No pid to signal — single-process ladder.
         try:
             proc.terminate()
         except ProcessLookupError:

@@ -1,7 +1,7 @@
 from pathlib import Path
 import tomllib
 
-from symphony.workflow import build_service_config, load_workflow
+from symphony.workflow import build_service_config, load_workflow, parse_workflow_text
 
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -62,9 +62,12 @@ def test_root_file_default_is_factory_and_advanced_profile_remains_compatible() 
     cfg = build_service_config(load_workflow(ROOT / "WORKFLOW.file.example.md"))
     assert cfg.tracker.active_states == ("Ready", "Build", "Verify")
     advanced = build_service_config(
-        load_workflow(ROOT / "examples/advanced/WORKFLOW.file.example.md")
+        parse_workflow_text(
+            (ROOT / "examples/advanced/WORKFLOW.file.example.md").read_text(encoding="utf-8"),
+            ROOT / "WORKFLOW.file.example.md",
+        )
     )
-    assert advanced.tracker.active_states == ("Todo", "In Progress", "Verify", "Learn")
+    assert advanced.tracker.active_states == ("Todo", "In Progress", "Verify", "Document")
 
 
 def test_factory_template_has_delivery_and_bounded_opencode_policy() -> None:
@@ -72,6 +75,9 @@ def test_factory_template_has_delivery_and_bounded_opencode_policy() -> None:
         load_workflow(ROOT / "src/symphony/factory/templates/WORKFLOW.md")
     )
     assert cfg.agent.auto_merge_on_done is True
+    assert cfg.agent.auto_merge_push_target is False
+    assert cfg.agent.auto_recover_blocked is False
+    assert cfg.agent.stage_contracts_enabled(cfg.tracker.active_states) is True
     assert cfg.agent.max_turns == 8
     assert cfg.agent.max_total_turns == 5
     assert cfg.agent.max_state_turns_by_state == {
@@ -115,7 +121,7 @@ def test_factory_verify_prompt_matches_machine_table_contract() -> None:
 
 def test_root_advanced_workflow_remains_compatible() -> None:
     cfg = build_service_config(load_workflow(ROOT / "WORKFLOW.md"))
-    assert cfg.tracker.active_states == ("Todo", "In Progress", "Verify", "Learn")
+    assert cfg.tracker.active_states == ("Todo", "In Progress", "Verify", "Document")
 
 
 def test_runtime_template_is_packaged_with_symphony() -> None:

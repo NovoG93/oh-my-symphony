@@ -59,6 +59,7 @@ from typing import Any
 import pytest
 
 import symphony.orchestrator.core as core_mod
+from symphony.errors import LinearUnknownPayload
 from symphony.issue import Issue
 from symphony.orchestrator import Orchestrator, RunningEntry
 from symphony.trackers.file import (
@@ -72,6 +73,7 @@ from symphony.workflow import (
     GeminiConfig,
     HooksConfig,
     PiConfig,
+    PrimeAgentConfig,
     PromptConfig,
     ServerConfig,
     ServiceConfig,
@@ -230,9 +232,7 @@ class _TicketMutatingBackend:
     async def initialize(self) -> None:
         self.calls.append(("initialize", {}))
 
-    async def start_session(
-        self, *, initial_prompt: str, issue_title: str
-    ) -> None:
+    async def start_session(self, *, initial_prompt: str, issue_title: str) -> None:
         self.session_id = f"fake-session-{self.init_id}"
         self.calls.append(
             (
@@ -252,9 +252,7 @@ class _TicketMutatingBackend:
         new_state, body = self.transitions.pop(0)
         front, _ = parse_ticket_file(self.ticket_path)
         front["state"] = new_state
-        front["updated_at"] = datetime.now(timezone.utc).strftime(
-            "%Y-%m-%dT%H:%M:%SZ"
-        )
+        front["updated_at"] = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
         write_ticket_atomic(self.ticket_path, front, body)
 
     async def stop(self) -> None:
@@ -317,8 +315,7 @@ def _make_file_tracker_config(
     max_attempts: int = 3,
 ) -> ServiceConfig:
     template = (
-        "issue={{ issue.identifier }} state={{ issue.state }} "
-        "rewind={{ is_rewind }}"
+        "issue={{ issue.identifier }} state={{ issue.state }} rewind={{ is_rewind }}"
     )
     return ServiceConfig(
         workflow_path=Path("/tmp/WORKFLOW.md"),
@@ -371,6 +368,13 @@ def _make_file_tracker_config(
             stall_timeout_ms=300_000,
             resume_across_turns=True,
         ),
+        prime_agent=PrimeAgentConfig(
+            command="prime-agent -p --mode json",
+            turn_timeout_ms=3_600_000,
+            read_timeout_ms=5_000,
+            stall_timeout_ms=300_000,
+            resume_across_turns=True,
+        ),
         server=ServerConfig(port=None),
         tui=TuiConfig(language="en", visible_lanes=5),
         prompts=PromptConfig(),
@@ -403,9 +407,7 @@ def _orch(workspace_path: Path) -> Orchestrator:
     return o
 
 
-def _seed_running_entry(
-    o: Orchestrator, issue: Issue, workspace_path: Path
-) -> None:
+def _seed_running_entry(o: Orchestrator, issue: Issue, workspace_path: Path) -> None:
     o._running[issue.id] = RunningEntry(
         issue=issue,
         started_at=datetime.now(timezone.utc),
@@ -466,9 +468,9 @@ def test_contract_passes_when_disk_has_required_sections(
     )
     cfg = _make_file_tracker_config(
         board_root=board_root,
-            active_states=("In Progress", "Verify", "Learn"),
-            max_turns=2,
-        )
+        active_states=("In Progress", "Verify", "Document"),
+        max_turns=2,
+    )
 
     _install_file_tracker_backend(
         monkeypatch,
@@ -518,7 +520,7 @@ def test_contract_fails_when_disk_missing_sections(
     )
     cfg = _make_file_tracker_config(
         board_root=board_root,
-        active_states=("In Progress", "Verify", "Learn"),
+        active_states=("In Progress", "Verify", "Document"),
         max_turns=2,
     )
 
@@ -550,7 +552,358 @@ def test_contract_fails_when_disk_missing_sections(
     )
 
 
-_FACTORY_VERIFY_BODY = """## Acceptance criteria
+_DOCUMENT_BODY_COMPLETE = """## Wiki Updates
+
+- docs/llm-wiki/feature.md (created)
+
+## As-Is -> To-Be Report
+
+### Goal
+ship it
+"""
+
+_DOCUMENT_BODY_MISSING_WIKI = """## Learnings
+
+- nothing durable
+"""
+
+
+def test_document_to_done_is_contract_gated(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The move INTO Done is a contract transition too.
+
+    Terminal transitions never reach `_transition_agent_phase` (the worker
+    loop stops first), so until the terminal gate in
+    `attempt._post_turn_refresh` the last gate of the default board —
+    Document -> Done — was prompt-only. A Document turn that skips
+    `## Wiki Updates` must be rewound to Document with a `## Contract
+    Failure` note instead of landing in Done.
+    """
+    board_root = tmp_path / "board"
+    ticket_path = _write_initial_ticket(
+        board_root, state="Document", body=_DOCUMENT_BODY_MISSING_WIKI
+    )
+    cfg = _make_file_tracker_config(
+        board_root=board_root,
+        active_states=("In Progress", "Verify", "Document"),
+        max_turns=2,
+    )
+    _install_file_tracker_backend(
+        monkeypatch,
+        ticket_path=ticket_path,
+        transitions=[("Done", _DOCUMENT_BODY_MISSING_WIKI)],
+    )
+    workspace_path = tmp_path / "workspace"
+    workspace_path.mkdir()
+    o = _orch(workspace_path)
+    issue = _make_issue_from_disk("Document", _DOCUMENT_BODY_MISSING_WIKI)
+    _seed_running_entry(o, issue, workspace_path)
+
+    asyncio.run(o._run_agent_attempt(issue, attempt=None, cfg=cfg))
+
+    final_front, final_body = parse_ticket_file(ticket_path)
+    assert _has_contract_failure_heading(final_body), final_body
+    assert "## Wiki Updates" in final_body
+    assert final_front["state"] == "Document", final_front["state"]
+
+
+def test_document_to_done_passes_with_wiki_and_report(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    board_root = tmp_path / "board"
+    ticket_path = _write_initial_ticket(
+        board_root, state="Document", body=_DOCUMENT_BODY_COMPLETE
+    )
+    cfg = _make_file_tracker_config(
+        board_root=board_root,
+        active_states=("In Progress", "Verify", "Document"),
+        max_turns=2,
+    )
+    _install_file_tracker_backend(
+        monkeypatch,
+        ticket_path=ticket_path,
+        transitions=[("Done", _DOCUMENT_BODY_COMPLETE)],
+    )
+    workspace_path = tmp_path / "workspace"
+    workspace_path.mkdir()
+    o = _orch(workspace_path)
+    issue = _make_issue_from_disk("Document", _DOCUMENT_BODY_COMPLETE)
+    _seed_running_entry(o, issue, workspace_path)
+
+    asyncio.run(o._run_agent_attempt(issue, attempt=None, cfg=cfg))
+
+    final_front, final_body = parse_ticket_file(ticket_path)
+    assert not _has_contract_failure_heading(final_body), final_body
+    assert final_front["state"] == "Done"
+
+
+def test_blocked_is_never_contract_gated(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A lane may give up without its outputs; only Done is gated."""
+    board_root = tmp_path / "board"
+    ticket_path = _write_initial_ticket(
+        board_root, state="Document", body=_DOCUMENT_BODY_MISSING_WIKI
+    )
+    cfg = _make_file_tracker_config(
+        board_root=board_root,
+        active_states=("In Progress", "Verify", "Document"),
+        max_turns=2,
+    )
+    _install_file_tracker_backend(
+        monkeypatch,
+        ticket_path=ticket_path,
+        transitions=[("Blocked", _DOCUMENT_BODY_MISSING_WIKI + "\n## Blocker\n\nno wiki root")],
+    )
+    workspace_path = tmp_path / "workspace"
+    workspace_path.mkdir()
+    o = _orch(workspace_path)
+    issue = _make_issue_from_disk("Document", _DOCUMENT_BODY_MISSING_WIKI)
+    _seed_running_entry(o, issue, workspace_path)
+
+    asyncio.run(o._run_agent_attempt(issue, attempt=None, cfg=cfg))
+
+    final_front, final_body = parse_ticket_file(ticket_path)
+    assert not _has_contract_failure_heading(final_body)
+    assert final_front["state"] == "Blocked"
+
+
+def test_contract_rewind_survives_mid_turn_running_entry_refresh(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A poll tick that refreshes ``running.issue`` to the *advanced* state
+    while the turn is still in flight must not defeat the rewind.
+
+    Live e2e (2026-09-06, pi/glm): the agent wrote ``state: Verify`` mid-turn,
+    the reconcile tick copied it into the running entry, and the rewind was
+    written with ``producing_state_raw == "Verify"`` — recorded in stats as
+    ``verify -> verify`` while the ticket note claimed a rewind.
+    """
+    import symphony.orchestrator.attempt as attempt_mod
+
+    board_root = tmp_path / "board"
+    ticket_path = _write_initial_ticket(
+        board_root, state="In Progress", body=_IN_PROGRESS_BODY_MISSING_DONE_SIGNALS
+    )
+    cfg = _make_file_tracker_config(
+        board_root=board_root,
+        active_states=("In Progress", "Verify", "Document"),
+        max_turns=2,
+    )
+    _install_file_tracker_backend(
+        monkeypatch,
+        ticket_path=ticket_path,
+        transitions=[("Verify", _IN_PROGRESS_BODY_MISSING_DONE_SIGNALS)],
+    )
+    workspace_path = tmp_path / "workspace"
+    workspace_path.mkdir()
+    (workspace_path / "docs" / "MT-1" / "work").mkdir(parents=True)
+    (workspace_path / "docs" / "MT-1" / "work" / "notes.md").write_text("ok")
+    o = _orch(workspace_path)
+    issue = _make_issue_from_disk("In Progress", _IN_PROGRESS_BODY_MISSING_DONE_SIGNALS)
+    _seed_running_entry(o, issue, workspace_path)
+
+    original_hooks = attempt_mod._after_turn_hooks
+
+    async def hooks_then_simulate_poll_tick(orch: Any, st: Any) -> None:
+        await original_hooks(orch, st)
+        # Simulate the reconcile tick landing before the turn boundary.
+        running = orch._running[st.running_issue_id]
+        running.issue = replace(running.issue, state="Verify")
+
+    monkeypatch.setattr(attempt_mod, "_after_turn_hooks", hooks_then_simulate_poll_tick)
+
+    asyncio.run(o._run_agent_attempt(issue, attempt=None, cfg=cfg))
+
+    final_front, final_body = parse_ticket_file(ticket_path)
+    assert _has_contract_failure_heading(final_body)
+    assert final_front["state"] == "In Progress", (
+        f"rewind was a no-op; final state {final_front['state']!r}"
+    )
+
+
+def test_full_refresh_payload_failure_records_error_and_rewinds(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    board_root = tmp_path / "board"
+    ticket_path = _write_initial_ticket(
+        board_root, state="In Progress", body=_IN_PROGRESS_BODY_COMPLETE
+    )
+    cfg = _make_file_tracker_config(
+        board_root=board_root,
+        active_states=("In Progress", "Verify", "Document"),
+        max_turns=2,
+    )
+    _install_file_tracker_backend(
+        monkeypatch,
+        ticket_path=ticket_path,
+        transitions=[("Verify", _IN_PROGRESS_BODY_COMPLETE)],
+    )
+
+    workspace_path = tmp_path / "workspace"
+    workspace_path.mkdir()
+    (workspace_path / "docs" / "MT-1" / "work").mkdir(parents=True)
+    (workspace_path / "docs" / "MT-1" / "work" / "notes.md").write_text("ok")
+    orchestrator = _orch(workspace_path)
+    issue = _make_issue_from_disk("In Progress", _IN_PROGRESS_BODY_COMPLETE)
+    _seed_running_entry(orchestrator, issue, workspace_path)
+
+    warnings: list[tuple[str, dict[str, Any]]] = []
+    recorded_errors: list[str] = []
+    recorded_descriptions: list[str | None] = []
+    original_record_tracker_error = orchestrator._record_tracker_error
+
+    def fail_full_refresh(*_args: Any) -> Issue:
+        raise LinearUnknownPayload("issue.inverseRelations incomplete")
+
+    def record_tracker_error(issue_id: str, exc: Exception | str) -> None:
+        recorded_errors.append(str(exc))
+        recorded_descriptions.append(orchestrator._running[issue_id].issue.description)
+        original_record_tracker_error(issue_id, exc)
+
+    monkeypatch.setattr(
+        Orchestrator,
+        "_tracker_call_full_by_id",
+        staticmethod(fail_full_refresh),
+    )
+    monkeypatch.setattr(orchestrator, "_record_tracker_error", record_tracker_error)
+    monkeypatch.setattr(
+        core_mod.log,
+        "warning",
+        lambda event, **fields: warnings.append((event, fields)),
+    )
+
+    asyncio.run(orchestrator._run_agent_attempt(issue, attempt=None, cfg=cfg))
+
+    final_front, final_body = parse_ticket_file(ticket_path)
+    assert any(event == "issue_full_refresh_failed" for event, _fields in warnings)
+    assert any(
+        error == "linear_unknown_payload: issue.inverseRelations incomplete"
+        for error in recorded_errors
+    )
+    assert recorded_descriptions
+    assert all(description is None for description in recorded_descriptions)
+    assert _has_contract_failure_heading(final_body)
+    assert final_front["state"] == "In Progress"
+
+
+def test_qa_scorecard_fail_warns_without_rewind(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Soft S2 warning path end-to-end against a real FileBoardTracker.
+
+    A Verify ticket that passes the presence + evidence contract but carries a
+    ``fail`` AC Scorecard row must NOT rewind. The orchestrator's
+    ``elif contract.warnings:`` branch appends a ``## Contract Warning``
+    note and lets the ticket advance past Verify. The contracts-layer unit
+    tests cover ``_scorecard_all_pass``; this guards the orchestrator
+    wiring (the core.py branch) against the same stale-body / phantom
+    refresh class of bug the rewind tests above guard.
+    """
+    board_root = tmp_path / "board"
+    ticket_path = _write_initial_ticket(
+        board_root, state="Verify", body=_VERIFY_BODY_SCORECARD_FAIL
+    )
+    cfg = _make_file_tracker_config(
+        board_root=board_root,
+        active_states=("Verify", "Document"),
+        max_turns=2,
+    )
+
+    _install_file_tracker_backend(
+        monkeypatch,
+        ticket_path=ticket_path,
+        transitions=[("Document", _VERIFY_BODY_SCORECARD_FAIL)],
+    )
+
+    workspace_path = tmp_path / "workspace"
+    workspace_path.mkdir()
+    qa_dir = workspace_path / "docs" / "MT-1" / "qa"
+    qa_dir.mkdir(parents=True)
+    (qa_dir / "security.md").write_text("security evidence")
+    (qa_dir / "happy.log").write_text("200")
+    (qa_dir / "edge.log").write_text("400")
+    o = _orch(workspace_path)
+    issue = _make_issue_from_disk("Verify", _VERIFY_BODY_SCORECARD_FAIL)
+    _seed_running_entry(o, issue, workspace_path)
+
+    asyncio.run(o._run_agent_attempt(issue, attempt=None, cfg=cfg))
+
+    final_front, final_body = parse_ticket_file(ticket_path)
+    assert _has_contract_warning_heading(final_body), (
+        "Soft scorecard warning did not append a ## Contract Warning "
+        "heading. Body was:\n" + final_body
+    )
+    assert not _has_contract_failure_heading(final_body), (
+        "Soft scorecard warning incorrectly escalated to a ## Contract Failure rewind."
+    )
+    assert final_front["state"] != "Verify", (
+        "Soft scorecard warning incorrectly rewound the ticket instead of "
+        f"advancing past Verify. Final state was {final_front['state']!r}."
+    )
+
+
+def test_stage_kinds_route_backend_kind_into_backend_factory(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`agent.stage_kinds` routing must reach `BackendInit.cfg.agent.kind` —
+    the config the worker actually builds its agent process from — not just
+    the bookkeeping fields on the running entry."""
+    board_root = tmp_path / "board"
+    ticket_path = _write_initial_ticket(
+        board_root, state="In Progress", body=_IN_PROGRESS_BODY_COMPLETE
+    )
+    cfg = _make_file_tracker_config(
+        board_root=board_root,
+        active_states=("In Progress", "Verify", "Document"),
+        max_turns=2,
+    )
+    cfg = replace(
+        cfg,
+        agent=replace(
+            cfg.agent, stage_kinds={"in progress": "claude", "verify": "gemini"}
+        ),
+    )
+
+    instances = _install_file_tracker_backend(
+        monkeypatch,
+        ticket_path=ticket_path,
+        transitions=[("Verify", _IN_PROGRESS_BODY_COMPLETE)],
+    )
+
+    workspace_path = tmp_path / "workspace"
+    workspace_path.mkdir()
+    (workspace_path / "docs" / "MT-1" / "work").mkdir(parents=True)
+    (workspace_path / "docs" / "MT-1" / "work" / "notes.md").write_text("ok")
+    o = _orch(workspace_path)
+    issue = _make_issue_from_disk("In Progress", _IN_PROGRESS_BODY_COMPLETE)
+    _seed_running_entry(o, issue, workspace_path)
+
+    asyncio.run(o._run_agent_attempt(issue, attempt=None, cfg=cfg))
+
+    assert instances, "backend factory was never called"
+    assert instances[0].calls[0] == ("factory", {"agent_kind": "claude"})
+    # F-01: a ticket that walks In Progress -> Verify inside ONE dispatch must
+    # get Verify's backend on the rebuild, not the lane it started in.
+    assert len(instances) > 1, (
+        "phase transition did not rebuild a backend; the routing assertion "
+        "below would be vacuous"
+    )
+    assert instances[1].calls[0] == ("factory", {"agent_kind": "gemini"}), (
+        "stage_kinds was not re-resolved at the in-run phase transition — "
+        f"got {instances[1].calls[0]!r}"
+    )
+    entry = o._running.get("MT-1")
+    if entry is not None:
+        assert entry.agent_kind == "gemini"
+
+
+_FACTORY_VERIFY_BODY = """## Proof commands
+
+- `python -m unittest -q`
+
+## Acceptance criteria
 
 - verified
 
@@ -587,7 +940,12 @@ def test_factory_verify_to_done_enforces_contract_before_terminal_exit(
     _install_file_tracker_backend(
         monkeypatch,
         ticket_path=ticket_path,
-        transitions=[("Done", body)],
+        transitions=[
+            (
+                "Done",
+                body + "\nVerified at: 2026-10-17T00:00:00Z\nOutput: 1 test passed\n",
+            )
+        ],
     )
     workspace_path = tmp_path / "workspace"
     workspace_path.mkdir()
@@ -637,58 +995,175 @@ def test_token_cap_does_not_accept_unproven_factory_stage_advance(
     assert "## Budget Exceeded" in final_body
 
 
-def test_qa_scorecard_fail_warns_without_rewind(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+@pytest.mark.parametrize(
+    ("source", "destination", "body", "expected"),
+    [
+        (
+            "Build",
+            "Done",
+            "\n\n".join(
+                f"## {heading}\n\nComplete"
+                for heading in (
+                    "Implementation",
+                    "Full Spec Review",
+                    "Edge Case Review",
+                    "Adversarial Review",
+                    "Test Evidence",
+                )
+            ),
+            "Build",
+        ),
+        (
+            "Verify",
+            "Blocked",
+            "## Blocker\n\nRequired browser environment unavailable.",
+            "Blocked",
+        ),
+        ("Verify", "Blocked", "## Verification\n\npass", "Verify"),
+        (
+            "Verify",
+            "Build",
+            "## QA Failure\n\nExpected successful save, got HTTP 500.",
+            "Build",
+        ),
+    ],
+)
+def test_factory_worker_destination_gate(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    source: str,
+    destination: str,
+    body: str,
+    expected: str,
 ) -> None:
-    """Soft S2 warning path end-to-end against a real FileBoardTracker.
-
-    A Verify ticket that passes the presence + evidence contract but carries a
-    ``fail`` AC Scorecard row must NOT rewind. The orchestrator's
-    ``elif contract.warnings:`` branch appends a ``## Contract Warning``
-    note and lets the ticket advance past Verify. The contracts-layer unit
-    tests cover ``_scorecard_all_pass``; this guards the orchestrator
-    wiring (the core.py branch) against the same stale-body / phantom
-    refresh class of bug the rewind tests above guard.
-    """
     board_root = tmp_path / "board"
+    ticket_path = _write_initial_ticket(board_root, state=source, body="Start")
+    cfg = _make_file_tracker_config(
+        board_root=board_root, active_states=("Ready", "Build", "Verify"), max_turns=1
+    )
+    cfg.raw["contract_profile"] = "factory"
+    _install_file_tracker_backend(
+        monkeypatch, ticket_path=ticket_path, transitions=[(destination, body)]
+    )
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    orch = _orch(workspace)
+    issue = _make_issue_from_disk(source, "Start")
+    _seed_running_entry(orch, issue, workspace)
+
+    asyncio.run(orch._run_agent_attempt(issue, attempt=None, cfg=cfg))
+
+    assert parse_ticket_file(ticket_path)[0]["state"] == expected
+
+
+@pytest.mark.parametrize("fresh", [False, True])
+def test_factory_exit_gate_requires_fresh_verification(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    fresh: bool,
+) -> None:
+    from symphony.orchestrator.factory_contracts import factory_verification_text
+
+    board_root = tmp_path / "board"
+    body = _FACTORY_VERIFY_BODY + "\nVerified at: old run\nOutput: 1 test passed\n"
     ticket_path = _write_initial_ticket(
-        board_root, state="Verify", body=_VERIFY_BODY_SCORECARD_FAIL
+        board_root,
+        state="Done",
+        body=(
+            body + "\nVerified at: 2026-10-17T00:00:00Z\nOutput: 1 test passed\n"
+            if fresh
+            else body
+        ),
     )
     cfg = _make_file_tracker_config(
-        board_root=board_root,
-        active_states=("Verify", "Learn"),
-        max_turns=2,
+        board_root=board_root, active_states=("Ready", "Build", "Verify")
     )
+    cfg.raw["contract_profile"] = "factory"
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    orch = _orch(workspace)
+    issue = _make_issue_from_disk("Verify", body)
+    _seed_running_entry(orch, issue, workspace)
+    entry = orch._running.pop(issue.id)
+    entry.state_at_turn_start = "verify"
+    entry.factory_verification_baseline = factory_verification_text(body)
+    entry.factory_verify_completed = True
 
-    _install_file_tracker_backend(
+    passed = asyncio.run(orch._enforce_factory_exit_contract(cfg, entry))
+
+    assert passed is fresh
+    assert parse_ticket_file(ticket_path)[0]["state"] == ("Done" if fresh else "Verify")
+
+
+def test_factory_exit_rejects_worker_rewriting_both_declared_and_reported_proof(
+    tmp_path: Path,
+) -> None:
+    board_root = tmp_path / "board"
+    body = _FACTORY_VERIFY_BODY.replace("python -m unittest -q", "python easier.py")
+    ticket_path = _write_initial_ticket(board_root, state="Done", body=body)
+    cfg = _make_file_tracker_config(board_root=board_root, active_states=("Ready", "Build", "Verify"))
+    cfg.raw["contract_profile"] = "factory"
+    orch = _orch(tmp_path)
+    issue = _make_issue_from_disk("Verify", _FACTORY_VERIFY_BODY)
+    _seed_running_entry(orch, issue, tmp_path)
+    entry = orch._running[issue.id]
+    entry.state_at_turn_start = "verify"
+    orch._start_factory_verify_phase(cfg, issue, entry)
+    entry.factory_verify_completed = True
+
+    assert not asyncio.run(orch._enforce_factory_exit_contract(cfg, entry))
+    front, final_body = parse_ticket_file(ticket_path)
+    assert front["state"] == "Verify"
+    assert "declared proof commands changed" in final_body
+
+
+def test_factory_build_runs_independent_verify_context_before_done(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    ledger = "\n\n".join(
+        f"## {heading}\n\nComplete"
+        for heading in (
+            "Implementation",
+            "Full Spec Review",
+            "Edge Case Review",
+            "Adversarial Review",
+            "Test Evidence",
+        )
+    )
+    build_body = (
+        ledger
+        + "\n\n## Acceptance criteria\n\n- verified\n\n## Proof commands\n\n- `python -m unittest -q`\n"
+    )
+    done_body = (
+        ledger
+        + "\n\n"
+        + _FACTORY_VERIFY_BODY
+        + "\nVerified at: 2026-10-17T00:00:00Z\nOutput: 1 test passed\n"
+    )
+    board_root = tmp_path / "board"
+    ticket_path = _write_initial_ticket(board_root, state="Build", body=build_body)
+    cfg = _make_file_tracker_config(
+        board_root=board_root, active_states=("Ready", "Build", "Verify"), max_turns=3
+    )
+    cfg.raw["contract_profile"] = "factory"
+    backends = _install_file_tracker_backend(
         monkeypatch,
         ticket_path=ticket_path,
-        transitions=[("Learn", _VERIFY_BODY_SCORECARD_FAIL)],
+        transitions=[("Verify", build_body), ("Done", done_body)],
     )
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    orch = _orch(workspace)
+    issue = _make_issue_from_disk("Build", build_body)
+    _seed_running_entry(orch, issue, workspace)
 
-    workspace_path = tmp_path / "workspace"
-    workspace_path.mkdir()
-    qa_dir = workspace_path / "docs" / "MT-1" / "qa"
-    qa_dir.mkdir(parents=True)
-    (qa_dir / "security.md").write_text("security evidence")
-    (qa_dir / "happy.log").write_text("200")
-    (qa_dir / "edge.log").write_text("400")
-    o = _orch(workspace_path)
-    issue = _make_issue_from_disk("Verify", _VERIFY_BODY_SCORECARD_FAIL)
-    _seed_running_entry(o, issue, workspace_path)
+    asyncio.run(orch._run_agent_attempt(issue, attempt=None, cfg=cfg))
 
-    asyncio.run(o._run_agent_attempt(issue, attempt=None, cfg=cfg))
-
-    final_front, final_body = parse_ticket_file(ticket_path)
-    assert _has_contract_warning_heading(final_body), (
-        "Soft scorecard warning did not append a ## Contract Warning "
-        "heading. Body was:\n" + final_body
-    )
-    assert not _has_contract_failure_heading(final_body), (
-        "Soft scorecard warning incorrectly escalated to a "
-        "## Contract Failure rewind."
-    )
-    assert final_front["state"] != "Verify", (
-        "Soft scorecard warning incorrectly rewound the ticket instead of "
-        f"advancing past Verify. Final state was {final_front['state']!r}."
+    assert parse_ticket_file(ticket_path)[0]["state"] == "Done"
+    assert len(backends) == 2
+    assert "stop" in [call[0] for call in backends[0].calls]
+    assert (
+        sum(call[0] == "run_turn" for backend in backends for call in backend.calls)
+        == 2
     )

@@ -7,7 +7,15 @@ from pathlib import Path
 import pytest
 
 from symphony.orchestrator.parsing import _parse_findings_rows
-from symphony.orchestrator.contracts import ContractResult, evaluate_contract
+from tests._win_skips import requires_symlink_privilege
+from symphony.orchestrator.contracts import (
+    ContractResult,
+    board_uses_default_contracts,
+    contract_producing_states,
+    deep_vault_dir,
+    evaluate_contract,
+)
+from symphony.workflow.presets import board_uses_shipped_contracts
 
 
 def _complete_in_progress_body() -> str:
@@ -137,6 +145,52 @@ def test_verify_contract_passes_with_review_qa_scorecard_and_merge(
 
     assert result.passed is True
     assert result.missing == []
+
+
+def test_verify_contract_accepts_inline_merge_status_heading(
+    tmp_path: Path,
+) -> None:
+    """The shipped Verify prompt asks for
+    `## Merge Status: preflight clean, orchestrator will merge at Done`.
+    The matcher used to require a bare `## Merge Status` line, so every
+    prompt-compliant ticket failed the Verify contract (masked until the
+    2026-09-06 rewind fix made rewinds real)."""
+    docs_root = tmp_path / "docs"
+    _write_verify_artifacts(docs_root)
+    body = _complete_verify_body().replace(
+        "## Merge Status",
+        "## Merge Status: preflight clean, orchestrator will merge at Done",
+    )
+    assert "## Merge Status:" in body
+
+    result = evaluate_contract(
+        producing_state="Verify",
+        ticket_body=body,
+        identifier="SMA-1",
+        docs_root=docs_root,
+    )
+
+    assert result.passed is True, result.missing
+
+
+def test_section_heading_with_inline_text_but_no_body_counts_as_present(
+    tmp_path: Path,
+) -> None:
+    docs_root = tmp_path / "docs"
+    _write_verify_artifacts(docs_root)
+    body = _complete_verify_body()
+    start = body.index("## Merge Status")
+    end = body.find("\n## ", start + 1)
+    trimmed = body[:start] + "## Merge Status: preflight clean\n" + (body[end + 1:] if end != -1 else "")
+
+    result = evaluate_contract(
+        producing_state="Verify",
+        ticket_body=trimmed,
+        identifier="SMA-1",
+        docs_root=docs_root,
+    )
+
+    assert "## Merge Status" not in result.missing
 
 
 def test_verify_contract_reads_scorecard_result_by_header(tmp_path: Path) -> None:
@@ -594,9 +648,9 @@ def test_verify_scorecard_fail_row_warns_without_rewind(tmp_path: Path) -> None:
     assert "[contract-warn]" in result.warning_note
 
 
-def test_learn_contract_requires_completion_record_or_human_review() -> None:
+def test_document_contract_requires_completion_record_or_human_review() -> None:
     result = evaluate_contract(
-        producing_state="Learn",
+        producing_state="Document",
         ticket_body="## Wiki Updates\n- docs/llm-wiki/foo.md\n",
         identifier="SMA-1",
     )
@@ -605,9 +659,9 @@ def test_learn_contract_requires_completion_record_or_human_review() -> None:
     assert "one of `## As-Is -> To-Be Report` or `## Human Review`" in result.missing
 
 
-def test_learn_contract_passes_with_completion_record() -> None:
+def test_document_contract_passes_with_completion_record() -> None:
     result = evaluate_contract(
-        producing_state="Learn",
+        producing_state="Document",
         ticket_body="""
 ## Wiki Updates
 - docs/llm-wiki/foo.md
@@ -622,9 +676,9 @@ def test_learn_contract_passes_with_completion_record() -> None:
     assert result.passed is True
 
 
-def test_learn_contract_passes_with_intervention_handoff() -> None:
+def test_document_contract_passes_with_intervention_handoff() -> None:
     result = evaluate_contract(
-        producing_state="Learn",
+        producing_state="Learn",  # legacy lane name stays a supported alias
         ticket_body="""
 ## Wiki Updates
 - docs/llm-wiki/foo.md
@@ -668,6 +722,69 @@ merged
         docs_root=docs_root,
     )
 
+    assert result.passed is True
+
+
+def test_done_contract_requires_artifact_store_when_root_is_passed(
+    tmp_path: Path,
+) -> None:
+    docs_root = tmp_path / "docs"
+    (docs_root / "SMA-1" / "qa").mkdir(parents=True)
+    (docs_root / "SMA-1" / "qa" / "evidence.log").write_text("ok")
+    (docs_root / "SMA-1" / "work").mkdir(parents=True)
+    (docs_root / "SMA-1" / "work" / "feature.md").write_text("ok")
+    store_root = tmp_path / "artifacts"
+
+    body = """
+## As-Is -> To-Be Report
+### As-Is
+- old
+### To-Be
+- new
+
+## Merge Status
+merged
+"""
+
+    empty = evaluate_contract(
+        producing_state="Done",
+        ticket_body=body,
+        identifier="SMA-1",
+        docs_root=docs_root,
+        artifact_store_root=store_root,
+    )
+    assert empty.passed is False
+    assert any("no collected artifacts" in item for item in empty.missing)
+
+    (store_root / "SMA-1" / "files").mkdir(parents=True)
+    (store_root / "SMA-1" / "files" / "shot.png").write_bytes(b"png")
+    populated = evaluate_contract(
+        producing_state="Done",
+        ticket_body=body,
+        identifier="SMA-1",
+        docs_root=docs_root,
+        artifact_store_root=store_root,
+    )
+    assert populated.passed is True
+
+
+def test_done_contract_ignores_artifact_store_when_root_is_omitted(
+    tmp_path: Path,
+) -> None:
+    docs_root = tmp_path / "docs"
+    (docs_root / "SMA-1" / "qa").mkdir(parents=True)
+    (docs_root / "SMA-1" / "qa" / "evidence.log").write_text("ok")
+    (docs_root / "SMA-1" / "work").mkdir(parents=True)
+    (docs_root / "SMA-1" / "work" / "feature.md").write_text("ok")
+
+    result = evaluate_contract(
+        producing_state="Done",
+        ticket_body=(
+            "## As-Is -> To-Be Report\n### As-Is\n- old\n\n## Merge Status\nmerged\n"
+        ),
+        identifier="SMA-1",
+        docs_root=docs_root,
+    )
     assert result.passed is True
 
 
@@ -727,3 +844,224 @@ def test_contract_result_note_property_combines_heading_and_body() -> None:
     )
     assert result.note.startswith("## Contract Failure\n")
     assert "## Done Signals" in result.note
+
+
+def test_board_uses_default_contracts_accepts_default_and_legacy_lanes() -> None:
+    assert board_uses_default_contracts(("Todo", "In Progress", "Verify", "Document"))
+    assert board_uses_default_contracts(("Todo", "In Progress", "Verify", "Learn"))
+    assert board_uses_default_contracts(["todo", "IN PROGRESS"])
+
+
+def test_board_uses_default_contracts_rejects_deep_and_custom_lanes() -> None:
+    deep = (
+        "Intake",
+        "Research",
+        "Plan",
+        "Review",
+        "Build",
+        "QA",
+        "Verify",
+        "Document",
+    )
+    assert not board_uses_default_contracts(deep)
+    assert not board_uses_default_contracts(("Todo", "In Progress", "Staging"))
+
+
+@requires_symlink_privilege
+def test_done_artifact_gate_ignores_temp_files_and_symlinks(tmp_path: Path) -> None:
+    """An interrupted copy or a planted symlink must not satisfy the gate.
+
+    `_copy_into_store` writes `.tmp-artifact-*` then renames; a crash in
+    that window leaves the temp file behind. The gate must agree with what
+    the board's Artifacts list shows, which is the index, not the directory.
+    """
+    docs_root = tmp_path / "docs"
+    (docs_root / "SMA-1" / "qa").mkdir(parents=True)
+    (docs_root / "SMA-1" / "qa" / "evidence.log").write_text("ok")
+    (docs_root / "SMA-1" / "work").mkdir(parents=True)
+    (docs_root / "SMA-1" / "work" / "feature.md").write_text("ok")
+    body = "## As-Is -> To-Be Report\n### As-Is\n- old\n\n## Merge Status\nmerged\n"
+    files = tmp_path / "artifacts" / "SMA-1" / "files"
+    files.mkdir(parents=True)
+
+    def verdict() -> bool:
+        return evaluate_contract(
+            producing_state="Done",
+            ticket_body=body,
+            identifier="SMA-1",
+            docs_root=docs_root,
+            artifact_store_root=tmp_path / "artifacts",
+        ).passed
+
+    (files / ".tmp-artifact-abc123").write_bytes(b"partial")
+    assert verdict() is False, "leftover temp file must not pass the gate"
+
+    outside = tmp_path / "outside.txt"
+    outside.write_text("secret")
+    (files / "planted.txt").symlink_to(outside)
+    assert verdict() is False, "a symlink must not pass the gate"
+
+    (files / "real.png").write_bytes(b"png")
+    assert verdict() is True
+
+
+# ---------------------------------------------------------------------------
+# deep preset contract set
+# ---------------------------------------------------------------------------
+
+_DEEP_LANES = ("Intake", "Research", "Plan", "Review", "Build", "QA", "Verify", "Document")
+
+
+def _deep(
+    state: str,
+    body: str,
+    docs_root: Path,
+    *,
+    request: str | None = "REQ-A",
+    advanced_state: str = "done",
+    app_release: bool = False,
+    identifier: str = "REQ-1",
+) -> ContractResult:
+    return evaluate_contract(
+        state,
+        body,
+        identifier,
+        docs_root=docs_root,
+        preset="deep",
+        request=request,
+        advanced_state=advanced_state,
+        app_release=app_release,
+    )
+
+
+def _vault(docs_root: Path, request: str | None = "REQ-A", identifier: str = "REQ-1") -> Path:
+    vault = deep_vault_dir(docs_root, identifier, request)
+    vault.mkdir(parents=True, exist_ok=True)
+    return vault
+
+
+def test_shipped_contracts_cover_default_and_exact_deep_lanes() -> None:
+    assert board_uses_shipped_contracts(("Todo", "In Progress", "Verify", "Document"))
+    assert board_uses_shipped_contracts(_DEEP_LANES)
+    assert board_uses_shipped_contracts(tuple(lane.lower() for lane in _DEEP_LANES))
+    assert not board_uses_shipped_contracts(_DEEP_LANES[:-1])
+    assert not board_uses_shipped_contracts(("Todo", "In Progress", "Staging"))
+    assert contract_producing_states("deep") == frozenset(
+        lane.lower() for lane in _DEEP_LANES
+    )
+    assert "done" in contract_producing_states(None)
+    assert "intake" not in contract_producing_states("default")
+
+
+def test_deep_vault_dir_prefers_request_group() -> None:
+    root = Path("/ws/docs")
+    assert deep_vault_dir(root, "BUILD-1", "todo-app") == root / "req" / "todo-app"
+    assert deep_vault_dir(root, "BUILD-1", "  ") == root / "BUILD-1"
+    assert deep_vault_dir(root, "BUILD-1", None) == root / "BUILD-1"
+
+
+def test_deep_intake_requires_brief_section_and_vault_file(tmp_path: Path) -> None:
+    result = _deep("Intake", "## Brief\n\nfeature", tmp_path)
+    assert result.passed is False
+    assert any("brief.md" in item for item in result.missing)
+
+    (_vault(tmp_path) / "brief.md").write_text("# Brief\n\nGoal", encoding="utf-8")
+    assert _deep("Intake", "## Brief\n\nfeature", tmp_path).passed is True
+    missing = _deep("Intake", "no section here", tmp_path).missing
+    assert missing == ["## Brief"]
+
+
+def test_deep_contract_uses_identifier_vault_without_request(tmp_path: Path) -> None:
+    (_vault(tmp_path, request=None) / "research.md").write_text("facts", encoding="utf-8")
+    assert _deep("Research", "## Research\n\nx", tmp_path, request=None).passed is True
+    assert _deep("Research", "## Research\n\nx", tmp_path, request="other").passed is False
+
+
+def test_deep_plan_requires_plan_and_contracts_files(tmp_path: Path) -> None:
+    vault = _vault(tmp_path)
+    (vault / "plan.md").write_text("# Plan", encoding="utf-8")
+    result = _deep("Plan", "## Plan Summary\n\nBUILD-1", tmp_path)
+    assert result.passed is False
+    assert [item for item in result.missing if "contracts.md" in item]
+    (vault / "contracts.md").write_text("# Contracts", encoding="utf-8")
+    assert _deep("Plan", "## Plan Summary\n\nBUILD-1", tmp_path).passed is True
+
+
+def test_deep_review_to_done_requires_pass_verdict_line(tmp_path: Path) -> None:
+    vault = _vault(tmp_path)
+    (vault / "review.md").write_text("objection stands\n", encoding="utf-8")
+    to_done = _deep("Review", "## Objections\n\nrow", tmp_path, advanced_state="Done")
+    assert to_done.passed is False
+    assert any("verdict: PASS" in item for item in to_done.missing)
+    # A third objection round escalates to Human Review: no PASS is expected.
+    to_human = _deep(
+        "Review", "## Objections\n\nrow", tmp_path, advanced_state="Human Review"
+    )
+    assert to_human.passed is True
+
+    (vault / "review.md").write_text("counterargument\nverdict: PASS\n", encoding="utf-8")
+    assert _deep("Review", "holds", tmp_path, advanced_state="done").passed is True
+    # Prose mentioning the verdict is not the gate line.
+    (vault / "review.md").write_text("the verdict: PASS would be premature", encoding="utf-8")
+    assert _deep("Review", "holds", tmp_path, advanced_state="done").passed is False
+
+
+def test_deep_build_requires_a_claim_naming_the_ticket(tmp_path: Path) -> None:
+    vault = _vault(tmp_path)
+    body = "## Implementation\n\nchanged x"
+    assert _deep("Build", body, tmp_path, identifier="BUILD-2").passed is False
+    (vault / "claims.md").write_text(
+        "## 2026-09-12T00:00:00Z BUILD-1\n- implemented: a\n", encoding="utf-8"
+    )
+    result = _deep("Build", body, tmp_path, identifier="BUILD-2")
+    assert result.passed is False
+    assert any("BUILD-2" in item for item in result.missing)
+    with (vault / "claims.md").open("a", encoding="utf-8") as fh:
+        fh.write("\n## 2026-09-12T01:00:00Z BUILD-2\n- implemented: b\n")
+    assert _deep("Build", body, tmp_path, identifier="BUILD-2").passed is True
+    assert _deep("Build", "no section", tmp_path, identifier="BUILD-2").missing == [
+        "## Implementation"
+    ]
+
+
+def test_deep_qa_requires_a_verdict_line(tmp_path: Path) -> None:
+    vault = _vault(tmp_path)
+    (vault / "qa-report.md").write_text("flows ok\n", encoding="utf-8")
+    assert _deep("QA", "", tmp_path).passed is False
+    (vault / "qa-report.md").write_text("flows ok\nVerdict: BLOCKED\n", encoding="utf-8")
+    assert _deep("QA", "", tmp_path).passed is True
+    (vault / "qa-report.md").write_text("Verdict: APPROVED\n", encoding="utf-8")
+    assert _deep("QA", "", tmp_path).passed is True
+
+
+def test_deep_verify_requires_green_or_red_and_exempts_app_release(
+    tmp_path: Path,
+) -> None:
+    vault = _vault(tmp_path)
+    assert _deep("Verify", "", tmp_path).passed is False
+    (vault / "verification.md").write_text("claims re-run\n", encoding="utf-8")
+    result = _deep("Verify", "", tmp_path)
+    assert result.passed is False
+    assert any("verdict: GREEN" in item for item in result.missing)
+    (vault / "verification.md").write_text("claims re-run\nverdict: RED\n", encoding="utf-8")
+    assert _deep("Verify", "", tmp_path).passed is True
+    # The host release cycle owns the app-release verifier's gate.
+    (vault / "verification.md").unlink()
+    assert _deep("Verify", "", tmp_path, app_release=True).passed is True
+
+
+def test_deep_document_requires_delivery_record(tmp_path: Path) -> None:
+    vault = _vault(tmp_path)
+    assert _deep("Document", "## Delivery\n\nshipped", tmp_path).passed is False
+    (vault / "delivery.md").write_text("# Delivery", encoding="utf-8")
+    assert _deep("Document", "## Delivery\n\nshipped", tmp_path).passed is True
+    assert _deep("Document", "", tmp_path).missing == ["## Delivery"]
+
+
+def test_deep_preset_never_applies_default_section_lists(tmp_path: Path) -> None:
+    """Deep Verify/Document share lane names with the default preset."""
+    vault = _vault(tmp_path)
+    (vault / "verification.md").write_text("verdict: GREEN\n", encoding="utf-8")
+    assert _deep("Verify", "", tmp_path).passed is True
+    assert _deep("Done", "", tmp_path).passed is True
+    assert evaluate_contract("Verify", "", "REQ-1", docs_root=tmp_path).passed is False

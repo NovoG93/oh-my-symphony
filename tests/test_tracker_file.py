@@ -775,12 +775,15 @@ def test_g5_strip_conflict_budget_and_blocked_rca_sections_on_active_restore(tmp
     issue = issue_from_file(fbt.find_path("MT-1"))
     fbt.append_note(issue, "Budget Exceeded", "tokens budget exceeded …")
     issue = issue_from_file(fbt.find_path("MT-1"))
-    fbt.append_note(issue, "Blocked RCA", "RCA ticket `RCA-1` opened.")
+    fbt.append_note(issue, "Blocked RCA", "Legacy RCA ticket `RCA-1` opened.")
+    issue = issue_from_file(fbt.find_path("MT-1"))
+    fbt.append_note(issue, "Blocked Fix", "Fix ticket `FIX-MT-1-1` opened.")
     before_path = fbt.find_path("MT-1")
     before_body = before_path.read_text()
     assert "## Conflict" in before_body
     assert "## Budget Exceeded" in before_body
     assert "## Blocked RCA" in before_body
+    assert "## Blocked Fix" in before_body
 
     # Restore via update_state into an active state.
     issue = issue_from_file(before_path)
@@ -795,6 +798,9 @@ def test_g5_strip_conflict_budget_and_blocked_rca_sections_on_active_restore(tmp
     )
     assert "## Blocked RCA" not in after_body, (
         "## Blocked RCA section must be stripped on transition into active state"
+    )
+    assert "## Blocked Fix" not in after_body, (
+        "## Blocked Fix section must be stripped on transition into active state"
     )
     assert "Original body." in after_body, (
         "operator-authored body must survive the strip"
@@ -1234,3 +1240,259 @@ def test_serialize_round_trip(tmp_path):
     parsed_front, parsed_body = parse_ticket_file(path)
     assert parsed_front["id"] == "X-1"
     assert parsed_body == "hello"
+
+
+# ---------------------------------------------------------------------------
+# request grouping field + dependency-graph load guardrails
+# ---------------------------------------------------------------------------
+
+
+def test_request_field_round_trips_through_create_and_parse(tmp_path):
+    root = tmp_path / "board"
+    fbt = FileBoardTracker(_tracker(root))
+
+    path = fbt.create(
+        identifier="REQ-T-1",
+        title="grouped work",
+        blocked_by=["REQ-T-0"],
+        request="REQ-1",
+    )
+
+    front, _ = parse_ticket_file(path)
+    assert front["request"] == "REQ-1"
+    assert front["blocked_by"] == ["REQ-T-0"]
+    issue = issue_from_file(path)
+    assert issue is not None
+    assert issue.request == "REQ-1"
+    assert issue.to_template_dict()["request"] == "REQ-1"
+    assert [b.identifier for b in issue.blocked_by] == ["REQ-T-0"]
+
+
+def test_request_field_absent_is_none_for_old_tickets(tmp_path):
+    path = _write(
+        tmp_path,
+        "OLD-1.md",
+        "---\nid: OLD-1\ntitle: legacy\nstate: Todo\n---\nbody\n",
+    )
+    issue = issue_from_file(path)
+    assert issue is not None
+    assert issue.request is None
+    assert issue.to_template_dict()["request"] == ""
+
+
+def test_update_fields_sets_and_clears_request_and_blocked_by(tmp_path):
+    root = tmp_path / "board"
+    fbt = FileBoardTracker(_tracker(root))
+    fbt.create(identifier="UPD-1", title="t")
+
+    fbt.update_fields("UPD-1", request="REQ-9", blocked_by=["UPD-0"])
+    front, _ = parse_ticket_file(root / "UPD-1.md")
+    assert front["request"] == "REQ-9"
+    assert front["blocked_by"] == ["UPD-0"]
+
+    fbt.update_fields("UPD-1", request="", blocked_by=[])
+    front, _ = parse_ticket_file(root / "UPD-1.md")
+    assert "request" not in front
+    assert "blocked_by" not in front
+
+
+def test_scan_warns_once_for_dangling_blockers_and_cycles(tmp_path, monkeypatch):
+    root = tmp_path / "board"
+    _write(root, "CYC-1.md", "---\nid: CYC-1\ntitle: a\nstate: Todo\nblocked_by: [CYC-2]\n---\n")
+    _write(root, "CYC-2.md", "---\nid: CYC-2\ntitle: b\nstate: Todo\nblocked_by: [CYC-1]\n---\n")
+    _write(root, "DAN-1.md", "---\nid: DAN-1\ntitle: c\nstate: Todo\nblocked_by: [GHOST-1]\n---\n")
+    warnings: list[tuple[str, dict[str, object]]] = []
+    monkeypatch.setattr(
+        file_tracker_module.log,
+        "warning",
+        lambda message, **fields: warnings.append((message, fields)),
+    )
+    fbt = FileBoardTracker(_tracker(root))
+
+    # Poll loop keeps working: the scan returns all tickets despite the mess.
+    assert len(fbt.fetch_candidate_issues()) == 3
+
+    dangling = [w for w in warnings if w[0] == "dangling_blocked_by"]
+    cycles = [w for w in warnings if w[0] == "dependency_cycle"]
+    assert dangling == [
+        ("dangling_blocked_by", {"identifier": "DAN-1", "missing": "GHOST-1"})
+    ]
+    assert len(cycles) == 1
+    assert "CYC-1" in cycles[0][1]["cycle"] and "CYC-2" in cycles[0][1]["cycle"]
+
+    # Identical findings are not re-logged on the next poll tick.
+    warnings.clear()
+    fbt.fetch_candidate_issues()
+    assert warnings == []
+
+
+def test_stage_routed_board_records_the_audit_stamp_not_the_pin(tmp_path):
+    """F-20: routed boards lost the "who ran this" field entirely."""
+    from symphony.trackers.file import FileBoardTracker, parse_ticket_file
+    from symphony.workflow import TrackerConfig
+
+    board = tmp_path / "kanban"
+    board.mkdir()
+    tracker = FileBoardTracker(
+        TrackerConfig(
+            kind="file",
+            endpoint="",
+            api_key="",
+            project_slug="",
+            active_states=("Todo",),
+            terminal_states=("Done",),
+            board_root=board,
+        )
+    )
+    tracker.create(identifier="MT-1", title="t")
+
+    tracker.record_last_agent_kind("MT-1", "gemini")
+
+    front, _ = parse_ticket_file(board / "MT-1.md")
+    assert front["last_agent_kind"] == "gemini"
+    assert "agent" not in front and "agent_kind" not in front
+    issue = tracker.fetch_issue_full_by_id("MT-1")
+    assert issue is not None
+    assert issue.last_agent_kind == "gemini"
+    # Never a dispatch pin.
+    assert issue.agent_kind is None
+    from symphony.orchestrator.helpers import _requested_agent_kind
+
+    assert _requested_agent_kind(issue) is None
+
+
+def _artifact_tracker(tmp_path: Path) -> FileBoardTracker:
+    board = tmp_path / "kanban"
+    board.mkdir()
+    tracker = FileBoardTracker(_tracker(board))
+    tracker.create(identifier="ART-1", title="Ticket")
+    return tracker
+
+
+def test_upsert_artifacts_section_appends_marked_block(tmp_path):
+    tracker = _artifact_tracker(tmp_path)
+
+    tracker.upsert_artifacts_section("ART-1", "- [Shot](<a.png>)")
+
+    _, body = parse_ticket_file(tmp_path / "kanban" / "ART-1.md")
+    assert "<!-- symphony-artifacts -->" in body
+    assert "## Artifacts" in body
+    assert "- [Shot](<a.png>)" in body
+    assert "<!-- /symphony-artifacts -->" in body
+
+
+def test_upsert_artifacts_section_replaces_instead_of_appending(tmp_path):
+    tracker = _artifact_tracker(tmp_path)
+
+    tracker.upsert_artifacts_section("ART-1", "- first")
+    tracker.upsert_artifacts_section("ART-1", "- first\n- second")
+
+    _, body = parse_ticket_file(tmp_path / "kanban" / "ART-1.md")
+    assert body.count("## Artifacts") == 1
+    assert body.count("<!-- symphony-artifacts -->") == 1
+    assert "- second" in body
+
+
+def test_upsert_artifacts_section_is_a_noop_when_unchanged(tmp_path):
+    tracker = _artifact_tracker(tmp_path)
+    tracker.upsert_artifacts_section("ART-1", "- first")
+    front_before, _ = parse_ticket_file(tmp_path / "kanban" / "ART-1.md")
+
+    time.sleep(0.01)
+    tracker.upsert_artifacts_section("ART-1", "- first")
+
+    front_after, _ = parse_ticket_file(tmp_path / "kanban" / "ART-1.md")
+    assert front_after["updated_at"] == front_before["updated_at"]
+
+
+def test_upsert_artifacts_section_empty_body_removes_block(tmp_path):
+    tracker = _artifact_tracker(tmp_path)
+    tracker.upsert_artifacts_section("ART-1", "- first")
+
+    tracker.upsert_artifacts_section("ART-1", "")
+
+    _, body = parse_ticket_file(tmp_path / "kanban" / "ART-1.md")
+    assert "symphony-artifacts" not in body
+    assert "## Artifacts" not in body
+
+
+def test_upsert_artifacts_section_preserves_operator_body(tmp_path):
+    tracker = _artifact_tracker(tmp_path)
+    tracker.update_fields("ART-1", description="## Notes\n\noperator text")
+
+    tracker.upsert_artifacts_section("ART-1", "- first")
+
+    _, body = parse_ticket_file(tmp_path / "kanban" / "ART-1.md")
+    assert "## Notes" in body
+    assert "operator text" in body
+    assert "## Artifacts" in body
+
+
+def test_warning_strip_does_not_orphan_the_artifacts_block(tmp_path):
+    """G5 strip must stop at the artifacts marker, not swallow it."""
+    tracker = _artifact_tracker(tmp_path)
+    tracker.upsert_artifacts_section("ART-1", "- first")
+    # Put the warning directly above the artifacts block — the position
+    # where a naive strip would run past the marker into `## Artifacts`.
+    path = tmp_path / "kanban" / "ART-1.md"
+    front, body = parse_ticket_file(path)
+    artifacts_start = body.index("<!-- symphony-artifacts -->")
+    reordered = (
+        f"{body[:artifacts_start]}## Conflict\n\nmerge conflict\n\n"
+        f"{body[artifacts_start:]}"
+    )
+    write_ticket_atomic(path, front, reordered)
+
+    issue = tracker.fetch_issue_full_by_id("ART-1")
+    tracker.update_state(issue, "Todo")  # active state -> strips warnings
+
+    _, after = parse_ticket_file(path)
+    assert "## Conflict" not in after
+    assert after.count("<!-- symphony-artifacts -->") == 1
+    assert after.count("<!-- /symphony-artifacts -->") == 1
+
+    tracker.upsert_artifacts_section("ART-1", "- second")
+    _, final = parse_ticket_file(path)
+    assert final.count("## Artifacts") == 1
+
+
+def test_list_all_identifiers_includes_every_state(tmp_path):
+    board = tmp_path / "kanban"
+    board.mkdir()
+    tracker = FileBoardTracker(_tracker(board))
+    tracker.create(identifier="A-1", title="todo")
+    tracker.create(identifier="A-2", title="done")
+    tracker.transition("A-2", "Done")
+    _write(board, ".tmp-junk.md", "not a ticket")
+
+    assert tracker.list_all_identifiers() == {"A-1", "A-2"}
+
+
+def test_upsert_artifacts_section_preserves_blank_lines_in_code_fences(tmp_path):
+    """The replace path must not collapse blank lines outside its own block.
+
+    Repro logs, diffs and pytest output routinely carry double blank lines.
+    """
+    tracker = _artifact_tracker(tmp_path)
+    fenced = "## Repro log\n\n```text\nstep one\n\n\nstep three\n```"
+    tracker.update_fields("ART-1", description=fenced)
+
+    tracker.upsert_artifacts_section("ART-1", "- first")
+    tracker.upsert_artifacts_section("ART-1", "- first\n- second")
+
+    _, body = parse_ticket_file(tmp_path / "kanban" / "ART-1.md")
+    assert "step one\n\n\nstep three" in body
+
+
+def test_upsert_artifacts_section_strips_markers_from_the_payload(tmp_path):
+    """Worker text carrying the close marker must not split the block."""
+    tracker = _artifact_tracker(tmp_path)
+    evil = "- [A <!-- /symphony-artifacts --> B](<y>)"
+
+    tracker.upsert_artifacts_section("ART-1", evil)
+    tracker.upsert_artifacts_section("ART-1", evil + "\n- [C](<z>)")
+
+    _, body = parse_ticket_file(tmp_path / "kanban" / "ART-1.md")
+    assert body.count("<!-- symphony-artifacts -->") == 1
+    assert body.count("<!-- /symphony-artifacts -->") == 1
+    assert body.count("## Artifacts") == 1

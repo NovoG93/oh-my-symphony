@@ -1,5 +1,13 @@
 # Operations guide
 
+> **Productized as the deep lane preset.** Symphony now ships this pipeline
+> as the built-in 8-lane **deep** preset (`Intake → Research → Plan → Review
+> → Build → QA → Verify → Document`), switchable from the admin UI settings
+> page or `POST /api/v1/workflow/presets/apply`, with prompts under
+> `docs/symphony-prompts/file/deep/`. Prefer the preset for new boards; use
+> this OneShot bundle when you need the standalone single-file template.
+> Where this folder disagrees with shipped behavior, the preset wins.
+
 This file holds operator-facing details that are useful during a OneShot run
 but too bulky for `SKILL.md`.
 
@@ -81,6 +89,22 @@ At a minimum, Deliver requires:
 - `verification.md` contains `verdict: GREEN`.
 - Browser apps have `.oneshot/vault/artifacts/qa-report.pdf`.
 - Browser apps have `qa-report.md` ending with `Verdict: APPROVED FOR DELIVERY`.
+
+App delivery adds the repository-root `release-contract.yaml` and the strict
+`docs/<verifier>/qa/release-evidence.json` gate. Run `symphony release check
+./WORKFLOW.md --ticket <current-verifier> --workspace <verifier-workspace>`;
+the exact current target and native artifacts must pass. An old GREEN is only
+history: repairs require a fresh verifier, and the `app-release-finalizer`
+waits for it. Verifier execution and repair-cycle mutation are file-tracker-only;
+a labeled remote card is refused before an agent turn, while remote workflows
+that never opt in stay unchanged.
+
+The CLI check is read-only; the host-owned gate generation and exact run
+bindings grant lifecycle authority. The same live verifier run may continue
+when the host preserves approval, but a host rewind or restarted redispatch
+means rerun evidence in Verify. Synchronize the configured local target branch
+first—Symphony does not fetch remote state. Startup evidence cleanup is fenced
+by a dedicated lease, so do not bypass it by deleting workspaces manually.
 
 ## Bundled templates
 

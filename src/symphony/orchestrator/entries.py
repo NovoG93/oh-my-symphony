@@ -12,9 +12,12 @@ import asyncio
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from ..backends import AgentBackend
+
+if TYPE_CHECKING:
+    from .run_registry import ContinuationCheckpoint
 from ..issue import Issue
 
 
@@ -28,6 +31,29 @@ class RunningEntry:
     attempt_kind: str = "initial"
     agent_kind: str = ""
     run_id: str = ""
+    # A recovered attempt always owns a new run id. The predecessor link is
+    # public history; the private checkpoint is consumed only by the backend
+    # startup path and never serialized from this in-memory entry.
+    continued_from_run_id: str = ""
+    continuation_checkpoint: "ContinuationCheckpoint | None" = None
+    recovery_session_resumed: bool = False
+    # Monotonic application-release identity captured before the worker can
+    # mutate board labels.  `release_gate_*` comes from the host-owned SQLite
+    # authority row; labels remain routing/audit data only.
+    known_app_release: bool = False
+    known_release_cycle_verifier: bool = False
+    known_app_release_finalizer: bool = False
+    release_gate_finalizer: str = ""
+    release_gate_expected_contract_sha256: str = ""
+    release_gate_cycle_fingerprint: str = ""
+    release_gate_generation: str = ""
+    release_finalizer_rewind_state: str = ""
+    release_gate_exhausted: bool = False
+    release_authority_resolved: bool = False
+    # Ephemeral proof that this exact verifier run durably created its RED
+    # successor lifecycle. It is deliberately not serialized: restart recovery
+    # re-proves the handoff from the registry and finalizer link instead.
+    release_verifier_handoff_complete: bool = False
     # Live backend driver for this attempt. Populated by `_run_agent_attempt`
     # immediately after `build_backend(...)` so `_on_codex_event` can route
     # the stall-progress predicate through `backend.is_progress_event(...)`
@@ -36,6 +62,11 @@ class RunningEntry:
     session_id: str | None = None
     thread_id: str | None = None
     turn_id: str | None = None
+    # Exact backend conversation id used only for authority checkpointing.
+    # Unlike `session_id`, it is never decorated with a turn id or serialized.
+    resume_session_id: str | None = None
+    # Latest local turn for which EVENT_TURN_COMPLETED was observed.
+    last_completed_turn_event: int = 0
     turn_count: int = 0
     last_codex_event: str | None = None
     last_codex_message: str = ""
@@ -85,6 +116,11 @@ class RunningEntry:
     # 2026-05-17 reproduced this on the old long pipeline; the same hazard
     # applies to Todo -> In Progress -> Verify transitions.
     state_at_turn_start: str = ""
+    # Factory proof is fresh only after this phase's independent Verify turn.
+    factory_verification_baseline: str | None = None
+    factory_verify_started_at: float = 0.0
+    factory_verify_completed: bool = False
+    factory_declared_proof: tuple[str, ...] | None = None
     agent_pgid: int | None = None
     # A backend stop raised after teardown began. Some drivers become closed
     # before the failing await, so a later idempotent stop cannot confirm that
@@ -111,6 +147,10 @@ class RunningEntry:
     # terminal or inactive tracker move. Worker exit must not repeat that git
     # cleanup against the same worktree.
     workspace_cleanup_started: bool = False
+    workspace_cleanup_finished: asyncio.Event = field(
+        default_factory=asyncio.Event,
+        repr=False,
+    )
     # Set when the per-attempt `max_turns` ceiling halted the worker without
     # the ticket having reached a terminal state. Treated as an explicit
     # non-success outcome in `_on_worker_exit`: no automatic continuation is
@@ -147,6 +187,10 @@ class RetryEntry:
     timer_handle: asyncio.TimerHandle
     error: str | None = None
     kind: str = "retry"
+    holds_slot: bool = True
+    # `## Touched Files` snapshot of the exited ticket so the C1 conflict
+    # pre-check can see retry-pending work (GitHub issue #28).
+    touched_files: frozenset[str] = frozenset()
 
 
 @dataclass
@@ -166,6 +210,8 @@ class _IssueDebug:
     current_attempt_kind: str | None = None
     completed_turn_count: int = 0
     rewind_count: int = 0
+    # Backends that already hit a quota/usage limit on this ticket.
+    quota_exhausted_kinds: set[str] = field(default_factory=set)
     state_turn_state: str = ""
     state_turn_count: int = 0
     last_workspace: Path | None = None

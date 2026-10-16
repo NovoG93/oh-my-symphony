@@ -35,12 +35,7 @@ def sync_wayfinder(
     prefix: str = "TASK",
     all_tickets: bool = True,
 ) -> list[SyncResult]:
-    if not _PREFIX_RE.fullmatch(prefix):
-        raise ValueError(
-            "ticket prefix must use only letters, numbers, dots, underscores, or hyphens"
-        )
-    tickets = _load_graph(wayfinder_root)
-    order = _topological_order(tickets)
+    order = _load_ordered_graph(wayfinder_root, prefix)
     existing = _existing_sources(tracker)
     identifiers = {key: value[0] for key, value in existing.items()}
     results: list[SyncResult] = []
@@ -84,6 +79,14 @@ def sync_wayfinder(
             path.unlink(missing_ok=True)
         raise
     return results
+
+
+def _load_ordered_graph(root: Path, prefix: str) -> list[WayfinderTicket]:
+    if not _PREFIX_RE.fullmatch(prefix):
+        raise ValueError(
+            "ticket prefix must use only letters, numbers, dots, underscores, or hyphens"
+        )
+    return _topological_order(_load_graph(root))
 
 
 def _load_graph(root: Path) -> dict[str, WayfinderTicket]:

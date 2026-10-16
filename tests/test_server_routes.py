@@ -1,8 +1,7 @@
 """HTTP route shape for `symphony.server.build_app`.
 
-`build_app(orchestrator)` exposes the JSON API the TUI / board-viewer /
-operators consume. The existing test_board_viewer covers the viewer's
-own server. This file pins the orchestrator-side route contract:
+`build_app(orchestrator)` exposes the JSON API the TUI / admin UI /
+operators consume. This file pins the orchestrator-side route contract:
 
   * GET  /                         -> text hint
   * GET  /api/v1/state             -> orchestrator.snapshot()
@@ -19,14 +18,21 @@ this works without the optional `pytest-aiohttp` plugin.
 
 from __future__ import annotations
 
+import io
+import warnings
 from dataclasses import dataclass, field
 from typing import Any, AsyncIterator, cast
 
+import pytest
 import pytest_asyncio
+from aiohttp import web
 from aiohttp.test_utils import TestClient, TestServer
 
+import symphony.server as server_mod
+from symphony.logging import StructuredLogger
 from symphony.orchestrator import Orchestrator
-from symphony.server import build_app
+from symphony.server import build_app, run_server
+from symphony.webapi import API_TOKEN_ENV
 
 
 @dataclass
@@ -94,11 +100,13 @@ class _StubOrchestrator:
         )
         rca_state = target_state or "In Progress"
         agent = agent_kind or "codex"
-        return True, f"RCA-1 opened to unblock {identifier}", {
+        return True, f"FIX-1 opened to unblock {identifier}", {
             "original_state": "Blocked",
             "target_state": "Todo",
             "source_reopen_state": "Todo",
-            "rca_identifier": "RCA-1",
+            "fix_identifier": "FIX-1",
+            "fix_state": rca_state,
+            "rca_identifier": "FIX-1",
             "rca_state": rca_state,
             "agent_kind": agent,
         }
@@ -151,6 +159,49 @@ async def test_root_serves_web_app(client: TestClient) -> None:
         assert "assets missing" in body
 
 
+async def test_run_server_uses_typed_aiohttp_application_key() -> None:
+    app, _ = _make_app_with_stub()
+    runner = None
+    try:
+        with warnings.catch_warnings():
+            warnings.simplefilter("error", web.NotAppKeyWarning)
+            runner, bound_port = await run_server(app, "127.0.0.1", 0)
+        assert bound_port > 0
+    finally:
+        if runner is not None:
+            await runner.cleanup()
+
+
+async def _run_server_log(
+    monkeypatch: pytest.MonkeyPatch, host: str
+) -> str:
+    buf = io.StringIO()
+    monkeypatch.setattr(server_mod, "log", StructuredLogger(streams=[buf]))
+    app, _ = _make_app_with_stub()
+    runner, _port = await run_server(app, host, 0)
+    try:
+        return buf.getvalue()
+    finally:
+        await runner.cleanup()
+
+
+async def test_run_server_warns_when_non_loopback_bind_has_no_api_token(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv(API_TOKEN_ENV, raising=False)
+    exposed = await _run_server_log(monkeypatch, "0.0.0.0")
+    assert "level=WARN" in exposed
+    assert "unauthenticated" in exposed
+
+    monkeypatch.setenv(API_TOKEN_ENV, "sekrit-token")
+    tokenized = await _run_server_log(monkeypatch, "0.0.0.0")
+    assert "level=WARN" not in tokenized
+
+    monkeypatch.delenv(API_TOKEN_ENV, raising=False)
+    local = await _run_server_log(monkeypatch, "127.0.0.1")
+    assert "level=WARN" not in local
+
+
 async def test_state_route_returns_orchestrator_snapshot(client: TestClient) -> None:
     resp = await client.get("/api/v1/state")
     assert resp.status == 200
@@ -169,7 +220,7 @@ async def test_refresh_get_returns_405_with_error_envelope(client: TestClient) -
 async def test_refresh_post_returns_202_with_queued_envelope(
     client: TestClient,
 ) -> None:
-    resp = await client.post("/api/v1/refresh")
+    resp = await client.post("/api/v1/refresh", json={})
     assert resp.status == 202
     payload = await resp.json()
     assert payload["queued"] is True
@@ -181,8 +232,8 @@ async def test_refresh_post_returns_202_with_queued_envelope(
 async def test_refresh_post_marks_coalesced_on_second_call(
     client: TestClient,
 ) -> None:
-    await client.post("/api/v1/refresh")
-    resp = await client.post("/api/v1/refresh")
+    await client.post("/api/v1/refresh", json={})
+    resp = await client.post("/api/v1/refresh", json={})
     payload = await resp.json()
     assert payload["coalesced"] is True
 
@@ -201,7 +252,7 @@ async def test_refresh_post_with_invalid_json_returns_400(
 
 
 async def test_refresh_post_with_empty_body_succeeds(client: TestClient) -> None:
-    resp = await client.post("/api/v1/refresh", data="")
+    resp = await client.post("/api/v1/refresh", data="", headers={"Content-Type": "application/json"})
     assert resp.status == 202
 
 
@@ -221,14 +272,14 @@ async def test_issue_route_returns_404_when_absent(client: TestClient) -> None:
 
 
 async def test_pause_route_returns_404_when_not_running(client: TestClient) -> None:
-    resp = await client.post("/api/v1/UNKNOWN-99/pause")
+    resp = await client.post("/api/v1/UNKNOWN-99/pause", json={})
     assert resp.status == 404
     payload = await resp.json()
     assert payload["error"]["code"] == "issue_not_running"
 
 
 async def test_pause_route_pauses_running_worker(client: TestClient) -> None:
-    resp = await client.post("/api/v1/MT-1/pause")
+    resp = await client.post("/api/v1/MT-1/pause", json={})
     assert resp.status == 200
     payload = await resp.json()
     assert payload["issue_identifier"] == "MT-1"
@@ -241,8 +292,8 @@ async def test_pause_route_pauses_running_worker(client: TestClient) -> None:
 async def test_pause_then_pause_again_reports_already_paused(
     client: TestClient,
 ) -> None:
-    await client.post("/api/v1/MT-1/pause")
-    resp = await client.post("/api/v1/MT-1/pause")
+    await client.post("/api/v1/MT-1/pause", json={})
+    resp = await client.post("/api/v1/MT-1/pause", json={})
     payload = await resp.json()
     assert payload["paused"] is True
     assert payload["changed"] is False
@@ -250,8 +301,8 @@ async def test_pause_then_pause_again_reports_already_paused(
 
 
 async def test_resume_route_releases_paused_worker(client: TestClient) -> None:
-    await client.post("/api/v1/MT-1/pause")
-    resp = await client.post("/api/v1/MT-1/resume")
+    await client.post("/api/v1/MT-1/pause", json={})
+    resp = await client.post("/api/v1/MT-1/resume", json={})
     assert resp.status == 200
     payload = await resp.json()
     assert payload["paused"] is False
@@ -267,7 +318,7 @@ async def test_resume_route_releases_paused_retry_worker() -> None:
     client = TestClient(server)
     await client.start_server()
     try:
-        resp = await client.post("/api/v1/MT-1/resume")
+        resp = await client.post("/api/v1/MT-1/resume", json={})
         assert resp.status == 200
         payload = await resp.json()
         assert payload["issue_identifier"] == "MT-1"
@@ -288,7 +339,7 @@ async def test_resume_route_releases_idle_paused_file_issue() -> None:
     client = TestClient(server)
     await client.start_server()
     try:
-        resp = await client.post("/api/v1/RCA-1/resume")
+        resp = await client.post("/api/v1/RCA-1/resume", json={})
         assert resp.status == 200
         payload = await resp.json()
         assert payload["issue_identifier"] == "RCA-1"
@@ -303,7 +354,7 @@ async def test_resume_route_releases_idle_paused_file_issue() -> None:
 async def test_resume_route_returns_404_for_unknown_identifier(
     client: TestClient,
 ) -> None:
-    resp = await client.post("/api/v1/UNKNOWN-99/resume")
+    resp = await client.post("/api/v1/UNKNOWN-99/resume", json={})
     assert resp.status == 404
     payload = await resp.json()
     assert payload["error"]["code"] == "issue_not_resumable"
@@ -314,15 +365,18 @@ async def test_recover_blocked_route_returns_recovery_payload(
 ) -> None:
     resp = await client.post(
         "/api/v1/MT-1/recover-blocked",
-        json={"target_state": "In Progress", "agent_kind": "codex"},
+        json={"fix_state": "In Progress", "agent_kind": "codex"},
     )
     assert resp.status == 200
     payload = await resp.json()
     assert payload["issue_identifier"] == "MT-1"
-    assert payload["rca_created"] is True
+    assert payload["fix_created"] is True
+    assert payload["rca_created"] is True  # deprecated alias
     assert payload["target_state"] == "Todo"
     assert payload["source_reopen_state"] == "Todo"
-    assert payload["rca_identifier"] == "RCA-1"
+    assert payload["fix_identifier"] == "FIX-1"
+    assert payload["fix_state"] == "In Progress"
+    assert payload["rca_identifier"] == "FIX-1"  # deprecated alias
     assert payload["rca_state"] == "In Progress"
     assert payload["agent_kind"] == "codex"
 

@@ -3,8 +3,11 @@
 from __future__ import annotations
 
 import asyncio
-from datetime import datetime, timezone
+from dataclasses import replace
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
+
+import pytest
 
 from symphony.issue import Issue
 from symphony.orchestrator import Orchestrator, RunningEntry
@@ -16,6 +19,7 @@ from symphony.workflow import (
     GeminiConfig,
     HooksConfig,
     PiConfig,
+    PrimeAgentConfig,
     ServerConfig,
     ServiceConfig,
     TrackerConfig,
@@ -79,6 +83,13 @@ def _make_config(
             stall_timeout_ms=300_000,
             resume_across_turns=True,
         ),
+prime_agent=PrimeAgentConfig(
+    command='prime-agent -p --mode json',
+    turn_timeout_ms=3_600_000,
+    read_timeout_ms=5_000,
+    stall_timeout_ms=300_000,
+    resume_across_turns=True,
+),
         server=ServerConfig(port=None),
         prompt_template="hi",
     )
@@ -247,3 +258,310 @@ async def test_escalation_gives_up_after_bounded_attempts(monkeypatch) -> None:
     # Bounded: past the cap the old discard behavior is the last resort.
     assert "id-MT-1" not in orch._claimed
     assert "id-MT-1" not in orch._pending_escalations
+
+
+# ---------------------------------------------------------------------------
+# F-02 — stall budget must come from the RESOLVED backend, not agent.kind
+# ---------------------------------------------------------------------------
+
+
+def _stalled_entry(issue: Issue, *, agent_kind: str, age_s: float) -> RunningEntry:
+    started = datetime.now(timezone.utc) - timedelta(seconds=age_s)
+    entry = RunningEntry(
+        issue=issue,
+        started_at=started,
+        retry_attempt=None,
+        worker_task=None,  # type: ignore[arg-type]
+        workspace_path=Path("/tmp/ws/MT-1"),
+        agent_kind=agent_kind,
+    )
+    return entry
+
+
+def test_stall_budget_uses_the_pinned_backends_timeout() -> None:
+    """A claude-pinned ticket must get claude's 900 s, not codex's 300 s."""
+    orch = _orch()
+    cfg = _make_config()
+    cfg = replace(cfg, claude=replace(cfg.claude, stall_timeout_ms=900_000))
+    issue = replace(_issue("MT-1", "In Progress"), agent_kind="claude")
+    entry = _stalled_entry(issue, agent_kind="claude", age_s=400)
+
+    assert orch._stall_timeout_ms_for_entry(cfg, entry) == 900_000
+
+
+def test_stall_budget_uses_the_stage_routed_backends_timeout() -> None:
+    orch = _orch()
+    cfg = _make_config()
+    cfg = replace(
+        cfg,
+        claude=replace(cfg.claude, stall_timeout_ms=900_000),
+        agent=replace(cfg.agent, stage_kinds={"in progress": "claude"}),
+    )
+    issue = _issue("MT-1", "In Progress")
+    entry = _stalled_entry(issue, agent_kind="", age_s=400)
+
+    assert orch._stall_timeout_ms_for_entry(cfg, entry) == 900_000
+
+
+def test_stall_budget_falls_back_to_the_default_backend() -> None:
+    orch = _orch()
+    cfg = _make_config()
+    entry = _stalled_entry(_issue("MT-1", "In Progress"), agent_kind="codex", age_s=1)
+
+    assert orch._stall_timeout_ms_for_entry(cfg, entry) == 300_000
+
+
+def test_stall_timeout_ms_by_state_overrides_the_backend_budget() -> None:
+    orch = _orch()
+    cfg = _make_config()
+    cfg = replace(
+        cfg,
+        agent=replace(cfg.agent, stall_timeout_ms_by_state={"in progress": 900_000}),
+    )
+    entry = _stalled_entry(_issue("MT-1", "In Progress"), agent_kind="codex", age_s=1)
+
+    assert orch._stall_timeout_ms_for_entry(cfg, entry) == 900_000
+    other = _stalled_entry(_issue("MT-2", "Todo"), agent_kind="codex", age_s=1)
+    assert orch._stall_timeout_ms_for_entry(cfg, other) == 300_000
+
+
+async def test_reconcile_does_not_cancel_a_pinned_worker_inside_its_own_budget(
+    monkeypatch,
+) -> None:
+    """The regression itself: two backends, two stall budgets, one reconcile."""
+    orch = _orch()
+    cfg = _make_config()
+    cfg = replace(cfg, claude=replace(cfg.claude, stall_timeout_ms=900_000))
+
+    healthy = replace(_issue("MT-1", "In Progress"), agent_kind="claude")
+    doomed = _issue("MT-2", "In Progress")
+    healthy_task = asyncio.create_task(_parked())
+    doomed_task = asyncio.create_task(_parked())
+    healthy_entry = _stalled_entry(healthy, agent_kind="claude", age_s=400)
+    healthy_entry.worker_task = healthy_task
+    doomed_entry = _stalled_entry(doomed, agent_kind="codex", age_s=400)
+    doomed_entry.worker_task = doomed_task
+    orch._running[healthy.id] = healthy_entry
+    orch._running[doomed.id] = doomed_entry
+    orch._workspace_manager = _RecordingWorkspaceManager()  # type: ignore[assignment]
+    monkeypatch.setattr(
+        orch, "_tracker_call_states_by_ids", lambda _cfg, _ids: [healthy, doomed]
+    )
+
+    await orch._reconcile_running(cfg)
+
+    assert healthy_entry.cancelled_at is None, (
+        "claude worker was stall-cancelled on codex's 300 s budget"
+    )
+    assert doomed_entry.cancelled_at is not None
+    healthy_task.cancel()
+    doomed_task.cancel()
+    await asyncio.gather(healthy_task, doomed_task, return_exceptions=True)
+
+
+# ---------------------------------------------------------------------------
+# F-32 — transition targets resolve through the board's own terminal lanes
+# ---------------------------------------------------------------------------
+
+
+def test_human_review_target_prefers_a_human_lane_then_blocked():
+    from symphony.orchestrator.helpers import _human_review_target_state
+
+    cfg = _make_config(terminal_states=("Done", "Needs Human", "Blocked"))
+    assert _human_review_target_state(cfg) == "Needs Human"
+
+    cfg = _make_config(terminal_states=("Done", "Blocked"))
+    assert _human_review_target_state(cfg) == "Blocked"
+
+    # Fully customized board: fall back to the first terminal lane rather
+    # than writing a state the tracker does not know.
+    cfg = _make_config(terminal_states=("Shipped", "Parked"))
+    assert _human_review_target_state(cfg) == "Shipped"
+
+    cfg = _make_config(terminal_states=())
+    assert _human_review_target_state(cfg) == ""
+
+
+def test_rewind_budget_target_prefers_blocked_then_human():
+    from symphony.orchestrator.helpers import _rewind_budget_target_state
+
+    cfg = _make_config(terminal_states=("Done", "Needs Human", "Blocked"))
+    assert _rewind_budget_target_state(cfg) == "Blocked"
+
+    cfg = _make_config(terminal_states=("Done", "Needs Human"))
+    assert _rewind_budget_target_state(cfg) == "Needs Human"
+
+    cfg = _make_config(terminal_states=("Shipped",))
+    assert _rewind_budget_target_state(cfg) == "Shipped"
+
+
+async def test_skip_document_refuses_a_board_with_no_terminal_lane(monkeypatch):
+    orch = _orch()
+    cfg = _make_config(active_states=("Document",), terminal_states=())
+    monkeypatch.setattr(orch._workflow_state, "current", lambda: cfg)
+    issue = _issue("MT-DOC", state="Document")
+    monkeypatch.setattr(
+        Orchestrator,
+        "_tracker_call_fetch_issue_full_by_id",
+        staticmethod(lambda _cfg, _identifier: issue),
+    )
+
+    ok, message = await orch.skip_document("MT-DOC")
+
+    assert ok is False
+    assert "no terminal lane" in message
+
+
+# ---------------------------------------------------------------------------
+# M7 — shared tracker client close-race protection
+# ---------------------------------------------------------------------------
+
+
+class _FakeTrackerClient:
+    """Duck-typed tracker client whose pool can be closed mid-flight."""
+
+    def __init__(self) -> None:
+        self.closed = False
+        self.fetches = 0
+
+    def fetch_candidate_issues(self) -> list[Issue]:
+        if self.closed:
+            raise RuntimeError(
+                "Cannot send a request, as the client has been closed."
+            )
+        self.fetches += 1
+        return []
+
+    def record_agent_kind(self, identifier: str, agent_kind: str) -> None:
+        if self.closed:
+            raise RuntimeError(
+                "Cannot send a request, as the client has been closed."
+            )
+
+    def record_last_agent_kind(self, identifier: str, agent_kind: str) -> None:
+        if self.closed:
+            raise RuntimeError(
+                "Cannot send a request, as the client has been closed."
+            )
+
+    def close(self) -> None:
+        self.closed = True
+
+
+def test_shared_tracker_client_reuses_and_rebuilds_on_cfg_change(monkeypatch):
+    """Hot reload (new ServiceConfig identity) still rebuilds the client."""
+    import symphony.orchestrator.core as core_module
+
+    orch = _orch()
+    cfg_a = _make_config()
+    cfg_b = _make_config()
+    built: list[_FakeTrackerClient] = []
+
+    def fake_build(_cfg):
+        client = _FakeTrackerClient()
+        built.append(client)
+        return client
+
+    monkeypatch.setattr(core_module, "build_tracker_client", fake_build)
+
+    first = orch._shared_tracker_client(cfg_a)
+    assert orch._shared_tracker_client(cfg_a) is first
+    assert orch._tracker_call_candidates(cfg_a) == []
+    assert first.fetches == 1
+
+    second = orch._shared_tracker_client(cfg_b)
+    assert second is not first
+    assert built == [first, second]
+
+
+def test_tracker_bridge_raises_clean_error_when_pool_closes_mid_call(monkeypatch):
+    """A stop() racing a bridge call surfaces a retryable error, logged once."""
+    import symphony.orchestrator.core as core_module
+    from symphony.orchestrator.core import _TrackerClientUnavailable
+
+    orch = _orch()
+    cfg = _make_config()
+    client = _FakeTrackerClient()
+    monkeypatch.setattr(core_module, "build_tracker_client", lambda _cfg: client)
+    warnings: list[str] = []
+    monkeypatch.setattr(
+        core_module.log, "warning", lambda event, **_f: warnings.append(event)
+    )
+
+    assert orch._tracker_call_candidates(cfg) == []
+
+    # stop() closed the pool while the bridge held the client reference.
+    client.closed = True
+    with pytest.raises(_TrackerClientUnavailable):
+        orch._tracker_call_candidates(cfg)
+    with pytest.raises(_TrackerClientUnavailable):
+        orch._tracker_call_candidates(cfg)
+
+    assert warnings == ["tracker_client_close_race"]
+
+
+def test_tracker_checkout_refuses_to_rebuild_after_stop(monkeypatch):
+    """The closing/closed generation flags block post-stop rebuilds."""
+    import symphony.orchestrator.core as core_module
+    from symphony.orchestrator.core import _TrackerClientUnavailable
+
+    orch = _orch()
+    cfg = _make_config()
+    built: list[_FakeTrackerClient] = []
+
+    def fake_build(_cfg):
+        client = _FakeTrackerClient()
+        built.append(client)
+        return client
+
+    monkeypatch.setattr(core_module, "build_tracker_client", fake_build)
+
+    assert orch._tracker_call_candidates(cfg) == []
+    assert len(built) == 1
+
+    # The stop() window: closing, not yet fully closed.
+    orch._tracker_client_closing = True
+    with pytest.raises(_TrackerClientUnavailable):
+        orch._tracker_call_candidates(cfg)
+    # Fully closed past stop().
+    orch._tracker_client_closed = True
+    with pytest.raises(_TrackerClientUnavailable):
+        orch._tracker_call_candidates(cfg)
+
+    # No rebuild raced the shutdown — the original client is the only one.
+    assert len(built) == 1
+
+
+def test_record_agent_kind_bridges_swallow_close_race(monkeypatch):
+    """Best-effort record calls are silently skipped when stop() races."""
+    import symphony.orchestrator.core as core_module
+
+    orch = _orch()
+    cfg = _make_config()
+    client = _FakeTrackerClient()
+    client.closed = True
+    monkeypatch.setattr(core_module, "build_tracker_client", lambda _cfg: client)
+
+    # Neither raises despite the closed pool underneath.
+    orch._tracker_call_record_agent_kind(cfg, "MT-1", "codex")
+    orch._tracker_call_record_last_agent_kind(cfg, "MT-1", "codex")
+
+
+async def test_stop_closes_shared_client_and_gates_late_bridges(monkeypatch):
+    """End to end: stop() closes the pool; late bridges fail retryably."""
+    import symphony.orchestrator.core as core_module
+    from symphony.orchestrator.core import _TrackerClientUnavailable
+
+    orch = _orch()
+    cfg = _make_config()
+    client = _FakeTrackerClient()
+    monkeypatch.setattr(core_module, "build_tracker_client", lambda _cfg: client)
+
+    assert await asyncio.to_thread(orch._tracker_call_candidates, cfg) == []
+    assert not client.closed
+
+    await orch.stop()
+
+    assert client.closed
+    with pytest.raises(_TrackerClientUnavailable):
+        await asyncio.to_thread(orch._tracker_call_candidates, cfg)

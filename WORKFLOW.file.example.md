@@ -23,7 +23,7 @@ hooks:
   after_create: |
     bash "$SYMPHONY_WORKFLOW_DIR/src/symphony/factory/templates/scripts/factory-setup-worktree.sh"
   before_remove: |
-    git -C "$SYMPHONY_WORKFLOW_DIR" worktree remove --force "$PWD" 2>/dev/null || true
+    exec bash "$SYMPHONY_WORKFLOW_DIR/src/symphony/factory/templates/scripts/factory-remove-worktree.sh"
 
 agent:
   kind: opencode
@@ -36,8 +36,11 @@ agent:
   max_attempts: 3
   auto_triage_actionable_todo: false
   budget_exhausted_state: Blocked
+  auto_recover_blocked: false
   auto_commit_on_done: true
   auto_merge_on_done: true
+  auto_merge_push_target: false
+  stage_contracts: "on"
   auto_merge_target_branch: ""
   max_total_tokens: 1250000
   max_total_tokens_by_state:

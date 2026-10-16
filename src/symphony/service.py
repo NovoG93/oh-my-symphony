@@ -13,6 +13,7 @@ import ctypes
 import hashlib
 import json
 import os
+import secrets
 import signal
 import subprocess
 import sys
@@ -22,10 +23,18 @@ import urllib.request
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Callable, Literal
+from typing import Any, Callable, Literal, Mapping
 
+from ._shell import _taskkill_tree
 from .errors import SymphonyError
 from .orchestrator.run_registry import RunRegistry, registry_path_for_workflow
+from .runtime_safety import ensure_workflow_repo_is_safe
+from .service_identity import (
+    SERVICE_INSTANCE_ENV,
+    SERVICE_INSTANCE_HEADER,
+    normalize_service_instance_id,
+    normalize_service_probe_credential,
+)
 from .workflow import (
     ServerConfig,
     build_service_config,
@@ -42,8 +51,70 @@ ServiceState = Literal["running", "stopped"]
 # at evaluation time, marking Win-only branches as unreachable on macOS/Linux.
 # A separately-bound bool keeps every branch analyzable on every host.
 _IS_WIN32: bool = sys.platform == "win32"
+# POSIX-only signal APIs resolved once (same pattern as the getattr'd
+# CREATE_NEW_PROCESS_GROUP flags in _spawn): the module imports and
+# type-checks on win32, while the guarded branches below keep their exact
+# POSIX behavior — os.killpg and signal.SIGKILL always exist there.
+_killpg: Callable[[int, int], None] | None = getattr(os, "killpg", None)
+_SIGKILL: int = getattr(signal, "SIGKILL", signal.SIGTERM)
 DEFAULT_SERVICE_PORT = 9999
-DEFAULT_VIEWER_PORT = 8765
+
+
+class _RejectRedirects(urllib.request.HTTPRedirectHandler):
+    """Keep identity probes bound to the endpoint they were asked to inspect."""
+
+    def redirect_request(
+        self,
+        req: Any,
+        fp: Any,
+        code: int,
+        msg: str,
+        headers: Any,
+        newurl: str,
+    ) -> None:
+        del req, fp, code, msg, headers, newurl
+        return None
+
+
+def _probe_host(host: str) -> str:
+    normalized = host.strip()
+    if normalized in {"", "0.0.0.0", "::", "[::]"}:
+        return "127.0.0.1"
+    if normalized.startswith("[") and normalized.endswith("]"):
+        normalized = normalized[1:-1]
+    return f"[{normalized}]" if ":" in normalized else normalized
+
+
+def _probe_json(
+    host: str,
+    port: int,
+    endpoint: str,
+    service_instance_id: str | None = None,
+) -> Any | None:
+    try:
+        url = f"http://{_probe_host(host)}:{port}{endpoint}"
+        headers = {"Accept": "application/json"}
+        normalized_instance_id = normalize_service_probe_credential(
+            service_instance_id
+        )
+        if normalized_instance_id is not None:
+            headers[SERVICE_INSTANCE_HEADER] = normalized_instance_id
+        request = urllib.request.Request(url, headers=headers)
+        opener = urllib.request.build_opener(_RejectRedirects())
+        with opener.open(request, timeout=0.5) as response:
+            if response.status != 200:
+                return None
+            return json.loads(response.read(4096).decode("utf-8"))
+    except (
+        OSError,
+        TimeoutError,
+        urllib.error.URLError,
+        urllib.error.HTTPError,
+        json.JSONDecodeError,
+        UnicodeDecodeError,
+        ValueError,
+    ):
+        return None
 
 
 class ServiceLockError(RuntimeError):
@@ -56,14 +127,16 @@ class ServiceRecord:
     workflow_dir: Path
     host: str
     port: int
-    viewer_port: int | None
     orchestrator_pid: int | None
-    viewer_pid: int | None
     log_path: Path
-    viewer_log_path: Path | None
     started_at: str
     orchestrator_command: list[str] = field(default_factory=list)
-    viewer_command: list[str] = field(default_factory=list)
+    service_instance_id: str | None = None
+
+
+@dataclass(frozen=True)
+class ServiceEndpointIdentity:
+    orchestrator_pid: int
 
 
 @dataclass(frozen=True)
@@ -97,9 +170,13 @@ def acquire_service_lock(workflow_path: str | Path):
     path = lock_path_for(workflow_path)
     path.parent.mkdir(parents=True, exist_ok=True)
     try:
-        fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+        fd = _open_lock_reclaiming_stale(path)
     except FileExistsError as exc:
-        raise ServiceLockError(f"service operation already in progress: {path}") from exc
+        raise ServiceLockError(
+            f"service operation already in progress: {path} "
+            f"(owner pid {_lock_owner_pid(path)}); delete {path} if no service "
+            "operation is running"
+        ) from exc
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as handle:
             handle.write(f"{os.getpid()}\n")
@@ -111,10 +188,31 @@ def acquire_service_lock(workflow_path: str | Path):
             pass
 
 
-def _path_or_none(value: Any) -> Path | None:
-    if value is None:
+def _lock_owner_pid(path: Path) -> int | None:
+    try:
+        return int(path.read_text(encoding="utf-8").strip())
+    except (OSError, ValueError):
         return None
-    return Path(str(value))
+
+
+def _open_lock_reclaiming_stale(path: Path) -> int:
+    """O_EXCL-create the lock; if it exists but its owner pid is dead, reclaim once."""
+    flags = os.O_CREAT | os.O_EXCL | os.O_WRONLY
+    try:
+        return os.open(path, flags)
+    except FileExistsError:
+        owner = _lock_owner_pid(path)
+        if owner is not None and is_process_running(owner):
+            raise
+        print(
+            f"reclaimed stale lock {path} (owner pid {owner} is not running)",
+            file=sys.stderr,
+        )
+        try:
+            path.unlink()
+        except FileNotFoundError:
+            pass
+        return os.open(path, flags)
 
 
 def _record_to_json(record: ServiceRecord) -> dict[str, Any]:
@@ -123,14 +221,11 @@ def _record_to_json(record: ServiceRecord) -> dict[str, Any]:
         "workflow_dir": str(record.workflow_dir),
         "host": record.host,
         "port": record.port,
-        "viewer_port": record.viewer_port,
         "orchestrator_pid": record.orchestrator_pid,
-        "viewer_pid": record.viewer_pid,
         "log_path": str(record.log_path),
-        "viewer_log_path": str(record.viewer_log_path) if record.viewer_log_path else None,
         "started_at": record.started_at,
         "orchestrator_command": list(record.orchestrator_command),
-        "viewer_command": list(record.viewer_command),
+        "service_instance_id": record.service_instance_id,
     }
 
 
@@ -140,18 +235,19 @@ def _record_from_json(data: dict[str, Any]) -> ServiceRecord:
         workflow_dir=Path(str(data["workflow_dir"])),
         host=str(data["host"]),
         port=int(data["port"]),
-        viewer_port=int(data["viewer_port"]) if data.get("viewer_port") is not None else None,
         orchestrator_pid=(
             int(data["orchestrator_pid"])
             if data.get("orchestrator_pid") is not None
             else None
         ),
-        viewer_pid=int(data["viewer_pid"]) if data.get("viewer_pid") is not None else None,
         log_path=Path(str(data["log_path"])),
-        viewer_log_path=_path_or_none(data.get("viewer_log_path")),
         started_at=str(data["started_at"]),
-        orchestrator_command=[str(part) for part in data.get("orchestrator_command", [])],
-        viewer_command=[str(part) for part in data.get("viewer_command", [])],
+        orchestrator_command=[
+            str(part) for part in data.get("orchestrator_command", [])
+        ],
+        service_instance_id=normalize_service_instance_id(
+            data.get("service_instance_id")
+        ),
     )
 
 
@@ -173,24 +269,66 @@ def load_record(workflow_path: str | Path) -> ServiceRecord | None:
 
 def is_symphony_api_reachable(host: str, port: int) -> bool:
     """Return whether the recorded service port responds like Symphony."""
-    probe_host = "127.0.0.1" if host in {"0.0.0.0", "::"} else host
-    url = f"http://{probe_host}:{port}/api/v1/state"
-    request = urllib.request.Request(url, headers={"Accept": "application/json"})
-    try:
-        with urllib.request.urlopen(request, timeout=0.5) as response:
-            if response.status != 200:
-                return False
-            payload = json.loads(response.read(4096).decode("utf-8"))
-    except (
-        OSError,
-        TimeoutError,
-        urllib.error.URLError,
-        urllib.error.HTTPError,
-        json.JSONDecodeError,
-        UnicodeDecodeError,
-    ):
-        return False
+    payload = _probe_json(host, port, "/api/v1/state")
     return isinstance(payload, dict) and "health" in payload and "counts" in payload
+
+
+def _payload_serves_workflow(payload: object, workflow_path: str | Path) -> bool:
+    if not isinstance(payload, dict):
+        return False
+    served_workflow = payload.get("workflow_path")
+    if not isinstance(served_workflow, str) or not served_workflow.strip():
+        return False
+    try:
+        served_path = Path(served_workflow).expanduser()
+        if not served_path.is_absolute():
+            return False
+        if served_path.resolve() != _resolved(workflow_path):
+            return False
+    except (OSError, RuntimeError, ValueError):
+        return False
+    return True
+
+
+def is_symphony_workflow_reachable(
+    host: str,
+    port: int,
+    workflow_path: str | Path,
+    *,
+    service_instance_id: str | None = None,
+) -> bool:
+    """Return whether a port serves Symphony for the exact workflow."""
+    payload = _probe_json(host, port, "/api/v1/health", service_instance_id)
+    return _payload_serves_workflow(payload, workflow_path)
+
+
+def probe_service_endpoint_identity(
+    host: str,
+    port: int,
+    workflow_path: str | Path,
+    service_instance_id: str,
+) -> ServiceEndpointIdentity | None:
+    """Return the serving PID only for an exact managed-service identity."""
+    expected_instance_id = normalize_service_probe_credential(service_instance_id)
+    if expected_instance_id is None:
+        return None
+    payload = _probe_json(host, port, "/api/v1/health", expected_instance_id)
+    if not _payload_serves_workflow(payload, workflow_path):
+        return None
+    assert isinstance(payload, dict)
+    served_instance_id = normalize_service_probe_credential(
+        payload.get("service_instance_id")
+    )
+    if served_instance_id != expected_instance_id:
+        return None
+    served_pid = payload.get("orchestrator_pid")
+    if (
+        not isinstance(served_pid, int)
+        or isinstance(served_pid, bool)
+        or served_pid <= 0
+    ):
+        return None
+    return ServiceEndpointIdentity(orchestrator_pid=served_pid)
 
 
 def port_owner_hint(
@@ -203,10 +341,26 @@ def port_owner_hint(
     record = load_record(workflow_path)
     if record is None or record.port != port:
         return None
+    if record.orchestrator_pid == os.getpid():
+        return None
     alive = is_running or is_process_running
-    api_probe = is_api_reachable or is_symphony_api_reachable
     pid_alive = alive(record.orchestrator_pid)
-    api_alive = False if pid_alive else api_probe(record.host, record.port)
+    if pid_alive:
+        api_alive = False
+    elif is_api_reachable is None:
+        probe_kwargs = (
+            {"service_instance_id": record.service_instance_id}
+            if record.service_instance_id is not None
+            else {}
+        )
+        api_alive = is_symphony_workflow_reachable(
+            record.host,
+            record.port,
+            _resolved(workflow_path),
+            **probe_kwargs,
+        )
+    else:
+        api_alive = is_api_reachable(record.host, record.port)
     if not pid_alive and not api_alive:
         return None
     pid = record.orchestrator_pid
@@ -305,10 +459,9 @@ def service_status(
 ) -> ServiceStatus:
     """Report persisted service state for a workflow.
 
-    The saved workflow record wins over the requested port: when the same
-    workflow has a live orchestrator PID or a live recorded Symphony API,
-    callers should treat it as already running even if the operator asks for a
-    different port.
+    The saved workflow record wins over the requested port. A live recorded PID
+    is trusted directly. When the PID is stale, the recorded endpoint must
+    identify the exact requested workflow before callers treat it as running.
     """
     record = load_record(workflow_path)
     if record is None:
@@ -322,11 +475,23 @@ def service_status(
     if is_running is None:
         is_running = is_process_running
 
-    if is_api_reachable is None:
-        is_api_reachable = is_symphony_api_reachable
-
     pid_running = is_running(record.orchestrator_pid)
-    api_reachable = False if pid_running else is_api_reachable(record.host, record.port)
+    if pid_running:
+        api_reachable = False
+    elif is_api_reachable is None:
+        probe_kwargs = (
+            {"service_instance_id": record.service_instance_id}
+            if record.service_instance_id is not None
+            else {}
+        )
+        api_reachable = is_symphony_workflow_reachable(
+            record.host,
+            record.port,
+            _resolved(workflow_path),
+            **probe_kwargs,
+        )
+    else:
+        api_reachable = is_api_reachable(record.host, record.port)
     state: ServiceState = "running" if pid_running or api_reachable else "stopped"
     return ServiceStatus(
         state=state,
@@ -339,8 +504,11 @@ def service_status(
 
 
 def _utc_now() -> str:
-    return datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace(
-        "+00:00", "Z"
+    return (
+        datetime.now(timezone.utc)
+        .replace(microsecond=0)
+        .isoformat()
+        .replace("+00:00", "Z")
     )
 
 
@@ -364,43 +532,19 @@ def build_orchestrator_command(
     ]
 
 
-def board_viewer_script_for(workflow_path: str | Path) -> Path | None:
-    script = _resolved(workflow_path).parent / "tools" / "board-viewer" / "server.py"
-    return script if script.exists() else None
-
-
-def build_viewer_command(
-    workflow_path: str | Path,
+def _popen_detached(
+    command: list[str],
     *,
-    host: str,
-    port: int,
-    viewer_port: int,
-    kanban_dir: Path | None = None,
-) -> list[str] | None:
-    """Build the shell-free board-viewer command when a viewer is available."""
-    script = board_viewer_script_for(workflow_path)
-    if script is None:
-        return None
-    command = [
-        sys.executable,
-        str(script),
-        "--port",
-        str(viewer_port),
-        "--symphony",
-        f"http://{host}:{port}",
-        "--workflow",
-        str(_resolved(workflow_path)),
-    ]
-    if kanban_dir is not None:
-        command.extend(["--kanban", str(kanban_dir)])
-    return command
-
-
-def _popen_detached(command: list[str], *, cwd: Path, log_path: Path) -> int:
+    cwd: Path,
+    log_path: Path,
+    env_overrides: Mapping[str, str] | None = None,
+) -> int:
     log_path.parent.mkdir(parents=True, exist_ok=True)
     log_handle = log_path.open("ab")
     env = os.environ.copy()
     env.setdefault("PYTHONUNBUFFERED", "1")
+    if env_overrides:
+        env.update(env_overrides)
     kwargs: dict[str, Any] = {
         "cwd": str(cwd),
         "stdout": log_handle,
@@ -435,20 +579,33 @@ def _wait_until(
     return predicate()
 
 
-def _terminate_process_windows(pid: int, *, force: bool = False) -> bool:
-    cmd = ["taskkill", "/PID", str(pid), "/T"]
-    if force:
-        cmd.append("/F")
-    try:
-        completed = subprocess.run(
-            cmd,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            check=False,
-        )
-    except OSError:
-        return False
-    return completed.returncode == 0
+# How long a freshly spawned orchestrator must stay alive before `service start`
+# reports success. Tests shrink it via monkeypatch.
+_START_STABILITY_WINDOW_S: float = 2.0
+
+
+def _exited_during_startup(pid: int, *, interval_s: float = 0.1) -> bool:
+    """Return True if pid exits within the stability window.
+
+    The spawned orchestrator is our direct child, so a dead one lingers as a
+    zombie and still answers ``kill(pid, 0)``; ``waitpid(WNOHANG)`` is what
+    actually observes the exit. ``is_process_running`` covers the case where
+    the pid is not our child (or win32, which has no waitpid).
+    """
+    deadline = time.monotonic() + _START_STABILITY_WINDOW_S
+    while True:
+        if not _IS_WIN32:
+            try:
+                reaped, _status = os.waitpid(pid, getattr(os, "WNOHANG"))
+            except OSError:  # ChildProcessError when pid is not our child
+                reaped = 0
+            if reaped == pid:
+                return True
+        if not is_process_running(pid):
+            return True
+        if time.monotonic() >= deadline:
+            return False
+        time.sleep(min(interval_s, max(deadline - time.monotonic(), 0.0)))
 
 
 def terminate_process(pid: int | None, *, force: bool = False) -> bool:
@@ -460,24 +617,32 @@ def terminate_process(pid: int | None, *, force: bool = False) -> bool:
     if parsed <= 0 or not is_process_running(parsed):
         return False
     if _IS_WIN32:
-        try:
-            return _terminate_process_windows(parsed, force=force)
-        except OSError:
-            return False
-    sig = signal.SIGKILL if force else signal.SIGTERM
+        return _taskkill_tree(parsed, force=force)
+    sig = _SIGKILL if force else signal.SIGTERM
     try:
-        os.killpg(parsed, sig)
+        if _killpg is None:  # pragma: no cover - win32 returned above
+            os.kill(parsed, sig)
+            return True
+        _killpg(parsed, sig)
     except ProcessLookupError:
-        return False
+        # killpg raises ESRCH for any pid that does not lead a process group
+        # (a child spawned without start_new_session); the process itself may
+        # still be alive, so signal it directly before giving up.
+        if not is_process_running(parsed):
+            return False
+        return _kill_single(parsed, sig)
     except PermissionError:
         return False
     except OSError:
-        try:
-            os.kill(parsed, sig)
-        except ProcessLookupError:
-            return False
-        except OSError:
-            return False
+        return _kill_single(parsed, sig)
+    return True
+
+
+def _kill_single(pid: int, sig: int) -> bool:
+    try:
+        os.kill(pid, sig)
+    except OSError:
+        return False
     return True
 
 
@@ -548,15 +713,48 @@ def _owned_workspace_paths(workflow_path: Path, *, owner_pid: int | None) -> lis
         registry.close()
 
 
+# `ps -axo pid=,command=` on POSIX; on win32 the same `pid<space>command`
+# line shape comes from PowerShell CIM (wmic is deprecated/removed on
+# modern Windows). Null command lines render as an empty command column,
+# which the shared substring match below simply never matches.
+_WIN_PROCESS_ENUMERATOR = [
+    "powershell",
+    "-NoProfile",
+    "-Command",
+    "Get-CimInstance Win32_Process | "
+    "ForEach-Object { '{0} {1}' -f $_.ProcessId, $_.CommandLine }",
+]
+
+
+def _workspace_needle_forms(path: str) -> tuple[str, ...]:
+    """Normalized substring forms of one workspace path for process matching.
+
+    Command lines record paths with either separator and, on Windows,
+    case-insensitive casing; Git-Bash workers may also render a native
+    ``D:\\a\\b`` path in MSYS form ``/d/a/b``. All forms are separator-
+    normalized (``/``) and casefolded so the match survives every spelling.
+    """
+    normalized = path.replace("\\", "/").casefold()
+    forms = {normalized}
+    if len(normalized) > 1 and normalized[1] == ":":
+        forms.add("/" + normalized[0] + normalized[2:])
+    return tuple(forms)
+
+
 def _workspace_bound_process_pids(workspace_paths: list[Path]) -> list[int]:
-    if _IS_WIN32 or not workspace_paths:
+    if not workspace_paths:
         return []
-    needles = [str(path) for path in workspace_paths if str(path)]
+    needles: list[tuple[str, ...]] = [
+        _workspace_needle_forms(str(path))
+        for path in workspace_paths
+        if str(path)
+    ]
     if not needles:
         return []
+    enumerator = _WIN_PROCESS_ENUMERATOR if _IS_WIN32 else ["ps", "-axo", "pid=,command="]
     try:
         completed = subprocess.run(
-            ["ps", "-axo", "pid=,command="],
+            enumerator,
             stdout=subprocess.PIPE,
             stderr=subprocess.DEVNULL,
             text=True,
@@ -581,7 +779,8 @@ def _workspace_bound_process_pids(workspace_paths: list[Path]) -> list[int]:
             continue
         if pid == current_pid:
             continue
-        if any(needle in command for needle in needles):
+        normalized_command = command.replace("\\", "/").casefold()
+        if any(any(form in normalized_command for form in forms) for forms in needles):
             pids.append(pid)
     return pids
 
@@ -654,6 +853,11 @@ def _start(args: argparse.Namespace) -> int:
     except SymphonyError as exc:
         print(f"FAIL workflow load failed: {exc}", file=sys.stderr)
         return 2
+    try:
+        ensure_workflow_repo_is_safe(workflow)
+    except SymphonyError as exc:
+        print(f"FAIL unsafe workflow repository: {exc}", file=sys.stderr)
+        return 1
 
     try:
         with acquire_service_lock(workflow):
@@ -701,67 +905,35 @@ def _start_locked(args: argparse.Namespace, *, workflow: Path, cfg: Any) -> int:
         if stop_rc != 0:
             return stop_rc
 
-    if not args.skip_doctor and not _run_doctor_or_print(cfg, host=args.host, port=port):
+    if not args.skip_doctor and not _run_doctor_or_print(
+        cfg, host=args.host, port=port
+    ):
         print("service start aborted: doctor reported FAIL", file=sys.stderr)
         return 1
 
     workflow_dir = workflow.parent
     log_path = workflow_dir / "log" / "symphony.log"
-    viewer_log_path = workflow_dir / "log" / "board-viewer.log"
     orchestrator_command = build_orchestrator_command(
         workflow,
         host=args.host,
         port=port,
     )
     orchestrator_pid: int | None = None
-    viewer_pid: int | None = None
+    service_instance_id = secrets.token_urlsafe(32)
     try:
         orchestrator_pid = _popen_detached(
             orchestrator_command,
             cwd=workflow_dir,
             log_path=log_path,
+            env_overrides={SERVICE_INSTANCE_ENV: service_instance_id},
         )
-        if not _wait_until(lambda: is_process_running(orchestrator_pid), timeout_s=2.0):
+        if _exited_during_startup(orchestrator_pid):
             print(
                 f"service start failed: orchestrator exited early; see {log_path}",
                 file=sys.stderr,
             )
             return 1
-
-        viewer_port = None if args.no_viewer else int(args.viewer_port)
-        viewer_command: list[str] = []
-        if viewer_port is not None:
-            built_viewer = build_viewer_command(
-                workflow,
-                host=args.host,
-                port=port,
-                viewer_port=viewer_port,
-                kanban_dir=cfg.tracker.board_root,
-            )
-            if built_viewer is not None:
-                viewer_command = built_viewer
-                viewer_pid = _popen_detached(
-                    viewer_command,
-                    cwd=workflow_dir,
-                    log_path=viewer_log_path,
-                )
-                if not _wait_until(lambda: is_process_running(viewer_pid), timeout_s=1.0):
-                    print(
-                        f"warning: board viewer exited early; see {viewer_log_path}",
-                        file=sys.stderr,
-                    )
-                    viewer_pid = None
-            else:
-                expected = workflow_dir / "tools" / "board-viewer" / "server.py"
-                print(
-                    f"warning: --viewer-port {viewer_port} requested but {expected} not found; "
-                    "viewer skipped (orchestrator OK). "
-                    "Copy `tools/board-viewer/` from the symphony checkout to enable the web UI.",
-                    file=sys.stderr,
-                )
     except OSError as exc:
-        if viewer_pid is not None:
-            terminate_process(viewer_pid, force=True)
         if orchestrator_pid is not None:
             terminate_process(orchestrator_pid, force=True)
         print(f"service start failed: {exc}", file=sys.stderr)
@@ -772,20 +944,15 @@ def _start_locked(args: argparse.Namespace, *, workflow: Path, cfg: Any) -> int:
         workflow_dir=workflow_dir.resolve(),
         host=args.host,
         port=port,
-        viewer_port=viewer_port if viewer_pid is not None else None,
         orchestrator_pid=orchestrator_pid,
-        viewer_pid=viewer_pid,
         log_path=log_path.resolve(),
-        viewer_log_path=viewer_log_path.resolve() if viewer_pid is not None else None,
         started_at=_utc_now(),
         orchestrator_command=orchestrator_command,
-        viewer_command=viewer_command,
+        service_instance_id=service_instance_id,
     )
     try:
         save_record(record)
     except Exception as exc:
-        if viewer_pid is not None:
-            terminate_process(viewer_pid, force=True)
         if orchestrator_pid is not None:
             terminate_process(orchestrator_pid, force=True)
         print(f"failed to save service record: {exc}", file=sys.stderr)
@@ -795,11 +962,6 @@ def _start_locked(args: argparse.Namespace, *, workflow: Path, cfg: Any) -> int:
         f"started symphony service pid={orchestrator_pid} "
         f"url=http://{args.host}:{port}/"
     )
-    if viewer_pid is not None and viewer_port is not None:
-        print(
-            f"started board viewer pid={viewer_pid} "
-            f"url=http://{args.host}:{viewer_port}/"
-        )
     return 0
 
 
@@ -811,10 +973,37 @@ def _stop(args: argparse.Namespace) -> int:
         return 0
 
     all_stopped = True
-    for label, pid in (
-        ("viewer", record.viewer_pid),
-        ("orchestrator", record.orchestrator_pid),
-    ):
+    for label, pid in (("orchestrator", record.orchestrator_pid),):
+        if _IS_WIN32 and not args.force and record.service_instance_id is not None:
+            if is_process_running(pid):
+                terminate_process(pid)
+                _wait_until(
+                    lambda pid=pid: not is_process_running(pid),
+                    timeout_s=float(args.timeout),
+                )
+            identity = probe_service_endpoint_identity(
+                record.host,
+                record.port,
+                record.workflow_path,
+                record.service_instance_id,
+            )
+            if identity is None:
+                stopped = False
+            else:
+                serving_pid = identity.orchestrator_pid
+                if is_process_running(serving_pid):
+                    terminate_process(serving_pid, force=True)
+                stopped = _wait_until(
+                    lambda serving_pid=serving_pid, pid=pid: (
+                        not is_process_running(serving_pid)
+                        and not is_process_running(pid)
+                    ),
+                    timeout_s=2.0,
+                )
+            if not stopped:
+                all_stopped = False
+                print(f"warning: {label} pid={pid} is still running", file=sys.stderr)
+            continue
         if not is_process_running(pid):
             continue
         terminate_process(pid)
@@ -875,11 +1064,6 @@ def _status(args: argparse.Namespace) -> int:
             f"stale pid={record.orchestrator_pid} port={record.port} "
             f"url=http://{record.host}:{record.port}/ (api alive)"
         )
-    if record.viewer_pid is not None and record.viewer_port is not None:
-        print(
-            f"viewer pid={record.viewer_pid} port={record.viewer_port} "
-            f"url=http://{record.host}:{record.viewer_port}/"
-        )
     if port is not None and record.port != port:
         print(
             f"requested port {port}; existing service for this workflow uses "
@@ -901,8 +1085,6 @@ def _restart(args: argparse.Namespace) -> int:
         workflow=args.workflow,
         host=args.host,
         port=args.port,
-        viewer_port=args.viewer_port,
-        no_viewer=args.no_viewer,
         replace=False,
         skip_doctor=args.skip_doctor,
     )
@@ -915,7 +1097,7 @@ def _logs(args: argparse.Namespace) -> int:
     if record is None:
         print(f"no service record for {workflow}", file=sys.stderr)
         return 1
-    path = record.viewer_log_path if args.viewer else record.log_path
+    path = record.log_path
     if path is None or not path.exists():
         print(f"log file not found: {path}", file=sys.stderr)
         return 1
@@ -940,12 +1122,12 @@ def build_parser() -> argparse.ArgumentParser:
             help="path to WORKFLOW.md (default: ./WORKFLOW.md)",
         )
 
-    p_start = sub.add_parser("start", help="start orchestrator and board viewer")
+    p_start = sub.add_parser(
+        "start", help="start the orchestrator (admin UI serves on --port)"
+    )
     add_workflow(p_start)
     p_start.add_argument("--host", default="127.0.0.1")
     p_start.add_argument("--port", type=int, default=None)
-    p_start.add_argument("--viewer-port", type=int, default=DEFAULT_VIEWER_PORT)
-    p_start.add_argument("--no-viewer", action="store_true")
     p_start.add_argument("--replace", action="store_true")
     p_start.add_argument("--skip-doctor", action="store_true")
     p_start.set_defaults(func=_start)
@@ -960,8 +1142,6 @@ def build_parser() -> argparse.ArgumentParser:
     add_workflow(p_restart)
     p_restart.add_argument("--host", default="127.0.0.1")
     p_restart.add_argument("--port", type=int, default=None)
-    p_restart.add_argument("--viewer-port", type=int, default=DEFAULT_VIEWER_PORT)
-    p_restart.add_argument("--no-viewer", action="store_true")
     p_restart.add_argument("--skip-doctor", action="store_true")
     p_restart.add_argument("--timeout", type=float, default=10.0)
     p_restart.add_argument("--force", action="store_true")
@@ -974,7 +1154,6 @@ def build_parser() -> argparse.ArgumentParser:
 
     p_logs = sub.add_parser("logs", help="print recent service logs")
     add_workflow(p_logs)
-    p_logs.add_argument("--viewer", action="store_true")
     p_logs.add_argument("--lines", type=int, default=80)
     p_logs.set_defaults(func=_logs)
 

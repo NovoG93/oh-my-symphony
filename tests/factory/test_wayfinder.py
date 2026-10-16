@@ -132,7 +132,7 @@ skills: []
 
 ## Proof
 
-- Manual check.
+- `pytest -q`
 
 ## Non-goals
 
@@ -165,7 +165,7 @@ skills: []
 
 ## Proof
 
-- Browser check.
+- `playwright-cli snapshot`
 
 ## Non-goals
 
@@ -190,7 +190,7 @@ skills: [superqa]
 
 ## Proof
 
-- Evidence review.
+- `python scripts/check-evidence.py`
 
 ## Non-goals
 
@@ -216,7 +216,7 @@ skills: []
 
 ## Proof
 
-- Browser check.
+- `playwright-cli snapshot`
 
 ## Non-goals
 
@@ -254,7 +254,7 @@ kind: backend
 
 ## Proof
 
-- Parser check.
+- `pytest tests/factory/test_wayfinder.py`
 
 ## Non-goals
 
@@ -277,7 +277,7 @@ browser: "yes"
 
 ## Proof
 
-- Parser check.
+- `pytest tests/factory/test_wayfinder.py`
 
 ## Non-goals
 
@@ -324,3 +324,43 @@ route: REVIEW-ONLY
 
     with pytest.raises(ValueError, match="unsupported Route"):
         parse_wayfinder_ticket(path)
+
+
+@pytest.mark.parametrize(
+    ("acceptance", "proof", "error"),
+    [("", "- `pytest`", "Acceptance criteria"),
+     ("Prose only", "- `pytest`", "Acceptance criteria"),
+     ("- [ ]", "- `pytest`", "Acceptance criteria"),
+     ("- Verified", "", "Proof commands"),
+     ("- Verified", "- Manual check", "Proof commands"),
+     ("- Verified", "- `   `", "Proof commands")],
+)
+def test_parser_rejects_empty_acceptance_or_non_command_proof(
+    tmp_path: Path, acceptance: str, proof: str, error: str,
+) -> None:
+    path = tmp_path / "empty.md"
+    path.write_text(
+        "---\nid: empty\ntitle: Empty declaration\nroute: LEGACY\n---\n"
+        f"## Acceptance criteria\n{acceptance}\n## Proof commands\n{proof}\n## Non-goals\n- None\n",
+        encoding="utf-8",
+    )
+    with pytest.raises(ValueError, match=error):
+        parse_wayfinder_ticket(path)
+
+
+def test_parser_preserves_multiple_unicode_proofs_and_numbered_acceptance(tmp_path: Path) -> None:
+    from symphony.factory.wayfinder import factory_acceptance_items, factory_proof_commands
+
+    path = tmp_path / "unicode.md"
+    body = (
+        "## Acceptance criteria\n1. [ ] 한글 결과를 검증한다.\n"
+        "   Preserve the complete statement.\n"
+        "## Proof\n- `python 검증.py --name \"값\"`\n- `npm run test && npm run build`\n"
+        "## Non-goals\n- None\n"
+    )
+    path.write_text("---\nid: unicode\ntitle: Unicode proof\nroute: LEGACY\n---\n" + body, encoding="utf-8")
+    ticket = parse_wayfinder_ticket(path)
+    assert factory_acceptance_items(ticket.description) == ["한글 결과를 검증한다. Preserve the complete statement."]
+    assert factory_proof_commands(ticket.description) == [
+        'python 검증.py --name "값"', "npm run test && npm run build",
+    ]

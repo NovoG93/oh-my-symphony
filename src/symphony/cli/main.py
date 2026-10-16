@@ -4,9 +4,12 @@ Subcommands:
     symphony [WORKFLOW]            run orchestrator (optionally with HTTP API via --port)
     symphony tui [WORKFLOW]        run orchestrator + Jira-style CLI Kanban TUI
     symphony board ...             file-tracker board helper
+    symphony factory ...           initialize, sync, and start a beginner factory
     symphony doctor [WORKFLOW]     preflight checks for WORKFLOW.md
-    symphony service ...           managed background orchestrator + viewer
+    symphony release check ...     validate app release evidence
+    symphony service ...           managed background orchestrator
     symphony wiki-sweep ...        scan docs/llm-wiki/ for dup/orphan/stale rows
+    symphony runs [WORKFLOW]       recent run-registry attempts
 """
 
 from __future__ import annotations
@@ -35,10 +38,51 @@ from ..service import port_owner_hint
 from ..workflow import WorkflowState, resolve_workflow_path
 
 
+# First-token subcommands routed by `main` before argparse sees argv.
+# Order is the order shown in `symphony --help`.
+SUBCOMMANDS: tuple[tuple[str, str], ...] = (
+    ("tui", "open the Kanban TUI (same as --tui)"),
+    ("doctor", "preflight a WORKFLOW.md before launching"),
+    ("board", "manage the file-based Kanban board (init/ls/new/mv/update/show/graph)"),
+    ("factory", "initialize, sync, and start an autonomous development factory"),
+    ("service", "run the orchestrator as a managed background service"),
+    ("project", "register and run independent project services"),
+    ("hub", "serve the multi-project hub"),
+    ("runs", "print recent run-registry attempts"),
+    ("release", "validate application release evidence"),
+    ("wiki-sweep", "lint docs/llm-wiki for duplicate slugs and orphans"),
+)
+
+
+def _subcommand_epilog() -> str:
+    width = max(len(name) for name, _ in SUBCOMMANDS)
+    lines = [f"  {name:<{width}}  {desc}" for name, desc in SUBCOMMANDS]
+    return (
+        "subcommands (run `symphony <subcommand> --help` for details):\n"
+        + "\n".join(lines)
+        + "\n\nwith no subcommand, symphony runs the orchestrator headless "
+        "for the given WORKFLOW.md."
+    )
+
+
+def _looks_like_mistyped_subcommand(token: str) -> bool:
+    """True for a bare word that is neither a flag nor a plausible path.
+
+    `symphony servce` should say "unknown command", not "WORKFLOW.md not
+    found". Anything with a path separator, a dot, or that exists on disk
+    is still treated as the workflow positional.
+    """
+    if token.startswith("-") or "/" in token or "\\" in token or "." in token:
+        return False
+    return not Path(token).exists()
+
+
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="symphony",
         description="Symphony multi-agent — Codex / Claude Code / Gemini orchestration.",
+        epilog=_subcommand_epilog(),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     parser.add_argument(
         "--version",
@@ -260,7 +304,7 @@ async def _run(args: argparse.Namespace) -> int:
         )
     else:
         # Surfaces the silent-no-HTTP case so the operator immediately sees
-        # why board-viewer / API consumers can't reach this instance.
+        # why the admin UI / API consumers can't reach this instance.
         # Common cause: `server.port` lives outside frontmatter (embedded
         # `---` fence in a YAML literal truncated the workflow header) —
         # see workflow.parse_workflow_text greedy end detection.
@@ -414,6 +458,18 @@ def main(argv: list[str] | None = None) -> int:
         from . import doctor
 
         return doctor.main(raw_argv[1:])
+    if raw_argv and raw_argv[0] == "release":
+        from . import release
+
+        return release.main(raw_argv[1:])
+    if raw_argv and raw_argv[0] == "project":
+        from . import project
+
+        return project.main(raw_argv[1:])
+    if raw_argv and raw_argv[0] == "hub":
+        from .. import hub
+
+        return hub.main(raw_argv[1:])
     if raw_argv and raw_argv[0] == "service":
         from .. import service
 
@@ -425,6 +481,15 @@ def main(argv: list[str] | None = None) -> int:
     if raw_argv and raw_argv[0] == "tui":
         # Rewrite `symphony tui [...args]` as `symphony --tui [...args]`.
         raw_argv = ["--tui", *raw_argv[1:]]
+    elif raw_argv and _looks_like_mistyped_subcommand(raw_argv[0]):
+        names = ", ".join(name for name, _ in SUBCOMMANDS)
+        print(
+            f"symphony: unknown command '{raw_argv[0]}'\n"
+            f"commands: {names}\n"
+            "run `symphony --help` for usage, or pass a path to WORKFLOW.md",
+            file=sys.stderr,
+        )
+        return 2
     args = _build_parser().parse_args(raw_argv)
     try:
         return asyncio.run(_run(args))

@@ -274,3 +274,24 @@ def test_sync_validates_whole_graph_before_writing(tmp_path: Path) -> None:
     else:
         raise AssertionError("invalid graph was accepted")
     assert not list((tmp_path / "kanban").glob("TASK-*.md"))
+
+
+def test_sync_imports_complete_diamond_graph_and_preserves_rerun_bytes(tmp_path: Path) -> None:
+    tickets = tmp_path / "wayfinder/tickets"
+    tickets.mkdir(parents=True)
+    _ticket(tickets / "base.md", "base", "Base")
+    _ticket(tickets / "left.md", "left", "Left", ("base",))
+    _ticket(tickets / "right.md", "right", "Right", ("base",))
+    _ticket(tickets / "join.md", "join", "Join", ("left", "right"))
+    tracker = _tracker(tmp_path / "kanban")
+
+    results = sync_wayfinder(tickets.parent, tracker)
+    identifiers = {item.key: item.identifier for item in results}
+    front, _ = parse_ticket_file(tracker.board_root / f"{identifiers['join']}.md")
+    assert front["blocked_by"] == [identifiers["left"], identifiers["right"]]
+    before = {path: path.read_bytes() for path in tracker.board_root.glob("*.md")}
+
+    rerun = sync_wayfinder(tickets.parent, tracker)
+    assert len(results) == len(rerun) == 4
+    assert all(not item.created for item in rerun)
+    assert before == {path: path.read_bytes() for path in tracker.board_root.glob("*.md")}

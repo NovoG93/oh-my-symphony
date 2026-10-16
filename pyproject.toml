@@ -1,14 +1,15 @@
 [build-system]
-requires = ["setuptools>=68"]
+requires = ["setuptools>=77"]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "oh-my-symphony"
-version = "0.13.0"
-description = "Multi-agent fork of OpenAI Symphony — supports Codex CLI, Claude Code CLI, Gemini CLI, OpenCode CLI, and Pi CLI behind one local Kanban orchestrator with TUI and web board."
+version = "0.25.0"
+description = "Multi-agent fork of OpenAI Symphony — supports Codex CLI, Claude Code CLI, Gemini CLI, AGY/Antigravity CLI, Kiro CLI, OpenCode CLI, Pi CLI, and Prime Agent CLI behind one local Kanban orchestrator with TUI and web board."
 readme = "README.md"
 requires-python = ">=3.12"
-license = { text = "Apache-2.0" }
+license = "Apache-2.0"
+license-files = ["LICENSE", "NOTICE"]
 authors = [{ name = "oh-my-symphony" }]
 dependencies = [
     "PyYAML>=6.0",
@@ -27,6 +28,9 @@ dev = [
     "pytest-cov>=5.0",
     "ruff>=0.8",
     "pyright>=1.1.390",
+    # The full-source type gate includes the bundled SuperQA runtime.
+    "playwright>=1.48",
+    "pillow>=10.0",
 ]
 browser = [
     "playwright>=1.48",
@@ -34,6 +38,7 @@ browser = [
 
 [project.scripts]
 symphony = "symphony.cli:main"
+symphony-pyright = "symphony.pyright:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
@@ -44,6 +49,7 @@ include-package-data = false
 [tool.setuptools.package-data]
 symphony = [
     "web/static/*",
+    "web/static/*/*",
     "factory/templates/*.md",
     "factory/templates/docs/symphony-prompts/file/*.md",
     "factory/templates/docs/symphony-prompts/file/stages/*.md",

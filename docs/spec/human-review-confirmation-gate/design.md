@@ -1,5 +1,11 @@
 # Design: Human Review Confirmation Gate
 
+> **Superseded — archived design record.** This document describes the repo as
+> it was when the spec was written. `tools/board-viewer/` and the `Learn` lane
+> no longer exist (the built-in admin web app on `server.port` is the only
+> board; `Learn` was renamed `Document`). Kept for the decision history, not
+> as a description of current behaviour.
+
 ## Overview
 
 The fix is a narrow parity and contract hardening change.
@@ -78,7 +84,7 @@ this spec does not invent a replacement terminal state.
 Add an API client method:
 
 ```js
-confirmDone: (id) => apiRequest(`/issues/${encodeURIComponent(id)}/confirm-done`, { method: 'POST' })
+confirmDone: (id) => apiRequest(`/issues/${encodeURIComponent(id)}/confirm-done`, { method: 'POST', body: '{}' })
 ```
 
 Add a card action branch in `buildCardEl`:

@@ -320,7 +320,8 @@ class Engine:
                          context: BrowserContext) -> Page:
         """Run one step; returns the page follow-up steps should target."""
         store, site, tmo = self.store, sc.site, step.timeout_ms
-        sub = lambda s: store.substitute(site, s) if s else s
+        def sub(s):
+            return store.substitute(site, s) if s else s
 
         if step.action == "goto":
             await page.goto(sub(step.url or sc.base_url), timeout=max(tmo, 30000),

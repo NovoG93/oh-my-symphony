@@ -110,6 +110,16 @@ class IssueCard(Static):
         self._status = status
         self._refresh_body()
 
+    def update_issue(self, issue: Issue) -> bool:
+        """Rebind the tracker Issue after a refresh. Returns True when the
+        card repainted. Reused cards otherwise keep serving the pre-refresh
+        Issue to the detail pane, the Enter modal and the `e` prefill."""
+        if issue == self._issue:
+            return False
+        self._issue = issue
+        self._refresh_body()
+        return True
+
     def set_density(self, density: str) -> None:
         if density == self._density:
             return
@@ -154,8 +164,22 @@ class IssueCard(Static):
             line.append(" ●", style="bold green")
         elif status.runtime == "retrying":
             line.append(" ↻", style="bold yellow")
+            # The compact line is the operator's default view — a bare ↻
+            # hides why the run is retrying. Mirror the rich card's 40-char
+            # error preview so the cause is visible without flipping density.
+            if status.error:
+                line.append(f" {_truncate(status.error, 40)}", style="dim red")
         elif status.runtime == "completed":
             line.append(" ✓", style="bold green")
+        # Stage-routed boards dispatch different backends per lane; a short
+        # colored chip after the runtime marker says who is on the ticket.
+        # Four letters, not one — c/c would collide between codex/claude.
+        if (
+            status.runtime in ("running", "retrying")
+            and status.agent_kind
+        ):
+            agent_color = AGENT_COLOR.get(status.agent_kind, "white")
+            line.append(f" {status.agent_kind[:4]}", style=f"bold {agent_color}")
         if issue.priority:
             line.append(f" P{issue.priority}", style="bright_red bold")
         if status.attention:
@@ -169,7 +193,7 @@ class IssueCard(Static):
             silent_s = _silent_seconds(status.last_event_at)
             if silent_s is not None and silent_s >= SILENT_THRESHOLD_S:
                 line.append(f"  silent {int(silent_s)}s", style="bold yellow")
-        elif normalize_state(issue.state) == "learn":
+        elif normalize_state(issue.state) in {"document", "learn"}:
             line.append("  S skip", style="dim magenta")
         if status.tokens:
             line.append(f"  {status.tokens:,}t", style="dim cyan")
@@ -241,8 +265,8 @@ class IssueCard(Static):
                     f"{t('card.blocked_by', language)} {', '.join(blocker_names)}",
                     style="dim red",
                 )
-        elif normalize_state(issue.state) == "learn":
-            meta.append("S to skip Learn", style="dim magenta")
+        elif normalize_state(issue.state) in {"document", "learn"}:
+            meta.append("S to skip Document", style="dim magenta")
         elif issue.labels:
             meta.append("  ".join(f"#{label}" for label in issue.labels[:3]), style="dim")
         if status.attention:
@@ -381,6 +405,7 @@ class Lane(Vertical):
             wanted_ids.add(card_id)
             existing_card = existing.pop(card_id, None)
             if existing_card is not None:
+                existing_card.update_issue(issue)
                 existing_card.update_status(status)
                 existing_card.set_density(density)
                 existing_card.set_stage_pos(self._stage_pos)

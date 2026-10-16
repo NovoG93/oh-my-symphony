@@ -5,8 +5,8 @@ The Symphony stage prompts encode contracts in narrative form:
 - In Progress must produce planning, acceptance, done-signal,
   implementation, and self-critique sections plus durable work artefacts.
 - Verify must produce review, security, QA, scorecard, and merge evidence.
-- Learn must produce the wiki write-back record and either a final delivery
-  report or an intervention-only human handoff.
+- Document must produce the wiki write-back record and either a final
+  delivery report or an intervention-only human handoff.
 - Done must produce `## As-Is -> To-Be Report` and `## Merge Status`, and
   the artefact directories named in `## Evidence` must actually contain
   files on disk.
@@ -47,14 +47,36 @@ here). Concretely:
   fail/error/empty result cell is surfaced as a soft `[contract-warn]`
   note this release (passed stays True) rather than a rewind, so a
   hollow-but-honest scorecard is visible without blocking the pipeline.
+
+Deep preset
+-----------
+
+The 8-lane deep preset keeps its gates in the vault
+(`docs/req/<request>/` or `docs/<ID>/`), not in ticket sections, and every
+lane prompt ends with a literal shell gate such as
+`grep -q '^verdict: PASS' review.md`. Those greps are self-attested: a
+worker that skips them still moves the ticket. `_evaluate_deep_contract`
+re-checks the same external facts at the transition — the lane's vault
+file exists and is non-empty, its verdict line is present (`verdict:
+PASS` before the request ticket may reach Done, `Verdict: APPROVED|BLOCKED`
+for QA, `verdict: GREEN|RED` for Verify), the Build claim names the ticket,
+and the short ticket section the prompt asked for is there. `app-release`
+verifiers are exempt: the host release cycle already owns that gate.
 """
 
 from __future__ import annotations
 
 import re
-import unicodedata
 from dataclasses import dataclass, field
 from pathlib import Path
+
+# Moved to the workflow layer (it validates lane names against the default
+# preset — a workflow-domain concern, not an orchestrator one). Re-exported
+# here because `cli/doctor.py` and the contract tests import it from this
+# module; the redundant-alias form marks the intentional re-export.
+from ..workflow.presets import (
+    board_uses_default_contracts as board_uses_default_contracts,
+)
 
 
 @dataclass(frozen=True)
@@ -131,24 +153,14 @@ _VERIFY_OUTCOMES = ("## Review", "## Review Findings")
 _REVIEW_CLEAN = "## Review"
 _REVIEW_FINDINGS = "## Review Findings"
 _QA_SCORECARD = "## AC Scorecard"
-_LEARN_REQUIRED = ("## Wiki Updates",)
-_LEARN_COMPLETION_OPTIONS = ("## As-Is -> To-Be Report", "## Human Review")
+_DOCUMENT_REQUIRED = ("## Wiki Updates",)
+_DOCUMENT_COMPLETION_OPTIONS = ("## As-Is -> To-Be Report", "## Human Review")
 _DONE_REQUIRED = ("## As-Is -> To-Be Report", "## Merge Status")
-_FACTORY_BUILD_REQUIRED = (
-    "## Implementation",
-    "## Full Spec Review",
-    "## Edge Case Review",
-    "## Adversarial Review",
-    "## Test Evidence",
-)
 
 # Result/verdict cells that count as "not a clean pass". Compared
 # case-insensitively after stripping whitespace and surrounding backticks.
 _SCORECARD_PASS_TOKENS = frozenset({"pass", "passed", "ok", "green", "✅"})
 _SECURITY_FAIL_TOKENS = frozenset({"fail", "failed", "critical"})
-_FACTORY_EVIDENCE_PLACEHOLDERS = frozenset(
-    {"", "n/a", "na", "none", "not run", "tbd", "-", "--", "—"}
-)
 
 # Evidence cells that name no real artefact — never treated as a cited path.
 _PATH_PLACEHOLDERS = frozenset({"", "n/a", "na", "none", "-", "--", "tbd", "—"})
@@ -162,11 +174,60 @@ _NA_RESULT_TOKENS = frozenset({"n/a", "na"})
 # Matches a single Markdown inline-code span, e.g. the two spans in
 # "`qa/a.log`, `qa/b.log` (`test_name`)".
 _INLINE_CODE_SPAN_RE = re.compile(r"`([^`]+)`")
-_FACTORY_CRITERION_ITEM_RE = re.compile(
-    r"^\s*(?:[-+*]|\d+[.)])\s+(?:\[[ xX]\]\s+)?(?P<text>\S(?:.*\S)?)\s*$"
+
+
+# Producing states whose forward transition is contract-checked, per preset.
+# `core.py` consults this before paying for a full-body issue refresh.
+_DEFAULT_PRODUCING_STATES = frozenset(
+    {"in progress", "verify", "document", "learn", "done"}
 )
-_MARKDOWN_INLINE_LINK_RE = re.compile(r"!?\[([^\]]+)]\([^)]+\)")
-_MARKDOWN_REFERENCE_LINK_RE = re.compile(r"!?\[([^\]]+)]\[[^\]]*]")
+_DEEP_PRODUCING_STATES = frozenset(
+    {"intake", "research", "plan", "review", "build", "qa", "verify", "document"}
+)
+
+# Deep preset: the ticket section each lane prompt appends ...
+_DEEP_TICKET_SECTIONS: dict[str, tuple[str, ...]] = {
+    "intake": ("## Brief",),
+    "research": ("## Research",),
+    "plan": ("## Plan Summary",),
+    "build": ("## Implementation",),
+    "document": ("## Delivery",),
+}
+# ... and the vault file(s) each lane must leave behind.
+_DEEP_VAULT_FILES: dict[str, tuple[str, ...]] = {
+    "intake": ("brief.md",),
+    "research": ("research.md",),
+    "plan": ("plan.md", "contracts.md"),
+    "review": ("review.md",),
+    "build": ("claims.md",),
+    "qa": ("qa-report.md",),
+    "verify": ("verification.md",),
+    "document": ("delivery.md",),
+}
+_DEEP_REVIEW_PASS_RE = re.compile(r"^verdict:\s*PASS\s*$", re.MULTILINE)
+_DEEP_QA_VERDICT_RE = re.compile(r"^Verdict:\s*(APPROVED|BLOCKED)\s*$", re.MULTILINE)
+_DEEP_VERIFY_VERDICT_RE = re.compile(r"^verdict:\s*(GREEN|RED)\s*$", re.MULTILINE)
+
+
+def contract_producing_states(preset: str | None) -> frozenset[str]:
+    """Normalized producing states the contract validator checks for `preset`."""
+    if preset == "factory":
+        return frozenset({"build", "verify"})
+    if preset == "deep":
+        return _DEEP_PRODUCING_STATES
+    return _DEFAULT_PRODUCING_STATES
+
+
+def deep_vault_dir(docs_root: Path, identifier: str, request: str | None) -> Path:
+    """Vault directory the deep prompts name for a ticket.
+
+    `docs/req/<request>/` when the ticket carries a request group, else
+    `docs/<ID>/` — mirrors the rule in `docs/symphony-prompts/file/deep/base.md`.
+    """
+    group = (request or "").strip()
+    if group:
+        return docs_root / "req" / group
+    return docs_root / identifier
 
 
 def evaluate_contract(
@@ -175,25 +236,101 @@ def evaluate_contract(
     identifier: str,
     *,
     docs_root: Path | None = None,
+    artifact_store_root: Path | None = None,
+    preset: str | None = None,
+    request: str | None = None,
+    advanced_state: str | None = None,
+    app_release: bool = False,
     profile: str = "advanced",
 ) -> ContractResult:
     """Evaluate the producing stage's contract against the ticket body.
 
-    Stages outside the 4-stage enforcement set pass through. The
-    orchestrator wires a failing result into a rewind by appending
-    `result.note` and moving state back to the producing stage.
+    Stages outside the enforcement set pass through. The orchestrator wires
+    a failing result into a rewind by appending `result.note` and moving
+    state back to the producing stage.
+
+    `artifact_store_root` is passed only when `artifacts.require_for_done`
+    is enabled; the Done contract then also requires at least one collected
+    file in the ticket's host-owned artifact store.
+
+    `preset="deep"` selects the deep-preset contract set (vault files and
+    verdict lines under `docs_root`); `request` names the ticket's request
+    group, `advanced_state` the lane the ticket moved to, and `app_release`
+    exempts a labelled release verifier whose gate the host already runs.
     """
     state = (producing_state or "").strip().lower()
     body = ticket_body or ""
+    advanced = (advanced_state or "").strip().lower()
+    if profile.strip().lower() == "factory":
+        from .factory_contracts import evaluate_factory_contract
 
-    if profile == "factory":
-        if state == "build":
-            return _build_result(
-                producing_state,
-                _missing_sections(body, _FACTORY_BUILD_REQUIRED),
-            )
-        if state == "verify":
-            return _evaluate_factory_verify_contract(producing_state, body)
+        result = evaluate_factory_contract(
+            producing_state, body, advanced, docs_root=docs_root
+        )
+    else:
+        result = _evaluate_lane_contract(
+            producing_state,
+            state,
+            body,
+            identifier,
+            docs_root,
+            artifact_store_root=artifact_store_root,
+            preset=preset,
+            request=request,
+            advanced=advanced,
+            app_release=app_release,
+        )
+    # `artifacts.require_for_done` guards the move INTO Done from whichever
+    # lane makes it (Document on the default board, any deep lane); the
+    # Done-as-producing-state branch above keeps its own copy for boards
+    # that still run a Done lane.
+    if (
+        artifact_store_root is not None
+        and identifier
+        and advanced == "done"
+        and state != "done"
+        and not _has_collected_artifact(artifact_store_root / identifier / "files")
+    ):
+        missing = list(result.missing) + [_ARTIFACT_STORE_MISSING]
+        result = _build_result(
+            producing_state, missing, warnings=result.warnings, failures=result.failures
+        )
+    return result
+
+
+_ARTIFACT_STORE_MISSING = (
+    "no collected artifacts (`artifacts.require_for_done` is enabled) — save "
+    "at least one deliverable file into the workspace `.symphony-artifacts/` "
+    "directory"
+)
+
+
+def _evaluate_lane_contract(
+    producing_state: str,
+    state: str,
+    body: str,
+    identifier: str,
+    docs_root: Path | None,
+    *,
+    artifact_store_root: Path | None,
+    preset: str | None,
+    request: str | None,
+    advanced: str,
+    app_release: bool,
+) -> ContractResult:
+    if preset == "deep":
+        if state not in _DEEP_PRODUCING_STATES:
+            return ContractResult(passed=True)
+        return _evaluate_deep_contract(
+            producing_state,
+            state,
+            body,
+            identifier,
+            docs_root,
+            request=request,
+            advanced_state=advanced,
+            app_release=app_release,
+        )
 
     if state == "in progress":
         return _evaluate_in_progress_contract(
@@ -203,139 +340,21 @@ def evaluate_contract(
     if state == "verify":
         return _evaluate_verify_contract(producing_state, body, identifier, docs_root)
 
-    if state == "learn":
-        return _evaluate_learn_contract(producing_state, body)
+    # "learn" is the pre-rename name of the default board's Document lane;
+    # existing boards keep the old lane name, so it stays a supported alias.
+    if state in ("document", "learn"):
+        return _evaluate_document_contract(producing_state, body)
 
     if state == "done":
-        return _evaluate_done_contract(producing_state, body, identifier, docs_root)
+        return _evaluate_done_contract(
+            producing_state,
+            body,
+            identifier,
+            docs_root,
+            artifact_store_root=artifact_store_root,
+        )
 
     return ContractResult(passed=True)
-
-
-def _evaluate_factory_verify_contract(
-    producing_state: str, body: str
-) -> ContractResult:
-    acceptance_heading = "## Acceptance criteria"
-    heading = "## Verification"
-    missing = _missing_sections(body, (acceptance_heading, heading))
-    acceptance_criteria = _factory_acceptance_criteria(body, acceptance_heading)
-    if acceptance_heading not in missing and not acceptance_criteria:
-        missing.append(
-            "## Acceptance criteria must contain at least one bullet or numbered item"
-        )
-    if heading in missing:
-        return _build_result(producing_state, missing)
-
-    required = ("criterion", "command", "result")
-    header = _markdown_table_header(body, heading)
-    if not all(name in header for name in required):
-        missing.append("## Verification table with `criterion | command | result`")
-        return _build_result(producing_state, missing)
-
-    rows = _parse_markdown_table_rows(body, heading)
-    if not rows:
-        missing.append("## Verification table must contain at least one evidence row")
-        return _build_result(producing_state, missing)
-
-    indexes = {name: header.index(name) for name in required}
-    verification_criteria: list[str] = []
-    for row in rows:
-        if len(row.cells) <= max(indexes.values()):
-            missing.append(f"## Verification row {row.row} is incomplete")
-            continue
-        criterion_cell = row.cells[indexes["criterion"]]
-        criterion = _normalize_cell(criterion_cell)
-        command = _normalize_cell(row.cells[indexes["command"]])
-        result = _normalize_cell(row.cells[indexes["result"]])
-        if criterion in _FACTORY_EVIDENCE_PLACEHOLDERS:
-            missing.append(f"## Verification row {row.row} criterion is missing")
-        else:
-            normalized = _normalize_factory_criterion(criterion_cell)
-            if normalized:
-                verification_criteria.append(normalized)
-        if command in _FACTORY_EVIDENCE_PLACEHOLDERS:
-            missing.append(
-                f"## Verification row {row.row} command must name the exact relevant proof"
-            )
-        if result != "pass":
-            missing.append(
-                f"## Verification row {row.row} result is not exactly `pass`: "
-                f"`{result or 'empty'}`"
-            )
-    missing.extend(
-        _missing_factory_acceptance_rows(acceptance_criteria, verification_criteria)
-    )
-    return _build_result(producing_state, missing)
-
-
-def _factory_acceptance_criteria(body: str, heading: str) -> list[tuple[str, str]]:
-    """Return declared list items as ``(display, normalized)`` pairs."""
-    criteria: list[tuple[str, str]] = []
-    current: list[str] = []
-
-    def append_current() -> None:
-        if not current:
-            return
-        display = " ".join(current)
-        normalized = _normalize_factory_criterion(display)
-        if normalized:
-            criteria.append((display, normalized))
-
-    for line in _section_body_text(body, heading).splitlines():
-        match = _FACTORY_CRITERION_ITEM_RE.match(line)
-        if match:
-            append_current()
-            current = [match.group("text").strip()]
-            continue
-        if current and line[:1].isspace() and line.strip():
-            current.append(line.strip())
-            continue
-        append_current()
-        current = []
-    append_current()
-    return criteria
-
-
-def _normalize_factory_criterion(value: str) -> str:
-    """Normalize presentational Markdown while preserving criterion wording."""
-    text = unicodedata.normalize("NFKC", value)
-    text = _MARKDOWN_INLINE_LINK_RE.sub(r"\1", text)
-    text = _MARKDOWN_REFERENCE_LINK_RE.sub(r"\1", text)
-    text = _INLINE_CODE_SPAN_RE.sub(r"\1", text)
-    for pattern in (
-        r"\*\*(.+?)\*\*",
-        r"__(.+?)__",
-        r"~~(.+?)~~",
-        r"(?<!\w)\*([^*\n]+)\*(?!\w)",
-        r"(?<!\w)_([^_\n]+)_(?!\w)",
-    ):
-        text = re.sub(pattern, r"\1", text)
-    text = re.sub(r"\\([\\`*_{}\[\]()#+.!~-])", r"\1", text)
-    return " ".join(text.casefold().split())
-
-
-def _missing_factory_acceptance_rows(
-    acceptance_criteria: list[tuple[str, str]], verification_criteria: list[str]
-) -> list[str]:
-    """Require one distinct Verification row per declared criterion."""
-    available: dict[str, int] = {}
-    for criterion in verification_criteria:
-        available[criterion] = available.get(criterion, 0) + 1
-
-    missing: list[str] = []
-    for display, normalized in acceptance_criteria:
-        if available.get(normalized, 0) > 0:
-            available[normalized] -= 1
-            continue
-        missing.append(
-            f"acceptance criterion lacks a distinct Verification row: `{display}`"
-        )
-    for normalized, count in available.items():
-        for _ in range(count):
-            missing.append(
-                f"Verification has undeclared criterion: `{normalized}`"
-            )
-    return missing
 
 
 def _evaluate_in_progress_contract(
@@ -385,9 +404,9 @@ def _evaluate_verify_contract(
     )
 
 
-def _evaluate_learn_contract(producing_state: str, body: str) -> ContractResult:
-    missing = _missing_sections(body, _LEARN_REQUIRED)
-    if not any(_section_present_nonempty(body, name) for name in _LEARN_COMPLETION_OPTIONS):
+def _evaluate_document_contract(producing_state: str, body: str) -> ContractResult:
+    missing = _missing_sections(body, _DOCUMENT_REQUIRED)
+    if not any(_section_present_nonempty(body, name) for name in _DOCUMENT_COMPLETION_OPTIONS):
         missing.append("one of `## As-Is -> To-Be Report` or `## Human Review`")
     return _build_result(producing_state, missing)
 
@@ -397,6 +416,8 @@ def _evaluate_done_contract(
     body: str,
     identifier: str,
     docs_root: Path | None,
+    *,
+    artifact_store_root: Path | None = None,
 ) -> ContractResult:
     missing = _missing_sections(body, _DONE_REQUIRED)
     if docs_root is not None and identifier:
@@ -404,7 +425,88 @@ def _evaluate_done_contract(
             target = docs_root / identifier / required_dir
             if not _directory_has_files(target):
                 missing.append(f"artefact directory `{target}` missing or empty")
+    if artifact_store_root is not None and identifier:
+        # `files/` mirrors ArtifactStore layout; checked directly so the
+        # contract stays a pure filesystem predicate like the docs checks.
+        store_files = artifact_store_root / identifier / "files"
+        if not _has_collected_artifact(store_files):
+            missing.append(_ARTIFACT_STORE_MISSING)
     return _build_result(producing_state, missing)
+
+
+def _evaluate_deep_contract(
+    producing_state: str,
+    state: str,
+    body: str,
+    identifier: str,
+    docs_root: Path | None,
+    *,
+    request: str | None,
+    advanced_state: str,
+    app_release: bool,
+) -> ContractResult:
+    """Re-check a deep lane's hard gate from outside the worker.
+
+    Presence of the lane's ticket section, existence of its vault file(s),
+    and the verdict line the prompt's shell gate greps for. The checks stay
+    at the level of facts the prompt cannot self-certify; prose shape is
+    not re-encoded here.
+    """
+    missing = _missing_sections(body, _DEEP_TICKET_SECTIONS.get(state, ()))
+    if state == "verify" and app_release:
+        # `symphony release check` plus the host release cycle own this gate.
+        return _build_result(producing_state, missing)
+    if docs_root is None or not identifier:
+        return _build_result(producing_state, missing)
+
+    vault = deep_vault_dir(docs_root, identifier, request)
+    texts: dict[str, str] = {}
+    for name in _DEEP_VAULT_FILES.get(state, ()):
+        path = vault / name
+        text = _read_text_file(path)
+        if not text.strip():
+            missing.append(f"vault file `{path}` missing or empty")
+        texts[name] = text
+
+    if state == "review" and texts.get("review.md", "").strip():
+        if advanced_state == "done" and not _DEEP_REVIEW_PASS_RE.search(
+            texts["review.md"]
+        ):
+            missing.append(
+                f"`{vault / 'review.md'}` has no `verdict: PASS` line, yet the "
+                "request ticket advanced to Done (which releases the Build DAG)"
+            )
+    if state == "build" and texts.get("claims.md", "").strip():
+        claim_re = re.compile(
+            r"^##\s.*" + re.escape(identifier) + r"\b", re.MULTILINE
+        )
+        if not claim_re.search(texts["claims.md"]):
+            missing.append(
+                f"`{vault / 'claims.md'}` has no `## <UTC time> {identifier}` claim"
+            )
+    if state == "qa" and texts.get("qa-report.md", "").strip():
+        if not _DEEP_QA_VERDICT_RE.search(texts["qa-report.md"]):
+            missing.append(
+                f"`{vault / 'qa-report.md'}` has no `Verdict: APPROVED` or "
+                "`Verdict: BLOCKED` line"
+            )
+    if state == "verify" and texts.get("verification.md", "").strip():
+        if not _DEEP_VERIFY_VERDICT_RE.search(texts["verification.md"]):
+            missing.append(
+                f"`{vault / 'verification.md'}` has no `verdict: GREEN` or "
+                "`verdict: RED` line"
+            )
+    return _build_result(producing_state, missing)
+
+
+def _read_text_file(path: Path) -> str:
+    """Return a regular file's text, or "" when absent/unreadable/not a file."""
+    try:
+        if not path.is_file():
+            return ""
+        return path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return ""
 
 
 def _missing_sections(body: str, required: tuple[str, ...]) -> list[str]:
@@ -422,17 +524,42 @@ def _section_present_nonempty(body: str, heading: str) -> bool:
     """
     if not body:
         return False
+    # The heading may carry an inline summary after a colon — the shipped
+    # Verify prompt itself asks for `## Merge Status: preflight clean, …`
+    # — so accept `## <heading>`, `## <heading>:` and `## <heading>: <text>`,
+    # and count that inline text as section content.
     pattern = re.compile(
-        r"^##\s+" + re.escape(heading[3:].strip()) + r"\s*:?\s*$",
+        r"^##\s+" + re.escape(heading[3:].strip()) + r"\s*(?::\s*(?P<inline>.*))?$",
         re.IGNORECASE | re.MULTILINE,
     )
     match = pattern.search(body)
     if not match:
         return False
+    inline = match.group("inline") or ""
     after = body[match.end() :]
     next_heading = re.search(r"^##\s+\S", after, re.MULTILINE)
     section_body = after if next_heading is None else after[: next_heading.start()]
-    return bool(section_body.strip())
+    return bool(inline.strip() or section_body.strip())
+
+
+def _has_collected_artifact(path: Path) -> bool:
+    """True when the ticket's artifact directory holds a real deliverable.
+
+    Stricter than `_directory_has_files`: an interrupted copy leaves a
+    `.tmp-artifact-*` file behind, and a worker can plant a symlink. Either
+    would satisfy a plain "directory is non-empty" check and pass the Done
+    gate for a ticket whose board Artifacts list renders empty.
+    """
+    if not path.is_dir():
+        return False
+    try:
+        entries = list(path.iterdir())
+    except OSError:
+        return False
+    return any(
+        entry.is_file() and not entry.is_symlink() and not entry.name.startswith(".")
+        for entry in entries
+    )
 
 
 def _directory_has_files(path: Path) -> bool:
@@ -507,7 +634,9 @@ def _markdown_table_header(body: str, heading: str) -> tuple[str, ...]:
     return ()
 
 
-def _parse_markdown_table_rows(body: str, heading: str) -> list[MarkdownTableRow]:
+def _parse_markdown_table_rows(
+    body: str, heading: str, *, escaped_pipes: bool = False
+) -> list[MarkdownTableRow]:
     """Parse table data rows under `heading`, preserving data-row numbers."""
     section = _section_body_text(body, heading)
     if not section:
@@ -517,7 +646,13 @@ def _parse_markdown_table_rows(body: str, heading: str) -> list[MarkdownTableRow
         stripped = line.strip()
         if not stripped.startswith("|"):
             continue
-        cells = tuple(c.strip() for c in stripped.strip("|").split("|"))
+        if escaped_pipes:
+            cells = tuple(
+                cell.strip().replace(r"\|", "|")
+                for cell in re.split(r"(?<!\\)\|", stripped.strip("|"))
+            )
+        else:
+            cells = tuple(c.strip() for c in stripped.strip("|").split("|"))
         # Drop the header/body separator row (cells made only of - : spaces).
         if cells and all(set(c) <= set("-: ") and c for c in cells):
             continue

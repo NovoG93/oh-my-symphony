@@ -29,6 +29,7 @@ from symphony.workflow import (
     GeminiConfig,
     HooksConfig,
     PiConfig,
+    PrimeAgentConfig,
     PromptConfig,
     ServerConfig,
     ServiceConfig,
@@ -134,7 +135,7 @@ def _make_config(
     *,
     max_turns: int = 5,
     max_attempts: int = 3,
-    active_states: tuple[str, ...] = ("Todo", "In Progress", "Verify", "Learn"),
+    active_states: tuple[str, ...] = ("Todo", "In Progress", "Verify", "Document"),
     prompt_template: str | None = None,
     prompts: PromptConfig | None = None,
     compact_issue_context: bool = False,
@@ -196,6 +197,13 @@ def _make_config(
             stall_timeout_ms=300_000,
             resume_across_turns=True,
         ),
+prime_agent=PrimeAgentConfig(
+    command='prime-agent -p --mode json',
+    turn_timeout_ms=3_600_000,
+    read_timeout_ms=5_000,
+    stall_timeout_ms=300_000,
+    resume_across_turns=True,
+),
         server=ServerConfig(port=None),
         tui=TuiConfig(language="en", visible_lanes=5),
         prompts=prompts or PromptConfig(),
@@ -277,6 +285,12 @@ def _seed_running_entry(o: Orchestrator, issue: Issue, tmp_path: Path) -> None:
         retry_attempt=None,
         worker_task=None,  # type: ignore[arg-type]
         workspace_path=tmp_path,
+        # This helper models the entry after `_dispatch`, which resolves
+        # release authority before registering the worker.  Leaving the
+        # default False makes direct worker-loop tests perform a second
+        # dispatch-preparation pass against the fixture's hard-coded
+        # workflow path and replace their isolated RunRegistry.
+        release_authority_resolved=True,
     )
 
 
@@ -1318,7 +1332,7 @@ def test_phase_transition_resets_token_budget_before_new_session_usage(
 
 
 # ---------------------------------------------------------------------------
-# Rewind detection - Verify/Learn -> In Progress
+# Rewind detection - Verify/Document -> In Progress
 # ---------------------------------------------------------------------------
 
 
@@ -1327,16 +1341,18 @@ def test_is_rewind_transition_pure_function() -> None:
     from symphony.orchestrator import _is_rewind_transition
 
     assert _is_rewind_transition("verify", "in progress") is True
+    assert _is_rewind_transition("document", "in progress") is True
+    # Legacy lane name (pre-rename boards) keeps its rewind semantics.
     assert _is_rewind_transition("learn", "in progress") is True
     # Forward transitions are NEVER rewinds.
     assert _is_rewind_transition("todo", "in progress") is False
     assert _is_rewind_transition("in progress", "verify") is False
-    assert _is_rewind_transition("verify", "learn") is False
+    assert _is_rewind_transition("verify", "document") is False
     # Same-state self-loops are not transitions at all.
     assert _is_rewind_transition("in progress", "in progress") is False
     # Backward jumps to states OTHER than In Progress are out of scope.
     assert _is_rewind_transition("verify", "todo") is False
-    assert _is_rewind_transition("learn", "verify") is False
+    assert _is_rewind_transition("document", "verify") is False
 
 
 def test_is_rewind_transition_uses_configured_active_state_order() -> None:
@@ -1725,7 +1741,10 @@ def test_dispatch_registers_running_entry_before_eager_worker_start(
     if eager_factory is None:
         pytest.skip("asyncio.eager_task_factory requires Python 3.12+")
 
-    cfg = _make_config(max_turns=1)
+    cfg = replace(
+        _make_config(max_turns=1),
+        workflow_path=tmp_path / "WORKFLOW.md",
+    )
     issue = _make_issue(state="Todo")
     o = _orch(tmp_path)
     _install_fake_backend(monkeypatch)

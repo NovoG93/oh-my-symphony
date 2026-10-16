@@ -6,7 +6,11 @@ creates isolated worktrees, retries failures, and runs an independent Verify
 turn.
 
 ```bash
+git init /path/to/project
 symphony factory init /path/to/project --agent opencode
+# Commit the generated files before starting workers:
+git -C /path/to/project add .
+git -C /path/to/project commit -m "Initialize Symphony factory"
 # Edit /path/to/project/wayfinder/tickets/*.md
 symphony factory sync /path/to/project/wayfinder
 symphony factory start /path/to/project/wayfinder
@@ -50,13 +54,28 @@ does not create a second GOAL/PLAN/QA run vault. The Build contract requires a
 short nonempty section for every pass before an independent `Verify` worker
 can add the acceptance-criterion evidence table and move the ticket to Done.
 
+Verification must use the exact commands declared in the ticket's Proof section.
+One criterion may cite several inline-code commands in its table cell. Every
+declared command needs evidence. The fresh Verify turn rewrites its Verification
+section with current UTC time and output; browser work also supplies a fresh,
+nonempty in-worktree report and explicit pass, failure, and side-effect counts.
+These checks validate the worker's evidence and prevent bypassing Verify; they
+do not independently attest that a model executed each reported command.
+
+`Blocked` preserves the workspace for missing authority or environment and does
+not create automatic repair tickets. Fix the named blocker, then use
+`symphony board update <ID> --state Verify --workflow /path/to/WORKFLOW.md`
+to retry proof, or `--state Build` when product work remains. Existing turn and
+token budgets still apply; inspect the ticket's budget diagnostics before retrying.
+
 `factory init` prints the exact Supergoal WAYFINDER prompt to use next.
 It merges runtime ignore rules into `.gitignore` without replacing user rules:
 board cards, worktrees, logs, and `WORKFLOW-PROGRESS.md` stay local runtime
 state. Commit the Wayfinder spec and product code, not `kanban/*.md`.
 `factory start` runs sync, Doctor (including any `--port` override), then the
 managed service. A Doctor failure stops before process launch. Verified Done
-work merges into the branch that launched the factory. Use
+work merges locally into the branch that launched the factory. Remote publishing
+is opt-in: configure an upstream and `agent.auto_merge_push_target: true`. Use
 `examples/advanced/WORKFLOW.file.example.md` for the advanced production
 pipeline.
 

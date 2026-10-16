@@ -7,7 +7,7 @@ from .plain_cli import PlainCliBackend
 
 
 class AgyBackend(PlainCliBackend):
-    """Drive `agy --print -` once per Symphony worker turn."""
+    """Drive `agy --print "$(cat)"` once per Symphony worker turn."""
 
     def __init__(self, init: BackendInit) -> None:
         cfg = init.cfg.agy

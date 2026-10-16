@@ -21,7 +21,7 @@ STAGE_HEADINGS_BY_STATE = {
     "Todo": "### TRIAGE",
     "In Progress": "### IMPLEMENT",
     "Verify": "### VERIFY",
-    "Learn": "### LEARN",
+    "Document": "### DOCUMENT",
     "Done": "### DONE",
 }
 
@@ -41,7 +41,9 @@ IN_PROGRESS_RULES = (
 )
 
 VERIFY_RULES = (
-    "Verify has three jobs: review, QA, and merge preflight/merge",
+    "Verify has three jobs: review, QA, and merge preflight",
+    # F-10: exactly one merge per ticket, created by the orchestrator at Done.
+    "Verify proves, Document documents, the orchestrator merges",
     "what worked",
     "what failed",
     "what is not covered",
@@ -55,7 +57,12 @@ VERIFY_RULES = (
     "Full integration gate",
     "committed target branch",
     "register new Kanban/board bug tickets",
-    "blocked_by",
+    # F-09: the lane names the validated write verb instead of telling the
+    # agent to hand-edit `blocked_by` frontmatter.
+    "board update {{ issue.identifier }} --add-blocked-by <ID>".replace(
+        "{{ issue.identifier }}", "DEMO-1"
+    ),
+    "never hand-edit frontmatter",
     "rerun from scratch",
     "## QA Evidence",
     "## AC Scorecard",
@@ -64,20 +71,37 @@ VERIFY_RULES = (
     "git merge-tree --write-tree",
     "Do not merge the target branch into the ticket workspace",
     "## Merge Status",
-    "Set state to `Learn`",
+    "Set state to `Document`",
 )
 
-LEARN_RULES = (
+APP_RELEASE_VERIFY_RULES = (
+    "Tickets labeled `app-release`",
+    "release-contract.yaml",
+    "docs/DEMO-1/qa/release-evidence.json",
+    "exact target commit",
+    "desktop, tablet, and mobile",
+    "symphony release check",
+    "Historical Markdown or ledger GREEN text is never current approval",
+    '"$SYMPHONY_WORKFLOW_DIR/WORKFLOW.md"',
+    "structurally valid repairable RED",
+    "forward historical transition",
+    "Evidence, schema, or environment errors stay in `Verify`",
+    "rebase this evidence-only verifier branch",
+    "never merges it into the target",
+)
+
+DOCUMENT_RULES = (
     "llm-wiki",
     "INDEX.md",
     "## Wiki Updates",
     "## As-Is -> To-Be Report",
     "Final History Gate",
-    "do not use `git add -A`",
-    "git commit",
-    "git push",
+    # The gate moved to the host: the agent is told to stay out of git, and
+    # told not to self-block when its sandbox refuses a local git write.
+    "Symphony runs it, not you",
+    "Do not stage, commit, or publish the delivery record yourself",
     "git ls-remote",
-    "set state to `Blocked`",
+    "Never set `Blocked` because a local git command failed",
     "## Human Review",
     "Set state to `Done`",
     "Set state to `Human Review` only",
@@ -106,6 +130,12 @@ HUMAN_REVIEW_HANDOFF_SHAPE = (
 
 
 def _load(name: str):
+    if name.startswith("examples/advanced/"):
+        from symphony.workflow import parse_workflow_text
+
+        return build_service_config(parse_workflow_text(
+            (REPO_ROOT / name).read_text(encoding="utf-8"), REPO_ROOT / "WORKFLOW.md"
+        ))
     return build_service_config(load_workflow(REPO_ROOT / name))
 
 
@@ -155,9 +185,9 @@ def test_active_states_cover_four_stage_pipeline(workflow: str) -> None:
         "Todo",
         "In Progress",
         "Verify",
-        "Learn",
+        "Document",
     )
-    for required in ("Todo", "In Progress", "Verify", "Learn"):
+    for required in ("Todo", "In Progress", "Verify", "Document"):
         assert required.lower() in cfg.prompts.stage_templates
     assert "done" in cfg.prompts.stage_templates
     assert "Human Review" in cfg.tracker.terminal_states
@@ -219,6 +249,23 @@ def test_verify_stage_demands_review_qa_and_merge_evidence(workflow: str) -> Non
         assert phrase in rendered
     assert "Do not use `git status -uno --porcelain` as merge proof" in rendered
     assert "set state to `In Progress`" in rendered
+    # F-10: the Verify lane must not hand-merge — that produced two merge
+    # commits per ticket and landed code before Document wrote the wiki.
+    assert "orchestrator will merge at Done" in rendered
+    assert "Do NOT create the merge commit yourself" in rendered
+    assert "create the explicit `--no-ff` merge commit" not in rendered
+
+
+def test_file_verify_stage_carries_the_app_release_machine_gate() -> None:
+    cfg = _load("examples/advanced/WORKFLOW.file.example.md")
+    rendered = render(
+        cfg.prompt_template_for_state("Verify"),
+        build_prompt_env(_issue("Verify"), attempt=None),
+    )
+
+    for phrase in APP_RELEASE_VERIFY_RULES:
+        assert phrase in rendered
+    assert "$SYMPHONY_WORKFLOW_PATH" not in rendered
 
 
 @pytest.mark.parametrize("workflow", WORKFLOW_FILES)
@@ -235,26 +282,57 @@ def test_verify_stage_respects_disabled_auto_merge(workflow: str) -> None:
 
     assert "Merge Gate is disabled" in rendered
     assert "leaves branch integration to the operator" in rendered
-    assert "Set state to `Learn`" in rendered
+    assert "Set state to `Document`" in rendered
 
 
 @pytest.mark.parametrize("workflow", WORKFLOW_FILES)
-def test_learn_stage_writes_wiki_and_done_or_intervention_handoff(workflow: str) -> None:
+def test_document_stage_writes_wiki_and_done_or_intervention_handoff(workflow: str) -> None:
     cfg = _load(workflow)
     rendered = render(
-        cfg.prompt_template_for_state("Learn"),
-        build_prompt_env(_issue("Learn"), attempt=None),
+        cfg.prompt_template_for_state("Document"),
+        build_prompt_env(_issue("Document"), attempt=None),
     )
 
-    for phrase in LEARN_RULES:
+    for phrase in DOCUMENT_RULES:
         assert phrase in rendered
     for heading in HUMAN_REVIEW_HANDOFF_SHAPE:
         assert heading in rendered
-    assert "Do NOT edit source or run the Merge Gate here" in rendered
+    # F-07: read-only history inspection is the lane's job, not a cage.
+    assert "Read-only inspection of history is expected" in rendered
+    assert "do NOT run git history commands" not in rendered
+    # F-08: the lane's write scope matches its charter (docs, not just wiki).
+    assert "the user-facing docs this change touched" in rendered
+    assert "Update every user-facing doc the change touched" in rendered
+    assert "no source or test edits" in rendered
+    # The ownership boundaries that ARE legitimate stay.
+    assert "Do not create commits, tags, branches, or pushes" in rendered
+    # F-27: `## Document Defect` was consumed as a rewind section that no
+    # prompt ever told an agent to write.
+    assert "## Document Defect" in rendered
+    assert "set state to `In Progress`" in rendered
+
+
+@pytest.mark.parametrize("workflow", WORKFLOW_FILES)
+def test_document_stage_receives_board_health_only_when_present(workflow: str) -> None:
+    cfg = _load(workflow)
+    template = cfg.prompt_template_for_state("Document")
+    quiet = render(template, build_prompt_env(_issue("Document"), attempt=None))
+    assert "Board health" not in quiet
+    noisy = render(
+        template,
+        build_prompt_env(
+            _issue("Document"),
+            attempt=None,
+            board_health="- lane `verify`: rewound 3x, contract failed 2x",
+        ),
+    )
+    assert "Board health (orchestrator stats, last 30 days)" in noisy
+    assert "rewound 3x" in noisy
+    assert "## Learnings" in noisy
 
 
 @pytest.mark.parametrize("flavor", ("file", "linear"))
-def test_base_prompt_declares_four_stage_pipeline_and_skip_learn(flavor: str) -> None:
+def test_base_prompt_declares_four_stage_pipeline_and_skip_document(flavor: str) -> None:
     text = (REPO_ROOT / "docs" / "symphony-prompts" / flavor / "base.md").read_text(
         encoding="utf-8"
     )
@@ -262,7 +340,7 @@ def test_base_prompt_declares_four_stage_pipeline_and_skip_learn(flavor: str) ->
     assert "Production pipeline (4 active stages)" in text
     assert "Board card mental model" in text
     assert "Each lane answers one human question" in text
-    assert "Todo  ->  In Progress  ->  Verify  ->  Learn" in text
+    assert "Todo  ->  In Progress  ->  Verify  ->  Document" in text
     assert "critical/manual intervention -> Human Review" in text
     assert "Use `Human Review` only for real critical/manual intervention" in text
     assert "Use `Not proven` when evidence is missing" in text
@@ -392,11 +470,11 @@ def test_file_base_prompt_renders_full_ticket_path_outside_description() -> None
         build_prompt_env(
             _issue("Verify", description="ticket body marker"),
             attempt=None,
-            full_ticket_path="kanban/DEMO-1.md",
+            full_ticket_path="release-kanban/DEMO-1.md",
         ),
     )
 
-    full_ticket_index = rendered.index("Full ticket: kanban/DEMO-1.md")
+    full_ticket_index = rendered.index("Full ticket: release-kanban/DEMO-1.md")
     description_index = rendered.index("## Description")
     description_block = rendered.split("## Description", 1)[1].split(
         "## Production pipeline",
@@ -405,7 +483,20 @@ def test_file_base_prompt_renders_full_ticket_path_outside_description() -> None
 
     assert full_ticket_index < description_index
     assert "ticket body marker" in description_block
-    assert "Full ticket: kanban/DEMO-1.md" not in description_block
+    assert "Full ticket: release-kanban/DEMO-1.md" not in description_block
+    assert "Ticket file: `release-kanban/DEMO-1.md`." in rendered
+    assert "Ticket file: `kanban/DEMO-1.md`." not in rendered
+
+
+def test_file_base_prompt_does_not_direct_workers_to_kanban_without_path() -> None:
+    cfg = _load("examples/advanced/WORKFLOW.file.example.md")
+    rendered = render(
+        cfg.prompt_template_for_state("Verify"),
+        build_prompt_env(_issue("Verify"), attempt=None),
+    )
+
+    assert "use the configured tracker board root" in rendered
+    assert "kanban/{{ issue.identifier }}.md" not in rendered
 
 
 def test_contract_rewind_prompt_uses_failing_rows_not_full_history() -> None:
@@ -464,3 +555,29 @@ Symphony rewound the ticket so the producing stage can complete the contract.
     assert "old vague failure" not in compact_description
     assert "stale historical log" not in compact_description
     assert "large implementation history" not in compact_description
+
+
+@pytest.mark.parametrize("workflow", WORKFLOW_FILES)
+def test_base_prompt_directs_deliverables_to_the_artifacts_dir(workflow: str) -> None:
+    cfg = _load(workflow)
+    rendered = render(
+        cfg.prompt_template_for_state("Verify"),
+        build_prompt_env(
+            _issue("Verify"), attempt=None, artifacts_dir=".symphony-artifacts"
+        ),
+    )
+    assert "`.symphony-artifacts/` at the workspace root" in rendered
+    assert "manifest.json" in rendered
+    # The docs/ evidence root stays authoritative for proof.
+    assert "Every ticket artefact lives under `docs/DEMO-1/`." in rendered
+
+
+@pytest.mark.parametrize("workflow", WORKFLOW_FILES)
+def test_base_prompt_omits_artifacts_directive_when_disabled(workflow: str) -> None:
+    cfg = _load(workflow)
+    rendered = render(
+        cfg.prompt_template_for_state("Verify"),
+        build_prompt_env(_issue("Verify"), attempt=None),
+    )
+    assert "Board deliverables" not in rendered
+    assert "manifest.json" not in rendered

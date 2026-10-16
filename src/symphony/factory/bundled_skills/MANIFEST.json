@@ -17,7 +17,14 @@
     "superqa": {
       "source": "https://github.com/cskwork/superqa-skill.git",
       "version": "v0.3.0",
-      "commit": "d4e6a210a2b66cb10998164a159bfd68de569df6"
+      "commit": "d4e6a210a2b66cb10998164a159bfd68de569df6",
+      "local_adaptations": {
+        "superqa_tui/cli.py": "Split semicolon-separated argparse calls for repository lint compatibility.",
+        "superqa_tui/engine.py": "Replace assigned substitution lambda with a named function; behavior unchanged.",
+        "superqa_tui/report.py": "Replace assigned escaping lambda and type effect lists for lint/type-check compatibility; behavior unchanged.",
+        "superqa_tui/scheduler.py": "Remove unused dataclasses.field import.",
+        "superqa_tui/visual.py": "Use an equivalent 256-entry pixel lookup table for Pillow type compatibility; preserve the strict >24 threshold."
+      }
     }
   },
   "adapted_sources": {
