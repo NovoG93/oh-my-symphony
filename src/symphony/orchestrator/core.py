@@ -118,6 +118,7 @@ from .constants import (
 from .contracts import _build_result, contract_producing_states, evaluate_contract
 from .factory_contracts import (
     factory_browser_failures,
+    factory_browser_required,
     factory_verification_text,
 )
 from .release_contracts import (
@@ -6787,6 +6788,11 @@ class Orchestrator:
         entry.factory_verification_baseline = None
         entry.factory_verify_completed = False
         entry.factory_verify_started_at = 0.0
+        if self._is_factory_profile(cfg):
+            entry.factory_browser_required = (
+                entry.factory_browser_required
+                or factory_browser_required(issue.description or "", issue.skills)
+            )
         if self._is_factory_profile(cfg) and entry.factory_declared_proof is None:
             entry.factory_declared_proof = tuple(
                 factory_proof_commands(issue.description or "")
@@ -7573,13 +7579,9 @@ class Orchestrator:
                     missing.append(
                         "Verification is unchanged from before this Verify phase; record fresh output and a UTC timestamp"
                     )
-                browser = "superqa" in issue.skills or bool(
-                    re.search(
-                        r"\bbrowser\b|## Browser Verification",
-                        issue.description or "",
-                        re.IGNORECASE,
-                    )
-                )
+                browser = factory_browser_required(
+                    issue.description or "", issue.skills
+                ) or bool(authority_entry and authority_entry.factory_browser_required)
                 if browser:
                     missing.extend(
                         factory_browser_failures(

@@ -123,6 +123,7 @@ class RunningEntry:
     factory_verify_started_at: float = 0.0
     factory_verify_completed: bool = False
     factory_declared_proof: tuple[str, ...] | None = None
+    factory_browser_required: bool = False
     agent_pgid: int | None = None
     # A backend stop raised after teardown began. Some drivers become closed
     # before the failing await, so a later idempotent stop cannot confirm that

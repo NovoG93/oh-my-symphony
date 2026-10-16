@@ -920,6 +920,12 @@ _FACTORY_VERIFY_BODY = """## Proof commands
     [
         ("## QA Failure\n\nmissing proof", "Verify", True),
         (_FACTORY_VERIFY_BODY, "Done", False),
+        (
+            _FACTORY_VERIFY_BODY + "\nNo browser surface or attached `superqa` applies.\n",
+            "Done",
+            False,
+        ),
+        (_FACTORY_VERIFY_BODY + "\n## Browser Verification\n\nClaimed complete.", "Verify", True),
     ],
 )
 def test_factory_verify_to_done_enforces_contract_before_terminal_exit(
@@ -1167,3 +1173,80 @@ def test_factory_build_runs_independent_verify_context_before_done(
         sum(call[0] == "run_turn" for backend in backends for call in backend.calls)
         == 2
     )
+
+
+@pytest.mark.parametrize("initial_state", ["Build", "Verify"])
+@pytest.mark.parametrize("attachment", ["skill", "heading"])
+def test_factory_browser_requirement_survives_worker_removing_original_attachment(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    initial_state: str,
+    attachment: str,
+) -> None:
+    board_root = tmp_path / "board"
+    build_body = (
+        "\n\n".join(
+            f"## {heading}\n\nComplete"
+            for heading in (
+                "Implementation",
+                "Full Spec Review",
+                "Edge Case Review",
+                "Adversarial Review",
+                "Test Evidence",
+            )
+        )
+        + "\n\n"
+        + _FACTORY_VERIFY_BODY
+    )
+    original_body = build_body if initial_state == "Build" else _FACTORY_VERIFY_BODY
+    if attachment == "heading":
+        original_body += "\n## Browser Verification\n\nBrowser report pending.\n"
+    ticket_path = _write_initial_ticket(
+        board_root, state=initial_state, body=original_body
+    )
+    front, _ = parse_ticket_file(ticket_path)
+    front["skills"] = ["superqa"] if attachment == "skill" else []
+    write_ticket_atomic(ticket_path, front, original_body)
+    cfg = _make_file_tracker_config(
+        board_root=board_root,
+        active_states=("Ready", "Build", "Verify"),
+        max_turns=2,
+    )
+    cfg.raw["contract_profile"] = "factory"
+    transitions = []
+    if initial_state == "Build":
+        transitions.append(("Verify", build_body))
+    transitions.append(
+        (
+            "Done",
+            _FACTORY_VERIFY_BODY
+            + "\nVerified UTC: 2026-10-17T00:00:00Z\nOutput: 1 test passed\n",
+        )
+    )
+    _install_file_tracker_backend(
+        monkeypatch, ticket_path=ticket_path, transitions=transitions
+    )
+    original_run_turn = _TicketMutatingBackend.run_turn
+
+    async def strip_attachment(self, **kwargs):
+        await original_run_turn(self, **kwargs)
+        front, body = parse_ticket_file(ticket_path)
+        front["skills"] = []
+        write_ticket_atomic(ticket_path, front, body)
+
+    monkeypatch.setattr(_TicketMutatingBackend, "run_turn", strip_attachment)
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    orchestrator = _orch(workspace)
+    issue = replace(
+        _make_issue_from_disk(initial_state, original_body),
+        skills=tuple(front["skills"]),
+    )
+    _seed_running_entry(orchestrator, issue, workspace)
+    entry = orchestrator._running[issue.id]
+    asyncio.run(orchestrator._run_agent_attempt(issue, attempt=None, cfg=cfg))
+    final_front, final_body = parse_ticket_file(ticket_path)
+    assert final_front["state"] == "Verify"
+    assert entry.factory_browser_required
+    assert "## Browser Verification requires" in final_body
+    assert final_front["skills"] == []

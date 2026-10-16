@@ -155,6 +155,17 @@ def factory_verification_text(body: str) -> str:
     return _section_body_text(body, "## Verification").strip()
 
 
+def factory_browser_required(body: str, skills: tuple[str, ...]) -> bool:
+    """Use routed browser QA or an explicit report section, not incidental prose."""
+    return "superqa" in skills or bool(
+        re.search(
+            r"^##[ \t]+Browser Verification[ \t]*:?[ \t]*\r?$",
+            body,
+            re.IGNORECASE | re.MULTILINE,
+        )
+    )
+
+
 def factory_browser_failures(
     body: str, workspace_path: Path, started_at: float
 ) -> list[str]:

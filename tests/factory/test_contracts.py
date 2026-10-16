@@ -1,5 +1,5 @@
 from symphony.orchestrator.contracts import evaluate_contract
-from symphony.orchestrator.factory_contracts import factory_browser_failures
+from symphony.orchestrator.factory_contracts import factory_browser_failures, factory_browser_required
 
 import os
 from pathlib import Path
@@ -370,3 +370,56 @@ def test_factory_browser_rejects_old_report_and_accepts_fresh_one(
     assert factory_browser_failures(body, tmp_path, 20.0)
     os.utime(report, (30.0, 30.0))
     assert not factory_browser_failures(body, tmp_path, 20.0)
+
+
+@pytest.mark.parametrize(
+    "body,skills,required",
+    [
+        ("No browser surface or attached `superqa` applies.", ("supergoal",), False),
+        (
+            "No browser surface or attached `superqa` applies.",
+            ("supergoal", "superqa"),
+            True,
+        ),
+        ("Browser verification is outside this Python slice.", (), False),
+        ("Mention `## Browser Verification` only as documentation.", (), False),
+        ("## Browser Verification\n\nClaimed complete.", (), True),
+        ("## browser verification:\n", (), True),
+        ("## Browser Verification\r\n", (), True),
+    ],
+)
+def test_factory_browser_applicability_uses_routing_or_explicit_heading(
+    body: str,
+    skills: tuple[str, ...],
+    required: bool,
+) -> None:
+    assert factory_browser_required(body, skills) is required
+
+
+@pytest.mark.parametrize("routing", ["browser: true", "kind: ui"])
+def test_factory_browser_metadata_still_requires_report_after_sync(
+    tmp_path: Path,
+    routing: str,
+) -> None:
+    from symphony.factory.sync import sync_wayfinder
+    from tests.factory.test_sync import _tracker
+
+    tickets = tmp_path / "wayfinder" / "tickets"
+    tickets.mkdir(parents=True)
+    (tickets / "001-ui.md").write_text(
+        "---\nid: ui\ntitle: Browser flow\nroute: GREENFIELD\n"
+        + routing
+        + "\n---\n\n## Acceptance criteria\n\n- Flow works.\n\n"
+        "## Proof commands\n\n- `python -m unittest -q`\n\n"
+        "## Non-goals\n\n- Unrelated work.\n",
+        encoding="utf-8",
+    )
+    tracker = _tracker(tmp_path / "kanban")
+    result = sync_wayfinder(tickets.parent, tracker)
+    issue = tracker.fetch_issue_full_by_id(result[0].identifier)
+    assert issue is not None and "superqa" in issue.skills
+    body = (
+        issue.description or ""
+    ) + "\nNo browser surface or attached `superqa` applies.\n"
+    assert factory_browser_required(body, issue.skills)
+    assert factory_browser_failures(body, tmp_path, 0.0)

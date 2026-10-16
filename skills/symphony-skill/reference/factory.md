@@ -93,3 +93,22 @@ an empty checkout directory with that link and is safe to rerun. It stops with
 a repair message if an older repository has tracked cards that produce a
 nonempty real directory; continuing would let the worker edit a stale private
 card that the scheduler cannot observe.
+
+## Data and external services
+
+The factory keeps its board, worktrees, progress, and run diagnostics in the local
+project. Tickets and logs can contain task text, code, command output, paths, and
+agent responses; review them before sharing a diagnostic bundle. Runtime ignore
+rules keep these files out of ordinary product commits, but do not encrypt them.
+
+The selected agent CLI receives the rendered ticket prompt and access to its
+workspace. That agent and any tools it runs may send prompts, code, or files to
+their configured external services. Their authentication, charges, retention,
+and data-handling terms apply. Check those settings before dispatching sensitive
+work; choosing a local file board does not make a hosted coding agent local.
+Factory remote Git publication is separately opt-in as described above.
+
+Symphony is provided under the repository's [Apache 2.0 license](../../../LICENSE).
+Use the [project issue tracker](https://github.com/cskwork/oh-my-symphony/issues)
+for support and feedback, after removing credentials and private project content.
+The factory does not create a Symphony product account or subscription.
