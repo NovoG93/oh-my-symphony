@@ -45,6 +45,7 @@ Versioning: [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Known limitations
 - Remaining PM findings include broad `ValueError` classification (`400 invalid_body`, unchanged pending separate contract approval), the test-only receipt builder, ignored unknown `pm.*` keys, and the runtime origin error omitting `SYMPHONY_TRUSTED_ORIGINS`. See the [finding IDs and operational effects](docs/pm-workspace-operations.md#accepted-findings-and-current-handling).
+- Bundled OpenSpec 1.14.2 depends on `braces` 3.0.3, which [GHSA-vfj7-8cjw-p6xm](https://github.com/advisories/GHSA-vfj7-8cjw-p6xm) (HIGH, no patched release) lets deeply nested patterns crash with a stack overflow. Both crashing shapes under braces' 10,000-character limit, placed in a custom schema's artifact output or `apply.tracks` glob, end as an OpenSpec JSON error instead: comma nesting hits OpenSpec's 16-level brace guard, and comma-free nesting stays a literal path. `tests/test_pm_openspec_bundle.py` pins this. The dependency itself is unpatched.
 - On a host without `ps`, a surviving process-group member that ignores SIGTERM can escape the final SIGKILL after its leader exits; cleanup stays uncertain and `stop()` raises. Native Windows PM behavior and real provider quota fallback remain unverified. The [human review checklist](docs/pm-workspace.md#final-human-review) is separate from automated proof and merge approval.
 
 ## [0.26.0] - 2026-09-22 - First-run experience: demo keeps the generated workflow, project-facing agent files, clean git status
