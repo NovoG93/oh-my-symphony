@@ -14,18 +14,20 @@ from typing import Any
 import pytest
 
 import symphony._shell as shell_module
+import symphony.backends.codex as codex_module
 import symphony.backends.per_turn as per_turn_module
 from symphony.backends import (
     EVENT_TURN_COMPLETED,
     MALFORMED_LINE_LIMIT,
     POST_STREAM_REAP_TIMEOUT_S,
     BackendInit,
+    TurnResult,
 )
 from symphony.backends.claude_code import ClaudeCodeBackend
 from symphony.backends.codex import CodexAppServerBackend
 from symphony.backends.gemini import GeminiBackend
 from symphony.backends.pi import PiBackend
-from symphony.errors import CodexNotFound, PortExit, TurnFailed
+from symphony.errors import CodexNotFound, PortExit, ResponseError, TurnFailed
 from tests.test_backends import (
     _FakeProcess,
     _FakeStdin,
@@ -48,6 +50,176 @@ class _PipeProcess(_FakeProcess):
         self.stdout = _FakeStream(lines=stdout_lines or [])
         self.stderr = None if stderr_lines is None else _FakeStream(lines=stderr_lines)
         self.returncode = returncode
+
+
+@pytest.mark.asyncio
+async def test_per_turn_actual_spawn_holds_launch_guard_through_pid_publication(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    events: list[object] = []
+    process = _PipeProcess(stdout_lines=[], stderr_lines=[])
+
+    async def fake_spawn(*args, **kwargs):
+        del args, kwargs
+        events.append("spawn")
+        return process
+
+    @contextlib.asynccontextmanager
+    async def guard():
+        events.append("enter")
+
+        async def publish(pid: int) -> None:
+            events.append(("publish", pid))
+
+        yield publish
+        events.append("exit")
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_spawn)
+    cfg = _make_cfg("gemini", workspace_root=tmp_path)
+    cwd = tmp_path / "ws"
+    cwd.mkdir()
+    backend = GeminiBackend(
+        BackendInit(
+            cfg=cfg, cwd=cwd, workspace_root=tmp_path,
+            on_event=_noop_event, process_launch_guard=guard,
+        )
+    )
+    spawned = await backend._spawn("true", pipe_stdin=False)
+    assert spawned is process
+    assert events == ["enter", "spawn", ("publish", process.pid), "exit"]
+
+
+@pytest.mark.asyncio
+async def test_per_turn_guard_exit_cancellation_retains_preawait_ownership(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    process = _PipeProcess(stdout_lines=[], stderr_lines=[])
+    identified: list[tuple[int, str | None]] = []
+
+    async def fake_spawn(*_args, **_kwargs):
+        return process
+
+    @contextlib.asynccontextmanager
+    async def cancelling_guard():
+        async def publish(_pid: int) -> None:
+            return None
+
+        try:
+            yield publish
+        finally:
+            raise asyncio.CancelledError
+
+    async def cancelled_cleanup(_proc, **_kwargs):
+        raise asyncio.CancelledError
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_spawn)
+    monkeypatch.setattr(per_turn_module, "process_identity", lambda _pid: "spawn-owner")
+    monkeypatch.setattr(
+        per_turn_module, "terminate_process_tree", cancelled_cleanup
+    )
+    cfg = _make_cfg("gemini", workspace_root=tmp_path)
+    cwd = tmp_path / "ws"
+    cwd.mkdir()
+    backend = GeminiBackend(BackendInit(
+        cfg=cfg,
+        cwd=cwd,
+        workspace_root=tmp_path,
+        on_event=_noop_event,
+        on_process_identified=lambda pid, identity: identified.append((pid, identity)),
+        process_launch_guard=cancelling_guard,
+    ))
+
+    with pytest.raises(asyncio.CancelledError):
+        await backend._spawn("true", pipe_stdin=False)
+
+    assert identified == [(process.pid, "spawn-owner")]
+    assert backend._active_proc is process
+    assert backend._active_process_identity == "spawn-owner"
+    assert backend._cleanup_unconfirmed
+
+
+@pytest.mark.asyncio
+async def test_codex_publication_failure_retains_original_identity_when_cleanup_cancels(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    process = _PipeProcess(stdout_lines=[], stderr_lines=[])
+    identified: list[tuple[int, str | None]] = []
+
+    async def fake_spawn(*_args, **_kwargs):
+        return process
+
+    @contextlib.asynccontextmanager
+    async def rejecting_guard():
+        async def publish(_pid: int) -> None:
+            raise RuntimeError("revoked")
+
+        yield publish
+
+    async def cancelled_cleanup(_proc, **_kwargs):
+        raise asyncio.CancelledError
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_spawn)
+    monkeypatch.setattr(codex_module, "process_identity", lambda _pid: "spawn-owner")
+    monkeypatch.setattr(codex_module, "terminate_process_tree", cancelled_cleanup)
+    cfg = _make_cfg("codex", workspace_root=tmp_path)
+    cwd = tmp_path / "ws"
+    cwd.mkdir()
+    backend = CodexAppServerBackend(BackendInit(
+        cfg=cfg,
+        cwd=cwd,
+        workspace_root=tmp_path,
+        on_event=_noop_event,
+        on_process_identified=lambda pid, identity: identified.append((pid, identity)),
+        process_launch_guard=rejecting_guard,
+    ))
+
+    with pytest.raises(asyncio.CancelledError):
+        await backend.start()
+
+    assert identified == [(process.pid, "spawn-owner")]
+    assert backend._process is process
+    assert backend._process_identity == "spawn-owner"
+    assert backend._cleanup_unconfirmed
+
+
+@pytest.mark.asyncio
+async def test_persistent_actual_spawn_reaps_when_guard_publication_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    process = _PipeProcess(stdout_lines=[], stderr_lines=[])
+    reaped: list[int] = []
+
+    async def fake_spawn(*args, **kwargs):
+        del args, kwargs
+        return process
+
+    async def fake_reap(proc, **_kwargs):
+        reaped.append(proc.pid)
+        proc.returncode = -15
+        return -15
+
+    @contextlib.asynccontextmanager
+    async def guard():
+        async def publish(pid: int) -> None:
+            del pid
+            raise RuntimeError("revoked")
+        yield publish
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_spawn)
+    monkeypatch.setattr("symphony.backends.codex.terminate_process_tree", fake_reap)
+    cfg = _make_cfg("codex", workspace_root=tmp_path)
+    cwd = tmp_path / "ws"
+    cwd.mkdir()
+    backend = CodexAppServerBackend(
+        BackendInit(
+            cfg=cfg, cwd=cwd, workspace_root=tmp_path,
+            on_event=_noop_event, process_launch_guard=guard,
+        )
+    )
+    with pytest.raises(RuntimeError, match="revoked"):
+        await backend.start()
+    assert reaped == [process.pid]
+    assert backend.pid is None
 
 
 @pytest.mark.asyncio
@@ -119,11 +291,22 @@ async def test_terminate_process_tree_escalates_sigterm_to_sigkill(
             "_taskkill_tree",
             lambda pid, *, force=True: taskkills.append(pid) or True,
         )
-
-    rc = await shell_module.terminate_process_tree(proc)
+        rc = await shell_module.terminate_process_tree(proc)
+        expected_waits = [2.0, 5.0]
+    else:
+        group_states = iter((True, True, False))
+        monkeypatch.setattr(
+            shell_module,
+            "process_group_exists",
+            lambda _pid: next(group_states),
+        )
+        rc = await shell_module.terminate_process_tree(
+            proc, term_timeout=0, kill_timeout=0
+        )
+        expected_waits = [0, 0]
 
     assert rc == -9
-    assert waits == [2.0, 5.0]
+    assert waits == expected_waits
     if sys.platform == "win32":
         # taskkill /T /F goes first; because the (faked) taskkill did not
         # reap the process, the terminate -> kill fallback ladder runs.
@@ -220,6 +403,38 @@ def test_kill_process_group_proceeds_on_identity_match(
     assert signalled == [4242]
 
 
+@pytest.mark.skipif(sys.platform == "win32", reason="process groups are POSIX-only")
+def test_process_group_exists_treats_contradictory_empty_status_as_unknown(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class EmptyStatus:
+        returncode = 0
+        stdout = ""
+
+    monkeypatch.setattr(shell_module.os, "killpg", lambda _pid, _sig: None)
+    monkeypatch.setattr(
+        shell_module.subprocess, "run", lambda *_args, **_kwargs: EmptyStatus()
+    )
+
+    assert shell_module.process_group_exists(4242) is None
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="process groups are POSIX-only")
+def test_process_group_exists_treats_failed_empty_status_as_unknown(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class FailedInspection:
+        returncode = 1
+        stdout = ""
+
+    monkeypatch.setattr(shell_module.os, "killpg", lambda _pid, _sig: None)
+    monkeypatch.setattr(
+        shell_module.subprocess, "run", lambda *_args, **_kwargs: FailedInspection()
+    )
+
+    assert shell_module.process_group_exists(4242) is None
+
+
 async def _wait_for_file(path: Path, *, timeout_s: float) -> None:
     deadline = time.monotonic() + timeout_s
     while time.monotonic() < deadline:
@@ -312,6 +527,148 @@ async def test_terminate_process_tree_kills_real_grandchild(tmp_path: Path) -> N
             await shell_module.safe_proc_wait(proc, timeout=1.0)
 
 
+@pytest.mark.skipif(os.name != "posix", reason="process groups are POSIX-only")
+@pytest.mark.asyncio
+async def test_terminate_process_tree_retains_unowned_group_after_parent_already_exited(
+    tmp_path: Path,
+) -> None:
+    child = tmp_path / "term_resistant_child.py"
+    ready = tmp_path / "term_resistant.ready"
+    child.write_text(
+        "import signal, time\n"
+        "from pathlib import Path\n"
+        "signal.signal(signal.SIGTERM, signal.SIG_IGN)\n"
+        f"Path({str(ready)!r}).write_text('ready', encoding='utf-8')\n"
+        "time.sleep(60)\n",
+        encoding="utf-8",
+    )
+    parent = tmp_path / "exited_parent.py"
+    parent.write_text(
+        "import subprocess, sys\n"
+        f"subprocess.Popen([sys.executable, {str(child)!r}])\n",
+        encoding="utf-8",
+    )
+    proc = await asyncio.create_subprocess_exec(
+        sys.executable,
+        str(parent),
+        start_new_session=True,
+    )
+    try:
+        assert await asyncio.wait_for(proc.wait(), timeout=5) == 0
+        await _wait_for_file(ready, timeout_s=5)
+        assert shell_module.process_group_exists(proc.pid) is True
+
+        cfg = _make_cfg("gemini", workspace_root=tmp_path)
+        backend = GeminiBackend(
+            BackendInit(
+                cfg=cfg,
+                cwd=tmp_path,
+                workspace_root=tmp_path,
+                on_event=_noop_event,
+            )
+        )
+        backend._active_proc = proc
+
+        with pytest.raises(RuntimeError, match="could not be confirmed"):
+            await backend.stop()
+        assert backend._active_proc is proc
+        assert shell_module.process_group_exists(proc.pid) is True
+    finally:
+        if shell_module.process_group_exists(proc.pid) is not False:
+            with contextlib.suppress(OSError):
+                os.killpg(proc.pid, signal.SIGKILL)
+
+
+@pytest.mark.skipif(os.name != "posix", reason="process groups are POSIX-only")
+@pytest.mark.asyncio
+async def test_terminate_process_tree_signals_own_live_group_when_ps_is_missing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A ps-less host must still stop our own unreaped worker.
+
+    The leader is our child and not yet reaped, so its pid (and pgid) cannot
+    have been reused; ``ps`` being unavailable is no reason to send nothing.
+    """
+    proc = await asyncio.create_subprocess_exec(
+        sys.executable, "-c", "import time; time.sleep(60)",
+        start_new_session=True,
+    )
+    try:
+        empty_path = tmp_path / "no-ps"
+        empty_path.mkdir()
+        monkeypatch.setenv("PATH", str(empty_path))
+        # Precondition: the group is live but ps cannot describe it.
+        assert shell_module.process_group_exists(proc.pid) is None
+
+        rc = await asyncio.wait_for(
+            shell_module.terminate_process_tree(proc), timeout=30
+        )
+
+        # The exact code depends on which reaper wins (safe_proc_wait's
+        # waitpid gives -SIGTERM; asyncio's watcher then records 255), so
+        # pin the contract: a confirmed exit status equal to the child's.
+        assert rc is not None
+        assert proc.returncode == rc
+        assert shell_module.process_group_exists(proc.pid) is False
+    finally:
+        if proc.returncode is None:
+            with contextlib.suppress(OSError):
+                os.killpg(proc.pid, signal.SIGKILL)
+            await shell_module.safe_proc_wait(proc, timeout=5)
+
+
+@pytest.mark.skipif(os.name != "posix", reason="process groups are POSIX-only")
+@pytest.mark.asyncio
+async def test_terminate_process_tree_stays_unconfirmed_when_ps_is_missing_and_group_survives(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Without ps a surviving group member must keep cleanup unconfirmed."""
+    ready = tmp_path / "member.ready"
+    member = tmp_path / "term_ignoring_member.py"
+    member.write_text(
+        "import signal, time\n"
+        "from pathlib import Path\n"
+        "signal.signal(signal.SIGTERM, signal.SIG_IGN)\n"
+        f"Path({str(ready)!r}).write_text('ready', encoding='utf-8')\n"
+        "time.sleep(60)\n",
+        encoding="utf-8",
+    )
+    leader = tmp_path / "leader.py"
+    leader.write_text(
+        "import subprocess, sys, time\n"
+        f"subprocess.Popen([sys.executable, {str(member)!r}])\n"
+        "time.sleep(60)\n",
+        encoding="utf-8",
+    )
+    proc = await asyncio.create_subprocess_exec(
+        sys.executable, str(leader), start_new_session=True,
+    )
+    try:
+        await _wait_for_file(ready, timeout_s=10)
+        empty_path = tmp_path / "no-ps"
+        empty_path.mkdir()
+        monkeypatch.setenv("PATH", str(empty_path))
+        assert shell_module.process_group_exists(proc.pid) is None
+
+        rc = await asyncio.wait_for(
+            shell_module.terminate_process_tree(
+                proc, term_timeout=0.5, kill_timeout=0.5
+            ),
+            timeout=30,
+        )
+
+        assert rc is None
+        # The leader itself was signalled and reaped.
+        assert proc.returncode is not None
+        # The TERM-ignoring member is still in the group.
+        os.killpg(proc.pid, 0)
+    finally:
+        with contextlib.suppress(OSError):
+            os.killpg(proc.pid, signal.SIGKILL)
+        if proc.returncode is None:
+            await shell_module.safe_proc_wait(proc, timeout=5)
+
+
 @pytest.mark.asyncio
 async def test_terminate_process_tree_skips_already_dead_process(
     monkeypatch: pytest.MonkeyPatch,
@@ -330,6 +687,7 @@ async def test_terminate_process_tree_skips_already_dead_process(
         "_signal_process_group",
         lambda *args, **kwargs: signals.append(args),
     )
+    monkeypatch.setattr(shell_module, "process_group_exists", lambda _pid: False)
 
     rc = await shell_module.terminate_process_tree(proc)
 
@@ -356,6 +714,225 @@ async def test_codex_stdout_eof_fails_completion_waiter_promptly(tmp_path: Path)
 
     with pytest.raises(TurnFailed, match="closed stdout"):
         await waiter
+
+
+@pytest.mark.asyncio
+async def test_codex_stop_rejects_unconfirmed_group_after_parent_exit(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    cfg = _make_cfg("codex", workspace_root=tmp_path)
+    cwd = tmp_path / "ws"
+    cwd.mkdir()
+    backend = CodexAppServerBackend(
+        BackendInit(cfg=cfg, cwd=cwd, workspace_root=tmp_path, on_event=_noop_event)
+    )
+    backend._process = _PipeProcess(returncode=0)  # type: ignore[assignment]
+
+    async def unconfirmed(_process, **_kwargs):
+        return None
+
+    monkeypatch.setattr(codex_module, "terminate_process_tree", unconfirmed)
+
+    with pytest.raises(RuntimeError, match="could not be confirmed"):
+        await backend.stop()
+
+
+@pytest.mark.asyncio
+async def test_per_turn_normal_completion_confirms_group_before_forgetting_process(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    cfg = _make_cfg("gemini", workspace_root=tmp_path)
+    cwd = tmp_path / "ws"
+    cwd.mkdir()
+    backend = GeminiBackend(
+        BackendInit(cfg=cfg, cwd=cwd, workspace_root=tmp_path, on_event=_noop_event)
+    )
+    proc = _PipeProcess(returncode=0)
+
+    async def spawn(*_args, **_kwargs):
+        backend._active_proc = proc  # type: ignore[assignment]
+        backend._active_process_identity = "spawn-owner"
+        return proc
+
+    async def drive(_proc):
+        return TurnResult("turn_completed", "turn-1")
+
+    reaped: list[object] = []
+
+    async def reap(owned):
+        reaped.append(owned)
+
+    monkeypatch.setattr(backend, "_spawn", spawn)
+    monkeypatch.setattr(backend, "_drive_turn", drive)
+    monkeypatch.setattr(backend, "_reap", reap)
+
+    result = await backend.run_turn(prompt="work", is_continuation=False)
+
+    assert result.status == "turn_completed"
+    assert reaped == [proc]
+    assert backend._active_proc is None
+
+
+@pytest.mark.asyncio
+async def test_per_turn_unconfirmed_normal_return_blocks_next_turn_until_stop_retry(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    cfg = _make_cfg("gemini", workspace_root=tmp_path)
+    cwd = tmp_path / "ws"
+    cwd.mkdir()
+    backend = GeminiBackend(
+        BackendInit(cfg=cfg, cwd=cwd, workspace_root=tmp_path, on_event=_noop_event)
+    )
+    proc = _PipeProcess(returncode=0)
+    spawn_calls = 0
+
+    async def spawn(*_args, **_kwargs):
+        nonlocal spawn_calls
+        spawn_calls += 1
+        backend._active_proc = proc  # type: ignore[assignment]
+        backend._active_process_identity = "spawn-owner"
+        return proc
+
+    async def drive(_proc):
+        return TurnResult("turn_completed", "turn-1")
+
+    async def unconfirmed_reap(_proc):
+        raise RuntimeError("backend process cleanup could not be confirmed")
+
+    monkeypatch.setattr(backend, "_spawn", spawn)
+    monkeypatch.setattr(backend, "_drive_turn", drive)
+    monkeypatch.setattr(backend, "_reap", unconfirmed_reap)
+
+    with pytest.raises(RuntimeError, match="could not be confirmed"):
+        await backend.run_turn(prompt="work", is_continuation=False)
+    assert backend._active_proc is proc
+    with pytest.raises(ResponseError, match="not confirmed"):
+        await backend.run_turn(prompt="unsafe next turn", is_continuation=True)
+    assert spawn_calls == 1
+    assert backend._active_proc is proc
+
+    async def confirmed_cleanup(_proc, **_kwargs):
+        return 0
+
+    monkeypatch.setattr(per_turn_module, "terminate_process_tree", confirmed_cleanup)
+    await backend.stop()
+    assert backend._active_proc is None
+
+
+@pytest.mark.asyncio
+async def test_per_turn_preserves_spawn_identity_across_publication(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    cfg = _make_cfg("gemini", workspace_root=tmp_path)
+    cwd = tmp_path / "ws"
+    cwd.mkdir()
+    proc = _PipeProcess(returncode=0)
+    identity_reads: list[int] = []
+    signals: list[tuple[int, int]] = []
+
+    async def spawn(*_args, **_kwargs):
+        return proc
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", spawn)
+    monkeypatch.setattr(
+        per_turn_module,
+        "process_identity",
+        lambda pid: identity_reads.append(pid) or "spawn-owner",
+    )
+    monkeypatch.setattr(shell_module, "process_group_exists", lambda _pid: True)
+    monkeypatch.setattr(
+        shell_module, "process_identity", lambda _pid: "replacement-owner"
+    )
+    monkeypatch.setattr(
+        shell_module,
+        "_signal_process_group",
+        lambda pid, sig: signals.append((pid, sig)) or True,
+    )
+    backend = GeminiBackend(
+        BackendInit(cfg=cfg, cwd=cwd, workspace_root=tmp_path, on_event=_noop_event)
+    )
+
+    async def drive(_proc):
+        return TurnResult("turn_completed", "turn-1")
+
+    monkeypatch.setattr(backend, "_drive_turn", drive)
+
+    with pytest.raises(RuntimeError, match="could not be confirmed"):
+        await backend.run_turn(prompt="work", is_continuation=False)
+
+    assert identity_reads == [proc.pid]
+    assert backend._active_process_identity == "spawn-owner"
+    assert backend._active_proc is proc
+    assert signals == []
+    with pytest.raises(ResponseError, match="not confirmed"):
+        await backend.run_turn(prompt="unsafe", is_continuation=True)
+
+
+@pytest.mark.asyncio
+async def test_per_turn_failed_stop_retains_process_for_retry_and_next_turn(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    cfg = _make_cfg("gemini", workspace_root=tmp_path)
+    cwd = tmp_path / "ws"
+    cwd.mkdir()
+    backend = GeminiBackend(
+        BackendInit(cfg=cfg, cwd=cwd, workspace_root=tmp_path, on_event=_noop_event)
+    )
+    proc = _PipeProcess(returncode=0)
+    backend._active_proc = proc  # type: ignore[assignment]
+    outcomes = iter((None, 0))
+    calls: list[object] = []
+
+    async def cleanup(owned, **_kwargs):
+        calls.append(owned)
+        return next(outcomes)
+
+    monkeypatch.setattr(per_turn_module, "terminate_process_tree", cleanup)
+
+    with pytest.raises(RuntimeError, match="could not be confirmed"):
+        await backend.stop()
+    assert backend._active_proc is proc
+    with pytest.raises(ResponseError, match="closed"):
+        await backend.run_turn(prompt="unsafe next turn", is_continuation=True)
+    assert backend._active_proc is proc
+    await backend.stop()
+    assert calls == [proc, proc]
+    assert backend._active_proc is None
+
+
+@pytest.mark.asyncio
+async def test_codex_stop_never_signals_reused_group_after_parent_exit(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    cfg = _make_cfg("codex", workspace_root=tmp_path)
+    cwd = tmp_path / "ws"
+    cwd.mkdir()
+    backend = CodexAppServerBackend(
+        BackendInit(cfg=cfg, cwd=cwd, workspace_root=tmp_path, on_event=_noop_event)
+    )
+    proc = _PipeProcess(returncode=0)
+    backend._process = proc  # type: ignore[assignment]
+    backend._process_identity = "recorded"
+    checked: list[int] = []
+    signalled: list[tuple[int, int]] = []
+    monkeypatch.setattr(shell_module, "process_group_exists", lambda _pid: True)
+    monkeypatch.setattr(
+        shell_module,
+        "process_identity",
+        lambda pid: checked.append(pid) or "replacement",
+    )
+    monkeypatch.setattr(
+        shell_module,
+        "_signal_process_group",
+        lambda pid, sig: signalled.append((pid, sig)) or True,
+    )
+
+    with pytest.raises(RuntimeError, match="could not be confirmed"):
+        await backend.stop()
+
+    assert checked == [proc.pid]
+    assert signalled == []
+    assert backend._process is proc
 
 
 @pytest.mark.asyncio
@@ -444,7 +1021,7 @@ async def test_claude_bounded_post_stream_reap_terminates_lingering_process(
         waits.append(timeout)
         return None
 
-    async def fake_terminate_process_tree(process):
+    async def fake_terminate_process_tree(process, **_kwargs):
         terminated.append(process.pid)
         process.returncode = 0
         return 0
@@ -470,7 +1047,9 @@ async def test_claude_bounded_post_stream_reap_terminates_lingering_process(
 
     assert result.status == EVENT_TURN_COMPLETED
     assert waits == [POST_STREAM_REAP_TIMEOUT_S]
-    assert terminated == [proc.pid]
+    # The stream path performs its bounded reap, then the shared run-turn
+    # finalizer independently confirms ownership cleanup before forgetting it.
+    assert terminated == [proc.pid, proc.pid]
 
 
 @pytest.mark.asyncio
@@ -493,7 +1072,7 @@ async def test_per_turn_failure_reaps_live_process(
     async def fail(*args, **kwargs):
         raise PortExit("stdin closed") if failure_stage == "stdin" else TurnFailed("bad event")
 
-    async def reap(process):
+    async def reap(process, **_kwargs):
         reaped.append(process.pid)
         process.returncode = -15
         return -15

@@ -9,6 +9,7 @@ Subcommands:
     symphony service ...           managed background orchestrator
     symphony wiki-sweep ...        scan docs/llm-wiki/ for dup/orphan/stale rows
     symphony runs [WORKFLOW]       recent run-registry attempts
+    symphony pm demo ...           create and serve a disposable PM Workspace demo
 """
 
 from __future__ import annotations
@@ -45,6 +46,7 @@ SUBCOMMANDS: tuple[tuple[str, str], ...] = (
     ("board", "manage the file-based Kanban board (init/ls/new/mv/update/show/graph)"),
     ("service", "run the orchestrator as a managed background service"),
     ("project", "register and run independent project services"),
+    ("pm", "create and serve a disposable PM Workspace demo"),
     ("hub", "serve the multi-project hub"),
     ("runs", "print recent run-registry attempts"),
     ("release", "validate application release evidence"),
@@ -463,6 +465,10 @@ def main(argv: list[str] | None = None) -> int:
         from . import project
 
         return project.main(raw_argv[1:])
+    if raw_argv and raw_argv[0] == "pm":
+        from . import pm
+
+        return pm.main(raw_argv[1:])
     if raw_argv and raw_argv[0] == "hub":
         from .. import hub
 

@@ -25,7 +25,7 @@ from pathlib import Path
 from typing import Any, Sequence
 
 from .. import __version__
-from .._shell import resolve_bash, terminate_process_tree
+from .._shell import process_identity, resolve_bash, terminate_process_tree
 from ..errors import (
     CodexNotFound,
     PortExit,
@@ -265,12 +265,16 @@ class CodexAppServerBackend(BaseAgentBackend):
         self._extra_env = dict(init.env)
         self._on_event = init.on_event
         self._on_process_started = init.on_process_started
+        self._on_process_identified = init.on_process_identified
+        self._process_launch_guard = init.process_launch_guard
         self._client_tools = init.client_tools
         self._approval_policy = codex.approval_policy
         self._sandbox_policy = codex.turn_sandbox_policy
         self._thread_sandbox = codex.thread_sandbox
         self._writable_roots: list[str] = []
         self._process: asyncio.subprocess.Process | None = None
+        self._process_identity: str | None = None
+        self._cleanup_unconfirmed = False
         self._reader_task: asyncio.Task[None] | None = None
         self._stderr_task: asyncio.Task[None] | None = None
         self._next_id = 1
@@ -297,24 +301,51 @@ class CodexAppServerBackend(BaseAgentBackend):
     async def start(self) -> None:
         command, env = self._prepare_command_and_env()
         try:
-            self._process = await asyncio.create_subprocess_exec(
-                resolve_bash(),
-                "-lc",
-                command,
-                cwd=str(self._cwd),
-                stdin=asyncio.subprocess.PIPE,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-                env=env,
-                limit=MAX_LINE_BYTES,
-                # Own process group so terminate/kill reaches the agent CLI
-                # behind the bash wrapper (POSIX only).
-                start_new_session=os.name == "posix",
-            )
+            async with self._process_launch_guard() as publish_started:
+                self._process = await asyncio.create_subprocess_exec(
+                    resolve_bash(),
+                    "-lc",
+                    command,
+                    cwd=str(self._cwd),
+                    stdin=asyncio.subprocess.PIPE,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
+                    env=env,
+                    limit=MAX_LINE_BYTES,
+                    # Own process group so terminate/kill reaches the agent CLI
+                    # behind the bash wrapper (POSIX only).
+                    start_new_session=os.name == "posix",
+                )
+                self._process_identity = process_identity(self._process.pid)
+                if self._on_process_identified is not None:
+                    self._on_process_identified(
+                        self._process.pid, self._process_identity
+                    )
+                elif self._on_process_started is not None:
+                    self._on_process_started(self._process.pid)
+                await publish_started(self._process.pid)
         except FileNotFoundError as exc:
             raise CodexNotFound("bash not available", error=str(exc)) from exc
-        if self._on_process_started is not None:
-            self._on_process_started(self._process.pid)
+        except BaseException as launch_exc:
+            if self._process is not None:
+                try:
+                    cleanup = await terminate_process_tree(
+                        self._process, identity=self._process_identity
+                    )
+                except BaseException:
+                    self._cleanup_unconfirmed = True
+                    raise
+                if cleanup is None:
+                    self._cleanup_unconfirmed = True
+                    if isinstance(launch_exc, asyncio.CancelledError):
+                        raise launch_exc
+                    raise RuntimeError(
+                        "backend process cleanup could not be confirmed"
+                    ) from launch_exc
+                self._process = None
+                self._process_identity = None
+            raise
+        assert self._process is not None
         if self._process.stdout is None or self._process.stdin is None:
             raise CodexNotFound("subprocess pipes not available")
         self._reader_task = asyncio.create_task(self._stdout_reader())
@@ -376,9 +407,14 @@ class CodexAppServerBackend(BaseAgentBackend):
         # finalizes server-side bookkeeping. Symphony already terminates
         # the subprocess below, which is sufficient for cleanup.
         cleanup_unconfirmed = False
-        if self._process is not None and self._process.returncode is None:
-            result = await terminate_process_tree(self._process)
-            cleanup_unconfirmed = result is None and self._process.returncode is None
+        if self._process is not None:
+            result = await terminate_process_tree(
+                self._process, identity=self._process_identity
+            )
+            cleanup_unconfirmed = result is None
+            if not cleanup_unconfirmed:
+                self._process = None
+                self._process_identity = None
         for task in (self._reader_task, self._stderr_task):
             if task is not None:
                 task.cancel()

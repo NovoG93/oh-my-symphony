@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "oh-my-symphony"
-version = "0.26.0"
+version = "0.27.0"
 description = "Multi-agent fork of OpenAI Symphony — supports Codex CLI, Claude Code CLI, Gemini CLI, AGY/Antigravity CLI, Kiro CLI, OpenCode CLI, Pi CLI, and Prime Agent CLI behind one local Kanban orchestrator with TUI and web board."
 readme = "README.md"
 requires-python = ">=3.12"
@@ -26,11 +26,19 @@ dev = [
     "pytest>=8.0",
     "pytest-asyncio>=0.23",
     "pytest-cov>=5.0",
+    "pytest-xdist>=3.6",
+    # The test suite exercises the PM workbook exchange.
+    "oh-my-symphony[pm-exchange]",
     "ruff>=0.8",
     "pyright>=1.1.390",
 ]
 browser = [
     "playwright>=1.48",
+]
+pm-exchange = [
+    "openpyxl==3.1.5",
+    "defusedxml==0.7.1",
+    "et-xmlfile==2.0.0",
 ]
 
 [project.scripts]
@@ -41,7 +49,11 @@ symphony-pyright = "symphony.pyright:main"
 where = ["src"]
 
 [tool.setuptools.package-data]
-symphony = ["web/static/*", "web/static/*/*"]
+symphony = [
+    "web/static/*",
+    "web/static/**/*",
+    "pm/resources/**/*",
+]
 
 [tool.ruff]
 target-version = "py312"
@@ -68,4 +80,5 @@ asyncio_mode = "auto"
 testpaths = ["tests"]
 markers = [
     "browser_e2e: browser-driven web UI tests; requires SYMPHONY_BROWSER_E2E=1 and Playwright browser binaries",
+    "timing: wall-clock budget checks; run them serially (-n0), never beside parallel workers",
 ]

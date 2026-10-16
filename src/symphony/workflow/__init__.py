@@ -95,6 +95,7 @@ from .config import (
     HooksConfig,
     KiroConfig,
     OpenCodeConfig,
+    PmConfig,
     PiConfig,
     PrimeAgentConfig,
     PreviewConfig,

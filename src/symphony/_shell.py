@@ -26,6 +26,7 @@ import shutil
 import signal
 import subprocess
 import sys
+import time
 from functools import lru_cache
 from pathlib import Path
 from typing import Any, Callable
@@ -282,9 +283,8 @@ def process_group_exists(pid: int) -> bool | None:
     except (PermissionError, OSError):
         return None
     try:
-        group_flag = "--pgroup" if sys.platform.startswith("linux") else "-g"
         result = subprocess.run(
-            ["ps", "-o", "stat=", group_flag, str(pid)],
+            ["ps", "-axo", "pgid=,stat="],
             capture_output=True,
             check=False,
             text=True,
@@ -292,12 +292,48 @@ def process_group_exists(pid: int) -> bool | None:
         )
     except (OSError, subprocess.SubprocessError):
         return None
-    if result.returncode not in (0, 1):
+    if result.returncode != 0:
         return None
-    statuses = [line.strip() for line in result.stdout.splitlines() if line.strip()]
+    statuses: list[str] = []
+    for line in result.stdout.splitlines():
+        fields = line.split(maxsplit=1)
+        if len(fields) == 2 and fields[0] == str(pid):
+            statuses.append(fields[1].strip())
     if not statuses:
-        return False if result.returncode == 1 else None
+        # killpg(0) found the group, so an empty successful listing is
+        # contradictory rather than proof that it disappeared.
+        return None
     return any(not status.upper().startswith("Z") for status in statuses)
+
+
+def process_group_identities(pid: int) -> frozenset[str] | None:
+    """Return immutable identities for the current members of a process group."""
+    if pid <= 0 or sys.platform == "win32":
+        return None
+    try:
+        result = subprocess.run(
+            ["ps", "-axo", "pid=,pgid="],
+            capture_output=True,
+            check=False,
+            text=True,
+            timeout=1,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if result.returncode != 0:
+        return None
+    member_pids: list[int] = []
+    for line in result.stdout.splitlines():
+        fields = line.split()
+        if len(fields) == 2 and fields[1] == str(pid):
+            try:
+                member_pids.append(int(fields[0]))
+            except ValueError:
+                return None
+    identities = {process_identity(member_pid) for member_pid in member_pids}
+    if None in identities:
+        return None
+    return frozenset(identity for identity in identities if identity is not None)
 
 
 def _taskkill_tree(pid: int, *, force: bool = True) -> bool:
@@ -364,7 +400,11 @@ def kill_process_group(pid: int, *, identity: str | None = None) -> bool:
 
 
 async def terminate_process_tree(
-    proc: Any, *, term_timeout: float = 2.0, kill_timeout: float = 5.0
+    proc: Any,
+    *,
+    identity: str | None = None,
+    term_timeout: float = 2.0,
+    kill_timeout: float = 5.0,
 ) -> int | None:
     """SIGTERM -> wait -> SIGKILL -> wait, addressing the whole process group.
 
@@ -380,10 +420,10 @@ async def terminate_process_tree(
     ``False``), with the single-process terminate/kill ladder kept as a
     fallback for taskkill-less hosts.
     """
-    if proc.returncode is not None:
-        return proc.returncode
     pid = proc.pid
     if sys.platform == "win32":
+        if proc.returncode is not None:
+            return proc.returncode
         if pid is not None:
             # `_taskkill_tree` never raises (OSError/timeout collapse to
             # False internally), so there is nothing to guard here.
@@ -419,9 +459,55 @@ async def terminate_process_tree(
             rc = await safe_proc_wait(proc, timeout=kill_timeout)
         return proc.returncode if proc.returncode is not None else rc
 
+    async def group_gone(timeout: float) -> bool | None:
+        deadline = time.monotonic() + timeout
+        last_observation: bool | None = None
+        while True:
+            exists = await asyncio.to_thread(process_group_exists, pid)
+            if exists is False:
+                return True
+            last_observation = exists
+            if time.monotonic() >= deadline:
+                return None if last_observation is None else False
+            await asyncio.sleep(0.05)
+
+    exists = await asyncio.to_thread(process_group_exists, pid)
+    if exists is False:
+        return proc.returncode
+    if exists is None:
+        if proc.returncode is not None:
+            return None
+        # ps could not describe the group (missing, timed out, or EPERM),
+        # but the leader is our own unreaped child: its pid — and so its
+        # pgid — cannot have been reused. Run the plain ladder on it, then
+        # report success only if the group is observed gone.
+        _signal_process_group(pid, signal.SIGTERM)
+        rc = await safe_proc_wait(proc, timeout=term_timeout)
+        if rc is None and proc.returncode is None:
+            _signal_process_group(pid, signal.SIGKILL)
+            rc = await safe_proc_wait(proc, timeout=kill_timeout)
+        if await group_gone(term_timeout) is not True:
+            return None
+        return proc.returncode if proc.returncode is not None else rc
+    if proc.returncode is not None and (
+        identity is None
+        or await asyncio.to_thread(process_identity, pid) != identity
+    ):
+        return None
     _signal_process_group(pid, signal.SIGTERM)
-    rc = await safe_proc_wait(proc, timeout=term_timeout)
-    if rc is None and proc.returncode is None:
+    rc = (
+        proc.returncode
+        if proc.returncode is not None
+        else await safe_proc_wait(proc, timeout=term_timeout)
+    )
+    gone = await group_gone(term_timeout)
+    if gone is None:
+        return None
+    if not gone:
         _signal_process_group(pid, signal.SIGKILL)
-        rc = await safe_proc_wait(proc, timeout=kill_timeout)
+        if proc.returncode is None:
+            rc = await safe_proc_wait(proc, timeout=kill_timeout)
+        gone = await group_gone(kill_timeout)
+        if gone is not True:
+            return None
     return proc.returncode if proc.returncode is not None else rc

@@ -428,6 +428,10 @@ async def test_codex_stop_reaps_with_safe_proc_wait(
         "_signal_process_group",
         lambda pid, sig: signals.append((pid, sig)) or True,
     )
+    group_states = iter((True, False))
+    monkeypatch.setattr(
+        shell_module, "process_group_exists", lambda _pid: next(group_states)
+    )
     if sys.platform == "win32":
         # Stop the unit test from taskkill-ing an unrelated real pid.
         monkeypatch.setattr(
@@ -475,6 +479,10 @@ async def test_gemini_stop_reaps_with_safe_proc_wait(
         shell_module,
         "_signal_process_group",
         lambda pid, sig: signals.append((pid, sig)) or True,
+    )
+    group_states = iter((True, False))
+    monkeypatch.setattr(
+        shell_module, "process_group_exists", lambda _pid: next(group_states)
     )
     if sys.platform == "win32":
         # Stop the unit test from taskkill-ing an unrelated real pid.
@@ -524,6 +532,10 @@ async def test_pi_stop_reaps_with_safe_proc_wait(
         "_signal_process_group",
         lambda pid, sig: signals.append((pid, sig)) or True,
     )
+    group_states = iter((True, False))
+    monkeypatch.setattr(
+        shell_module, "process_group_exists", lambda _pid: next(group_states)
+    )
     if sys.platform == "win32":
         # Stop the unit test from taskkill-ing an unrelated real pid.
         monkeypatch.setattr(
@@ -571,7 +583,7 @@ async def test_backend_stop_raises_when_process_cleanup_is_unconfirmed(
     proc = _FakeProcess()
     setattr(backend, process_attr, proc)
 
-    async def _unconfirmed(_proc):
+    async def _unconfirmed(_proc, **_kwargs):
         return None
 
     monkeypatch.setattr(module, "terminate_process_tree", _unconfirmed)
@@ -704,7 +716,7 @@ async def test_claude_run_turn_cancellation_terminates_active_subprocess(
         del args, kwargs
         return proc
 
-    async def fake_terminate_process_tree(wait_proc):  # noqa: ANN001
+    async def fake_terminate_process_tree(wait_proc, **_kwargs):  # noqa: ANN001
         terminated.append(wait_proc)
         wait_proc.returncode = -15
         return -15
@@ -772,7 +784,7 @@ async def test_terminal_success_does_not_complete_when_inline_reap_is_unconfirme
     _install_subprocess_double(monkeypatch, module, [proc])
     events: list[dict[str, Any]] = []
 
-    async def _unconfirmed(wait_proc):  # noqa: ANN001
+    async def _unconfirmed(wait_proc, **_kwargs):  # noqa: ANN001
         assert wait_proc is proc
         return None
 
@@ -881,7 +893,7 @@ async def test_gemini_run_turn_cancellation_terminates_active_subprocess(
         await asyncio.Future()
         return 0
 
-    async def fake_terminate_process_tree(wait_proc):  # noqa: ANN001
+    async def fake_terminate_process_tree(wait_proc, **_kwargs):  # noqa: ANN001
         terminated.append(wait_proc)
         wait_proc.returncode = -15
         return -15
@@ -1138,7 +1150,7 @@ async def test_pi_run_turn_cancellation_terminates_active_subprocess(
         del args, kwargs
         return proc
 
-    async def fake_terminate_process_tree(wait_proc):  # noqa: ANN001
+    async def fake_terminate_process_tree(wait_proc, **_kwargs):  # noqa: ANN001
         terminated.append(wait_proc)
         wait_proc.returncode = -15
         return -15
@@ -1613,7 +1625,7 @@ async def test_opencode_run_turn_cancellation_terminates_active_subprocess(
         await asyncio.Future()
         return 0
 
-    async def fake_terminate_process_tree(wait_proc):  # noqa: ANN001
+    async def fake_terminate_process_tree(wait_proc, **_kwargs):  # noqa: ANN001
         terminated.append(wait_proc)
         wait_proc.returncode = -15
         return -15
@@ -2658,7 +2670,7 @@ async def test_codex_corrupt_stream_closes_reaps_and_later_turn_fails_fast(
     terminated: list[_FakeSubprocess] = []
     logged: list[tuple[str, dict]] = []
 
-    async def fake_terminate_process_tree(process):  # noqa: ANN001
+    async def fake_terminate_process_tree(process, **_kwargs):  # noqa: ANN001
         terminated.append(process)
         process.returncode = -15
         return -15
@@ -2703,7 +2715,7 @@ async def test_codex_corrupt_stream_failed_reap_is_retried_by_stop(
     backend._process = proc  # type: ignore[assignment]
     attempts: list[_FakeSubprocess] = []
 
-    async def flaky_terminate_process_tree(process):  # noqa: ANN001
+    async def flaky_terminate_process_tree(process, **_kwargs):  # noqa: ANN001
         attempts.append(process)
         if len(attempts) == 1:
             raise RuntimeError("first reap failed")
@@ -2743,7 +2755,7 @@ async def test_codex_valid_json_resets_malformed_line_streak(
     backend._process = proc  # type: ignore[assignment]
     terminated: list[_FakeSubprocess] = []
 
-    async def fake_terminate_process_tree(process):  # noqa: ANN001
+    async def fake_terminate_process_tree(process, **_kwargs):  # noqa: ANN001
         terminated.append(process)
         return process.returncode
 
