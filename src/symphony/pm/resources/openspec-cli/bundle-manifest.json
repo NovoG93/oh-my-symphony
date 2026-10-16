@@ -132,8 +132,8 @@
     },
     {
       "path": "lib/openspec/cli/openspec.mjs",
-      "bytes": 884698,
-      "sha256": "4e3aa5efe1f6f60e47e79a162870a5aacb8a5e50cf1c7f3ed1f27bafe76f307b"
+      "bytes": 885159,
+      "sha256": "179e3085bffa2086eda3bd5fc2f1ec4d3673c300df5b1d83680a73afcc34ca00"
     },
     {
       "path": "package.json",

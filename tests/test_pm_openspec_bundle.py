@@ -281,6 +281,43 @@ def test_deeply_nested_schema_glob_is_refused_not_crashed(
     assert "RangeError" not in result.stdout + result.stderr
 
 
+def test_bundled_braces_has_depth_guard():
+    assert "Brace pattern nests more than" in CLI.read_text()
+
+
+def test_braces_stub_refuses_deep_nesting_and_keeps_normal_expansion(node):
+    if not (BUILD / "node_modules/braces/package.json").is_file():
+        skip_or_fail("braces stub test needs npm ci --prefix scripts/openspec-bundle", flag=REQUIRED)
+    script = r"""
+const real = require('./node_modules/braces/index.js');
+const guarded = require('./stubs/braces.cjs');
+const run = (f) => { try { return f(); } catch (e) { return e.constructor.name + ': ' + e.message; } };
+const deep = (unit, depth) => '{' + unit.repeat(depth) + 'a' + '}'.repeat(depth) + '}';
+console.log(JSON.stringify({
+  crashOpen: run(() => real(deep('{', 4990))).split(':')[0],
+  crashComma: run(() => real(deep('{,', 3320))).split(':')[0],
+  open: run(() => guarded(deep('{', 4990))),
+  comma: run(() => guarded.expand(deep('{,', 3320))),
+  limit: run(() => guarded('{'.repeat(16) + 'a,b' + '}'.repeat(16)).length),
+  over: run(() => guarded.parse('{'.repeat(17) + 'a,b' + '}'.repeat(17))),
+  escaped: run(() => guarded('\\{'.repeat(40) + '{a,b}').length),
+  normal: guarded.expand('specs/{a,b}/*.{md,txt}'),
+  reference: real.expand('specs/{a,b}/*.{md,txt}'),
+}));
+"""
+    result = subprocess.run([node, "-e", script], cwd=BUILD, capture_output=True, text=True, timeout=30)
+    assert result.returncode == 0, result.stderr
+    outcome = json.loads(result.stdout)
+    refused = "Error: Brace pattern nests more than 16 levels"
+    assert outcome["crashOpen"] == outcome["crashComma"] == "RangeError"
+    assert outcome["open"] == outcome["comma"] == outcome["over"] == refused
+    assert outcome["limit"] == 1
+    assert outcome["escaped"] == 1
+    assert outcome["normal"] == outcome["reference"] == [
+        "specs/a/*.md", "specs/a/*.txt", "specs/b/*.md", "specs/b/*.txt",
+    ]
+
+
 def test_r11_rebuild_is_byte_identical(node, build_workspace, tmp_path):
     output = build_workspace.parents[1] / "src/symphony/pm/resources/openspec-cli"
     for _ in range(2):
