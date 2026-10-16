@@ -5,6 +5,8 @@ from __future__ import annotations
 import asyncio
 import base64
 import binascii
+import contextvars
+import functools
 import hashlib
 import html
 import io
@@ -14,6 +16,7 @@ import sqlite3
 import subprocess
 import uuid
 import zipfile
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import nullcontext
 from dataclasses import asdict, dataclass, field, is_dataclass
 from datetime import date, datetime, timezone
@@ -62,6 +65,27 @@ def register_pm_routes(app: web.Application, ctx: Any, orchestrator: Any) -> Non
     active_planning: dict[str, _ActivePlanning] = {}
     cancelling_planning: set[str] = set()
     exchange_semaphores: dict[int, asyncio.Semaphore] = {}
+
+    # glibc gives each allocating thread its own malloc arena and keeps freed
+    # memory in it. On the default executor (CPUs + 4 threads) a 4-CPU Linux
+    # server stayed ~60 MiB above idle after serving a 1,000-task plan; two PM
+    # threads keep it near 21 MiB within the same latency budgets. Long-running
+    # host commands (verification, acceptance, tool probes) stay on the default
+    # executor so they cannot starve PM reads.
+    pm_executor: list[ThreadPoolExecutor] = []
+
+    async def to_pm_thread(func: Callable[..., _T], /, *args: Any, **kwargs: Any) -> _T:
+        if not pm_executor:
+            workers = max(2, int(ctx.config().pm.exchange_concurrency) + 1)
+            pm_executor.append(ThreadPoolExecutor(workers, thread_name_prefix="symphony-pm"))
+        call = functools.partial(contextvars.copy_context().run, func, *args, **kwargs)
+        return await asyncio.get_running_loop().run_in_executor(pm_executor[0], call)
+
+    async def shutdown_pm_executor(_app: web.Application) -> None:
+        while pm_executor:
+            pm_executor.pop().shutdown(wait=False)
+
+    app.on_cleanup.append(shutdown_pm_executor)
 
     def storage_root(name: str) -> Path:
         return ctx.workflow_dir() / ".symphony" / "pm" / name
@@ -133,7 +157,7 @@ def register_pm_routes(app: web.Application, ctx: Any, orchestrator: Any) -> Non
         return result
 
     async def run_service(work: Callable[[PmApplication], _T], pctx: PmRequestContext | None = None) -> _T:
-        return await asyncio.to_thread(_with_thread_application, service(), work, pctx)
+        return await to_pm_thread(_with_thread_application, service(), work, pctx)
 
     def owner(request: web.Request) -> str:
         value = request.headers.get("X-Symphony-PM-Owner", "local-operator").strip()
@@ -172,7 +196,7 @@ def register_pm_routes(app: web.Application, ctx: Any, orchestrator: Any) -> Non
             chunks.append(chunk)
         try:
             # A multi-MB base64 upload decodes off the event loop.
-            value = await asyncio.to_thread(json.loads, b"".join(chunks))
+            value = await to_pm_thread(json.loads, b"".join(chunks))
         except (UnicodeDecodeError, json.JSONDecodeError) as exc:
             raise PmError("invalid_json", "request body is invalid") from exc
         if not isinstance(value, dict):
@@ -528,18 +552,18 @@ def register_pm_routes(app: web.Application, ctx: Any, orchestrator: Any) -> Non
                 pmapp._require("exchange")
             return change
 
-        change = await asyncio.to_thread(load_change)
+        change = await to_pm_thread(load_change)
         if format_name == "xlsx":
             async with exchange_semaphore():
-                runtime = await asyncio.to_thread(
+                runtime = await to_pm_thread(
                     _with_thread_repository, pmapp.repository,
                     lambda repository: _export_runtime_projection(repository.registry, pmapp.handoff.tracker, change),
                 )
-                exported = await asyncio.to_thread(
+                exported = await to_pm_thread(
                     pmapp.exchange.export, change, runtime, export_id=export_id
                 )
         else:
-            exported = await asyncio.to_thread(_render_export, change, format_name, pmapp.exchange)
+            exported = await to_pm_thread(_render_export, change, format_name, pmapp.exchange)
 
         def store_export() -> None:
             export_root.mkdir(parents=True, exist_ok=True)
@@ -548,7 +572,7 @@ def register_pm_routes(app: web.Application, ctx: Any, orchestrator: Any) -> Non
             (export_root / f"{export_id}.snapshot.json").write_text(json.dumps(_json(change), sort_keys=True), encoding="utf-8")
             (export_root / f"{export_id}.json").write_text(json.dumps({"filename": exported.filename, "suffix": suffix, "content_type": exported.content_type, "metadata": exported.metadata}), encoding="utf-8")
 
-        await asyncio.to_thread(store_export)
+        await to_pm_thread(store_export)
         return web.json_response({"export_id": export_id, "filename": exported.filename, "metadata": exported.metadata}, status=201)
 
     async def get_export(request: web.Request):
@@ -595,7 +619,7 @@ def register_pm_routes(app: web.Application, ctx: Any, orchestrator: Any) -> Non
             raise PmError("payload_too_large", "encoded upload exceeds limit", status=413)
         try:
             async with exchange_semaphore():
-                data = await asyncio.to_thread(base64.b64decode, encoded, validate=True)
+                data = await to_pm_thread(base64.b64decode, encoded, validate=True)
         except (binascii.Error, ValueError) as exc:
             raise PmError("invalid_request", "payload.base64 is malformed") from exc
         if len(data) > ctx.config().pm.max_workbook_mb * 1024 * 1024:
@@ -605,9 +629,9 @@ def register_pm_routes(app: web.Application, ctx: Any, orchestrator: Any) -> Non
         export_root = storage_root("exports")
         pmapp = service()
         request_owner = owner(request)
-        await asyncio.to_thread(pmapp._require, "exchange")
+        await to_pm_thread(pmapp._require, "exchange")
         async with exchange_semaphore():
-            metadata = await asyncio.to_thread(pmapp.exchange.inspect_metadata, data)
+            metadata = await to_pm_thread(pmapp.exchange.inspect_metadata, data)
         export_id = metadata.get("export_id", "")
         if not re.fullmatch(r"[0-9a-f]{32}", export_id):
             raise PmError("trusted_base_missing", "workbook is not tied to a durable Symphony export", status=409)
@@ -620,9 +644,9 @@ def register_pm_routes(app: web.Application, ctx: Any, orchestrator: Any) -> Non
             current = _read_change_snapshot(pmapp.repository, pctx, request_owner)
             return trusted, current
 
-        trusted, current = await asyncio.to_thread(load_bases)
+        trusted, current = await to_pm_thread(load_bases)
         async with exchange_semaphore():
-            candidate = await asyncio.to_thread(
+            candidate = await to_pm_thread(
                 pmapp.exchange.preview_import, data, trusted, current,
                 filename=filename,
             )
@@ -637,7 +661,7 @@ def register_pm_routes(app: web.Application, ctx: Any, orchestrator: Any) -> Non
             import_root.mkdir(parents=True, exist_ok=True)
             (import_root / f"{import_id}.json").write_text(json.dumps(result, sort_keys=True), encoding="utf-8")
 
-        await asyncio.to_thread(store_preview)
+        await to_pm_thread(store_preview)
         return web.json_response(result)
 
     async def apply_import(request: web.Request):

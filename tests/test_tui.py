@@ -1683,8 +1683,18 @@ class _ExplodingOrchestrator(_StubOrchestrator):
         raise RuntimeError("paused boom")
 
 
-def _notification_messages(app: KanbanApp) -> list[str]:
-    return [n.message for n in app._notifications]
+def _record_notifications(app: KanbanApp) -> list[str]:
+    # Toasts expire after their timeout; record every notify() call so a
+    # slow run cannot hide a toast that was already shown.
+    sent: list[str] = []
+    notify = app.notify
+
+    def recording_notify(message: str, *args: Any, **kwargs: Any) -> None:
+        sent.append(message)
+        notify(message, *args, **kwargs)
+
+    app.notify = recording_notify  # type: ignore[method-assign]
+    return sent
 
 
 @pytest.mark.asyncio
@@ -1696,19 +1706,19 @@ async def test_orchestrator_errors_notify_instead_of_crashing(
     cfg = _file_board_config(tmp_path)
     _write_ticket(tmp_path / "kanban", "T-1.md", "Todo")
     app = KanbanApp(_ExplodingOrchestrator(), _StaticWorkflowState(cfg))  # type: ignore[arg-type]
+    sent = _record_notifications(app)
     async with app.run_test(size=(140, 40)) as pilot:
         card = await _boot_file_board_with_card(app, pilot)
         assert app.is_running
-        messages = _notification_messages(app)
-        assert any("snapshot boom" in m for m in messages)
+        assert any("snapshot boom" in m for m in sent)
         # Heartbeat fires every 0.5 s; the same failure must not re-toast.
         await _settle(pilot, 1.2)
-        assert sum("snapshot boom" in m for m in _notification_messages(app)) == 1
+        assert sum("snapshot boom" in m for m in sent) == 1
 
         await pilot.press("P")
         await pilot.pause()
         assert app.is_running
-        assert any("paused boom" in m for m in _notification_messages(app))
+        assert any("paused boom" in m for m in sent)
 
         card.focus()
         await pilot.pause()
@@ -1716,10 +1726,10 @@ async def test_orchestrator_errors_notify_instead_of_crashing(
         await _settle(pilot)
         assert app.is_running
         assert not isinstance(app.screen, EditIssueScreen)
-        assert any("find boom" in m for m in _notification_messages(app))
+        assert any("find boom" in m for m in sent)
 
         await pilot.press("s")
         await _settle(pilot, 0.2)
         assert app.is_running
         assert not isinstance(app.screen, StatsScreen)
-        assert any("stats boom" in m for m in _notification_messages(app))
+        assert any("stats boom" in m for m in sent)

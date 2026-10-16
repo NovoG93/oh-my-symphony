@@ -245,6 +245,79 @@ def test_r18_status_uses_builtin_schema(node, tmp_path):
     assert "Unknown schema 'spec-driven'" in result.stdout + result.stderr
 
 
+@pytest.mark.parametrize("nesting", ["{,", "{"])
+@pytest.mark.parametrize(("field", "command"), [
+    ("generates", "status"),
+    ("generates", "instructions"),
+    ("tracks", "instructions"),
+])
+def test_deeply_nested_schema_glob_is_refused_not_crashed(
+    node, tmp_path, field, command, nesting,
+):
+    # braces <=3.0.3 (GHSA-vfj7-8cjw-p6xm) overflows the stack on both shapes
+    # below its 10,000-character limit. OpenSpec must refuse the pattern (or
+    # treat it as a literal path) before braces walks it.
+    depth = 9_980 // (len(nesting) + 1)
+    pattern = "{" + nesting * depth + "a" + "}" * depth + "}"
+    schema = (BUNDLE / "schemas/spec-driven/schema.yaml").read_text()
+    schema = schema.replace("name: spec-driven", "name: deep", 1)
+    original = {"generates": "generates: proposal.md", "tracks": "tracks: tasks.md"}[field]
+    assert original in schema
+    schema = schema.replace(original, f"{field}: '{pattern}'", 1)
+    project = tmp_path / "planning"
+    schema_dir = project / "openspec/schemas/deep"
+    shutil.copytree(BUNDLE / "schemas/spec-driven/templates", schema_dir / "templates")
+    (schema_dir / "schema.yaml").write_text(schema)
+    (project / "openspec/config.yaml").write_text("schema: deep\n")
+    change = project / "openspec/changes/add-greeting"
+    change.mkdir(parents=True)
+    (change / ".openspec.yaml").write_text("schema: deep\ncreated: '2026-10-16'\n")
+    args = ("status",) if command == "status" else ("instructions", "apply")
+    result = run_cli(node, *args, "--change", "add-greeting", "--json", cwd=project)
+    assert result.returncode == 1, result.stderr
+    assert json.loads(result.stdout)["status"][0]["severity"] == "error"
+    if "," in nesting:
+        assert "nests braces more than 16 levels deep" in result.stdout
+    assert "RangeError" not in result.stdout + result.stderr
+
+
+def test_bundled_braces_has_depth_guard():
+    assert "Brace pattern nests more than" in CLI.read_text()
+
+
+def test_braces_stub_refuses_deep_nesting_and_keeps_normal_expansion(node):
+    if not (BUILD / "node_modules/braces/package.json").is_file():
+        skip_or_fail("braces stub test needs npm ci --prefix scripts/openspec-bundle", flag=REQUIRED)
+    script = r"""
+const real = require('./node_modules/braces/index.js');
+const guarded = require('./stubs/braces.cjs');
+const run = (f) => { try { return f(); } catch (e) { return e.constructor.name + ': ' + e.message; } };
+const deep = (unit, depth) => '{' + unit.repeat(depth) + 'a' + '}'.repeat(depth) + '}';
+console.log(JSON.stringify({
+  crashOpen: run(() => real(deep('{', 4990))).split(':')[0],
+  crashComma: run(() => real(deep('{,', 3320))).split(':')[0],
+  open: run(() => guarded(deep('{', 4990))),
+  comma: run(() => guarded.expand(deep('{,', 3320))),
+  limit: run(() => guarded('{'.repeat(16) + 'a,b' + '}'.repeat(16)).length),
+  over: run(() => guarded.parse('{'.repeat(17) + 'a,b' + '}'.repeat(17))),
+  escaped: run(() => guarded('\\{'.repeat(40) + '{a,b}').length),
+  normal: guarded.expand('specs/{a,b}/*.{md,txt}'),
+  reference: real.expand('specs/{a,b}/*.{md,txt}'),
+}));
+"""
+    result = subprocess.run([node, "-e", script], cwd=BUILD, capture_output=True, text=True, timeout=30)
+    assert result.returncode == 0, result.stderr
+    outcome = json.loads(result.stdout)
+    refused = "Error: Brace pattern nests more than 16 levels"
+    assert outcome["crashOpen"] == outcome["crashComma"] == "RangeError"
+    assert outcome["open"] == outcome["comma"] == outcome["over"] == refused
+    assert outcome["limit"] == 1
+    assert outcome["escaped"] == 1
+    assert outcome["normal"] == outcome["reference"] == [
+        "specs/a/*.md", "specs/a/*.txt", "specs/b/*.md", "specs/b/*.txt",
+    ]
+
+
 def test_r11_rebuild_is_byte_identical(node, build_workspace, tmp_path):
     output = build_workspace.parents[1] / "src/symphony/pm/resources/openspec-cli"
     for _ in range(2):

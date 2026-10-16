@@ -33,6 +33,7 @@ const result = await build({
     '@inquirer/prompts': './stubs/inquirer.mjs',
     '@inquirer/core': './stubs/inquirer.mjs',
     ora: './stubs/ora.mjs',
+    braces: './stubs/braces.cjs',
   },
   banner: { js: "import { createRequire as __cr } from 'node:module'; const require = __cr(import.meta.url);" },
   plugins: [{

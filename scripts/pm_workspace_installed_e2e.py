@@ -739,6 +739,14 @@ class BrowserProof:
         self.playwright = sync_playwright().start()
         self.browser = self.playwright.chromium.launch(headless=True)
         self.page = self.browser.new_page(viewport={"width": 1366, "height": 768})
+        # Secondary PM controls sit in collapsed "pm-more" disclosures. This
+        # journey proves the actions, not the disclosures, so open each one as
+        # it renders; the page remembers open disclosures across re-renders.
+        self.page.add_init_script(
+            "new MutationObserver(() => document.querySelectorAll('details.pm-more:not([open])')"
+            ".forEach((details) => { details.open = true; }))"
+            ".observe(document, { childList: true, subtree: true });"
+        )
         self.page.goto(url, wait_until="networkidle")
         self.page.get_by_role("heading", name="Artifacts", exact=True).wait_for()
         self.actions: list[str] = ["opened_registered_project"]
