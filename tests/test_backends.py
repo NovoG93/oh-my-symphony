@@ -2116,6 +2116,65 @@ def test_scan_workspace_symlinks_collects_resolved_targets(tmp_path: Path) -> No
     assert roots == sorted(roots)  # deterministic ordering
 
 
+@pytest.mark.skipif(os.name != "nt", reason="Windows directory junctions")
+@pytest.mark.parametrize("chained", [False, True], ids=["direct", "chain"])
+def test_codex_junction_roots_reach_command_env_and_every_turn(
+    tmp_path: Path, chained: bool
+) -> None:
+    host_board = tmp_path / "host board"
+    host_board.mkdir()
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    (workspace / "real_dir").mkdir()
+    (workspace / ".git").mkdir()
+
+    def junction(link: Path, target: Path) -> None:
+        link_literal = str(link).replace("'", "''")
+        target_literal = str(target).replace("'", "''")
+        subprocess.run(
+            [
+                "powershell.exe", "-NoProfile", "-NonInteractive", "-Command",
+                "$ErrorActionPreference='Stop'; "
+                f"New-Item -ItemType Junction -Path '{link_literal}' "
+                f"-Target '{target_literal}' | Out-Null",
+            ],
+            check=True, capture_output=True, text=True,
+        )
+
+    target = host_board
+    if chained:
+        target = tmp_path / "board junction"
+        junction(target, host_board)
+    link = workspace / "kanban"
+    junction(link, target)
+    assert link.is_junction() and not link.is_symlink()
+    resolved_board = str(host_board.resolve())
+    assert _scan_workspace_symlinks(workspace) == [resolved_board]
+
+    cfg = _make_cfg("codex", workspace_root=workspace)
+    cfg = replace(
+        cfg,
+        codex=replace(
+            cfg.codex,
+            command="codex app-server",
+            thread_sandbox="workspace-write",
+            turn_sandbox_policy="workspace-write",
+        ),
+    )
+    backend = CodexAppServerBackend(
+        BackendInit(cfg=cfg, cwd=workspace, workspace_root=workspace, on_event=_noop_event)
+    )
+    command, env = backend._prepare_command_and_env()
+    assert command == _inject_writable_roots(cfg.codex.command, [resolved_board])
+    assert env["SYMPHONY_CODEX_WRITABLE_ROOTS"] == resolved_board
+    backend._thread_id = "thread-junction"
+    for prompt in ("Initial board transition", "Review board transition"):
+        params = backend._build_turn_params(prompt)
+        assert params["sandboxPolicy"] == {
+            "type": "workspaceWrite", "writableRoots": [resolved_board],
+        }
+
+
 def test_scan_workspace_symlinks_empty_when_no_symlinks(tmp_path: Path) -> None:
     (tmp_path / "kanban").mkdir()
     assert _scan_workspace_symlinks(tmp_path) == []
@@ -2310,6 +2369,30 @@ def test_inject_writable_roots_serializes_native_windows_paths_without_shell_bac
     else:
         assert parsed == original
     assert roots == original
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows native argv through Git Bash")
+@pytest.mark.parametrize(
+    "root", [r"C:\host-board", r"C:\host board\user's\kanban", r"\\server\share\kanban"]
+)
+def test_inject_writable_roots_survives_windows_native_argv(
+    tmp_path: Path, root: str
+) -> None:
+    probe = tmp_path / "argv.py"
+    probe.write_text("import json, sys; print(json.dumps(sys.argv[1:]))", encoding="utf-8")
+    command = _inject_writable_roots("codex app-server", [root])
+    command = command.replace(
+        "codex ", f"{shlex.quote(sys.executable)} {shlex.quote(str(probe))} ", 1
+    )
+    result = subprocess.run(
+        [shell_module.resolve_bash(), "-lc", command],
+        check=True, capture_output=True, text=True,
+    )
+    arguments = json.loads(result.stdout)
+    assert arguments[0] == "-c"
+    roots = tomllib.loads(arguments[1])["sandbox_workspace_write"]["writable_roots"]
+    assert roots == [root.replace("\\", "/")]
+    assert arguments[2] == "app-server"
 
 
 def test_inject_writable_roots_modifies_bare_codex_command() -> None:
