@@ -1800,8 +1800,23 @@ def _register_issue_routes(
                 "state_in_use",
                 f"{identifier} has a running worker; pause or wait before changing state",
             )
-        await asyncio.to_thread(tracker.update_fields, identifier, **fields)
-        if new_state is not None and new_state.lower() != current.state.lower():
+        updated_fields = sorted(fields)
+        confirming = (
+            current.state.strip().lower() == "human review"
+            and new_state is not None
+            and new_state.strip().lower() == "done"
+        )
+        if confirming:
+            try:
+                await orchestrator.confirm_done(identifier)
+            except FileNotFoundError:
+                return _json_error(404, "issue_not_found", f"unknown issue {identifier}")
+            except ValueError as exc:
+                return _json_error(409, "not_confirmable", str(exc))
+            fields.pop("state")
+        if fields:
+            await asyncio.to_thread(tracker.update_fields, identifier, **fields)
+        if not confirming and new_state is not None and new_state.lower() != current.state.lower():
             await asyncio.to_thread(
                 ctx.stats().record_transition,
                 issue=identifier,
@@ -1809,7 +1824,7 @@ def _register_issue_routes(
                 to_state=new_state.lower(),
             )
         orchestrator.request_refresh()
-        return web.json_response({"identifier": identifier, "updated": sorted(fields)})
+        return web.json_response({"identifier": identifier, "updated": updated_fields})
 
     async def handle_issue_recover_blocked(request: web.Request) -> web.Response:
         identifier = _check_identifier(request.match_info["identifier"])

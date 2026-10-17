@@ -156,10 +156,11 @@ def run_smoke(
             "PATCH",
             f"/api/v1/issues/{issue}",
             200,
-            {"state": "Done", "title": "API smoke done"},
+            # A CRUD-only fixture has no delivery workspace to confirm.
+            {"state": "Archive", "title": "API smoke archived"},
         )
         detail = expect(base_url, "GET", f"/api/v1/issues/{issue}", 200)
-        if detail["state"] != "Done" or detail["title"] != "API smoke done":
+        if detail["state"] != "Archive" or detail["title"] != "API smoke archived":
             raise SmokeFailure("patch did not persist")
         ok("issue patch")
 

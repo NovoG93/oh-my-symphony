@@ -958,6 +958,7 @@ class Orchestrator:
         # set is only a cache; concurrent manual/automatic recovery requests
         # must re-check the persisted board before either creates an RCA.
         self._blocked_rca_creation_lock = asyncio.Lock()
+        self._manual_completion_lock = asyncio.Lock()
         # A worker's post-turn path and the reconciliation loop can observe
         # the same Verify transition before either has finished persisting
         # release authority. Keep one lock per live RunningEntry so the
@@ -3296,6 +3297,147 @@ class Orchestrator:
     def iter_running_issues(self) -> tuple[Issue, ...]:
         """Return the issues currently owned by running workers."""
         return tuple(entry.issue for entry in self._running.values())
+
+    async def confirm_done(self, identifier: str) -> dict[str, Any]:
+        """Complete an operator-reviewed ticket through the host delivery gates."""
+        async with self._manual_completion_lock:
+            cfg = self._workflow_state.current()
+            if cfg is None:
+                raise ValueError("workflow is unavailable")
+            found = await asyncio.to_thread(
+                self._tracker_call_fetch_issue_full_by_id, cfg, identifier
+            )
+            if found is None:
+                raise FileNotFoundError(identifier)
+            issue: Issue = found
+            if self.find_running_issue_id(identifier) is not None:
+                raise ValueError(f"{identifier} has a running worker")
+            if normalize_state(issue.state) == "done":
+                return {"issue_identifier": identifier, "state": issue.state, "changed": False}
+            if normalize_state(issue.state) != "human review":
+                raise ValueError(f"{identifier} is not in Human Review")
+            done_state = next(
+                (s for s in cfg.tracker.terminal_states if normalize_state(s) == "done"),
+                None,
+            )
+            if done_state is None:
+                raise ValueError("workflow has no Done terminal state")
+            manager = self._workspace_manager
+            if manager is None:
+                raise ValueError("workspace manager is unavailable")
+            path = manager.path_for(identifier)
+            if not path.is_dir():
+                raise ValueError(f"workspace is missing for {identifier}; restore it before confirming")
+            def check_release_identity(current: Issue) -> None:
+                # Authority survives label removal and belongs to a verifier/finalizer run.
+                if _is_release_evidence_issue(current) or self._release_registry_call(
+                    cfg, "manual_completion_identity",
+                    lambda registry: (
+                        registry.get_release_gate_for_verifier(identifier) is not None
+                        or registry.get_release_gate(identifier) is not None
+                        or registry.get_release_evidence_identity(identifier) is not None
+                    ),
+                ):
+                    raise ValueError("release evidence must finish through its authorized verifier/finalizer run")
+
+            check_release_identity(issue)
+            run_id = self._release_registry_call(
+                cfg,
+                "manual_completion_acquire",
+                lambda registry: registry.acquire_run(
+                    issue, workspace_path=path, attempt=None,
+                    attempt_kind="manual-confirmation", agent_kind="operator",
+                ),
+            )
+            if not run_id:
+                raise ValueError(f"{identifier} has an active run lease")
+            heartbeat_error: Exception | None = None
+            heartbeat_stop = asyncio.Event()
+
+            def check_ownership() -> None:
+                if heartbeat_error is not None:
+                    raise SymphonyError("manual completion lease renewal failed") from heartbeat_error
+                owned = self._release_registry_call(
+                    cfg, "manual_completion_heartbeat",
+                    lambda registry: registry.heartbeat(issue_id=issue.id, run_id=run_id),
+                )
+                if not owned:
+                    raise SymphonyError("manual completion lost its run lease")
+
+            async def renew_lease() -> None:
+                nonlocal heartbeat_error
+                while not heartbeat_stop.is_set():
+                    try:
+                        check_ownership()
+                    except Exception as exc:
+                        heartbeat_error = exc
+                        return
+                    try:
+                        await asyncio.wait_for(
+                            heartbeat_stop.wait(), timeout=min(cfg.poll_interval_ms / 1000, 30)
+                        )
+                    except asyncio.TimeoutError:
+                        pass
+
+            heartbeat_task = asyncio.create_task(renew_lease())
+            completed = False
+            try:
+                check_ownership()
+                # Another service may have completed or relabeled our pre-lease snapshot.
+                current = await asyncio.to_thread(
+                    self._tracker_call_fetch_issue_full_by_id, cfg, identifier
+                )
+                if current is None:
+                    raise FileNotFoundError(identifier)
+                if current.id != issue.id:
+                    raise ValueError(f"{identifier} changed identity during confirmation")
+                if normalize_state(current.state) == "done":
+                    return {"issue_identifier": identifier, "state": current.state, "changed": False}
+                if normalize_state(current.state) != "human review":
+                    raise ValueError(f"{identifier} is no longer in Human Review")
+                check_release_identity(current)
+                issue = current
+                check_ownership()
+                debug = self._issue_debug.setdefault(issue.id, _IssueDebug())
+                debug.last_workspace = path
+                if cfg.agent.auto_commit_on_done:
+                    history = await finalize_delivery_history(
+                        path, identifier=identifier, title=issue.title,
+                        state=issue.state, push=cfg.agent.auto_merge_push_target,
+                    )
+                    if not history.durable or history.status == HISTORY_PUSH_FAILED:
+                        debug.last_error = f"history gate failed ({history.status}): {history.detail}"
+                        raise ValueError(debug.last_error)
+                check_ownership()
+                if not await self._auto_merge_done_gate_or_block(
+                    cfg, issue, path, debug_target=debug
+                ):
+                    raise ValueError("merge gate failed; workspace preserved; inspect the ticket")
+                check_ownership()
+                await asyncio.to_thread(self._tracker_call_update_state, cfg, issue, done_state)
+                self._dispatch_state.cancel_pending_retry(issue.id)
+                self._dispatch_state.claimed.discard(issue.id)
+                check_ownership()
+                await self._after_done_then_remove_per_policy(
+                    cfg, path, identifier=identifier, title=issue.title, debug_target=debug
+                )
+                check_ownership()
+                await self._maybe_run_wiki_sweep(cfg, identifier=identifier)
+                completed = True
+                return {"issue_identifier": identifier, "state": done_state, "changed": True}
+            finally:
+                heartbeat_stop.set()
+                await heartbeat_task
+                self._release_registry_call(
+                    cfg,
+                    "manual_completion_finish",
+                    lambda registry: registry.complete_run(
+                        issue_id=issue.id, run_id=run_id,
+                        status="manual_confirm_done" if completed else "manual_confirm_failed",
+                    ),
+                )
+                self.request_refresh()
+                await self._notify_observers()
 
     def snapshot(self) -> dict[str, Any]:
         cfg = self._workflow_state.current()

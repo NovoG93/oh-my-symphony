@@ -1126,6 +1126,7 @@ JSON API endpoints:
 | POST   | `/api/v1/refresh`                 | Coalesced trigger of poll + reconcile        |
 | POST   | `/api/v1/{id}/pause` `/resume`    | Hold / release a running worker              |
 | POST   | `/api/v1/issues/{id}/skip-document` | Move idle Document ticket to Human Review (deprecated alias: `/skip-learn`) |
+| POST   | `/api/v1/{id}/confirm-done` | Confirm Human Review through host history/merge/hooks/cleanup; requires retained workspace and refuses run-bound release evidence |
 
 #### Behind a reverse proxy or tunnel
 
