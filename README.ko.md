@@ -60,6 +60,16 @@ Wayfinder frontmatter에 명시한다. 기존 운영 프로필은
 upstream을 설정하고 `agent.auto_merge_push_target: true`를 명시해야 한다.
 `symphony project create`는 기존 고급 워크플로를 유지한다.
 
+`Blocked`가 되면 카드의 `Blocker`에서 원인과 보존된 worktree 경로를 먼저
+확인한다. Git 오류나 토큰 한도 문제를 해결한 뒤
+`symphony board update <ID> --state Verify --workflow ./WORKFLOW.md`로 검증을
+다시 요청한다. 일시정지된 티켓은 상태만 옮겨서는 실행되지 않는다. TUI의
+`P` 또는 실행 중인 서비스의 `POST /api/v1/<ID>/resume`으로 재개해야 한다.
+실제 병합까지 성공하면 Symphony가 작성한 복구 진단은
+`Resolved Blocker (history)`로 표시되고 원문은 이력으로 남는다.
+운영자가 직접 작성한 Blocker는 유지된다. 상세 한도와 복구 절차는
+[팩토리 운영 안내](skills/symphony-skill/reference/factory.md)를 참고한다.
+
 네 가지 표준 skill은 Symphony 패키지에 고정되어 프로젝트로 복사되므로 별도
 설치가 필요 없고, 복사본은 프로젝트에 맞게 수정할 수 있다. 브라우저 실행에는
 추가 런타임이 필요하다. Superdesign gate는 Node.js 18+, `@playwright/cli`

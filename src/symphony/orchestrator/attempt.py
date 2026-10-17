@@ -469,6 +469,7 @@ def _build_attempt_backend(
             process_launch_guard=orch._pm_process_launch_guard(
                 running_issue_id, issue, cfg, workspace.path
             ),
+            _require_durable_process=True,
         )
     )
 

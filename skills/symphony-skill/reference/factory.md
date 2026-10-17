@@ -86,6 +86,54 @@ budget and recovery steps. Inspect the cause before changing limits or retrying;
 pause with the same operator control above. Fresh verification must finish before
 delivery; a worker-written Done state alone is not evidence of a local merge.
 
+After successful target delivery, Symphony marks its own Git-snapshot and
+token-cancellation diagnostics as `Resolved Blocker (history)`. The original
+message remains below that heading for audit. An operator-authored or edited
+Blocker is left intact. Ambiguous older diagnostics, such as an embedded second
+Blocker heading or repeated recovery instructions, also remain unchanged.
+Resuming a ticket, entering Done, or committing its worktree alone
+does not resolve a delivery failure. For workflows that publish remotely, local
+ancestry alone is insufficient to mark a previous delivery failure resolved.
+
+### Worker timeouts and recovery
+
+The local objective is bounded failure detection with retained work and a usable
+recovery path. It is not an availability or latency guarantee for a hosted model.
+These are the existing defaults; the selected backend and per-state workflow
+settings determine the effective limits.
+
+| Boundary | Default limit | What happens when it is exceeded |
+| --- | --- | --- |
+| Codex initialize or thread/start reply | `codex.read_timeout_ms: 20000`, per request | A response-timeout diagnostic is reported; the ticket is paused for operator recovery. |
+| Codex turn/start reply | `codex.turn_timeout_ms: 3600000` | A turn-timeout diagnostic is reported. |
+| Codex turn completion after its reply | A separate wait with the same turn limit | A completion timeout is reported. The two waits are not one combined deadline. |
+| Worker without progress | `codex.stall_timeout_ms: 300000`, checked during reconciliation | The stalled worker is cancelled. Detection includes polling delay (factory default: 30000 ms) and process cleanup. |
+| Recognized transient overload/network error | Retry after 10, 20, then 40 seconds by default | Retries use exponential backoff, capped by `agent.max_retry_backoff_ms` (300000 ms); `agent.max_retries` defaults to 3. |
+
+Ordinary timeout, stall, and other non-transient failures pause the ticket;
+queued retries stay held until explicit resume. Inspect the service log and
+ticket diagnostic, repair the named dependency, then resume with the same
+operator control described above. Exhausted retries produce an Escalation and
+Blocked state. Other agent adapters have their own stream/turn timeout handling;
+Codex's per-request read limit is not a universal HTTP timeout.
+
+### Windows service interruption
+
+New Windows backend processes run under a private supervisor and an owned job
+object. The supervisor starts the backend only after the host records its
+ownership. If the orchestrator exits unexpectedly, the supervisor terminates
+that job's ordinary child processes. Restart confirms that the recorded job is
+empty or gone before reusing the workspace; an operator pause still requires
+explicit resume. This contains ordinary child creation, not work submitted to
+external services, WMI, scheduled tasks, or preexisting daemons.
+
+Older run records without this ownership identity remain protected when process
+cleanup cannot be established. An absent numeric process ID alone does not prove
+that all old descendants exited. Preserve the worktree and run database and seek
+operator-reviewed recovery for those records; do not delete the database to
+clear a hold. Permission or containment failures are reported rather than
+launching an uncontained backend.
+
 `factory init` prints the exact Supergoal WAYFINDER prompt to use next.
 It merges runtime ignore rules into `.gitignore` without replacing user rules:
 board cards, worktrees, logs, and `WORKFLOW-PROGRESS.md` stay local runtime
@@ -102,6 +150,29 @@ an empty checkout directory with that link and is safe to rerun. It stops with
 a repair message if an older repository has tracked cards that produce a
 nonempty real directory; continuing would let the worker edit a stale private
 card that the scheduler cannot observe.
+
+The shipped cleanup hooks detach board links and Windows directory junctions
+before Git removes the worktree. They validate the worktree's repository,
+location, registration, and every configured board target first. A cleanup
+diagnostic is not a promise that a custom hook preserves the directory:
+Symphony's existing workspace manager still proceeds with its own removal after
+a hook failure.
+
+Upgrading Symphony does not rewrite an existing project's copied hooks. Before
+using an older project on Windows, preserve its customizations and compare its
+`before_run` and `before_remove` blocks with the current
+`examples/advanced/WORKFLOW.file.example.md` (or `WORKFLOW.example.md` for Linear).
+Also refresh the copied `scripts/symphony-setup-worktree.sh`: advanced refresh
+uses it to remove and reattach a retained worktree, so its cleanup must protect
+the same shared links. For stale empty targets, setup's existing metadata prune
+can remove other unlocked stale registrations; it preserves valid and locked
+worktrees and uses ordinary branch checkout checks.
+Factory projects should also compare `scripts/factory-remove-worktree.sh` with
+the current factory template. Refresh those cleanup adapters together with the
+installed package: they use its private `symphony._worktree_cleanup` helper and
+the interpreter supplied by Symphony. Run `symphony doctor ./WORKFLOW.md` after
+the reviewed update. Do not retain an older raw `git worktree remove --force`
+hook on Windows, where Git can traverse a shared-board junction.
 
 ## Data and external services
 
