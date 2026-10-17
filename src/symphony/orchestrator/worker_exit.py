@@ -52,7 +52,7 @@ from ..workflow import ServiceConfig
 from ..workspace import HISTORY_PUSH_FAILED, HistoryGateResult
 from .constants import CONTINUATION_RETRY_DELAY_MS, RETRY_BASE_MS
 from .entries import RunningEntry, _IssueDebug
-from .helpers import _max_turns_exhausted_target_state
+from .helpers import _is_successful_terminal_state, _max_turns_exhausted_target_state
 from .release_cycle import (
     is_release_success_state as _is_release_success_state,
     release_verifier_state as _release_verifier_state,
@@ -114,7 +114,15 @@ async def handle_worker_exit(
         orch._finish_run_lease(issue_id, entry, reason, error)
     debug = _record_exit_accounting(orch, issue_id, entry, reason, error)
 
-    if terminal_cancelled:
+    if (
+        terminal_cancelled
+        and entry.hit_token_budget
+        and cfg is not None
+        and orch._is_factory_profile(cfg)
+        and _is_successful_terminal_state(entry.issue.state)
+    ):
+        await _stop_factory_budget_cancelled_delivery(orch, cfg, issue_id, entry, debug)
+    elif terminal_cancelled:
         # Workspace cleanup remains owned by reconcile. This is cancellation,
         # not a successful completion: do not merge or invoke Done hooks here.
         orch._dispatch_state.cancel_pending_retry(issue_id)
@@ -478,6 +486,83 @@ async def _handle_token_budget(
     orch._claimed.add(issue_id)
     debug.last_error = "max_total_tokens reached; workflow config unavailable"
     return False
+
+
+async def _stop_factory_budget_cancelled_delivery(
+    orch: Orchestrator,
+    cfg: ServiceConfig,
+    issue_id: str,
+    entry: RunningEntry,
+    debug: _IssueDebug,
+) -> None:
+    """A cancelled verifier's Done card is not a delivered product."""
+    cap = entry.token_budget_cap or orch._token_cap_for_entry(cfg, entry)
+    budget_state = entry.state_at_turn_start or "Verify"
+    message = (
+        f"max_total_tokens reached ({entry.codex_state_total_tokens}/{cap} "
+        f"in {budget_state}); worker cancelled before delivery; "
+        "workspace preserved; operator action required"
+    )
+    orch._dispatch_state.cancel_pending_retry(issue_id)
+    orch._persisted_retry_attempts.pop(issue_id, None)
+    orch._claimed.add(issue_id)
+    orch._paused_issue_ids.add(issue_id)
+    orch._pause_reasons[issue_id] = message
+    # A persisted pause also protects a still-Done card if the tracker write fails.
+    # Unlike budget_exhausted, the operator resume control can clear this hold.
+    orch._set_issue_flags(issue_id, paused=True, pause_reason=message, retry_attempt=None)
+    debug.last_error = message
+    configured_target = cfg.agent.budget_exhausted_state
+    target = (
+        configured_target
+        if configured_target in (*cfg.tracker.active_states, *cfg.tracker.terminal_states)
+        and not _is_successful_terminal_state(configured_target)
+        and normalize_state(configured_target) not in {"archive", "cancelled"}
+        else next(
+            (state for state in cfg.tracker.terminal_states
+             if normalize_state(state) == "blocked"),
+            next(
+                (state for state in reversed(cfg.tracker.active_states)
+                 if not _is_successful_terminal_state(state)
+                 and normalize_state(state) not in {"archive", "cancelled"}),
+                "",
+            ),
+        )
+    )
+    note = (
+        f"{message}.\n\n"
+        f"The worker wrote {entry.issue.state}, but token-budget cancellation stopped delivery. "
+        "Delivery and cleanup were stopped, and the workspace and its product "
+        "files were preserved. Do not treat this ticket as delivered.\n\n"
+        f"- workspace: `{entry.workspace_path}`\n\n"
+        "Fix the token-budget cause without deleting the workspace. Check "
+        "`agent.max_total_tokens` and `agent.max_total_tokens_by_state`. Then "
+        "return this ticket to Verify and resume it through the operator resume "
+        "control so verification can run again before delivery."
+    )
+    try:
+        if target:
+            await asyncio.to_thread(
+                orch._tracker_call_update_state, cfg, entry.issue, target
+            )
+            entry.issue = replace(entry.issue, state=target)
+        await asyncio.to_thread(
+            orch._tracker_call_append_note, cfg, entry.issue, "Blocker", note
+        )
+        orch._clear_tracker_error(issue_id)
+    except Exception as exc:
+        debug.last_error = f"{message}; recovery state/note persistence failed: {exc}"
+        orch._record_tracker_error(issue_id, exc)
+        log.error(
+            "factory_budget_cancelled_delivery_persist_failed",
+            issue_id=issue_id, identifier=entry.issue.identifier, error=str(exc),
+        )
+    log.warning(
+        "factory_budget_cancelled_delivery_preserved",
+        issue_id=issue_id, identifier=entry.issue.identifier,
+        state=entry.issue.state, path=str(entry.workspace_path),
+        state_total_tokens=entry.codex_state_total_tokens, max_total_tokens=cap,
+    )
 
 
 async def _handle_no_stage_change(

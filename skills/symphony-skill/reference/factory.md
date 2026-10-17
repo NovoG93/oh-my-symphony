@@ -77,6 +77,15 @@ above, then clear its pause with the TUI's `P` control or
 clear a persisted pause. Verify runs again before delivery; remote publishing
 remains opt-in.
 
+If a factory verifier writes Done but is then cancelled for exceeding its token
+budget, Symphony also retains the worktree and pauses the ticket in a safe
+non-success lane, normally `Blocked`. Its Blocker records the exceeded phase
+budget and recovery steps. Inspect the cause before changing limits or retrying;
+`agent.max_total_tokens_by_state.Verify` overrides the fallback
+`agent.max_total_tokens` for Verify. Return the card to `Verify` and clear the
+pause with the same operator control above. Fresh verification must finish before
+delivery; a worker-written Done state alone is not evidence of a local merge.
+
 `factory init` prints the exact Supergoal WAYFINDER prompt to use next.
 It merges runtime ignore rules into `.gitignore` without replacing user rules:
 board cards, worktrees, logs, and `WORKFLOW-PROGRESS.md` stay local runtime
