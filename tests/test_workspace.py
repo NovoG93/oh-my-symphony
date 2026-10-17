@@ -6,6 +6,7 @@ import json
 import os
 import shutil
 import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -409,6 +410,14 @@ _SETUP_SCRIPT_POSIX_COMMANDS = (
 )
 
 
+def _setup_script_host_env(root: Path) -> dict[str, str]:
+    return {
+        "SYMPHONY_PYTHON": sys.executable,
+        "SYMPHONY_WORKSPACE_ROOT": str(root),
+        "PYTHONPATH": str(Path(__file__).parents[1] / "src"),
+    }
+
+
 def _setup_script_test_path(tmp_path: Path, *, include_flock: bool) -> str:
     fakebin = tmp_path / "fakebin"
     fakebin.mkdir()
@@ -458,6 +467,7 @@ def test_setup_worktree_script_supports_linked_workflow_dir(tmp_path, lock_backe
     env = {
         **os.environ,
         "SYMPHONY_WORKFLOW_DIR": str(workflow_dir),
+        **_setup_script_host_env(workspace.parent),
         "SYMPHONY_FEATURE_BASE_BRANCH": "operator",
         "PATH": _setup_script_test_path(
             tmp_path, include_flock=lock_backend == "flock"
@@ -534,6 +544,7 @@ def test_setup_worktree_script_refreshes_only_exact_local_target(
         env={
             **os.environ,
             "SYMPHONY_WORKFLOW_DIR": str(host),
+            **_setup_script_host_env(workspace.parent),
             "SYMPHONY_FEATURE_BASE_BRANCH": "main",
             "SYMPHONY_MERGE_TARGET_BRANCH": merge_target,
             "PATH": _setup_script_test_path(tmp_path, include_flock=False),
@@ -586,6 +597,7 @@ def test_setup_worktree_script_preserves_unmerged_branch_tip(tmp_path):
         env={
             **os.environ,
             "SYMPHONY_WORKFLOW_DIR": str(host),
+            **_setup_script_host_env(workspace.parent),
             "SYMPHONY_FEATURE_BASE_BRANCH": "main",
             "SYMPHONY_MERGE_TARGET_BRANCH": "main",
             "PATH": _setup_script_test_path(tmp_path, include_flock=False),
@@ -607,6 +619,7 @@ def _preserve_worktree_manager(tmp_path: Path, host: Path, monkeypatch) -> Works
     monkeypatch.setenv(
         "PATH", _setup_script_test_path(tmp_path, include_flock=False)
     )
+    monkeypatch.setenv("PYTHONPATH", str(Path(__file__).parents[1] / "src"))
     script = Path(__file__).parents[1] / "scripts" / "symphony-setup-worktree.sh"
     return WorkspaceManager(
         tmp_path / "managed-workspaces",
@@ -1178,6 +1191,7 @@ exit 0
     env = {
         **os.environ,
         "SYMPHONY_WORKFLOW_DIR": str(host),
+        **_setup_script_host_env(workspace_root),
         "SYMPHONY_FEATURE_BASE_BRANCH": "main",
         "PATH": f"{fakebin}{os.pathsep}{os.environ.get('PATH', '')}",
     }

@@ -107,7 +107,7 @@ def _watch_mutations(monkeypatch):
     run = subprocess.run
 
     def watch(args, **kwargs):
-        if "remove" in args or "update-index" in args:
+        if any(command in args for command in ("remove", "prune", "update-index", "update-ref", "add")):
             calls.append(args)
         return run(args, **kwargs)
 
@@ -310,3 +310,19 @@ def test_git_error_only_accepts_windows_empty_unregistered_255(
         with pytest.raises(subprocess.CalledProcessError):
             cleanup_module.cleanup(workspace)
     assert expected == {name: (host / name).read_bytes() for name in expected}
+
+
+@pytest.mark.skipif(os.name != "nt", reason="native Git long-path removal")
+def test_native_cleanup_removes_deep_venv_leaf_without_global_config(tmp_path, monkeypatch):
+    host, _, workspace, external, expected = _prepare(tmp_path, monkeypatch)
+    _git(host, "config", "core.longpaths", "false")
+    leaf = workspace / ".venv/Lib/site-packages" / ("package" * 15) / ("nested" * 14) / "keep.txt"
+    assert len(str(leaf)) > 260
+    leaf.parent.mkdir(parents=True)
+    leaf.write_bytes(b"owned deep leaf")
+    cleanup_module.cleanup(workspace)
+    assert not workspace.exists()
+    assert not cleanup_module._registered(host, workspace)
+    assert _git(host, "config", "core.longpaths").stdout.strip() == "false"
+    assert expected == {name: (host / name).read_bytes() for name in expected}
+    assert (external / "keep.bin").read_bytes() == b"preserve external bytes\x00\xff"

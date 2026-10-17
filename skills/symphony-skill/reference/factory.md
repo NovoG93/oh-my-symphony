@@ -162,6 +162,11 @@ Upgrading Symphony does not rewrite an existing project's copied hooks. Before
 using an older project on Windows, preserve its customizations and compare its
 `before_run` and `before_remove` blocks with the current
 `examples/advanced/WORKFLOW.file.example.md` (or `WORKFLOW.example.md` for Linear).
+Also refresh the copied `scripts/symphony-setup-worktree.sh`: advanced refresh
+uses it to remove and reattach a retained worktree, so its cleanup must protect
+the same shared links. For stale empty targets, setup's existing metadata prune
+can remove other unlocked stale registrations; it preserves valid and locked
+worktrees and uses ordinary branch checkout checks.
 Factory projects should also compare `scripts/factory-remove-worktree.sh` with
 the current factory template. Refresh those cleanup adapters together with the
 installed package: they use its private `symphony._worktree_cleanup` helper and

@@ -77,6 +77,7 @@ jobs:
           tests/test_factory_recovery_history.py
           tests/test_advanced_board_link.py
           tests/test_worktree_cleanup.py
+          tests/test_setup_worktree_recovery.py
           tests/factory/test_cli.py
           tests/test_shell.py
           tests/test_backends.py
