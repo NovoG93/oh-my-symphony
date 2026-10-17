@@ -35,6 +35,7 @@ from typing import Any, Awaitable, Callable, Coroutine, TypeVar, cast
 
 from .. import __version__
 from .._shell import kill_process_group, process_group_exists, process_identity
+from .._windows_job import is_job_identity, job_exists, terminate_job
 from ..artifacts import ArtifactRecord, ArtifactStore, format_bytes
 from ..backends import (
     EVENT_AGENT_RETRY,
@@ -471,9 +472,22 @@ def _reclaim_kill_confirm(record: RunRecord) -> str | None:
             pid=pid,
         )
         return None
-    if pid is None:
-        return "no_backend_pid"
     expected_identity = record.backend_process_identity
+    if pid is None:
+        return None if is_job_identity(expected_identity) else "no_backend_pid"
+    if is_job_identity(expected_identity):
+        assert expected_identity is not None
+        exists = job_exists(expected_identity)
+        if exists is False:
+            return "not_found"
+        if exists is None or not terminate_job(expected_identity):
+            return None
+        deadline = time.monotonic() + 1.0
+        while job_exists(expected_identity) is not False:
+            if time.monotonic() >= deadline:
+                return None
+            time.sleep(0.05)
+        return "killed"
     current_identity = process_identity(pid)
     group_exists = process_group_exists(pid)
     if current_identity is None:
@@ -2771,6 +2785,8 @@ class Orchestrator:
         Lookup failures degrade to None rather than blocking a legitimate
         kill: the fingerprint is hardening, not authority.
         """
+        if entry.agent_process_identity_captured and is_job_identity(entry.agent_process_identity):
+            return entry.agent_process_identity
         registry = self._run_registry
         if registry is None or not entry.run_id:
             return None
@@ -2789,11 +2805,11 @@ class Orchestrator:
         *,
         backend_process_identity: str | None = None,
         identity_captured: bool = False,
-    ) -> None:
+    ) -> bool:
         """Keep in-memory and persisted backend ownership in lockstep."""
         entry = self._running.get(issue_id)
         if entry is None:
-            return
+            return False
         if (
             not identity_captured
             and backend_agent_pid is not None
@@ -2807,13 +2823,29 @@ class Orchestrator:
             if identity_captured:
                 entry.agent_process_identity = backend_process_identity
                 entry.agent_process_identity_captured = True
-            lease_ok = self._heartbeat_run_lease(
-                issue_id,
-                entry,
-                backend_agent_pid=backend_agent_pid,
-                backend_process_identity=backend_process_identity,
-                identity_captured=identity_captured,
-            )
+            if is_job_identity(backend_process_identity):
+                # GO requires exact current-lease persistence, never best-effort
+                # heartbeat defaults or reacquiring an identity-less replacement row.
+                registry = self._run_registry
+                try:
+                    lease_ok = bool(registry is not None and entry.run_id and registry.heartbeat(
+                        issue_id=issue_id, run_id=entry.run_id,
+                        backend_agent_pid=backend_agent_pid,
+                        backend_process_identity=backend_process_identity,
+                        backend_process_identity_captured=True,
+                    ) is True)
+                except Exception as exc:
+                    self._registry_error_count += 1
+                    self._last_registry_error = f"windows_backend_heartbeat: {exc}"
+                    lease_ok = False
+                if not lease_ok:
+                    entry.lease_lost = True
+            else:
+                lease_ok = self._heartbeat_run_lease(
+                    issue_id, entry, backend_agent_pid=backend_agent_pid,
+                    backend_process_identity=backend_process_identity,
+                    identity_captured=identity_captured,
+                )
             if not lease_ok:
                 task = entry.worker_task
                 if task is not None and not task.done() and entry.cancelled_at is None:
@@ -2824,13 +2856,13 @@ class Orchestrator:
                     )
                     task.cancel()
                     entry.cancelled_at = datetime.now(timezone.utc)
-            return
+            return lease_ok
         entry.agent_process_identity = None
         entry.agent_process_identity_captured = False
         registry = self._run_registry
         if registry is None or not entry.run_id:
-            return
-        self._registry_guard(
+            return True
+        return self._registry_guard(
             "clear_backend_agent_pid",
             lambda: registry.clear_backend_agent_pid(
                 issue_id=issue_id,
@@ -4182,6 +4214,8 @@ class Orchestrator:
             push_target=cfg.agent.auto_merge_push_target,
         )
         if result is None or result.ok:
+            if result is not None and result.status in {"merged", "nothing_to_apply"}:
+                await self._resolve_delivered_factory_blockers(cfg, issue)
             return True
         await self._block_done_ticket_for_merge_gate(
             cfg,
@@ -4191,6 +4225,24 @@ class Orchestrator:
             debug_target=debug_target,
         )
         return False
+
+    async def _resolve_delivered_factory_blockers(
+        self, cfg: ServiceConfig, issue: Issue
+    ) -> None:
+        if not self._is_factory_profile(cfg) or cfg.tracker.kind != "file":
+            return
+        from ..trackers.file import FileBoardTracker
+
+        try:
+            await asyncio.to_thread(
+                FileBoardTracker(cfg.tracker)._resolve_factory_recovery_blockers,
+                issue.identifier,
+            )
+        except Exception as exc:
+            log.warning(
+                "factory_recovery_history_update_failed",
+                identifier=issue.identifier, error=str(exc),
+            )
 
     # ------------------------------------------------------------------
     # tick loop (§16.2)
@@ -7763,6 +7815,7 @@ class Orchestrator:
                 process_launch_guard=self._pm_process_launch_guard(
                     running_issue_id, issue, cfg, workspace_path
                 ),
+                _require_durable_process=True,
             )
         )
         try:
@@ -10228,6 +10281,9 @@ class Orchestrator:
                             target=cfg.agent.auto_merge_target_branch or "HEAD",
                             path=str(path),
                         )
+                        # Ancestry proves local delivery, not an opted-in remote push.
+                        if not cfg.agent.auto_merge_push_target:
+                            await self._resolve_delivered_factory_blockers(cfg, issue)
                         await self._workspace_manager.remove(path)
                     elif cfg.agent.auto_merge_on_done:
                         await self._block_done_ticket_for_merge_gate(

@@ -2261,8 +2261,7 @@ def test_advanced_workflows_restore_host_board_tracking_before_remove() -> None:
         "WORKFLOW.md", "WORKFLOW.example.md", "examples/advanced/WORKFLOW.file.example.md"
     ):
         workflow = (root / name).read_text(encoding="utf-8")
-        assert "update-index --no-skip-worktree" in workflow
-        assert '"$dir/$ISSUE_ID.md"' in workflow
+        assert '-m symphony._worktree_cleanup "$workspace" --restore-board-tracking' in workflow
 
 
 @pytest.mark.skipif(not _HAS_GIT, reason="git CLI required")
