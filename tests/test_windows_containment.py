@@ -49,7 +49,8 @@ async def test_native_stdio_unicode_cwd_env_and_exact_exit(tmp_path, status):
     cwd.mkdir()
     code = (
         "import sys,os,json; data=sys.stdin.buffer.read(); "
-        "print(json.dumps([os.getcwd(),os.environ['OWNED_TEST_UNICODE'],data.decode()],ensure_ascii=False)); "
+        "sys.stdout.buffer.write((json.dumps([os.getcwd(),os.environ['OWNED_TEST_UNICODE'],data.decode()],"
+        "ensure_ascii=False)+'\\n').encode('utf-8')); "
         "sys.stderr.buffer.write('별도 오류\\n'.encode()); sys.exit(" + str(status) + ")"
     )
     proc, identity = await _spawn([sys.executable, "-c", code], cwd)
