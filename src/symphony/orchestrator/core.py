@@ -64,12 +64,13 @@ from ..continuous_improvement import (
     default_improvement_runner,
     lease_path_for,
 )
+from ..factory.wayfinder import factory_proof_commands
 from ..issue import BlockerRef, Issue, normalize_state
 from ..logging import get_logger
 from ..prompt import build_first_turn_prompt
 from ..runtime_safety import ensure_workflow_repo_is_safe
 from ..service_identity import SERVICE_INSTANCE_ENV, normalize_service_instance_id
-from ..skills import render_skill_block
+from ..skills import render_skill_block, select_skills_for_stage
 from ..stats import StatsStore, board_health_summary, stats_store_for
 from ..trackers import TrackerClient, build_tracker_client
 from ..utils.wiki_sweep import sweep as _wiki_sweep_run
@@ -85,7 +86,10 @@ from ..workflow.presets import guess_lane_preset
 from ..utils.auto_merge import AutoMergeResult, auto_merge_on_done_best_effort
 from ..utils.git_sandbox import SANDBOX_WRITE_DENIED, classify_history_failure
 from ..workspace import (
+    COMMIT_FAILED,
     HISTORY_PUSH_FAILED,
+    CommitOutcome,
+    HistoryGateResult,
     WorkspaceManager,
     commit_workspace_on_done,
     # Only `worker_exit` calls this now, and it reads it through this
@@ -111,7 +115,12 @@ from .constants import (
     WAIT_AGE_BUMP_MIN,
     _TOKEN_EMA_ALPHA,
 )
-from .contracts import contract_producing_states, evaluate_contract
+from .contracts import _build_result, contract_producing_states, evaluate_contract
+from .factory_contracts import (
+    factory_browser_failures,
+    factory_browser_required,
+    factory_verification_text,
+)
 from .release_contracts import (
     ReleaseValidationResult,
     release_workspace_target_errors,
@@ -152,6 +161,7 @@ from .helpers import (
     _requested_agent_kind,
     _sort_for_dispatch_fifo,
     _task_debug,
+    _terminal_state_matching,
     _to_iso,
     _utc_iso_z,
 )
@@ -3427,7 +3437,11 @@ class Orchestrator:
             "feature_branch_pattern": "symphony/<ID>",
             "base_branch": base,
             "merge_target_branch": target,
-            "merge_timing": "after Document, before Done",
+            "merge_timing": (
+                "after Verify"
+                if self._is_factory_profile(cfg)
+                else "after Document, before Done"
+            ),
             "auto_merge_enabled": bool(cfg.agent.auto_merge_on_done),
             "merge_delivery": (
                 "upstream-publishing"
@@ -4029,6 +4043,65 @@ class Orchestrator:
             return
         await self._workspace_manager.remove(path)
 
+    async def _preserve_history_failure(
+        self,
+        cfg: ServiceConfig,
+        issue: Issue,
+        workspace_path: Path,
+        outcome: CommitOutcome | HistoryGateResult,
+    ) -> Issue:
+        """Stop delivery and cleanup when the host could not snapshot this work."""
+        message = (
+            "Git history snapshot failed; workspace preserved; operator action required"
+        )
+        debug = self._issue_debug.setdefault(issue.id, _IssueDebug())
+        debug.last_workspace = workspace_path
+        debug.last_error = message
+        self._paused_issue_ids.add(issue.id)
+        self._pause_reasons[issue.id] = message
+        self._set_issue_flags(issue.id, paused=True, pause_reason=message)
+        target = _terminal_state_matching(cfg, "block", "human")
+        if not target and cfg.tracker.active_states:
+            target = cfg.tracker.active_states[-1]
+        note = (
+            f"{message}.\n\n"
+            "The host could not record this workspace in Git. Delivery and cleanup "
+            "were stopped, and the workspace and its product files were preserved.\n\n"
+            f"- status: `{outcome.status}`\n"
+            f"- classification: `{outcome.failure_kind}`\n"
+            f"- workspace: `{workspace_path}`\n"
+            f"- detail: {outcome.detail[:1000]}\n\n"
+            "Fix the reported Git/index problem without deleting the workspace. "
+            "Then return this ticket to its verification lane and resume it through "
+            "the operator resume control. Do not treat this ticket as delivered."
+        )
+        try:
+            if target:
+                await asyncio.to_thread(
+                    self._tracker_call_update_state, cfg, issue, target
+                )
+                issue = replace(issue, state=target)
+            await asyncio.to_thread(
+                self._tracker_call_append_note, cfg, issue, "Blocker", note
+            )
+        except Exception as exc:
+            self._record_tracker_error(issue.id, exc)
+            log.error(
+                "history_failure_persist_failed",
+                identifier=issue.identifier,
+                error=str(exc),
+            )
+        self._record_stats_gate(
+            issue.identifier, issue.state, "history_commit_failed", (outcome.detail,)
+        )
+        log.error(
+            "history_commit_failed_workspace_preserved",
+            identifier=issue.identifier,
+            path=str(workspace_path),
+            detail=outcome.detail,
+        )
+        return issue
+
     async def _block_done_ticket_for_merge_gate(
         self,
         cfg: "ServiceConfig",
@@ -4470,6 +4543,15 @@ class Orchestrator:
             if decision.disposition is not _EligibilityDisposition.READY:
                 continue
 
+            if await self._auto_promote_factory_ready(issue, cfg):
+                entry.update(
+                    status="waiting",
+                    code="factory_ready_promotion",
+                    reason="factory dependency gate advanced to Build",
+                    dispatch_outcome="state_changed",
+                )
+                continue
+
             ready_rank += 1
             entry["queue_rank"] = ready_rank
             if not mutating_scan_open or self._available_slots(cfg) <= 0:
@@ -4591,6 +4673,14 @@ class Orchestrator:
         ):
             if await self._auto_triage_todo_if_actionable(issue, cfg):
                 continue
+            if self._is_factory_profile(cfg):
+                decision = self._eligibility_decision(
+                    issue, cfg, owning_retry=False, include_global_slots=False
+                )
+                if decision.disposition is not _EligibilityDisposition.READY:
+                    continue
+                if await self._auto_promote_factory_ready(issue, cfg):
+                    continue
             if self._available_slots(cfg) <= 0:
                 break
             if not self._should_dispatch(issue, cfg):
@@ -4609,10 +4699,28 @@ class Orchestrator:
                 issue,
                 cfg,
                 attempt=persisted_attempt,
-                attempt_kind=(
-                    "retry" if persisted_attempt is not None else None
-                ),
+                attempt_kind=("retry" if persisted_attempt is not None else None),
             )
+
+    async def _auto_promote_factory_ready(
+        self, issue: Issue, cfg: ServiceConfig
+    ) -> bool:
+        """Advance an eligible dependency gate without starting an agent."""
+        if not self._is_factory_profile(cfg) or normalize_state(issue.state) != "ready":
+            return False
+        try:
+            await asyncio.to_thread(
+                self._tracker_call_update_state, cfg, issue, "Build"
+            )
+            self._clear_tracker_error(issue.id)
+        except Exception as exc:
+            self._record_tracker_error(issue.id, exc)
+            log.warning(
+                "factory_ready_promotion_failed",
+                identifier=issue.identifier,
+                error=str(exc),
+            )
+        return True
 
     def _sort_with_wait_age_bump(
         self,
@@ -5464,6 +5572,8 @@ class Orchestrator:
 
         opened = 0
         for issue in _sort_for_dispatch_fifo(terminal_issues, cfg):
+            if issue.id in self._paused_issue_ids:
+                continue
             if opened >= slots:
                 break
             if normalize_state(issue.state) != "blocked":
@@ -6630,15 +6740,101 @@ class Orchestrator:
             threshold = by_state.get("learn")
         return threshold or 0
 
-    def _ticket_prompt_path(self, cfg: ServiceConfig, issue: Issue) -> str | None:
+    def _ticket_prompt_path(
+        self, cfg: ServiceConfig, issue: Issue, workspace_path: Path | None = None
+    ) -> str | None:
         if cfg.tracker.kind != "file":
             return None
+        if self._is_factory_profile(cfg) and workspace_path is not None:
+            host_board = cfg.tracker.board_root
+            if host_board is None:
+                return None
+            local_path = workspace_path / "kanban" / f"{issue.identifier}.md"
+            if (
+                local_path.parent.resolve() == host_board.resolve()
+                and local_path.is_file()
+            ):
+                return str(local_path.relative_to(workspace_path))
+            host_path = host_board / f"{issue.identifier}.md"
+            return str(host_path) if host_path.is_file() else None
         tracker = getattr(self, "_tracker", None)
         find_path = getattr(tracker, "find_path", None)
         if find_path is None:
             return None
         path = find_path(issue.identifier)
         return str(path) if path is not None else None
+
+    @staticmethod
+    def _is_factory_profile(cfg: ServiceConfig) -> bool:
+        return (
+            str(cfg.raw.get("contract_profile", "advanced")).strip().lower()
+            == "factory"
+        )
+
+    def _render_stage_skills(
+        self, cfg: ServiceConfig, issue: Issue, workspace_path: Path
+    ) -> str:
+        factory = self._is_factory_profile(cfg)
+        return render_skill_block(
+            cfg.workflow_path.parent,
+            select_skills_for_stage(
+                str(cfg.raw.get("contract_profile", "advanced")),
+                issue.state,
+                issue.skills,
+            ),
+            runtime_dir=workspace_path if factory else None,
+            inline_body=not factory,
+        )
+
+    def _start_factory_verify_phase(
+        self, cfg: ServiceConfig, issue: Issue, entry: RunningEntry
+    ) -> None:
+        entry.factory_verification_baseline = None
+        entry.factory_verify_completed = False
+        entry.factory_verify_started_at = 0.0
+        if self._is_factory_profile(cfg):
+            entry.factory_browser_required = (
+                entry.factory_browser_required
+                or factory_browser_required(issue.description or "", issue.skills)
+            )
+        if self._is_factory_profile(cfg) and entry.factory_declared_proof is None:
+            entry.factory_declared_proof = tuple(
+                factory_proof_commands(issue.description or "")
+            )
+        if self._is_factory_profile(cfg) and normalize_state(issue.state) == "verify":
+            entry.factory_verification_baseline = factory_verification_text(
+                issue.description or ""
+            )
+            entry.factory_verify_started_at = datetime.now(timezone.utc).timestamp()
+
+    async def _enforce_factory_exit_contract(
+        self, cfg: ServiceConfig, entry: RunningEntry
+    ) -> bool:
+        """Use the same gate when a worker exit/reconcile skips the phase loop."""
+        producing = normalize_state(entry.state_at_turn_start)
+        if not self._is_factory_profile(cfg) or producing not in {"build", "verify"}:
+            return True
+        latest = await self._refresh_issue_full(cfg, entry.issue.id)
+        if latest is not None:
+            entry.issue = latest
+        current = normalize_state(entry.issue.state)
+        if current == producing or _is_rewind_transition(
+            producing, current, cfg.tracker.active_states
+        ):
+            return True
+        outcome = await self._enforce_stage_contract(
+            cfg=cfg,
+            running_issue_id=entry.issue.id,
+            issue=entry.issue,
+            producing_state=producing,
+            producing_state_raw=_canonical_state_label(cfg, producing),
+            current_state=current,
+            workspace_path=entry.workspace_path,
+            known_app_release=entry.known_app_release,
+            running_entry=entry,
+        )
+        entry.issue = outcome.issue
+        return not outcome.rewound
 
     def _record_token_attention_for_turn(
         self, entry: RunningEntry, cfg: ServiceConfig | None
@@ -7175,8 +7371,9 @@ class Orchestrator:
         # method gates the move into Done from the worker loop
         # (`attempt._post_turn_refresh`), where terminal transitions never
         # reach this phase handler.
-        if not is_rewind and cfg.agent.stage_contracts_enabled(
-            cfg.tracker.active_states
+        if not is_rewind and (
+            self._is_factory_profile(cfg)
+            or cfg.agent.stage_contracts_enabled(cfg.tracker.active_states)
         ):
             outcome = await self._enforce_stage_contract(
                 cfg=cfg,
@@ -7269,33 +7466,6 @@ class Orchestrator:
             running_entry.turn_id = None
             running_entry.resume_session_id = None
             running_entry.last_completed_turn_event = 0
-            # New backend session reports absolute token
-            # totals from 0; the high-water marks below
-            # MUST reset or `_apply_token_totals` computes
-            # `max(new - old_high, 0) = 0` and silently
-            # drops every token from the new phase until
-            # the cumulative count overtakes the old mark.
-            # Cumulative `codex_*_tokens` are NOT reset;
-            # state-local totals reset so
-            # max_total_tokens_by_state is measured per
-            # stage, not against ticket lifetime usage.
-            running_entry.last_reported_input_tokens = 0
-            running_entry.last_reported_cache_input_tokens = 0
-            running_entry.last_reported_output_tokens = 0
-            running_entry.last_reported_total_tokens = 0
-            running_entry.codex_state_input_tokens = 0
-            running_entry.codex_state_cache_input_tokens = 0
-            running_entry.codex_state_output_tokens = 0
-            running_entry.codex_state_total_tokens = 0
-            # Per-stage EMA window restarts with the
-            # new state so first-turn cost in the new
-            # stage isn't inflated by the prior
-            # stage's cumulative total.
-            running_entry.last_ema_state_total_tokens = 0
-            running_entry.hit_token_budget = False
-            running_entry.token_budget_cap = 0
-            debug.state_turn_state = current_state
-            debug.state_turn_count = 0
         return _AgentPhaseTransition(
             state=_AgentPhaseState(
                 issue=issue,
@@ -7319,6 +7489,7 @@ class Orchestrator:
         current_state: str,
         workspace_path: Path,
         known_app_release: bool,
+        running_entry: RunningEntry | None = None,
     ) -> _StageContractOutcome:
         """Evaluate the producing lane's stage contract after a forward move.
 
@@ -7336,7 +7507,10 @@ class Orchestrator:
             producing_state_raw = _canonical_state_label(cfg, producing_state)
         # The deep preset carries its own contract set (vault files +
         # verdict lines); anything else gets the default section set.
-        lane_preset = guess_lane_preset(cfg.tracker.active_states)
+        factory = self._is_factory_profile(cfg)
+        lane_preset = (
+            "factory" if factory else guess_lane_preset(cfg.tracker.active_states)
+        )
         if producing_state not in contract_producing_states(lane_preset):
             return _StageContractOutcome(
                 issue=issue,
@@ -7351,6 +7525,7 @@ class Orchestrator:
         # tests/test_orchestrator_contract_integration.py for the
         # regression the v0.6.7 release surfaced.
         refreshed_for_contract = await self._refresh_issue_full(cfg, running_issue_id)
+        authority_entry = running_entry or self._running.get(running_issue_id)
         if refreshed_for_contract is not None:
             issue = refreshed_for_contract
             known_app_release = known_app_release or _has_app_release_label(issue)
@@ -7372,7 +7547,57 @@ class Orchestrator:
             request=issue.request,
             advanced_state=current_state,
             app_release=known_app_release,
+            profile="factory" if factory else "advanced",
         )
+        if (
+            factory
+            and current_state in {"verify", "done", "completed"}
+            and authority_entry is not None
+        ):
+            if (
+                authority_entry.factory_declared_proof is not None
+                and tuple(factory_proof_commands(issue.description or ""))
+                != authority_entry.factory_declared_proof
+            ):
+                contract = _build_result(
+                    producing_state,
+                    list(contract.missing)
+                    + [
+                        "declared proof commands changed after this worker started; preserve the approved proof"
+                    ],
+                )
+        if factory and _is_successful_terminal_state(current_state):
+            missing = list(contract.missing)
+            if refreshed_for_contract is None:
+                missing.append("the authoritative full ticket could not be refreshed")
+            if producing_state == "verify":
+                if (
+                    authority_entry is None
+                    or not authority_entry.factory_verify_completed
+                ):
+                    missing.append("Done requires a completed independent Verify turn")
+                elif (
+                    factory_verification_text(issue.description or "")
+                    == authority_entry.factory_verification_baseline
+                ):
+                    missing.append(
+                        "Verification is unchanged from before this Verify phase; record fresh output and a UTC timestamp"
+                    )
+                browser = factory_browser_required(
+                    issue.description or "", issue.skills
+                ) or bool(authority_entry and authority_entry.factory_browser_required)
+                if browser:
+                    missing.extend(
+                        factory_browser_failures(
+                            issue.description or "",
+                            workspace_path,
+                            authority_entry.factory_verify_started_at
+                            if authority_entry
+                            else 0.0,
+                        )
+                    )
+            if missing:
+                contract = _build_result(producing_state, missing)
         if not contract.passed:
             log.warning(
                 "stage_contract_failed",
@@ -7438,6 +7663,26 @@ class Orchestrator:
             rewound=False,
         )
 
+    @staticmethod
+    def _reset_phase_accounting(
+        entry: RunningEntry, state: str, debug: _IssueDebug
+    ) -> None:
+        """Start one backend phase without erasing ticket-lifetime totals."""
+        entry.last_reported_input_tokens = 0
+        entry.last_reported_cache_input_tokens = 0
+        entry.last_reported_output_tokens = 0
+        entry.last_reported_total_tokens = 0
+        entry.codex_state_input_tokens = 0
+        entry.codex_state_cache_input_tokens = 0
+        entry.codex_state_output_tokens = 0
+        entry.codex_state_total_tokens = 0
+        entry.last_ema_state_total_tokens = 0
+        entry.hit_token_budget = False
+        entry.token_budget_cap = 0
+        entry.state_at_turn_start = normalize_state(state)
+        debug.state_turn_state = normalize_state(state)
+        debug.state_turn_count = 0
+
     async def _rebuild_backend_for_phase(
         self,
         *,
@@ -7454,10 +7699,8 @@ class Orchestrator:
         """Tear down `old_client` and rebuild a fresh-context backend.
 
         Returns `(new_client, new_first_prompt)` so the worker loop can
-        rebind both. The caller is responsible for resetting bookkeeping
-        on `RunningEntry` (session_id, token high-water marks, etc.) —
-        keeping that here would couple this helper to the running-state
-        dict and hurt testability.
+        rebind both. Phase-local usage resets before the new backend can
+        emit startup telemetry; ticket-lifetime counters are preserved.
         """
         try:
             await old_client.stop()
@@ -7484,6 +7727,11 @@ class Orchestrator:
             raise
         else:
             self._sync_backend_agent_pid(running_issue_id, None)
+        running = self._running.get(running_issue_id)
+        if running is not None:
+            debug = self._issue_debug.setdefault(running_issue_id, _IssueDebug())
+            self._reset_phase_accounting(running, issue.state, debug)
+            self._start_factory_verify_phase(cfg, issue, running)
         tools: list[Any] = []
         if cfg.tracker.kind == "linear" and cfg.agent.kind == "codex":
             tools.append(linear_graphql_tool())
@@ -7529,7 +7777,7 @@ class Orchestrator:
                 )
             await new_client.initialize()
             skill_context = await asyncio.to_thread(
-                render_skill_block, cfg.workflow_path.parent, issue.skills
+                self._render_stage_skills, cfg, issue, workspace_path
             )
             board_health = ""
             if self._board_health_wanted(issue.state):
@@ -7552,7 +7800,7 @@ class Orchestrator:
                     _parse_findings_rows(issue.description) if is_rewind else None
                 ),
                 compact_issue_context=cfg.agent.compact_issue_context,
-                full_ticket_path=self._ticket_prompt_path(cfg, issue),
+                full_ticket_path=self._ticket_prompt_path(cfg, issue, workspace_path),
                 artifacts_dir=self._prompt_artifacts_dir(cfg),
                 extra_context=skill_context,
                 board_health=board_health,
@@ -7927,7 +8175,7 @@ class Orchestrator:
     def _token_cap_for_entry(cfg: ServiceConfig | None, entry: RunningEntry) -> int:
         if cfg is None:
             return 0
-        state = normalize_state(entry.issue.state)
+        state = normalize_state(entry.state_at_turn_start or entry.issue.state)
         by_state = cfg.agent.max_total_tokens_by_state
         cap = by_state.get(state)
         if cap is None and state == "learn":
@@ -8080,6 +8328,7 @@ class Orchestrator:
         # record the reason so the operator finds out without log-diving.
         cfg = self._workflow_state.current()
         cap = self._token_cap_for_entry(cfg, entry)
+        budget_state = entry.state_at_turn_start or entry.issue.state
         if (
             cap > 0
             and entry.cancelled_at is None
@@ -8092,12 +8341,12 @@ class Orchestrator:
                 state_total_tokens=entry.codex_state_total_tokens,
                 total_tokens=entry.codex_total_tokens,
                 cap=cap,
-                state=entry.issue.state,
+                state=budget_state,
             )
             debug = self._issue_debug.setdefault(issue_id, _IssueDebug())
             debug.last_error = (
                 f"token budget exceeded "
-                f"({entry.codex_state_total_tokens}/{cap} in {entry.issue.state}) "
+                f"({entry.codex_state_total_tokens}/{cap} in {budget_state}) "
                 "— worker cancelled"
             )
             entry.hit_token_budget = True
@@ -9305,6 +9554,11 @@ class Orchestrator:
                     terminal_age_s=round(terminal_age, 1),
                 )
                 return
+            if not await self._enforce_factory_exit_contract(cfg, entry):
+                entry.terminal_seen_at = None
+                return
+            issue = entry.issue
+            state = normalize_state(issue.state)
             log.info(
                 "reconcile_terminate_terminal",
                 issue_id=issue.id,
@@ -9334,7 +9588,7 @@ class Orchestrator:
                         # Snapshot before remove — `git worktree remove
                         # --force` would otherwise discard whatever the
                         # agent left uncommitted in the worktree.
-                        await commit_workspace_on_done(
+                        outcome = await commit_workspace_on_done(
                             entry.workspace_path,
                             identifier=entry.issue.identifier,
                             title=entry.issue.title,
@@ -9342,6 +9596,11 @@ class Orchestrator:
                             state=issue.state,
                             extra_excludes=self._artifact_commit_excludes(cfg),
                         )
+                        if not outcome.durable:
+                            entry.issue = await self._preserve_history_failure(
+                                cfg, entry.issue, entry.workspace_path, outcome
+                            )
+                            return
                     if release_evidence_only:
                         if entry.known_app_release_finalizer:
                             try:
@@ -9462,7 +9721,7 @@ class Orchestrator:
                 entry.workspace_cleanup_started = True
                 try:
                     if cfg.agent.auto_commit_on_done:
-                        await commit_workspace_on_done(
+                        outcome = await commit_workspace_on_done(
                             entry.workspace_path,
                             identifier=entry.issue.identifier,
                             title=entry.issue.title,
@@ -9470,6 +9729,11 @@ class Orchestrator:
                             state=issue.state,
                             extra_excludes=self._artifact_commit_excludes(cfg),
                         )
+                        if not outcome.durable:
+                            entry.issue = await self._preserve_history_failure(
+                                cfg, entry.issue, entry.workspace_path, outcome
+                            )
+                            return
                     await self._workspace_manager.remove(entry.workspace_path)
                 finally:
                     entry.workspace_cleanup_finished.set()
@@ -9855,6 +10119,8 @@ class Orchestrator:
         if self._workspace_manager is None:
             return
         for issue in terminals:
+            if issue.id in self._paused_issue_ids:
+                continue
             (
                 issue,
                 release_evidence_only,
@@ -9896,13 +10162,16 @@ class Orchestrator:
                         if release_stopped:
                             continue
                         if cfg.agent.auto_commit_on_done:
-                            await commit_workspace_on_done(
+                            outcome = await commit_workspace_on_done(
                                 path,
                                 identifier=issue.identifier,
                                 title=issue.title,
                                 exit_reason="startup_release_evidence_cleanup",
                                 state=issue.state,
                             )
+                            if not outcome.durable:
+                                await self._preserve_history_failure(cfg, issue, path, outcome)
+                                continue
                         await self._workspace_manager.remove(path)
                     finally:
                         try:
@@ -9940,6 +10209,18 @@ class Orchestrator:
                             target_branch=cfg.agent.auto_merge_target_branch,
                         )
                     if already_merged:
+                        status = await asyncio.to_thread(_worktree_status_snapshot, path)
+                        if status is None or status:
+                            detail = (
+                                "Startup cleanup could not inspect Git worktree status."
+                                if status is None
+                                else "Startup cleanup found unrecorded work despite merged branch ancestry: "
+                                + ", ".join(status)
+                            )
+                            await self._preserve_history_failure(
+                                cfg, issue, path, CommitOutcome(COMMIT_FAILED, detail=detail)
+                            )
+                            continue
                         log.info(
                             "startup_terminal_cleanup_skipped_already_merged",
                             identifier=issue.identifier,
@@ -9982,11 +10263,14 @@ class Orchestrator:
                     # hold the last in-progress changes the agent never got
                     # to commit. Snapshot before remove so a force-prune
                     # doesn't lose them.
-                    await commit_workspace_on_done(
+                    outcome = await commit_workspace_on_done(
                         path,
                         identifier=issue.identifier,
                         title=issue.title,
                         exit_reason="startup_terminal_cleanup",
                         state=issue.state,
                     )
+                    if not outcome.durable:
+                        await self._preserve_history_failure(cfg, issue, path, outcome)
+                        continue
                 await self._workspace_manager.remove(path)

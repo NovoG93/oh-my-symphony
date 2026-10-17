@@ -146,7 +146,7 @@ def _sandbox_uses_workspace_write(*values: Any) -> bool:
 
 
 def _scan_workspace_symlinks(*roots: Path) -> list[str]:
-    """Return realpath targets of top-level symlinks AND git-worktree gitdirs.
+    """Return targets of top-level symlinks/junctions and git-worktree gitdirs.
 
     Codex with ``sandbox_mode=workspace-write`` resolves paths via realpath
     and refuses to write through paths whose target falls outside the
@@ -188,7 +188,7 @@ def _scan_workspace_symlinks(*roots: Path) -> list[str]:
         except (OSError, FileNotFoundError):
             continue
         for entry in entries:
-            if not entry.is_symlink():
+            if not (entry.is_symlink() or entry.is_junction()):
                 continue
             try:
                 target = entry.resolve(strict=False)
@@ -221,7 +221,12 @@ def _inject_writable_roots(command: str, writable_roots: Sequence[str]) -> str:
         return command
     leading_ws = command[: len(command) - len(stripped)]
     rest = stripped[len("codex"):]
-    roots_toml = json.dumps(list(writable_roots), separators=(",", ":"))
+    # Git Bash's native Windows argv bridge corrupts escaped path backslashes.
+    command_roots = (
+        [root.replace("\\", "/") for root in writable_roots]
+        if os.name == "nt" else list(writable_roots)
+    )
+    roots_toml = json.dumps(command_roots, separators=(",", ":"))
     config_arg = shlex.quote(f"sandbox_workspace_write.writable_roots={roots_toml}")
     return (
         f"{leading_ws}codex -c {config_arg}{rest}"
