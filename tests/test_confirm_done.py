@@ -126,6 +126,7 @@ async def test_confirm_done_merge_failure_reports_blocked(handoff):
     assert [c.args[2] for c in h.notify.call_args_list] == ["Blocked"]
 
 
+@pytest.mark.timing
 async def test_confirm_done_renews_lease_during_slow_delivery(handoff, monkeypatch):
     h = handoff
     cfg = replace(h.cfg, poll_interval_ms=10)
