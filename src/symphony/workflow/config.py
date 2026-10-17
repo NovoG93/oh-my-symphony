@@ -1,7 +1,7 @@
 """SPEC §4.1.3, §6.4 — frozen typed config view exposed to the orchestrator.
 
-Every field a long-running workflow can carry — tracker, hooks, the four
-backend kinds, TUI/server/progress/system/wiki extras, prompt template
+Every field a long-running workflow can carry — tracker, hooks, backend
+kind configs, TUI/server/progress/system/wiki extras, prompt template
 overrides — lives here as a `@dataclass(frozen=True)` value type. The
 builder (`build_service_config`) is the only writer; the orchestrator and
 TUI only read.
@@ -18,17 +18,37 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from ..errors import ConfigValidationError
 from ..notifications import NotificationsConfig
 from .coercion import _normalize_state_key
 from .constants import (
+    DEFAULT_AGY_COMMAND,
+    DEFAULT_AUTO_RECOVER_BLOCKED,
     DEFAULT_AUTO_MERGE_EXCLUDE_PATHS,
+    DEFAULT_BACKEND_READ_TIMEOUT_MS,
+    DEFAULT_BACKEND_STALL_TIMEOUT_MS,
+    DEFAULT_BACKEND_TURN_TIMEOUT_MS,
+    CI_MODE_READINESS,
+    DEFAULT_CI_INTERVAL_MS,
+    DEFAULT_CI_MAX_IMPROVEMENT_TICKETS_PER_RUN,
+    DEFAULT_CI_MAX_TICKETS_PER_RUN,
+    DEFAULT_CI_MAX_TURNS,
+    DEFAULT_CI_MODE_INTERVAL_HOURS,
+    DEFAULT_CI_TICKET_PREFIX,
     DEFAULT_CODEX_MODEL,
     DEFAULT_CODEX_REASONING_EFFORT,
+    DEFAULT_KIRO_COMMAND,
     DEFAULT_MAX_ATTEMPTS,
+    DEFAULT_MAX_REOPENS,
     DEFAULT_MAX_RETRIES,
+    DEFAULT_MAX_STATE_TURNS,
     DEFAULT_MAX_TOTAL_TURNS,
+    DEFAULT_OPENCODE_COMMAND,
+    DEFAULT_PRIME_AGENT_COMMAND,
     DEFAULT_WORKSPACE_REUSE_POLICY,
+    SUPPORTED_CI_MODES,
 )
+from .presets import board_uses_shipped_contracts
 
 
 @dataclass(frozen=True)
@@ -58,6 +78,9 @@ class TrackerConfig:
     # ignore this field. Defaults to empty so existing callers stay
     # source-compatible.
     email: str = ""
+    # Timeout used by Jira/Linear HTTP clients for each network operation.
+    # File tracker ignores this field.
+    network_timeout_seconds: float = 30.0
 
 
 @dataclass(frozen=True)
@@ -74,6 +97,9 @@ class HooksConfig:
     # None preserves legacy behaviour and keeps existing positional
     # `HooksConfig(...)` callers source-compatible.
     after_done: str | None = None
+    # Doctor warning patterns are advisory by default. Workflows that treat
+    # setup masking as release-blocking can opt into a fatal doctor result.
+    fail_on_warning_patterns: bool = False
 
 
 @dataclass(frozen=True)
@@ -84,8 +110,20 @@ class AgentConfig:
     max_retry_backoff_ms: int
     max_concurrent_agents_by_state: dict[str, int]
     max_total_turns: int = DEFAULT_MAX_TOTAL_TURNS
-    # Soft cap for Review/QA rewinds back into In Progress. 0 disables.
+    max_state_turns: int = DEFAULT_MAX_STATE_TURNS
+    max_state_turns_by_state: dict[str, int] = field(default_factory=dict)
+    no_stage_change_action: str = "block"
+    # Soft cap for Verify/Document rewinds back into In Progress. 0 disables.
     max_attempts: int = DEFAULT_MAX_ATTEMPTS
+    # Cap on how many times one ticket may be dispatched again after it
+    # already reached Done (deep preset: Verify RED / QA BLOCKED reopen a
+    # merged Build slice; any board: an operator moves a Done card back).
+    # Each reopen is a fresh run, so `max_attempts` never sees it. On the
+    # (max_reopens+1)th reopen the orchestrator appends `## Reopen Budget`
+    # and moves the ticket to Blocked instead of dispatching another cycle;
+    # a `## Reopen Approved` section on the ticket extends the budget by
+    # one. 0 disables.
+    max_reopens: int = DEFAULT_MAX_REOPENS
     # Cap on auto-retries scheduled after a worker exits with a non-normal
     # outcome (timeout, crash, transient backend error). On exhaustion the
     # orchestrator stops scheduling further retries, appends an
@@ -94,9 +132,24 @@ class AgentConfig:
     # default) so it surfaces on the board instead of looping silently.
     # 0 disables the cap (legacy behaviour: retry forever with backoff).
     max_retries: int = DEFAULT_MAX_RETRIES
-    # File-board optimization: actionable Todo tickets can be routed to Explore
-    # by the orchestrator without spending a model turn on one-line triage.
+    # File-board optimization: actionable Todo tickets can be routed to
+    # In Progress without spending a model turn on one-line triage.
     auto_triage_actionable_todo: bool = True
+    # Self-healing path for failed terminal blockers. When a ticket lands in
+    # Blocked, the orchestrator opens one FIX ticket that can clarify/fix/prove the
+    # root cause before the source returns to the active workflow.
+    auto_recover_blocked: bool = DEFAULT_AUTO_RECOVER_BLOCKED
+    # Render first-turn prompts with state-relevant ticket context instead
+    # of the whole accumulating Markdown body. Workflows can opt out when a
+    # custom ticket format needs full raw history in every worker prompt.
+    compact_issue_context: bool = True
+    # Resume an interrupted ticket from its latest completed-turn checkpoint.
+    # Set false to preserve fresh-session dispatch after service/host restarts.
+    crash_continuation: bool = True
+    # Candidate ordering policy. "fifo" preserves stable registration order;
+    # "dag" adds declared priority and downstream critical-path depth while
+    # keeping starvation recovery ahead of both.
+    scheduling_policy: str = "fifo"
     # When a ticket reaches the Done state cleanly, snapshot the workspace
     # into a single git commit (`git init` if no enclosing repo found).
     # Default ON so a fresh `pip install oh-my-symphony` plus a
@@ -114,6 +167,12 @@ class AgentConfig:
     # changes or any git error skips the merge and logs an event — no
     # exception propagates.
     auto_merge_on_done: bool = True
+    # When true (the default), a successful terminal merge is pushed to the
+    # target branch's configured upstream and verified with `git ls-remote`.
+    # Set false for an explicitly local-only merge gate: the host still
+    # performs the same safety checks and `git merge --no-ff`, but never
+    # contacts a remote. This is useful for disposable/local release runs.
+    auto_merge_push_target: bool = True
     # Target branch in the host repo. Empty string ("") = use whatever
     # branch is currently checked out in the host repo at fire time.
     auto_merge_target_branch: str = ""
@@ -152,6 +211,9 @@ class AgentConfig:
     # Optional per-state override for `max_total_tokens`. Keys are state
     # names lowercased by the parser, e.g. "review" or "in progress".
     max_total_tokens_by_state: dict[str, int] = field(default_factory=dict)
+    # Attention-only per-state token thresholds. These never cancel or block
+    # workers; they only surface unusually large turns to operators.
+    token_attention_threshold_by_state: dict[str, int] = field(default_factory=dict)
     # Target tracker state to transition the ticket to when
     # `max_total_turns` is exhausted. Empty string (default, legacy) =
     # no transition; the in-memory `_turn_budget_exhausted` guard alone
@@ -162,6 +224,70 @@ class AgentConfig:
     # decision survives restart and reaches operators reviewing the
     # board. Must match a state your tracker.kind backend can write to.
     budget_exhausted_state: str = ""
+    # Optional per-state backend routing. Keys are tracker state names
+    # lowercased by the parser (e.g. "research"), values are supported
+    # agent kinds. Lets cheap/fast agents own light lanes (Research,
+    # Document) while a strong default handles heavy ones (Plan, Build,
+    # Review). Resolution order at dispatch: explicit dispatch arg >
+    # per-ticket `agent_kind` frontmatter pin > this map > `kind`.
+    stage_kinds: dict[str, str] = field(default_factory=dict)
+    # Backends to fall back to, in order, when a worker exits on a quota /
+    # usage-limit error (not a transient rate limit, which retries on the
+    # same backend). The orchestrator pins the next untried kind onto the
+    # ticket (file boards: `agent.kind` frontmatter), appends
+    # `## Backend Fallback`, and retries instead of auto-pausing. Empty
+    # keeps the pause-for-operator behaviour.
+    fallback_kinds: tuple[str, ...] = ()
+    # Whether the shipped stage-contract validator (the mechanical evidence
+    # floor in `orchestrator/contracts.py`) runs on this board.
+    #   "auto" (default) — on when every active lane is a default-preset lane
+    #                      (Todo / In Progress / Verify / Document, plus the
+    #                      legacy `Learn`), off otherwise. Renaming a lane
+    #                      therefore disables it — which is why the decision
+    #                      is logged, reported by doctor and exposed on the
+    #                      workflow API instead of being silent.
+    #   "on"            — always enforce, whatever the lanes are called.
+    #   "off"           — never enforce; the prompts are the only gate.
+    stage_contracts: str = "auto"
+    # Optional per-state stall budget, in milliseconds. Keys are tracker
+    # state names lowercased by the parser (e.g. "verify"). Heavy lanes
+    # (a Verify that runs a full suite, a Build that compiles) can legally
+    # go quiet far longer than a light lane; without this the operator has
+    # to raise the *backend's* stall_timeout_ms for every lane at once.
+    # Falls back to the resolved backend's `stall_timeout_ms`.
+    stall_timeout_ms_by_state: dict[str, int] = field(default_factory=dict)
+
+    def stage_contracts_enabled(self, active_states: "tuple[str, ...]") -> bool:
+        """Resolve `agent.stage_contracts` against the board's lanes."""
+        mode = (self.stage_contracts or "auto").strip().lower()
+        if mode == "on":
+            return True
+        if mode == "off":
+            return False
+        return board_uses_shipped_contracts(active_states)
+
+    def stall_timeout_ms_for_state(self, state: str | None, fallback: int) -> int:
+        """Per-state stall budget with fallback to the backend's value."""
+        value = self.stall_timeout_ms_by_state.get(_normalize_state_key(state or ""))
+        if value is None or value <= 0:
+            return fallback
+        return value
+
+    def kind_for_state(self, state: str | None, ticket_pin: str | None = None) -> str:
+        """Resolve the backend for a dispatch of a ticket in `state`.
+
+        Precedence: ticket pin (`agent_kind` frontmatter) > `stage_kinds`
+        entry for the ticket's state > workflow-level `kind`. Explicit
+        dispatch arguments outrank all three and are applied by callers
+        before reaching this helper.
+        """
+        pin = (ticket_pin or "").strip().lower()
+        if pin:
+            return pin
+        stage = self.stage_kinds.get(_normalize_state_key(state or ""))
+        if stage:
+            return stage
+        return self.kind
 
 
 @dataclass(frozen=True)
@@ -195,17 +321,81 @@ class ClaudeConfig:
 
 @dataclass(frozen=True)
 class GeminiConfig:
-    """`agent.kind: gemini` — driving Gemini CLI in JSON/session mode."""
+    """`agent.kind: gemini` — driving Gemini CLI as one plain-text turn."""
 
     command: str
     turn_timeout_ms: int
     read_timeout_ms: int
     stall_timeout_ms: int
-    # When True, turns 2+ within one worker attempt add `--resume <id>` so
-    # Gemini rejoins the session UUID minted at start_session. Cross-attempt
-    # and cross-phase resume is intentionally not supported because those
-    # paths build a new backend instance.
+    # Retained for config compatibility. Current Gemini CLI releases expose no
+    # resume/session flag, so Symphony keeps the session id locally.
     resume_across_turns: bool = True
+
+
+@dataclass(frozen=True)
+class AgyConfig:
+    """`agent.kind: agy` — driving Antigravity CLI in print mode."""
+
+    command: str
+    turn_timeout_ms: int
+    read_timeout_ms: int
+    stall_timeout_ms: int
+    resume_across_turns: bool = False
+
+
+def _default_agy_config() -> AgyConfig:
+    return AgyConfig(
+        command=DEFAULT_AGY_COMMAND,
+        turn_timeout_ms=DEFAULT_BACKEND_TURN_TIMEOUT_MS,
+        read_timeout_ms=DEFAULT_BACKEND_READ_TIMEOUT_MS,
+        stall_timeout_ms=DEFAULT_BACKEND_STALL_TIMEOUT_MS,
+        resume_across_turns=False,
+    )
+
+
+@dataclass(frozen=True)
+class KiroConfig:
+    """`agent.kind: kiro` — driving Kiro CLI in noninteractive chat mode."""
+
+    command: str
+    turn_timeout_ms: int
+    read_timeout_ms: int
+    stall_timeout_ms: int
+    resume_across_turns: bool = True
+
+
+def _default_kiro_config() -> KiroConfig:
+    return KiroConfig(
+        command=DEFAULT_KIRO_COMMAND,
+        turn_timeout_ms=DEFAULT_BACKEND_TURN_TIMEOUT_MS,
+        read_timeout_ms=DEFAULT_BACKEND_READ_TIMEOUT_MS,
+        stall_timeout_ms=DEFAULT_BACKEND_STALL_TIMEOUT_MS,
+        resume_across_turns=True,
+    )
+
+
+@dataclass(frozen=True)
+class OpenCodeConfig:
+    """`agent.kind: opencode` — driving OpenCode CLI run/json mode."""
+
+    command: str
+    turn_timeout_ms: int
+    read_timeout_ms: int
+    stall_timeout_ms: int
+    # When True, turns 2+ add `--session <id>` after OpenCode reports an
+    # actual session id in JSON output. Before then, continuations run fresh
+    # rather than inventing an OpenCode-owned id.
+    resume_across_turns: bool = True
+
+
+def _default_opencode_config() -> OpenCodeConfig:
+    return OpenCodeConfig(
+        command=DEFAULT_OPENCODE_COMMAND,
+        turn_timeout_ms=DEFAULT_BACKEND_TURN_TIMEOUT_MS,
+        read_timeout_ms=DEFAULT_BACKEND_READ_TIMEOUT_MS,
+        stall_timeout_ms=DEFAULT_BACKEND_STALL_TIMEOUT_MS,
+        resume_across_turns=True,
+    )
 
 
 @dataclass(frozen=True)
@@ -223,10 +413,104 @@ class PiConfig:
 
 
 @dataclass(frozen=True)
+class PrimeAgentConfig:
+    """`agent.kind: prime-agent` — driving the Prime Agent CLI in print/json mode.
+
+    Same JSON protocol as Pi; uses ``--resume <id>`` instead of ``--session <id>``.
+    """
+
+    command: str
+    turn_timeout_ms: int
+    read_timeout_ms: int
+    stall_timeout_ms: int
+    resume_across_turns: bool
+
+
+def _default_prime_agent_config() -> PrimeAgentConfig:
+    return PrimeAgentConfig(
+        command=DEFAULT_PRIME_AGENT_COMMAND,
+        turn_timeout_ms=DEFAULT_BACKEND_TURN_TIMEOUT_MS,
+        read_timeout_ms=DEFAULT_BACKEND_READ_TIMEOUT_MS,
+        stall_timeout_ms=DEFAULT_BACKEND_STALL_TIMEOUT_MS,
+        resume_across_turns=True,
+    )
+
+
+@dataclass(frozen=True)
 class ServerConfig:
     """§13.7 optional HTTP extension."""
 
     port: int | None
+
+
+@dataclass(frozen=True)
+class PreviewConfig:
+    """Trusted, loopback-only product preview configured in WORKFLOW.md."""
+
+    enabled: bool = False
+    command: str = ""
+    cwd: str = "."
+    health_path: str = "/"
+    url_path: str = "/"
+    startup_timeout_ms: int = 30_000
+    release_ticket: str = ""
+    acceptance: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
+class ArtifactsConfig:
+    """Ticket artifact collection configured in WORKFLOW.md.
+
+    Workers drop deliverable files into `dir` inside their workspace; the
+    orchestrator copies new files into the host-owned store under
+    `.symphony/artifacts/<TICKET-ID>/` after each completed turn. On by
+    default because collection is a no-op until a worker creates the
+    directory. `ttl_days: 0` disables the off-board sweep entirely.
+    `require_for_done` extends the Done stage contract: tickets cannot land
+    in Done without at least one collected artifact.
+    """
+
+    enabled: bool = True
+    dir: str = ".symphony-artifacts"  # keep in sync with artifacts.DEFAULT_MAGIC_DIR
+    max_file_mb: int = 25
+    max_ticket_mb: int = 200
+    ttl_days: int = 30
+    require_for_done: bool = False
+
+
+@dataclass(frozen=True)
+class ManualVerificationProcedure:
+    instructions: str
+    report: str = "required"
+    artifacts: str = "optional"
+    label: str | None = None
+
+
+@dataclass(frozen=True)
+class PmConfig:
+    """Default-off Human-Readable PM Workspace capabilities and hard limits."""
+
+    authoring: bool = False
+    exchange: bool = False
+    assistance: bool = False
+    handoff: bool = False
+    openspec_executable: str | None = None
+    planning_workspace_root: Path | None = None
+    max_encoded_upload_mb: int = 8
+    max_workbook_mb: int = 5
+    max_uncompressed_mb: int = 50
+    max_zip_entries: int = 1_000
+    max_nodes: int = 5_000
+    max_edges: int = 20_000
+    max_text_chars: int = 16_384
+    operation_timeout_ms: int = 30_000
+    exchange_concurrency: int = 1
+    verification_procedures: dict[str, tuple[str, ...]] = field(default_factory=dict)
+    manual_verification_procedures: dict[str, ManualVerificationProcedure] = field(default_factory=dict)
+
+    @property
+    def enabled(self) -> bool:
+        return any((self.authoring, self.exchange, self.assistance, self.handoff))
 
 
 @dataclass(frozen=True)
@@ -309,6 +593,63 @@ class PromptConfig:
 
 
 @dataclass(frozen=True)
+class ContinuousImprovementConfig:
+    """Default-off heartbeat that periodically runs product-readiness checks.
+
+    Missing `continuous_improvement:` in WORKFLOW.md means disabled with all
+    defaults below. Only `enabled`, `interval_ms`, `max_turns`, `modes`, and
+    `agent_kind` are settable through the mutation API
+    (`set_continuous_improvement_settings`); the remaining fields are
+    parse-only from WORKFLOW.md.
+    """
+
+    enabled: bool = False
+    # Minimum enforced by the parser is DEFAULT_CI_MIN_INTERVAL_MS (1 minute).
+    interval_ms: int = DEFAULT_CI_INTERVAL_MS
+    # 0 means unlimited.
+    max_turns: int = DEFAULT_CI_MAX_TURNS
+    ticket_prefix: str = DEFAULT_CI_TICKET_PREFIX
+    max_tickets_per_run: int = DEFAULT_CI_MAX_TICKETS_PER_RUN
+    require_idle_board: bool = True
+    # Agent backend that will run the tickets this heartbeat creates,
+    # stamped per-ticket via the existing per-ticket agent_kind override.
+    # "" (default) inherits whatever `agent.kind` the workflow is already
+    # configured with.
+    agent_kind: str = ""
+    # Experimental improvement modes (SUPPORTED_CI_MODES). Empty means
+    # "readiness only", which is exactly what `enabled: true` did before
+    # modes existed — see `resolved_modes`.
+    modes: tuple[str, ...] = ()
+    # Per-mode cadence floor in hours, overriding
+    # DEFAULT_CI_MODE_INTERVAL_HOURS. 0 = run on every due heartbeat.
+    mode_interval_hours: dict[str, float] = field(default_factory=dict)
+    # Cap on proposal tickets (triage/agent modes) filed by a single run.
+    max_improvement_tickets_per_run: int = (
+        DEFAULT_CI_MAX_IMPROVEMENT_TICKETS_PER_RUN
+    )
+
+    def resolved_modes(self) -> tuple[str, ...]:
+        """Modes this heartbeat should consider, in canonical order.
+
+        Disabled means nothing runs. Enabled with no explicit `modes:`
+        preserves the pre-modes behaviour (readiness only).
+        """
+        if not self.enabled:
+            return ()
+        if not self.modes:
+            return (CI_MODE_READINESS,)
+        return tuple(m for m in SUPPORTED_CI_MODES if m in self.modes)
+
+    def interval_hours_for(self, mode: str) -> float:
+        """Cadence floor for one mode: explicit override, else the default."""
+        override = self.mode_interval_hours.get(mode)
+        if override is None:
+            return DEFAULT_CI_MODE_INTERVAL_HOURS.get(mode, 0.0)
+        return float(override)
+
+
+
+@dataclass(frozen=True)
 class ServiceConfig:
     workflow_path: Path
     poll_interval_ms: int
@@ -321,15 +662,32 @@ class ServiceConfig:
     gemini: GeminiConfig
     pi: PiConfig
     server: ServerConfig
+    agy: AgyConfig = field(default_factory=_default_agy_config)
+    kiro: KiroConfig = field(default_factory=_default_kiro_config)
+    opencode: OpenCodeConfig = field(default_factory=_default_opencode_config)
     tui: TuiConfig = field(default_factory=TuiConfig)
     progress: ProgressConfig = field(default_factory=ProgressConfig)
     system: SystemConfig = field(default_factory=SystemConfig)
     prompts: PromptConfig = field(default_factory=PromptConfig)
     wiki: WikiConfig = field(default_factory=WikiConfig)
     notifications: NotificationsConfig = field(default_factory=NotificationsConfig)
+    continuous_improvement: ContinuousImprovementConfig = field(
+        default_factory=ContinuousImprovementConfig
+    )
     raw: dict[str, Any] = field(default_factory=dict)
     prompt_template: str = ""
     workspace_reuse_policy: str = DEFAULT_WORKSPACE_REUSE_POLICY
+    # Appended after the original fields so positional ServiceConfig callers
+    # keep receiving the same values as before Prime Agent was added.
+    prime_agent: PrimeAgentConfig = field(default_factory=_default_prime_agent_config)
+    # §13.8 Product Preview — off by default, keyword-only so existing
+    # positional ServiceConfig callers are unaffected.
+    preview: PreviewConfig = field(default_factory=PreviewConfig)
+    # Ticket artifact collection — appended after the original fields so
+    # positional ServiceConfig callers keep receiving the same values.
+    artifacts: ArtifactsConfig = field(default_factory=ArtifactsConfig)
+    # PM Workspace is appended to preserve positional ServiceConfig callers.
+    pm: PmConfig = field(default_factory=PmConfig)
 
     def prompt_template_for_state(self, state: str) -> str:
         """Return the runtime prompt template for one tracker state."""
@@ -361,8 +719,37 @@ class ServiceConfig:
                 self.pi.read_timeout_ms,
                 self.pi.stall_timeout_ms,
             )
-        return (
-            self.gemini.turn_timeout_ms,
-            self.gemini.read_timeout_ms,
-            self.gemini.stall_timeout_ms,
+        if kind == "prime-agent":
+            return (
+                self.prime_agent.turn_timeout_ms,
+                self.prime_agent.read_timeout_ms,
+                self.prime_agent.stall_timeout_ms,
+            )
+        if kind == "gemini":
+            return (
+                self.gemini.turn_timeout_ms,
+                self.gemini.read_timeout_ms,
+                self.gemini.stall_timeout_ms,
+            )
+        if kind == "agy":
+            return (
+                self.agy.turn_timeout_ms,
+                self.agy.read_timeout_ms,
+                self.agy.stall_timeout_ms,
+            )
+        if kind == "kiro":
+            return (
+                self.kiro.turn_timeout_ms,
+                self.kiro.read_timeout_ms,
+                self.kiro.stall_timeout_ms,
+            )
+        if kind == "opencode":
+            return (
+                self.opencode.turn_timeout_ms,
+                self.opencode.read_timeout_ms,
+                self.opencode.stall_timeout_ms,
+            )
+        raise ConfigValidationError(
+            "agent.kind must be one of agy, codex, claude, gemini, kiro, opencode, pi, prime-agent",
+            value=kind,
         )

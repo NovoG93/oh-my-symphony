@@ -21,6 +21,21 @@ from .config import ServiceConfig
 from .constants import SUPPORTED_TRACKER_KINDS
 
 
+def stage_turn_budget_error(config: ServiceConfig) -> str | None:
+    active_states = [state for state in config.tracker.active_states if state]
+    required_turns = len(active_states)
+    if required_turns <= 1:
+        return None
+    if config.agent.max_turns >= required_turns:
+        return None
+    states = ", ".join(active_states)
+    return (
+        f"agent.max_turns={config.agent.max_turns} cannot cover "
+        f"{required_turns} active states ({states}). Set agent.max_turns >= "
+        f"{required_turns}, or reduce active_states for a single-stage harness."
+    )
+
+
 def validate_for_dispatch(config: ServiceConfig) -> None:
     if not config.tracker.kind:
         raise UnsupportedTrackerKind("tracker.kind is required")
@@ -70,6 +85,15 @@ def validate_for_dispatch(config: ServiceConfig) -> None:
     elif kind == "gemini":
         if not config.gemini.command.strip():
             raise ConfigValidationError("gemini.command must be non-empty")
+    elif kind == "opencode":
+        if not config.opencode.command.strip():
+            raise ConfigValidationError("opencode.command must be non-empty")
     elif kind == "pi":
         if not config.pi.command.strip():
             raise ConfigValidationError("pi.command must be non-empty")
+    elif kind == "prime-agent":
+        if not config.prime_agent.command.strip():
+            raise ConfigValidationError("prime_agent.command must be non-empty")
+    budget_error = stage_turn_budget_error(config)
+    if budget_error is not None:
+        raise ConfigValidationError(budget_error)

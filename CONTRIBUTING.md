@@ -3,7 +3,7 @@
 Thanks for helping improve Symphony. This repo is public, and external pull
 requests are welcome.
 
-## Branch And PR Target
+## Branch and PR target
 
 - Open pull requests against `dev` unless a maintainer asks for a different
   target.
@@ -12,20 +12,23 @@ requests are welcome.
 - Prefer small, focused PRs. Separate backend behavior, UI, docs, and release
   metadata when they are not part of the same user-visible change.
 
-## Local Setup
+## Local setup
 
 ```bash
 python3 -m venv .venv
 source .venv/bin/activate
-pip install -e ".[dev]"
+python -m pip install -e ".[dev]"
 ```
 
-## Required Verification
+## Required verification
 
-Run the full test suite before opening or updating a PR:
+Run the full test suite and project checks after installing the development
+dependencies before opening or updating a PR:
 
 ```bash
-pytest -q
+python -m pytest -q
+python -m ruff check src tests
+symphony-pyright
 ```
 
 For workflow, service, or board changes, also run:
@@ -35,11 +38,27 @@ symphony doctor ./WORKFLOW.md
 ```
 
 For backend adapter changes, include the most relevant targeted test command
-and any manual smoke evidence. Real Codex, Claude Code, Gemini, and Pi CLI
+and manual smoke evidence. Real Codex, Claude Code, Gemini, and Pi CLI
 integration checks are useful when available, but CI only requires the local
 test suite because contributors may not have every agent CLI installed.
 
-## Development Standards
+### Windows note
+
+Some tooling that launches the venv through a trampoline (wrappers, hidden
+consoles) can receive stray console Ctrl+C broadcasts that kill a full
+`pytest` run mid-suite (typically at `shutdown_default_executor`). If a
+full-suite run dies partway with a `KeyboardInterrupt`, run it detached
+from any console instead:
+
+```pwsh
+# PowerShell, from the repo root
+$env:SYMPHONY_BROWSER_E2E = '1'   # optional: include Playwright browser e2e
+Start-Process -FilePath ".venv\Scripts\python.exe" `
+  -ArgumentList "-m pytest -q --junitxml=pytest-results.xml" `
+  -WorkingDirectory "." -WindowStyle Hidden
+```
+
+## Development standards
 
 - Keep agent-specific protocol details inside `src/symphony/backends/`.
   The orchestrator should see normalized backend events, not raw CLI payloads.
@@ -52,7 +71,7 @@ test suite because contributors may not have every agent CLI installed.
 - Update README or `docs/` when the user-facing behavior or operator workflow
   changes.
 
-## PR Checklist
+## PR checklist
 
 Before requesting review, make sure the PR includes:
 

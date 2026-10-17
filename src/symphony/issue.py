@@ -16,6 +16,15 @@ class BlockerRef:
 
 
 @dataclass(frozen=True)
+class PlanningRef:
+    change_id: str
+    task_id: str
+    task_revision: str
+    handoff_id: str
+    snapshot_id: str
+
+
+@dataclass(frozen=True)
 class Issue:
     id: str
     identifier: str
@@ -30,6 +39,15 @@ class Issue:
     created_at: datetime | None = None
     updated_at: datetime | None = None
     agent_kind: str | None = None
+    skills: tuple[str, ...] = field(default_factory=tuple)
+    request: str | None = None
+    # Audit-only record of the backend that last ran this ticket. NEVER read
+    # as a dispatch pin (`_requested_agent_kind` ignores it) — on a
+    # `stage_kinds`-routed board the pin field must stay empty or the first
+    # lane's backend would freeze for the whole ticket (F-20).
+    last_agent_kind: str | None = None
+    planning_ref: PlanningRef | None = None
+    planning_ref_state: str = "absent"
 
     def to_template_dict(self) -> dict[str, Any]:
         """§12.2 — convert keys to strings, preserve nested arrays/maps."""
@@ -50,6 +68,21 @@ class Issue:
             "created_at": self.created_at.isoformat() if self.created_at else None,
             "updated_at": self.updated_at.isoformat() if self.updated_at else None,
             "agent_kind": self.agent_kind or "",
+            "last_agent_kind": self.last_agent_kind or "",
+            "skills": list(self.skills),
+            "request": self.request or "",
+            "planning_ref": (
+                {
+                    "change_id": self.planning_ref.change_id,
+                    "task_id": self.planning_ref.task_id,
+                    "task_revision": self.planning_ref.task_revision,
+                    "handoff_id": self.planning_ref.handoff_id,
+                    "snapshot_id": self.planning_ref.snapshot_id,
+                }
+                if self.planning_ref
+                else None
+            ),
+            "planning_ref_state": self.planning_ref_state,
         }
 
 

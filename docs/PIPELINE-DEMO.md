@@ -1,87 +1,159 @@
 ---
 id: PIPELINE-DEMO
 identifier: PIPELINE-DEMO
-title: Reference ticket showing the Plan / Review / QA / Done shape
+title: Reference ticket showing the In Progress / Verify / Document / Done shape
 state: Done
 priority: 3
 labels:
 - demo
 - docs
 created_at: '2026-05-09T20:00:00Z'
-updated_at: '2026-05-09T20:00:00Z'
+updated_at: '2026-07-02T00:00:00Z'
 ---
 
-This ticket is a worked example. It illustrates the artefacts the agent
-should produce as it walks the production pipeline. Real tickets follow
-this same shape but with project-specific content.
+This ticket is a worked example. It illustrates the sections a completed
+four-stage Symphony ticket should leave behind.
 
 ## Plan
 
-- 작업 범위: `/api/v1/refresh` 엔드포인트의 응답 캐시 헤더를 `Cache-Control: no-store`로 변경.
-- 변경 파일: `src/symphony/server.py` (1 곳), `tests/test_server.py` (테스트 1건 추가).
-- 가장 먼저 추가할 실패 테스트: `test_refresh_sets_no_store_cache_header`.
+- Goal: make manual refresh responses bypass intermediary caches.
+- Before state: `/api/v1/refresh` can be stored briefly by a proxy.
+- After target: `/api/v1/refresh` always returns `Cache-Control: no-store`.
+- Change `/api/v1/refresh` responses from `Cache-Control: max-age=0` to
+  `Cache-Control: no-store`.
+- Touch only `src/symphony/server.py` and the focused server route test.
+- First failing test: `test_refresh_sets_no_store_cache_header`.
+
+## Acceptance Tests
+
+- `POST /api/v1/refresh` returns 200 with `Cache-Control: no-store` - prove
+  with curl output.
+- Existing refresh payload shape is unchanged - prove with focused route test.
+- No unrelated API route header changes - prove with reviewed diff.
+
+## Done Signals
+
+- Focused server route test passes.
+- Manual curl shows the new header.
+- Diff contains only the endpoint header change and its regression test.
+- Not proven: broader route-by-route cache policy.
 
 ## Implementation
 
-- `src/symphony/server.py:142` — `_handle_refresh()` 응답에 `Cache-Control: no-store` 헤더 추가.
-- `tests/test_server.py:88` — 응답 헤더를 검증하는 회귀 테스트 추가.
-- 그 외 변경 없음. 다른 핸들러는 영향받지 않도록 의도적으로 좁게 수정.
+- `src/symphony/server.py` - `_handle_refresh()` sets `Cache-Control:
+  no-store`.
+- `tests/test_server.py` - regression test asserts the response header.
+- `docs/PIPELINE-DEMO.md` - no runtime behavior; this file only demonstrates
+  the ticket body shape.
+
+## Self-Critique
+
+- The fix is intentionally narrow. It does not change `/api/v1/state`, which
+  may deserve a separate cache-policy ticket.
+- Header spelling is inline because the value has one use site.
+- Verify should focus on the real response header and confirm the payload did
+  not drift.
+
+## Security Audit
+
+| Area | Status | Evidence |
+| --- | --- | --- |
+| secrets | pass | `qa/security-audit.md` |
+| input-validation | pass | `qa/security-audit.md` |
+| injection | n/a | `qa/security-audit.md` |
+| xss | n/a | `qa/security-audit.md` |
+| csrf | n/a | `qa/security-audit.md` |
+| authz | pass | `qa/security-audit.md` |
+| rate-limit | n/a | `qa/security-audit.md` |
 
 ## Review
 
-- LOW | `src/symphony/server.py:142` | 헤더 키를 상수로 빼는 것이 깔끔하나, 단일 사용처라 인라인 유지 (간결성 우선). 액션 없음.
-- HIGH | 없음.
-- CRITICAL | 없음.
+- Diff matches the plan and does not widen route behavior.
+- Regression test covers the changed observable header.
+- No blocking review findings.
 
 ## QA Evidence
 
-```
+What worked:
+- Focused route test passed.
+- Manual curl showed `Cache-Control: no-store`.
+
+What did not work:
+- None.
+
+Not covered:
+- Broader cache policy for other routes.
+
+How to re-run:
+- `pytest -q tests/test_server.py`
+- `curl -i -X POST -H 'Content-Type: application/json' -d '{}' http://127.0.0.1:9999/api/v1/refresh`
+
+```text
 $ pytest -q tests/test_server.py
 ....                                                                     [100%]
 4 passed in 0.42s
 exit code: 0
 
-$ curl -i -X POST http://127.0.0.1:9999/api/v1/refresh
+$ curl -i -X POST -H 'Content-Type: application/json' -d '{}' http://127.0.0.1:9999/api/v1/refresh
 HTTP/1.1 200 OK
 Content-Type: application/json
 Cache-Control: no-store
 ...
 exit code: 0
-
-$ python scripts/diff_refresh_response.py --baseline main --candidate HEAD
-- Cache-Control: max-age=0
-+ Cache-Control: no-store
-exit code: 0
 ```
 
-artefacts: `qa-artifacts/refresh-response-tobe.json`,
-            `qa-artifacts/refresh-response-asis.json`.
+artefacts:
+- `docs/PIPELINE-DEMO/qa/refresh-response-asis.json`
+- `docs/PIPELINE-DEMO/qa/refresh-response-tobe.json`
+
+## AC Scorecard
+
+| AC | Result | Evidence |
+| --- | --- | --- |
+| refresh returns no-store | pass | `qa/refresh-response-tobe.json` |
+| payload shape unchanged | pass | `qa/server-test.log` |
+| no unrelated API route changes | pass | `work/diff-review.md` |
+
+## Merge Status
+
+- target branch: `main`
+- feature branch: `symphony/PIPELINE-DEMO`
+- proof: merged with `--no-ff`; final ref recorded in
+  `docs/PIPELINE-DEMO/verify/merge-proof.txt`.
+
+## Wiki Updates
+
+- `docs/llm-wiki/api-cache-policy.md` - documented that refresh-like control
+  routes should use `no-store` when operators expect immediate state.
 
 ## As-Is -> To-Be Report
 
+### Goal
+- Manual refresh responses bypass intermediary caches.
+
 ### As-Is
-- `/api/v1/refresh` 응답이 `Cache-Control: max-age=0`으로 내려가 일부 프록시
-  계층(특히 사내 NGINX)이 짧게 캐시. 운영자가 강제 새로고침해도 같은 페이로드를
-  수 초간 재사용하는 사례가 보고됨 (log/symphony.log 2026-05-08 14:22 부근).
+- `/api/v1/refresh` returned `Cache-Control: max-age=0`, allowing short proxy
+  reuse in some deployments.
 
 ### To-Be
-- 동일 엔드포인트가 `Cache-Control: no-store`를 반환. 프록시 캐시 우회가
-  보장되며 강제 새로고침 시 항상 최신 폴링 결과가 반영됨. 위 QA 단계의
-  curl 출력으로 확인.
+- `/api/v1/refresh` returns `Cache-Control: no-store`, so forced refreshes
+  request fresh state.
 
 ### Reasoning
-- 가장 좁은 변경으로 문제 해결 (헤더 한 줄). 캐시 정책 전반을 손대지 않은 것은
-  다른 엔드포인트가 의도적으로 캐시 가능 상태이기 때문.
-- 대안으로 `Pragma: no-cache` 동시 부착도 검토했으나, HTTP/1.1 환경에서는
-  `Cache-Control`만으로 충분하고 헤더 중복은 디버깅을 흐림.
-- 후속: `/api/v1/state`도 동일 이슈 가능성이 있으나 별도 티켓에서 다룸
-  (TASK-NEXT 에 기록 예정).
+- One header change solves the reported behavior without changing unrelated
+  handlers. A broader cache policy is deferred because it needs route-by-route
+  review.
 
 ### Evidence
-- 명령: `pytest -q tests/test_server.py` (rc=0),
-  `curl -i -X POST http://127.0.0.1:9999/api/v1/refresh` (rc=0),
-  `python scripts/diff_refresh_response.py --baseline main --candidate HEAD` (rc=0).
-- 테스트: `tests/test_server.py::test_refresh_sets_no_store_cache_header`.
-- 아티팩트: `qa-artifacts/refresh-response-asis.json`,
-              `qa-artifacts/refresh-response-tobe.json`.
-- 관련 로그: `log/symphony.log` 2026-05-08 14:22:11Z 라인.
+- Commands: `pytest -q tests/test_server.py` rc=0; `curl -i -X POST -H 'Content-Type: application/json' -d '{}'
+  http://127.0.0.1:9999/api/v1/refresh` rc=0.
+- Test: `tests/test_server.py::test_refresh_sets_no_store_cache_header`.
+- Artefacts: `docs/PIPELINE-DEMO/qa/refresh-response-asis.json`,
+  `docs/PIPELINE-DEMO/qa/refresh-response-tobe.json`.
+
+### Not Covered
+- Broader cache policy for other polling routes.
+
+### How To Re-run
+- Run `pytest -q tests/test_server.py`, then call
+  `curl -i -X POST -H 'Content-Type: application/json' -d '{}' http://127.0.0.1:9999/api/v1/refresh`.

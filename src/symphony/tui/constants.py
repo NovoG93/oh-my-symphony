@@ -12,9 +12,15 @@ from __future__ import annotations
 STATE_COLOR = {
     "todo": "bright_black",
     "in progress": "cyan",
+    "verify": "yellow",
+    "document": "bright_magenta",
+    # legacy lane name (pre-rename boards)
+    "learn": "bright_magenta",
+    "human review": "magenta",
     "blocked": "red",
     "review": "yellow",
     "done": "green",
+    "archive": "bright_black",
     "cancelled": "magenta",
     "canceled": "magenta",
     "duplicate": "magenta",
@@ -25,6 +31,7 @@ AGENT_COLOR = {
     "codex": "bright_blue",
     "claude": "bright_magenta",
     "gemini": "bright_yellow",
+    "prime-agent": "bright_cyan",
 }
 
 

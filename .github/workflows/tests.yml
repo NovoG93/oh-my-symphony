@@ -36,5 +36,18 @@ jobs:
           python -m pip install --upgrade pip
           python -m pip install -e ".[dev]"
 
-      - name: Run tests
-        run: python -m pytest -q
+      - name: Install frontend test dependencies
+        run: npm ci
+
+      - name: Lint (ruff)
+        run: python -m ruff check src tests
+
+      - name: Check SPA translations
+        run: python scripts/check_i18n.py
+
+      - name: Type check (pyright)
+        run: symphony-pyright
+
+      - name: Run tests with coverage
+        # Parallel suite, then the wall-clock budget tests alone (see the `timing` marker).
+        run: python -m pytest -q -n auto -m "not timing" --cov=src/symphony --cov-report= && python -m pytest -q -n0 -m timing --cov=src/symphony --cov-append --cov-report=term --cov-fail-under=80

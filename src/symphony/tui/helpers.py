@@ -5,9 +5,8 @@ Everything in this module is dependency-light: rendering uses Rich
 import most of these directly to assert behavior without spinning up a
 Textual app.
 
-`_fetch_candidates` and `_fetch_terminals` deliberately live here (not
-in the app) so unit tests can `monkeypatch.setattr("symphony.tui._fetch_candidates", ...)`
-and the live `KanbanApp` picks up the stub at call time.
+Tracker fetch helpers deliberately live here (not in the app) so tests can
+replace the app's imported snapshot seam without constructing live clients.
 """
 
 from __future__ import annotations
@@ -43,6 +42,7 @@ class _CardStatus:
     # True when the orchestrator has been asked to hold this worker at the
     # next turn boundary. Surfaced from `snapshot()["running"][N]["paused"]`.
     paused: bool = False
+    attention: dict[str, Any] | None = None
 
 
 def _parse_iso(value: Any) -> datetime | None:
@@ -71,6 +71,34 @@ def _truncate(text: str, n: int) -> str:
     if len(text) <= n:
         return text
     return text[: max(n - 1, 1)] + "…"
+
+
+def _attention_label(attention: dict[str, Any] | None) -> str:
+    if not attention:
+        return ""
+    label = attention.get("label") or attention.get("kind") or "Attention"
+    return str(label)
+
+
+def _append_attention_meta(
+    text: Text, attention: dict[str, Any] | None, *, include_due_at: bool
+) -> None:
+    if not attention:
+        return
+    severity = str(attention.get("severity") or "warning")
+    style = {
+        "error": "bold red",
+        "warning": "bold yellow",
+        "info": "bold cyan",
+    }.get(severity, "bold yellow")
+    label = _attention_label(attention)
+    message = str(attention.get("message") or "").strip()
+    text.append(f"! {label}", style=style)
+    if message:
+        text.append(f": {message}", style="dim")
+    due_at = attention.get("due_at")
+    if include_due_at and due_at:
+        text.append(f"  due {due_at}", style="dim cyan")
 
 
 def _first_meaningful_line(description: str | None) -> str:
@@ -106,6 +134,22 @@ def _ordered_column_states(cfg: ServiceConfig) -> list[str]:
     return ordered
 
 
+def _stage_position(
+    state: str, cfg: ServiceConfig | None
+) -> tuple[int, int] | None:
+    if cfg is None:
+        return None
+    active = list(cfg.tracker.active_states)
+    total = len(active)
+    if total == 0:
+        return None
+    state_key = normalize_state(state)
+    for idx, name in enumerate(active, start=1):
+        if normalize_state(name) == state_key:
+            return idx, total
+    return None
+
+
 def _compact_rate_limits(rl: dict[str, Any]) -> str:
     parts: list[str] = []
     for key, value in rl.items():
@@ -134,6 +178,7 @@ def _build_runtime_index(snap: dict[str, Any]) -> dict[str, _CardStatus]:
             last_message=str(row.get("last_message") or ""),
             agent_kind=str(row.get("agent_kind") or ""),
             paused=bool(row.get("paused", False)),
+            attention=row.get("attention") if isinstance(row.get("attention"), dict) else None,
         )
     for row in snap.get("retrying", []) or []:
         issue_id = row.get("issue_id") or ""
@@ -142,8 +187,45 @@ def _build_runtime_index(snap: dict[str, Any]) -> dict[str, _CardStatus]:
             attempt=int(row.get("attempt", 0) or 0),
             error=str(row.get("error") or "") or None,
             paused=bool(row.get("paused", False)),
+            attention=row.get("attention") if isinstance(row.get("attention"), dict) else None,
         )
     return index
+
+
+def _partition_tracker_snapshot(
+    issues: list[Issue], cfg: ServiceConfig
+) -> tuple[list[Issue], list[Issue]]:
+    active = {normalize_state(state) for state in cfg.tracker.active_states}
+    terminal = {normalize_state(state) for state in cfg.tracker.terminal_states}
+    candidates = [
+        issue
+        for issue in issues
+        if normalize_state(issue.state) in active
+        and normalize_state(issue.state) not in terminal
+    ]
+    terminals = [
+        issue for issue in issues if normalize_state(issue.state) in terminal
+    ]
+    return candidates, terminals
+
+
+def _fetch_tracker_snapshot(
+    cfg: ServiceConfig,
+) -> tuple[list[Issue], list[Issue]]:
+    client = build_tracker_client(cfg)
+    try:
+        if cfg.tracker.kind.lower() == "file":
+            states = tuple(cfg.tracker.active_states) + tuple(
+                cfg.tracker.terminal_states
+            )
+            return _partition_tracker_snapshot(
+                client.fetch_issues_by_states(states), cfg
+            )
+        candidates = client.fetch_candidate_issues()
+        terminals = client.fetch_issues_by_states(cfg.tracker.terminal_states)
+        return candidates, terminals
+    finally:
+        client.close()
 
 
 def _fetch_candidates(cfg: ServiceConfig) -> list[Issue]:

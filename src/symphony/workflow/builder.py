@@ -13,11 +13,13 @@ documented defaults. The dispatch-time, harder validation lives in
 
 from __future__ import annotations
 
+import re
 import tempfile
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any
 
 from ..errors import ConfigValidationError
+from ..logging import get_logger
 from ..notifications import build_notifications_config
 from .coercion import (
     _as_int,
@@ -32,11 +34,20 @@ from .coercion import (
 )
 from .config import (
     AgentConfig,
+    AgyConfig,
     ClaudeConfig,
     CodexConfig,
+    ContinuousImprovementConfig,
     GeminiConfig,
     HooksConfig,
+    KiroConfig,
+    ManualVerificationProcedure,
+    OpenCodeConfig,
+    PmConfig,
     PiConfig,
+    PrimeAgentConfig,
+    ArtifactsConfig,
+    PreviewConfig,
     ProgressConfig,
     PromptConfig,
     ServerConfig,
@@ -49,12 +60,20 @@ from .config import (
 from .constants import (
     _AFTER_DONE_FAILURE_POLICIES,
     DEFAULT_ACTIVE_STATES,
+    DEFAULT_AGY_COMMAND,
     DEFAULT_AGENT_KIND,
     DEFAULT_AUTO_MERGE_EXCLUDE_PATHS,
+    DEFAULT_AUTO_RECOVER_BLOCKED,
     DEFAULT_BACKEND_READ_TIMEOUT_MS,
     DEFAULT_BACKEND_STALL_TIMEOUT_MS,
     DEFAULT_BACKEND_TURN_TIMEOUT_MS,
     DEFAULT_BOARD_ROOT_NAME,
+    DEFAULT_CI_INTERVAL_MS,
+    DEFAULT_CI_MAX_IMPROVEMENT_TICKETS_PER_RUN,
+    DEFAULT_CI_MAX_TICKETS_PER_RUN,
+    DEFAULT_CI_MAX_TURNS,
+    DEFAULT_CI_MIN_INTERVAL_MS,
+    DEFAULT_CI_TICKET_PREFIX,
     DEFAULT_CLAUDE_COMMAND,
     DEFAULT_CODEX_COMMAND,
     DEFAULT_CODEX_MODEL,
@@ -64,13 +83,18 @@ from .constants import (
     DEFAULT_CODEX_TURN_TIMEOUT_MS,
     DEFAULT_GEMINI_COMMAND,
     DEFAULT_HOOK_TIMEOUT_MS,
+    DEFAULT_KIRO_COMMAND,
     DEFAULT_MAX_ATTEMPTS,
+    DEFAULT_MAX_REOPENS,
     DEFAULT_MAX_CONCURRENT_AGENTS,
     DEFAULT_MAX_RETRIES,
     DEFAULT_MAX_RETRY_BACKOFF_MS,
+    DEFAULT_MAX_STATE_TURNS,
     DEFAULT_MAX_TOTAL_TURNS,
     DEFAULT_MAX_TURNS,
+    DEFAULT_OPENCODE_COMMAND,
     DEFAULT_PI_COMMAND,
+    DEFAULT_PRIME_AGENT_COMMAND,
     DEFAULT_POLL_INTERVAL_MS,
     DEFAULT_PROMPT,
     DEFAULT_TERMINAL_STATES,
@@ -80,9 +104,11 @@ from .constants import (
     LINEAR_API_KEY_ENV,
     LINEAR_DEFAULT_ENDPOINT,
     SUPPORTED_AGENT_KINDS,
+    SUPPORTED_CI_MODES,
     SUPPORTED_WORKSPACE_REUSE_POLICIES,
 )
 from .parser import WorkflowDefinition
+from .presets import board_uses_default_contracts
 
 
 def _build_prompt_config(raw: Any, base_dir: Path) -> PromptConfig:
@@ -118,8 +144,21 @@ def _build_prompt_config(raw: Any, base_dir: Path) -> PromptConfig:
     )
 
 
-def build_service_config(workflow: WorkflowDefinition) -> ServiceConfig:
-    """§6.1 — apply defaults and resolve typed values."""
+def _canonical_agent_kind(kind: str) -> str:
+    if kind == "antigravity":
+        return "agy"
+    return kind
+
+
+def build_service_config(
+    workflow: WorkflowDefinition, *, log_decisions: bool = True
+) -> ServiceConfig:
+    """§6.1 — apply defaults and resolve typed values.
+
+    ``log_decisions=False`` keeps read-only lookups (project registry
+    resource resolution) from emitting operator-facing decision logs about
+    *other* projects' workflows.
+    """
     cfg = workflow.config
     base_dir = workflow.base_dir()
 
@@ -183,6 +222,12 @@ def build_service_config(workflow: WorkflowDefinition) -> ServiceConfig:
     else:
         archive_after_days = archive_after_raw
 
+    network_timeout_seconds = _validated_positive_float_or_default(
+        tracker_raw.get("network_timeout_seconds"),
+        30.0,
+        name="tracker.network_timeout_seconds",
+    )
+
     archive_state_raw = tracker_raw.get("archive_state")
     archive_state = (
         archive_state_raw.strip()
@@ -206,6 +251,7 @@ def build_service_config(workflow: WorkflowDefinition) -> ServiceConfig:
         archive_state=archive_state,
         archive_after_days=archive_after_days,
         email=tracker_email,
+        network_timeout_seconds=network_timeout_seconds,
     )
 
     polling_raw = cfg.get("polling") or {}
@@ -255,6 +301,9 @@ def build_service_config(workflow: WorkflowDefinition) -> ServiceConfig:
             hooks_raw.get("timeout_ms"), DEFAULT_HOOK_TIMEOUT_MS, name="hooks.timeout_ms"
         ),
         after_done=hooks_raw.get("after_done") if isinstance(hooks_raw.get("after_done"), str) else None,
+        fail_on_warning_patterns=bool(
+            hooks_raw.get("fail_on_warning_patterns", False)
+        ),
     )
 
     agent_raw = cfg.get("agent") or {}
@@ -268,7 +317,20 @@ def build_service_config(workflow: WorkflowDefinition) -> ServiceConfig:
         DEFAULT_MAX_TOTAL_TURNS,
         name="agent.max_total_turns",
     )
-    agent_kind = _as_str(agent_raw.get("kind"), DEFAULT_AGENT_KIND).strip().lower() or DEFAULT_AGENT_KIND
+    max_state_turns = _validated_nonnegative_or_default(
+        agent_raw.get("max_state_turns"),
+        DEFAULT_MAX_STATE_TURNS,
+        name="agent.max_state_turns",
+    )
+    no_stage_change_action = _validated_no_stage_change_action(
+        agent_raw.get("no_stage_change_action"),
+        active_states=tracker.active_states,
+        terminal_states=tracker.terminal_states,
+    )
+    agent_kind = _canonical_agent_kind(
+        _as_str(agent_raw.get("kind"), DEFAULT_AGENT_KIND).strip().lower()
+        or DEFAULT_AGENT_KIND
+    )
     if agent_kind not in SUPPORTED_AGENT_KINDS:
         raise ConfigValidationError(
             f"agent.kind must be one of {sorted(SUPPORTED_AGENT_KINDS)}",
@@ -291,10 +353,20 @@ def build_service_config(workflow: WorkflowDefinition) -> ServiceConfig:
             agent_raw.get("max_concurrent_agents_by_state")
         ),
         max_total_turns=max_total_turns,
+        max_state_turns=max_state_turns,
+        max_state_turns_by_state=_normalize_state_map(
+            agent_raw.get("max_state_turns_by_state")
+        ),
+        no_stage_change_action=no_stage_change_action,
         max_attempts=_validated_nonnegative_or_default(
             agent_raw.get("max_attempts"),
             DEFAULT_MAX_ATTEMPTS,
             name="agent.max_attempts",
+        ),
+        max_reopens=_validated_nonnegative_or_default(
+            agent_raw.get("max_reopens"),
+            DEFAULT_MAX_REOPENS,
+            name="agent.max_reopens",
         ),
         max_retries=_validated_nonnegative_or_default(
             agent_raw.get("max_retries"),
@@ -304,11 +376,28 @@ def build_service_config(workflow: WorkflowDefinition) -> ServiceConfig:
         auto_triage_actionable_todo=bool(
             agent_raw.get("auto_triage_actionable_todo", True)
         ),
+        auto_recover_blocked=bool(
+            agent_raw.get("auto_recover_blocked", DEFAULT_AUTO_RECOVER_BLOCKED)
+        ),
+        compact_issue_context=bool(
+            agent_raw.get("compact_issue_context", True)
+        ),
+        crash_continuation=_validated_bool(
+            agent_raw.get("crash_continuation"),
+            True,
+            name="agent.crash_continuation",
+        ),
+        scheduling_policy=_validated_scheduling_policy(
+            agent_raw.get("scheduling_policy")
+        ),
         auto_commit_on_done=bool(
             agent_raw.get("auto_commit_on_done", True)
         ),
         auto_merge_on_done=bool(
             agent_raw.get("auto_merge_on_done", True)
+        ),
+        auto_merge_push_target=bool(
+            agent_raw.get("auto_merge_push_target", True)
         ),
         auto_merge_target_branch=_as_str(
             agent_raw.get("auto_merge_target_branch"), ""
@@ -335,9 +424,26 @@ def build_service_config(workflow: WorkflowDefinition) -> ServiceConfig:
         max_total_tokens_by_state=_normalize_state_map(
             agent_raw.get("max_total_tokens_by_state")
         ),
+        token_attention_threshold_by_state=_normalize_state_map(
+            agent_raw.get("token_attention_threshold_by_state")
+        ),
         budget_exhausted_state=_as_str(
             agent_raw.get("budget_exhausted_state"), ""
         ) or "",
+        fallback_kinds=_validated_fallback_kinds(agent_raw.get("fallback_kinds")),
+        stage_kinds=_validated_stage_kinds(
+            agent_raw.get("stage_kinds"),
+            active_states=tracker.active_states,
+            terminal_states=tracker.terminal_states,
+        ),
+        stage_contracts=_validated_stage_contracts(
+            agent_raw.get("stage_contracts")
+        ),
+        stall_timeout_ms_by_state=_validated_stall_timeout_by_state(
+            agent_raw.get("stall_timeout_ms_by_state"),
+            active_states=tracker.active_states,
+            terminal_states=tracker.terminal_states,
+        ),
     )
 
     codex_raw = cfg.get("codex") or {}
@@ -397,6 +503,63 @@ def build_service_config(workflow: WorkflowDefinition) -> ServiceConfig:
         resume_across_turns=bool(gemini_raw.get("resume_across_turns", True)),
     )
 
+    agy_raw = cfg.get("agy") or cfg.get("antigravity") or {}
+    if not isinstance(agy_raw, dict):
+        agy_raw = {}
+    agy = AgyConfig(
+        command=_as_str(agy_raw.get("command"), DEFAULT_AGY_COMMAND) or DEFAULT_AGY_COMMAND,
+        turn_timeout_ms=_validated_positive_or_default(
+            agy_raw.get("turn_timeout_ms"), DEFAULT_BACKEND_TURN_TIMEOUT_MS, name="agy.turn_timeout_ms"
+        ),
+        read_timeout_ms=_validated_positive_or_default(
+            agy_raw.get("read_timeout_ms"), DEFAULT_BACKEND_READ_TIMEOUT_MS, name="agy.read_timeout_ms"
+        ),
+        stall_timeout_ms=_validated_positive_or_default(
+            agy_raw.get("stall_timeout_ms"), DEFAULT_BACKEND_STALL_TIMEOUT_MS, name="agy.stall_timeout_ms"
+        ),
+        resume_across_turns=bool(agy_raw.get("resume_across_turns", False)),
+    )
+
+    kiro_raw = cfg.get("kiro") or {}
+    if not isinstance(kiro_raw, dict):
+        kiro_raw = {}
+    kiro = KiroConfig(
+        command=_as_str(kiro_raw.get("command"), DEFAULT_KIRO_COMMAND) or DEFAULT_KIRO_COMMAND,
+        turn_timeout_ms=_validated_positive_or_default(
+            kiro_raw.get("turn_timeout_ms"), DEFAULT_BACKEND_TURN_TIMEOUT_MS, name="kiro.turn_timeout_ms"
+        ),
+        read_timeout_ms=_validated_positive_or_default(
+            kiro_raw.get("read_timeout_ms"), DEFAULT_BACKEND_READ_TIMEOUT_MS, name="kiro.read_timeout_ms"
+        ),
+        stall_timeout_ms=_validated_positive_or_default(
+            kiro_raw.get("stall_timeout_ms"), DEFAULT_BACKEND_STALL_TIMEOUT_MS, name="kiro.stall_timeout_ms"
+        ),
+        resume_across_turns=bool(kiro_raw.get("resume_across_turns", True)),
+    )
+
+    opencode_raw = cfg.get("opencode") or {}
+    if not isinstance(opencode_raw, dict):
+        opencode_raw = {}
+    opencode = OpenCodeConfig(
+        command=_as_str(opencode_raw.get("command"), DEFAULT_OPENCODE_COMMAND) or DEFAULT_OPENCODE_COMMAND,
+        turn_timeout_ms=_validated_positive_or_default(
+            opencode_raw.get("turn_timeout_ms"),
+            DEFAULT_BACKEND_TURN_TIMEOUT_MS,
+            name="opencode.turn_timeout_ms",
+        ),
+        read_timeout_ms=_validated_positive_or_default(
+            opencode_raw.get("read_timeout_ms"),
+            DEFAULT_BACKEND_READ_TIMEOUT_MS,
+            name="opencode.read_timeout_ms",
+        ),
+        stall_timeout_ms=_validated_positive_or_default(
+            opencode_raw.get("stall_timeout_ms"),
+            DEFAULT_BACKEND_STALL_TIMEOUT_MS,
+            name="opencode.stall_timeout_ms",
+        ),
+        resume_across_turns=bool(opencode_raw.get("resume_across_turns", True)),
+    )
+
     pi_raw = cfg.get("pi") or {}
     if not isinstance(pi_raw, dict):
         pi_raw = {}
@@ -414,6 +577,30 @@ def build_service_config(workflow: WorkflowDefinition) -> ServiceConfig:
         resume_across_turns=bool(pi_raw.get("resume_across_turns", True)),
     )
 
+    pa_raw = cfg.get("prime_agent") or {}
+    if not isinstance(pa_raw, dict):
+        pa_raw = {}
+    prime_agent = PrimeAgentConfig(
+        command=_as_str(pa_raw.get("command"), DEFAULT_PRIME_AGENT_COMMAND)
+        or DEFAULT_PRIME_AGENT_COMMAND,
+        turn_timeout_ms=_validated_positive_or_default(
+            pa_raw.get("turn_timeout_ms"),
+            DEFAULT_BACKEND_TURN_TIMEOUT_MS,
+            name="prime_agent.turn_timeout_ms",
+        ),
+        read_timeout_ms=_validated_positive_or_default(
+            pa_raw.get("read_timeout_ms"),
+            DEFAULT_BACKEND_READ_TIMEOUT_MS,
+            name="prime_agent.read_timeout_ms",
+        ),
+        stall_timeout_ms=_validated_positive_or_default(
+            pa_raw.get("stall_timeout_ms"),
+            DEFAULT_BACKEND_STALL_TIMEOUT_MS,
+            name="prime_agent.stall_timeout_ms",
+        ),
+        resume_across_turns=bool(pa_raw.get("resume_across_turns", True)),
+    )
+
     server_raw = cfg.get("server") or {}
     if not isinstance(server_raw, dict):
         server_raw = {}
@@ -425,6 +612,242 @@ def build_service_config(workflow: WorkflowDefinition) -> ServiceConfig:
     else:
         port = None
     server = ServerConfig(port=port)
+
+    preview_raw = cfg.get("preview") or {}
+    if not isinstance(preview_raw, dict):
+        raise ConfigValidationError("preview must be a mapping", value=preview_raw)
+    preview_command = _as_str(preview_raw.get("command"), "").strip()
+    # A launch recipe is usable by default.  Missing preview configuration
+    # remains disabled/unconfigured, while operators can still opt out of a
+    # checked-in recipe explicitly with ``enabled: false``.
+    preview_enabled = _validated_bool(
+        preview_raw.get("enabled"), bool(preview_command), name="preview.enabled"
+    )
+    preview_cwd = _as_str(preview_raw.get("cwd"), ".").strip() or "."
+    # Reject escapes under both POSIX and native path semantics. The
+    # workflow config's path space is POSIX-flavored: on Windows a drive-less
+    # `Path("/tmp/outside")` reports `is_absolute() == False`, which would
+    # let a leading-slash escape through, while a drive-absolute Windows path
+    # is only caught by the native check.
+    cwd_posix = PurePosixPath(preview_cwd)
+    cwd_native = Path(preview_cwd)
+    if cwd_posix.is_absolute() or cwd_native.is_absolute() or any(
+        part == ".." for part in (*cwd_posix.parts, *cwd_native.parts)
+    ):
+        raise ConfigValidationError(
+            "preview.cwd must be a relative path inside the preview checkout",
+            value=preview_cwd,
+        )
+    health_path = _as_str(preview_raw.get("health_path"), "/").strip() or "/"
+    url_path = _as_str(preview_raw.get("url_path"), "/").strip() or "/"
+    for name, path_value in (("preview.health_path", health_path), ("preview.url_path", url_path)):
+        if not path_value.startswith("/") or "://" in path_value:
+            raise ConfigValidationError(
+                f"{name} must be an absolute URL path", value=path_value
+            )
+    startup_timeout_ms = _validated_positive_or_default(
+        preview_raw.get("startup_timeout_ms"),
+        30_000,
+        name="preview.startup_timeout_ms",
+    )
+    release_ticket = _as_str(preview_raw.get("release_ticket"), "").strip()
+    acceptance_raw = preview_raw.get("acceptance", [])
+    if not isinstance(acceptance_raw, list) or not all(
+        isinstance(item, str) and item.strip() for item in acceptance_raw
+    ):
+        raise ConfigValidationError(
+            "preview.acceptance must be a list of non-empty strings",
+            value=acceptance_raw,
+        )
+    if preview_enabled and not preview_command:
+        raise ConfigValidationError(
+            "preview.command is required when preview.enabled is true"
+        )
+    if preview_enabled and "${HOST}" not in preview_command:
+        raise ConfigValidationError(
+            "preview.command must include ${HOST} so the product binds to loopback"
+        )
+    preview = PreviewConfig(
+        enabled=preview_enabled,
+        command=preview_command,
+        cwd=preview_cwd,
+        health_path=health_path,
+        url_path=url_path,
+        startup_timeout_ms=startup_timeout_ms,
+        release_ticket=release_ticket,
+        acceptance=tuple(item.strip() for item in acceptance_raw),
+    )
+
+    artifacts_raw = cfg.get("artifacts") or {}
+    if not isinstance(artifacts_raw, dict):
+        raise ConfigValidationError("artifacts must be a mapping", value=artifacts_raw)
+    artifacts_defaults = ArtifactsConfig()
+    artifacts_dir = (
+        _as_str(artifacts_raw.get("dir"), artifacts_defaults.dir).strip()
+        or artifacts_defaults.dir
+    )
+    dir_path = Path(artifacts_dir)
+    if (
+        dir_path.is_absolute()
+        or len(dir_path.parts) != 1
+        or artifacts_dir in (".", "..")
+    ):
+        raise ConfigValidationError(
+            "artifacts.dir must be a single relative directory name",
+            value=artifacts_dir,
+        )
+    # The name is written verbatim into `.git/info/exclude`. Gitignore
+    # metacharacters would change what the line means -- `#drop` is a
+    # comment, `!keep` a negation -- and the rule would silently stop
+    # protecting the branch from collected deliverables.
+    if not re.fullmatch(r"[A-Za-z0-9._-]+", artifacts_dir):
+        raise ConfigValidationError(
+            "artifacts.dir may contain only letters, digits, dot, dash and "
+            "underscore (it is written into .git/info/exclude verbatim)",
+            value=artifacts_dir,
+        )
+    artifacts_ttl_raw = artifacts_raw.get("ttl_days")
+    if artifacts_ttl_raw is None:
+        artifacts_ttl_days = artifacts_defaults.ttl_days
+    elif (
+        isinstance(artifacts_ttl_raw, bool)
+        or not isinstance(artifacts_ttl_raw, int)
+        or artifacts_ttl_raw < 0
+    ):
+        raise ConfigValidationError(
+            "artifacts.ttl_days must be an integer >= 0 (0 disables the sweep)",
+            value=artifacts_ttl_raw,
+        )
+    else:
+        artifacts_ttl_days = artifacts_ttl_raw
+    artifacts = ArtifactsConfig(
+        enabled=_validated_bool(
+            artifacts_raw.get("enabled"), True, name="artifacts.enabled"
+        ),
+        dir=artifacts_dir,
+        max_file_mb=_validated_positive_or_default(
+            artifacts_raw.get("max_file_mb"),
+            artifacts_defaults.max_file_mb,
+            name="artifacts.max_file_mb",
+        ),
+        max_ticket_mb=_validated_positive_or_default(
+            artifacts_raw.get("max_ticket_mb"),
+            artifacts_defaults.max_ticket_mb,
+            name="artifacts.max_ticket_mb",
+        ),
+        ttl_days=artifacts_ttl_days,
+        require_for_done=_validated_bool(
+            artifacts_raw.get("require_for_done"),
+            False,
+            name="artifacts.require_for_done",
+        ),
+    )
+
+    pm_raw = cfg.get("pm") or {}
+    if not isinstance(pm_raw, dict):
+        raise ConfigValidationError("pm must be a mapping", value=pm_raw)
+    pm_defaults = PmConfig()
+    pinned_planning_keys = [
+        key
+        for key in (
+            "planning_codex_version",
+            "planning_model",
+            "planning_reasoning_effort",
+        )
+        if key in pm_raw
+    ]
+    if pinned_planning_keys:
+        # The installed runtime and fixed model/effort have no workflow overrides;
+        # accepting these keys would
+        # suggest an effect they never have.
+        from ..pm.planning import EFFORT, MODEL
+
+        raise ConfigValidationError(
+            f"pm.{pinned_planning_keys[0]} is not configurable; the PM planning "
+            "assistant uses the compatible installed Codex CLI, pinned model "
+            f"{MODEL}, reasoning effort {EFFORT}. Remove "
+            + ", ".join(f"pm.{key}" for key in pinned_planning_keys)
+            + " from WORKFLOW.md",
+            value={key: pm_raw[key] for key in pinned_planning_keys},
+        )
+    raw_pm_workspace = pm_raw.get("planning_workspace_root")
+    if isinstance(raw_pm_workspace, str) and raw_pm_workspace.strip():
+        pm_workspace_root = _resolve_config_path(base_dir, raw_pm_workspace.strip())
+    elif raw_pm_workspace is None:
+        # Planning worktrees must not live inside the protected project checkout.
+        pm_workspace_root = (workspace_root / "pm-planning").resolve()
+    else:
+        raise ConfigValidationError(
+            "pm.planning_workspace_root must be a non-empty path string",
+            value=raw_pm_workspace,
+        )
+    pm = PmConfig(
+        authoring=_validated_bool(
+            pm_raw.get("authoring"), False, name="pm.authoring"
+        ),
+        exchange=_validated_bool(
+            pm_raw.get("exchange"), False, name="pm.exchange"
+        ),
+        assistance=_validated_bool(
+            pm_raw.get("assistance"), False, name="pm.assistance"
+        ),
+        handoff=_validated_bool(pm_raw.get("handoff"), False, name="pm.handoff"),
+        openspec_executable=_as_str(
+            pm_raw.get("openspec_executable")
+        ).strip()
+        or pm_defaults.openspec_executable,
+        planning_workspace_root=pm_workspace_root,
+        max_encoded_upload_mb=_validated_positive_or_default(
+            pm_raw.get("max_encoded_upload_mb"),
+            pm_defaults.max_encoded_upload_mb,
+            name="pm.max_encoded_upload_mb",
+        ),
+        max_workbook_mb=_validated_positive_or_default(
+            pm_raw.get("max_workbook_mb"),
+            pm_defaults.max_workbook_mb,
+            name="pm.max_workbook_mb",
+        ),
+        max_uncompressed_mb=_validated_positive_or_default(
+            pm_raw.get("max_uncompressed_mb"),
+            pm_defaults.max_uncompressed_mb,
+            name="pm.max_uncompressed_mb",
+        ),
+        max_zip_entries=_validated_positive_or_default(
+            pm_raw.get("max_zip_entries"),
+            pm_defaults.max_zip_entries,
+            name="pm.max_zip_entries",
+        ),
+        max_nodes=_validated_positive_or_default(
+            pm_raw.get("max_nodes"), pm_defaults.max_nodes, name="pm.max_nodes"
+        ),
+        max_edges=_validated_positive_or_default(
+            pm_raw.get("max_edges"), pm_defaults.max_edges, name="pm.max_edges"
+        ),
+        max_text_chars=_validated_positive_or_default(
+            pm_raw.get("max_text_chars"),
+            pm_defaults.max_text_chars,
+            name="pm.max_text_chars",
+        ),
+        operation_timeout_ms=_validated_positive_or_default(
+            pm_raw.get("operation_timeout_ms"),
+            pm_defaults.operation_timeout_ms,
+            name="pm.operation_timeout_ms",
+        ),
+        exchange_concurrency=_validated_positive_or_default(
+            pm_raw.get("exchange_concurrency"),
+            pm_defaults.exchange_concurrency,
+            name="pm.exchange_concurrency",
+        ),
+        verification_procedures=_parse_pm_verification_procedures(
+            pm_raw.get("verification_procedures")
+        ),
+        manual_verification_procedures=_parse_pm_manual_verification_procedures(
+            pm_raw.get("manual_verification_procedures"),
+            native_ids=set(_parse_pm_verification_procedures(
+                pm_raw.get("verification_procedures")
+            )),
+        ),
+    )
 
     tui_raw = cfg.get("tui") or {}
     if not isinstance(tui_raw, dict):
@@ -534,6 +957,13 @@ def build_service_config(workflow: WorkflowDefinition) -> ServiceConfig:
         resolve_var=resolve_var_indirection,
     )
 
+    continuous_improvement = _build_continuous_improvement_config(
+        cfg.get("continuous_improvement")
+    )
+
+    if log_decisions:
+        _log_stage_contracts_decision(agent, tracker)
+
     return ServiceConfig(
         workflow_path=workflow.source_path,
         poll_interval_ms=poll_interval_ms,
@@ -544,7 +974,11 @@ def build_service_config(workflow: WorkflowDefinition) -> ServiceConfig:
         codex=codex,
         claude=claude,
         gemini=gemini,
+        agy=agy,
+        kiro=kiro,
+        opencode=opencode,
         pi=pi,
+        prime_agent=prime_agent,
         server=server,
         tui=tui,
         progress=progress,
@@ -552,9 +986,13 @@ def build_service_config(workflow: WorkflowDefinition) -> ServiceConfig:
         prompts=prompts,
         wiki=wiki,
         notifications=notifications,
+        continuous_improvement=continuous_improvement,
         raw=dict(cfg),
         prompt_template=prompt_template,
         workspace_reuse_policy=workspace_reuse_policy,
+        preview=preview,
+        artifacts=artifacts,
+        pm=pm,
     )
 
 
@@ -575,6 +1013,24 @@ def _validated_positive_or_default(value: Any, default: int, *, name: str) -> in
     return ivalue
 
 
+def _validated_positive_float_or_default(
+    value: Any, default: float, *, name: str
+) -> float:
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        raise ConfigValidationError(f"{name} must be a positive number", value=value)
+    try:
+        fvalue = float(value)
+    except (TypeError, ValueError) as exc:
+        raise ConfigValidationError(
+            f"{name} must be a positive number", value=value
+        ) from exc
+    if fvalue <= 0:
+        raise ConfigValidationError(f"{name} must be a positive number", value=value)
+    return fvalue
+
+
 def _validated_nonnegative_or_default(value: Any, default: int, *, name: str) -> int:
     """Validate counters where 0 is an explicit off switch."""
     if value is None:
@@ -592,6 +1048,166 @@ def _validated_nonnegative_or_default(value: Any, default: int, *, name: str) ->
     return ivalue
 
 
+def _validated_fallback_kinds(value: Any) -> tuple[str, ...]:
+    """agent.fallback_kinds — ordered, distinct, supported agent kinds."""
+    if value is None:
+        return ()
+    if isinstance(value, str):
+        value = [value]
+    if not isinstance(value, list):
+        raise ConfigValidationError(
+            "agent.fallback_kinds must be a list of agent kinds", value=value
+        )
+    out: list[str] = []
+    for raw in value:
+        kind = _canonical_agent_kind(_as_str(raw).strip().lower())
+        if kind not in SUPPORTED_AGENT_KINDS:
+            raise ConfigValidationError(
+                f"agent.fallback_kinds entries must be one of "
+                f"{sorted(SUPPORTED_AGENT_KINDS)}",
+                value=raw,
+            )
+        if kind not in out:
+            out.append(kind)
+    return tuple(out)
+
+
+def _validated_stage_kinds(
+    value: Any,
+    *,
+    active_states: tuple[str, ...],
+    terminal_states: tuple[str, ...],
+) -> dict[str, str]:
+    """agent.stage_kinds — per-state backend routing, keys lowercased.
+
+    Values must be supported agent kinds (a typo would dispatch nothing, so
+    it is a hard config error). Unknown state keys only warn: states are
+    user-editable through the web UI, and a stale mapping entry should not
+    brick the whole workflow load.
+    """
+    if value is None:
+        return {}
+    if not isinstance(value, dict):
+        raise ConfigValidationError(
+            "agent.stage_kinds must be a map of state name to agent kind",
+            value=value,
+        )
+    known = {state.strip().lower() for state in (*active_states, *terminal_states)}
+    out: dict[str, str] = {}
+    for key, raw in value.items():
+        if not isinstance(key, str):
+            continue
+        normalized_key = key.strip().lower()
+        if not normalized_key:
+            continue
+        kind = _canonical_agent_kind(_as_str(raw).strip().lower())
+        if kind not in SUPPORTED_AGENT_KINDS:
+            raise ConfigValidationError(
+                f"agent.stage_kinds[{key!r}] must be one of "
+                f"{sorted(SUPPORTED_AGENT_KINDS)}",
+                value=raw,
+            )
+        if normalized_key not in known:
+            get_logger().warning(
+                "agent_stage_kinds_unknown_state",
+                state=key,
+                known_states=sorted(known),
+            )
+        out[normalized_key] = kind
+    return out
+
+
+def _log_stage_contracts_decision(agent: AgentConfig, tracker: TrackerConfig) -> None:
+    """Say out loud when the mechanical evidence floor is NOT running.
+
+    F-06: renaming one default lane (`Document` → `Docs`) silently switched
+    the whole stage-contract validator off. It is a legitimate outcome of a
+    customized board, but it must never be invisible — this is the product's
+    evidence floor.
+    """
+    mode = (agent.stage_contracts or "auto").strip().lower()
+    if agent.stage_contracts_enabled(tracker.active_states):
+        return
+    if mode == "off":
+        get_logger().info(
+            "stage_contracts_disabled",
+            reason="agent.stage_contracts: off",
+            lanes=list(tracker.active_states),
+        )
+        return
+    offending = [
+        state
+        for state in tracker.active_states
+        if not board_uses_default_contracts((state,))
+    ]
+    get_logger().warning(
+        "stage_contracts_disabled",
+        reason="board lanes are neither the default preset nor the deep preset",
+        offending_lanes=offending,
+        lanes=list(tracker.active_states),
+        hint="set agent.stage_contracts: on to enforce them anyway",
+    )
+
+
+_STAGE_CONTRACT_MODES = ("auto", "on", "off")
+
+
+def _validated_stage_contracts(value: Any) -> str:
+    """agent.stage_contracts — auto (default) | on | off."""
+    if value is None:
+        return "auto"
+    if isinstance(value, bool):
+        return "on" if value else "off"
+    mode = _as_str(value).strip().lower()
+    if mode not in _STAGE_CONTRACT_MODES:
+        raise ConfigValidationError(
+            f"agent.stage_contracts must be one of {list(_STAGE_CONTRACT_MODES)}",
+            value=value,
+        )
+    return mode
+
+
+def _validated_stall_timeout_by_state(
+    value: Any,
+    *,
+    active_states: tuple[str, ...],
+    terminal_states: tuple[str, ...],
+) -> dict[str, int]:
+    """agent.stall_timeout_ms_by_state — per-lane stall budget, keys lowercased.
+
+    Same shape as `max_total_tokens_by_state`: non-positive / non-numeric
+    entries are dropped rather than fatal, because a stall budget is an
+    ergonomics knob and a stale entry must not brick the workflow load.
+    Unknown state keys warn (states are UI-editable).
+    """
+    if value is not None and not isinstance(value, dict):
+        raise ConfigValidationError(
+            "agent.stall_timeout_ms_by_state must be a map of state name to ms",
+            value=value,
+        )
+    out = _normalize_state_map(value)
+    known = {state.strip().lower() for state in (*active_states, *terminal_states)}
+    for key in out:
+        if key not in known:
+            get_logger().warning(
+                "agent_stall_timeout_unknown_state",
+                state=key,
+                known_states=sorted(known),
+            )
+    return out
+
+
+def _validated_scheduling_policy(value: Any) -> str:
+    if value is None:
+        return "fifo"
+    if not isinstance(value, str) or value.strip().lower() not in {"fifo", "dag"}:
+        raise ConfigValidationError(
+            "agent.scheduling_policy must be one of ['fifo', 'dag']",
+            value=value,
+        )
+    return value.strip().lower()
+
+
 def _validated_after_done_failure_policy(value: Any) -> str:
     """Accept 'warn' (default) or 'block'. Anything else is a config error."""
     if value is None:
@@ -603,3 +1219,283 @@ def _validated_after_done_failure_policy(value: Any) -> str:
             value=value,
         )
     return value
+
+
+def _validated_no_stage_change_action(
+    value: Any,
+    *,
+    active_states: tuple[str, ...],
+    terminal_states: tuple[str, ...],
+) -> str:
+    action = _as_str(value, "block").strip() or "block"
+    if action.lower() == "block":
+        return "block"
+    configured = {
+        state.strip().lower(): state.strip()
+        for state in (*active_states, *terminal_states)
+        if state.strip()
+    }
+    key = action.lower()
+    if key not in configured:
+        raise ConfigValidationError(
+            "agent.no_stage_change_action must be 'block' or a configured tracker state",
+            value=action,
+        )
+    return configured[key]
+
+
+def _validated_bool(value: Any, default: bool, *, name: str) -> bool:
+    """Strict boolean — YAML `1`/`"true"`/`"false"` are config errors, not truthy coercions."""
+    if value is None:
+        return default
+    if not isinstance(value, bool):
+        raise ConfigValidationError(f"{name} must be a boolean", value=value)
+    return value
+
+
+def _parse_pm_verification_procedures(value: Any) -> dict[str, tuple[str, ...]]:
+    if value is None:
+        return {}
+    if not isinstance(value, dict):
+        raise ConfigValidationError(
+            "pm.verification_procedures must be a mapping of ids to argv lists",
+            value=value,
+        )
+    result: dict[str, tuple[str, ...]] = {}
+    for key, command in value.items():
+        if (
+            not isinstance(key, str)
+            or not key.strip()
+            or not isinstance(command, list)
+            or not command
+            or not all(isinstance(part, str) and part for part in command)
+        ):
+            raise ConfigValidationError(
+                "each pm.verification_procedures entry must be a non-empty argv list",
+                value={key: command},
+            )
+        result[key.strip()] = tuple(command)
+    return result
+
+
+def _parse_pm_manual_verification_procedures(
+    value: Any, *, native_ids: set[str]
+) -> dict[str, ManualVerificationProcedure]:
+    if value is None:
+        return {}
+    if not isinstance(value, dict):
+        raise ConfigValidationError(
+            "pm.manual_verification_procedures must be a mapping", value=value
+        )
+    result: dict[str, ManualVerificationProcedure] = {}
+    for key, definition in value.items():
+        if not isinstance(key, str) or not key.strip() or not isinstance(definition, dict):
+            raise ConfigValidationError("manual verification procedure is invalid", value={key: definition})
+        procedure_id = key.strip()
+        if procedure_id in native_ids:
+            raise ConfigValidationError("verification procedure ids must be unique across native and manual kinds", value=procedure_id)
+        if set(definition) - {"label", "instructions", "report", "artifacts"}:
+            raise ConfigValidationError("manual verification procedure has unknown keys", value=definition)
+        instructions = definition.get("instructions")
+        report = definition.get("report", "required")
+        artifacts = definition.get("artifacts", "optional")
+        label = definition.get("label")
+        if (
+            not isinstance(instructions, str) or not instructions.strip()
+            or report != "required"
+            or artifacts not in {"optional", "required"}
+            or (label is not None and not isinstance(label, str))
+        ):
+            raise ConfigValidationError("manual verification procedure definition is invalid", value=definition)
+        result[procedure_id] = ManualVerificationProcedure(
+            instructions.strip(), report, artifacts,
+            label.strip() if isinstance(label, str) and label.strip() else None,
+        )
+    return result
+
+
+def _validated_strict_int(
+    value: Any, default: int, *, name: str, minimum: int
+) -> int:
+    """Stricter than `_validated_positive_or_default`: rejects numeric strings too.
+
+    Only a real `int` (never `bool`) is accepted — `"1800000"` is a config
+    error here, unlike the legacy `_validated_*_or_default` family which
+    happily coerces any int-parseable string.
+    """
+    if value is None:
+        return default
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ConfigValidationError(f"{name} must be an integer", value=value)
+    if value < minimum:
+        raise ConfigValidationError(f"{name} must be >= {minimum}", value=value)
+    return value
+
+
+def _validated_ci_agent_kind(value: Any) -> str:
+    """Empty string (inherit workflow default agent) or a member of SUPPORTED_AGENT_KINDS.
+
+    Mirrors `webapi._check_agent_kind`'s normalize-then-validate shape.
+    """
+    if value is None:
+        return ""
+    if not isinstance(value, str):
+        raise ConfigValidationError(
+            "continuous_improvement.agent_kind must be a string", value=value
+        )
+    kind = value.strip().lower()
+    if kind and kind not in SUPPORTED_AGENT_KINDS:
+        raise ConfigValidationError(
+            "continuous_improvement.agent_kind must be \"\" or one of "
+            f"{sorted(SUPPORTED_AGENT_KINDS)}",
+            value=kind,
+        )
+    return kind
+
+
+# Sole consumer is _validated_ci_ticket_prefix below — kept local rather than
+# in constants.py since nothing else in the package needs it.
+_CI_TICKET_PREFIX_RE = re.compile(r"^[A-Za-z][A-Za-z0-9]{0,19}$")
+
+
+def _validated_ci_ticket_prefix(value: Any) -> str:
+    if value is None:
+        return DEFAULT_CI_TICKET_PREFIX
+    if not isinstance(value, str) or not _CI_TICKET_PREFIX_RE.match(value):
+        raise ConfigValidationError(
+            "continuous_improvement.ticket_prefix must be an identifier-safe string "
+            "(letters/digits, starting with a letter, max 20 chars)",
+            value=value,
+        )
+    return value
+
+
+
+def validated_ci_modes(value: Any) -> tuple[str, ...]:
+    """Normalize `continuous_improvement.modes` to canonical mode order.
+
+    `None`/absent means "no explicit modes" — the config's `resolved_modes()`
+    then falls back to readiness-only, which is what an `enabled: true` block
+    meant before improvement modes existed. Shared with the mutation API so
+    WORKFLOW.md and the settings card reject the same strings.
+    """
+    if value is None:
+        return ()
+    if isinstance(value, str) or not isinstance(value, (list, tuple)):
+        raise ConfigValidationError(
+            "continuous_improvement.modes must be a list of mode names",
+            value=value,
+        )
+    seen: list[str] = []
+    for item in value:
+        if not isinstance(item, str):
+            raise ConfigValidationError(
+                "continuous_improvement.modes must be a list of mode names",
+                value=item,
+            )
+        mode = item.strip().lower()
+        if mode not in SUPPORTED_CI_MODES:
+            raise ConfigValidationError(
+                "unknown continuous_improvement mode "
+                f"{mode!r}; supported: {list(SUPPORTED_CI_MODES)}",
+                value=item,
+            )
+        if mode not in seen:
+            seen.append(mode)
+    return tuple(mode for mode in SUPPORTED_CI_MODES if mode in seen)
+
+
+def _validated_ci_mode_interval_hours(value: Any) -> dict[str, float]:
+    """`{mode: hours}` cadence overrides; hours must be a non-negative number."""
+    if value is None:
+        return {}
+    if not isinstance(value, dict):
+        raise ConfigValidationError(
+            "continuous_improvement.mode_interval_hours must be a mapping "
+            "of mode name to hours",
+            value=value,
+        )
+    out: dict[str, float] = {}
+    for raw_mode, raw_hours in value.items():
+        mode = raw_mode.strip().lower() if isinstance(raw_mode, str) else raw_mode
+        if mode not in SUPPORTED_CI_MODES:
+            raise ConfigValidationError(
+                "unknown continuous_improvement mode "
+                f"{raw_mode!r}; supported: {list(SUPPORTED_CI_MODES)}",
+                value=raw_mode,
+            )
+        if isinstance(raw_hours, bool) or not isinstance(raw_hours, (int, float)):
+            raise ConfigValidationError(
+                f"continuous_improvement.mode_interval_hours.{mode} must be a number",
+                value=raw_hours,
+            )
+        if raw_hours < 0:
+            raise ConfigValidationError(
+                f"continuous_improvement.mode_interval_hours.{mode} must be >= 0",
+                value=raw_hours,
+            )
+        out[mode] = float(raw_hours)
+    return out
+
+
+def _build_continuous_improvement_config(raw: Any) -> ContinuousImprovementConfig:
+    """§continuous-improvement heartbeat — default-off, all fields validated strictly.
+
+    Missing `continuous_improvement:` in WORKFLOW.md means disabled with
+    defaults (see docs/continuous-improvement/rubric.md "Default configuration").
+    """
+    ci_raw = raw or {}
+    if not isinstance(ci_raw, dict):
+        ci_raw = {}
+
+    enabled = _validated_bool(
+        ci_raw.get("enabled"), False, name="continuous_improvement.enabled"
+    )
+    interval_ms = _validated_strict_int(
+        ci_raw.get("interval_ms"),
+        DEFAULT_CI_INTERVAL_MS,
+        name="continuous_improvement.interval_ms",
+        minimum=DEFAULT_CI_MIN_INTERVAL_MS,
+    )
+    max_turns = _validated_strict_int(
+        ci_raw.get("max_turns"),
+        DEFAULT_CI_MAX_TURNS,
+        name="continuous_improvement.max_turns",
+        minimum=0,
+    )
+    ticket_prefix = _validated_ci_ticket_prefix(ci_raw.get("ticket_prefix"))
+    max_tickets_per_run = _validated_strict_int(
+        ci_raw.get("max_tickets_per_run"),
+        DEFAULT_CI_MAX_TICKETS_PER_RUN,
+        name="continuous_improvement.max_tickets_per_run",
+        minimum=1,
+    )
+    require_idle_board = _validated_bool(
+        ci_raw.get("require_idle_board"),
+        True,
+        name="continuous_improvement.require_idle_board",
+    )
+    agent_kind = _validated_ci_agent_kind(ci_raw.get("agent_kind"))
+    modes = validated_ci_modes(ci_raw.get("modes"))
+    mode_interval_hours = _validated_ci_mode_interval_hours(
+        ci_raw.get("mode_interval_hours")
+    )
+    max_improvement_tickets_per_run = _validated_strict_int(
+        ci_raw.get("max_improvement_tickets_per_run"),
+        DEFAULT_CI_MAX_IMPROVEMENT_TICKETS_PER_RUN,
+        name="continuous_improvement.max_improvement_tickets_per_run",
+        minimum=1,
+    )
+
+    return ContinuousImprovementConfig(
+        enabled=enabled,
+        interval_ms=interval_ms,
+        max_turns=max_turns,
+        ticket_prefix=ticket_prefix,
+        max_tickets_per_run=max_tickets_per_run,
+        require_idle_board=require_idle_board,
+        agent_kind=agent_kind,
+        modes=modes,
+        mode_interval_hours=mode_interval_hours,
+        max_improvement_tickets_per_run=max_improvement_tickets_per_run,
+    )

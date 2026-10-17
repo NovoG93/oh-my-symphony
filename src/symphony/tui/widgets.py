@@ -30,7 +30,9 @@ from .constants import (
 )
 from .helpers import (
     _CardStatus,
+    _append_attention_meta,
     _append_token_meta,
+    _attention_label,
     _compact_rate_limits,
     _first_meaningful_line,
     _safe_id,
@@ -77,12 +79,14 @@ class IssueCard(Static):
         language: str,
         *,
         density: str = DENSITY_RICH,
+        stage_pos: tuple[int, int] | None = None,
     ) -> None:
         super().__init__("")
         self._issue = issue
         self._status = status
         self._language = language
         self._density = density
+        self._stage_pos = stage_pos
         self.id = f"card-{_safe_id(issue.id)}"
         self._refresh_body()
 
@@ -98,14 +102,34 @@ class IssueCard(Static):
     def density(self) -> str:
         return self._density
 
+    @property
+    def stage_pos(self) -> tuple[int, int] | None:
+        return self._stage_pos
+
     def update_status(self, status: _CardStatus) -> None:
         self._status = status
         self._refresh_body()
+
+    def update_issue(self, issue: Issue) -> bool:
+        """Rebind the tracker Issue after a refresh. Returns True when the
+        card repainted. Reused cards otherwise keep serving the pre-refresh
+        Issue to the detail pane, the Enter modal and the `e` prefill."""
+        if issue == self._issue:
+            return False
+        self._issue = issue
+        self._refresh_body()
+        return True
 
     def set_density(self, density: str) -> None:
         if density == self._density:
             return
         self._density = density
+        self._refresh_body()
+
+    def set_stage_pos(self, stage_pos: tuple[int, int] | None) -> None:
+        if stage_pos == self._stage_pos:
+            return
+        self._stage_pos = stage_pos
         self._refresh_body()
 
     def _refresh_body(self) -> None:
@@ -132,22 +156,45 @@ class IssueCard(Static):
         color = STATE_COLOR.get(normalize_state(issue.state), "white")
         line = Text()
         line.append(issue.identifier, style=f"bold {color}")
+        if self._stage_pos:
+            line.append(f" [{self._stage_pos[0]}/{self._stage_pos[1]}]", style="dim")
         if status.runtime == "running" and status.paused:
             line.append(" ⏸", style="bold bright_magenta")
         elif status.runtime == "running":
             line.append(" ●", style="bold green")
         elif status.runtime == "retrying":
             line.append(" ↻", style="bold yellow")
+            # The compact line is the operator's default view — a bare ↻
+            # hides why the run is retrying. Mirror the rich card's 40-char
+            # error preview so the cause is visible without flipping density.
+            if status.error:
+                line.append(f" {_truncate(status.error, 40)}", style="dim red")
         elif status.runtime == "completed":
             line.append(" ✓", style="bold green")
+        # Stage-routed boards dispatch different backends per lane; a short
+        # colored chip after the runtime marker says who is on the ticket.
+        # Four letters, not one — c/c would collide between codex/claude.
+        if (
+            status.runtime in ("running", "retrying")
+            and status.agent_kind
+        ):
+            agent_color = AGENT_COLOR.get(status.agent_kind, "white")
+            line.append(f" {status.agent_kind[:4]}", style=f"bold {agent_color}")
         if issue.priority:
             line.append(f" P{issue.priority}", style="bright_red bold")
+        if status.attention:
+            line.append(
+                f"  ! {_attention_label(status.attention)}",
+                style="bold yellow",
+            )
         line.append("  ")
         line.append(_truncate(issue.title or "", 60), style="white")
         if status.runtime == "running":
             silent_s = _silent_seconds(status.last_event_at)
             if silent_s is not None and silent_s >= SILENT_THRESHOLD_S:
                 line.append(f"  silent {int(silent_s)}s", style="bold yellow")
+        elif normalize_state(issue.state) in {"document", "learn"}:
+            line.append("  S skip", style="dim magenta")
         if status.tokens:
             line.append(f"  {status.tokens:,}t", style="dim cyan")
         return line
@@ -159,6 +206,8 @@ class IssueCard(Static):
         color = STATE_COLOR.get(normalize_state(issue.state), "white")
 
         title = Text(issue.identifier, style=f"bold {color}")
+        if self._stage_pos:
+            title.append(f" [{self._stage_pos[0]}/{self._stage_pos[1]}]", style="dim")
         if status.runtime == "running" and status.paused:
             title.append("  ⏸", style="bold bright_magenta")
         elif status.runtime == "running":
@@ -216,8 +265,14 @@ class IssueCard(Static):
                     f"{t('card.blocked_by', language)} {', '.join(blocker_names)}",
                     style="dim red",
                 )
+        elif normalize_state(issue.state) in {"document", "learn"}:
+            meta.append("S to skip Document", style="dim magenta")
         elif issue.labels:
-            meta.append("  ".join(f"#{l}" for l in issue.labels[:3]), style="dim")
+            meta.append("  ".join(f"#{label}" for label in issue.labels[:3]), style="dim")
+        if status.attention:
+            if meta.plain.strip():
+                meta.append("\n")
+            _append_attention_meta(meta, status.attention, include_due_at=False)
 
         # Idle/completed cards still surface aggregate token spend so an
         # operator can audit cost after a run wraps.
@@ -276,11 +331,19 @@ class Lane(Vertical):
 
     can_focus = True
 
-    def __init__(self, state_label: str, color: str, legend: str | None) -> None:
+    def __init__(
+        self,
+        state_label: str,
+        color: str,
+        legend: str | None,
+        *,
+        stage_pos: tuple[int, int] | None = None,
+    ) -> None:
         super().__init__()
         self._state_label = state_label
         self._color = color
         self._legend = legend
+        self._stage_pos = stage_pos
         self._title = Static("", classes="lane-title")
         self._legend_widget = Static(legend or "", classes="lane-legend")
         self._scroll = VerticalScroll()
@@ -308,8 +371,11 @@ class Lane(Vertical):
 
     def set_count(self, count: int) -> None:
         self._card_count = count
-        self._title.update(Text(f"{self._state_label} ({count})", style=f"bold {self._color}"))
-        self.border_title = f"{self._state_label} ({count})"
+        label = self._state_label
+        if self._stage_pos:
+            label = f"{label} [{self._stage_pos[0]}/{self._stage_pos[1]}]"
+        self._title.update(Text(f"{label} ({count})", style=f"bold {self._color}"))
+        self.border_title = f"{label} ({count})"
 
     def render_cards(
         self,
@@ -339,10 +405,20 @@ class Lane(Vertical):
             wanted_ids.add(card_id)
             existing_card = existing.pop(card_id, None)
             if existing_card is not None:
+                existing_card.update_issue(issue)
                 existing_card.update_status(status)
                 existing_card.set_density(density)
+                existing_card.set_stage_pos(self._stage_pos)
                 continue
-            self._scroll.mount(IssueCard(issue, status, language, density=density))
+            self._scroll.mount(
+                IssueCard(
+                    issue,
+                    status,
+                    language,
+                    density=density,
+                    stage_pos=self._stage_pos,
+                )
+            )
         # Stale cards (issue moved to another lane / closed) get removed.
         for stale_id, stale_card in existing.items():
             if stale_id not in wanted_ids:
@@ -477,19 +553,28 @@ class DetailPane(Vertical):
     def is_open(self) -> bool:
         return self.has_class("-visible")
 
-    def show_for(self, issue: Issue, status: _CardStatus) -> None:
+    def show_for(
+        self,
+        issue: Issue,
+        status: _CardStatus,
+        stage_pos: tuple[int, int] | None = None,
+    ) -> None:
         color = STATE_COLOR.get(normalize_state(issue.state), "white")
         title = Text(issue.identifier, style=f"bold {color}")
+        if stage_pos:
+            title.append(f" [{stage_pos[0]}/{stage_pos[1]}]", style="dim")
         if issue.title:
             title.append(f"  {issue.title}", style="white")
         self._title.update(title)
 
         meta = Text()
         meta.append(f"state={issue.state}", style="dim")
+        if stage_pos:
+            meta.append(f"  stage={stage_pos[0]}/{stage_pos[1]}", style="dim")
         if issue.priority:
             meta.append(f"  P{issue.priority}", style="bright_red bold")
         if issue.labels:
-            meta.append("  " + " ".join(f"#{l}" for l in issue.labels), style="dim")
+            meta.append("  " + " ".join(f"#{label}" for label in issue.labels), style="dim")
         if status.runtime != "idle":
             runtime_label = (
                 f"runtime={status.runtime} (paused)"
@@ -506,6 +591,9 @@ class DetailPane(Vertical):
                 meta.append(f"  retry#{status.attempt}", style="yellow")
             if status.error:
                 meta.append(f"\nerror: {status.error}", style="red")
+        if status.attention:
+            meta.append("\n")
+            _append_attention_meta(meta, status.attention, include_due_at=True)
         if status.tokens or status.input_tokens or status.output_tokens:
             meta.append("\n")
             _append_token_meta(meta, status, dim=False)

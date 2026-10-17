@@ -13,6 +13,7 @@ branch the live agents only hit once a day.
 
 from __future__ import annotations
 
+import asyncio
 from pathlib import Path
 
 import pytest
@@ -45,6 +46,7 @@ from symphony.workflow import (
     GeminiConfig,
     HooksConfig,
     PiConfig,
+    PrimeAgentConfig,
     ServerConfig,
     ServiceConfig,
     TrackerConfig,
@@ -107,12 +109,16 @@ def _make_cfg(kind: str, *, workspace_root: Path) -> ServiceConfig:
             stall_timeout_ms=30_000,
             resume_across_turns=True,
         ),
+prime_agent=PrimeAgentConfig(
+    command='prime-agent -p --mode json',
+    turn_timeout_ms=3_600_000,
+    read_timeout_ms=5_000,
+    stall_timeout_ms=300_000,
+    resume_across_turns=True,
+),
         server=ServerConfig(port=None),
         prompt_template="hi",
     )
-
-
-import asyncio
 
 
 def _noop_event(_: dict) -> "asyncio.Future[None]":
@@ -133,13 +139,19 @@ class TestClaudeIsErrorResultBranches:
     Existing tests cover the happy and the most-reported branches. These
     pin the rarer ones that a future refactor could silently invert."""
 
-    def test_subtype_success_overrides_string_is_error_yes(self) -> None:
-        # Per docstring: subtype=="success" short-circuits BEFORE is_error.
+    def test_is_error_overrides_success_subtype(self) -> None:
+        # Claude rate-limit results can report subtype=success with is_error=true.
         assert (
             _is_error_result(
                 {"type": "result", "subtype": "success", "is_error": "yes"}
             )
-            is False
+            is True
+        )
+        assert (
+            _is_error_result(
+                {"type": "result", "subtype": "success", "is_error": True}
+            )
+            is True
         )
 
     def test_subtype_starts_with_error_short_circuits_true(self) -> None:

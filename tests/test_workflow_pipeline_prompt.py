@@ -1,11 +1,4 @@
-"""Coverage for the production-pipeline prompt templates shipped in
-WORKFLOW.file.example.md / WORKFLOW.example.md plus docs/symphony-prompts/.
-
-These tests assert the prompt: (1) parses + renders for every active state,
-    (2) carries only the current stage-specific instructions the agent needs,
-    (3) renders the retry and blocked_by branches, and (4) preserves the
-    fixed human-review handoff before Done.
-"""
+"""Coverage for the shipped 4-stage prompt templates."""
 
 from __future__ import annotations
 
@@ -14,81 +7,116 @@ from pathlib import Path
 import pytest
 
 from symphony.issue import BlockerRef, Issue
-from symphony.prompt import build_prompt_env, render
+from symphony.prompt import build_first_turn_prompt, build_prompt_env, render
 from symphony.workflow import build_service_config, load_workflow
 
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
-
-# `WORKFLOW.md` is gitignored — every operator customizes it for their own
-# board (different prompt body, different agent.kind, different hooks). The
-# pipeline prompt is shipped via the *example* files; those are the
-# canonical reference users copy from. We deliberately do not assert the
-# pipeline prompt lives in `WORKFLOW.md` itself, since requiring that
-# would break any non-pipeline workflow people legitimately run.
-WORKFLOW_FILES = (
-    "WORKFLOW.file.example.md",
-    "WORKFLOW.example.md",
-)
+WORKFLOW_FILES = ("WORKFLOW.file.example.md", "WORKFLOW.example.md")
 
 STAGE_HEADINGS_BY_STATE = {
     "Todo": "### TRIAGE",
-    "Explore": "### EXPLORE",
-    "Plan": "### PLAN",
     "In Progress": "### IMPLEMENT",
-    "Review": "### REVIEW",
-    "QA": "### QA",
-    "Learn": "### LEARN",
+    "Verify": "### VERIFY",
+    "Document": "### DOCUMENT",
     "Done": "### DONE",
 }
 
-# Phrases the EXPLORE stage must reference so the agent actually consults
-# the three sources of domain knowledge (wiki, history, code) and produces
-# the structured brief / candidate plans / recommendation.
-EXPLORE_HARD_RULES = (
-    "llm-wiki",
-    "git log",
-    "Domain Brief",
-    "Plan Candidates",
-    "Recommendation",
+IN_PROGRESS_RULES = (
+    "proof map",
+    "before state",
+    "after target",
+    "what would still be `Not proven`",
+    "## Plan",
+    "## Acceptance Tests",
+    "## Done Signals",
+    "## Implementation",
+    "## Self-Critique",
+    "Static browser apps that claim direct `file://` support must boot from `file://`",
+    "## Pipeline Route",
+    "state to `Verify`",
 )
 
-# Phrases the LEARN stage must reference so wiki updates are not optional.
-LEARN_HARD_RULES = (
+VERIFY_RULES = (
+    "Verify has three jobs: review, QA, and merge preflight",
+    # F-10: exactly one merge per ticket, created by the orchestrator at Done.
+    "Verify proves, Document documents, the orchestrator merges",
+    "what worked",
+    "what failed",
+    "what is not covered",
+    "How to re-run",
+    "## Security Audit",
+    "## Review Findings",
+    "Browser UI work must drive Playwright/headless Chromium",
+    "fail on module-script/CORS boot errors",
+    "DOM shims are smoke only, never final Verify authority",
+    "## Environment Block",
+    "Full integration gate",
+    "committed target branch",
+    "register new Kanban/board bug tickets",
+    # F-09: the lane names the validated write verb instead of telling the
+    # agent to hand-edit `blocked_by` frontmatter.
+    "board update {{ issue.identifier }} --add-blocked-by <ID>".replace(
+        "{{ issue.identifier }}", "DEMO-1"
+    ),
+    "never hand-edit frontmatter",
+    "rerun from scratch",
+    "## QA Evidence",
+    "## AC Scorecard",
+    "Evidence cells must cite files under `docs/DEMO-1/` as `qa/...` or `work/...`",
+    "## QA Failure",
+    "git merge-tree --write-tree",
+    "Do not merge the target branch into the ticket workspace",
+    "## Merge Status",
+    "Set state to `Document`",
+)
+
+APP_RELEASE_VERIFY_RULES = (
+    "Tickets labeled `app-release`",
+    "release-contract.yaml",
+    "docs/DEMO-1/qa/release-evidence.json",
+    "exact target commit",
+    "desktop, tablet, and mobile",
+    "symphony release check",
+    "Historical Markdown or ledger GREEN text is never current approval",
+    '"$SYMPHONY_WORKFLOW_DIR/WORKFLOW.md"',
+    "structurally valid repairable RED",
+    "forward historical transition",
+    "Evidence, schema, or environment errors stay in `Verify`",
+    "rebase this evidence-only verifier branch",
+    "never merges it into the target",
+)
+
+DOCUMENT_RULES = (
     "llm-wiki",
     "INDEX.md",
-    "Decision log",
-    "Wiki Updates",
-)
-
-# File-tracker variants record QA via a `## QA Evidence` markdown section in
-# the ticket body; the Linear variant records it as a "QA Evidence comment".
-# Both must mention `QA Evidence` and demand real execution.
-QA_HARD_RULES = (
-    "THIS STAGE MUST EXECUTE REAL CODE",
-    "QA Evidence",
-)
-
-REVIEW_REWIND_RULES = (
-    "CRITICAL, HIGH, or MEDIUM finding",
-    "Review Findings",
-)
-
-QA_REWIND_RULES = (
-    "server-reported HIGH",
-    "QA Failure",
+    "## Wiki Updates",
+    "## As-Is -> To-Be Report",
+    "Final History Gate",
+    # The gate moved to the host: the agent is told to stay out of git, and
+    # told not to self-block when its sandbox refuses a local git write.
+    "Symphony runs it, not you",
+    "Do not stage, commit, or publish the delivery record yourself",
+    "git ls-remote",
+    "Never set `Blocked` because a local git command failed",
+    "## Human Review",
+    "Set state to `Done`",
+    "Set state to `Human Review` only",
+    "Operator skip",
 )
 
 DONE_REPORT_SHAPE = (
     "## As-Is -> To-Be Report",
+    "### Goal",
     "### As-Is",
     "### To-Be",
     "### Reasoning",
     "### Evidence",
+    "### Not Covered",
+    "### How To Re-run",
 )
 
 HUMAN_REVIEW_HANDOFF_SHAPE = (
-    "## Human Review",
     "### What Changed",
     "### Why It Matters",
     "### Evidence",
@@ -99,8 +127,31 @@ HUMAN_REVIEW_HANDOFF_SHAPE = (
 
 
 def _load(name: str):
-    cfg = build_service_config(load_workflow(REPO_ROOT / name))
-    return cfg
+    return build_service_config(load_workflow(REPO_ROOT / name))
+
+
+@pytest.mark.parametrize("workflow", WORKFLOW_FILES)
+def test_shipped_workflows_allow_registry_access_without_full_sandbox(
+    workflow: str,
+) -> None:
+    cfg = _load(workflow)
+
+    assert cfg.codex.thread_sandbox == "workspace-write"
+    assert cfg.codex.turn_sandbox_policy == {
+        "type": "workspaceWrite",
+        "networkAccess": True,
+    }
+
+
+def test_workflow_docs_explain_registry_network_policy() -> None:
+    docs = (
+        REPO_ROOT / "skills" / "symphony-skill" / "reference" / "workflow-config.md"
+    ).read_text(encoding="utf-8")
+    normalized_docs = " ".join(docs.split())
+
+    assert "turn_sandbox_policy: {type: workspaceWrite, networkAccess: true}" in docs
+    assert "package registries" in docs
+    assert "does not require `danger-full-access`" in normalized_docs
 
 
 def _issue(state: str, **overrides) -> Issue:
@@ -118,166 +169,103 @@ def _issue(state: str, **overrides) -> Issue:
 
 
 @pytest.mark.parametrize("workflow", WORKFLOW_FILES)
-def test_active_states_cover_full_pipeline(workflow: str) -> None:
+def test_active_states_cover_four_stage_pipeline(workflow: str) -> None:
     cfg = _load(workflow)
-    for required in ("Todo", "Explore", "Plan", "In Progress", "Review", "QA", "Learn"):
-        assert required in cfg.tracker.active_states, (
-            f"{workflow} active_states missing {required!r} — TUI lane will not render"
-        )
-        assert required.lower() in cfg.prompts.stage_templates, (
-            f"{workflow} prompts.stages missing {required!r}"
-        )
-    assert "done" in cfg.prompts.stage_templates, (
-        f"{workflow} prompts.stages missing terminal Done report prompt"
+
+    assert tuple(cfg.tracker.active_states) == (
+        "Todo",
+        "In Progress",
+        "Verify",
+        "Document",
     )
+    for required in ("Todo", "In Progress", "Verify", "Document"):
+        assert required.lower() in cfg.prompts.stage_templates
+    assert "done" in cfg.prompts.stage_templates
     assert "Human Review" in cfg.tracker.terminal_states
     assert "Human Review" not in cfg.tracker.active_states
 
 
 @pytest.mark.parametrize("workflow", WORKFLOW_FILES)
-@pytest.mark.parametrize(
-    "state", ["Todo", "Explore", "Plan", "In Progress", "Review", "QA", "Learn", "Done"]
-)
-def test_prompt_renders_for_every_stage(workflow: str, state: str) -> None:
+@pytest.mark.parametrize("state", list(STAGE_HEADINGS_BY_STATE))
+def test_prompt_renders_only_current_stage(workflow: str, state: str) -> None:
     cfg = _load(workflow)
     rendered = render(
         cfg.prompt_template_for_state(state),
         build_prompt_env(_issue(state), attempt=None),
     )
+
     assert f"Current state: {state}." in rendered
     current_heading = STAGE_HEADINGS_BY_STATE[state]
-    assert current_heading in rendered, (
-        f"missing current stage heading {current_heading!r} at state={state}"
-    )
+    assert current_heading in rendered
     for other_state, heading in STAGE_HEADINGS_BY_STATE.items():
-        if other_state == state:
-            continue
-        assert heading not in rendered, (
-            f"unexpected stage heading {heading!r} in render for state={state}"
-        )
+        if other_state != state:
+            assert heading not in rendered
 
 
 @pytest.mark.parametrize("workflow", WORKFLOW_FILES)
-def test_qa_stage_demands_real_execution(workflow: str) -> None:
+def test_todo_routes_actionable_work_to_in_progress(workflow: str) -> None:
     cfg = _load(workflow)
     rendered = render(
-        cfg.prompt_template_for_state("QA"),
-        build_prompt_env(_issue("QA"), attempt=None),
+        cfg.prompt_template_for_state("Todo"),
+        build_prompt_env(_issue("Todo"), attempt=None),
     )
-    for phrase in QA_HARD_RULES:
-        assert phrase in rendered, f"QA stage missing hard rule: {phrase!r}"
+
+    assert "routing to In Progress" in rendered
+    assert "set state to `In Progress`" in rendered
 
 
 @pytest.mark.parametrize("workflow", WORKFLOW_FILES)
-def test_review_high_findings_rewind_to_in_progress(workflow: str) -> None:
-    cfg = _load(workflow)
-    rendered = render(
-        cfg.prompt_template_for_state("Review"),
-        build_prompt_env(_issue("Review"), attempt=None),
-    )
-    for phrase in REVIEW_REWIND_RULES:
-        assert phrase in rendered, f"Review stage missing rewind rule: {phrase!r}"
-
-
-@pytest.mark.parametrize("workflow", WORKFLOW_FILES)
-def test_qa_server_reported_high_issues_rewind_to_in_progress(
-    workflow: str,
-) -> None:
-    cfg = _load(workflow)
-    rendered = render(
-        cfg.prompt_template_for_state("QA"),
-        build_prompt_env(_issue("QA"), attempt=None),
-    )
-    for phrase in QA_REWIND_RULES:
-        assert phrase in rendered, f"QA stage missing server-high rewind rule: {phrase!r}"
-
-
-@pytest.mark.parametrize("workflow", WORKFLOW_FILES)
-def test_explore_stage_consults_wiki_history_and_code(workflow: str) -> None:
-    cfg = _load(workflow)
-    rendered = render(
-        cfg.prompt_template_for_state("Explore"),
-        build_prompt_env(_issue("Explore"), attempt=None),
-    )
-    for phrase in EXPLORE_HARD_RULES:
-        assert phrase in rendered, f"Explore stage missing hard rule: {phrase!r}"
-
-
-@pytest.mark.parametrize("workflow", WORKFLOW_FILES)
-def test_plan_stage_creates_professional_executable_plan(workflow: str) -> None:
-    cfg = _load(workflow)
-    rendered = render(
-        cfg.prompt_template_for_state("Plan"),
-        build_prompt_env(_issue("Plan"), attempt=None),
-    )
-    for phrase in (
-        "Do not write production code",
-        "## Plan",
-        "implementation-plan.md",
-        "execute by reading only `## Plan`",
-        "verification commands",
-        "state to `In Progress`",
-    ):
-        assert phrase in rendered, f"Plan stage missing hard rule: {phrase!r}"
-
-
-@pytest.mark.parametrize("workflow", WORKFLOW_FILES)
-def test_in_progress_uses_plan_as_primary_contract(workflow: str) -> None:
+def test_in_progress_stage_combines_plan_build_and_self_critique(workflow: str) -> None:
     cfg = _load(workflow)
     rendered = render(
         cfg.prompt_template_for_state("In Progress"),
         build_prompt_env(_issue("In Progress"), attempt=None),
     )
 
-    assert "Read the plan first" in rendered
-    assert "That plan should be enough to implement" in rendered
-    assert "Use Explore notes, llm-wiki, or" in rendered
-    assert "only as reference material" in rendered
+    for phrase in IN_PROGRESS_RULES:
+        assert phrase in rendered
+    assert "docs/{{ issue.identifier }}/work/" not in rendered
+    assert "docs/DEMO-1/work/" in rendered
 
 
 @pytest.mark.parametrize("workflow", WORKFLOW_FILES)
-def test_learn_stage_writes_back_to_wiki(workflow: str) -> None:
+def test_verify_stage_demands_review_qa_and_merge_evidence(workflow: str) -> None:
     cfg = _load(workflow)
     rendered = render(
-        cfg.prompt_template_for_state("Learn"),
-        build_prompt_env(_issue("Learn"), attempt=None),
-    )
-    for phrase in LEARN_HARD_RULES:
-        assert phrase in rendered, f"Learn stage missing hard rule: {phrase!r}"
-
-
-@pytest.mark.parametrize("workflow", WORKFLOW_FILES)
-def test_learn_stage_requires_merge_before_done(workflow: str) -> None:
-    cfg = _load(workflow)
-    rendered = render(
-        cfg.prompt_template_for_state("Learn"),
-        build_prompt_env(_issue("Learn"), attempt=None),
-    )
-    for phrase in ("Merge Gate", "target branch", "before setting state to `Human Review`"):
-        assert phrase in rendered, f"Learn stage missing merge gate: {phrase!r}"
-    assert "before setting state to `Done`" not in rendered
-
-
-@pytest.mark.parametrize("workflow", WORKFLOW_FILES)
-def test_learn_stage_requires_merge_tree_preflight_not_status_only(workflow: str) -> None:
-    cfg = _load(workflow)
-    rendered = render(
-        cfg.prompt_template_for_state("Learn"),
-        build_prompt_env(_issue("Learn"), attempt=None),
+        cfg.prompt_template_for_state("Verify"),
+        build_prompt_env(_issue("Verify"), attempt=None),
     )
 
-    assert "git merge-tree --write-tree" in rendered
-    assert "Do not use `git status -uno --porcelain` as the merge proof" in rendered
-    assert "committed target/branch merge conflict" in rendered
+    for phrase in VERIFY_RULES:
+        assert phrase in rendered
+    assert "Do not use `git status -uno --porcelain` as merge proof" in rendered
+    assert "set state to `In Progress`" in rendered
+    # F-10: the Verify lane must not hand-merge — that produced two merge
+    # commits per ticket and landed code before Document wrote the wiki.
+    assert "orchestrator will merge at Done" in rendered
+    assert "Do NOT create the merge commit yourself" in rendered
+    assert "create the explicit `--no-ff` merge commit" not in rendered
+
+
+def test_file_verify_stage_carries_the_app_release_machine_gate() -> None:
+    cfg = _load("WORKFLOW.file.example.md")
+    rendered = render(
+        cfg.prompt_template_for_state("Verify"),
+        build_prompt_env(_issue("Verify"), attempt=None),
+    )
+
+    for phrase in APP_RELEASE_VERIFY_RULES:
+        assert phrase in rendered
+    assert "$SYMPHONY_WORKFLOW_PATH" not in rendered
 
 
 @pytest.mark.parametrize("workflow", WORKFLOW_FILES)
-def test_learn_stage_respects_disabled_auto_merge(workflow: str) -> None:
+def test_verify_stage_respects_disabled_auto_merge(workflow: str) -> None:
     cfg = _load(workflow)
     rendered = render(
-        cfg.prompt_template_for_state("Learn"),
+        cfg.prompt_template_for_state("Verify"),
         build_prompt_env(
-            _issue("Learn"),
+            _issue("Verify"),
             attempt=None,
             auto_merge_on_done=False,
         ),
@@ -285,33 +273,117 @@ def test_learn_stage_respects_disabled_auto_merge(workflow: str) -> None:
 
     assert "Merge Gate is disabled" in rendered
     assert "leaves branch integration to the operator" in rendered
-    assert "before setting state to `Done`" not in rendered
-    assert "Transition state to `Human Review`" in rendered
+    assert "Set state to `Document`" in rendered
+
+
+@pytest.mark.parametrize("workflow", WORKFLOW_FILES)
+def test_document_stage_writes_wiki_and_done_or_intervention_handoff(workflow: str) -> None:
+    cfg = _load(workflow)
+    rendered = render(
+        cfg.prompt_template_for_state("Document"),
+        build_prompt_env(_issue("Document"), attempt=None),
+    )
+
+    for phrase in DOCUMENT_RULES:
+        assert phrase in rendered
+    for heading in HUMAN_REVIEW_HANDOFF_SHAPE:
+        assert heading in rendered
+    # F-07: read-only history inspection is the lane's job, not a cage.
+    assert "Read-only inspection of history is expected" in rendered
+    assert "do NOT run git history commands" not in rendered
+    # F-08: the lane's write scope matches its charter (docs, not just wiki).
+    assert "the user-facing docs this change touched" in rendered
+    assert "Update every user-facing doc the change touched" in rendered
+    assert "no source or test edits" in rendered
+    # The ownership boundaries that ARE legitimate stay.
+    assert "Do not create commits, tags, branches, or pushes" in rendered
+    # F-27: `## Document Defect` was consumed as a rewind section that no
+    # prompt ever told an agent to write.
+    assert "## Document Defect" in rendered
+    assert "set state to `In Progress`" in rendered
+
+
+@pytest.mark.parametrize("workflow", WORKFLOW_FILES)
+def test_document_stage_receives_board_health_only_when_present(workflow: str) -> None:
+    cfg = _load(workflow)
+    template = cfg.prompt_template_for_state("Document")
+    quiet = render(template, build_prompt_env(_issue("Document"), attempt=None))
+    assert "Board health" not in quiet
+    noisy = render(
+        template,
+        build_prompt_env(
+            _issue("Document"),
+            attempt=None,
+            board_health="- lane `verify`: rewound 3x, contract failed 2x",
+        ),
+    )
+    assert "Board health (orchestrator stats, last 30 days)" in noisy
+    assert "rewound 3x" in noisy
+    assert "## Learnings" in noisy
 
 
 @pytest.mark.parametrize("flavor", ("file", "linear"))
-def test_base_prompt_declares_merge_gate(flavor: str) -> None:
+def test_base_prompt_declares_four_stage_pipeline_and_skip_document(flavor: str) -> None:
     text = (REPO_ROOT / "docs" / "symphony-prompts" / flavor / "base.md").read_text(
         encoding="utf-8"
     )
 
-    assert "eight stages, no skipping" in text
-    assert "Plan  ->  In Progress" in text
-    assert "Learn  ->  Merge Gate  ->  Human Review  ->  Done" in text
-    assert "successful Learn Merge Gate" in text
-    assert "human confirmation" in text
+    assert "Production pipeline (4 active stages)" in text
+    assert "Board card mental model" in text
+    assert "Each lane answers one human question" in text
+    assert "Todo  ->  In Progress  ->  Verify  ->  Document" in text
+    assert "critical/manual intervention -> Human Review" in text
+    assert "Use `Human Review` only for real critical/manual intervention" in text
+    assert "Use `Not proven` when evidence is missing" in text
+    assert "Never skip Verify" in text
 
 
-@pytest.mark.parametrize("workflow", WORKFLOW_FILES)
-def test_learn_stage_carries_human_review_handoff_shape(workflow: str) -> None:
-    cfg = _load(workflow)
-    rendered = render(
-        cfg.prompt_template_for_state("Learn"),
-        build_prompt_env(_issue("Learn"), attempt=None),
+def test_operator_skill_routes_ticket_registration_by_work_type() -> None:
+    skill = (REPO_ROOT / "skills" / "symphony-skill" / "SKILL.md").read_text(
+        encoding="utf-8"
     )
-    for heading in HUMAN_REVIEW_HANDOFF_SHAPE:
-        assert heading in rendered, f"Human Review handoff missing section: {heading!r}"
-    assert "Transition state to `Human Review`" in rendered
+    delegation = (
+        REPO_ROOT
+        / "skills"
+        / "symphony-skill"
+        / "reference"
+        / "delegation.md"
+    ).read_text(encoding="utf-8")
+    decomposition = (
+        REPO_ROOT
+        / "skills"
+        / "symphony-skill"
+        / "oneshot"
+        / "reference"
+        / "decomposition.md"
+    ).read_text(encoding="utf-8")
+
+    assert "production-ready app delivery planning" in skill
+    assert "Work-type route: classify the request before ticket creation" in skill
+    assert "Do not force every task through" in skill
+    assert "product-delivery shape" in skill
+    assert "App-delivery work starts with discovery" in skill
+    assert "Human Review history gate" in skill
+    assert "committed and pushed" in skill
+    assert "Final integration loop" in skill
+    assert "Work type | First ticket owns | Final proof owns" in delegation
+    assert "Bugfix | Reproduction, suspected area, failing test/log" in delegation
+    assert "Do not register product-discovery tickets for a narrow bugfix" in delegation
+    assert "target customer and the job they need done" in delegation
+    assert "Reproduce failure with failing test/log" in delegation
+    assert "Behavior contract + acceptance matrix" in delegation
+    assert "Product readiness brief + release matrix" in delegation
+    assert "Release verification on merged target" in delegation
+    assert "register new Kanban bug tickets" in delegation
+    assert "loop until the merged target passes" in delegation
+    assert "curl 000" in delegation
+    assert "Route before slicing" in decomposition
+    assert "Bugfix**: reproduction -> minimal fix -> regression verification" in decomposition
+    assert "Feature/enhancement**: behavior contract" in decomposition
+    assert "Do not use the app-delivery pattern for every prompt" in decomposition
+    assert "If this is app delivery, is the product defined?" in decomposition
+    assert "Merged-target release verification" in decomposition
+    assert "defect-registration loop" in decomposition
 
 
 @pytest.mark.parametrize("workflow", WORKFLOW_FILES)
@@ -338,22 +410,165 @@ def test_blocked_by_branch_renders(workflow: str) -> None:
 
 
 def test_pipeline_demo_ticket_is_a_complete_worked_example() -> None:
-    """The shipped reference ticket must demonstrate every artefact the
-    pipeline expects, so users can copy its structure.
-
-    Lives under ``docs/`` (not ``kanban/``) so it is tracked in git;
-    ``kanban/`` is gitignored as the user-local board directory.
-    """
     body = (REPO_ROOT / "docs" / "PIPELINE-DEMO.md").read_text(encoding="utf-8")
     for required in (
         "## Plan",
+        "## Acceptance Tests",
+        "## Done Signals",
         "## Implementation",
+        "## Self-Critique",
+        "## Security Audit",
         "## Review",
         "## QA Evidence",
-        "## As-Is -> To-Be Report",
-        "### As-Is",
-        "### To-Be",
-        "### Reasoning",
-        "### Evidence",
+        "## AC Scorecard",
+        "## Merge Status",
+        "## Wiki Updates",
+        *DONE_REPORT_SHAPE,
     ):
-        assert required in body, f"PIPELINE-DEMO missing section {required!r}"
+        assert required in body
+
+
+@pytest.mark.parametrize("workflow", WORKFLOW_FILES)
+def test_base_prompt_renders_token_budget_directive_when_set(workflow: str) -> None:
+    cfg = _load(workflow)
+    rendered = render(
+        cfg.prompt_template_for_state("Verify"),
+        build_prompt_env(
+            _issue("Verify"),
+            attempt=None,
+            token_ema=1200,
+            token_budget=8000,
+        ),
+    )
+    assert "under 8000 completion tokens" in rendered
+    assert "1200" in rendered
+
+
+@pytest.mark.parametrize("workflow", WORKFLOW_FILES)
+def test_base_prompt_omits_token_budget_directive_by_default(workflow: str) -> None:
+    cfg = _load(workflow)
+    rendered = render(
+        cfg.prompt_template_for_state("Verify"),
+        build_prompt_env(_issue("Verify"), attempt=None),
+    )
+    assert "Token budget" not in rendered
+
+
+def test_file_base_prompt_renders_full_ticket_path_outside_description() -> None:
+    cfg = _load("WORKFLOW.file.example.md")
+    rendered = render(
+        cfg.prompt_template_for_state("Verify"),
+        build_prompt_env(
+            _issue("Verify", description="ticket body marker"),
+            attempt=None,
+            full_ticket_path="release-kanban/DEMO-1.md",
+        ),
+    )
+
+    full_ticket_index = rendered.index("Full ticket: release-kanban/DEMO-1.md")
+    description_index = rendered.index("## Description")
+    description_block = rendered.split("## Description", 1)[1].split(
+        "## Production pipeline",
+        1,
+    )[0]
+
+    assert full_ticket_index < description_index
+    assert "ticket body marker" in description_block
+    assert "Full ticket: release-kanban/DEMO-1.md" not in description_block
+    assert "Ticket file: `release-kanban/DEMO-1.md`." in rendered
+    assert "Ticket file: `kanban/DEMO-1.md`." not in rendered
+
+
+def test_file_base_prompt_does_not_direct_workers_to_kanban_without_path() -> None:
+    cfg = _load("WORKFLOW.file.example.md")
+    rendered = render(
+        cfg.prompt_template_for_state("Verify"),
+        build_prompt_env(_issue("Verify"), attempt=None),
+    )
+
+    assert "use the configured tracker board root" in rendered
+    assert "kanban/{{ issue.identifier }}.md" not in rendered
+
+
+def test_contract_rewind_prompt_uses_failing_rows_not_full_history() -> None:
+    body = """\
+Original task: make contract failures cheap and specific.
+
+## Acceptance Criteria
+
+- Contract rewind prompt includes failing rows and expected evidence shape.
+
+## Contract Failure
+Stage `Verify` did not produce the required outputs.
+Missing:
+- old vague failure
+
+```text
+stale historical log that must not be resent
+```
+
+## Implementation
+
+large implementation history that should not be in a contract rewind
+
+## Contract Failure
+Stage `Verify` did not produce the required outputs.
+
+Failing rows:
+- `## AC Scorecard` row 1 evidence `validated in source`
+  expected durable evidence such as `docs/DEMO-1/qa/evidence.md`,
+  `qa/...`, or `work/...`.
+
+Symphony rewound the ticket so the producing stage can complete the contract.
+"""
+    prompt, env = build_first_turn_prompt(
+        prompt_template=(
+            "Full ticket: {{ issue.full_ticket_path }}\n"
+            "## Description\n\n{{ issue.description }}"
+        ),
+        issue=_issue("Verify", description=body),
+        attempt=None,
+        language="en",
+        max_turns=3,
+        is_rewind=True,
+        compact_issue_context=True,
+        full_ticket_path="kanban/DEMO-1.md",
+    )
+
+    compact_description = env["issue"]["description"]
+    assert "Full ticket: kanban/DEMO-1.md" in prompt
+    assert "Original task: make contract failures cheap and specific." in prompt
+    assert "## Acceptance Criteria" in compact_description
+    assert "`## AC Scorecard` row 1" in compact_description
+    assert "validated in source" in compact_description
+    assert "docs/DEMO-1/qa/evidence.md" in compact_description
+
+    assert "old vague failure" not in compact_description
+    assert "stale historical log" not in compact_description
+    assert "large implementation history" not in compact_description
+
+
+@pytest.mark.parametrize("workflow", WORKFLOW_FILES)
+def test_base_prompt_directs_deliverables_to_the_artifacts_dir(workflow: str) -> None:
+    cfg = _load(workflow)
+    rendered = render(
+        cfg.prompt_template_for_state("Verify"),
+        build_prompt_env(
+            _issue("Verify"), attempt=None, artifacts_dir=".symphony-artifacts"
+        ),
+    )
+    assert "`.symphony-artifacts/` at the workspace root" in rendered
+    assert "manifest.json" in rendered
+    # The docs/ evidence root stays authoritative for proof.
+    assert "Every ticket artefact lives under `docs/DEMO-1/`." in rendered
+
+
+@pytest.mark.parametrize("workflow", WORKFLOW_FILES)
+def test_base_prompt_omits_artifacts_directive_when_disabled(workflow: str) -> None:
+    cfg = _load(workflow)
+    rendered = render(
+        cfg.prompt_template_for_state("Verify"),
+        build_prompt_env(_issue("Verify"), attempt=None),
+    )
+    assert "Board deliverables" not in rendered
+    assert "manifest.json" not in rendered

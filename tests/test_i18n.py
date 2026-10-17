@@ -8,6 +8,7 @@ from pathlib import Path
 from symphony.i18n import (
     DEFAULT_LANGUAGE,
     DOC_LANG_PREAMBLE,
+    DOC_WRITING_RULE,
     LANGUAGE_ENV_VAR,
     STRINGS,
     doc_language_preamble,
@@ -236,3 +237,61 @@ def test_workflow_alias_korean(tmp_path, monkeypatch):
     )
     cfg = build_service_config(load_workflow(path))
     assert cfg.tui.language == "ko"
+
+
+# ---------------------------------------------------------------------------
+# F-24 — the shipped i18n checker must pass on a clean tree
+# ---------------------------------------------------------------------------
+
+
+def test_check_i18n_script_passes_on_this_tree() -> None:
+    """A shipped checker that fails on a clean tree is worse than none.
+
+    It also has to understand the SPA's dynamic keys (the template-literal
+    `workflow.ciMode.` prefix), which is what made it red at HEAD.
+    """
+    import subprocess
+    import sys
+    from pathlib import Path
+
+    repo_root = Path(__file__).resolve().parents[1]
+    result = subprocess.run(
+        [sys.executable, "scripts/check_i18n.py"],
+        cwd=repo_root,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "OK:" in result.stdout
+
+
+def test_check_i18n_treats_template_literal_prefixes_as_used() -> None:
+    """The specific defect: `workflow.ciMode.*` looked "defined but unused"."""
+    import subprocess
+    import sys
+    from pathlib import Path
+
+    repo_root = Path(__file__).resolve().parents[1]
+    app_js = (
+        repo_root / "src" / "symphony" / "web" / "static" / "app.js"
+    ).read_text(encoding="utf-8")
+    assert "t(`workflow.ciMode.${mode}`)" in app_js
+    result = subprocess.run(
+        [sys.executable, "scripts/check_i18n.py"],
+        cwd=repo_root,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert "workflow.ciMode" not in result.stdout
+
+
+def test_every_preamble_carries_the_single_writing_rule():
+    from symphony.pm.planning import DEVELOPER_INSTRUCTIONS
+
+    assert set(DOC_WRITING_RULE) == set(DOC_LANG_PREAMBLE)
+    for lang in DOC_LANG_PREAMBLE:
+        assert doc_language_preamble(lang).endswith(DOC_WRITING_RULE[lang])
+    assert doc_language_preamble("fr").endswith(DOC_WRITING_RULE["en"])
+    assert DEVELOPER_INSTRUCTIONS.endswith(DOC_WRITING_RULE["en"])

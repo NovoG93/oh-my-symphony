@@ -10,6 +10,1222 @@ Versioning: [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.27.0] - 2026-10-16 - PM Workspace and portable planning demo
+
+### Added
+- Add the default-off local PM Workspace: five planning artifacts, managed WBS, constrained XLSX exchange, pinned OpenSpec integration, proposal-only assistance, revision approval, native ticket handoff, evidence checks, and fenced actual-process dispatch authority. A trimmed OpenSpec 1.14.2 CLI ships inside Symphony and runs with the host's Node.js 20.19.0 or newer whenever `pm.openspec_executable` is absent; set that key only to use your own OpenSpec 1.14.2.
+- Add `symphony pm demo [--path DIR] [--lang en|ko]`: a disposable, loopback-only PM Workspace with one validated sample change in English or Korean. It never starts an agent; Ctrl-C stops it and keeps the folder. Not verified on Windows. Each planning screen gains a "What do these buttons do?" guide (collapsed by default), `?lang=en|ko` sets the page language, and buttons that need a missing host tool are disabled up front with the reason: Approve revision and Preview archive without Node.js 20.19.0+, the planning assistant without a compatible installed Codex CLI and a Codex login. `symphony pm` now always runs this command, even when a `./pm` directory exists; run a workflow there with `symphony ./pm`.
+- PM approval and handoff remain separate local actions. This change does not enable automatic merge/push, deployment, publication, or real-project archive.
+- PM Workspace storyboard cards use structured server-owned fields and stable frame identities.
+- PM assistance exposes all seven bounded planning actions with per-document diff review.
+- No-run verification supports real host-executed native commands and immutable manual evidence through explicit acceptance.
+- Requirement and scenario coverage shows independent partial states and non-authoritative waiver records.
+- XLSX preview binds a plain `.xlsx` filename to the durable import snapshot and rejects hostile XML, duplicate IDs, active content, and unsupported containers before mutation.
+- XLSX exports include a UTC export time, native execution snapshots/links and leaf-status summary, derived display numbers/dependency summaries/adjacent titles, frozen identifying columns, parent indentation, read-only shading, and advisory controlled-field dropdowns while retaining version 1 import compatibility and custom task values.
+
+### Changed
+- PM planning assistance uses the installed Codex CLI after shared binary-generated schema and strict initialize checks, with executable replacement invalidating compatibility admission. GPT-6.1 Sol at medium reasoning, isolation, read-only/tool-disabled/no-network execution, and no provider fallback remain required. No automatic upgrade or downgrade is performed.
+- PM planning configuration rejects `pm.planning_codex_version`, `pm.planning_model`, and `pm.planning_reasoning_effort`; the dedicated planning client checks installed CLI capabilities and pins model and effort. Other unknown `pm.*` keys are still ignored, so use only documented settings.
+- PM mutations refuse untrusted cross-origin requests with `403 forbidden_origin`. Reverse-proxy operators must declare the browser origin in `SYMPHONY_TRUSTED_ORIGINS`; the disposable demo remains loopback-only and ignores that setting. `X-Symphony-PM-Owner` is an audit claim, not authentication.
+- CI runs the suite in parallel (`pytest-xdist`) and the wall-clock `timing` tests alone afterwards. Plain `python -m pytest -q` still runs everything serially.
+- Every worker prompt and the PM planning assistant now carry one shared writing rule (lead with the result, no filler or repetition, keep every number and warning).
+- Worker process cleanup is now confirmed per process group for every per-turn CLI backend (all backends except the Codex app-server). A turn whose agent leaves a background process running in its process group fails cleanup confirmation, and that backend refuses further turns until a stop confirms the group is gone.
+- The bundled OpenSpec and any configured `pm.openspec_executable` move from 1.14.0 to exactly 1.14.2; Node.js 20.19.0+ and the six commands PM Workspace calls are unchanged. Strict validation treats upstream warnings as invalid, including applicable main-spec and new `ADDED` requirement descriptions over 500 characters and spec text archive does not carry; recognized artifact-output and `apply.tracks` globs nested more than 16 levels are refused. PM containment, ownership, and path refusals are unchanged, and the `symphony-pm` schema and owner or project custom schemas are not edited or migrated. The planning assistant is asked to write within these limits without truncating owner content.
+
+### Fixed
+- PM source drafts compare with saved content, so recovered drafts are immediately savable. Localized discard guards preserve edits on Cancel across planning tabs, nested Design views, and project switching.
+- PM menus and drawers use the existing defined surface colors, narrow layouts wrap content and actions, and one owned overlay manages background interaction, keyboard focus, Escape/close and draft-safe storyboard dismissal. Empty optional assistance-review sections no longer render `nullnull`.
+- PM snapshot/archive operations share stable per-change authority; synchronous PM transactions and manual evidence/report reads run off the event loop with owned registry connections. Read-only Git status disables optional index locking, evidence Git checks use the existing operation timeout, and registry-recognition errors stay within the fail-closed dispatch result.
+- PM atomic writes, semantic-stage publication and recovery preserve existing regular-file modes while keeping new files at 0600. Archive recovery fsyncs its atomic writes and cleans temporary files after failure.
+- Default pytest execution includes the required Node PM UI suite and fails when Node is missing or the suite fails.
+- Korean Design source editors retain translated controls after opening from Storyboard, UX, or API. Repeated source/review toggles keep the selected language, existing source, focus behavior, and event handlers.
+- Failed project and planning-change selection restores the prior selection, content, focus, and announced error instead of leaving mismatched UI state.
+- PM planning assistance admits only a compatible installed Codex CLI, planning drafts are preserved, and planning cancellation is bound across admission, startup, and turn lifetime; further planning work is refused when cleanup is uncertain.
+- PM planning screens put secondary controls in mobile disclosures, keep the active artifact tab visible, serialize WBS refreshes, and manage keyboard focus for overlays.
+- Bundled OpenSpec 1.14.2 depends on `braces` 3.0.3, which [GHSA-vfj7-8cjw-p6xm](https://github.com/advisories/GHSA-vfj7-8cjw-p6xm) (HIGH, no patched release) lets deeply nested patterns crash Node with a stack overflow. The bundle now wraps `braces` with a guard that refuses patterns nested more than 16 levels (`scripts/openspec-bundle/stubs/braces.cjs`), so the bundled CLI is no longer byte-for-byte upstream there. OpenSpec's own 16-level guard already refused the comma-nested shape in schema output and `apply.tracks` globs. `tests/test_pm_openspec_bundle.py` pins both guards.
+- PM request work (transactions, XLSX exchange, JSON parsing) runs on a dedicated 2-thread pool (`pm.exchange_concurrency` + 1 when that is higher) instead of the default executor. On a 4-CPU Linux host, serving a 1,000-task plan left the server 59.5 MiB above idle, over the 50 MiB budget, because glibc keeps freed memory in per-thread malloc arenas; with the pool two runs of the same benchmark measured 34.8 and 30.8 MiB with all 11 reference budgets passing. Verification, acceptance and host-tool probes stay on the default executor.
+
+### Known limitations
+- Remaining PM findings include broad `ValueError` classification (`400 invalid_body`, unchanged pending separate contract approval), the test-only receipt builder, ignored unknown `pm.*` keys, and the runtime origin error omitting `SYMPHONY_TRUSTED_ORIGINS`. See the [finding IDs and operational effects](docs/pm-workspace-operations.md#accepted-findings-and-current-handling).
+- On a host without `ps`, a surviving process-group member that ignores SIGTERM can escape the final SIGKILL after its leader exits; cleanup stays uncertain and `stop()` raises. Native Windows PM behavior and real provider quota fallback remain unverified. The [human review checklist](docs/pm-workspace.md#final-human-review) is separate from automated proof and merge approval.
+
+## [0.26.0] - 2026-09-22 - First-run experience: demo keeps the generated workflow, project-facing agent files, clean git status
+
+### Fixed
+- `symphony project create` and `project add` now copy project-facing `AGENTS.md` / `GEMINI.md` templates instead of Symphony's own repository instructions, which told Codex and Gemini that the user's project "is Symphony".
+- Bootstrapped projects exclude `.symphony/` (state database, token EMA, stats) and `WORKFLOW-PROGRESS.md` through the local `info/exclude`, so the first run no longer leaves runtime files as untracked noise in `git status`.
+- A refused orchestrator start (protected source repository, port in use) no longer toggles macOS keep-awake before failing, and the failure sentence no longer ends with a doubled period.
+- Registry resource lookups no longer emit `stage_contracts_disabled` decision logs about other registered projects during `symphony project create`.
+
+### Changed
+- The "Try it in 60 seconds" demo writes `WORKFLOW.mock.md` beside the generated `WORKFLOW.md` instead of overwriting it, links the host board into each mock workspace so `symphony doctor` and the runtime report no board-reachability warnings, runs two concurrent mock workers so both the sample ticket and the new ticket move, and installs without the `[dev]` extras. README, README.ko, and the manual tutorial and cheatsheet carry the same steps.
+- README (English and Korean) lists Install and the 60-second demo directly after the table of contents.
+- `symphony --help` names every supported backend instead of only Codex, Claude Code, and Gemini.
+
+## [0.25.0] - 2026-09-12 - Execution diagnostics and Deep workflow reliability
+
+### Fixed
+- Per-attempt turn exhaustion retains its budget guard when no terminal destination exists or tracker persistence fails.
+- Startup preserves Human Review workspaces, and retry exhaustion prefers a configured Blocked lane over human review.
+- Reopened Deep Build prompts retain the latest failure evidence. Shared Deep instructions remove a repeated diagram while preserving ordering and completion gates.
+- Codex reports cached-input telemetry through the existing cache field without adding that subset to inclusive token totals.
+
+### Added
+- Ticket details explain the saved scheduler decision, link unresolved dependencies, and show known remaining execution limits. Missing usage stays unknown and disabled caps stay distinct from exhausted limits. Reloading this information is read-only.
+- Recorded an isolated real GPT-6 Astra Deep run through two Build contracts, intentional QA failure, repair, independent re-QA, Verify, and Document. This is local library-workflow evidence, not app-release or all-backend certification.
+
+## [0.24.0] - 2026-09-12 - Mechanical gates on every preset, reopen and quota budgets, learning loop
+
+### Fixed
+- Cancelled workers whose fresh tracker state is terminal no longer create a paused, slot-holding retry that blocks unrelated work. Reopened active tickets and unknown tracker state retain the existing cancellation recovery behavior.
+- Boards with only terminal tickets no longer show the misleading first-ticket empty-state hint.
+- Codex v2 token totals no longer count cached input and reasoning output twice; new dashboard usage and token budgets use the inclusive provider input/output totals. Historical stored totals are not migrated.
+- Deep file-board dependency chains no longer overflow Python's recursion limit; topological ordering avoids rescanning every remaining ticket per wave.
+- Prompt-write and turn-processing failures reap a live per-turn backend process before returning the error.
+- Transient rate-limit wording no longer switches backends; explicit quota/billing failures retain configured fallback behavior.
+- Gate-only history now appears on the stats page instead of the empty state.
+- English/Korean manuals clarify automatic completion and the deep request/DAG split; the homepage lists Prime Agent once.
+
+### Added
+- **Deep preset stage contracts.** `agent.stage_contracts: auto` now enforces
+  a contract set on the 8-lane deep preset too (`board_uses_shipped_contracts`).
+  At every lane transition the orchestrator re-checks what the lane prompt's
+  shell gate self-attests: the vault file exists (`brief.md`, `research.md`,
+  `plan.md` + `contracts.md`, `review.md`, `claims.md`, `qa-report.md`,
+  `verification.md`, `delivery.md`), its verdict line is present
+  (`verdict: PASS` before a request ticket may reach Done, `Verdict:
+  APPROVED|BLOCKED` for QA, `verdict: GREEN|RED` for Verify), the Build claim
+  names the ticket, and the short ticket section was appended. A miss appends
+  `## Contract Failure` and rewinds to the lane. `app-release` verifiers are
+  exempt because the host release cycle already owns that gate.
+- **Structured Jira notes.** `JiraClient.append_note` renders a Markdown
+  subset (headings, `- ` bullets, inline code/strong) into ADF instead of
+  flattening every line to a paragraph, so multi-section notes stay
+  readable in Jira.
+- **Idempotent Jira comment delivery.** `JiraClient.append_note_once(issue,
+  heading, body, marker)` reuses an existing comment carrying the marker,
+  raises `JiraCommentConflict` when that comment was edited, reads the post
+  back, and raises `JiraCommentDeliveryUncertain` when the read-back is
+  missing or differs, so a lost acknowledgement never turns into a
+  duplicate. `fetch_comments` pages `GET /issue/{key}/comment` to `total`
+  and refuses a truncated listing.
+- **Read-only intent analysis lane (pattern).** `examples/WORKFLOW.jira.example.md`
+  documents a pre-Intake analysis stage whose tracker note is a fixed
+  three-section projection: intent for non-developers, an optional policy
+  classification, then developer notes with a verdict.
+
+- **`agent.max_reopens` bounds the Build ↔ Verify reopen loop.** A deep
+  Verify RED / QA BLOCKED reopens a merged Build slice by moving it from Done
+  back to Build; that is a fresh run with a fresh rewind counter, so
+  `agent.max_attempts` never bounded the oscillation. The orchestrator now
+  counts the ticket's prior Done runs in the run registry and, past the cap
+  (default 3), appends `## Reopen Budget` and parks the ticket in Blocked
+  instead of dispatching another cycle. A `## Reopen Approved` section on
+  the ticket extends the budget by one; `0` disables.
+
+- **Trip-wire scan on the intent card.** The chat intent gate now runs the
+  sdlc-kit `tools/tripwire.sh` heuristics (migration/schema, data deletion,
+  public API, security paths, infra/config) over every proposal. Hits are
+  listed on the card, recorded as `## Trip-wires` on the request ticket and
+  in `.sdlc/work/<slug>/intent.md`, force a `micro` track to `full`, and the
+  deep Review prompt treats each as a mandatory objection candidate
+  (AGENTS.md rule 3 for lazymode-waived gates).
+
+- **`agent.fallback_kinds` — backend fallback on quota errors.** A worker
+  that exits on a usage-limit / quota / billing error (not a transient 429)
+  used to auto-pause until an operator re-pinned the ticket by hand (the
+  2026-09-05 E2E lost ~20 minutes this way). With `fallback_kinds` set, the
+  orchestrator force-pins the next untried kind onto the file-board ticket
+  (`FileBoardTracker.record_agent_kind(..., force=True)`), appends
+  `## Backend Fallback`, and schedules the normal retry. When every listed
+  kind has hit its limit the ticket pauses as before. Remote trackers
+  cannot carry the pin and keep the pause.
+- **`symphony doctor` probes the agent binary.** `agent.kind=<kind>` now runs
+  `<binary> --version` after the PATH lookup: a non-zero exit is a `warn`
+  naming the stub's output (the E2E host's `~/.opencode/bin/opencode` was an
+  npm postinstall stub), an exec failure is a `fail`.
+
+- **Learning loop closed: gate stats feed the Document lane.** `stats.jsonl`
+  gains `gate` events (contract failure with the missing items, reopen-budget
+  hold, backend fallback) and the aggregate now derives rewinds from the
+  board's lane order, exposing per-lane `rewinds_in/out`,
+  `contract_failures`, and a `gates.top_contract_misses` list on
+  `/api/v1/stats`, the web Stats page, and the TUI stats screen. The
+  Document lane's first prompt receives `{{ board_health }}` — a few lines
+  summarising the last 30 days — so recurring misses become `## Learnings`
+  and wiki entries instead of being rediscovered; healthy boards render
+  nothing.
+
+### Changed
+- **`core.py` extraction: `release_transition.py`.** The Verify-exit release
+  gate (`_enforce_app_release_transition_inner`, ~420 lines) now lives in
+  `orchestrator/release_transition.py` as a module-level function that takes
+  the orchestrator explicitly, following the `worker_exit.py` / `attempt.py`
+  convention; `core.py` keeps a one-call forward and the
+  `validate_release_contract` / `resolve_target_release_identity` test seams.
+  `core.py` is 9,822 → 9,680 lines.
+- **Parallel test suite is load-tolerant.** The two tests that failed only
+  under `pytest -n auto` (HANDOFF 2026-09-05 item 7) now wait long enough on
+  a loaded host: the worktree-script subprocess timeout is 60 s (was 5 s) and
+  the release-reconcile worker-start wait is 10 s (was 1 s).
+- **The move into Done is contract-gated.** Terminal transitions never
+  reached the phase handler, so the last gate of every board — `Document ->
+  Done` on the default preset, every lane `-> Done` on the deep preset — was
+  prompt-only, and `artifacts.require_for_done` could not fire on a board
+  whose Done lane is terminal. `attempt._post_turn_refresh` now runs the
+  producing lane's contract before accepting Done; a failure rewinds the
+  ticket with `## Contract Failure` and counts against `agent.max_attempts`.
+  Blocked, Cancelled, and Human Review stay ungated.
+
+### Fixed
+- **Empty `auto_merge_target_branch` no longer strands the release verifier.**
+  `WORKFLOW.file.example.md` ships both branch keys empty (meaning "the
+  current branch"), and the deep preset accepts that, but the release binder
+  refused it every tick (`release_dispatch_refused ... resolvable local
+  branch: ''`) while `VERIFY-1` waited in `Verify`. `resolve_configured_target_branch`
+  now resolves the empty value to the checked-out branch for `validate_release_contract`,
+  `inspect_release_contract`, and `resolve_target_release_identity`; a detached
+  HEAD still fails the "resolvable local branch" check.
+- **Symlink loops in project-setup paths.** Python 3.13+ `Path.resolve()`
+  no longer raises on a self-referential symlink, so a chat project-setup
+  marker pointing at one became a selectable action. `canonical_project_repo`
+  now rejects any unresolvable symlink component with `ELOOP`.
+- **Flaky release-reconcile test on slow hosts.** The lease-hold test waited
+  1 s for cleanup to start, but the preceding release enforcement shells out
+  to git a dozen-plus times and took ~1.05 s on macOS. The waits are now 10 s.
+
+## [0.23.0] - 2026-09-06 - Printable manual, hardened web auth, honest service lifecycle
+
+### Added
+- **Printable manual on GitHub Pages.** `docs/manual/{en,ko}/{cheatsheet,tutorial}.html`
+  plus a download section on the landing page. `pages.yml` renders the four
+  PDFs with Chromium at deploy time (`scripts/build_manual_pdf.py`); the TUI
+  key and CLI subcommand tables are generated from `HELP_SECTIONS` and
+  `SUBCOMMANDS` by `scripts/sync_manual_tables.py`, and a test fails when
+  they drift.
+
+### Changed
+- **TUI `?` help is a modal.** The one-line 8-second toast listing ~25
+  bindings is now a scrollable `HelpScreen` grouped into Board / Navigate /
+  Layout / Ticket; `?`, `esc`, or `q` closes it. A test asserts every
+  `KanbanApp` binding appears in it.
+- **`symphony --help` lists the subcommands.** `tui`, `doctor`, `board`,
+  `service`, `project`, `hub`, `runs`, `release`, `wiki-sweep` were routed
+  before argparse and so never appeared in the top-level help.
+- **Mistyped subcommands fail fast.** `symphony servce start` now prints
+  `unknown command 'servce'` plus the command list (exit 2) instead of
+  resolving `./servce` as a workflow and reporting a missing WORKFLOW.md.
+  Tokens with a dot, a path separator, or that exist on disk are still
+  treated as the workflow path.
+- README (en/ko) key tables now list every binding; the KO table had
+  lagged behind by nine keys (`n`/`e`/`a`/`c`/`S`/`P`/`L`/`/`/`s`).
+
+### Fixed
+- **Stage-contract rewinds actually rewind.** When a poll tick refreshed the
+  running entry to the *advanced* state while the turn was still in flight,
+  the rewind was written with that state's casing and became a silent no-op
+  (stats recorded `verify -> verify`; the ticket note still claimed a rewind).
+  The producing state's casing is now taken from the turn-start snapshot,
+  and `_transition_agent_phase` falls back to the workflow's spelling of the
+  producing state whenever the raw label does not denote it. Found by the
+  0.23.0 live end-to-end run with `pi` / `glm-5.3-flash`.
+- **Verify contract accepts the heading the Verify prompt asks for.** The
+  shipped prompt says to append `## Merge Status: preflight clean, …`, but
+  the section matcher only recognised a bare `## Merge Status` line, so every
+  prompt-compliant ticket failed the Verify contract. Headings may now carry
+  an inline summary after the colon and that text counts as section content.
+  Surfaced by the same live run once rewinds became real.
+- **`service start` no longer reports success for an orchestrator that dies
+  at once** (for example, port already bound). The 2s gate polled "is the pid
+  alive?", which is true on the first poll, so the check never ran; a dead
+  child is also a zombie that still answers `kill(pid, 0)`. Startup now reaps
+  with `waitpid(WNOHANG)` for the whole window and fails if the child exits.
+  `port_owner_hint` also stops naming the current process as the port owner.
+- **`service stop` can signal an orchestrator that does not lead a process
+  group.** `killpg` raises `ProcessLookupError` for such pids and the stop path
+  returned `False`; it now falls back to `os.kill` while the process is alive.
+- **A leftover `.symphony/run/*.lock` after a crash, SIGKILL, or reboot no
+  longer blocks `service start` forever.** The lock owner pid is read back;
+  a dead or unparsable owner is reclaimed once (logged as `reclaimed stale
+  lock`), and a live owner's error now says which file to delete.
+- **TUI `e` no longer re-queues a finished ticket.** A file-board ticket
+  whose `state:` differed from WORKFLOW.md only by case (`done` vs `Done`)
+  was prefilled with the first active state, so a title-only edit moved it
+  back to `Todo`. The state Select now matches case-insensitively and offers
+  an unknown state as an extra option.
+- **TUI cards refresh their Issue in place.** Reused `IssueCard` widgets kept
+  the pre-refresh ticket, so the detail pane, Enter modal and `e` prefill
+  showed stale fields and a second edit reverted the first.
+- **Orchestrator errors no longer crash the TUI.** `snapshot()`,
+  `iter_running_issues()`, `find_running_issue_id()`, `is_paused()` and
+  `stats.aggregate()` are guarded; the board keeps the last good snapshot and
+  toasts each distinct failure at most once per 10s.
+- **Body-less mutations can no longer bypass the JSON content-type gate.**
+  `_api_guard` skipped the `application/json` check when a POST/PUT/PATCH/
+  DELETE had no body, so a cross-origin HTML form could hit `pause`,
+  `resume`, `refresh`, `skip-document`, and friends without a CORS preflight.
+  A body-less mutation now returns 415 when the request carries any
+  browser provenance header (`Origin`, `Referer`, `Sec-Fetch-Site`,
+  `Sec-Fetch-Mode`) and no JSON type. Plain `curl -X POST` from a shell has
+  none of those headers, is not a CSRF vector, and keeps working unchanged;
+  the web app and `scripts/smoke_web_api.py` send `{}` regardless.
+- **Loopback-only gates work behind a declared reverse proxy.** With
+  `SYMPHONY_TRUSTED_ORIGINS` set, project management and `/_debug/tasks`
+  read the client from `X-Forwarded-For` (first entry) or `Forwarded: for=`
+  instead of trusting the proxy's loopback TCP peer; a missing, malformed,
+  or non-loopback forwarded address is refused. Without trusted origins the
+  headers are ignored, so a direct loopback caller cannot forge them.
+- **Chat WebSocket rejects foreign origins on every bind.** The Origin check
+  only ran when the server was loopback-bound, which is exactly the case that
+  needed it least. `run_server` also logs a WARN when the bind is
+  non-loopback and `SYMPHONY_API_TOKEN` is unset.
+
+
+## [0.22.0] - 2026-09-05 - Chat intent gate and orchestrator extractions
+
+### Added
+
+- **Chat intent gate (dark-factory cycle).** Software requests typed into
+  the web chat become a strict, server-owned intent card (Problem, Evidence,
+  Success criteria, Out of scope, Constraints, Open questions, Track). One
+  approval from the card or a bare `approve` reply makes the server file the
+  request ticket and record `.sdlc/work/<slug>/intent.md`; the agent never
+  files the request itself. Deep boards receive the ticket in `Intake`,
+  default boards in the first active state. Works in Q&A and edit mode.
+- Project-setup proposals accept `preset: deep`, so a new application asked
+  for in chat is born on the eight-lane pipeline; the preset is applied
+  before the initial commit.
+- The deep `Intake` prompt consumes the approved intent instead of
+  re-asking; `Track: micro` skips Research.
+
+### Changed
+
+- The chat board preamble teaches the intent protocol; `symphony board new`
+  / `board update` remain for operator-directed edits to existing tickets.
+- Per-dispatch environment (`SYMPHONY_TOKEN_EMA`, `SYMPHONY_TOKEN_BUDGET`,
+  `SYMPHONY_REWIND_SCOPE`) travels in `BackendInit.env` and is overlaid at
+  spawn time instead of mutating `os.environ` (#29).
+- `orchestrator/core.py` shrinks from 11.3k to 9.8k lines: the worker-exit
+  state machine moved to `orchestrator/worker_exit.py` and the
+  `_run_agent_attempt` body to `orchestrator/attempt.py`, both as
+  behavior-preserving extractions gated on the full suite.
+- The claude and pi backends subclass the shared per-turn skeleton through
+  `per_turn.JsonlStreamBackend` instead of carrying their own copies of the
+  spawn, stream, reap, and emit lifecycle.
+
+### Fixed
+
+- Retry-pending tickets keep their `## Touched Files` snapshot, so the
+  conflict pre-check no longer lets an overlapping candidate dispatch past a
+  ticket waiting on a retry (#28).
+- `.symphony/token_ema.json` and `done_count.json` renames retry on a held
+  handle (Windows `WinError 32`) before logging, and are namespaced per
+  workflow file so sibling workflows in one directory stop overwriting each
+  other (#30, #32).
+
+## [0.21.0] - 2026-08-24 - Authenticated boards and safer Windows orchestration
+
+### Added
+
+- **Optional board API authentication.** Set `SYMPHONY_API_TOKEN` to require
+  bearer authentication on operator API requests. The web app keeps the token
+  in session storage, attaches it centrally, and uses the query token only for
+  the browser WebSocket handshake. `SYMPHONY_TRUSTED_ORIGINS` remains the
+  separate control for public proxy and tunnel origins.
+- **More usable board surfaces.** TUI quit confirmation protects active agents;
+  compact cards show retry and backend context; web cards and commit rows gain
+  keyboard operation, onboarding states, stale-board feedback, clearer request
+  status, accessible labels, and complete English/Korean translations.
+
+### Changed
+
+- Extract run-attempt phase transitions behind one immutable transaction seam,
+  preserving ownership, backend rebinding, tracker writes, and cleanup order
+  while making the orchestration path easier to reason about and test.
+- Consolidate duplicated per-turn backend lifecycle helpers, move blocking
+  cleanup off the event loop, reuse one tracker HTTP client safely, and close
+  it without racing in-flight work.
+
+### Fixed
+
+- **Reliable Windows shutdown.** Terminate full backend process trees, gate
+  stored-PID kills by process identity where available, reclaim dead leases
+  with a native liveness probe, and stop managed services through an exact
+  workflow plus strong per-launch health capability. Weak, stale, or legacy
+  identities fail closed and never authorize an automatic force-kill.
+- **Windows filesystem and command behavior.** Use native ticket locks,
+  machine-local skill junctions, safe long-command stdin, cross-platform path
+  validation, preserved backslash argv parsing, and robust workspace-process
+  discovery.
+- Keep SPA keyboard actions disabled while board data is stale, preserve the
+  WebSocket auth boundary, restrict `/api/v1/_debug/tasks` to loopback callers,
+  and prevent internal exception details from leaking through HTTP 500
+  responses.
+- Make OneShot select a Python interpreter that actually executes instead of a
+  broken Windows Store alias, and keep its Windows bootstrap E2E fully isolated
+  under the temporary test home.
+- Keep Linux type checking portable across guarded Windows-only `ctypes` APIs
+  and make the migration concurrency test assert the real exactly-once schema
+  invariant rather than one scheduling interleaving.
+
+## [0.20.1] - 2026-08-13 - Proxied and tunnelled boards can manage projects
+
+### Fixed
+
+- **Project management behind a proxy or tunnel.** The project mutation
+  guard and the chat WebSocket compared the browser `Origin` byte-for-byte
+  against the `Host` header, so a board reached through cloudflared, ngrok,
+  or a TLS-terminating proxy rejected its own UI with
+  `project mutations require same-origin requests`. Loopback origins are now
+  accepted whatever their scheme or port, the host the browser actually
+  addressed is accepted, and the 403 names the environment variable to set.
+
+### Added
+
+- **`SYMPHONY_TRUSTED_ORIGINS`.** Comma-separated public front doors for a
+  proxied board — full origins (`https://board.example.com`), bare
+  hostnames (any scheme/port), or `*`. Declared hosts also satisfy the
+  `/api/` Host allowlist, so proxies that forward the public `Host`
+  verbatim work too. Opaque (`null`) and undeclared foreign origins are
+  still rejected.
+
+## [0.20.0] - 2026-08-13 - Ticket artifacts, runs explorer, and DAG scheduling
+
+### Added
+
+- Add host-owned ticket artifacts. Agents save deliverables (screenshots,
+  reports, exports) to `.symphony-artifacts/` at their workspace root; after
+  every turn Symphony copies new files to `.symphony/artifacts/<TICKET-ID>/`,
+  lists them in the web board's ticket drawer with inline image previews, and
+  writes an `## Artifacts` section on the ticket. Deliverables outlive the
+  workspace, stay out of Git, and never reach the merge. Configured under
+  `artifacts:` in `WORKFLOW.md`; `require_for_done: true` blocks Done until a
+  ticket has one, and `ttl_days` drops artifacts for archived tickets.
+- Add an attempt-centric Runs explorer with search/filter controls, polling,
+  per-run lifecycle timelines, bounded/redacted failure diagnostics, token and
+  Git/workspace references, and downloadable diagnostic JSON.
+- Add the additive SQLite v7 diagnostic schema and run detail/download API.
+  Persisted diagnostic events are allowlisted, redacted before storage, capped
+  per string/event/run, and remain non-authoritative telemetry.
+- Add durable crash continuation from private completed-turn checkpoints. A
+  confirmed dead or managed-stopped predecessor is fenced and linked to one new
+  Run attempt; exact supported backend sessions resume, unsupported or
+  release-authority runs start fresh, and interrupted turns remain at-least-once.
+- Add opt-in explainable DAG scheduling with `agent.scheduling_policy: dag`.
+  Dispatch and read-only queue explanations consume one scheduler decision path;
+  the Board Request view shows dependency execution order, deterministic waves,
+  capacity/retry ownership, and final dispatch refusals for file boards.
+
+## [0.19.1] - 2026-08-10 - Production-gated delivery and agent reliability
+
+### Added
+
+- Let operators choose any supported agent backend when starting each Chat
+  session, while keeping the workflow's configured backend as the default.
+- Add explicit local-only delivery with `agent.auto_merge_push_target: false`.
+  Symphony keeps its dirty-tree, conflict, and merge checks while skipping
+  remote publication and verification by policy.
+- Add an opt-in, host-owned application release contract that binds strict
+  browser/runtime evidence, implementation ancestry, and immutable runner
+  sources to one exact local target commit. File-board RED cycles create
+  idempotent repair groups and a fresh verifier before delivery can continue.
+
+### Changed
+
+- Enable configured Product Preview recipes by default while preserving an
+  explicit opt-out and valid unconfigured workflows. Running previews now
+  refresh readiness from successful or redirect health responses, expose an
+  unhealthy state when a live process stops serving correctly, and recover
+  when its health endpoint succeeds again.
+- Bind release approval and finalization to durable cycle generations and exact
+  active worker runs, including peer-fenced startup cleanup. The provenance
+  migration backs up databases with existing release gates and safely returns
+  legacy pending or approved gates to fresh verification.
+
+### Fixed
+
+- Reserve deterministic repair and verifier identities before file-board
+  creation, fence RED lifecycle writes to the exact live verifier lease, and
+  bind delivery completion to the exact host-observed terminal ticket version.
+  Crashes, peer takeovers, label loss, and terminal-ticket replay now fail
+  closed without duplicate repair work or inherited approval.
+- Validate copied verifier workflows against the canonical host board: only a
+  safe relative mount resolving exactly to the configured board is accepted;
+  missing, traversing, wrong-target, and arbitrary external mounts fail closed.
+- Retire verifiers after they durably hand off a RED repair cycle and discard
+  their stale paused retries on restart, so repair tickets can dispatch without
+  weakening lost-lease or unrelated release-generation safeguards.
+- Respect configured file-board roots in rendered worker prompts and pass the
+  configured Symphony environment to every workspace hook, so customized board
+  layouts behave consistently across setup, execution, and verification.
+- Safely refresh clean reused ticket worktrees when their feature branch has
+  already been merged into the configured target. Dirty or divergent worktrees
+  remain untouched, while unsafe or concurrently changing cases fail closed.
+- Pass the rendered prompt to AGY as its required `--print` argument instead
+  of the literal `-`, which AGY 1.1.x treats as prompt text rather than stdin.
+
+## [0.19.0] - 2026-08-09 - Live multi-agent chat and reliable delivery
+
+### Added
+
+- Stream Codex, Pi, and Prime Agent replies into Chat as they arrive, while
+  preserving complete final answers and filtering private thinking blocks.
+- Open Chat with an immediately usable idle QA session when no live session
+  exists; no agent turn starts and no tokens are consumed until a message is sent.
+- Add the portable `symphony-pyright` command so local, CI, and continuous
+  improvement checks use the active Python interpreter consistently.
+
+### Fixed
+
+- Replace cumulative agent snapshots instead of concatenating them, restore
+  terminal assistant messages from provider transcripts, and keep resumable
+  sessions visible when automatic idle-session initialization fails.
+- Keep active tracked board cards from blocking automated merges through shared
+  workspace links, then restore normal host Git tracking during cleanup.
+- Preserve ruamel.yaml runtime behavior while satisfying full-project type
+  checking without broad suppressions or environment-specific `.venv` paths.
+
+## [0.18.2] - 2026-08-08 - Responsive settings and safer blocked recovery
+
+### Added
+
+- Manage local projects from both the Hub and each project board: show the
+  canonical repository, workflow, and issue-board paths; create or adopt a path;
+  and switch to another independently running project without retargeting active
+  workers. Missing paths and existing non-Git directories are initialized as Git
+  repositories, while existing Git metadata and files are preserved.
+- Reorganize the web Settings page into workspace, workflow, and automation
+  sections with clearer descriptions, responsive card sizing, visible save
+  semantics, and English/Korean copy that remains readable down to phone widths.
+
+### Fixed
+
+- Replace newly generated blocked-recovery `RCA-*` cards with source-linked
+  `FIX-*` tickets. Fix workers now clarify vague requests into concrete,
+  testable acceptance criteria before retrying the source; the source depends
+  on the fix, legacy RCA cards remain compatible, and an unproven fix is moved
+  out of `Done` instead of leaving the parent silently Blocked.
+- Keep the useful rightmost portion of long project paths visible and reveal the
+  complete value on hover or keyboard focus without widening the sidebar.
+- Adopt repositories whose ignore rules hide Symphony operator files by
+  force-adding only files created by Symphony; unrelated ignored or modified
+  project files remain untouched.
+- Skip ports already occupied by unregistered local services when allocating a
+  new project endpoint, so start-and-switch does not fail after registration.
+
+## [0.18.1] - 2026-08-08 - Project workflow containment
+
+### Fixed
+
+- Require every registered or bootstrapped `WORKFLOW.md` path to be relative
+  to, contained by, and backed by the same Git repository as its project.
+  Absolute paths, `..` escapes, symlink escapes, and cross-repository workflow
+  selection are rejected before any external file can be written.
+
+## [0.18.0] - 2026-08-08 - Multi-project hub and isolated delivery
+
+### Added
+
+- **Central multi-project hub** — `symphony project create|add|list|start|stop|status`
+  manages independent Git repositories and `symphony hub` provides one local
+  switchboard while project services continue running in parallel. New projects
+  are bootstrapped as sibling Git repositories with an initial commit; existing
+  projects retain their own Git identity, workflow, board, branches, workspaces,
+  merge target, and Product Preview.
+- **Prime Agent backend** — select `agent.kind: prime-agent` alongside the other
+  supported coding-agent CLIs, with configuration preflight, lifecycle handling,
+  terminal-completion detection, and workflow examples.
+- **Managed Product Preview** — start and stop the selected target branch from
+  the admin UI using a preview-owned detached checkout, isolated per registered
+  project service.
+- Commit `uv.lock` so development and operator installs resolve the same tested
+  dependency set, plus a regression test for broken Claude skill symlinks.
+
+### Fixed
+
+- Recover blocked integrations autonomously when delivery branches are present,
+  while making the operator-only recovery boundary explicit when they are not.
+- Render Markdown tables correctly in ticket details on the web board.
+- Remove the stale `.claude/skills/symphony-oneshot` symlink left after operator
+  routing was consolidated into `symphony-skill`.
+
+### Security
+
+- Refuse ticket dispatch, managed service startup, and doctor approval when a
+  workflow points at the canonical `oh-my-symphony` source Git repository,
+  including linked worktrees. Product work must run in a separately registered
+  repository, preventing generated applications from modifying the orchestrator
+  that launched them.
+
+## [0.17.0] - 2026-08-08 - Minimal Symphony: chat-to-delivery ticket DAGs
+
+The "minimal" line: delete duplicate machinery, keep every operator-facing
+feature, and turn chat into a gated ticket-DAG pipeline.
+
+### Removed
+
+- **Governed per-ticket workflow engine** — the `symphony.flow` package, the
+  `symphony workflow`/`symphony run`/`symphony approval` CLIs, the
+  `workflow_engine:` config block, the flow run store, and the earlier
+  Unreleased notes describing them (the feature never shipped in a release).
+  Board-level `blocked_by` ticket DAGs are the one DAG substrate.
+- **`tools/board-viewer/`** standalone web board and the service
+  `--viewer-port` flag. The built-in admin UI on the orchestrator port is
+  the only board.
+- Repo debris: per-ticket dev archives under `docs/`, one-off screenshot and
+  demo scripts, generated progress files, and empty packages.
+
+### Added
+
+- **Continuous-improvement modes (experimental, opt-in)** — the heartbeat
+  grows from a product-readiness inspector into an autonomous application
+  improvement engine. `continuous_improvement.modes` selects any of
+  `readiness` (today's checks), `blocked_fixes` (triage Blocked / Human
+  Review tickets into linked fix tickets with a root-cause note),
+  `security` (optional `pip-audit` / `npm audit` scans into patch tickets),
+  `market_research` and `feature_improvements` (an agent turn that proposes
+  improvements with evidence). Everything stays opt-in: a missing or
+  disabled block runs nothing, and `enabled: true` with no `modes:` is the
+  old readiness-only behaviour. Proposals become **normal board tickets**
+  (first active state, `Goal`/`Scope`/`Acceptance` body, `ci` label,
+  `REQ-CI-<date>-<n>` request group, per-run cap, de-duplicated against open
+  tickets) and flow through the ordinary pipeline — never a parallel
+  execution path. Per-mode cadence via `mode_interval_hours` is durable
+  across restarts; a heartbeat with nothing due re-arms without spending a
+  turn. Agent-driven modes get a succinct prompt from
+  `docs/symphony-prompts/ci/` (built-in default otherwise) and may write
+  only their JSON proposal file — the orchestrator supplies the agent
+  capability so `continuous_improvement.py` stays orchestrator-free. Modes
+  are editable from the web settings card and
+  `PUT /api/v1/workflow/continuous-improvement`.
+- **Validated board tool** — `symphony board new` gains `--blocked-by`
+  (repeatable), `--request REQ-<n>` grouping, `--label` (repeatable), and
+  `--description-file PATH|-`. Creation — and the web API's issue
+  create/update — validates unique id, legal state, existing blockers, and
+  an acyclic dependency graph (violations print the cycle path).
+  `symphony board graph [--request REQ-n]` prints the ticket DAG.
+- **Per-stage backend routing** — `agent.stage_kinds` maps board states to
+  agent kinds. Resolution per dispatch: ticket `agent_kind` pin >
+  `agent.stage_kinds[state]` > `agent.kind`.
+- **Lane presets** — a succinct 4-lane default (`Todo → In Progress →
+  Verify → Document`) and an optional 8-lane deep pipeline (`Intake → Research
+  → Plan → Review → Build → QA → Verify → Document`) ported from the
+  OneShot template. Switchable from the admin UI settings page or
+  `GET /api/v1/workflow/presets` + `POST /api/v1/workflow/presets/apply`,
+  with comments preserved and removed-lane tickets migrated; boards stay
+  fully customizable.
+- **Chat board-intake protocol** — the chat agent files validated ticket
+  DAGs instead of freehand ticket markdown: a simple request becomes one
+  ticket; a complex request becomes a research → plan → plan-review →
+  build → qa → document stage-ticket DAG under one `--request` group; a
+  deep-preset board gets one Intake ticket and the pipeline decomposes.
+
+### Changed
+
+- **Default board: `Learn` lane renamed to `Document`** (existing boards with
+  a `Learn` lane keep working — the orchestrator, contracts, rewinds, and the
+  skip control all accept the legacy name, and `POST .../skip-learn` stays as
+  a deprecated alias of `POST .../skip-document`).
+- `symphony doctor` **loses two rows** (`viewer.board-viewer` and
+  `workflow_engine`) with the subsystems they checked, and **gains six**:
+  `board.reachable`, `board.deep_merge_contract`, `agent.stage_contracts`,
+  `board.cli`, `board.dependencies`, plus the existing rows. Anything parsing
+  doctor output should expect the new set.
+- `WORKFLOW-PROGRESS.md`'s board URL now points at the orchestrator's
+  `server.port` instead of the removed viewer's `:8765`.
+- **One merge per ticket.** The Verify prompt runs a
+  `git merge-tree --write-tree` preflight and records
+  `## Merge Status: preflight clean, orchestrator will merge at Done`; the
+  orchestrator's `auto_merge_on_done` creates the single `--no-ff` merge
+  commit *after* the Document lane has written its docs and wiki entries.
+  Previously both merged, producing two merge commits per ticket and landing
+  code on the target branch before Document ran.
+- **Document lane write scope** now matches its charter: `docs/llm-wiki/`,
+  the user-facing docs the change touched (README / CHANGELOG / config and
+  policy references), the ticket vault, and ticket comments. Read-only git
+  history inspection (`git log`/`show`/`diff`) is explicitly expected; the
+  commit/branch/push/merge boundary stays.
+- `agent.stage_kinds` is now re-resolved at **every** stage change, including
+  the in-run lane transitions one dispatch walks.
+- The stall budget is resolved from the backend a ticket actually runs on
+  (pin or stage route), not the workflow default.
+
+### Added (hardening)
+
+- `agent.stall_timeout_ms_by_state` — per-lane stall budget for heavy stages.
+- `agent.stage_contracts: auto|on|off` — explicit control of the mechanical
+  evidence floor, with a load-time `stage_contracts_disabled` log line, a
+  doctor row, `agent.stage_contracts_enabled` on `GET /api/v1/workflow`, and
+  a Settings-page hint when a renamed lane turns it off.
+- `symphony board update <id> [--state] [--blocked-by] [--add-blocked-by]
+  [--request]` — the validated write verb the stage prompts already assumed.
+- `SYMPHONY_BOARD_ROOT` / `SYMPHONY_BOARD_ROOT_NAME` / `SYMPHONY_CLI` in the
+  dispatch and hook environments.
+- Ticket frontmatter `last_agent_kind` — audit-only record of the backend
+  that last ran a ticket on a `stage_kinds`-routed board (never a pin).
+- Web board cards render `⛓ blocked by …` and request chips, and both the
+  create modal and the drawer can set `blocked_by` / `request`.
+
+### Fixed
+
+- Board identifiers are validated everywhere (`^[A-Za-z][A-Za-z0-9_-]{0,63}$`):
+  `symphony board new "../../evil"` no longer writes outside the board root.
+- The worktree setup hook links the **configured** `tracker.board_root`
+  instead of a hardcoded `kanban`, and a workspace whose board is not the host
+  board now fails the dispatch with a named error instead of looping forever.
+- Transient backend stream faults (`stream unreadable`, `no result event`)
+  schedule a bounded retry instead of auto-pausing the ticket. Tickets already
+  paused for those reasons self-heal on restart, because
+  `_is_retryable_auto_pause_reason` releases matching persisted pauses.
+- A `blocked_by` id that is not on the board is reported as
+  "blocker X is not on the board" (card + `board.dependencies` doctor row)
+  instead of deadlocking silently.
+- Applying a lane preset on a board without the preset's prompt files now
+  refuses with the `cp -R docs/symphony-prompts` fix instead of writing
+  placeholder prompts and reporting success.
+- Continuous improvement: cadence is stamped only for modes that produced a
+  real result; a `blocked_fixes` source returns to the pipeline once its fix
+  is Done; request ids are unique across the whole board; proposal dedupe no
+  longer collapses two proposals sharing a 60-char title prefix; an agent turn
+  that writes outside its proposal file is discarded and recorded
+  `not_proven`.
+- `scripts/check_i18n.py` understands template-literal key prefixes (it was
+  failing on a clean tree) and now runs in CI and in the test suite.
+
+Suite: 1718 passed, 7 skipped; ruff clean.
+
+## [0.16.1] - 2026-08-06 - Delivery commits survive the agent's sandbox
+
+### Fixed
+
+- A ticket can no longer be parked in `Blocked` because its agent lacked
+  permission to write git objects. The default workspace is a linked git
+  worktree, which keeps the object database in the host repo's `.git` while
+  the per-worktree admin dir lives in `.git/worktrees/<ID>`. Symphony granted
+  only the latter, so its grant covered the index lock but not the blob
+  write that reports `failed to insert into database`. Both directories are
+  now granted. (Measured afterwards: codex 0.146.0 grants a worktree's git
+  dirs on its own, so the injection is belt-and-braces there; the gap was
+  real for anything that does not.)
+- Continuous improvement now actually runs its checks. They were spawned as
+  `python -m pytest` (and `ruff`, `pyright`) with no shell, so on any machine
+  without a real `python` executable on PATH — macOS ships none, most Linux
+  distros ship only `python3`, and a shell alias does not apply to a
+  subprocess — every check returned `command not found`. That is reported as
+  `not_proven` rather than `failed`, so the heartbeat completed every phase,
+  proved nothing and opened no tickets, silently. Checks now run under
+  `sys.executable`, which is also the environment Symphony's own `pytest`,
+  `ruff` and `pyright` are installed into.
+- The `Blocked` recovery loop no longer dead-ends. An RCA ticket inherits the
+  same sandbox as the ticket it is rescuing and cannot open a further RCA, so
+  a permission failure stopped the board permanently. Symphony now re-checks a
+  blocked ticket's history against the real repository first, and reopens it
+  for one automated retry when the delivery commit is actually present.
+
+### Changed
+
+- The Final History Gate moved from the agent to the orchestrator. The agent
+  writes artefacts and sets state; the host commits the workspace, publishes
+  the branch when it has an upstream, and re-reads the remote tip with
+  `git ls-remote`. The host runs unsandboxed, so the delivery record is
+  recorded whatever the agent's CLI is allowed to do. A commit that cannot be
+  verified on the remote moves the card to `Human Review` — never `Blocked`,
+  since the work is committed and only publishing is outstanding.
+- The web board's type and spacing scale is `rem`-based and larger, with the
+  responsive rules cleaned up so lanes, modals and the Git and Chat pages hold
+  their layout down to mobile widths.
+
+### Added
+
+- Every backend (`agy`, `claude`, `codex`, `gemini`, `kiro`, `opencode`,
+  `pi`) exports `SYMPHONY_GIT_WRITABLE_ROOTS` so wrapper scripts can widen
+  their own sandbox; `codex` and `claude` additionally receive the roots as
+  CLI flags when Symphony can see the CLI token.
+- `symphony doctor` gained `git history writable`, which probes the object
+  database the host-side gate depends on, and `agent git grant`, which warns
+  when a wrapper-script command hides the CLI token that flag injection needs.
+- The web board is available in English and Korean. User-facing copy moved out
+  of `app.js` into an `i18n.js` catalogue, and `scripts/check_i18n.py` guards
+  the two locales against drift.
+
+## [0.16.0] - 2026-08-06 - Streaming chat, concurrent sessions, branch actions
+
+### Added
+
+- Chat answers now stream token by token. The Claude CLI already emitted
+  `--include-partial-messages` deltas; chat parses them and pushes them to the
+  focused socket only, without a sequence number, transcript row or JSONL line,
+  so a turn's hundreds of chunks cannot evict the conversation history.
+- Chat sessions carry an advisory turn and token budget chosen when the session
+  starts. Crossing a limit warns once and shows a red chip; it never blocks a
+  turn, because only the operator can judge when a conversation is finished.
+- Up to three chat sessions now run at once, each with its own turn lock,
+  sequence counter and transcript. `/api/v1/chat/sessions` is the new plural
+  surface; the singular `/api/v1/chat/session` routes stay as an alias for the
+  active session and still allow only one session at a time.
+- Chat sessions survive a server restart. Session metadata is mirrored into
+  `.symphony/chat/index.json` after every state change, and
+  `POST /api/v1/chat/sessions/{id}/reattach` rebuilds the backend — resuming the
+  agent-side conversation by id with Claude, and reintroducing the repository
+  through the preamble with backends that cannot resume.
+- The Git page can delete, push and open a pull request for a task branch.
+  Deleting refuses unmerged branches unless forced, pushing covers
+  `symphony/*` plus the merge target (which requires retyping its name) and is
+  never a force push, and `POST /api/v1/git/pr` shells out to `gh` and reports
+  a missing CLI, an unpushed branch or a non-GitHub remote distinctly.
+  `GET /api/v1/git/remote-status` tells the UI which actions are usable.
+
+### Fixed
+
+- The `turn_completed` chat frame reported a turn count one behind, because the
+  event is emitted while the turn is still running. Turns are now counted when
+  the message is sent, so the budget snapshot on that frame is current.
+- Stopping a chat session now flushes its JSONL transcript before the session is
+  released, so an immediate reattach cannot replay a truncated conversation.
+
+### Verified
+
+- Full suite: 1,494 passed, 5 skipped, with browser E2E enabled; Ruff clean and
+  Pyright at the unchanged 27-error environment baseline. The single failure,
+  `test_run_continuous_improvement_real_git_target_worktree_e2e`, reproduces
+  identically on the release base commit with none of this work applied.
+- Browser E2E now drives the Git and Chat pages end to end: a push to a local
+  bare remote, a delete refused while unmerged and accepted once forced, a
+  target push rejected until its name is retyped, token deltas rendering into a
+  live bubble and being replaced by the finished markdown, an advisory budget
+  warning that leaves the composer usable, two concurrent sessions, and a
+  stopped session reattached from its transcript.
+- Streaming, budget accounting and the session index were additionally checked
+  against a real Claude CLI turn: deltas arrive unnumbered, never reach the
+  JSONL, and a session over its limit still runs.
+
+## [0.15.0] - 2026-07-18 - Production boundary hardening
+
+### Fixed
+
+- Auto-merge now checks excluded roots with literal Git path boundaries and
+  stages only the exact untracked, non-ignored capture files. Partial staging
+  and commit-hook failures restore repository state without losing captured
+  file bytes or staging unrelated tracked edits.
+- Retry waits now distinguish agent failures from capacity, dependency, lease,
+  continuous-improvement, and blocker contention. Non-agent waits preserve
+  duplicate-prevention ownership without consuming a worker slot or retry
+  attempt.
+- Server startup now uses one typed aiohttp application key, eliminating the
+  startup warning while preserving existing host-guard behavior.
+
+### Changed
+
+- File-board TUI refreshes now scan and parse each ticket once while preserving
+  ticket order and the existing Jira and Linear query behavior.
+- Distribution metadata now declares the SPDX `Apache-2.0` license expression,
+  includes `LICENSE` and `NOTICE`, and uses the PEP 639-capable Setuptools 77
+  build floor.
+
+### Verified
+
+- Full suite: 1,415 passed, 6 skipped with 84.18% coverage; Ruff and Pyright
+  clean.
+- The frozen 1,000- and 5,000-card file-board benchmark preserved ordering and
+  parse counts while running at 50.56% and 53.44% of the prior two-scan
+  baseline.
+- Isolated wheel and sdist checks passed, including installed CLI and static
+  resources, SPDX/legal-file metadata, warning rejection, and source-tree
+  cleanliness.
+- Installed-artifact lifecycle testing passed `symphony doctor`, exact health,
+  all nine API smoke checks, graceful shutdown, closed-port and zero-active-run
+  checks, cleanup, and original-board integrity.
+
+### Verification limits
+
+- The lifecycle test used an empty disposable file board and did not exercise a
+  real worker dispatch, managed service/viewer, browser/TUI interaction, or live
+  Jira and Linear adapters.
+- The existing registry-error fail-open policy and non-atomic Jira/Linear
+  multi-query snapshots remain unchanged.
+
+## [0.14.0] - 2026-07-17 - Auto-merge retry and restart safety
+
+### Fixed
+
+- Auto-merge retries now synchronize and verify the configured upstream even
+  when the feature branch is already merged locally. A rejected target push can
+  be retried without creating a duplicate merge commit or reporting success
+  while the remote target remains stale.
+- Startup cleanup now preserves `Blocked` workspaces and their diagnostic files,
+  allowing a rejected-push recovery to continue after a clean Symphony restart.
+  Cleanup behavior for `Done` and other terminal states is unchanged.
+
+### Added
+
+- Regression coverage for repeated push rejection, recovery with and without
+  capture directories, remote SHA verification, and repeated blocked-workspace
+  restarts.
+
+### Verified
+
+- Full suite: 1,385 passed, 5 skipped; Ruff and Pyright clean; `symphony doctor`
+  passed.
+- A real Codex/Git lifecycle reached Done after a rejected target push, a clean
+  orchestrator restart, and recovery. The original merge was reused, the
+  diagnostic workspace survived until recovery, and local and remote target
+  SHAs matched afterward.
+
+## [0.13.0] - 2026-07-10 - Agent-flow reliability hardening
+
+### Fixed
+
+- Closed the AF-01 through AF-16 reliability audit across worker identity,
+  process-group cleanup, leases, retry timing, tracker refresh, prompt budgets,
+  and terminal dispatch state.
+- Preserved merged lineage during Done squashes and aligned Verify evidence
+  validation with the shipped contract.
+- Hardened OpenCode telemetry and worktree setup.
+
+### Verified
+
+- Full suite: 1,371 passed, 5 skipped; Ruff and Pyright clean.
+- Three real OpenCode lifecycle runs exercised Todo through Done with the merge
+  gate enabled.
+
+## [0.12.0] - 2026-07-06 - Continuous improvement and blocked recovery
+
+### Added
+
+- Continuous-improvement heartbeat checks that file follow-up work through the
+  normal Kanban flow.
+- Root Cause Analysis recovery tickets for blocked work, with guarded reopening
+  of the source ticket after successful recovery.
+
+### Changed
+
+- Human Review became intervention-only in prompts and contracts.
+- File-board recovery, backend retry handling, and dispatch preflight checks
+  were hardened.
+
+### Verified
+
+- A real OpenCode end-to-end run passed; the release push gate completed with
+  1,279 passed and 2 skipped.
+
+## [0.11.0] - 2026-07-05 - OpenCode terminal cleanup
+
+### Fixed
+
+- Terminal reconciliation now bounds the natural-exit grace window by the first
+  poll tick that observes a running card in a terminal lane. OpenCode liveness
+  heartbeats can no longer refresh the 60 second grace window forever and leave
+  `Human Review` cards stuck in `/api/v1/state` as `running: 1`.
+- Checked-in SMA-20 QA smoke evidence now passes the repository `ruff check .`
+  gate.
+- The local pre-push quality gate now strips Git hook environment variables
+  before running the test suite, so tests that create temporary repositories do
+  not inherit the parent repo's `GIT_DIR`.
+
+### Added
+
+- Regression coverage for terminal-state cleanup with recent backend
+  heartbeats:
+  `tests/test_orchestrator_dispatch.py::test_reconcile_terminal_grace_expires_despite_recent_heartbeat`.
+
+### Verified
+
+- Real OpenCode file-board E2E on `dev` reached `Human Review`, logged
+  `reconcile_terminate_terminal` at `terminal_state_age_s=61.1`, and drained
+  `/api/v1/state` to `running: 0`, `retrying: 0`.
+
+## [0.10.1] - 2026-07-05 - Prompt compaction default-on
+
+### Changed
+
+- Prompt context compaction now defaults on for new workflows. Workflows that
+  need the full raw ticket history in every first-turn prompt can set
+  `agent.compact_issue_context: false`.
+
+## [0.10.0] - 2026-07-05 - Codex E2E reliability hardening
+
+### Added
+
+- State-local same-state turn watchdogs via `agent.max_state_turns_by_state`,
+  with budget notes that report the effective per-state limit.
+- Token attention signals via `agent.token_attention_threshold_by_state`; high
+  token use stays telemetry unless an explicit hard cap is configured.
+- Stage-aware prompt context compaction behind
+  `agent.compact_issue_context: true`, including full-ticket path links for file
+  workflows so workers can audit the raw card when needed.
+- Workspace owner sidecars and hook-output manifests under the workspace root,
+  so reused `TASK-*` paths and failed `after_create` setup are diagnosable.
+- Structured contract-failure rows and scoped rewind prompts for Verify evidence
+  failures, including row numbers and expected artifact path shapes.
+
+### Changed
+
+- OpenCode token accounting now follows the 1.17 `step_finish.part.tokens`
+  schema, including nested cache and reasoning fields without double-counting
+  explicit cache totals.
+- `symphony doctor` now reports masked setup commands such as `|| true` and
+  piped `tail` as warnings by default, with
+  `hooks.fail_on_warning_patterns: true` available when a workflow wants those
+  checks to fail.
+- Workflow state renames carry the new per-state turn-cap map along with the
+  existing concurrency and token maps.
+- Public docs now lead with the built-in 9999 browser admin UI and a sanitized
+  screenshot, while still keeping the terminal TUI visible.
+
+### Fixed
+
+- `GET /api/v1/issues/<ID>` now serializes raw YAML frontmatter `date` and
+  `datetime` values before returning JSON, fixing the `CODEX-E2E-001` detail
+  drawer load failure.
+- File tickets auto-heal shallow accidental indentation on canonical top-level
+  metadata keys such as `updated_at`, preventing post-turn refresh failures from
+  malformed agent-authored YAML.
+- Verify contract checks reject placeholder or prose-only evidence cells, so
+  quality gates require durable artifacts rather than hollow table entries.
+- File-board dependency blockers now apply beyond `Todo`; unresolved dependency
+  IDs stay visible through `blocked_dependency` instead of letting held work run.
+
+### Verification
+
+- `rtk pytest -q` -> 1,108 passed, 2 skipped during the reliability hardening
+  pass.
+- `pytest tests/test_webapi.py tests/test_web_api_smoke_script.py -q` -> 24
+  passed for the issue-detail serialization fix.
+- Fresh remote-clone Codex E2E rerun reached `Human Review` on `CODEX-E2E-002`
+  with `worker_exit reason=normal` and the issue detail API returning string
+  timestamps.
+- Copied-board prompt measurement showed compact Verify context reducing
+  `TASK-005` from 5,453 to 3,944 `o200k_base` tokens, a 27.7% reduction.
+
+## [0.9.3] - 2026-07-04 - OpenCode telemetry and refresh hardening
+
+### Fixed
+
+- OpenCode 1.17 JSONL text extraction now reads `type=="text"` frames under
+  `part.text`, preventing productive OpenCode turns from being counted as empty.
+- OpenCode 1.17 token usage now reads `step_finish.part.tokens`, restoring
+  token telemetry for `max_total_tokens` and operator visibility.
+- File-tracker ticket parsing auto-heals the observed shallow `updated_at`
+  indentation issue before normal tracker writes serialize canonical YAML.
+
+## [0.9.2] - 2026-07-04 - OpenCode empty-turn preview
+
+### Fixed
+
+- OpenCode completed-turn events now emit the response under the `message`
+  preview key so the orchestrator can reset the empty-response-loop guard.
+
+## [0.9.1] - 2026-07-03 - Landing page version sync
+
+### Changed
+
+- Synchronized source version and public landing-page badge after the v0.9.1
+  release closeout.
+
+## [0.9.0] — 4-stage pipeline simplification
+
+### Changed
+
+- Default active workflow is now `Todo -> In Progress -> Verify -> Learn`,
+  followed by `Human Review` and `Done`. `Plan`, `Critic`, `Review`, and `QA`
+  are folded into In Progress and Verify contracts.
+- Verify owns Review, QA, and Merge Gate, and is never skipped. Learn is
+  lightweight wiki write-back and can be operator-skipped to Human Review with
+  a `## Learn Skipped` audit note.
+- Root examples now keep only the current workflow files; demo/smoke/Jira
+  workflow examples and demo boards live under `examples/`.
+
+### Added
+
+- TUI stage badges (`[n/4]`), multiline ticket creation, focused-ticket edit
+  modal (`e`), and Learn skip hotkey (`S`).
+- Web and API Learn skip controls:
+  `POST /api/v1/{identifier}/skip-learn` and
+  `POST /api/v1/issues/{identifier}/skip-learn`.
+
+### Removed
+
+- Dedicated skills UI surfaces (web route/nav/forms and TUI create/detail
+  fields). `skills:` frontmatter, `Issue.skills`, and prompt injection remain
+  for power users and backward compatibility.
+
+### Breaking
+
+- Existing custom `WORKFLOW.md` files that still name `Explore`, `Plan`,
+  `Critic`, `Review`, or `QA` must migrate their active states and prompt stage
+  mapping to the 4-stage layout before using the new default prompts.
+
+## [0.8.0] — built-in web Kanban app (multica/Archon-style revamp)
+
+The orchestrator port now serves a full web app: the board is no longer
+read-only. Everything the operator previously edited by hand in WORKFLOW.md —
+kanban columns, per-stage prompts, branch policy — is editable from the
+browser (comment-preservingly, via ruamel.yaml round-trip), and issues are
+registered from the UI or the TUI with skills attached per ticket.
+
+### Added
+
+- **Web app at `/`** (`symphony --port 9999`, `symphony service start`):
+  Linear-style board with issue create/edit/delete, drag-and-drop state
+  moves, per-column "+", live run badges (turn count, tokens, pause/resume).
+  Vanilla HTML/CSS/JS served by the existing aiohttp server — no build step,
+  no CDN, no signup.
+- **User-editable workflow**: add / delete / rename / reorder kanban columns
+  and edit each column's stage prompt from the Workflow page. Writes go back
+  into WORKFLOW.md frontmatter with comments preserved; tickets in renamed or
+  removed columns migrate automatically; a column with a running worker
+  refuses edits (409).
+- **Skills**: drop `skills/<name>/SKILL.md` next to WORKFLOW.md, attach
+  skills to a ticket (web modal, TUI form, or `skills:` frontmatter), and the
+  orchestrator appends the skill bodies to that ticket's first-turn prompt.
+- **Stats page** + TUI `s` screen: tokens/day, done/day, per-column dwell
+  time, per-agent totals, avg cycle time — aggregated from a new append-only
+  `.symphony/stats.jsonl` event store (turns, transitions, run outcomes).
+- **TUI `n`**: register a new ticket without leaving the terminal.
+- REST API: `GET/POST/PATCH/DELETE /api/v1/issues*`, `GET /api/v1/board`,
+  `PUT /api/v1/workflow/states`, `GET/PUT /api/v1/workflow/prompts/<state>`,
+  `PUT /api/v1/workflow/branch-policy`, `GET /api/v1/skills`,
+  `GET /api/v1/stats`, `GET /api/v1/git/branches`.
+
+### Changed
+
+- `GET /` serves the web app instead of a plain-text hint (API endpoints are
+  unchanged). Mutating endpoints require `Content-Type: application/json`
+  and a loopback Host header (cross-origin form / DNS-rebinding guard).
+- `tools/board-viewer/` is deprecated in place; the built-in app replaces it.
+- New dependency: `ruamel.yaml` (comment-preserving WORKFLOW.md edits).
+
+### Verification discipline and hardening
+
+Ports the `supergoal` skill's verification discipline into Symphony's per-stage
+pipeline, then hardens it so every promised mechanism is honest and enforced: a
+new independent Critic stage turns the prose spec into failing tests before
+review, content-checking gates assert artefacts are real (not just that headings
+are present), and a difficulty gate keeps the heavy loop off trivial tickets.
+Backward-compatible: the new gates no-op on existing non-bug / clean-Critic
+boards, and a ticket without `## Difficulty` keeps the full loop.
+
+### Added
+
+- **Critic stage** between In Progress and Review (data-driven `active_states`
+  addition, no `core.py` rewrite): a fresh-context agent enumerates required
+  behaviors the builder's tests miss and writes one failing test per gap,
+  recording them in a durable `docs/<id>/critic/surfaced-requirements.md` ledger
+  before rewinding to In Progress for the fix.
+- **Content-checking contract gates** (`evaluate_contract`): cited evidence
+  paths in the QA scorecard / Review security audit must exist on disk; a `fail`
+  security-audit row cannot coexist with a clean Review; a bug ticket's populated
+  `reproduce/` dir must be closed by `qa/repro-after.log`; a Critic rewind must
+  persist its ledger file. Missing artefacts rewind the producing stage instead
+  of passing on a hollow heading.
+- **Difficulty gate**: Plan declares `## Difficulty: trivial|standard|complex`;
+  a `trivial` non-bug ticket with no runtime change skips Critic and QA, and the
+  route is always recorded in `## Pipeline Route` (never silent).
+- **Skill contract tests** (`tests/skills/`) and a **scenario-proof suite**
+  (`tests/test_supergoal_hardening_loop.py`) that walks a bug ticket through the
+  full critic → fix → review → QA loop, asserting each gate fires and clears.
+
+### Changed
+
+- **Bug reproduction is language-agnostic**: the reproduction authored at Todo
+  and re-run at QA is the project's own test framework (pytest / go test / …),
+  not a hardcoded Playwright `.spec.ts`.
+- **QA confirms a runner exists before trusting it**: before running playwright /
+  a boot command / a non-Python runner, QA verifies availability and fails with
+  `## QA Failure` rather than recording a scorecard pass it never executed.
+
+### Fixed
+
+- **Critic bounded-loop claim corrected**: the prompt and spec said the 3-cycle
+  cap was "enforced by S2's gate counting `## Critic` rewinds" — it was not (the
+  gate counts nothing). The Critic now counts prior `## Surfaced Requirements`
+  cycles itself and escalates to `Blocked` with `## Critic Cap` on the 3rd, with
+  the shared `cfg.agent.max_attempts` budget as the hard backstop.
+
+### Added
+
+- **`symphony --version`** prints the package version and exits 0. Previously
+  the flag errored with `unrecognized arguments: --version`. (`cli/main.py`,
+  regression test in `test_cli_main_routing.py`.)
+
+### Fixed
+
+- **Symphony OneShot bootstrap test failed on CI** (`test_symphony_oneshot_bootstrap.py::test_bootstrap_creates_vault_skeleton`).
+  The hermetic run asserts `bootstrap.sh` exits 0, but the script's final
+  `symphony doctor` preflight fails (exit 1) when no agent CLI is on `$PATH` —
+  and CI installs `symphony` without `claude`, so doctor's `check_agent_cli`
+  failed and bootstrap exited 1. The test now honors its own "no agent CLI"
+  contract by putting a never-invoked `claude` stub on `$PATH` (doctor only
+  `shutil.which`-es it). bootstrap.sh's strict preflight is intentionally
+  unchanged. Also hardened the test's bash invocation for the Windows
+  maintainer box (`resolve_bash()` to dodge the WSL launcher, `as_posix()` to
+  stop bash collapsing a backslash script path) — both no-ops on Linux/CI.
+- **Launcher install hint** in `tui-open.sh` suggested `python3.11 -m venv`,
+  which fails `command not found` on hosts that ship only the declared 3.12+
+  floor (pyproject, CI matrix, README badge, and bootstrapping docs are all
+  3.12). Changed the hint to `python3`.
+- **README key-binding docs** were missing the load-bearing `c` (confirm a
+  Done-gated card) and `P` (pause/resume) bindings in both the key table and
+  the footer mockup — `c` clears the manual Done gate, so its absence could
+  strand a reader. The `doctor` "five first-run failures" summary also
+  enumerated only four. Both now match the running app (`tui/app.py`) and the
+  doctor's own later enumeration.
+- **Double-dispatch race on per-attempt `max_turns` exhaustion** (found by the
+  live run-path smoke, root-caused in
+  `docs/improvements/dispatch-double-dispatch-race-2026-06-28.md`). The
+  worker-exit handler popped the worker from `_running` and then `await`ed
+  auto-commit and the async `budget_exhausted_state` persist; a poll tick
+  firing in that window pruned the in-tick `_claimed` lock and re-dispatched
+  the still-active ticket, producing a second worker and a `git index.lock`
+  collision. `_on_worker_exit` now holds the ticket in a
+  `_terminal_persist_pending` in-flight set for its whole duration, so it stays
+  ineligible until its terminal state is durably written. The live smoke now
+  shows exactly one dispatch and one worker exit. (`orchestrator/core.py`,
+  regression test in `test_orchestrator_dispatch.py`.)
+
+### Changed
+
+- **Auto-archive sweep throttled** to a 5-minute cadence
+  (`ARCHIVE_SWEEP_INTERVAL_SEC`) instead of a full terminal-board rescan on
+  every poll tick. Archivability is day-granular (`archive_after_days`,
+  default 30), so the per-tick rescan was wasted work; the `archive_after_days
+  <= 0` disable still wins and the first tick after start always sweeps once.
+  (`orchestrator/core.py`, regression test in `test_orchestrator_archive.py`.)
+
+## [0.7.2] — 2026-06-10 — agent-terse workflow prompts + token-budget directive
+
+Prompt-cost release. All 18 stage templates under
+`docs/symphony-prompts/{file,linear}/` rewritten as terse agent-directives:
+rendered dispatch prompts shrink ~12% (282,009 → 247,942 chars across the
+28 tracker × language × stage combinations) with every section anchor,
+transition rule, command, table spec, and liquid branch preserved —
+verified by the 51-test prompt contract suite plus an independent
+old-vs-new rule audit. Human-facing artefact templates (Plain-language
+header, caps table, wiki entry, As-Is→To-Be report, Human Review handoff)
+are untouched.
+
+### Added
+
+- **Soft token-budget directive** in both `base.md` templates: when
+  `agent.max_total_tokens_by_state` sets a budget, the prompt now renders
+  `Token budget: keep this turn under N completion tokens` from the
+  previously unused C3 `token_ema` / `token_budget` env vars. Off by
+  default (budget 0). Regression tests pin both states.
+- **Chore short-circuits on linear boards**: the file tracker's
+  Explore/Plan/Review/Learn `chore`-label fast paths are now ported to the
+  linear prompt set, so metadata-only tickets skip the full stage
+  contracts there too.
+
+### Changed
+
+- **linear Learn delegates bulk wiki sweeping** to `symphony wiki-sweep`
+  (the orchestrator already runs it every `wiki.sweep_every_n` Done
+  transitions regardless of tracker kind); the per-ticket invalidated-entry
+  update, beginner-block shape check, and `Wiki Conflict` flag stay in the
+  prompt.
+- **linear wiki entry template gains the Observability hooks block**, so
+  file- and linear-authored `docs/llm-wiki/` entries share one schema.
+
 ## [0.7.0] — 2026-05-20 — TUI import hotfix + contract-validation hydration + viewer doctor
 
 Follow-up release after v0.6.7 contract enforcement. Fixes a TUI startup
@@ -620,7 +1836,28 @@ First public release of the multi-agent fork.
 - Per-state concurrency caps, `$VAR`/`~` expansion, dynamic WORKFLOW
   reload, structured stderr logging, `symphony doctor`.
 
-[Unreleased]: https://github.com/cskwork/oh-my-symphony/compare/v0.4.8...HEAD
+[Unreleased]: https://github.com/cskwork/oh-my-symphony/compare/v0.21.0...HEAD
+[0.21.0]: https://github.com/cskwork/oh-my-symphony/compare/v0.20.1...v0.21.0
+[0.20.1]: https://github.com/cskwork/oh-my-symphony/compare/v0.20.0...v0.20.1
+[0.20.0]: https://github.com/cskwork/oh-my-symphony/compare/v0.19.1...v0.20.0
+[0.19.1]: https://github.com/cskwork/oh-my-symphony/compare/v0.19.0...v0.19.1
+[0.19.0]: https://github.com/cskwork/oh-my-symphony/compare/v0.18.2...v0.19.0
+[0.18.2]: https://github.com/cskwork/oh-my-symphony/compare/v0.18.1...v0.18.2
+[0.18.1]: https://github.com/cskwork/oh-my-symphony/compare/v0.18.0...v0.18.1
+[0.18.0]: https://github.com/cskwork/oh-my-symphony/compare/v0.17.0...v0.18.0
+[0.17.0]: https://github.com/cskwork/oh-my-symphony/compare/v0.16.0...v0.17.0
+[0.16.0]: https://github.com/cskwork/oh-my-symphony/releases/tag/v0.16.0
+[0.15.0]: https://github.com/cskwork/oh-my-symphony/releases/tag/v0.15.0
+[0.14.0]: https://github.com/cskwork/oh-my-symphony/releases/tag/v0.14.0
+[0.13.0]: https://github.com/cskwork/oh-my-symphony/releases/tag/v0.13.0
+[0.12.0]: https://github.com/cskwork/oh-my-symphony/releases/tag/v0.12.0
+[0.11.0]: https://github.com/cskwork/oh-my-symphony/releases/tag/v0.11.0
+[0.10.1]: https://github.com/cskwork/oh-my-symphony/releases/tag/v0.10.1
+[0.10.0]: https://github.com/cskwork/oh-my-symphony/releases/tag/v0.10.0
+[0.9.3]: https://github.com/cskwork/oh-my-symphony/releases/tag/v0.9.3
+[0.9.2]: https://github.com/cskwork/oh-my-symphony/releases/tag/v0.9.2
+[0.9.1]: https://github.com/cskwork/oh-my-symphony/releases/tag/v0.9.1
+[0.9.0]: https://github.com/cskwork/oh-my-symphony/releases/tag/v0.9.0
 [0.4.8]: https://github.com/cskwork/oh-my-symphony/releases/tag/v0.4.8
 [0.4.7]: https://github.com/cskwork/oh-my-symphony/releases/tag/v0.4.7
 [0.4.3]: https://github.com/cskwork/oh-my-symphony/releases/tag/v0.4.3

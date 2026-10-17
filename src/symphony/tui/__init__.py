@@ -13,9 +13,8 @@ Public surface (kept stable for cli.py and tests):
     _CardStatus, SILENT_THRESHOLD_S, _parse_iso, _silent_seconds
     STATE_COLOR, AGENT_COLOR
 
-Tests stub `symphony.tui._fetch_candidates` / `_fetch_terminals` via
-`monkeypatch.setattr`; the `app` module references those names through
-the parent package so the patch reaches the runtime call path.
+Tests stub `symphony.tui.app._fetch_tracker_snapshot` via
+`monkeypatch.setattr`; the app resolves its imported consumer reference.
 """
 
 from __future__ import annotations
@@ -38,6 +37,7 @@ from .helpers import (
     _card_sort_key,
     _compact_rate_limits,
     _fetch_candidates,
+    _fetch_tracker_snapshot,
     _fetch_terminals,
     _first_meaningful_line,
     _matches_filter,
@@ -47,7 +47,14 @@ from .helpers import (
     _silent_seconds,
     _truncate,
 )
-from .screens import TicketDetailScreen, _RefreshNow
+from .screens import (
+    EditIssueScreen,
+    HelpScreen,
+    NewIssueScreen,
+    StatsScreen,
+    TicketDetailScreen,
+    _RefreshNow,
+)
 from .widgets import DetailPane, FilterBar, IssueCard, Lane, StatsBar
 from .app import KanbanApp, KanbanTUI
 
@@ -61,6 +68,10 @@ __all__ = [
     "IssueCard",
     "Lane",
     "StatsBar",
+    "EditIssueScreen",
+    "HelpScreen",
+    "NewIssueScreen",
+    "StatsScreen",
     "TicketDetailScreen",
     # constants
     "AGENT_COLOR",
@@ -80,6 +91,7 @@ __all__ = [
     "_card_sort_key",
     "_compact_rate_limits",
     "_fetch_candidates",
+    "_fetch_tracker_snapshot",
     "_fetch_terminals",
     "_first_meaningful_line",
     "_matches_filter",

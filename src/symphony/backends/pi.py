@@ -29,202 +29,204 @@ Usage shape inside an `AssistantMessage`:
 We accumulate (input + cacheRead + cacheWrite) into `input_tokens` so totals
 remain comparable with the Codex / Claude buckets, where token counts (not
 billed cost) are the unit.
+
+The spawn / prompt / stream / reap lifecycle lives in
+``per_turn.JsonlStreamBackend``; this module supplies the pi command line,
+the JSONL frame handling, and the terminal-event / exit-status
+interpretation. ``prime_agent.py`` subclasses it with a different config
+section and resume flag.
 """
 
 from __future__ import annotations
 
 import asyncio
-import json
-import os
-import shlex
-import time
-from collections import deque
 from typing import Any
 
-from .._shell import resolve_bash, safe_proc_wait
-from ..errors import (
-    PortExit,
-    ResponseError,
-    TurnFailed,
-    TurnTimeout,
-)
+from ..errors import TurnFailed
 from ..logging import get_logger
-from ..workspace import validate_agent_cwd
+from ..workflow import PiConfig, PrimeAgentConfig
 from . import (
     EVENT_AGENT_RETRY,
     EVENT_COMPACTION,
-    EVENT_MALFORMED,
     EVENT_OTHER_MESSAGE,
-    EVENT_SESSION_STARTED,
     EVENT_TURN_COMPLETED,
     EVENT_TURN_FAILED,
     BackendInit,
-    BaseAgentBackend,
     TurnResult,
 )
+from .per_turn import JsonlStreamBackend
 
 
 log = get_logger()
 
-PENDING_SESSION_ID = "pending"
-
-# StreamReader line-buffer limit for the subprocess pipes. The asyncio
-# default of 64 KiB overflows on JSON-mode events whose `message_update` or
-# tool-result payload exceeds that on a single line. Matches codex.py.
-MAX_LINE_BYTES = 10 * 1024 * 1024
-
-
-def _utc_iso() -> str:
-    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+# Model-output lifecycle events. Everything else on the stream (session
+# header, tool_execution_* echoes, keepalives) must not reset the
+# orchestrator's stall clock — mirrors the claude backend's
+# assistant-frames-only predicate.
+_PROGRESS_EVENT_TYPES = frozenset(
+    {"message_start", "message_update", "message_end", "turn_start", "turn_end"}
+)
 
 
-class PiBackend(BaseAgentBackend):
+class PiBackend(JsonlStreamBackend):
     """One subprocess per turn; speaks pi --mode json JSONL."""
 
+    _agent_name = "pi"
+
+    # Subclass override point: the CLI flag used for session resume.
+    # Pi uses ``--session <id>``; PrimeAgent uses ``--resume <id>``.
+    _resume_flag = "--session"
+
+    # Let stderr settle briefly after stdout closes so a TurnFailed can
+    # carry the actual reason (auth error, network, ratelimit, ...) up to
+    # the orchestrator instead of the opaque "no agent_end event" string.
+    _stderr_settle_s = 0.1
+
+    def is_progress_event(self, event: dict[str, Any]) -> bool:
+        return event.get("type") in _PROGRESS_EVENT_TYPES
+
     def __init__(self, init: BackendInit) -> None:
-        validate_agent_cwd(init.cwd, init.workspace_root)
-        self._pi = init.cfg.pi
-        self._cwd = init.cwd
-        self._on_event = init.on_event
-        self._session_id: str | None = None
-        self._closed = False
-        self._active_proc: asyncio.subprocess.Process | None = None
-        self._latest_usage: dict[str, int] = {
-            "input_tokens": 0,
-            "output_tokens": 0,
-            "total_tokens": 0,
-        }
-        self._last_message: str = ""
-        # Bounded ring buffer of stderr lines so a TurnFailed exception can
-        # carry the actual reason (auth error, network, ratelimit, ...) up to
-        # the orchestrator instead of the opaque "no agent_end event" string.
-        self._stderr_tail: deque[str] = deque(maxlen=20)
+        cfg = self._turn_config(init)
+        super().__init__(
+            init, agent_name=self._agent_name, turn_timeout_ms=cfg.turn_timeout_ms
+        )
+        self._pi = cfg
+
+    @staticmethod
+    def _turn_config(init: BackendInit) -> PiConfig | PrimeAgentConfig:
+        """Config section this backend drives; PrimeAgent points elsewhere."""
+        return init.cfg.pi
 
     # ------------------------------------------------------------------
-    # AgentBackend lifecycle
+    # per-turn hooks
     # ------------------------------------------------------------------
 
-    async def start(self) -> None:
-        return None
+    def _command_for_turn(self, *, prompt: str, is_continuation: bool) -> str:
+        # Pi documents stdin as appended to the `-p` argument. Since the
+        # default command is `pi --mode json -p ""`, the prompt arrives
+        # entirely through stdin.
+        del prompt
+        # Both the assistant preview and stderr diagnostics belong to this
+        # subprocess. Clear them before every turn so a missing terminal event
+        # cannot make a later empty turn look successful (or repeat stale
+        # diagnostics from an earlier process).
+        self._last_message = ""
+        self._stderr_tail.clear()
+        return self._pi.command + self._resume_args(
+            is_continuation=is_continuation,
+            resume_across_turns=self._pi.resume_across_turns,
+        )
 
-    async def stop(self) -> None:
-        if self._closed:
-            return
-        self._closed = True
-        proc = self._active_proc
-        if proc is not None and proc.returncode is None:
-            try:
-                proc.terminate()
-            except ProcessLookupError:
-                pass
-            rc = await safe_proc_wait(proc, timeout=2.0)
-            if rc is None and proc.returncode is None:
-                try:
-                    proc.kill()
-                except ProcessLookupError:
-                    pass
-                await safe_proc_wait(proc)
-
-    @property
-    def session_id(self) -> str | None:
-        return self._session_id
-
-    @property
-    def pid(self) -> int | None:
-        return self._active_proc.pid if self._active_proc is not None else None
-
-    @property
-    def latest_usage(self) -> dict[str, int]:
-        return dict(self._latest_usage)
-
-    @property
-    def latest_rate_limits(self) -> dict[str, Any] | None:
-        # Pi does not surface rate-limit telemetry in the JSON stream.
-        return None
-
-    async def initialize(self) -> dict[str, Any]:
-        return {"agent": "pi"}
-
-    async def start_session(
-        self, *, initial_prompt: str, issue_title: str | None
-    ) -> str:
-        # Pi mints a session id when the first `pi --mode json` invocation
-        # writes the `session` header line. Return a placeholder; the real id
-        # arrives in `_consume_stream` and triggers `session_started`.
-        del initial_prompt, issue_title
-        return PENDING_SESSION_ID
-
-    async def run_turn(self, *, prompt: str, is_continuation: bool) -> TurnResult:
-        if self._closed:
-            raise ResponseError("backend is closed")
-
-        cmd = self._pi.command
-        if (
-            is_continuation
-            and self._pi.resume_across_turns
-            and self._session_id
-            and self._session_id != PENDING_SESSION_ID
-        ):
-            cmd = f"{cmd} --session {shlex.quote(self._session_id)}"
-
-        try:
-            proc = await asyncio.create_subprocess_exec(
-                resolve_bash(),
-                "-lc",
-                cmd,
-                cwd=str(self._cwd),
-                stdin=asyncio.subprocess.PIPE,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-                env=os.environ.copy(),
-                limit=MAX_LINE_BYTES,
+    async def _handle_stream_event(
+        self, msg: dict[str, Any]
+    ) -> dict[str, Any] | None:
+        kind = msg.get("type")
+        if kind == "session":
+            sid = msg.get("id")
+            if isinstance(sid, str) and sid:
+                await self._observe_session_id(sid)
+        elif kind == "message_end":
+            message = msg.get("message") or {}
+            if isinstance(message, dict):
+                self._update_usage(message.get("usage") or {})
+                if message.get("role") == "assistant":
+                    last_text = _extract_text(message)
+                    if last_text:
+                        self._last_message = last_text[:400]
+            await self._emit(EVENT_OTHER_MESSAGE, msg)
+        elif kind == "turn_end":
+            # `turn_end` carries the same AssistantMessage as the
+            # paired `message_end`; usage is already accumulated, so
+            # only refresh the last-message preview if missing.
+            message = msg.get("message") or {}
+            if (
+                isinstance(message, dict)
+                and message.get("role") == "assistant"
+                and not self._last_message
+            ):
+                last_text = _extract_text(message)
+                if last_text:
+                    self._last_message = last_text[:400]
+            await self._emit(EVENT_OTHER_MESSAGE, msg)
+        elif kind == "agent_end":
+            return msg
+        elif kind == "compaction_start":
+            # Pi auto-compacts when the conversation approaches the
+            # model's context window (or on `/compact`). Surface as a
+            # normalized event so symphony can log it once at INFO
+            # — a sudden token drop on the next turn would otherwise
+            # be unattributable.
+            await self._emit(
+                EVENT_COMPACTION,
+                {
+                    "phase": "start",
+                    "reason": msg.get("reason"),
+                },
             )
-        except FileNotFoundError as exc:
-            raise PortExit("bash not available", error=str(exc)) from exc
+        elif kind == "compaction_end":
+            result = msg.get("result") or {}
+            payload = {
+                "phase": "end",
+                "reason": msg.get("reason"),
+                "aborted": bool(msg.get("aborted")),
+                "will_retry": bool(msg.get("willRetry")),
+            }
+            if isinstance(result, dict):
+                # Best-effort: surface tokensBefore from the
+                # CompactionEntry summary if pi includes it.
+                for src, dst in (
+                    ("tokensBefore", "tokens_before"),
+                    ("firstKeptEntryId", "first_kept_entry_id"),
+                ):
+                    if src in result:
+                        payload[dst] = result[src]
+            err = msg.get("errorMessage")
+            if isinstance(err, str) and err:
+                payload["error"] = err
+            await self._emit(EVENT_COMPACTION, payload)
+        elif kind == "auto_retry_start":
+            await self._emit(
+                EVENT_AGENT_RETRY,
+                {
+                    "phase": "start",
+                    "attempt": msg.get("attempt"),
+                    "max_attempts": msg.get("maxAttempts"),
+                    "delay_ms": msg.get("delayMs"),
+                    "error": msg.get("errorMessage"),
+                },
+            )
+        elif kind == "auto_retry_end":
+            await self._emit(
+                EVENT_AGENT_RETRY,
+                {
+                    "phase": "end",
+                    "attempt": msg.get("attempt"),
+                    "success": bool(msg.get("success")),
+                    "final_error": msg.get("finalError"),
+                },
+            )
+        else:
+            await self._emit(EVENT_OTHER_MESSAGE, msg)
+        return None
 
-        # `stop()` may have flipped `_closed` while we awaited spawn — reap
-        # the orphaned process and bail.
-        if self._closed:
-            await self._reap(proc)
-            raise ResponseError("backend closed during spawn")
-        self._active_proc = proc
-        try:
-            assert proc.stdin is not None and proc.stdout is not None
-            try:
-                # Pi documents stdin as appended to the `-p` argument. Since
-                # the default command is `pi --mode json -p ""`, the prompt
-                # arrives entirely through stdin.
-                proc.stdin.write(prompt.encode("utf-8"))
-                await proc.stdin.drain()
-                proc.stdin.close()
-            except (BrokenPipeError, ConnectionResetError) as exc:
-                raise PortExit("pi stdin closed", error=str(exc)) from exc
+    async def _complete_stream_turn(
+        self,
+        proc: asyncio.subprocess.Process,
+        terminal: dict[str, Any] | None,
+        rc: int | None,
+    ) -> TurnResult:
+        del proc
+        if terminal is not None:
+            await self._require_resume_confirmation()
+            terminal_message = _extract_last_assistant_message(
+                terminal.get("messages")
+            )
+            if terminal_message:
+                self._last_message = terminal_message[:400]
 
-            timeout_s = self._pi.turn_timeout_ms / 1000.0
-            try:
-                terminal = await asyncio.wait_for(
-                    self._consume_stream(proc), timeout=timeout_s
-                )
-            except asyncio.TimeoutError as exc:
-                await self._reap(proc)
-                await self._emit(EVENT_TURN_FAILED, {"reason": "turn_timeout"})
-                raise TurnTimeout("pi turn timed out") from exc
-
-            safe_rc = await safe_proc_wait(proc)
-            if terminal is None:
-                stderr_blob = self._stderr_blob()
-                rc = safe_rc if safe_rc is not None else proc.returncode
-                err_msg = (
-                    f"pi exited with no agent_end event (rc={rc})"
-                    + (f"; stderr: {stderr_blob}" if stderr_blob else "")
-                )
-                await self._emit(
-                    EVENT_TURN_FAILED,
-                    {"reason": err_msg, "stderr_tail": list(self._stderr_tail)},
-                )
-                raise TurnFailed(err_msg)
-
-            failure_reason = _extract_failure_reason(terminal)
+            failure_reason = _extract_failure_reason(
+                terminal, agent_name=self._agent_name
+            )
             if failure_reason is not None:
                 stderr_blob = self._stderr_blob()
                 if stderr_blob:
@@ -237,178 +239,77 @@ class PiBackend(BaseAgentBackend):
                 await self._emit(EVENT_TURN_FAILED, payload)
                 raise TurnFailed(failure_reason)
 
+            # A clean terminal event is not success if the CLI itself
+            # reports a non-zero process status.
+            if rc not in (None, 0):
+                await self._raise_nonzero_exit(rc)
+
             await self._emit(EVENT_TURN_COMPLETED, terminal)
             return TurnResult(
                 status=EVENT_TURN_COMPLETED,
                 turn_id=self._session_id,
                 last_message=self._last_message,
             )
-        finally:
-            self._active_proc = None
 
-    # ------------------------------------------------------------------
-    # JSONL parsing
-    # ------------------------------------------------------------------
-
-    async def _consume_stream(
-        self, proc: asyncio.subprocess.Process
-    ) -> dict[str, Any] | None:
-        """Read JSONL events; return the terminal `agent_end` event or None."""
-        assert proc.stdout is not None
-        terminal: dict[str, Any] | None = None
-        stderr_task = asyncio.create_task(self._drain_stderr(proc))
-        try:
-            while True:
-                try:
-                    line = await proc.stdout.readline()
-                except asyncio.CancelledError:
-                    raise
-                except Exception as exc:
-                    log.error("pi_stdout_read_error", error=str(exc))
-                    break
-                if not line:
-                    break
-                text = line.decode("utf-8", errors="replace").strip()
-                if not text:
-                    continue
-                try:
-                    msg = json.loads(text)
-                except json.JSONDecodeError:
-                    await self._emit(EVENT_MALFORMED, {"raw": text[:500]})
-                    continue
-                if not isinstance(msg, dict):
-                    continue
-                kind = msg.get("type")
-                if kind == "session":
-                    sid = msg.get("id")
-                    if isinstance(sid, str) and sid:
-                        self._session_id = sid
-                        await self._emit(
-                            EVENT_SESSION_STARTED,
-                            {"session_id": sid, "thread_id": sid},
-                        )
-                elif kind == "message_end":
-                    message = msg.get("message") or {}
-                    if isinstance(message, dict):
-                        self._update_usage(message.get("usage") or {})
-                        last_text = _extract_text(message)
-                        if last_text:
-                            self._last_message = last_text[:400]
-                    await self._emit(EVENT_OTHER_MESSAGE, msg)
-                elif kind == "turn_end":
-                    # `turn_end` carries the same AssistantMessage as the
-                    # paired `message_end`; usage is already accumulated, so
-                    # only refresh the last-message preview if missing.
-                    message = msg.get("message") or {}
-                    if isinstance(message, dict) and not self._last_message:
-                        last_text = _extract_text(message)
-                        if last_text:
-                            self._last_message = last_text[:400]
-                    await self._emit(EVENT_OTHER_MESSAGE, msg)
-                elif kind == "agent_end":
-                    terminal = msg
-                elif kind == "compaction_start":
-                    # Pi auto-compacts when the conversation approaches the
-                    # model's context window (or on `/compact`). Surface as a
-                    # normalized event so symphony can log it once at INFO
-                    # — a sudden token drop on the next turn would otherwise
-                    # be unattributable.
-                    await self._emit(
-                        EVENT_COMPACTION,
-                        {
-                            "phase": "start",
-                            "reason": msg.get("reason"),
-                        },
-                    )
-                elif kind == "compaction_end":
-                    result = msg.get("result") or {}
-                    payload = {
-                        "phase": "end",
-                        "reason": msg.get("reason"),
-                        "aborted": bool(msg.get("aborted")),
-                        "will_retry": bool(msg.get("willRetry")),
+        # Graceful exit with assistant output but no explicit agent_end:
+        # prime-agent's -p mode sometimes closes stdout before flushing
+        # the terminal event. Only rc=0 plus text from this turn qualifies;
+        # stale output from a previous turn was cleared in _command_for_turn.
+        if rc not in (None, 0):
+            await self._raise_nonzero_exit(rc)
+        if rc == 0 and self._last_message:
+            await self._require_resume_confirmation()
+            synthetic = {
+                "type": "agent_end",
+                "messages": [
+                    {
+                        "role": "assistant",
+                        "content": [
+                            {"type": "text", "text": self._last_message}
+                        ],
+                        "stopReason": "stop",
                     }
-                    if isinstance(result, dict):
-                        # Best-effort: surface tokensBefore from the
-                        # CompactionEntry summary if pi includes it.
-                        for src, dst in (
-                            ("tokensBefore", "tokens_before"),
-                            ("firstKeptEntryId", "first_kept_entry_id"),
-                        ):
-                            if src in result:
-                                payload[dst] = result[src]
-                    err = msg.get("errorMessage")
-                    if isinstance(err, str) and err:
-                        payload["error"] = err
-                    await self._emit(EVENT_COMPACTION, payload)
-                elif kind == "auto_retry_start":
-                    await self._emit(
-                        EVENT_AGENT_RETRY,
-                        {
-                            "phase": "start",
-                            "attempt": msg.get("attempt"),
-                            "max_attempts": msg.get("maxAttempts"),
-                            "delay_ms": msg.get("delayMs"),
-                            "error": msg.get("errorMessage"),
-                        },
-                    )
-                elif kind == "auto_retry_end":
-                    await self._emit(
-                        EVENT_AGENT_RETRY,
-                        {
-                            "phase": "end",
-                            "attempt": msg.get("attempt"),
-                            "success": bool(msg.get("success")),
-                            "final_error": msg.get("finalError"),
-                        },
-                    )
-                else:
-                    await self._emit(EVENT_OTHER_MESSAGE, msg)
-        finally:
-            stderr_task.cancel()
-            try:
-                await stderr_task
-            except (asyncio.CancelledError, Exception):
-                pass
-        return terminal
+                ],
+                "message": self._last_message,
+            }
+            log.info(
+                f"{self._agent_name}_agent_end_missing_ok",
+                reason="rc=0 with assistant output, no agent_end event",
+            )
+            await self._emit(EVENT_TURN_COMPLETED, synthetic)
+            return TurnResult(
+                status=EVENT_TURN_COMPLETED,
+                turn_id=self._session_id,
+                last_message=self._last_message,
+            )
 
-    async def _drain_stderr(self, proc: asyncio.subprocess.Process) -> None:
-        if proc.stderr is None:
-            return
-        while True:
-            try:
-                line = await proc.stderr.readline()
-            except (asyncio.CancelledError, Exception):
-                break
-            if not line:
-                break
-            text = line.decode("utf-8", errors="replace").rstrip()
-            if text:
-                self._stderr_tail.append(text)
-            log.debug("pi_stderr", line=text)
+        stderr_blob = self._stderr_blob()
+        err_msg = (
+            f"{self._agent_name} exited with no agent_end event (rc={rc})"
+            + (f"; stderr: {stderr_blob}" if stderr_blob else "")
+        )
+        await self._emit(
+            EVENT_TURN_FAILED,
+            {"reason": err_msg, "stderr_tail": list(self._stderr_tail)},
+        )
+        raise TurnFailed(err_msg)
 
-    def _stderr_blob(self) -> str:
-        """Compact stderr tail for inclusion in failure messages (≤400 chars)."""
-        if not self._stderr_tail:
-            return ""
-        joined = " | ".join(self._stderr_tail)
-        return joined if len(joined) <= 400 else joined[-400:]
-
-    async def _reap(self, proc: asyncio.subprocess.Process) -> None:
-        """Best-effort terminate→wait→kill ladder; mirrors `stop()`."""
-        if proc.returncode is not None:
-            return
-        try:
-            proc.terminate()
-        except ProcessLookupError:
-            return
-        rc = await safe_proc_wait(proc, timeout=2.0)
-        if rc is None and proc.returncode is None:
-            try:
-                proc.kill()
-            except ProcessLookupError:
-                pass
-            await safe_proc_wait(proc)
+    async def _raise_nonzero_exit(self, rc: int) -> None:
+        """Turn a non-zero CLI status into a backend-specific failure."""
+        stderr_blob = self._stderr_blob()
+        err_msg = f"{self._agent_name} exited with code {rc}"
+        if stderr_blob:
+            err_msg += f"; stderr: {stderr_blob}"
+        await self._emit(
+            EVENT_TURN_FAILED,
+            {
+                "reason": err_msg,
+                "exit_code": rc,
+                "stderr": stderr_blob,
+                "stderr_tail": list(self._stderr_tail),
+            },
+        )
+        raise TurnFailed(err_msg)
 
     def _update_usage(self, usage: dict[str, Any]) -> None:
         """Accumulate Pi's per-message Usage into the running totals."""
@@ -424,21 +325,6 @@ class PiBackend(BaseAgentBackend):
         self._latest_usage["input_tokens"] += billed_in
         self._latest_usage["output_tokens"] += out_t
         self._latest_usage["total_tokens"] += billed_in + out_t
-
-    async def _emit(self, event: str, payload: dict[str, Any]) -> None:
-        try:
-            await self._on_event(
-                {
-                    "event": event,
-                    "timestamp": _utc_iso(),
-                    "payload": payload if isinstance(payload, dict) else {"data": payload},
-                    "usage": dict(self._latest_usage),
-                    "rate_limits": None,
-                    "agent_pid": self.pid,
-                }
-            )
-        except Exception as exc:
-            log.warning("event_callback_failed", error=str(exc))
 
 
 def _extract_text(message: dict[str, Any]) -> str:
@@ -460,7 +346,22 @@ def _extract_text(message: dict[str, Any]) -> str:
     return ""
 
 
-def _extract_failure_reason(terminal: dict[str, Any]) -> str | None:
+def _extract_last_assistant_message(messages: object) -> str:
+    """Return the last textual assistant message from an agent_end list."""
+    if not isinstance(messages, list):
+        return ""
+    for message in reversed(messages):
+        if not isinstance(message, dict) or message.get("role") != "assistant":
+            continue
+        text = _extract_text(message)
+        if text:
+            return text
+    return ""
+
+
+def _extract_failure_reason(
+    terminal: dict[str, Any], agent_name: str = "pi"
+) -> str | None:
     """Return a non-empty failure reason if the terminal `agent_end` event
     indicates the run ended in error; otherwise None.
 
@@ -481,5 +382,5 @@ def _extract_failure_reason(terminal: dict[str, Any]) -> str | None:
         err = last.get("errorMessage")
         if isinstance(err, str) and err:
             return err
-        return f"pi turn ended with stopReason={stop_reason!r}"
+        return f"{agent_name} turn ended with stopReason={stop_reason!r}"
     return None

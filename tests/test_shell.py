@@ -2,13 +2,16 @@
 
 from __future__ import annotations
 
+import asyncio
+import subprocess as _subprocess
 import sys
+from types import SimpleNamespace
 from typing import Iterator
 
 import pytest
 
 from symphony import _shell
-from symphony._shell import _is_wsl_launcher, resolve_bash
+from symphony._shell import _is_wsl_launcher, resolve_bash, safe_proc_wait
 
 
 @pytest.fixture(autouse=True)
@@ -85,13 +88,6 @@ def test_windows_picks_git_bash_when_available(
 # ---------------------------------------------------------------------------
 
 
-import asyncio
-import subprocess as _subprocess
-from types import SimpleNamespace
-
-from symphony._shell import safe_proc_wait
-
-
 class _FakeWindowsProcess:
     def __init__(
         self,
@@ -145,10 +141,28 @@ def test_safe_proc_wait_short_circuits_when_returncode_set() -> None:
 
 
 @pytest.mark.skipif(sys.platform == "win32", reason="POSIX waitpid semantics")
+def test_safe_proc_wait_falls_back_when_asyncio_watcher_reaped(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """When waitpid reports ECHILD, asyncio may still know the return code."""
+
+    def already_reaped(_pid: int, _flags: int) -> tuple[int, int]:
+        raise ChildProcessError
+
+    monkeypatch.setattr(_shell.os, "waitpid", already_reaped)
+    fake = _FakeWindowsProcess(wait_result=3)
+
+    rc = asyncio.run(safe_proc_wait(fake, timeout=1.0))
+
+    assert rc == 3
+    assert fake.wait_calls == 1
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX waitpid semantics")
 def test_safe_proc_wait_timeout_returns_none() -> None:
     """Long-running child past the timeout returns None instead of blocking."""
     popen = _subprocess.Popen(
-        ["bash", "-c", "sleep 5"],
+        ["bash", "-c", "sleep 1"],
         stdout=_subprocess.DEVNULL,
         stderr=_subprocess.DEVNULL,
     )
@@ -194,3 +208,15 @@ def test_safe_proc_wait_windows_timeout_returns_none(
     rc = asyncio.run(safe_proc_wait(fake, timeout=0.01))
     assert rc is None
     assert fake.wait_calls == 1
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX process identity")
+def test_process_identity_is_stable_for_current_process() -> None:
+    import os
+
+    first = _shell.process_identity(os.getpid())
+    second = _shell.process_identity(os.getpid())
+
+    assert first is not None
+    assert first == second
+    assert _shell.process_identity(-1) is None

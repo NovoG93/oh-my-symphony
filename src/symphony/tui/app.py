@@ -7,16 +7,15 @@ The App owns:
   - all key bindings + actions (zoom, pagination, density, filter, archive,
     pause/resume, language toggle, scroll).
 
-`_fetch_candidates` / `_fetch_terminals` are referenced via the parent
-package namespace (`_tui_pkg._fetch_candidates`) so that test stubs
-applied via `monkeypatch.setattr("symphony.tui._fetch_candidates", ...)`
-take effect — a direct `from .helpers import _fetch_candidates` would
-bind the function once at import time and ignore the patch.
+`_fetch_tracker_snapshot` is imported directly and resolved through this
+module's globals at call time, so tests patch the consumer's reference.
 """
 
 from __future__ import annotations
 
 import asyncio
+import time
+from dataclasses import replace
 from typing import Any, Iterable
 
 from rich.console import Console
@@ -44,20 +43,36 @@ from .helpers import (
     _CardStatus,
     _build_runtime_index,
     _card_sort_key,
+    _fetch_tracker_snapshot,
     _matches_filter,
     _ordered_column_states,
+    _stage_position,
 )
-from .screens import _RefreshNow
+from .screens import (
+    EditIssueScreen,
+    HelpScreen,
+    NewIssueScreen,
+    StatsScreen,
+    _RefreshNow,
+)
 from .widgets import DetailPane, FilterBar, IssueCard, Lane, StatsBar
 
 
 log = get_logger()
 
+# Seconds the quit confirmation stays armed after a first `q` on a busy
+# board. A second `q` inside this window quits; outside it, `q` re-arms.
+QUIT_CONFIRM_WINDOW_S = 5.0
 
-# Bind to the parent package object so `_tui_pkg._fetch_candidates` does
-# attribute lookup at call time — that's how test monkeypatches on
-# `symphony.tui._fetch_candidates` reach this code path.
-import symphony.tui as _tui_pkg  # noqa: E402  (intentional post-import side effect)
+
+_ORCH_ERROR_REPEAT_S = 10.0
+_EMPTY_SNAPSHOT: dict[str, Any] = {
+    "counts": {"running": 0, "retrying": 0},
+    "codex_totals": {},
+    "running": [],
+    "retrying": [],
+    "generated_at": "",
+}
 
 
 class KanbanApp(App):
@@ -109,7 +124,11 @@ class KanbanApp(App):
         Binding("L", "toggle_language", "Language"),
         Binding("a", "archive_focused", "Archive"),
         Binding("c", "confirm_done_focused", "Confirm done"),
+        Binding("S", "skip_document_focused", "Skip Document"),
         Binding("P", "toggle_pause_focused", "Pause/resume"),
+        Binding("n", "new_issue", "New issue"),
+        Binding("e", "edit_focused", "Edit issue"),
+        Binding("s", "stats", "Stats"),
         Binding("slash", "open_filter", "Filter"),
         Binding("escape", "escape", "Close filter / zoom", show=False),
     ]
@@ -155,6 +174,16 @@ class KanbanApp(App):
         # restarting the TUI. Reset on relaunch — persistence belongs in
         # WORKFLOW.md / SYMPHONY_LANG, not in TUI state.
         self._language_override: str | None = None
+        # H1 — quit guard. `q` is the reflexive "close the viewer" key, but
+        # exiting the TUI stops the orchestrator and every in-flight agent.
+        # While workers are live the first press only arms a short
+        # confirmation window; see `action_quit`.
+        self._quit_armed: bool = False
+        # Orchestrator queries run on the 0.5 s heartbeat. A raise there
+        # must not tear the app down: keep the last good snapshot and toast
+        # each distinct failure once instead of every tick.
+        self._last_snapshot: dict[str, Any] = _EMPTY_SNAPSHOT
+        self._orch_error_seen: dict[str, float] = {}
 
     # ----- composition -------------------------------------------------
 
@@ -171,7 +200,12 @@ class KanbanApp(App):
                 for state_label in ordered:
                     key = normalize_state(state_label)
                     color = STATE_COLOR.get(key, "white")
-                    lane = Lane(state_label, color, descriptions.get(key))
+                    lane = Lane(
+                        state_label,
+                        color,
+                        descriptions.get(key),
+                        stage_pos=_stage_position(state_label, cfg),
+                    )
                     if key in self._terminal_keys:
                         lane.add_class("-terminal")
                     self._lanes[key] = lane
@@ -229,8 +263,9 @@ class KanbanApp(App):
 
     async def _refresh_tracker(self, cfg: ServiceConfig) -> None:
         try:
-            candidates = await asyncio.to_thread(_tui_pkg._fetch_candidates, cfg)
-            terminals = await asyncio.to_thread(_tui_pkg._fetch_terminals, cfg)
+            candidates, terminals = await asyncio.to_thread(
+                _fetch_tracker_snapshot, cfg
+            )
         except Exception as exc:
             log.debug("tui_tracker_fetch_failed", error=str(exc))
             return
@@ -243,7 +278,7 @@ class KanbanApp(App):
         cfg = self._ws.current()
         if cfg is None:
             return
-        snapshot = self._orch.snapshot()
+        snapshot = self._safe_snapshot()
         try:
             stats = self.query_one(StatsBar)
         except (NoMatches, ScreenStackError):
@@ -271,7 +306,7 @@ class KanbanApp(App):
             issues = sorted(issues_by_state.get(key, []), key=_card_sort_key)
             lane.set_count(len(issues))
             cards = [
-                (issue, runtime_index.get(issue.id, _CardStatus()))
+                (issue, self._card_status_for_issue(issue, runtime_index))
                 for issue in issues
             ]
             lane.render_cards(
@@ -282,12 +317,38 @@ class KanbanApp(App):
         self._apply_lane_widths()
         self._refresh_detail_pane()
 
+    def _safe_snapshot(self) -> dict[str, Any]:
+        try:
+            self._last_snapshot = self._orch.snapshot()
+        except Exception as exc:
+            self._notify_orch_error("orchestrator snapshot failed", exc)
+        return self._last_snapshot
+
+    def _safe_running_issues(self) -> list[Issue]:
+        try:
+            return list(self._orch.iter_running_issues())
+        except Exception as exc:
+            self._notify_orch_error("orchestrator running-issues failed", exc)
+            return []
+
+    def _notify_orch_error(self, what: str, exc: Exception) -> None:
+        # Heartbeat calls this every 0.5 s while the fault persists; surface
+        # each distinct message at most once per window.
+        message = f"{what}: {exc}"
+        now = time.monotonic()
+        last = self._orch_error_seen.get(message)
+        if last is not None and now - last < _ORCH_ERROR_REPEAT_S:
+            return
+        self._orch_error_seen[message] = now
+        log.warning("tui_orchestrator_query_failed", what=what, error=str(exc))
+        self.notify(message, severity="error", timeout=4)
+
     def _all_known_issues(self) -> Iterable[Issue]:
         seen: set[str] = set()
         for source in (
             self._candidates,
             self._terminal_issues,
-            list(self._orch.iter_running_issues()),
+            self._safe_running_issues(),
         ):
             for issue in source:
                 if issue.id in seen:
@@ -295,7 +356,70 @@ class KanbanApp(App):
                 seen.add(issue.id)
                 yield issue
 
+    def _card_status_for_issue(
+        self, issue: Issue, runtime_index: dict[str, _CardStatus]
+    ) -> _CardStatus:
+        status = runtime_index.get(issue.id, _CardStatus())
+        if status.attention is not None:
+            return status
+        attention_fn = getattr(self._orch, "issue_attention", None)
+        if not callable(attention_fn):
+            return status
+        try:
+            attention = attention_fn(issue)
+        except Exception as exc:
+            log.debug(
+                "tui_issue_attention_failed",
+                identifier=issue.identifier,
+                error=str(exc),
+            )
+            return status
+        if not attention:
+            return status
+        return replace(status, attention=attention)
+
     # ----- actions -----------------------------------------------------
+
+    def action_quit(self) -> None:
+        """Quit — with a guard rail while workers are live.
+
+        An idle board quits immediately, exactly as before. A board with
+        running or retrying workers requires a second `q` within
+        `QUIT_CONFIRM_WINDOW_S`: the first press only arms the
+        confirmation and says how many agents would be stopped, because
+        exiting the TUI tears down the orchestrator and aborts those
+        runs mid-turn.
+        """
+        busy = self._busy_worker_count()
+        if busy == 0 or self._quit_armed:
+            self.exit()
+            return
+        self._quit_armed = True
+        self.set_timer(QUIT_CONFIRM_WINDOW_S, self._disarm_quit)
+        plural = "" if busy == 1 else "s"
+        self.notify(
+            f"{busy} agent{plural} running — press q again to stop them and quit",
+            severity="warning",
+            timeout=QUIT_CONFIRM_WINDOW_S,
+        )
+
+    def _disarm_quit(self) -> None:
+        self._quit_armed = False
+
+    def _busy_worker_count(self) -> int:
+        """Running + retrying workers from the orchestrator snapshot.
+
+        A snapshot failure degrades to "idle" so a broken observer can
+        never trap the operator in the app — quitting then matches the
+        historical single-press behavior.
+        """
+        try:
+            counts = self._orch.snapshot().get("counts", {}) or {}
+        except Exception:
+            return 0
+        return int(counts.get("running", 0) or 0) + int(
+            counts.get("retrying", 0) or 0
+        )
 
     def action_refresh(self) -> None:
         self._kick_tracker_refresh()
@@ -303,19 +427,17 @@ class KanbanApp(App):
         self.notify("refreshed")
 
     def action_help(self) -> None:
-        lang = self._effective_language()
-        page = self._current_page_index() + 1
-        total_pages = self._page_count()
-        msg = (
-            "q quit · r refresh · enter details · "
-            "1-9 zoom lane · 0/esc reset · "
-            f"t/T page lanes ({page}/{total_pages}) · +/- resize window · "
-            "d density · p detail-pane · ]/[ focus detail/board · "
-            "L language · a archive · c confirm done · P pause/resume · / filter · "
-            "tab focus · j/k scroll · g/G top/bottom · "
-            f"lang={lang}"
+        """Open the grouped key-binding modal (`?` again, esc, or q closes)."""
+        if isinstance(self.screen, HelpScreen):
+            self.pop_screen()
+            return
+        self.push_screen(
+            HelpScreen(
+                language=self._effective_language(),
+                page=self._current_page_index() + 1,
+                total_pages=self._page_count(),
+            )
         )
-        self.notify(msg, timeout=8)
 
     def action_open_details(self) -> None:
         focused = self.focused
@@ -588,6 +710,41 @@ class KanbanApp(App):
         self.notify(f"confirmed {issue.identifier} as Done", timeout=2)
         self._kick_tracker_refresh()
 
+    def action_skip_document_focused(self) -> None:
+        """Move a Document card to Human Review without running Document."""
+        focused = self.focused
+        if not isinstance(focused, IssueCard):
+            self.notify("focus a card first", timeout=2)
+            return
+        issue = focused.issue
+        if normalize_state(issue.state) not in {"document", "learn"}:
+            self.notify(
+                f"only Document cards can be skipped (state={issue.state})",
+                timeout=3,
+            )
+            return
+        self.run_worker(
+            self._skip_document_issue(issue),
+            thread=False,
+            exclusive=False,
+            group="skip_document",
+        )
+
+    async def _skip_document_issue(self, issue: Issue) -> None:
+        try:
+            changed, message = await self._orch.skip_document(issue.identifier)
+        except Exception as exc:
+            log.warning(
+                "tui_skip_document_failed", identifier=issue.identifier, error=str(exc)
+            )
+            self.notify(f"skip failed: {exc}", timeout=4, severity="error")
+            return
+        if not changed:
+            self.notify(message, timeout=4, severity="warning")
+            return
+        self.notify(message, timeout=2)
+        self._kick_tracker_refresh()
+
     @staticmethod
     def _call_update_state(
         cfg: ServiceConfig, issue: Issue, target_state: str
@@ -597,6 +754,196 @@ class KanbanApp(App):
             client.update_state(issue, target_state)
         finally:
             client.close()
+
+    # ----- new issue ('n') + stats ('s') --------------------------------
+
+    def action_new_issue(self) -> None:
+        """Register a new ticket on the file board via a modal form."""
+        cfg = self._ws.current()
+        if cfg is None:
+            return
+        if cfg.tracker.kind != "file":
+            self.notify(
+                "issue creation from the TUI requires tracker.kind: file",
+                timeout=3,
+            )
+            return
+        # Skill discovery reads SKILL.md files — do it off the UI loop,
+        # then open the modal once the list is in hand.
+        self.run_worker(
+            self._open_new_issue(cfg), thread=False, exclusive=True, group="new_issue"
+        )
+
+    async def _open_new_issue(self, cfg: ServiceConfig) -> None:
+        from ..workflow import SUPPORTED_AGENT_KINDS
+
+        def _on_result(form: dict[str, Any] | None) -> None:
+            if form:
+                self.run_worker(
+                    self._create_issue(cfg, form),
+                    thread=False,
+                    exclusive=False,
+                    group="create_issue",
+                )
+
+        self.push_screen(
+            NewIssueScreen(
+                states=list(cfg.tracker.active_states),
+                agent_kinds=sorted(SUPPORTED_AGENT_KINDS),
+            ),
+            _on_result,
+        )
+
+    async def _create_issue(self, cfg: ServiceConfig, form: dict[str, Any]) -> None:
+        from ..stats import stats_store_for
+        from ..trackers.file import FileBoardTracker
+
+        def _create() -> str:
+            tracker = FileBoardTracker(cfg.tracker)
+            identifier, _ = tracker.create_with_next_identifier(
+                "TASK",
+                title=form["title"],
+                state=form["state"],
+                priority=form["priority"],
+                labels=form["labels"],
+                description=form["description"],
+                agent_kind=form["agent_kind"] or None,
+            )
+            stats_store_for(
+                cfg.workflow_path.parent / ".symphony" / "stats.jsonl"
+            ).record_transition(
+                issue=identifier, from_state="", to_state=form["state"].lower()
+            )
+            return identifier
+
+        try:
+            identifier = await asyncio.to_thread(_create)
+        except Exception as exc:
+            log.warning("tui_create_issue_failed", error=str(exc))
+            self.notify(f"create failed: {exc}", timeout=4, severity="error")
+            return
+        self.notify(f"created {identifier}", timeout=2)
+        self._kick_tracker_refresh()
+
+    def action_edit_focused(self) -> None:
+        """Edit the focused file-board ticket in a modal."""
+        focused = self.focused
+        if not isinstance(focused, IssueCard):
+            self.notify("focus a card first", timeout=2)
+            return
+        cfg = self._ws.current()
+        if cfg is None:
+            return
+        if cfg.tracker.kind != "file":
+            self.notify(
+                "issue editing from the TUI requires tracker.kind: file",
+                timeout=3,
+            )
+            return
+        issue = focused.issue
+        try:
+            running_id = self._orch.find_running_issue_id(issue.identifier)
+        except Exception as exc:
+            log.warning(
+                "tui_find_running_failed", identifier=issue.identifier, error=str(exc)
+            )
+            self.notify(f"edit check failed: {exc}", severity="error", timeout=4)
+            return
+        if running_id is not None:
+            self.notify(
+                f"{issue.identifier} is running; wait before editing",
+                timeout=3,
+                severity="warning",
+            )
+            return
+
+        def _on_result(form: dict[str, Any] | None) -> None:
+            if form:
+                self.run_worker(
+                    self._update_issue(cfg, issue, form),
+                    thread=False,
+                    exclusive=False,
+                    group="edit_issue",
+                )
+
+        from ..workflow import SUPPORTED_AGENT_KINDS
+
+        self.push_screen(
+            EditIssueScreen(
+                issue,
+                states=list(cfg.tracker.active_states) + list(cfg.tracker.terminal_states),
+                agent_kinds=sorted(SUPPORTED_AGENT_KINDS),
+            ),
+            _on_result,
+        )
+
+    async def _update_issue(
+        self, cfg: ServiceConfig, issue: Issue, form: dict[str, Any]
+    ) -> None:
+        from ..stats import stats_store_for
+        from ..trackers.file import FileBoardTracker
+
+        def _update() -> None:
+            tracker = FileBoardTracker(cfg.tracker)
+            tracker.update_fields(
+                issue.identifier,
+                title=form["title"],
+                description=form["description"],
+                state=form["state"],
+                priority=form["priority"],
+                clear_priority=form["priority"] is None,
+                labels=form["labels"],
+                agent_kind=form["agent_kind"],
+            )
+            if normalize_state(form["state"]) != normalize_state(issue.state):
+                stats_store_for(
+                    cfg.workflow_path.parent / ".symphony" / "stats.jsonl"
+                ).record_transition(
+                    issue=issue.identifier,
+                    from_state=issue.state.lower(),
+                    to_state=form["state"].lower(),
+                )
+
+        try:
+            await asyncio.to_thread(_update)
+        except Exception as exc:
+            log.warning(
+                "tui_update_issue_failed", identifier=issue.identifier, error=str(exc)
+            )
+            self.notify(f"edit failed: {exc}", timeout=4, severity="error")
+            return
+        self.notify(f"updated {issue.identifier}", timeout=2)
+        self._kick_tracker_refresh()
+
+    def action_stats(self) -> None:
+        cfg = self._ws.current()
+        if cfg is None:
+            return
+        self.run_worker(
+            self._open_stats(cfg), thread=False, exclusive=True, group="stats"
+        )
+
+    async def _open_stats(self, cfg: ServiceConfig) -> None:
+        from ..stats import stats_store_for
+
+        store = getattr(self._orch, "stats", None) or stats_store_for(
+            cfg.workflow_path.parent / ".symphony" / "stats.jsonl"
+        )
+        terminal = {s.lower() for s in cfg.tracker.terminal_states}
+        done_states = {"done"} if "done" in terminal else terminal
+        try:
+            aggregate = await asyncio.to_thread(
+                store.aggregate, 30, done_states, cfg.tracker.active_states
+            )
+        except Exception as exc:
+            log.warning("tui_stats_failed", error=str(exc))
+            self.notify(f"stats failed: {exc}", timeout=4, severity="error")
+            return
+        casing = {
+            s.lower(): s
+            for s in (*cfg.tracker.active_states, *cfg.tracker.terminal_states)
+        }
+        self.push_screen(StatsScreen(aggregate, casing))
 
     # ----- pause / resume ---------------------------------------------
 
@@ -615,7 +962,13 @@ class KanbanApp(App):
             self.notify("focus a card first", timeout=2)
             return
         issue_id = focused.issue.id
-        if self._orch.is_paused(issue_id):
+        try:
+            paused = self._orch.is_paused(issue_id)
+        except Exception as exc:
+            log.warning("tui_is_paused_failed", issue_id=issue_id, error=str(exc))
+            self.notify(f"pause check failed: {exc}", severity="error", timeout=4)
+            return
+        if paused:
             if self._orch.resume_worker(issue_id):
                 self.notify(f"resumed {focused.issue.identifier}", timeout=2)
             else:
@@ -660,7 +1013,7 @@ class KanbanApp(App):
             # changing each tick, so we re-render even when the same card
             # is still focused.
             self._last_focused_card_id = focused.id
-            pane.show_for(focused.issue, focused.status)
+            pane.show_for(focused.issue, focused.status, focused.stage_pos)
             return
         # Focus may have shifted INTO the pane itself (user pressed `]` to
         # scroll the description). Keep showing the previously focused card
@@ -673,7 +1026,7 @@ class KanbanApp(App):
         ):
             card = self._find_card_by_id(self._last_focused_card_id)
             if card is not None:
-                pane.show_for(card.issue, card.status)
+                pane.show_for(card.issue, card.status, card.stage_pos)
             return
         if self._last_focused_card_id is not None:
             self._last_focused_card_id = None

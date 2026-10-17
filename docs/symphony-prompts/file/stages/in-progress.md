@@ -1,35 +1,19 @@
-### IMPLEMENT  -- when state is `In Progress`
+### IMPLEMENT -- make the change and leave a proof map
 
-**Allowed tools (advisory).** Read full repo + docs + ticket. Write source files within the agreed Plan scope, `docs/{{ issue.identifier }}/work/`, and ticket comments. Run tests, formatters, `git add` / `git commit` (Symphony commits at turn end). Do NOT push branches, merge, or open PRs — Symphony's Learn Merge Gate handles integration.
+Write source, tests, `docs/{{ issue.identifier }}/work/`, and ticket comments; run tests and formatters. Do NOT push, merge, or open PRs; Verify owns the Merge Gate. Make the smallest correct change a fresh verifier can audit without guessing.
 
-You are the implementer. Ship the smallest change that satisfies the brief.
+1. Read `docs/llm-wiki/INDEX.md` first when it exists; reuse current knowledge before broad repo search. Delegate broad exploration or verification sweeps to fresh-context subagents when the CLI supports them.
+2. Produce or refresh before editing source:
+   - `## Plan` -- user goal, before state, after target, concrete steps.
+   - `## Acceptance Tests` -- one proof per acceptance criterion (signal + command or artifact).
+   - `## Done Signals` -- exact visible state Verify should see, including what would still be `Not proven`.
+   - `## Difficulty` -- `trivial` / `standard` / `complex` with one-line rationale.
+3. TDD loop: write the failing test, make it pass, refactor. No production code without a test or an explicit `chore` rationale.
+4. Save durable work notes under `docs/{{ issue.identifier }}/work/` (at least one file).
+5. Append `## Implementation` -- what changed, why this approach, alternatives rejected.
+6. Re-check null/empty/boundary/error paths, then append `## Self-Critique` -- risk, not-covered items, and the exact focus for Verify.
+   - Static browser apps that claim direct `file://` support must boot from `file://`; do not use `<script type="module">` or dynamic `import()` unless the acceptance path explicitly serves HTTP.
+7. Append `## Pipeline Route`: always route to `Verify` (note if the trivial non-runtime QA short path applies, but never skip Verify).
+8. Set state to `Verify`.
 
-1. **Read the plan first.** Re-read the most recent `## Plan` and
-   `docs/{{ issue.identifier }}/plan/implementation-plan.md` if it exists.
-   That plan should be enough to implement. Use Explore notes, llm-wiki, or
-   other docs only as reference material when the plan is ambiguous or
-   missing a required detail. If `## Plan` is missing, set state to `Plan`,
-   append `## Plan Missing`, and stop. Fresh context means earlier
-   conversation is gone; the markdown is the contract.
-2. **Rewind scope.** `$SYMPHONY_REWIND_SCOPE` is a JSON
-   `{severity, file, line, fix}[]` Symphony sets on Review→In Progress /
-   QA→In Progress rewinds. Scope this turn to those files. Touching any
-   other file needs a one-line `## Scope Expansion` rationale (commit
-   gets a `[scope-expand]` marker — non-blocking). Unset → follow
-   `## Plan`; unset AND the latest section is `## QA Failure` /
-   `## Review Findings` → scope to those rows anyway.
-3. Implement the chosen option from `## Plan` (or, on rewind, only the
-   flagged failure items above). Do not reopen the plan unless the brief
-   got a fact wrong — then append a one-line `## Plan Adjustment` and
-   proceed.
-4. TDD loop: write the failing test the brief specified, make it pass,
-   refactor. No production code without a test exercising it.
-5. Pair the change with user-facing docs at
-   `docs/{{ issue.identifier }}/work/feature.md` (or `bug.md` if this
-   ticket carries the `bug` label) — what changed, how a user observes
-   it, any knobs/flags. Plain language, no jargon.
-6. Before `Review`, write one concise commit subject to
-   `.symphony/commit-message.txt`; Symphony commits it after the turn.
-   Append `## Implementation` with intent per change and decisions worth
-   recording.
-7. Set state to `Review`.
+On rewind: `$SYMPHONY_REWIND_SCOPE` may contain JSON rows from `## Review Findings` or `## QA Failure`. Limit this turn to those rows unless a one-line `## Scope Expansion` explains why more files are required.

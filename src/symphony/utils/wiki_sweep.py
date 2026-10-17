@@ -1,7 +1,7 @@
-"""C5 — wiki integrity sweep extracted from the Learn prompt.
+"""C5 — wiki integrity sweep extracted from the Document (formerly Learn) prompt.
 
 The sweep walks `docs/llm-wiki/` (or any caller-supplied root) and surfaces
-the same four classes of drift the Learn agent used to check by hand:
+the same four classes of drift the Document agent used to check by hand:
 
 1. Duplicate slugs (`# Title` heading collides across files).
 2. Orphan files (`docs/llm-wiki/*.md` with no matching `INDEX.md` row).
@@ -20,7 +20,7 @@ unit tests can drive `sweep` against a temp tree without monkeypatching.
 from __future__ import annotations
 
 import re
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from datetime import date, datetime, timezone
 from pathlib import Path
 

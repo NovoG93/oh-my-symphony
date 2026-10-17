@@ -16,12 +16,15 @@ framework, so this file shrinks to:
 from __future__ import annotations
 
 import asyncio
+from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
 import pytest
 
+import symphony.trackers.file as file_tracker_module
+import symphony.tui.helpers as tui_helpers
 from symphony.issue import Issue
 from symphony.tui import (
     DENSITY_COMPACT,
@@ -58,6 +61,7 @@ from symphony.workflow import (
     GeminiConfig,
     HooksConfig,
     PiConfig,
+    PrimeAgentConfig,
     ServerConfig,
     ServiceConfig,
     TrackerConfig,
@@ -99,6 +103,9 @@ class _StubOrchestrator:
 
     def iter_running_issues(self) -> tuple[Issue, ...]:
         return self._running_issues
+
+    def find_running_issue_id(self, identifier: str) -> str | None:
+        return None
 
     def add_observer(self, observer: Any) -> None:
         # KanbanApp registers a tick observer; the Pilot test exercises the
@@ -168,6 +175,13 @@ def _make_config(
             stall_timeout_ms=300_000,
             resume_across_turns=True,
         ),
+prime_agent=PrimeAgentConfig(
+    command='prime-agent -p --mode json',
+    turn_timeout_ms=3_600_000,
+    read_timeout_ms=5_000,
+    stall_timeout_ms=300_000,
+    resume_across_turns=True,
+),
         server=ServerConfig(port=None),
         tui=TuiConfig(language=language, visible_lanes=visible_lanes),
         prompt_template="hi",
@@ -276,6 +290,142 @@ def test_ordered_column_states_dedupes_active_then_terminal() -> None:
     assert _ordered_column_states(cfg) == ["Todo", "In Progress", "Done", "Cancelled"]
 
 
+def _write_ticket(root: Path, name: str, state: str) -> Path:
+    root.mkdir(parents=True, exist_ok=True)
+    path = root / name
+    path.write_text(
+        f"---\nid: {name[:-3]}\ntitle: {name[:-3]}\nstate: {state}\n---\n",
+        encoding="utf-8",
+    )
+    return path
+
+
+def _file_config(
+    root: Path,
+    *,
+    active: tuple[str, ...] = ("Todo", "Shared"),
+    terminal: tuple[str, ...] = ("Shared", "Done"),
+) -> ServiceConfig:
+    cfg = _make_config(active_states=active, terminal_states=terminal)
+    return replace(
+        cfg,
+        tracker=replace(
+            cfg.tracker,
+            kind="file",
+            endpoint="",
+            api_key="",
+            project_slug="",
+            board_root=root,
+        ),
+    )
+
+
+@pytest.mark.asyncio
+async def test_app_file_refresh_parses_each_ticket_once(
+    tmp_path: Path, monkeypatch: Any
+) -> None:
+    root = tmp_path / "board"
+    for name, state in (("A.md", "Todo"), ("B.md", "Done"), ("C.md", "Shared")):
+        _write_ticket(root, name, state)
+    cfg = _file_config(root)
+    original = file_tracker_module.issue_from_file
+    parses = 0
+
+    def counted(path: Path) -> Issue | None:
+        nonlocal parses
+        parses += 1
+        return original(path)
+
+    monkeypatch.setattr(file_tracker_module, "issue_from_file", counted)
+    app = KanbanApp(_StubOrchestrator(), _StaticWorkflowState(cfg))  # type: ignore[arg-type]
+
+    await app._refresh_tracker(cfg)
+
+    assert parses == 3
+    assert [issue.identifier for issue in app._candidates] == ["A"]
+    assert [issue.identifier for issue in app._terminal_issues] == ["B", "C"]
+
+
+def test_fetch_tracker_snapshot_file_scans_once_and_sees_next_poll(
+    tmp_path: Path, monkeypatch: Any
+) -> None:
+    root = tmp_path / "board"
+    _write_ticket(root, "A.md", "Todo")
+    mutable = _write_ticket(root, "B.md", "Done")
+    _write_ticket(root, "C.md", "Shared")
+    cfg = _file_config(root)
+    original = file_tracker_module.issue_from_file
+    parses = 0
+
+    def counted(path: Path) -> Issue | None:
+        nonlocal parses
+        parses += 1
+        return original(path)
+
+    monkeypatch.setattr(file_tracker_module, "issue_from_file", counted)
+
+    candidates, terminals = tui_helpers._fetch_tracker_snapshot(cfg)
+
+    assert [issue.identifier for issue in candidates] == ["A"]
+    assert [issue.identifier for issue in terminals] == ["B", "C"]
+    assert parses == 3
+
+    mutable.write_text(
+        "---\nid: B\ntitle: B\nstate: Todo\n---\n", encoding="utf-8"
+    )
+    candidates, terminals = tui_helpers._fetch_tracker_snapshot(cfg)
+
+    assert [issue.identifier for issue in candidates] == ["A", "B"]
+    assert [issue.identifier for issue in terminals] == ["C"]
+    assert parses == 6
+
+
+def test_fetch_tracker_snapshot_non_file_reuses_and_closes_one_client(
+    monkeypatch: Any,
+) -> None:
+    calls: list[str] = []
+
+    class _Tracker:
+        def fetch_candidate_issues(self) -> list[Issue]:
+            calls.append("active")
+            return [_issue("SMA-1")]
+
+        def fetch_issues_by_states(self, _states: tuple[str, ...]) -> list[Issue]:
+            calls.append("terminal")
+            return [_issue("SMA-9", state="Done")]
+
+        def close(self) -> None:
+            calls.append("close")
+
+    monkeypatch.setattr(tui_helpers, "build_tracker_client", lambda _cfg: _Tracker())
+
+    candidates, terminals = tui_helpers._fetch_tracker_snapshot(_make_config())
+
+    assert [issue.identifier for issue in candidates] == ["SMA-1"]
+    assert [issue.identifier for issue in terminals] == ["SMA-9"]
+    assert calls == ["active", "terminal", "close"]
+
+
+def test_fetch_tracker_snapshot_closes_client_when_fetch_fails(
+    monkeypatch: Any,
+) -> None:
+    closed = False
+
+    class _Tracker:
+        def fetch_candidate_issues(self) -> list[Issue]:
+            raise RuntimeError("tracker unavailable")
+
+        def close(self) -> None:
+            nonlocal closed
+            closed = True
+
+    monkeypatch.setattr(tui_helpers, "build_tracker_client", lambda _cfg: _Tracker())
+
+    with pytest.raises(RuntimeError, match="tracker unavailable"):
+        tui_helpers._fetch_tracker_snapshot(_make_config())
+    assert closed is True
+
+
 def test_state_color_map_covers_common_states() -> None:
     for s in ("todo", "in progress", "done", "blocked"):
         assert s in STATE_COLOR
@@ -305,10 +455,28 @@ def test_build_runtime_index_extracts_running_and_retrying() -> None:
                 "tokens": {"total_tokens": 100, "input_tokens": 60, "output_tokens": 40},
                 "last_message": "hello",
                 "agent_kind": "pi",
+                "attention": {
+                    "kind": "stalled",
+                    "label": "Stalled",
+                    "message": "worker cancellation pending",
+                    "severity": "error",
+                    "due_at": None,
+                },
             }
         ],
         "retrying": [
-            {"issue_id": "id-2", "attempt": 2, "error": "timeout"},
+            {
+                "issue_id": "id-2",
+                "attempt": 2,
+                "error": "timeout",
+                "attention": {
+                    "kind": "retry_scheduled",
+                    "label": "Retry scheduled",
+                    "message": "timeout",
+                    "severity": "info",
+                    "due_at": "2026-07-03T01:00:00Z",
+                },
+            },
         ],
     }
     idx = _build_runtime_index(snap)
@@ -319,14 +487,99 @@ def test_build_runtime_index_extracts_running_and_retrying() -> None:
     assert idx["id-1"].tokens == 100
     assert idx["id-1"].last_event_at is not None
     assert idx["id-1"].agent_kind == "pi"
+    assert idx["id-1"].attention["kind"] == "stalled"  # type: ignore[index]
     assert idx["id-2"].runtime == "retrying"
     assert idx["id-2"].attempt == 2
     assert idx["id-2"].error == "timeout"
+    assert idx["id-2"].attention["kind"] == "retry_scheduled"  # type: ignore[index]
 
 
 def test_build_runtime_index_tolerates_missing_blocks() -> None:
     assert _build_runtime_index({}) == {}
     assert _build_runtime_index({"running": None, "retrying": None}) == {}
+
+
+def test_compact_card_renders_attention_label() -> None:
+    card = IssueCard.__new__(IssueCard)
+    card._issue = _issue("SMA-1")  # type: ignore[attr-defined]
+    card._status = _CardStatus(  # type: ignore[attr-defined]
+        attention={
+            "kind": "tracker_error",
+            "label": "Tracker error",
+            "message": "update failed",
+            "severity": "warning",
+            "due_at": None,
+        }
+    )
+    card._stage_pos = None  # type: ignore[attr-defined]
+
+    assert "! Tracker error" in card._render_compact().plain
+
+
+def test_compact_card_shows_retry_error_and_agent_chip() -> None:
+    """M2 — the default compact density must not hide *why* a run retries,
+    nor which backend owns a live ticket."""
+    card = IssueCard.__new__(IssueCard)
+    card._issue = _issue("SMA-1")  # type: ignore[attr-defined]
+    card._status = _CardStatus(  # type: ignore[attr-defined]
+        runtime="retrying", error="exit 1 after long delay", agent_kind="codex"
+    )
+    card._stage_pos = None  # type: ignore[attr-defined]
+
+    plain = card._render_compact().plain
+    assert "↻" in plain
+    assert "exit 1 after long delay" in plain
+    assert "code" in plain  # 4-char colored agent chip (codex → "code")
+
+
+def test_compact_card_truncates_long_retry_error() -> None:
+    card = IssueCard.__new__(IssueCard)
+    card._issue = _issue("SMA-2")  # type: ignore[attr-defined]
+    card._status = _CardStatus(  # type: ignore[attr-defined]
+        runtime="retrying",
+        error="x" * 120,
+    )
+    card._stage_pos = None  # type: ignore[attr-defined]
+
+    plain = card._render_compact().plain
+    assert len(plain) < 200  # line-width discipline holds
+    assert "…" in plain
+
+
+def test_ticket_detail_modal_renders_attention_message_and_due_at() -> None:
+    status = _CardStatus(
+        attention={
+            "kind": "retry_scheduled",
+            "label": "Retry scheduled",
+            "message": "backend timeout",
+            "severity": "info",
+            "due_at": "2026-07-03T01:00:00Z",
+        }
+    )
+    screen = TicketDetailScreen(_issue("SMA-1"), status, "en")
+
+    meta = screen._meta_text().plain
+    assert "Retry scheduled: backend timeout" in meta
+    assert "due 2026-07-03T01:00:00Z" in meta
+
+
+def test_app_card_status_uses_orchestrator_attention() -> None:
+    cfg = _make_config()
+    issue = _issue("SMA-1")
+    orch = _StubOrchestrator()
+    orch.issue_attention = lambda _issue: {  # type: ignore[attr-defined]
+        "kind": "budget_exhausted",
+        "label": "Budget exhausted",
+        "message": "turn budget",
+        "severity": "warning",
+        "due_at": None,
+    }
+    app = KanbanApp(orch, _StaticWorkflowState(cfg))  # type: ignore[arg-type]
+
+    status = app._card_status_for_issue(issue, {})
+
+    assert status.attention is not None
+    assert status.attention["kind"] == "budget_exhausted"
 
 
 # ---------------------------------------------------------------------------
@@ -335,8 +588,10 @@ def test_build_runtime_index_tolerates_missing_blocks() -> None:
 
 
 def _stub_tracker(monkeypatch: Any, candidates: list[Issue], terminals: list[Issue]) -> None:
-    monkeypatch.setattr("symphony.tui._fetch_candidates", lambda _: list(candidates))
-    monkeypatch.setattr("symphony.tui._fetch_terminals", lambda _: list(terminals))
+    monkeypatch.setattr(
+        "symphony.tui.app._fetch_tracker_snapshot",
+        lambda _: (list(candidates), list(terminals)),
+    )
 
 
 @pytest.mark.asyncio
@@ -374,6 +629,36 @@ async def test_q_quits_app(monkeypatch: Any) -> None:
         await pilot.press("q")
         await pilot.pause()
     # run_test() exits when the app does; the assertion is implicit.
+
+
+@pytest.mark.asyncio
+async def test_q_requires_second_press_while_workers_run(
+    monkeypatch: Any,
+) -> None:
+    """H1 — `q` on a busy board must not kill running agents unconfirmed.
+
+    First press arms a short confirmation window (and notifies); the
+    second press inside it quits. run_test() completing after the second
+    press is the exit assertion.
+    """
+    cfg = _make_config()
+    _stub_tracker(monkeypatch, [], [])
+    snap = {
+        "counts": {"running": 2, "retrying": 1},
+        "codex_totals": {},
+        "running": [],
+        "retrying": [],
+        "generated_at": "now",
+    }
+    app = KanbanApp(_StubOrchestrator(snapshot=snap), _StaticWorkflowState(cfg))  # type: ignore[arg-type]
+    async with app.run_test(size=(120, 30)) as pilot:
+        await pilot.pause()
+        await pilot.press("q")
+        await pilot.pause()
+        # Busy board: armed, not exited.
+        assert app._quit_armed is True  # noqa: SLF001
+        await pilot.press("q")
+        await pilot.pause()
 
 
 @pytest.mark.asyncio
@@ -1112,3 +1397,335 @@ def test_matches_filter_substring_on_id_title_labels() -> None:
     assert _matches_filter(issue, "gemini")
     assert _matches_filter(issue, "backend")
     assert not _matches_filter(issue, "frontend")
+
+
+# ---------------------------------------------------------------------------
+# new issue ('n') + stats ('s')
+# ---------------------------------------------------------------------------
+
+
+def _file_board_config(tmp_path: Path) -> ServiceConfig:
+    from dataclasses import replace as dc_replace
+
+    cfg = _make_config(active_states=("Todo", "In Progress"), terminal_states=("Done",))
+    tracker = dc_replace(
+        cfg.tracker, kind="file", board_root=tmp_path / "kanban"
+    )
+    return dc_replace(cfg, tracker=tracker, workflow_path=tmp_path / "WORKFLOW.md")
+
+
+@pytest.mark.asyncio
+async def test_n_opens_new_issue_modal_and_creates_ticket(
+    monkeypatch: Any, tmp_path: Path
+) -> None:
+    from textual.widgets import Input as TextualInput
+    from textual.widgets import TextArea
+
+    from symphony.tui import NewIssueScreen
+
+    cfg = _file_board_config(tmp_path)
+    _stub_tracker(monkeypatch, [], [])
+    app = KanbanApp(_StubOrchestrator(), _StaticWorkflowState(cfg))  # type: ignore[arg-type]
+    async with app.run_test(size=(140, 40)) as pilot:
+        await pilot.pause()
+        await pilot.press("n")
+        await pilot.pause()
+        assert isinstance(app.screen, NewIssueScreen)
+        app.screen.query_one("#ni-title", TextualInput).value = "wire the modal"
+        app.screen.query_one("#ni-description", TextArea).text = "line one\nline two"
+        await pilot.pause()
+        await pilot.click("#ni-create")
+        await pilot.pause()
+        await asyncio.sleep(0.1)
+        await pilot.pause()
+    ticket = tmp_path / "kanban" / "TASK-1.md"
+    assert ticket.exists()
+    text = ticket.read_text(encoding="utf-8")
+    assert "title: wire the modal" in text
+    assert "state: Todo" in text
+    assert "line one" in text
+    assert "line two" in text
+    assert "skills:" not in text
+
+
+@pytest.mark.asyncio
+async def test_n_refuses_non_file_tracker(monkeypatch: Any) -> None:
+    from symphony.tui import NewIssueScreen
+
+    cfg = _make_config()  # linear tracker
+    _stub_tracker(monkeypatch, [], [])
+    app = KanbanApp(_StubOrchestrator(), _StaticWorkflowState(cfg))  # type: ignore[arg-type]
+    async with app.run_test(size=(120, 30)) as pilot:
+        await pilot.pause()
+        await pilot.press("n")
+        await pilot.pause()
+        assert not isinstance(app.screen, NewIssueScreen)
+
+
+@pytest.mark.asyncio
+async def test_s_opens_stats_screen(monkeypatch: Any, tmp_path: Path) -> None:
+    from symphony.stats import StatsStore
+    from symphony.tui import StatsScreen
+
+    cfg = _file_board_config(tmp_path)
+    store = StatsStore(tmp_path / ".symphony" / "stats.jsonl")
+    store.record_turn(
+        issue="T-1", state="todo", agent="claude",
+        input_tokens=10, cache_tokens=0, output_tokens=5, total_tokens=15,
+    )
+    _stub_tracker(monkeypatch, [], [])
+    app = KanbanApp(_StubOrchestrator(), _StaticWorkflowState(cfg))  # type: ignore[arg-type]
+    async with app.run_test(size=(140, 40)) as pilot:
+        await pilot.pause()
+        await pilot.press("s")
+        await pilot.pause()
+        await asyncio.sleep(0.1)
+        await pilot.pause()
+        assert isinstance(app.screen, StatsScreen)
+        await pilot.press("escape")
+        await pilot.pause()
+        assert not isinstance(app.screen, StatsScreen)
+
+
+@pytest.mark.asyncio
+async def test_question_mark_toggles_help_screen(monkeypatch: Any) -> None:
+    """`?` opens the grouped key-binding modal; a second `?` (or esc) closes it.
+
+    The modal replaces the old 8-second toast, whose one-line dump of ~25
+    bindings was unreadable on narrow terminals.
+    """
+    from symphony.tui import HelpScreen
+
+    cfg = _make_config()
+    _stub_tracker(monkeypatch, [], [])
+    app = KanbanApp(_StubOrchestrator(), _StaticWorkflowState(cfg))  # type: ignore[arg-type]
+    async with app.run_test(size=(120, 40)) as pilot:
+        await pilot.pause()
+        await pilot.press("question_mark")
+        await pilot.pause()
+        assert isinstance(app.screen, HelpScreen)
+        await pilot.press("question_mark")
+        await pilot.pause()
+        assert not isinstance(app.screen, HelpScreen)
+        await pilot.press("question_mark")
+        await pilot.pause()
+        await pilot.press("escape")
+        await pilot.pause()
+        assert not isinstance(app.screen, HelpScreen)
+
+
+def test_help_sections_cover_every_app_binding() -> None:
+    """Every key in `KanbanApp.BINDINGS` must appear in the help modal, so
+    a new binding cannot ship undocumented."""
+    from symphony.tui.screens import HELP_SECTIONS
+
+    help_text = " ".join(
+        f"{key} {action}" for _, rows in HELP_SECTIONS for key, action in rows
+    )
+    aliases = {
+        "question_mark": "?", "slash": "/", "plus": "+", "equals_sign": "+",
+        "minus": "-", "right_square_bracket": "]", "left_square_bracket": "[",
+        "shift+tab": "shift+tab", "pagedown": "pgdn", "pageup": "pgup",
+        "escape": "esc", "down": "↓", "up": "↑",
+    }
+    for binding in KanbanApp.BINDINGS:
+        for raw in binding.key.split(","):
+            key = aliases.get(raw, raw)
+            if key.isdigit():
+                continue  # 1-9 / 0 documented as a range
+            assert key in help_text, f"binding {raw!r} missing from HELP_SECTIONS"
+
+
+# ---------------------------------------------------------------------------
+# edit ('e') state prefill + card rebinding + orchestrator error guards
+# ---------------------------------------------------------------------------
+
+
+from textual.widgets import Input as TextualInput  # noqa: E402
+from textual.widgets import Select  # noqa: E402
+
+
+async def _settle(pilot: Any, seconds: float = 0.1) -> None:
+    await pilot.pause()
+    await asyncio.sleep(seconds)
+    await pilot.pause()
+
+
+async def _boot_file_board_with_card(app: KanbanApp, pilot: Any) -> IssueCard:
+    await _settle(pilot)
+    cards = list(app.query(IssueCard))
+    assert cards, "expected one ticket card"
+    cards[0].focus()
+    await pilot.pause()
+    return cards[0]
+
+
+@pytest.mark.asyncio
+async def test_e_keeps_terminal_state_when_ticket_casing_differs(
+    tmp_path: Path,
+) -> None:
+    """A ticket with `state: done` must not be re-queued to `Todo` by a
+    title-only edit — the state Select has to match case-insensitively."""
+    from symphony.tui import EditIssueScreen
+
+    cfg = _file_board_config(tmp_path)
+    _write_ticket(tmp_path / "kanban", "T-1.md", "done")
+    app = KanbanApp(_StubOrchestrator(), _StaticWorkflowState(cfg))  # type: ignore[arg-type]
+    async with app.run_test(size=(140, 40)) as pilot:
+        await _boot_file_board_with_card(app, pilot)
+        await pilot.press("e")
+        await pilot.pause()
+        assert isinstance(app.screen, EditIssueScreen)
+        assert app.screen.query_one("#ei-state", Select).value == "Done"
+        app.screen.query_one("#ei-title", TextualInput).value = "renamed"
+        await pilot.pause()
+        await pilot.click("#ei-save")
+        await _settle(pilot)
+    text = (tmp_path / "kanban" / "T-1.md").read_text(encoding="utf-8")
+    assert "title: renamed" in text
+    assert "state: Done" in text
+
+
+def test_edit_screen_offers_unknown_state_as_extra_option() -> None:
+    """A state that matches no configured column still round-trips instead
+    of silently collapsing to the first active state."""
+    from symphony.tui import EditIssueScreen
+
+    screen = EditIssueScreen(
+        _issue("T-9", state="Parked"), states=["Todo", "Done"], agent_kinds=[]
+    )
+    assert screen._states == ["Todo", "Done", "Parked"]
+    assert screen._initial_state == "Parked"
+
+
+@pytest.mark.asyncio
+async def test_reused_card_rebinds_issue_after_edit(tmp_path: Path) -> None:
+    """Lane.render_cards reuses card widgets across refreshes; the reused
+    card must carry the refreshed Issue or the next edit reverts the last."""
+    from symphony.tui import EditIssueScreen
+
+    cfg = _file_board_config(tmp_path)
+    _write_ticket(tmp_path / "kanban", "T-1.md", "Todo")
+    app = KanbanApp(_StubOrchestrator(), _StaticWorkflowState(cfg))  # type: ignore[arg-type]
+    async with app.run_test(size=(140, 40)) as pilot:
+        card = await _boot_file_board_with_card(app, pilot)
+        await pilot.press("e")
+        await pilot.pause()
+        assert isinstance(app.screen, EditIssueScreen)
+        app.screen.query_one("#ei-title", TextualInput).value = "second title"
+        await pilot.pause()
+        await pilot.click("#ei-save")
+        await _settle(pilot, 0.3)
+        assert card.is_attached, "card should be reused, not remounted"
+        assert card.issue.title == "second title"
+
+        card.focus()
+        await pilot.pause()
+        await pilot.press("e")
+        await pilot.pause()
+        assert isinstance(app.screen, EditIssueScreen)
+        assert app.screen.query_one("#ei-title", TextualInput).value == "second title"
+        app.screen.query_one("#ei-priority", Select).value = 2
+        await pilot.pause()
+        await pilot.click("#ei-save")
+        await _settle(pilot, 0.3)
+    text = (tmp_path / "kanban" / "T-1.md").read_text(encoding="utf-8")
+    assert "title: second title" in text
+    assert "priority: 2" in text
+
+
+@pytest.mark.asyncio
+async def test_issue_card_update_issue_skips_repaint_when_unchanged(
+    monkeypatch: Any,
+) -> None:
+    cfg = _make_config(active_states=("Todo",), terminal_states=("Done",))
+    issue = _issue("SMA-1")
+    _stub_tracker(monkeypatch, [issue], [])
+    app = KanbanApp(_StubOrchestrator(), _StaticWorkflowState(cfg))  # type: ignore[arg-type]
+    async with app.run_test(size=(120, 30)) as pilot:
+        await _settle(pilot)
+        card = list(app.query(IssueCard))[0]
+        repaints: list[int] = []
+        card._refresh_body = lambda: repaints.append(1)  # type: ignore[method-assign]
+        assert card.update_issue(issue) is False
+        assert repaints == []
+        assert card.update_issue(replace(issue, title="new")) is True
+        assert card.issue.title == "new"
+        assert repaints == [1]
+
+
+class _ExplodingStats:
+    def aggregate(self, *_args: Any, **_kwargs: Any) -> dict[str, Any]:
+        raise RuntimeError("stats boom")
+
+
+class _ExplodingOrchestrator(_StubOrchestrator):
+    """Every orchestrator query raises — the TUI must survive all of them."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.stats = _ExplodingStats()
+
+    def snapshot(self) -> dict[str, Any]:
+        raise RuntimeError("snapshot boom")
+
+    def iter_running_issues(self) -> tuple[Issue, ...]:
+        raise RuntimeError("running boom")
+
+    def find_running_issue_id(self, identifier: str) -> str | None:
+        raise RuntimeError("find boom")
+
+    def is_paused(self, issue_id: str) -> bool:
+        raise RuntimeError("paused boom")
+
+
+def _record_notifications(app: KanbanApp) -> list[str]:
+    # Toasts expire after their timeout; record every notify() call so a
+    # slow run cannot hide a toast that was already shown.
+    sent: list[str] = []
+    notify = app.notify
+
+    def recording_notify(message: str, *args: Any, **kwargs: Any) -> None:
+        sent.append(message)
+        notify(message, *args, **kwargs)
+
+    app.notify = recording_notify  # type: ignore[method-assign]
+    return sent
+
+
+@pytest.mark.asyncio
+async def test_orchestrator_errors_notify_instead_of_crashing(
+    tmp_path: Path,
+) -> None:
+    from symphony.tui import EditIssueScreen, StatsScreen
+
+    cfg = _file_board_config(tmp_path)
+    _write_ticket(tmp_path / "kanban", "T-1.md", "Todo")
+    app = KanbanApp(_ExplodingOrchestrator(), _StaticWorkflowState(cfg))  # type: ignore[arg-type]
+    sent = _record_notifications(app)
+    async with app.run_test(size=(140, 40)) as pilot:
+        card = await _boot_file_board_with_card(app, pilot)
+        assert app.is_running
+        assert any("snapshot boom" in m for m in sent)
+        # Heartbeat fires every 0.5 s; the same failure must not re-toast.
+        await _settle(pilot, 1.2)
+        assert sum("snapshot boom" in m for m in sent) == 1
+
+        await pilot.press("P")
+        await pilot.pause()
+        assert app.is_running
+        assert any("paused boom" in m for m in sent)
+
+        card.focus()
+        await pilot.pause()
+        await pilot.press("e")
+        await _settle(pilot)
+        assert app.is_running
+        assert not isinstance(app.screen, EditIssueScreen)
+        assert any("find boom" in m for m in sent)
+
+        await pilot.press("s")
+        await _settle(pilot, 0.2)
+        assert app.is_running
+        assert not isinstance(app.screen, StatsScreen)
+        assert any("stats boom" in m for m in sent)

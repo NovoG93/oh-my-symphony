@@ -5,8 +5,11 @@ Subcommands:
     symphony tui [WORKFLOW]        run orchestrator + Jira-style CLI Kanban TUI
     symphony board ...             file-tracker board helper
     symphony doctor [WORKFLOW]     preflight checks for WORKFLOW.md
-    symphony service ...           managed background orchestrator + viewer
+    symphony release check ...     validate app release evidence
+    symphony service ...           managed background orchestrator
     symphony wiki-sweep ...        scan docs/llm-wiki/ for dup/orphan/stale rows
+    symphony runs [WORKFLOW]       recent run-registry attempts
+    symphony pm demo ...           create and serve a disposable PM Workspace demo
 """
 
 from __future__ import annotations
@@ -17,20 +20,77 @@ import signal
 import sys
 from pathlib import Path
 
+from .. import __version__
 from ..errors import SymphonyError
 from ..utils import wiki_sweep as wiki_sweep
 from ..utils.keep_awake import KeepAwake
 from ..logging import configure_logging
 from ..orchestrator import Orchestrator
+from ..orchestrator.run_registry import (
+    RunRecord,
+    RunRegistry,
+    clamp_run_history_limit,
+    registry_path_for_workflow,
+)
 from ..progress_md import ProgressFileWriter
 from ..server import build_app, run_server
+from ..service import port_owner_hint
 from ..workflow import WorkflowState, resolve_workflow_path
+
+
+# First-token subcommands routed by `main` before argparse sees argv.
+# Order is the order shown in `symphony --help`.
+SUBCOMMANDS: tuple[tuple[str, str], ...] = (
+    ("tui", "open the Kanban TUI (same as --tui)"),
+    ("doctor", "preflight a WORKFLOW.md before launching"),
+    ("board", "manage the file-based Kanban board (init/ls/new/mv/update/show/graph)"),
+    ("service", "run the orchestrator as a managed background service"),
+    ("project", "register and run independent project services"),
+    ("pm", "create and serve a disposable PM Workspace demo"),
+    ("hub", "serve the multi-project hub"),
+    ("runs", "print recent run-registry attempts"),
+    ("release", "validate application release evidence"),
+    ("wiki-sweep", "lint docs/llm-wiki for duplicate slugs and orphans"),
+)
+
+
+def _subcommand_epilog() -> str:
+    width = max(len(name) for name, _ in SUBCOMMANDS)
+    lines = [f"  {name:<{width}}  {desc}" for name, desc in SUBCOMMANDS]
+    return (
+        "subcommands (run `symphony <subcommand> --help` for details):\n"
+        + "\n".join(lines)
+        + "\n\nwith no subcommand, symphony runs the orchestrator headless "
+        "for the given WORKFLOW.md."
+    )
+
+
+def _looks_like_mistyped_subcommand(token: str) -> bool:
+    """True for a bare word that is neither a flag nor a plausible path.
+
+    `symphony servce` should say "unknown command", not "WORKFLOW.md not
+    found". Anything with a path separator, a dot, or that exists on disk
+    is still treated as the workflow positional.
+    """
+    if token.startswith("-") or "/" in token or "\\" in token or "." in token:
+        return False
+    return not Path(token).exists()
 
 
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="symphony",
-        description="Symphony multi-agent — Codex / Claude Code / Gemini orchestration.",
+        description=(
+            "Symphony multi-agent — Codex / Claude Code / Gemini / AGY / Kiro / "
+            "OpenCode / Pi / Prime Agent orchestration."
+        ),
+        epilog=_subcommand_epilog(),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    parser.add_argument(
+        "--version",
+        action="version",
+        version=f"symphony {__version__}",
     )
     parser.add_argument(
         "workflow",
@@ -87,19 +147,82 @@ def _build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _fail_startup(log, event: str, sentence: str, **fields) -> int:
+    """U3 — structured event for logs plus one actionable sentence.
+
+    The headless run path used to emit only key=value events
+    (`workflow_load_failed error=...`), which read as machine noise next
+    to the friendly sentences the service path prints for the same
+    failures.
+    """
+    log.error(event, **fields)
+    print(f"symphony: {sentence}", file=sys.stderr)
+    return 1
+
+
+def _startup_preflight_failures(cfg) -> list[str]:
+    """A2 — doctor-lite before the orchestrator starts.
+
+    Only the checks whose failure is otherwise deferred and cryptic: a
+    missing agent CLI fails at first dispatch, the shipped after_create
+    placeholder fails every dispatch with rc=128. The full check set
+    stays in `symphony doctor`.
+    """
+    from .doctor import check_after_create_hook, check_agent_cli
+
+    failures: list[str] = []
+    for check in (check_agent_cli(cfg), check_after_create_hook(cfg)):
+        if check.status == "fail":
+            failures.append(f"{check.name}: {check.message}")
+    return failures
+
+
 async def _run(args: argparse.Namespace) -> int:
     log = configure_logging(args.log_level)
 
     workflow_path = resolve_workflow_path(args.workflow)
     if not workflow_path.exists():
-        log.error("workflow_path_missing", path=str(workflow_path))
-        return 1
+        return _fail_startup(
+            log,
+            "workflow_path_missing",
+            f"WORKFLOW.md not found at {workflow_path}. Pass a path "
+            "(`symphony ./WORKFLOW.md`) or run `symphony board init` to "
+            "scaffold a new board.",
+            path=str(workflow_path),
+        )
 
     state = WorkflowState(workflow_path)
     cfg, err = state.reload()
     if cfg is None:
-        log.error("workflow_load_failed", error=str(err))
-        return 1
+        return _fail_startup(
+            log,
+            "workflow_load_failed",
+            f"WORKFLOW.md could not be loaded: {err}. Fix the YAML "
+            f"frontmatter and re-run; `symphony doctor {workflow_path}` "
+            "pinpoints most configuration mistakes.",
+            error=str(err),
+        )
+
+    if args.tui and not (sys.stdin.isatty() and sys.stdout.isatty()):
+        return _fail_startup(
+            log,
+            "tui_requires_tty",
+            "the TUI needs an interactive terminal. Run without --tui for "
+            "headless mode, or use `symphony service start` and open the "
+            "web board instead.",
+        )
+
+    preflight_failures = _startup_preflight_failures(cfg)
+    if preflight_failures:
+        for failure in preflight_failures:
+            print(f"symphony: {failure}", file=sys.stderr)
+        return _fail_startup(
+            log,
+            "startup_preflight_failed",
+            f"fix the above and re-run; `symphony doctor {workflow_path}` "
+            "runs the full check set.",
+            failures=len(preflight_failures),
+        )
 
     # CLI flag wins over WORKFLOW.md; both default to on for the macOS
     # "lock the screen on me and I lose the run" case the user flagged.
@@ -107,17 +230,23 @@ async def _run(args: argparse.Namespace) -> int:
         args.keep_awake if args.keep_awake is not None else cfg.system.keep_awake
     )
     keep_awake = KeepAwake() if keep_awake_enabled else None
-    if keep_awake is not None:
-        keep_awake.start()
 
     orchestrator = Orchestrator(state)
     try:
         await orchestrator.start()
     except SymphonyError as exc:
-        log.error("startup_failed", error=str(exc))
-        if keep_awake is not None:
-            keep_awake.stop()
-        return 1
+        return _fail_startup(
+            log,
+            "startup_failed",
+            f"orchestrator startup failed: {str(exc).rstrip('.')}. "
+            f"`symphony doctor {workflow_path}` checks ports, the agent "
+            "CLI, and tracker configuration.",
+            error=str(exc),
+        )
+    # Only hold the host awake once startup succeeded; a refused start
+    # (protected source repo, port in use) must not toggle caffeinate.
+    if keep_awake is not None:
+        keep_awake.start()
 
     # Register the progress writer BEFORE any subsequent `await` so the
     # first tick's `_notify_observers` sees it. CLI flag > WORKFLOW.md
@@ -146,11 +275,39 @@ async def _run(args: argparse.Namespace) -> int:
     runner = None
     if server_port is not None:
         app = build_app(orchestrator)
-        runner, bound = await run_server(app, args.host, server_port)
+        try:
+            runner, bound = await run_server(app, args.host, server_port)
+        except OSError as exc:
+            # A2 — EADDRINUSE used to escape as a raw traceback after the
+            # orchestrator had already started.
+            await orchestrator.stop()
+            if keep_awake is not None:
+                keep_awake.stop()
+            owner = port_owner_hint(workflow_path, server_port)
+            owner_sentence = (
+                f" {owner}."
+                if owner
+                else " Stop the other process "
+                f"(`lsof -ti :{server_port}`), pick a different --port, or "
+                "check `symphony service status`."
+            )
+            return _fail_startup(
+                log,
+                "http_port_unavailable",
+                f"port {server_port} on {args.host} is already in use or "
+                f"cannot be bound ({exc}).{owner_sentence}",
+                host=args.host,
+                port=server_port,
+                error=str(exc),
+            )
         log.info("http_extension_active", host=args.host, port=bound)
+        print(
+            f"symphony: board ready at http://{args.host}:{bound}",
+            file=sys.stderr,
+        )
     else:
         # Surfaces the silent-no-HTTP case so the operator immediately sees
-        # why board-viewer / API consumers can't reach this instance.
+        # why the admin UI / API consumers can't reach this instance.
         # Common cause: `server.port` lives outside frontmatter (embedded
         # `---` fence in a YAML literal truncated the workflow header) —
         # see workflow.parse_workflow_text greedy end detection.
@@ -241,6 +398,55 @@ def _wiki_sweep_main(argv: list[str]) -> int:
     return 0 if report.is_clean() else 1
 
 
+def _runs_main(argv: list[str]) -> int:
+    parser = argparse.ArgumentParser(
+        prog="symphony runs",
+        description="Print recent run-registry attempts for a WORKFLOW.md.",
+    )
+    parser.add_argument(
+        "workflow",
+        nargs="?",
+        default=None,
+        help="path to WORKFLOW.md (default: ./WORKFLOW.md)",
+    )
+    parser.add_argument("--issue", default=None, help="filter by issue id")
+    parser.add_argument("--limit", type=int, default=50, help="max rows, clamped to 1-200")
+    args = parser.parse_args(argv)
+
+    workflow_path = resolve_workflow_path(args.workflow)
+    registry_path = registry_path_for_workflow(workflow_path)
+    if not registry_path.exists():
+        print(f"no runs recorded for {workflow_path}")
+        return 0
+
+    registry = RunRegistry(registry_path)
+    try:
+        rows = registry.recent_runs(
+            issue_id=args.issue,
+            limit=clamp_run_history_limit(args.limit),
+        )
+    finally:
+        registry.close()
+    if not rows:
+        print(f"no runs recorded for {workflow_path}")
+        return 0
+    print("identifier  attempt  agent  status  started -> completed")
+    for row in rows:
+        print(_format_run_row(row))
+    return 0
+
+
+def _format_run_row(row: RunRecord) -> str:
+    attempt = row.attempt_kind or "-"
+    agent = row.agent_kind or "-"
+    started = row.started_at.isoformat() if row.started_at else "-"
+    completed = row.completed_at.isoformat() if row.completed_at else "-"
+    return (
+        f"{row.identifier}  {attempt}  {agent}  {row.status}  "
+        f"{started} -> {completed}"
+    )
+
+
 def main(argv: list[str] | None = None) -> int:
     raw_argv = argv if argv is not None else sys.argv[1:]
     if raw_argv and raw_argv[0] == "board":
@@ -251,15 +457,42 @@ def main(argv: list[str] | None = None) -> int:
         from . import doctor
 
         return doctor.main(raw_argv[1:])
+    if raw_argv and raw_argv[0] == "release":
+        from . import release
+
+        return release.main(raw_argv[1:])
+    if raw_argv and raw_argv[0] == "project":
+        from . import project
+
+        return project.main(raw_argv[1:])
+    if raw_argv and raw_argv[0] == "pm":
+        from . import pm
+
+        return pm.main(raw_argv[1:])
+    if raw_argv and raw_argv[0] == "hub":
+        from .. import hub
+
+        return hub.main(raw_argv[1:])
     if raw_argv and raw_argv[0] == "service":
         from .. import service
 
         return service.main(raw_argv[1:])
     if raw_argv and raw_argv[0] == "wiki-sweep":
         return _wiki_sweep_main(raw_argv[1:])
+    if raw_argv and raw_argv[0] == "runs":
+        return _runs_main(raw_argv[1:])
     if raw_argv and raw_argv[0] == "tui":
         # Rewrite `symphony tui [...args]` as `symphony --tui [...args]`.
         raw_argv = ["--tui", *raw_argv[1:]]
+    elif raw_argv and _looks_like_mistyped_subcommand(raw_argv[0]):
+        names = ", ".join(name for name, _ in SUBCOMMANDS)
+        print(
+            f"symphony: unknown command '{raw_argv[0]}'\n"
+            f"commands: {names}\n"
+            "run `symphony --help` for usage, or pass a path to WORKFLOW.md",
+            file=sys.stderr,
+        )
+        return 2
     args = _build_parser().parse_args(raw_argv)
     try:
         return asyncio.run(_run(args))

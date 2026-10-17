@@ -17,10 +17,13 @@ cache. This file pins:
 from __future__ import annotations
 
 import json
+from typing import Any
 
 import httpx
 import pytest
 
+import symphony.trackers._retry as retry_module
+import symphony.trackers.linear as linear_module
 from symphony.errors import (
     LinearApiRequestError,
     LinearApiStatusError,
@@ -49,6 +52,24 @@ def _client(handler) -> LinearClient:
     return LinearClient(_cfg(), http_client=httpx.Client(transport=transport))
 
 
+def test_owned_http_client_uses_configured_network_timeout() -> None:
+    cfg = _cfg()
+    cfg = TrackerConfig(
+        kind=cfg.kind,
+        endpoint=cfg.endpoint,
+        api_key=cfg.api_key,
+        project_slug=cfg.project_slug,
+        active_states=cfg.active_states,
+        terminal_states=cfg.terminal_states,
+        network_timeout_seconds=7.5,
+    )
+    client = LinearClient(cfg)
+    try:
+        assert client._client.timeout.connect == 7.5
+    finally:
+        client.close()
+
+
 def _issue(uuid: str = "u-1", state: str = "Done") -> Issue:
     return Issue(
         id=uuid,
@@ -70,7 +91,11 @@ def test_fetch_candidate_issues_paginates_through_cursor_and_normalizes() -> Non
 
     def handler(request: httpx.Request) -> httpx.Response:
         body = json.loads(request.content)
-        calls.append(body.get("variables") or {})
+        calls.append(body)
+        query = body.get("query") or ""
+        assert "inverseRelations(filter:" not in query
+        assert "inverseRelations(first: 50)" in query
+        assert "pageInfo { hasNextPage }" in query
         after = (body.get("variables") or {}).get("after")
         if after is None:
             return httpx.Response(
@@ -94,14 +119,23 @@ def test_fetch_candidate_issues_paginates_through_cursor_and_normalizes() -> Non
                                     "inverseRelations": {
                                         "nodes": [
                                             {
+                                                "type": "related",
+                                                "issue": {
+                                                    "id": "u-related",
+                                                    "identifier": "TEAM-9",
+                                                    "state": {"name": "Todo"},
+                                                },
+                                            },
+                                            {
                                                 "type": "blocks",
                                                 "issue": {
                                                     "id": "u-blocker",
                                                     "identifier": "TEAM-2",
                                                     "state": {"name": "In Progress"},
                                                 },
-                                            }
-                                        ]
+                                            },
+                                        ],
+                                        "pageInfo": {"hasNextPage": False},
                                     },
                                     "createdAt": "2026-01-01T00:00:00Z",
                                     "updatedAt": "2026-01-02T00:00:00Z",
@@ -126,7 +160,10 @@ def test_fetch_candidate_issues_paginates_through_cursor_and_normalizes() -> Non
                                 "priority": None,
                                 "state": {"name": "In Progress"},
                                 "labels": {"nodes": []},
-                                "inverseRelations": {"nodes": []},
+                                "inverseRelations": {
+                                    "nodes": [],
+                                    "pageInfo": {"hasNextPage": False},
+                                },
                             }
                         ],
                         "pageInfo": {"hasNextPage": False},
@@ -157,13 +194,50 @@ def test_fetch_candidate_issues_paginates_through_cursor_and_normalizes() -> Non
     assert first.updated_at is not None
 
     # Pagination: page 1 had no `after`; page 2 was sent the cursor.
-    assert calls[0].get("after") is None
-    assert calls[1].get("after") == "cur-1"
+    assert calls[0]["variables"].get("after") is None
+    assert calls[1]["variables"].get("after") == "cur-1"
 
     # Second page normalized fine with empty labels/blockers.
     assert second.identifier == "TEAM-3"
     assert second.labels == ()
     assert second.blocked_by == ()
+
+
+def test_fetch_candidate_issues_stops_at_max_pages(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls = 0
+    warnings: list[tuple[str, dict]] = []
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        return httpx.Response(
+            200,
+            json={
+                "data": {
+                    "issues": {
+                        "nodes": [],
+                        "pageInfo": {
+                            "hasNextPage": True,
+                            "endCursor": f"cursor-{calls}",
+                        },
+                    }
+                }
+            },
+        )
+
+    monkeypatch.setattr(linear_module, "MAX_PAGES", 2)
+    monkeypatch.setattr(
+        linear_module.log,
+        "warning",
+        lambda message, **fields: warnings.append((message, fields)),
+    )
+    client = _client(handler)
+
+    assert client.fetch_candidate_issues() == []
+    assert calls == 2
+    assert warnings == [("linear_pagination_max_pages", {"max_pages": 2})]
 
 
 def test_paginate_raises_when_has_next_page_but_end_cursor_missing() -> None:
@@ -265,7 +339,11 @@ def test_fetch_issue_full_by_id_missing_node_returns_none() -> None:
 
 
 def test_fetch_issue_full_by_id_normalizes_full_body() -> None:
-    def handler(_request: httpx.Request) -> httpx.Response:
+    def handler(request: httpx.Request) -> httpx.Response:
+        query = json.loads(request.content).get("query") or ""
+        assert "inverseRelations(filter:" not in query
+        assert "inverseRelations(first: 50)" in query
+        assert "pageInfo { hasNextPage }" in query
         return httpx.Response(
             200,
             json={
@@ -278,7 +356,27 @@ def test_fetch_issue_full_by_id_normalizes_full_body() -> None:
                         "priority": 1,
                         "state": {"name": "Review"},
                         "labels": {"nodes": [{"name": "qa"}]},
-                        "inverseRelations": {"nodes": []},
+                        "inverseRelations": {
+                            "nodes": [
+                                {
+                                    "type": "related",
+                                    "issue": {
+                                        "id": "u-related",
+                                        "identifier": "TEAM-9",
+                                        "state": {"name": "Todo"},
+                                    },
+                                },
+                                {
+                                    "type": "blocks",
+                                    "issue": {
+                                        "id": "u-blocker",
+                                        "identifier": "TEAM-2",
+                                        "state": {"name": "In Progress"},
+                                    },
+                                },
+                            ],
+                            "pageInfo": {"hasNextPage": False},
+                        },
                     }
                 }
             },
@@ -291,6 +389,143 @@ def test_fetch_issue_full_by_id_normalizes_full_body() -> None:
     assert issue.description == "the body"
     assert issue.priority == 1
     assert issue.labels == ("qa",)
+    assert [blocker.identifier for blocker in issue.blocked_by] == ["TEAM-2"]
+
+
+_MISSING = object()
+
+
+@pytest.mark.parametrize("fetch_kind", ["candidate", "full"])
+@pytest.mark.parametrize(
+    ("inverse_relations", "message"),
+    [
+        (_MISSING, "issue.inverseRelations missing"),
+        (None, "issue.inverseRelations missing"),
+        ([], "issue.inverseRelations missing"),
+        ({}, "issue.inverseRelations.nodes missing"),
+        (
+            {"nodes": None, "pageInfo": {"hasNextPage": False}},
+            "issue.inverseRelations.nodes missing",
+        ),
+        (
+            {"nodes": {}, "pageInfo": {"hasNextPage": False}},
+            "issue.inverseRelations.nodes missing",
+        ),
+        ({"nodes": []}, "issue.inverseRelations.pageInfo missing"),
+        ({"nodes": [], "pageInfo": None}, "issue.inverseRelations.pageInfo missing"),
+        ({"nodes": [], "pageInfo": []}, "issue.inverseRelations.pageInfo missing"),
+        (
+            {"nodes": [], "pageInfo": {}},
+            "issue.inverseRelations.pageInfo.hasNextPage missing",
+        ),
+        (
+            {"nodes": [], "pageInfo": {"hasNextPage": None}},
+            "issue.inverseRelations.pageInfo.hasNextPage missing",
+        ),
+        (
+            {"nodes": [], "pageInfo": {"hasNextPage": "false"}},
+            "issue.inverseRelations.pageInfo.hasNextPage missing",
+        ),
+        (
+            {"nodes": [], "pageInfo": {"hasNextPage": True}},
+            "issue.inverseRelations incomplete",
+        ),
+    ],
+)
+def test_full_reads_reject_unusable_inverse_relations(
+    fetch_kind: str, inverse_relations: object, message: str
+) -> None:
+    node = {
+        "id": "u-1",
+        "identifier": "TEAM-1",
+        "title": "issue",
+        "state": {"name": "Todo"},
+        "labels": {"nodes": []},
+    }
+    if inverse_relations is not _MISSING:
+        node["inverseRelations"] = inverse_relations
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        if fetch_kind == "candidate":
+            return httpx.Response(
+                200,
+                json={
+                    "data": {
+                        "issues": {
+                            "nodes": [node],
+                            "pageInfo": {"hasNextPage": False},
+                        }
+                    }
+                },
+            )
+        return httpx.Response(200, json={"data": {"issue": node}})
+
+    client = _client(handler)
+    with pytest.raises(LinearUnknownPayload) as exc_info:
+        if fetch_kind == "candidate":
+            client.fetch_candidate_issues()
+        else:
+            client.fetch_issue_full_by_id("u-1")
+    assert exc_info.value.message == message
+
+
+@pytest.mark.parametrize("fetch_kind", ["candidate", "full"])
+def test_full_reads_accept_complete_fifty_relation_connection(fetch_kind: str) -> None:
+    relations = [
+        {
+            "type": "related",
+            "issue": {
+                "id": f"u-related-{index}",
+                "identifier": f"TEAM-{index}",
+                "state": {"name": "Todo"},
+            },
+        }
+        for index in range(49)
+    ]
+    relations.append(
+        {
+            "type": "blocks",
+            "issue": {
+                "id": "u-blocker",
+                "identifier": "TEAM-BLOCKER",
+                "state": {"name": "In Progress"},
+            },
+        }
+    )
+    node = {
+        "id": "u-1",
+        "identifier": "TEAM-1",
+        "title": "issue",
+        "state": {"name": "Todo"},
+        "labels": {"nodes": []},
+        "inverseRelations": {
+            "nodes": relations,
+            "pageInfo": {"hasNextPage": False},
+        },
+    }
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        if fetch_kind == "candidate":
+            return httpx.Response(
+                200,
+                json={
+                    "data": {
+                        "issues": {
+                            "nodes": [node],
+                            "pageInfo": {"hasNextPage": False},
+                        }
+                    }
+                },
+            )
+        return httpx.Response(200, json={"data": {"issue": node}})
+
+    client = _client(handler)
+    if fetch_kind == "candidate":
+        issue = client.fetch_candidate_issues()[0]
+    else:
+        issue = client.fetch_issue_full_by_id("u-1")
+        assert issue is not None
+    assert [blocker.identifier for blocker in issue.blocked_by] == ["TEAM-BLOCKER"]
 
 
 # ---------------------------------------------------------------------------
@@ -324,9 +559,7 @@ def test_team_id_cache_avoids_second_lookup_for_same_issue_id() -> None:
             issue_team_calls += 1
             return httpx.Response(
                 200,
-                json={
-                    "data": {"issue": {"id": "u-1", "team": {"id": "team-A"}}}
-                },
+                json={"data": {"issue": {"id": "u-1", "team": {"id": "team-A"}}}},
             )
         if "WorkflowStates" in query:
             workflow_states_calls += 1
@@ -401,7 +634,9 @@ def test_update_state_with_empty_issue_id_raises() -> None:
         raise AssertionError("must not reach network with empty issue id")
 
     client = _client(handler)
-    issue = Issue(id="", identifier="X", title="", description=None, priority=None, state="x")
+    issue = Issue(
+        id="", identifier="X", title="", description=None, priority=None, state="x"
+    )
     with pytest.raises(LinearUnknownPayload):
         client.update_state(issue, "Done")
 
@@ -411,22 +646,110 @@ def test_update_state_with_empty_issue_id_raises() -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_post_raises_request_error_on_transport_failure() -> None:
+def _empty_issues_response() -> httpx.Response:
+    return httpx.Response(
+        200,
+        json={"data": {"issues": {"nodes": [], "pageInfo": {"hasNextPage": False}}}},
+    )
+
+
+def test_post_raises_request_error_on_transport_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    sleeps: list[float] = []
+    calls = 0
+
     def handler(_request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
         raise httpx.ConnectError("dial tcp: i/o timeout")
 
+    monkeypatch.setattr(retry_module, "sleep_with_jitter", sleeps.append)
     client = _client(handler)
     with pytest.raises(LinearApiRequestError):
         client.fetch_candidate_issues()
+    assert calls == 3
+    assert sleeps == [0.5, 1.0]
 
 
-def test_post_raises_status_error_on_non_200() -> None:
+def test_post_transport_failure_retries_then_returns_issues(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    sleeps: list[float] = []
+    calls = 0
+
     def handler(_request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise httpx.ConnectError("dial tcp: i/o timeout")
+        return _empty_issues_response()
+
+    monkeypatch.setattr(retry_module, "sleep_with_jitter", sleeps.append)
+    client = _client(handler)
+
+    assert client.fetch_candidate_issues() == []
+    assert calls == 2
+    assert sleeps == [0.5]
+
+
+def test_post_rate_limit_retries_after_retry_after_then_returns_issues(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    sleeps: list[float] = []
+    calls = 0
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            return httpx.Response(429, headers={"Retry-After": "2"})
+        return _empty_issues_response()
+
+    monkeypatch.setattr(retry_module, "sleep_with_jitter", sleeps.append)
+    client = _client(handler)
+
+    assert client.fetch_candidate_issues() == []
+    assert calls == 2
+    assert sleeps == [2.0]
+
+
+def test_post_retries_server_error_then_raises_status_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    sleeps: list[float] = []
+    calls = 0
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
         return httpx.Response(500, text="server explosion")
 
+    monkeypatch.setattr(retry_module, "sleep_with_jitter", sleeps.append)
     client = _client(handler)
     with pytest.raises(LinearApiStatusError):
         client.fetch_candidate_issues()
+    assert calls == 3
+    assert sleeps == [0.5, 1.0]
+
+
+def test_post_client_error_fails_without_retry(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    sleeps: list[float] = []
+    calls = 0
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        return httpx.Response(400, text="bad request")
+
+    monkeypatch.setattr(retry_module, "sleep_with_jitter", sleeps.append)
+    client = _client(handler)
+    with pytest.raises(LinearApiStatusError):
+        client.fetch_candidate_issues()
+    assert calls == 1
+    assert sleeps == []
 
 
 def test_post_raises_unknown_payload_on_non_json_body() -> None:
@@ -506,7 +829,7 @@ def test_extract_nodes_filters_non_dict_entries() -> None:
 
 
 def test_execute_raw_posts_query_and_returns_payload() -> None:
-    captured: dict = {}
+    captured: dict[str, dict[str, Any]] = {}
 
     def handler(request: httpx.Request) -> httpx.Response:
         captured["body"] = json.loads(request.content)
@@ -520,7 +843,7 @@ def test_execute_raw_posts_query_and_returns_payload() -> None:
 
 
 def test_execute_raw_defaults_variables_to_empty_dict() -> None:
-    captured: dict = {}
+    captured: dict[str, dict[str, Any]] = {}
 
     def handler(request: httpx.Request) -> httpx.Response:
         captured["body"] = json.loads(request.content)

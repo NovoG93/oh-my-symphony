@@ -21,11 +21,11 @@ import asyncio
 import json
 import os
 import shlex
-import time
 from pathlib import Path
 from typing import Any, Sequence
 
-from .._shell import resolve_bash, safe_proc_wait
+from .. import __version__
+from .._shell import process_identity, resolve_bash, terminate_process_tree
 from ..errors import (
     CodexNotFound,
     PortExit,
@@ -33,39 +33,42 @@ from ..errors import (
     ResponseTimeout,
     TurnCancelled,
     TurnFailed,
-    TurnInputRequired,
     TurnTimeout,
 )
 from ..logging import get_logger
+from ..utils.git_sandbox import git_roots_env, git_roots_outside
 from ..workspace import validate_agent_cwd
 from . import (
     EVENT_APPROVAL_AUTO_APPROVED,
+    EVENT_APPROVAL_DENIED,
     EVENT_MALFORMED,
     EVENT_NOTIFICATION,
     EVENT_OTHER_MESSAGE,
     EVENT_SESSION_STARTED,
     EVENT_TURN_CANCELLED,
     EVENT_TURN_COMPLETED,
-    EVENT_TURN_ENDED_WITH_ERROR,
     EVENT_TURN_FAILED,
     EVENT_TURN_INPUT_REQUIRED,
     EVENT_UNSUPPORTED_TOOL_CALL,
+    MALFORMED_LINE_LIMIT,
     BackendInit,
     BaseAgentBackend,
     ToolDescriptor,
     TurnResult,
+    _is_valid_session_id,
 )
+from .approval_policy import dangerous_command_reason
+from .per_turn import MAX_LINE_BYTES, _emit_event
 
 
 log = get_logger()
-
-MAX_LINE_BYTES = 10 * 1024 * 1024  # upstream §10.1 — 10 MB
 
 # Codex app-server protocol (v2 of `codex app-server`, codex-cli ≥ 0.39).
 # Older releases used `v2/initialize`, `v2/threads.start`, `v2/threads.runTurn`
 # — see commit history if you need to support a legacy app-server.
 METHOD_INITIALIZE = "initialize"
 METHOD_THREAD_START = "thread/start"
+METHOD_THREAD_RESUME = "thread/resume"
 METHOD_TURN_START = "turn/start"
 METHOD_THREAD_ARCHIVE = "thread/archive"
 # `thread/approveGuardianDeniedAction` is the rough equivalent of the legacy
@@ -76,16 +79,13 @@ METHOD_APPROVAL_RESPOND = "thread/approveGuardianDeniedAction"
 NOTIF_TURN_COMPLETED = "turn/completed"
 NOTIF_TURN_STARTED = "turn/started"
 NOTIF_ITEM_COMPLETED = "item/completed"
+NOTIF_AGENT_MESSAGE_DELTA = "item/agentMessage/delta"
 NOTIF_THREAD_TOKEN_USAGE = "thread/tokenUsage/updated"
 NOTIF_RATE_LIMITS = "account/rateLimits/updated"
 
 # Last-message preview is rendered in the dashboard / passed back as
 # `TurnResult.last_message`. 1000 chars matches what the legacy backend used.
 _ASSISTANT_MESSAGE_PREVIEW_CAP = 1000
-
-
-def _utc_iso() -> str:
-    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
 
 
 # v2 turn/start `sandboxPolicy` is a tagged enum object, not a kebab-case
@@ -157,15 +157,20 @@ def _scan_workspace_symlinks(*roots: Path) -> list[str]:
        silently fail and the worker burns turns repeating "쓰기 불가".
 
     2. ``after_create`` attaches the workspace as a git worktree of the host
-       repo (the default Symphony hook), which stores the worktree's
-       admin state in ``<host_repo>/.git/worktrees/<ID>/``. The worktree's
-       ``.git`` file is a one-liner pointer (``gitdir: <abspath>``), not a
-       directory. Every ``git`` invocation inside the worktree writes
-       ``index.lock``, ``HEAD.lock``, etc. under that admin dir, and the
-       merge-gate's ``git merge-tree`` writes objects to it too. Without
-       the gitdir in ``writable_roots`` the merge gate dies with
-       ``unable to create temporary file: Operation not permitted`` and
-       Symphony surfaces the worker as ``Blocked``.
+       repo (the default Symphony hook), which splits git's writable state
+       across *two* directories outside the workspace: the per-worktree
+       admin dir ``<host_repo>/.git/worktrees/<ID>/`` (index and ref locks)
+       and the shared common dir ``<host_repo>/.git/`` that owns
+       ``objects/``. Granting only the admin dir covers the index lock but
+       not the blob write, which fails with ``unable to create temporary
+       file: Operation not permitted`` / ``failed to insert into database``
+       on any sandbox that does not grant the common dir itself.
+
+       Measured 2026-08-06: codex 0.146.0 grants a linked worktree's git
+       dirs on its own, so this injection is belt-and-braces there — it
+       closes the gap for versions and configurations that do not.
+       ``writable_git_roots`` returns both directories; see
+       ``utils.git_sandbox``.
 
     The scan returns resolved targets that the backend passes to codex as
     ``sandbox_workspace_write.writable_roots``, preserving the safer
@@ -190,22 +195,14 @@ def _scan_workspace_symlinks(*roots: Path) -> list[str]:
             except OSError:
                 continue
             seen.add(str(target))
-        # Git-worktree pointer file. Resolving the gitdir target by reading
-        # `.git` is safe: the file is plain text owned by the same user that
-        # ran `git worktree add`, and the worst case is a missing/garbled
-        # pointer (treated as "no extra writable root").
-        git_file = root / ".git"
-        try:
-            if git_file.is_file():
-                content = git_file.read_text(encoding="utf-8", errors="replace")
-                for line in content.splitlines():
-                    if line.startswith("gitdir:"):
-                        target = line[len("gitdir:"):].strip()
-                        if target:
-                            seen.add(target)
-                        break
-        except OSError:
-            pass
+    # Git admin dirs: the per-worktree gitdir *and* the common dir that owns
+    # the object database. Both are needed for `git add`/`commit` and for the
+    # merge gate's `git merge-tree --write-tree`. Computed once against the
+    # first root (the agent cwd, the only directory codex already grants) so
+    # a git dir that happens to sit under the workspace *root* is still
+    # granted explicitly. A plain repo workspace adds nothing here.
+    if roots:
+        seen.update(git_roots_outside(*roots))
     return sorted(seen)
 
 
@@ -265,13 +262,19 @@ class CodexAppServerBackend(BaseAgentBackend):
         self._codex = codex
         self._cwd = init.cwd
         self._workspace_root = init.workspace_root
+        self._extra_env = dict(init.env)
         self._on_event = init.on_event
+        self._on_process_started = init.on_process_started
+        self._on_process_identified = init.on_process_identified
+        self._process_launch_guard = init.process_launch_guard
         self._client_tools = init.client_tools
         self._approval_policy = codex.approval_policy
         self._sandbox_policy = codex.turn_sandbox_policy
         self._thread_sandbox = codex.thread_sandbox
         self._writable_roots: list[str] = []
         self._process: asyncio.subprocess.Process | None = None
+        self._process_identity: str | None = None
+        self._cleanup_unconfirmed = False
         self._reader_task: asyncio.Task[None] | None = None
         self._stderr_task: asyncio.Task[None] | None = None
         self._next_id = 1
@@ -298,19 +301,51 @@ class CodexAppServerBackend(BaseAgentBackend):
     async def start(self) -> None:
         command, env = self._prepare_command_and_env()
         try:
-            self._process = await asyncio.create_subprocess_exec(
-                resolve_bash(),
-                "-lc",
-                command,
-                cwd=str(self._cwd),
-                stdin=asyncio.subprocess.PIPE,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-                env=env,
-                limit=MAX_LINE_BYTES,
-            )
+            async with self._process_launch_guard() as publish_started:
+                self._process = await asyncio.create_subprocess_exec(
+                    resolve_bash(),
+                    "-lc",
+                    command,
+                    cwd=str(self._cwd),
+                    stdin=asyncio.subprocess.PIPE,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
+                    env=env,
+                    limit=MAX_LINE_BYTES,
+                    # Own process group so terminate/kill reaches the agent CLI
+                    # behind the bash wrapper (POSIX only).
+                    start_new_session=os.name == "posix",
+                )
+                self._process_identity = process_identity(self._process.pid)
+                if self._on_process_identified is not None:
+                    self._on_process_identified(
+                        self._process.pid, self._process_identity
+                    )
+                elif self._on_process_started is not None:
+                    self._on_process_started(self._process.pid)
+                await publish_started(self._process.pid)
         except FileNotFoundError as exc:
             raise CodexNotFound("bash not available", error=str(exc)) from exc
+        except BaseException as launch_exc:
+            if self._process is not None:
+                try:
+                    cleanup = await terminate_process_tree(
+                        self._process, identity=self._process_identity
+                    )
+                except BaseException:
+                    self._cleanup_unconfirmed = True
+                    raise
+                if cleanup is None:
+                    self._cleanup_unconfirmed = True
+                    if isinstance(launch_exc, asyncio.CancelledError):
+                        raise launch_exc
+                    raise RuntimeError(
+                        "backend process cleanup could not be confirmed"
+                    ) from launch_exc
+                self._process = None
+                self._process_identity = None
+            raise
+        assert self._process is not None
         if self._process.stdout is None or self._process.stdin is None:
             raise CodexNotFound("subprocess pipes not available")
         self._reader_task = asyncio.create_task(self._stdout_reader())
@@ -332,6 +367,10 @@ class CodexAppServerBackend(BaseAgentBackend):
         No-op when sandbox is not workspace-write or no symlinks exist.
         """
         env = os.environ.copy()
+        # Backend-neutral grant, exported by every Symphony backend so any
+        # wrapper script can widen its own sandbox the same way.
+        env.update(git_roots_env(self._cwd, self._workspace_root))
+        env.update(self._extra_env)
         command = self._codex.command
         if not _sandbox_uses_workspace_write(self._thread_sandbox, self._sandbox_policy):
             self._writable_roots = []
@@ -363,25 +402,19 @@ class CodexAppServerBackend(BaseAgentBackend):
         return new_command, env
 
     async def stop(self) -> None:
-        if self._closed:
-            return
         self._closed = True
         # v2 has no `thread/stop` — `thread/archive` exists but only
         # finalizes server-side bookkeeping. Symphony already terminates
         # the subprocess below, which is sufficient for cleanup.
+        cleanup_unconfirmed = False
         if self._process is not None:
-            if self._process.returncode is None:
-                try:
-                    self._process.terminate()
-                except ProcessLookupError:
-                    pass
-                rc = await safe_proc_wait(self._process, timeout=2.0)
-                if rc is None and self._process.returncode is None:
-                    try:
-                        self._process.kill()
-                    except ProcessLookupError:
-                        pass
-                    await safe_proc_wait(self._process)
+            result = await terminate_process_tree(
+                self._process, identity=self._process_identity
+            )
+            cleanup_unconfirmed = result is None
+            if not cleanup_unconfirmed:
+                self._process = None
+                self._process_identity = None
         for task in (self._reader_task, self._stderr_task):
             if task is not None:
                 task.cancel()
@@ -389,6 +422,8 @@ class CodexAppServerBackend(BaseAgentBackend):
                     await task
                 except (asyncio.CancelledError, Exception):
                     pass
+        if cleanup_unconfirmed:
+            raise RuntimeError("backend process cleanup could not be confirmed")
 
     @property
     def session_id(self) -> str | None:
@@ -411,7 +446,7 @@ class CodexAppServerBackend(BaseAgentBackend):
         # plus optional `capabilities`. Tools are no longer declared at
         # initialize time — they're handled per-thread / per-turn now.
         params = {
-            "clientInfo": {"name": "symphony", "version": "0.2.0"},
+            "clientInfo": {"name": "symphony", "version": __version__},
         }
         return await self._request(METHOD_INITIALIZE, params)
 
@@ -449,6 +484,36 @@ class CodexAppServerBackend(BaseAgentBackend):
             {"thread_id": self._thread_id, "session_id": self._thread_id},
         )
         return self._thread_id
+
+    async def resume_session(self, session_id: str) -> bool:
+        """Resume an exact Codex thread when the app-server verifies it.
+
+        RPC rejection, transport failure, or a response that does not echo the
+        requested thread id is an unsupported recovery attempt. Leave the
+        current thread untouched so the caller can fall back to
+        :meth:`start_session` without inheriting unverified state.
+        """
+        if not _is_valid_session_id(session_id):
+            return False
+        try:
+            result = await self._request(
+                METHOD_THREAD_RESUME,
+                {"threadId": session_id},
+            )
+        except (ResponseError, ResponseTimeout, PortExit):
+            return False
+
+        thread = result.get("thread")
+        resumed_id = thread.get("id") if isinstance(thread, dict) else None
+        if resumed_id != session_id:
+            return False
+
+        self._thread_id = session_id
+        await self._emit(
+            EVENT_SESSION_STARTED,
+            {"thread_id": session_id, "session_id": session_id},
+        )
+        return True
 
     async def run_turn(self, *, prompt: str, is_continuation: bool) -> TurnResult:
         if self._thread_id is None:
@@ -538,6 +603,9 @@ class CodexAppServerBackend(BaseAgentBackend):
         except asyncio.TimeoutError as exc:
             await self._emit(EVENT_TURN_FAILED, {"reason": "turn_timeout"})
             raise TurnTimeout("turn timed out waiting for completion") from exc
+        except TurnFailed as exc:
+            await self._emit(EVENT_TURN_FAILED, {"reason": str(exc)})
+            raise
         final_turn = _coerce_turn(final)
         return final_turn or turn
 
@@ -583,13 +651,10 @@ class CodexAppServerBackend(BaseAgentBackend):
         self._next_id += 1
         future: asyncio.Future[dict[str, Any]] = asyncio.get_running_loop().create_future()
         self._pending[msg_id] = future
-        body = json.dumps(
-            {"jsonrpc": "2.0", "id": msg_id, "method": method, "params": params},
-            ensure_ascii=False,
-        )
         try:
-            self._process.stdin.write((body + "\n").encode("utf-8"))
-            await self._process.stdin.drain()
+            await self._write_json_rpc(
+                {"jsonrpc": "2.0", "id": msg_id, "method": method, "params": params}
+            )
         except (BrokenPipeError, ConnectionResetError) as exc:
             self._pending.pop(msg_id, None)
             raise PortExit("stdin closed", error=str(exc)) from exc
@@ -608,9 +673,20 @@ class CodexAppServerBackend(BaseAgentBackend):
             )
         return response.get("result") or {}
 
+    async def _write_json_rpc(self, payload: dict[str, Any]) -> None:
+        if self._process is None or self._process.stdin is None:
+            raise ResponseError("subprocess not started")
+        body = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+        # Existing request writes are line-atomic and unlocked. Server-request
+        # replies come from this single reader task, so keep the same discipline.
+        self._process.stdin.write((body + "\n").encode("utf-8"))
+        await self._process.stdin.drain()
+
     async def _stdout_reader(self) -> None:
         assert self._process is not None and self._process.stdout is not None
         stdout = self._process.stdout
+        malformed_streak = 0
+        stream_corrupt: str | None = None
         while True:
             try:
                 line = await stdout.readline()
@@ -628,17 +704,51 @@ class CodexAppServerBackend(BaseAgentBackend):
                 msg = json.loads(text)
             except json.JSONDecodeError:
                 await self._emit(EVENT_MALFORMED, {"raw": text[:500]})
+                malformed_streak += 1
+                if malformed_streak >= MALFORMED_LINE_LIMIT:
+                    stream_corrupt = text
+                    break
                 continue
+            malformed_streak = 0
             if isinstance(msg, dict) and "id" in msg and msg["id"] in self._pending:
                 fut = self._pending.pop(msg["id"])
                 if not fut.done():
                     fut.set_result(msg)
                 continue
+            if isinstance(msg, dict) and "id" in msg and msg.get("method"):
+                await self._handle_server_request(msg)
+                continue
             await self._handle_notification(msg if isinstance(msg, dict) else {})
+        rc = self._process.returncode if self._process is not None else None
+        if stream_corrupt is not None:
+            reason = (
+                f"codex stream unreadable: {MALFORMED_LINE_LIMIT} consecutive "
+                f"malformed lines (last: {stream_corrupt[:200]!r})"
+            )
+            self._closed = True
+        else:
+            reason = f"codex app-server closed stdout (rc={rc})"
         for fut in self._pending.values():
             if not fut.done():
-                fut.set_exception(PortExit("subprocess stdout closed"))
+                fut.set_exception(PortExit(reason))
         self._pending.clear()
+        # A crash mid-turn used to stall for the full turn timeout and be
+        # misreported as TurnTimeout — the completion waiter was never
+        # resolved on EOF. Fail it promptly with the real cause.
+        waiter = self._turn_completion_waiter
+        if waiter is not None and not waiter.done():
+            waiter.set_exception(TurnFailed(reason))
+        if stream_corrupt is not None:
+            log.error(
+                "codex_stream_corrupt",
+                malformed_line_limit=MALFORMED_LINE_LIMIT,
+                last_line=stream_corrupt[:200],
+            )
+            process = self._process
+            if process is not None and process.returncode is None:
+                # This reader task cannot call stop(): stop() cancels and awaits
+                # the reader itself. Reuse the same process-tree reaper directly.
+                await terminate_process_tree(process)
 
     async def _stderr_reader(self) -> None:
         assert self._process is not None and self._process.stderr is not None
@@ -699,6 +809,18 @@ class CodexAppServerBackend(BaseAgentBackend):
                 waiter.set_result(params if isinstance(params, dict) else {})
             return
         # ----- streamed thread items (assistant text, tool calls, etc.) -----
+        if method == NOTIF_AGENT_MESSAGE_DELTA:
+            delta = params.get("delta") if isinstance(params, dict) else None
+            if isinstance(delta, str) and delta:
+                await self._emit(
+                    EVENT_OTHER_MESSAGE,
+                    {
+                        "type": "agent_delta",
+                        "text": delta,
+                        "item_id": params.get("itemId"),
+                    },
+                )
+            return
         if method == NOTIF_ITEM_COMPLETED:
             item = params.get("item") if isinstance(params, dict) else None
             if isinstance(item, dict) and item.get("type") == "agentMessage":
@@ -716,7 +838,9 @@ class CodexAppServerBackend(BaseAgentBackend):
                         EVENT_OTHER_MESSAGE,
                         {
                             "type": "assistant",
-                            "message": self._latest_assistant_message,
+                            # Chat consumers need the complete final answer;
+                            # only the dashboard metadata preview is capped.
+                            "message": text,
                             "item": item,
                         },
                     )
@@ -732,6 +856,93 @@ class CodexAppServerBackend(BaseAgentBackend):
             return
         await self._emit(_normalize_event_name(method), params)
 
+    async def _handle_server_request(self, msg: dict[str, Any]) -> None:
+        method = str(msg.get("method") or "")
+        params = msg.get("params")
+        if not isinstance(params, dict):
+            params = {}
+        msg_id = msg.get("id")
+        result: dict[str, Any] | None
+        error: dict[str, Any] | None = None
+
+        if method == "item/commandExecution/requestApproval":
+            command = _command_text(params.get("command"))
+            reason = dangerous_command_reason(command)
+            if reason is not None:
+                result = {"decision": "decline"}
+                await self._emit(
+                    EVENT_APPROVAL_DENIED,
+                    {"method": method, "command": command, "reason": reason},
+                )
+            else:
+                result = {"decision": "accept"}
+                await self._emit(
+                    EVENT_APPROVAL_AUTO_APPROVED,
+                    _approval_event_payload(method, params, command=command),
+                )
+        elif method == "item/fileChange/requestApproval":
+            result = {"decision": "accept"}
+            await self._emit(
+                EVENT_APPROVAL_AUTO_APPROVED,
+                _approval_event_payload(method, params),
+            )
+        elif method == "mcpServer/elicitation/request":
+            result = {"action": "accept", "content": {}}
+            await self._emit(
+                EVENT_APPROVAL_AUTO_APPROVED,
+                _approval_event_payload(method, params),
+            )
+        elif method == "item/tool/requestUserInput":
+            result = {"answers": _empty_user_input_answers(params)}
+            await self._emit(
+                EVENT_APPROVAL_AUTO_APPROVED,
+                _approval_event_payload(method, params),
+            )
+        elif method == "item/permissions/requestApproval":
+            permissions = params.get("permissions")
+            result = {
+                "permissions": permissions if isinstance(permissions, dict) else {},
+                "scope": "session",
+            }
+            await self._emit(
+                EVENT_APPROVAL_AUTO_APPROVED,
+                _approval_event_payload(method, params),
+            )
+        elif method == "execCommandApproval":
+            command = _command_text(params.get("command"))
+            reason = dangerous_command_reason(command)
+            if reason is not None:
+                result = {"decision": "denied"}
+                await self._emit(
+                    EVENT_APPROVAL_DENIED,
+                    {"method": method, "command": command, "reason": reason},
+                )
+            else:
+                result = {"decision": "approved"}
+                await self._emit(
+                    EVENT_APPROVAL_AUTO_APPROVED,
+                    _approval_event_payload(method, params, command=command),
+                )
+        elif method == "applyPatchApproval":
+            result = {"decision": "approved"}
+            await self._emit(
+                EVENT_APPROVAL_AUTO_APPROVED,
+                _approval_event_payload(method, params),
+            )
+        else:
+            result = None
+            error = {
+                "code": -32601,
+                "message": f"unsupported server request: {method}",
+            }
+
+        response: dict[str, Any] = {"jsonrpc": "2.0", "id": msg_id}
+        if error is not None:
+            response["error"] = error
+        else:
+            response["result"] = result or {}
+        await self._write_json_rpc(response)
+
     def _update_tokens_absolute(self, payload: dict[str, Any]) -> None:
         # Upstream §13.5 — prefer absolute totals, ignore delta-style payloads.
         if not isinstance(payload, dict):
@@ -741,41 +952,25 @@ class CodexAppServerBackend(BaseAgentBackend):
                 self._latest_usage[key] = int(payload[key])
 
     def _update_tokens_from_v2_block(self, usage: dict[str, Any]) -> None:
-        """Codex 0.130+ thread/tokenUsage/updated.tokenUsage.total shape.
+        """Read absolute cumulative totals from Codex app-server v2.
 
-        Fields seen in the wild (camelCase, captured from a real run):
-          inputTokens, cachedInputTokens, outputTokens,
-          reasoningOutputTokens, totalTokens
-
-        Symphony's three-bucket model has no separate cache or reasoning
-        buckets, so cached input is folded into input_tokens and reasoning
-        output is folded into output_tokens.
-
-        Codex's own `totalTokens` field excludes both cache reads and
-        reasoning output (it counts only `inputTokens + outputTokens`),
-        which would make symphony's three-bucket invariant fail —
-        `input_tokens + output_tokens > total_tokens`. To preserve that
-        invariant and stay unit-comparable with the other backends,
-        symphony recomputes `total_tokens` as `folded_in + folded_out`
-        rather than copying codex's narrower value.
-
-        These notifications report ABSOLUTE cumulative totals (not deltas),
-        so we overwrite rather than accumulate.
+        cachedInputTokens is a subset of inputTokens; reasoningOutputTokens
+        is a subset of outputTokens. Adding either subset again inflates
+        the dashboard and token budgets. Preserve those inclusive totals and
+        expose cache only as the existing optional subset telemetry field.
+        Overwrite, rather than accumulate, each notification.
         """
         if not isinstance(usage, dict):
             return
         in_t = int(usage.get("inputTokens") or 0)
-        cached = int(usage.get("cachedInputTokens") or 0)
         out_t = int(usage.get("outputTokens") or 0)
-        reasoning = int(usage.get("reasoningOutputTokens") or 0)
-        folded_in = in_t + cached
-        folded_out = out_t + reasoning
-        # Always compute total = folded_in + folded_out so the invariant
-        # `total_tokens == input_tokens + output_tokens` holds. Codex's
-        # narrower `totalTokens` is intentionally ignored.
-        self._latest_usage["input_tokens"] = folded_in
-        self._latest_usage["output_tokens"] = folded_out
-        self._latest_usage["total_tokens"] = folded_in + folded_out
+        self._latest_usage["input_tokens"] = in_t
+        self._latest_usage["output_tokens"] = out_t
+        self._latest_usage["total_tokens"] = in_t + out_t
+        if "cachedInputTokens" in usage:
+            self._latest_usage["cache_input_tokens"] = int(usage["cachedInputTokens"] or 0)
+        else:
+            self._latest_usage.pop("cache_input_tokens", None)
 
     async def _handle_approval(self, params: dict[str, Any]) -> None:
         # Best-effort auto-approve. The legacy `respondToApproval` method is
@@ -806,22 +1001,17 @@ class CodexAppServerBackend(BaseAgentBackend):
         )
 
     async def _emit(self, event: str, payload: dict[str, Any]) -> None:
-        ev_payload = payload if isinstance(payload, dict) else {"data": payload}
-        try:
-            await self._on_event(
-                {
-                    "event": event,
-                    "timestamp": _utc_iso(),
-                    "payload": ev_payload,
-                    "usage": dict(self._latest_usage),
-                    "rate_limits": dict(self._latest_rate_limits)
-                    if self._latest_rate_limits
-                    else None,
-                    "agent_pid": self.pid,
-                }
-            )
-        except Exception as exc:
-            log.warning("event_callback_failed", error=str(exc))
+        # No session redaction on the app-server protocol (thread ids are
+        # opaque handles, not secrets carried in evidence) — passing no
+        # `redact_session` is an identity in the shared helper.
+        await _emit_event(
+            self._on_event,
+            event,
+            payload,
+            usage=self._latest_usage,
+            rate_limits=self._latest_rate_limits,
+            agent_pid=self.pid,
+        )
 
 
 def _normalize_event_name(method: str) -> str:
@@ -844,6 +1034,51 @@ def _normalize_event_name(method: str) -> str:
     if "notif" in lower:
         return EVENT_NOTIFICATION
     return EVENT_OTHER_MESSAGE
+
+
+def _command_text(value: Any) -> str:
+    if isinstance(value, str):
+        return value
+    if isinstance(value, list):
+        return " ".join(str(part) for part in value)
+    return ""
+
+
+def _empty_user_input_answers(params: dict[str, Any]) -> dict[str, dict[str, list[Any]]]:
+    questions = params.get("questions")
+    if not isinstance(questions, list):
+        return {}
+    answers: dict[str, dict[str, list[Any]]] = {}
+    for question in questions:
+        if not isinstance(question, dict):
+            continue
+        question_id = question.get("id")
+        if isinstance(question_id, str) and question_id:
+            answers[question_id] = {"answers": []}
+    return answers
+
+
+def _approval_event_payload(
+    method: str,
+    params: dict[str, Any],
+    *,
+    command: str | None = None,
+) -> dict[str, str]:
+    payload = {"method": method}
+    if command:
+        payload["command"] = command[:400]
+        return payload
+    for key in ("tool", "name", "serverName", "server", "path"):
+        value = params.get(key)
+        if isinstance(value, str) and value.strip():
+            payload["tool"] = value.strip()[:400]
+            return payload
+    for key in ("message", "reason", "prompt"):
+        value = params.get(key)
+        if isinstance(value, str) and value.strip():
+            payload["message"] = value.strip()[:400]
+            return payload
+    return payload
 
 
 def linear_graphql_tool() -> ToolDescriptor:

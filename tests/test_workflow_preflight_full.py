@@ -15,6 +15,7 @@ build_service_config defaults. This file extends coverage to:
 
 from __future__ import annotations
 
+import re
 import textwrap
 from dataclasses import replace
 from pathlib import Path
@@ -35,11 +36,25 @@ from symphony.workflow import (
     validate_for_dispatch,
 )
 
+_REPO_ROOT = Path(__file__).resolve().parents[1]
+
 
 def _write(tmp_path: Path, body: str) -> Path:
     path = tmp_path / "WORKFLOW.md"
     path.write_text(textwrap.dedent(body), encoding="utf-8")
     return path
+
+
+def _extract_readme_quickstart_workflow(path: Path) -> str:
+    text = path.read_text(encoding="utf-8")
+    match = re.search(
+        # The 60-second demo writes its mock workflow beside the generated WORKFLOW.md.
+        r"cat > WORKFLOW\.mock\.md <<'YAML'\n(?P<workflow>---\n.*?\n)YAML",
+        text,
+        re.DOTALL,
+    )
+    assert match is not None
+    return match.group("workflow")
 
 
 # ---------------------------------------------------------------------------
@@ -120,6 +135,45 @@ def test_file_tracker_with_board_root_passes_preflight(tmp_path: Path) -> None:
     )
     cfg = build_service_config(load_workflow(path))
     # Should not raise — file tracker has all required fields.
+    validate_for_dispatch(cfg)
+
+
+def test_multi_stage_workflow_rejects_too_low_max_turns(tmp_path: Path) -> None:
+    path = _write(
+        tmp_path,
+        """\
+        ---
+        tracker:
+          kind: file
+          board_root: ./tickets
+          active_states: [Todo, In Progress, Verify, Document]
+          terminal_states: [Done, Blocked]
+        agent:
+          max_turns: 1
+        ---
+        body
+        """,
+    )
+    cfg = build_service_config(load_workflow(path))
+
+    with pytest.raises(ConfigValidationError, match="agent.max_turns=1"):
+        validate_for_dispatch(cfg)
+
+
+def test_shipped_workflow_example_passes_dispatch_preflight() -> None:
+    cfg = build_service_config(load_workflow(_REPO_ROOT / "examples/WORKFLOW.smoke.md"))
+
+    validate_for_dispatch(cfg)
+
+
+@pytest.mark.parametrize("relative_path", ["README.md", "README.ko.md"])
+def test_readme_quickstart_workflow_passes_dispatch_preflight(
+    tmp_path: Path, relative_path: str
+) -> None:
+    workflow_text = _extract_readme_quickstart_workflow(_REPO_ROOT / relative_path)
+    path = _write(tmp_path, workflow_text)
+    cfg = build_service_config(load_workflow(path))
+
     validate_for_dispatch(cfg)
 
 
@@ -241,7 +295,7 @@ def test_env_var_indirection_with_explicit_value_passes(
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.parametrize("kind", ["codex", "claude", "gemini", "pi"])
+@pytest.mark.parametrize("kind", ["codex", "claude", "gemini", "opencode", "pi"])
 def test_empty_backend_command_fails_preflight(tmp_path: Path, kind: str) -> None:
     """Setting the chosen backend's `command:` to "" via YAML normally
     fills in a default; the preflight guard against an empty command
@@ -270,7 +324,7 @@ def test_empty_backend_command_fails_preflight(tmp_path: Path, kind: str) -> Non
 
 def test_other_backends_empty_command_does_not_fail_preflight(tmp_path: Path) -> None:
     """When agent.kind=codex, only codex.command is required to be set.
-    Empty claude/gemini/pi commands are tolerated because they are not used."""
+    Empty inactive backend commands are tolerated because they are not used."""
     path = _write(
         tmp_path,
         """\
@@ -290,6 +344,7 @@ def test_other_backends_empty_command_does_not_fail_preflight(tmp_path: Path) ->
         cfg,
         claude=replace(cfg.claude, command=""),
         gemini=replace(cfg.gemini, command=""),
+        opencode=replace(cfg.opencode, command=""),
         pi=replace(cfg.pi, command=""),
     )
     # Should NOT raise: the active backend is codex and it has a command.
@@ -353,3 +408,41 @@ def test_workflow_with_no_tracker_block_at_all_fails_preflight(tmp_path: Path) -
         with pytest.raises(UnsupportedTrackerKind):
             validate_for_dispatch(cfg)
     # else: the builder defaulted to a usable kind — that's fine too.
+
+
+# ---------------------------------------------------------------------------
+# F-18 — bootstrap-recommended examples must give claude a usable command
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "workflow",
+    [
+        "WORKFLOW.md",
+        "WORKFLOW.example.md",
+        "WORKFLOW.file.example.md",
+        "skills/symphony-skill/oneshot/templates/WORKFLOW.oneshot.md",
+    ],
+)
+def test_shipped_claude_commands_accept_edits_and_extend_write_scope(
+    workflow: str,
+) -> None:
+    """A bare `claude -p` worker cannot accept edits or write the host board.
+
+    That is the configuration that produced acceptance finding 1, and until
+    this test it was what a fresh bootstrap copied.
+    """
+    text = Path(workflow).read_text(encoding="utf-8")
+    command_lines = [
+        line
+        for line in text.splitlines()
+        if line.strip().startswith("command:") and "claude" in line
+    ]
+    assert command_lines, f"{workflow} declares no claude command"
+    for line in command_lines:
+        assert "--permission-mode acceptEdits" in line, (
+            f"{workflow}: claude worker cannot accept edits unattended: {line}"
+        )
+        assert "--add-dir" in line, (
+            f"{workflow}: claude worker has no write scope beyond its cwd: {line}"
+        )

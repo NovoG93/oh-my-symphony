@@ -6,13 +6,16 @@ __pycache__/
 build/
 dist/
 .coverage
+.coverage.*
 htmlcov/
 /tmp_workspaces/
 .claude/
 .omc/
 .omx/
 .playwright-mcp/
-.symphony/
+# Local runtime state (state.db, token_ema.json, chat transcripts) stays out of git.
+.symphony/*
+.domain-agent/
 
 # Auto-generated kanban mirror (regenerated on every TUI launch)
 /WORKFLOW-PROGRESS.md
@@ -34,3 +37,24 @@ kanban_demo_codex/
 tmp_workspaces/
 WORKFLOW.demo.*.md
 /.symphony*-demo/
+.sdlc/work/*/scratch/
+
+# Rendered at Pages deploy time by scripts/build_manual_pdf.py
+/docs/manual/pdf/
+/node_modules/
+scripts/openspec-bundle/node_modules/
+.sdlc/archive/*/scratch/
+.sdlc/work/*/progress.md
+.sdlc/archive/*/progress.md
+.sdlc/approvals/
+.sdlc/archive/*/approvals/
+.sdlc/work/*/baseline.txt
+.sdlc/archive/*/baseline.txt
+.sdlc/work/*/deviations.md
+.sdlc/archive/*/deviations.md
+.sdlc/work/*/evidence.md
+.sdlc/archive/*/evidence.md
+.sdlc/work/*/harvest.md
+.sdlc/archive/*/harvest.md
+.sdlc/work/*/spec.md
+.sdlc/archive/*/spec.md

@@ -1,38 +1,39 @@
-"""Optional HTTP JSON API.
+"""HTTP server: web Kanban app + JSON API.
 
-The upstream HTML dashboard at `/` was removed in the multi-agent fork — the
-primary UI is the CLI Kanban (`symphony tui`). Remaining endpoints are the
-programmatic JSON API: state snapshots, per-issue debug, and a coalesced
-refresh trigger.
+`/` serves the built-in web board (see `webapi.py` for the REST surface:
+board/issue CRUD, workflow column + prompt editing, stats). The
+endpoints below predate the web app and remain for scripts and the TUI:
 
-Endpoints:
-    GET  /                       — text hint pointing at `symphony tui`
     GET  /api/v1/state           — runtime snapshot
     GET  /api/v1/<identifier>    — issue debug detail
     POST /api/v1/refresh         — trigger immediate poll/reconcile
-    POST /api/v1/<identifier>/confirm-done — confirm Human Review as Done
+    POST /api/v1/<id>/pause|resume
+    POST /api/v1/<id>/recover-blocked
+    POST /api/v1/<id>/skip-document  (deprecated alias: /skip-learn)
+    POST /api/v1/<id>/confirm-done
 """
 
 from __future__ import annotations
 
 import asyncio
 import json
+import time
 
 from aiohttp import web
 
 from .logging import get_logger
 from .orchestrator import Orchestrator
+from .webapi import (
+    _LOOPBACK_BINDS,
+    API_TOKEN_ENV,
+    BIND_HOST_KEY,
+    _configured_api_token,
+    _request_is_loopback,
+    register_web_routes,
+)
 
 
 log = get_logger()
-
-ROOT_HINT = (
-    "oh-my-symphony JSON API.\n"
-    "The HTML dashboard was replaced by a CLI Kanban — run `symphony tui`.\n"
-    "API: GET /api/v1/state, GET /api/v1/<identifier>, POST /api/v1/refresh,\n"
-    "     POST /api/v1/<identifier>/pause, POST /api/v1/<identifier>/resume,\n"
-    "     POST /api/v1/<identifier>/confirm-done\n"
-)
 
 
 def _error_response(status: int, code: str, message: str) -> web.Response:
@@ -42,9 +43,6 @@ def _error_response(status: int, code: str, message: str) -> web.Response:
 
 def build_app(orchestrator: Orchestrator) -> web.Application:
     app = web.Application()
-
-    async def handle_root(_request: web.Request) -> web.Response:
-        return web.Response(text=ROOT_HINT, content_type="text/plain")
 
     async def handle_state(_request: web.Request) -> web.Response:
         return web.json_response(orchestrator.snapshot())
@@ -95,10 +93,12 @@ def build_app(orchestrator: Orchestrator) -> web.Application:
 
     async def handle_resume(request: web.Request) -> web.Response:
         identifier = request.match_info.get("identifier", "")
-        issue_id = orchestrator.find_running_issue_id(identifier)
+        issue_id = orchestrator.find_resumable_issue_id(identifier)
         if issue_id is None:
             return _error_response(
-                404, "issue_not_running", f"no running worker for {identifier}"
+                404,
+                "issue_not_resumable",
+                f"no running, retry-held, or idle paused worker for {identifier}",
             )
         changed = orchestrator.resume_worker(issue_id)
         return web.json_response(
@@ -115,9 +115,7 @@ def build_app(orchestrator: Orchestrator) -> web.Application:
         try:
             result = await orchestrator.confirm_done(identifier)
         except FileNotFoundError:
-            return _error_response(
-                404, "issue_not_found", f"unknown terminal issue {identifier}"
-            )
+            return _error_response(404, "issue_not_found", f"unknown issue {identifier}")
         except ValueError as exc:
             return _error_response(409, "not_confirmable", str(exc))
         except Exception as exc:
@@ -125,13 +123,74 @@ def build_app(orchestrator: Orchestrator) -> web.Application:
             return _error_response(500, "confirm_done_failed", str(exc))
         return web.json_response(result)
 
+    async def handle_skip_document(request: web.Request) -> web.Response:
+        identifier = request.match_info.get("identifier", "")
+        changed, message = await orchestrator.skip_document(identifier)
+        if not changed:
+            status = 404 if message.startswith("unknown issue") else 409
+            return _error_response(status, "document_skip_rejected", message)
+        return web.json_response(
+            {
+                "issue_identifier": identifier,
+                "skipped": True,
+                "message": message,
+            }
+        )
+
+    async def handle_recover_blocked(request: web.Request) -> web.Response:
+        identifier = request.match_info.get("identifier", "")
+        try:
+            body = await request.json() if request.body_exists else {}
+        except json.JSONDecodeError:
+            return _error_response(400, "invalid_json", "request body is not JSON")
+        if body and not isinstance(body, dict):
+            return _error_response(400, "invalid_body", "request body must be an object")
+        target_state = (
+            body.get("fix_state", body.get("rca_state", body.get("target_state")))
+            if isinstance(body, dict)
+            else None
+        )
+        agent_kind = body.get("agent_kind") if isinstance(body, dict) else None
+        if target_state is not None and not isinstance(target_state, str):
+            return _error_response(
+                400, "invalid_body", "fix_state must be a string"
+            )
+        if agent_kind is not None and not isinstance(agent_kind, str):
+            return _error_response(400, "invalid_body", "agent_kind must be a string")
+        changed, message, details = await orchestrator.recover_blocked_issue(
+            identifier,
+            target_state=target_state,
+            agent_kind=agent_kind,
+        )
+        if not changed:
+            status = 404 if message.startswith("unknown issue") else 409
+            return _error_response(status, "blocked_recovery_rejected", message)
+        return web.json_response(
+            {
+                "issue_identifier": identifier,
+                "fix_created": True,
+                # Deprecated alias retained for API compatibility.
+                "rca_created": True,
+                "message": message,
+                **details,
+            }
+        )
+
     async def handle_method_not_allowed(request: web.Request) -> web.Response:
         return _error_response(405, "method_not_allowed", request.method)
 
-    async def handle_debug_tasks(_request: web.Request) -> web.Response:
+    async def handle_debug_tasks(request: web.Request) -> web.Response:
         # Dump every live asyncio task with its suspended coroutine stack.
         # `Task.get_stack()` returns the deepest frame the task is parked
         # at — exactly what py-spy can't show us across the await boundary.
+        # Live stacks and coroutine reprs can name local paths and prompt
+        # text, so this stays loopback-only like the run diagnostics.
+        if not _request_is_loopback(request):
+            return _error_response(
+                403,
+                "debug_tasks_local_only",
+                "task diagnostics are available only from the local machine",
+            )
         out = []
         for t in asyncio.all_tasks():
             stack_frames = []
@@ -150,28 +209,46 @@ def build_app(orchestrator: Orchestrator) -> web.Application:
             )
         return web.json_response({"tasks": out})
 
-    app.router.add_get("/", handle_root)
+    async def handle_health(_request: web.Request) -> web.Response:
+        return web.json_response(orchestrator.health())
+
+    app.router.add_get("/api/v1/health", handle_health)
     app.router.add_get("/api/v1/state", handle_state)
     app.router.add_get("/api/v1/refresh", handle_method_not_allowed)
     app.router.add_post("/api/v1/refresh", handle_refresh)
     app.router.add_get("/api/v1/_debug/tasks", handle_debug_tasks)
+    # Web app routes (board/issues/workflow/stats + static SPA).
+    # Registered before the `{identifier}` catch-alls below so named routes
+    # like /api/v1/board resolve to their handlers, not to issue lookup.
+    register_web_routes(app, orchestrator)
     app.router.add_post("/api/v1/{identifier}/pause", handle_pause)
     app.router.add_post("/api/v1/{identifier}/resume", handle_resume)
     app.router.add_post("/api/v1/{identifier}/confirm-done", handle_confirm_done)
+    app.router.add_post("/api/v1/{identifier}/recover-blocked", handle_recover_blocked)
+    app.router.add_post("/api/v1/{identifier}/skip-document", handle_skip_document)
+    # Deprecated alias — lane renamed Learn -> Document; old scripts keep working.
+    app.router.add_post("/api/v1/{identifier}/skip-learn", handle_skip_document)
     app.router.add_get("/api/v1/{identifier}", handle_issue)
 
     return app
 
 
 def _now_iso() -> str:
-    import time
-
     return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
 
 
 async def run_server(
     app: web.Application, host: str, port: int
 ) -> tuple[web.AppRunner, int]:
+    # The API guard middleware only enforces the loopback Host allowlist
+    # when the server itself is loopback-bound; record the bind address.
+    app[BIND_HOST_KEY] = host
+    if host.lower() not in _LOOPBACK_BINDS and _configured_api_token() is None:
+        log.warning(
+            "http_server_unauthenticated_on_network_bind",
+            host=host,
+            hint=f"set {API_TOKEN_ENV} or bind to 127.0.0.1",
+        )
     runner = web.AppRunner(app)
     await runner.setup()
     site = web.TCPSite(runner, host=host, port=port)

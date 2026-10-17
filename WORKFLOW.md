@@ -2,8 +2,8 @@
 tracker:
   kind: file
   board_root: ./kanban
-  active_states: [Todo, Explore, Plan, "In Progress", Review, QA, Learn]
-  terminal_states: ["Human Review", Done, Cancelled, Blocked, Archive]
+  active_states: [Todo, "In Progress", Verify, Document]
+  terminal_states: ["Human Review", Done, Blocked, Archive, Cancelled]
   # Auto-archive sweep: terminal-state issues whose `updated_at` is older
   # than `archive_after_days` move to `archive_state` on the next poll.
   # Set `archive_after_days: 0` to disable the sweep (manual `a` hotkey
@@ -12,15 +12,12 @@ tracker:
   archive_state: Archive
   archive_after_days: 30
   state_descriptions:
-    Todo: "Triage; route to Explore"
-    Explore: "Brief from llm-wiki + git + code"
-    Plan: "Lock implementation plan"
-    "In Progress": "TDD loop, draft branch"
-    Review: "Read diff, fix CRITICAL/HIGH/MEDIUM"
-    QA: "pytest -q + real-CLI smoke"
-    Learn: "Distill learnings, update llm-wiki"
-    "Human Review": "Human confirms agent work before Done"
-    Done: "Human-confirmed complete"
+    Todo: "Triage; route to In Progress"
+    "In Progress": "Plan + TDD implementation + self-critique"
+    Verify: "Review + QA + Merge Gate"
+    Document: "Docs + wiki write-back; Done unless intervention"
+    "Human Review": "Manual intervention or explicit review before Done"
+    Done: "Verified complete"
     Archive: "Auto-archived after 30 days idle"
 
 polling:
@@ -46,12 +43,12 @@ hooks:
   # The workspace starts empty. Attach it as a git worktree of the host
   # repo on a per-ticket symphony/<ID> branch so the host working tree
   # stays untouched while the agent works. Product changes and docs/
-  # artefacts stay on the feature branch. The default Learn gate merges
+  # artefacts stay on the feature branch. The default Document gate merges
   # that feature branch into the target branch before the ticket can move
   # to Done.
   #
   # IMPORTANT: only host-owned board roots such as kanban/ are symlinked
-  # back to the host repo. docs/ stays branch-local so review/QA evidence
+  # back to the host repo. docs/ stays branch-local so Verify evidence
   # and wiki updates are reviewable deliverables.
   # Body extracted to scripts/symphony-setup-worktree.sh so the hook stays
   # one line and the worktree-setup logic is versioned, lintable, and
@@ -65,7 +62,7 @@ hooks:
     # NEVER `git reset --hard` inside a worktree — discards mid-run work.
     set -uo pipefail
     HOST_REPO="${SYMPHONY_WORKFLOW_DIR:?SYMPHONY_WORKFLOW_DIR not set}"
-    for dir in kanban; do
+    for dir in ${SYMPHONY_BOARD_ROOT_NAME:-kanban}; do
       source="$HOST_REPO/$dir"
       target="$PWD/$dir"
       [ -e "$source" ] || continue
@@ -214,6 +211,10 @@ hooks:
     set -uo pipefail
     HOST_REPO="${SYMPHONY_WORKFLOW_DIR:?}"
     WORKTREE_PATH="$PWD"
+    ISSUE_ID="${SYMPHONY_ISSUE_ID:-$(basename "$WORKTREE_PATH")}"
+    for dir in ${SYMPHONY_BOARD_ROOT_NAME:-kanban}; do
+      git -C "$HOST_REPO" update-index --no-skip-worktree -- "$dir/$ISSUE_ID.md" 2>/dev/null || true
+    done
     git -C "$HOST_REPO" worktree remove --force "$WORKTREE_PATH" 2>/dev/null || true
   # after_done: fires once when the ticket reaches `Done` (after the
   # squash commit lands). Receives the same env as the other hooks plus
@@ -238,43 +239,78 @@ hooks:
 
 agent:
   kind: claude
+  # Backends to switch to, in order, when a worker exits on a quota /
+  # usage-limit error ("usage limit", "insufficient_quota", "billing"…).
+  # Transient rate limits (429) still retry on the same backend. Symphony
+  # pins the next untried kind onto the ticket (`agent.kind` frontmatter),
+  # appends `## Backend Fallback`, and retries instead of pausing for an
+  # operator. Empty list keeps the pause. File boards only.
+  fallback_kinds: []
   max_concurrent_agents: 1
   max_turns: 100
   max_retry_backoff_ms: 300000
-  # Soft cap on stage rewinds (Review→In Progress + QA→In Progress
+  # Soft cap on stage rewinds (Verify/Document -> In Progress
   # combined). Symphony increments this counter at phase-transition time;
   # on the (max_attempts+1)th rewind, it moves the ticket to Blocked
   # instead of starting another In Progress pass. Set to 0 to disable.
   max_attempts: 3
+  # Cap on re-dispatching a ticket that already reached Done (deep preset:
+  # Verify RED / QA BLOCKED reopen a merged Build slice; each reopen is a
+  # fresh run, so max_attempts never sees it). Past the cap Symphony
+  # appends `## Reopen Budget` and parks the ticket in Blocked; a
+  # `## Reopen Approved` section on the ticket buys one more cycle.
+  # Set 0 to disable.
+  max_reopens: 3
+  # Mechanical evidence floor (orchestrator/contracts.py):
+  #   auto (default) — enforce when the board is a shipped preset: every
+  #                    active lane is a default-preset lane (Todo / In
+  #                    Progress / Verify / Document), or the lanes are exactly
+  #                    the deep preset (vault-file + verdict-line contracts).
+  #                    Renaming a lane therefore turns it OFF — logged as
+  #                    `stage_contracts_disabled` and reported by
+  #                    `symphony doctor`, never silent.
+  #   on             — enforce the default contract set whatever the lanes
+  #                    are called.
+  #   off            — never enforce; the stage prompts are the only gate.
+  stage_contracts: auto
   # File-board optimization: obvious Todo tickets with Acceptance Criteria
-  # are routed to Explore by Symphony itself, saving a model turn. Bug tickets,
-  # blocked tickets, and underspecified tickets still run the Todo prompt.
+  # are routed to In Progress by Symphony itself, saving a model turn. Bug
+  # tickets, blocked tickets, and underspecified tickets still run Todo.
   auto_triage_actionable_todo: true
+  # Blocked integration/merge/review episodes are software work: Symphony
+  # opens one deduplicated FIX ticket, dispatches it, verifies the repair,
+  # and reopens the source ticket without waiting for an operator.
+  auto_recover_blocked: true
   max_concurrent_agents_by_state:
     Todo: 1
-    Explore: 1
-    Plan: 1
     "In Progress": 1
-    Review: 1
-    QA: 1
-    Learn: 1
+    Verify: 1
+    Document: 1
   max_total_tokens: 100000000
   max_total_tokens_by_state:
     "In Progress": 500000000
-    QA: 500000000
-  # Merge policy for the Learn -> Human Review gate. Learn must merge the
+    Verify: 500000000
+  # Per-lane stall budget (ms). A heavy lane can legally go quiet far longer
+  # than a light one — a Verify that runs a full suite emits nothing for
+  # minutes. Falls back to the resolved backend's `stall_timeout_ms`, so this
+  # is the knob to reach for instead of widening every lane at once.
+  # stall_timeout_ms_by_state:
+  #   Verify: 900000
+  # Merge policy for the Verify -> Document gate. Verify must merge the
   # `symphony/<ID>` feature branch into the target branch before setting
-  # Human Review. A human then confirms the card to Done from the TUI (`c`)
-  # or board viewer button. The post-Done auto-merge remains a best-effort
-  # fallback for older prompts.
+  # Document. A human later confirms the card to Done from the TUI (`c`) or
+  # board viewer button.
   auto_merge_on_done: true
+  # Publish and verify the target upstream after the local --no-ff merge.
+  # Set false for a local-only run; no git push or git ls-remote is attempted.
+  auto_merge_push_target: true
   # Branch/ref used as the start point for new `symphony/<ID>` feature
   # branches. Empty string = current host branch. The board viewer can
   # update this from its real git branch dropdown.
-  feature_base_branch: ""
-  # Branch to merge into after Learn. Empty string = same as feature base
-  # branch/current host branch. The board viewer can update this too.
-  auto_merge_target_branch: ""
+  feature_base_branch: "dev"
+  # Branch to merge into after Document. Pinning this avoids integration drift
+  # when an operator checks out another host branch while Symphony is running.
+  auto_merge_target_branch: "dev"
   auto_merge_exclude_paths:
     - kanban
 
@@ -293,7 +329,14 @@ claude:
   command: 'claude -p --output-format stream-json --verbose --permission-mode acceptEdits --add-dir "$SYMPHONY_WORKFLOW_DIR"'
   resume_across_turns: true
   turn_timeout_ms: 3600000
-  read_timeout_ms: 5000
+  read_timeout_ms: 20000
+  stall_timeout_ms: 300000
+
+prime_agent:
+  command: 'prime-agent -p --mode json'
+  resume_across_turns: true
+  turn_timeout_ms: 3600000
+  read_timeout_ms: 20000
   stall_timeout_ms: 300000
 
 codex:
@@ -306,30 +349,45 @@ codex:
   # user-level config untouched.
   command: codex app-server -c model=gpt-5-codex
   approval_policy: never
-  thread_sandbox: workspace-write
-  turn_sandbox_policy: workspace-write
+  # The release workflow requires workers to run Playwright/Chromium gates.
+  # Codex's macOS workspace-write sandbox can block Chromium's Mach bootstrap
+  # before the app loads, so browser-capable Codex workers run without an
+  # outer Codex sandbox. The per-ticket git worktree, kanban symlink check,
+  # and ticket scope guard remain the containment boundary.
+  thread_sandbox: danger-full-access
+  turn_sandbox_policy: danger-full-access
 
 gemini:
   command: 'gemini -p ""'
+
+opencode:
+  # `opencode run [message..]` is OpenCode's documented scripting path.
+  # Symphony appends the prompt as a shell-quoted message argument and adds
+  # `--session <id>` on continuation turns after OpenCode reports a session id.
+  command: opencode run --format json --auto
+  resume_across_turns: true
+  turn_timeout_ms: 3600000
+  read_timeout_ms: 20000
+  stall_timeout_ms: 300000
 
 pi:
   command: 'pi --mode json -p ""'
   resume_across_turns: true
 
 qa:
-  # Boot recipe for As-Is/To-Be HTTP runs. The QA prompt prefers these
+  # Boot recipe for As-Is/To-Be HTTP runs. The Verify prompt prefers these
   # over re-discovering boot details per ticket. Leave any field blank
   # to fall back to the prompt's heuristics.
   boot:
-    # Shell command that boots the API in the foreground. The QA agent
+    # Shell command that boots the API in the foreground. The Verify agent
     # runs it twice (As-Is in a sibling worktree, To-Be in the current
     # worktree) on the two distinct ports below, with `SYMPHONY_QA_PORT`
     # exported. Use that variable to bind the port.
     command: ""
     # Optional health-check URL — `${PORT}` is replaced with the run's
-    # port. The QA agent polls until 200 OK before sending payloads.
+    # port. The Verify agent polls until 200 OK before sending payloads.
     health_url: ""
-    # Two ports the QA agent binds, one per build. Pick free ports that
+    # Two ports the Verify agent binds, one per build. Pick free ports that
     # don't collide with anything on the host.
     asis_port: 8801
     tobe_port: 8802
@@ -337,11 +395,11 @@ qa:
     # both runs. Keep secrets out of WORKFLOW.md — reference $VARs.
     env: {}
     # Optional docker-compose / docker-compose-like file to bring up
-    # before booting. Tear-down is the QA agent's responsibility.
+    # before booting. Tear-down is the Verify agent's responsibility.
     compose_file: ""
-  # Performance regression budget. The QA prompt records latency for
+  # Performance regression budget. The Verify prompt records latency for
   # every payload on As-Is and To-Be; if To-Be exceeds As-Is by more
-  # than `latency_factor` (e.g. 2.0 = 2× slower) on any payload, QA
+  # than `latency_factor` (e.g. 2.0 = 2× slower) on any payload, Verify
   # fails with `## QA Failure`. Set to 0 to disable.
   regression_budget:
     latency_factor: 2.0
@@ -352,6 +410,30 @@ qa:
 server:
   port: 9999
 
+# One-click preview of the integrated product. The command is trusted local
+# configuration; the web API never accepts command/path/ref overrides.
+preview:
+  enabled: true
+  cwd: todo-app
+  command: python3 -m http.server ${PORT} --bind ${HOST}
+  health_path: /
+  url_path: /
+  startup_timeout_ms: 10000
+  release_ticket: SMA-32
+  acceptance:
+    - Add and render todos
+    - Toggle completed state
+    - Delete todos
+    - Filter All, Active, and Completed
+    - Show the items-left counter
+    - Clear completed todos
+    - Edit inline with Enter and Escape
+    - Show the correct empty state
+    - Restore todos from localStorage after reload
+    - Run with a clean browser console
+    - Support the documented keyboard flow
+    - Ship an accurate README and screenshot evidence
+
 tui:
   language: en
 
@@ -359,12 +441,9 @@ prompts:
   base: ./docs/symphony-prompts/file/base.md
   stages:
     Todo: ./docs/symphony-prompts/file/stages/todo.md
-    Explore: ./docs/symphony-prompts/file/stages/explore.md
-    Plan: ./docs/symphony-prompts/file/stages/plan.md
     "In Progress": ./docs/symphony-prompts/file/stages/in-progress.md
-    Review: ./docs/symphony-prompts/file/stages/review.md
-    QA: ./docs/symphony-prompts/file/stages/qa.md
-    Learn: ./docs/symphony-prompts/file/stages/learn.md
+    Verify: ./docs/symphony-prompts/file/stages/verify.md
+    Document: ./docs/symphony-prompts/file/stages/document.md
     Done: ./docs/symphony-prompts/file/stages/done.md
 
 ---

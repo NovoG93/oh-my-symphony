@@ -10,8 +10,8 @@ from __future__ import annotations
 import re
 
 
-AUTO_TRIAGE_TARGET_STATE = "Explore"
-AUTO_TRIAGE_NOTE = "Ticket is actionable; routing to Explore."
+AUTO_TRIAGE_TARGET_STATE = "In Progress"
+AUTO_TRIAGE_NOTE = "Ticket is actionable; routing to In Progress."
 _AUTO_TRIAGE_ACCEPTANCE_RE = re.compile(r"\bacceptance\s+criteria\b", re.IGNORECASE)
 _AUTO_TRIAGE_TRIAGE_RE = re.compile(r"^##\s+Triage\b", re.IGNORECASE | re.MULTILINE)
 
@@ -26,6 +26,37 @@ RETRY_BASE_MS = 10_000  # §8.4
 # otherwise hold its concurrency slot forever and starve the rest of the
 # board. The cancel is still issued; this just stops the slot from leaking.
 STALL_FORCE_EJECT_GRACE_S = 30.0
+
+# Minimum wall-clock interval between auto-archive sweeps. The sweep is
+# day-granular (`archive_after_days`, default 30), so re-scanning the whole
+# terminal board on every poll tick is wasted work — a multi-minute cadence
+# still archives a newly-stale ticket well within its threshold. This is an
+# internal cadence, not a user policy: the `archive_after_days <= 0` disable
+# still wins, and the first tick after start always sweeps once.
+ARCHIVE_SWEEP_INTERVAL_SEC = 300.0
+
+# R8 — escalation durability. When moving a retry-capped ticket to its
+# terminal state fails (tracker blip), the escalation is re-attempted on a
+# timer instead of silently discarding the claim — a discarded claim would
+# re-enter dispatch and restart the very retry storm the cap exists to stop.
+# Past the attempt bound the old discard behavior is the last resort.
+ESCALATION_RETRY_DELAY_MS = 10_000
+ESCALATION_MAX_ATTEMPTS = 5
+
+# R1 — tick-loop supervision. The per-tick guard turns any tick exception
+# into counters instead of a dead loop; consecutive failures past the
+# threshold flip health() to "degraded". The restart bound only matters for
+# BaseException escapes (per-tick guard catches Exception): past the bound
+# the loop stays down but visibly so.
+TICK_DEGRADED_AFTER_CONSECUTIVE_FAILURES = 3
+TICK_LOOP_MAX_RESTARTS = 3
+TICK_FAILURE_BACKOFF_MAX_S = 30.0
+
+# Initiative B — how long `stop()` waits for supervised background tasks
+# (worker-exit cleanup, retry firing, escalations) to finish before
+# cancelling the stragglers. Bounded so shutdown can never hang on a
+# stuck cleanup, long enough that lease release / registry writes land.
+STOP_BACKGROUND_TASKS_TIMEOUT_S = 5.0
 
 # G2 — empty-response loop guard. Three consecutive `EVENT_TURN_COMPLETED`
 # events whose turn produced no fresh preview text trigger the escalation
@@ -47,9 +78,10 @@ WAIT_AGE_BUMP_MIN = 10.0
 # `normalize_state` lowercases its input, so compare in lowercase.
 _REWIND_TRANSITIONS = frozenset(
     {
-        ("review", "in progress"),
-        ("qa", "in progress"),
-        ("in progress", "plan"),
+        ("verify", "in progress"),
+        ("document", "in progress"),
+        # legacy lane name (pre-rename boards with a Learn lane)
+        ("learn", "in progress"),
     }
 )
 
@@ -71,6 +103,9 @@ _REVIEW_FINDINGS_HEADING_RE = re.compile(
 )
 _QA_FAILURE_HEADING_RE = re.compile(
     r"^##\s+QA\s+Failure\s*:?\s*$", re.IGNORECASE | re.MULTILINE
+)
+_CONTRACT_FAILURE_HEADING_RE = re.compile(
+    r"^##\s+Contract\s+Failure\s*:?\s*$", re.IGNORECASE | re.MULTILINE
 )
 _NEXT_HEADING_RE = re.compile(r"^##\s+\S", re.MULTILINE)
 # Bullet list rows: `- path/to/file.py` (optionally with surrounding backticks).

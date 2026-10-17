@@ -442,6 +442,10 @@ def build_prompt_env(
     token_ema: int = 0,
     token_budget: int = 0,
     rewind_scope: list[dict[str, Any]] | None = None,
+    compact_issue_context: bool = False,
+    full_ticket_path: str | None = None,
+    artifacts_dir: str = "",
+    board_health: str = "",
 ) -> dict[str, Any]:
     """§12.1 — input variables for prompt rendering.
 
@@ -451,8 +455,8 @@ def build_prompt_env(
     is English to keep behavior stable for callers that don't pass it.
 
     `is_rewind` is True when this prompt is being rendered for a phase
-    transition that moves *backwards* in the pipeline (Review→In Progress
-    or QA→In Progress). The orchestrator's `attempt` counter only fires on
+    transition that moves *backwards* in the pipeline (Verify→In Progress
+    or Document→In Progress). The orchestrator's `attempt` counter only fires on
     full worker re-dispatch from the retry path, so an in-flight rewind
     inside a single worker run otherwise has no signal to give the agent.
     Always present in the env (default False) so strict templates that
@@ -470,11 +474,30 @@ def build_prompt_env(
     list when no rewind / parsing failed. Available to templates as
     `{{ rewind_scope }}` (typically iterated with `{% for row in
     rewind_scope %}…{% endfor %}`).
+
+    `artifacts_dir` is the workspace directory workers drop board
+    deliverables into (`artifacts.dir`), or "" when artifact collection is
+    disabled — so templates can guard with `{% if artifacts_dir %}`.
+
+    `board_health` is the few-line `stats.board_health_summary` of the last
+    30 days (rewinds, contract failures, recurring misses), passed only to
+    the write-back lane so it can turn repeat failures into lessons; ""
+    elsewhere and on healthy boards (`{% if board_health %}`).
     """
     if hasattr(issue_obj, "to_template_dict"):
         issue_dict = issue_obj.to_template_dict()
     else:
         issue_dict = dict(issue_obj)
+    issue_dict = dict(issue_dict)
+    if compact_issue_context:
+        from .prompt_context import build_issue_prompt_context
+
+        issue_dict["description"] = build_issue_prompt_context(
+            issue_obj,
+            state=issue_dict.get("state") or "",
+            is_rewind=is_rewind,
+        )
+    issue_dict["full_ticket_path"] = full_ticket_path or ""
     from .i18n import normalize_language
 
     return {
@@ -489,6 +512,8 @@ def build_prompt_env(
         "token_ema": int(token_ema or 0),
         "token_budget": int(token_budget or 0),
         "rewind_scope": list(rewind_scope) if rewind_scope else [],
+        "artifacts_dir": artifacts_dir or "",
+        "board_health": board_health or "",
     }
 
 
@@ -498,6 +523,7 @@ def build_first_turn_prompt(
     issue: Any,
     attempt: int | None,
     language: str,
+    turn_number: int = 1,
     max_turns: int,
     max_attempts: int = 3,
     is_rewind: bool = False,
@@ -505,6 +531,11 @@ def build_first_turn_prompt(
     token_ema: int = 0,
     token_budget: int = 0,
     rewind_scope: list[dict[str, Any]] | None = None,
+    compact_issue_context: bool = False,
+    full_ticket_path: str | None = None,
+    artifacts_dir: str = "",
+    extra_context: str = "",
+    board_health: str = "",
 ) -> tuple[str, dict[str, Any]]:
     """Construct the first-turn prompt sent to a worker.
 
@@ -515,12 +546,16 @@ def build_first_turn_prompt(
 
     `is_rewind=True` is forwarded to the template env so WORKFLOW.md
     authors can branch the retry-preamble block on rewind specifically
-    (in-flight `Review→In Progress` / `QA→In Progress` handoffs that
+    (in-flight `Verify→In Progress` / `Document→In Progress` handoffs that
     don't trip the dispatch-level retry counter).
 
     `token_ema` / `token_budget` / `rewind_scope` plumb the C3 + A2
     template-context fields through to `build_prompt_env`. Defaults keep
     older callers (and tests) unchanged.
+
+    `extra_context` is appended verbatim after the rendered body — used
+    for ticket-attached skill blocks, which must not pass through the
+    strict template renderer (skill files may contain literal `{{ }}`).
 
     Returns `(final_prompt, env)` so callers can keep `env` for later
     bookkeeping (e.g. logging, tests).
@@ -538,10 +573,16 @@ def build_first_turn_prompt(
         token_ema=token_ema,
         token_budget=token_budget,
         rewind_scope=rewind_scope,
+        compact_issue_context=compact_issue_context,
+        full_ticket_path=full_ticket_path,
+        artifacts_dir=artifacts_dir,
+        board_health=board_health,
     )
-    env["turn_number"] = 1
+    env["turn_number"] = turn_number
     env["max_turns"] = max_turns
     body = render(prompt_template, env)
+    if extra_context.strip():
+        body = body.rstrip() + "\n\n" + extra_context.strip() + "\n"
     return preamble + "\n\n" + body, env
 
 
