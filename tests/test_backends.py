@@ -17,8 +17,10 @@ import shlex
 import subprocess
 import sys
 import uuid
+import tomllib
+from types import SimpleNamespace
 from dataclasses import replace
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
 from typing import Any
 
 import pytest
@@ -2113,6 +2115,65 @@ def test_scan_workspace_symlinks_collects_resolved_targets(tmp_path: Path) -> No
     assert roots == sorted(roots)  # deterministic ordering
 
 
+@pytest.mark.skipif(os.name != "nt", reason="Windows directory junctions")
+@pytest.mark.parametrize("chained", [False, True], ids=["direct", "chain"])
+def test_codex_junction_roots_reach_command_env_and_every_turn(
+    tmp_path: Path, chained: bool
+) -> None:
+    host_board = tmp_path / "host board"
+    host_board.mkdir()
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    (workspace / "real_dir").mkdir()
+    (workspace / ".git").mkdir()
+
+    def junction(link: Path, target: Path) -> None:
+        link_literal = str(link).replace("'", "''")
+        target_literal = str(target).replace("'", "''")
+        subprocess.run(
+            [
+                "powershell.exe", "-NoProfile", "-NonInteractive", "-Command",
+                "$ErrorActionPreference='Stop'; "
+                f"New-Item -ItemType Junction -Path '{link_literal}' "
+                f"-Target '{target_literal}' | Out-Null",
+            ],
+            check=True, capture_output=True, text=True,
+        )
+
+    target = host_board
+    if chained:
+        target = tmp_path / "board junction"
+        junction(target, host_board)
+    link = workspace / "kanban"
+    junction(link, target)
+    assert link.is_junction() and not link.is_symlink()
+    resolved_board = str(host_board.resolve())
+    assert _scan_workspace_symlinks(workspace) == [resolved_board]
+
+    cfg = _make_cfg("codex", workspace_root=workspace)
+    cfg = replace(
+        cfg,
+        codex=replace(
+            cfg.codex,
+            command="codex app-server",
+            thread_sandbox="workspace-write",
+            turn_sandbox_policy="workspace-write",
+        ),
+    )
+    backend = CodexAppServerBackend(
+        BackendInit(cfg=cfg, cwd=workspace, workspace_root=workspace, on_event=_noop_event)
+    )
+    command, env = backend._prepare_command_and_env()
+    assert command == _inject_writable_roots(cfg.codex.command, [resolved_board])
+    assert env["SYMPHONY_CODEX_WRITABLE_ROOTS"] == resolved_board
+    backend._thread_id = "thread-junction"
+    for prompt in ("Initial board transition", "Review board transition"):
+        params = backend._build_turn_params(prompt)
+        assert params["sandboxPolicy"] == {
+            "type": "workspaceWrite", "writableRoots": [resolved_board],
+        }
+
+
 def test_scan_workspace_symlinks_empty_when_no_symlinks(tmp_path: Path) -> None:
     (tmp_path / "kanban").mkdir()
     assert _scan_workspace_symlinks(tmp_path) == []
@@ -2207,12 +2268,34 @@ def test_scan_workspace_symlinks_includes_object_database_of_a_real_worktree(
     workspace = tmp_path / "ws"
     git(host, "worktree", "add", "-q", str(workspace), "-b", "symphony/T-1")
 
+    board = host / "kanban"
+    board.mkdir()
+    linked_board = workspace / "kanban"
+    if os.name == "nt":
+        subprocess.run(
+            ["cmd", "/c", "mklink", "/J", str(linked_board), str(board)],
+            check=True, capture_output=True,
+        )
+        assert linked_board.is_junction()
+    else:
+        linked_board.symlink_to(board, target_is_directory=True)
+
     roots = _scan_workspace_symlinks(workspace)
 
     common_dir = (host / ".git").resolve()
     gitdir = (host / ".git" / "worktrees" / "ws").resolve()
-    assert str(gitdir) in roots, "index.lock lives here"
-    assert str(common_dir) in roots, "objects/ lives here — the missing grant"
+    expected = sorted(str(path) for path in (gitdir, common_dir, board.resolve()))
+    assert roots == expected
+    cfg = _make_cfg("codex", workspace_root=tmp_path)
+    cfg = replace(cfg, codex=replace(cfg.codex, thread_sandbox="workspace-write"))
+    backend = CodexAppServerBackend(
+        BackendInit(cfg=cfg, cwd=workspace, workspace_root=tmp_path, on_event=_noop_event)
+    )
+    command, prepared_env = backend._prepare_command_and_env()
+    parsed = tomllib.loads(shlex.split(command)[2])["sandbox_workspace_write"]["writable_roots"]
+    assert parsed == [Path(root).as_posix() for root in expected]
+    assert backend._writable_roots == expected
+    assert prepared_env["SYMPHONY_CODEX_WRITABLE_ROOTS"] == os.pathsep.join(expected)
 
 
 def test_scan_workspace_symlinks_omits_git_dir_inside_the_workspace(
@@ -2264,6 +2347,51 @@ def test_inject_writable_roots_modifies_direct_codex_command() -> None:
         'sandbox_workspace_write.writable_roots=["/a","/b"]',
         "app-server",
     ]
+
+
+@pytest.mark.parametrize("platform", ["nt", "posix"])
+def test_inject_writable_roots_serializes_native_windows_paths_without_shell_backslashes(
+    monkeypatch: pytest.MonkeyPatch, platform: str,
+) -> None:
+    monkeypatch.setattr(codex_module, "os", SimpleNamespace(name=platform))
+    roots = [r"C:\Users\한글 Name\project\.git", r"D:\other's project\.git\worktrees\TASK-1"]
+    original = list(roots)
+
+    command = _inject_writable_roots("codex app-server", roots)
+    args = shlex.split(command)
+    assert args[:2] == ["codex", "-c"]
+    assert args[-1] == "app-server"
+    parsed = tomllib.loads(args[2])["sandbox_workspace_write"]["writable_roots"]
+    if platform == "nt":
+        assert parsed == [root.replace("\\", "/") for root in original]
+        assert [PureWindowsPath(root) for root in parsed] == [PureWindowsPath(root) for root in original]
+    else:
+        assert parsed == original
+    assert roots == original
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows native argv through Git Bash")
+@pytest.mark.parametrize(
+    "root", [r"C:\host-board", r"C:\host board\user's\kanban", r"\\server\share\kanban"]
+)
+def test_inject_writable_roots_survives_windows_native_argv(
+    tmp_path: Path, root: str
+) -> None:
+    probe = tmp_path / "argv.py"
+    probe.write_text("import json, sys; print(json.dumps(sys.argv[1:]))", encoding="utf-8")
+    command = _inject_writable_roots("codex app-server", [root])
+    command = command.replace(
+        "codex ", f"{shlex.quote(sys.executable)} {shlex.quote(str(probe))} ", 1
+    )
+    result = subprocess.run(
+        [shell_module.resolve_bash(), "-lc", command],
+        check=True, capture_output=True, text=True,
+    )
+    arguments = json.loads(result.stdout)
+    assert arguments[0] == "-c"
+    roots = tomllib.loads(arguments[1])["sandbox_workspace_write"]["writable_roots"]
+    assert roots == [root.replace("\\", "/")]
+    assert arguments[2] == "app-server"
 
 
 def test_inject_writable_roots_modifies_bare_codex_command() -> None:
@@ -2335,7 +2463,7 @@ def test_codex_start_command_prep_injects_when_symlinks_exist(
     command, env = backend._prepare_command_and_env()
 
     assert "sandbox_workspace_write.writable_roots" in command
-    assert str(host_docs.resolve()) in command
+    assert host_docs.resolve().as_posix() in command
     assert "SYMPHONY_CODEX_WRITABLE_ROOTS" in env
     assert str(host_docs.resolve()) in env["SYMPHONY_CODEX_WRITABLE_ROOTS"]
 
