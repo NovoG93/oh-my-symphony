@@ -21,6 +21,10 @@ Versioning: [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - `docs/prd/v1.0-lean-core.md` and ADR 0006: v1.0 reduces bloat without removing shipped features.
 
 ### Changed
+- The TUI ticket modals and `symphony board new|update --agent` accept the workflow's `agent.profiles` names; `symphony factory --agent` stays limited to built-in kinds.
+- `symphony factory init --agent agy` writes the shipped default command `agy --print "$(cat)"` instead of `agy --print -`.
+- Removed source helpers that only tests called (`dependency_waves`, `json_value`, `build_from_receipts`, `is_symphony_api_reachable`, `next_identifier`, `_adf_paragraphs`); the factory skill installer used by tests moved into `tests/`. Documented `append_note_once` and the `linear_graphql` passthrough `execute_raw` stay.
+- Workspace preserve tests no longer run the real venv/pip setup through a login shell, which timed them out under load.
 - Internal split with no behavior change: `orchestrator/core.py` (10,474 lines) into 11 modules of at most 1,629 lines, `orchestrator/run_registry.py` (4,142) into 5 modules of at most 1,397, and `webapi.py` (3,448) into the `symphony.webapi` package of 12 modules of at most 727. Import paths and test patch targets stay valid. Unused helpers were removed.
 - `symphony board show` explains that a Done ticket alone does not confirm target merge or workspace cleanup; ticket data and non-Done output remain unchanged.
 - The factory guide provides copyable PowerShell recovery and delivery inspection, with explicit stops after failed native commands or HTTP requests and separate handling for an uncleared pause.
