@@ -95,6 +95,13 @@ DEFAULT_CI_MAX_IMPROVEMENT_TICKETS_PER_RUN = 3
 
 SUPPORTED_AGENT_KINDS = {"agy", "codex", "claude", "gemini", "kiro", "opencode", "pi", "prime-agent"}
 DEFAULT_AGENT_KIND = "codex"
+# `agent.profiles` — plain-CLI backends declared as data. Only `text` (stdout
+# is the final assistant message) is implemented; stream protocols keep their
+# own backend modules.
+SUPPORTED_PROFILE_FORMATS = ("text",)
+# Where a profile's continuation flag goes: appended to the command, or
+# inserted before a trailing `"$(cat)"` positional prompt argument.
+SUPPORTED_PROFILE_CONTINUATION_POSITIONS = ("append", "before_prompt_arg")
 DEFAULT_CLAUDE_COMMAND = (
     "claude -p --output-format stream-json --include-partial-messages --verbose"
 )

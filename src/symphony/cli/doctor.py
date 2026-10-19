@@ -179,6 +179,8 @@ def check_agent_cli(cfg: ServiceConfig) -> CheckResult:
         command = cfg.pi.command
     elif kind == "prime-agent":
         command = cfg.prime_agent.command
+    elif kind in cfg.agent.profiles:
+        command = cfg.agent.profiles[kind].command
     else:
         return CheckResult(f"agent.kind={kind}", "fail", f"unsupported agent kind {kind!r}")
 
@@ -844,6 +846,7 @@ def _agent_commands(cfg: ServiceConfig) -> dict[str, str]:
         "opencode": cfg.opencode.command,
         "pi": cfg.pi.command,
         "prime-agent": cfg.prime_agent.command,
+        **{name: profile.command for name, profile in cfg.agent.profiles.items()},
     }
 
 # CLIs Symphony can widen on the command line. Every other kind gets the grant

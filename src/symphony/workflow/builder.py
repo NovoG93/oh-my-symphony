@@ -33,6 +33,7 @@ from .coercion import (
     resolve_var_indirection,
 )
 from .config import (
+    AgentProfileConfig,
     AgentConfig,
     AgyConfig,
     ClaudeConfig,
@@ -105,6 +106,8 @@ from .constants import (
     LINEAR_DEFAULT_ENDPOINT,
     SUPPORTED_AGENT_KINDS,
     SUPPORTED_CI_MODES,
+    SUPPORTED_PROFILE_CONTINUATION_POSITIONS,
+    SUPPORTED_PROFILE_FORMATS,
     SUPPORTED_WORKSPACE_REUSE_POLICIES,
 )
 from .parser import WorkflowDefinition
@@ -327,13 +330,16 @@ def build_service_config(
         active_states=tracker.active_states,
         terminal_states=tracker.terminal_states,
     )
+    agent_profiles = _validated_agent_profiles(agent_raw.get("profiles"))
+    selectable_kinds = {*SUPPORTED_AGENT_KINDS, *agent_profiles}
     agent_kind = _canonical_agent_kind(
         _as_str(agent_raw.get("kind"), DEFAULT_AGENT_KIND).strip().lower()
         or DEFAULT_AGENT_KIND
     )
-    if agent_kind not in SUPPORTED_AGENT_KINDS:
+    if agent_kind not in selectable_kinds:
         raise ConfigValidationError(
-            f"agent.kind must be one of {sorted(SUPPORTED_AGENT_KINDS)}",
+            f"agent.kind must be one of {sorted(selectable_kinds)} "
+            "(built-in kinds or agent.profiles names)",
             value=agent_kind,
         )
     agent = AgentConfig(
@@ -430,11 +436,14 @@ def build_service_config(
         budget_exhausted_state=_as_str(
             agent_raw.get("budget_exhausted_state"), ""
         ) or "",
-        fallback_kinds=_validated_fallback_kinds(agent_raw.get("fallback_kinds")),
+        fallback_kinds=_validated_fallback_kinds(
+            agent_raw.get("fallback_kinds"), profiles=agent_profiles
+        ),
         stage_kinds=_validated_stage_kinds(
             agent_raw.get("stage_kinds"),
             active_states=tracker.active_states,
             terminal_states=tracker.terminal_states,
+            selectable_kinds=selectable_kinds,
         ),
         stage_contracts=_validated_stage_contracts(
             agent_raw.get("stage_contracts")
@@ -444,6 +453,7 @@ def build_service_config(
             active_states=tracker.active_states,
             terminal_states=tracker.terminal_states,
         ),
+        profiles=agent_profiles,
     )
 
     codex_raw = cfg.get("codex") or {}
@@ -1048,8 +1058,135 @@ def _validated_nonnegative_or_default(value: Any, default: int, *, name: str) ->
     return ivalue
 
 
-def _validated_fallback_kinds(value: Any) -> tuple[str, ...]:
-    """agent.fallback_kinds — ordered, distinct, supported agent kinds."""
+_PROFILE_KEYS = (
+    "command",
+    "format",
+    "unattended_flags",
+    "continuation_flag",
+    "continuation_position",
+    "turn_timeout_ms",
+    "read_timeout_ms",
+    "stall_timeout_ms",
+    "resume_across_turns",
+)
+
+
+def _validated_agent_profiles(value: Any) -> dict[str, AgentProfileConfig]:
+    """agent.profiles — plain-CLI backends declared as data.
+
+    Names are lowercased. A name that matches a built-in kind (or the
+    `antigravity` alias) is an error rather than an override, so a profile
+    can never silently replace a shipped backend; built-ins are tuned through
+    their own blocks (`agy:`, `kiro:`, ...). Unknown keys are errors so a
+    typo such as `cmd:` does not leave the profile half-configured.
+    """
+    if value is None:
+        return {}
+    if not isinstance(value, dict):
+        raise ConfigValidationError(
+            "agent.profiles must be a map of profile name to profile settings",
+            value=value,
+        )
+    out: dict[str, AgentProfileConfig] = {}
+    for raw_name, raw in value.items():
+        name = _as_str(raw_name).strip().lower()
+        label = f"agent.profiles.{raw_name}"
+        if not name:
+            raise ConfigValidationError(
+                "agent.profiles names must be non-empty strings", value=raw_name
+            )
+        if name in SUPPORTED_AGENT_KINDS or name == "antigravity":
+            raise ConfigValidationError(
+                f"{label} shadows the built-in agent kind {name!r}; rename the "
+                f"profile or configure the built-in through its own block",
+                value=raw_name,
+            )
+        if name in out:
+            raise ConfigValidationError(
+                f"{label} duplicates profile {name!r}", value=raw_name
+            )
+        if not isinstance(raw, dict):
+            raise ConfigValidationError(f"{label} must be a map", value=raw)
+        unknown = sorted(str(key) for key in raw if key not in _PROFILE_KEYS)
+        if unknown:
+            raise ConfigValidationError(
+                f"{label} has unknown keys {unknown}; allowed: {list(_PROFILE_KEYS)}",
+                value=unknown,
+            )
+        command = raw.get("command")
+        if not isinstance(command, str) or not command.strip():
+            raise ConfigValidationError(
+                f"{label}.command must be a non-empty string", value=command
+            )
+        fmt = raw.get("format", "text")
+        if fmt not in SUPPORTED_PROFILE_FORMATS:
+            raise ConfigValidationError(
+                f"{label}.format must be one of {list(SUPPORTED_PROFILE_FORMATS)}; "
+                "stream protocols need a dedicated backend",
+                value=fmt,
+            )
+        flags = raw.get("unattended_flags", [])
+        if not isinstance(flags, list) or not all(
+            isinstance(flag, str) and flag.strip() for flag in flags
+        ):
+            raise ConfigValidationError(
+                f"{label}.unattended_flags must be a list of non-empty strings",
+                value=flags,
+            )
+        continuation_flag = raw.get("continuation_flag")
+        if continuation_flag is not None and (
+            not isinstance(continuation_flag, str) or not continuation_flag.strip()
+        ):
+            raise ConfigValidationError(
+                f"{label}.continuation_flag must be a non-empty string",
+                value=continuation_flag,
+            )
+        position = raw.get("continuation_position", "append")
+        if position not in SUPPORTED_PROFILE_CONTINUATION_POSITIONS:
+            raise ConfigValidationError(
+                f"{label}.continuation_position must be one of "
+                f"{list(SUPPORTED_PROFILE_CONTINUATION_POSITIONS)}",
+                value=position,
+            )
+        out[name] = AgentProfileConfig(
+            name=name,
+            command=command,
+            format=fmt,
+            unattended_flags=tuple(flag.strip() for flag in flags),
+            continuation_flag=continuation_flag.strip() if continuation_flag else None,
+            continuation_position=position,
+            turn_timeout_ms=_validated_positive_or_default(
+                raw.get("turn_timeout_ms"),
+                DEFAULT_BACKEND_TURN_TIMEOUT_MS,
+                name=f"{label}.turn_timeout_ms",
+            ),
+            read_timeout_ms=_validated_positive_or_default(
+                raw.get("read_timeout_ms"),
+                DEFAULT_BACKEND_READ_TIMEOUT_MS,
+                name=f"{label}.read_timeout_ms",
+            ),
+            stall_timeout_ms=_validated_positive_or_default(
+                raw.get("stall_timeout_ms"),
+                DEFAULT_BACKEND_STALL_TIMEOUT_MS,
+                name=f"{label}.stall_timeout_ms",
+            ),
+            resume_across_turns=_validated_bool(
+                raw.get("resume_across_turns"),
+                False,
+                name=f"{label}.resume_across_turns",
+            ),
+        )
+    return out
+
+
+def _validated_fallback_kinds(
+    value: Any, *, profiles: dict[str, AgentProfileConfig]
+) -> tuple[str, ...]:
+    """agent.fallback_kinds — ordered, distinct, supported agent kinds.
+
+    Profiles are rejected here: a fallback pins the ticket's `agent.kind`,
+    and ticket pins accept built-in kinds only.
+    """
     if value is None:
         return ()
     if isinstance(value, str):
@@ -1061,6 +1198,13 @@ def _validated_fallback_kinds(value: Any) -> tuple[str, ...]:
     out: list[str] = []
     for raw in value:
         kind = _canonical_agent_kind(_as_str(raw).strip().lower())
+        if kind in profiles:
+            raise ConfigValidationError(
+                "agent.fallback_kinds cannot name an agent.profiles entry "
+                "(fallback pins the ticket, and ticket pins accept built-in "
+                f"kinds only); use one of {sorted(SUPPORTED_AGENT_KINDS)}",
+                value=raw,
+            )
         if kind not in SUPPORTED_AGENT_KINDS:
             raise ConfigValidationError(
                 f"agent.fallback_kinds entries must be one of "
@@ -1077,11 +1221,13 @@ def _validated_stage_kinds(
     *,
     active_states: tuple[str, ...],
     terminal_states: tuple[str, ...],
+    selectable_kinds: set[str],
 ) -> dict[str, str]:
     """agent.stage_kinds — per-state backend routing, keys lowercased.
 
-    Values must be supported agent kinds (a typo would dispatch nothing, so
-    it is a hard config error). Unknown state keys only warn: states are
+    Values must be built-in agent kinds or agent.profiles names (a typo
+    would dispatch nothing, so it is a hard config error). Unknown state
+    keys only warn: states are
     user-editable through the web UI, and a stale mapping entry should not
     brick the whole workflow load.
     """
@@ -1101,10 +1247,10 @@ def _validated_stage_kinds(
         if not normalized_key:
             continue
         kind = _canonical_agent_kind(_as_str(raw).strip().lower())
-        if kind not in SUPPORTED_AGENT_KINDS:
+        if kind not in selectable_kinds:
             raise ConfigValidationError(
                 f"agent.stage_kinds[{key!r}] must be one of "
-                f"{sorted(SUPPORTED_AGENT_KINDS)}",
+                f"{sorted(selectable_kinds)}",
                 value=raw,
             )
         if normalized_key not in known:
