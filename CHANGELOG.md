@@ -10,6 +10,15 @@ Versioning: [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Removed
+- `tui-open.sh` and `tui-open.bat`. Run `symphony tui [WORKFLOW.md]`; it checks the agent CLI and `after_create` hook before starting and names the process holding the server port. `symphony project create|add` no longer copies the launchers.
+- `GEMINI.md`, `GEMINI.project.md`, and `AGENTS.project.md`. Bootstrapped projects get one `AGENTS.md` from `examples/project/AGENTS.md`. Gemini CLI users set `context.fileName` to `AGENTS.md` in `.gemini/settings.json`.
+- The printable manual (`docs/manual/`) and its PDF build (`scripts/build_manual_pdf.py`, `scripts/sync_manual_tables.py`, and the Pages PDF steps).
+- Committed development records: `.sdlc/`, `.impeccable/`, `HANDOFF.md`, `CONTEXT.md`, `QUALITY-LEDGER.md`, `.quality.md`, `docs/plans/`, `docs/quality/`, `docs/spec/`, `docs/changelog/`, `docs/features/`, and `docs/handoffs/`. The `v0.27.0` tag keeps them; links now point there.
+
+### Added
+- `docs/prd/v1.0-lean-core.md` and ADR 0006: v1.0 reduces bloat without removing shipped features.
+
 ### Changed
 - `symphony board show` explains that a Done ticket alone does not confirm target merge or workspace cleanup; ticket data and non-Done output remain unchanged.
 - The factory guide provides copyable PowerShell recovery and delivery inspection, with explicit stops after failed native commands or HTTP requests and separate handling for an uncleared pause.
@@ -67,7 +76,7 @@ Versioning: [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ### Known limitations
 - Remaining PM findings include broad `ValueError` classification (`400 invalid_body`, unchanged pending separate contract approval), the test-only receipt builder, ignored unknown `pm.*` keys, and the runtime origin error omitting `SYMPHONY_TRUSTED_ORIGINS`. See the [finding IDs and operational effects](docs/pm-workspace-operations.md#accepted-findings-and-current-handling).
 - On a host without `ps`, a surviving process-group member that ignores SIGTERM can escape the final SIGKILL after its leader exits; cleanup stays uncertain and `stop()` raises. Native Windows PM behavior and real provider quota fallback remain unverified. The [human review checklist](docs/pm-workspace.md#final-human-review) is separate from automated proof and merge approval.
-- The independently assessed factory candidate scored **75% (FAIL against the >90% target)**. This release is explicitly authorized with those known limits; the score is historical candidate evidence, not a new score for the combined release. Native screen-reader/presentation, actual partial-write interruption, complete external-host/request-category evidence, and complete fresh-install comparisons remain unverified. A real-model recovery delivered preserved product bytes, but its original diagnostic text was absent afterward; the writer and timing are unknown. See the [assessment](docs/quality/factory-recovery/ASSESSMENT.md) and [verification boundaries](docs/quality/factory-recovery/VERIFICATION.md).
+- The independently assessed factory candidate scored **75% (FAIL against the >90% target)**. This release is explicitly authorized with those known limits; the score is historical candidate evidence, not a new score for the combined release. Native screen-reader/presentation, actual partial-write interruption, complete external-host/request-category evidence, and complete fresh-install comparisons remain unverified. A real-model recovery delivered preserved product bytes, but its original diagnostic text was absent afterward; the writer and timing are unknown. See the [assessment](https://github.com/cskwork/oh-my-symphony/blob/v0.27.0/docs/quality/factory-recovery/ASSESSMENT.md) and [verification boundaries](https://github.com/cskwork/oh-my-symphony/blob/v0.27.0/docs/quality/factory-recovery/VERIFICATION.md).
 - Existing copied workflows and setup hooks require a reviewed refresh with the updated package. Legacy worker records with unknown ownership remain fenced. One low KaTeX/Mermaid advisory affects bundled PM assets; CLI exploitability is untested.
 
 ## [0.26.0] - 2026-09-22 - First-run experience: demo keeps the generated workflow, project-facing agent files, clean git status
