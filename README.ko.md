@@ -154,7 +154,8 @@ git add . && git commit -m "Initialize Symphony factory"
 symphony factory start ./wayfinder
 ```
 
-브라우저 검증 gate에는 Node.js, Playwright 등 추가 런타임이 필요합니다.
+Superdesign 브라우저 검증 gate에는 Node.js 18+, `@playwright/cli`
+(`npm install -g @playwright/cli@latest`), `playwright-cli install --skills`가 필요합니다.
 [Autonomous development factory](docs/reference.md#autonomous-development-factory)와
 [팩토리 가이드](skills/symphony-skill/reference/factory.md)를 참고하세요.
 

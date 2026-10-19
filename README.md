@@ -152,7 +152,8 @@ git add . && git commit -m "Initialize Symphony factory"
 symphony factory start ./wayfinder
 ```
 
-Browser gates need extra runtimes (Node.js, Playwright). See
+Superdesign browser gates need Node.js 18+, `@playwright/cli`
+(`npm install -g @playwright/cli@latest`), and `playwright-cli install --skills`. See
 [Autonomous development factory](docs/reference.md#autonomous-development-factory)
 and the [factory guide](skills/symphony-skill/reference/factory.md).
 
