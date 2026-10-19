@@ -24,15 +24,6 @@ class RequestGroupKey:
     value: str
 
 
-@dataclass(frozen=True)
-class RequestGroup:
-    """Deterministic request membership suitable for API serialization."""
-
-    key: RequestGroupKey
-    request: str | None
-    issue_identifiers: tuple[str, ...]
-
-
 def normalize_scheduling_policy(value: object | None) -> SchedulingPolicy:
     """Return a canonical scheduling policy or reject an unsupported value."""
 
@@ -181,19 +172,6 @@ def group_by_request(
     for issue in sort_for_dispatch(list(issues)):
         groups.setdefault(request_group_key(issue), []).append(issue)
     return groups
-
-
-def group_issues_by_request(issues: Sequence[Issue]) -> tuple[RequestGroup, ...]:
-    """Return request-group membership metadata in registration order."""
-
-    return tuple(
-        RequestGroup(
-            key=key,
-            request=key.value if key.kind == "request" else None,
-            issue_identifiers=tuple(issue.identifier for issue in members),
-        )
-        for key, members in group_by_request(issues).items()
-    )
 
 
 def _dependency_graph(
