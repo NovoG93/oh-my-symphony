@@ -17,9 +17,11 @@ Versioning: [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - Committed development records: `.sdlc/`, `.impeccable/`, `HANDOFF.md`, `CONTEXT.md`, `QUALITY-LEDGER.md`, `.quality.md`, `docs/plans/`, `docs/quality/`, `docs/spec/`, `docs/changelog/`, `docs/features/`, and `docs/handoffs/`. The `v0.27.0` tag keeps them; links now point there.
 
 ### Added
+- `agent.profiles` in `WORKFLOW.md` declares plain-text agent CLIs as data (`command`, `format: text`, `unattended_flags`, `continuation_flag`, `continuation_position`, timeouts), selectable anywhere an agent kind is accepted (`agent.kind`, `stage_kinds`, `fallback_kinds`, per-ticket pins, chat, and the web API) and checked by `symphony doctor`; built-in `agy` and `kiro` now run as profiles with unchanged config.
 - `docs/prd/v1.0-lean-core.md` and ADR 0006: v1.0 reduces bloat without removing shipped features.
 
 ### Changed
+- Internal split with no behavior change: `orchestrator/core.py` (10,474 lines) into 11 modules of at most 1,629 lines, `orchestrator/run_registry.py` (4,142) into 5 modules of at most 1,397, and `webapi.py` (3,448) into the `symphony.webapi` package of 12 modules of at most 727. Import paths and test patch targets stay valid. Unused helpers were removed.
 - `symphony board show` explains that a Done ticket alone does not confirm target merge or workspace cleanup; ticket data and non-Done output remain unchanged.
 - The factory guide provides copyable PowerShell recovery and delivery inspection, with explicit stops after failed native commands or HTTP requests and separate handling for an uncleared pause.
 

@@ -263,20 +263,6 @@ class ValidationReport:
 
 
 @dataclass(frozen=True)
-class VerificationEvidence:
-    task_id: str
-    task_revision: str
-    ticket_identifier: str
-    run_id: str
-    tested_commit: str
-    procedure: str
-    environment: str
-    recorded_at: str
-    result: Literal["passed", "failed"]
-    artifact_refs: tuple[str, ...] = ()
-
-
-@dataclass(frozen=True)
 class VerificationReport:
     valid: bool
     tested_commit: str
@@ -657,15 +643,3 @@ def _optional_text(value: Any) -> str | None:
         raise PmError("invalid_request", "optional text fields must be strings")
     text = value.strip()
     return text or None
-
-
-def ensure_known_fields(
-    body: dict[str, Any], allowed: Sequence[str], *, where: str = "request"
-) -> None:
-    unknown = sorted(set(body) - set(allowed))
-    if unknown:
-        raise PmError(
-            "invalid_request",
-            f"unknown fields in {where}",
-            details={"unknown_fields": unknown},
-        )

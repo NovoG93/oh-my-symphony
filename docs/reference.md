@@ -387,7 +387,7 @@ Set `agent.kind` in `WORKFLOW.md`:
 
 ```yaml
 agent:
-  kind: claude          # codex | claude | gemini | agy | kiro | opencode | pi | prime-agent
+  kind: claude          # codex | claude | gemini | agy | kiro | opencode | pi | prime-agent | <profile name>
 
 claude:
   command: claude -p --output-format stream-json --verbose
@@ -408,6 +408,33 @@ prime_agent:
 Each backend reads its own block (`codex`, `claude`, `gemini`, `agy`, `kiro`,
 `opencode`, `pi`, `prime_agent`); only the one matching the resolved kind is
 used at runtime. `agent.kind: antigravity` aliases to `agy`.
+
+**Plain-text CLI profiles.** `agent.profiles` declares any agent CLI that
+reads the prompt on stdin and prints its answer on stdout, with no Python:
+
+```yaml
+agent:
+  kind: my-cli
+  profiles:
+    my-cli:
+      command: 'my-cli run "$(cat)"'   # required
+      format: text                     # only `text` is supported today
+      unattended_flags: [--yes]        # appended unless already in command
+      continuation_flag: --continue    # added on continuation turns
+      continuation_position: before_prompt_arg  # or `append` (default)
+      resume_across_turns: true        # default false
+      turn_timeout_ms: 3600000         # timeouts default like other backends
+```
+
+`before_prompt_arg` inserts the flags before a trailing `"$(cat)"` argument
+and appends them otherwise. Profile names are lowercased and cannot reuse a
+built-in kind (`agy`, `antigravity`, `codex`, ...): that is a config error,
+not an override. Unknown keys and formats other than `text` are config
+errors. `agent.kind`, `agent.stage_kinds`, ticket pins, chat sessions,
+`agent.fallback_kinds` and `continuous_improvement.agent_kind` can select a
+profile. `symphony doctor` checks the profile command's
+executable. The built-in `agy` and `kiro` kinds run on the same profile
+engine, configured through their own blocks.
 
 **Per-ticket pin.** A file-board ticket can opt into a different backend with
 frontmatter:
@@ -467,8 +494,10 @@ sees normalized events (`session_started`, `turn_completed`, `turn_failed`,
 
 ### Adding a backend
 
-Backend adapters live under `src/symphony/backends/`. Adding one (for example
-an Ollama-driven local model) means:
+A plain-text CLI needs only an `agent.profiles` entry (see above). A CLI with
+a stream protocol worth parsing needs an adapter under
+`src/symphony/backends/`. Adding one (for example an Ollama-driven local
+model) means:
 
 1. implementing the `AgentBackend` Protocol in a new module,
 2. registering it in `build_backend()` (`src/symphony/backends/__init__.py`),
@@ -1271,7 +1300,7 @@ src/symphony/
   notifications/     Slack state-transition notifications
   tui/               Textual Kanban TUI package
   web/static/        built-in browser app assets
-  webapi.py          web app REST routes + static SPA serving
+  webapi/            web app REST routes (one module per resource) + static SPA serving
   server.py          aiohttp server, health/state/refresh routes
   hub.py             multi-project hub
   projects.py        multi-project registry + managed service metadata
