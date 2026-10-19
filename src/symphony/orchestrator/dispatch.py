@@ -23,7 +23,7 @@ from ..errors import SymphonyError
 from ..factory.wayfinder import factory_proof_commands
 from ..issue import BlockerRef, Issue, normalize_state
 from ..skills import render_skill_block, select_skills_for_stage
-from ..workflow import ServiceConfig, SUPPORTED_AGENT_KINDS
+from ..workflow import ServiceConfig, selectable_agent_kinds
 from ..workspace import WorkspaceManager
 from .constants import ARCHIVE_SWEEP_INTERVAL_SEC, WAIT_AGE_BUMP_MIN, _TOKEN_EMA_ALPHA
 from .factory_contracts import factory_browser_required, factory_verification_text
@@ -707,18 +707,20 @@ def _eligibility_contract_decision(
             "incomplete issue identity",
         )
     requested_agent = _requested_agent_kind(issue)
-    if requested_agent is not None and requested_agent not in SUPPORTED_AGENT_KINDS:
+    kinds = selectable_agent_kinds(cfg.agent.profiles)
+    if requested_agent is not None and requested_agent not in kinds:
         log.warning(
             "ticket_agent_kind_unsupported",
             issue_id=issue.id,
             identifier=issue.identifier,
             agent_kind=requested_agent,
-            supported=sorted(SUPPORTED_AGENT_KINDS),
+            supported=sorted(kinds),
         )
         return _EligibilityDecision(
             _EligibilityDisposition.REJECT,
             "unsupported_agent",
-            f"unsupported agent kind: {requested_agent}",
+            f"unsupported agent kind: {requested_agent}; "
+            f"supported: {sorted(kinds)}",
         )
     return None
 

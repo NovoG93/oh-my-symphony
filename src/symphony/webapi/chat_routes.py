@@ -83,7 +83,7 @@ def _register_chat_routes(
             raise WorkflowMutationError("mode must be a string")
         agent_kind = None
         if body.get("agent_kind") not in (None, ""):
-            agent_kind = _check_agent_kind(body.get("agent_kind"))
+            agent_kind = _check_agent_kind(body.get("agent_kind"), ctx.config())
         max_turns = _check_budget(body.get("max_turns"), "max_turns")
         max_tokens = _check_budget(body.get("max_tokens"), "max_tokens")
         confirmation_token = _check_chat_confirmation_token(

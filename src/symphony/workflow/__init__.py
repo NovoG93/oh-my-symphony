@@ -66,6 +66,7 @@ from .constants import (
     LINEAR_API_KEY_ENV,
     LINEAR_DEFAULT_ENDPOINT,
     SUPPORTED_AGENT_KINDS,
+    selectable_agent_kinds,
     SUPPORTED_CI_MODES,
     SUPPORTED_TRACKER_KINDS,
     SUPPORTED_WORKSPACE_REUSE_POLICIES,
@@ -153,6 +154,7 @@ __all__ = [
     "WorkflowState",
     # constants used by callers / tests
     "SUPPORTED_AGENT_KINDS",
+    "selectable_agent_kinds",
     "SUPPORTED_CI_MODES",
     "CI_AGENT_MODES",
     "CI_MODE_READINESS",

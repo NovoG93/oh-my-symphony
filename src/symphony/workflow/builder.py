@@ -105,6 +105,7 @@ from .constants import (
     LINEAR_API_KEY_ENV,
     LINEAR_DEFAULT_ENDPOINT,
     SUPPORTED_AGENT_KINDS,
+    selectable_agent_kinds,
     SUPPORTED_CI_MODES,
     SUPPORTED_PROFILE_CONTINUATION_POSITIONS,
     SUPPORTED_PROFILE_FORMATS,
@@ -331,7 +332,7 @@ def build_service_config(
         terminal_states=tracker.terminal_states,
     )
     agent_profiles = _validated_agent_profiles(agent_raw.get("profiles"))
-    selectable_kinds = {*SUPPORTED_AGENT_KINDS, *agent_profiles}
+    selectable_kinds = selectable_agent_kinds(agent_profiles)
     agent_kind = _canonical_agent_kind(
         _as_str(agent_raw.get("kind"), DEFAULT_AGENT_KIND).strip().lower()
         or DEFAULT_AGENT_KIND
@@ -437,7 +438,7 @@ def build_service_config(
             agent_raw.get("budget_exhausted_state"), ""
         ) or "",
         fallback_kinds=_validated_fallback_kinds(
-            agent_raw.get("fallback_kinds"), profiles=agent_profiles
+            agent_raw.get("fallback_kinds"), selectable_kinds=selectable_kinds
         ),
         stage_kinds=_validated_stage_kinds(
             agent_raw.get("stage_kinds"),
@@ -968,7 +969,7 @@ def build_service_config(
     )
 
     continuous_improvement = _build_continuous_improvement_config(
-        cfg.get("continuous_improvement")
+        cfg.get("continuous_improvement"), selectable_kinds=selectable_kinds
     )
 
     if log_decisions and str(cfg.get("contract_profile", "")).strip().lower() != "factory":
@@ -1180,13 +1181,9 @@ def _validated_agent_profiles(value: Any) -> dict[str, AgentProfileConfig]:
 
 
 def _validated_fallback_kinds(
-    value: Any, *, profiles: dict[str, AgentProfileConfig]
+    value: Any, *, selectable_kinds: set[str]
 ) -> tuple[str, ...]:
-    """agent.fallback_kinds — ordered, distinct, supported agent kinds.
-
-    Profiles are rejected here: a fallback pins the ticket's `agent.kind`,
-    and ticket pins accept built-in kinds only.
-    """
+    """agent.fallback_kinds — ordered, distinct, selectable agent kinds."""
     if value is None:
         return ()
     if isinstance(value, str):
@@ -1198,17 +1195,10 @@ def _validated_fallback_kinds(
     out: list[str] = []
     for raw in value:
         kind = _canonical_agent_kind(_as_str(raw).strip().lower())
-        if kind in profiles:
-            raise ConfigValidationError(
-                "agent.fallback_kinds cannot name an agent.profiles entry "
-                "(fallback pins the ticket, and ticket pins accept built-in "
-                f"kinds only); use one of {sorted(SUPPORTED_AGENT_KINDS)}",
-                value=raw,
-            )
-        if kind not in SUPPORTED_AGENT_KINDS:
+        if kind not in selectable_kinds:
             raise ConfigValidationError(
                 f"agent.fallback_kinds entries must be one of "
-                f"{sorted(SUPPORTED_AGENT_KINDS)}",
+                f"{sorted(selectable_kinds)}",
                 value=raw,
             )
         if kind not in out:
@@ -1478,8 +1468,8 @@ def _validated_strict_int(
     return value
 
 
-def _validated_ci_agent_kind(value: Any) -> str:
-    """Empty string (inherit workflow default agent) or a member of SUPPORTED_AGENT_KINDS.
+def _validated_ci_agent_kind(value: Any, *, selectable_kinds: set[str]) -> str:
+    """Empty string (inherit workflow default agent) or a selectable agent kind.
 
     Mirrors `webapi._check_agent_kind`'s normalize-then-validate shape.
     """
@@ -1490,10 +1480,10 @@ def _validated_ci_agent_kind(value: Any) -> str:
             "continuous_improvement.agent_kind must be a string", value=value
         )
     kind = value.strip().lower()
-    if kind and kind not in SUPPORTED_AGENT_KINDS:
+    if kind and kind not in selectable_kinds:
         raise ConfigValidationError(
             "continuous_improvement.agent_kind must be \"\" or one of "
-            f"{sorted(SUPPORTED_AGENT_KINDS)}",
+            f"{sorted(selectable_kinds)}",
             value=kind,
         )
     return kind
@@ -1584,7 +1574,9 @@ def _validated_ci_mode_interval_hours(value: Any) -> dict[str, float]:
     return out
 
 
-def _build_continuous_improvement_config(raw: Any) -> ContinuousImprovementConfig:
+def _build_continuous_improvement_config(
+    raw: Any, *, selectable_kinds: set[str]
+) -> ContinuousImprovementConfig:
     """§continuous-improvement heartbeat — default-off, all fields validated strictly.
 
     Missing `continuous_improvement:` in WORKFLOW.md means disabled with
@@ -1621,7 +1613,9 @@ def _build_continuous_improvement_config(raw: Any) -> ContinuousImprovementConfi
         True,
         name="continuous_improvement.require_idle_board",
     )
-    agent_kind = _validated_ci_agent_kind(ci_raw.get("agent_kind"))
+    agent_kind = _validated_ci_agent_kind(
+        ci_raw.get("agent_kind"), selectable_kinds=selectable_kinds
+    )
     modes = validated_ci_modes(ci_raw.get("modes"))
     mode_interval_hours = _validated_ci_mode_interval_hours(
         ci_raw.get("mode_interval_hours")

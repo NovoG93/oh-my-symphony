@@ -24,7 +24,7 @@ from ..skills import normalize_skill_names
 from ..trackers.file import FileBoardTracker, parse_ticket_file
 from ..trackers.validate import validate_ticket_dependencies
 from ..workflow import (
-    SUPPORTED_AGENT_KINDS,
+    selectable_agent_kinds,
     ServiceConfig,
 )
 from ..workflow.mutate import WorkflowMutationError
@@ -166,7 +166,7 @@ def _register_issue_routes(
                     "tracker_kind": cfg.tracker.kind,
                     "read_only": read_only,
                     "default_agent_kind": cfg.agent.kind,
-                    "agent_kinds": sorted(SUPPORTED_AGENT_KINDS),
+                    "agent_kinds": sorted(selectable_agent_kinds(cfg.agent.profiles)),
                 },
                 "columns": _columns_payload(cfg),
                 "issues": issues,
@@ -377,7 +377,7 @@ def _register_issue_routes(
             "priority": _check_priority(body.get("priority")),
             "labels": _check_labels(body.get("labels")),
             "description": _check_description(body.get("description")),
-            "agent_kind": _check_agent_kind(body.get("agent_kind")) or None,
+            "agent_kind": _check_agent_kind(body.get("agent_kind"), cfg) or None,
             "skills": list(normalize_skill_names(body.get("skills") or [])),
             "blocked_by": blocked_by or None,
             "request": _check_request(body.get("request")) or None,
@@ -573,7 +573,7 @@ def _register_issue_routes(
                 str(s) for s in (raw_skills or []) if isinstance(s, str)
             ]
         if "agent_kind" in body:
-            fields["agent_kind"] = _check_agent_kind(body.get("agent_kind"))
+            fields["agent_kind"] = _check_agent_kind(body.get("agent_kind"), cfg)
         if "request" in body:
             fields["request"] = _check_request(body.get("request"))
         if "blocked_by" in body:
@@ -631,6 +631,7 @@ def _register_issue_routes(
         return web.json_response({"identifier": identifier, "updated": updated_fields})
 
     async def handle_issue_recover_blocked(request: web.Request) -> web.Response:
+        cfg = ctx.config()
         identifier = _check_identifier(request.match_info["identifier"])
         body = await _read_json(request)
         raw_target = body.get(
@@ -639,7 +640,7 @@ def _register_issue_routes(
         if raw_target is not None and not isinstance(raw_target, str):
             raise WorkflowMutationError("fix_state must be a string")
         agent_kind = (
-            _check_agent_kind(body.get("agent_kind")) if "agent_kind" in body else None
+            _check_agent_kind(body.get("agent_kind"), cfg) if "agent_kind" in body else None
         )
         changed, message, details = await orchestrator.recover_blocked_issue(
             identifier,

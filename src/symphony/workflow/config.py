@@ -47,6 +47,7 @@ from .constants import (
     DEFAULT_PRIME_AGENT_COMMAND,
     DEFAULT_WORKSPACE_REUSE_POLICY,
     SUPPORTED_CI_MODES,
+    selectable_agent_kinds,
 )
 from .presets import board_uses_shipped_contracts
 
@@ -815,7 +816,6 @@ class ServiceConfig:
                 self.opencode.stall_timeout_ms,
             )
         raise ConfigValidationError(
-            "agent.kind must be one of agy, codex, claude, gemini, kiro, opencode, "
-            "pi, prime-agent, or an agent.profiles name",
+            f"agent.kind must be one of {sorted(selectable_agent_kinds(self.agent.profiles))}",
             value=kind,
         )

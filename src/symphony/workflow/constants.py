@@ -10,6 +10,7 @@ pulling the whole config builder.
 from __future__ import annotations
 
 import re
+from collections.abc import Iterable
 
 SUPPORTED_TRACKER_KINDS = {"linear", "file", "jira"}
 LINEAR_DEFAULT_ENDPOINT = "https://api.linear.app/graphql"
@@ -145,3 +146,8 @@ SYMPHONY_BRANCH_PREFIX = "symphony/"
 _AFTER_DONE_FAILURE_POLICIES = ("warn", "block")
 
 _VAR_PATTERN = re.compile(r"^\$([A-Za-z_][A-Za-z0-9_]*)$")
+
+
+def selectable_agent_kinds(profiles: Iterable[str] = ()) -> set[str]:
+    """Return built-in agent kinds plus configured profile names."""
+    return {*SUPPORTED_AGENT_KINDS, *profiles}

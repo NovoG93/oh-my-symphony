@@ -56,6 +56,7 @@ from ..workflow import (
     build_service_config,
     load_workflow,
     resolve_workflow_path,
+    selectable_agent_kinds,
 )
 from ..workflow.preflight import stage_turn_budget_error
 from ..workflow.presets import guess_lane_preset
@@ -182,7 +183,10 @@ def check_agent_cli(cfg: ServiceConfig) -> CheckResult:
     elif kind in cfg.agent.profiles:
         command = cfg.agent.profiles[kind].command
     else:
-        return CheckResult(f"agent.kind={kind}", "fail", f"unsupported agent kind {kind!r}")
+        return CheckResult(
+            f"agent.kind={kind}", "fail", f"unsupported agent kind {kind!r}; "
+            f"supported: {sorted(selectable_agent_kinds(cfg.agent.profiles))}",
+        )
 
     name = f"agent.kind={kind}"
     try:

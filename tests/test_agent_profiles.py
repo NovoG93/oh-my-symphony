@@ -131,10 +131,6 @@ def test_stage_kinds_may_route_to_a_profile(tmp_path: Path) -> None:
         ("{kind: codex, profiles: [mini]}", "agent.profiles must be a map"),
         ("{kind: mini}", "agent.kind must be one of"),
         (
-            "{kind: codex, fallback_kinds: [mini], profiles: {mini: {command: m}}}",
-            "agent.fallback_kinds cannot name an agent.profiles entry",
-        ),
-        (
             "{kind: codex, stage_kinds: {todo: nope}, profiles: {mini: {command: m}}}",
             "agent.stage_kinds['todo'] must be one of",
         ),
@@ -298,3 +294,111 @@ def test_doctor_checks_profile_command(tmp_path: Path) -> None:
     assert ok_result.status == "pass"
     assert missing_result.status == "fail"
     assert "not on $PATH" in missing_result.message
+
+
+def test_selectable_agent_kinds_includes_profiles_and_preserves_builtins(
+    tmp_path: Path,
+) -> None:
+    from symphony.workflow import SUPPORTED_AGENT_KINDS, selectable_agent_kinds
+
+    cfg = _cfg(tmp_path, _ECHO_PROFILE)
+    assert selectable_agent_kinds() == SUPPORTED_AGENT_KINDS
+    assert selectable_agent_kinds(cfg.agent.profiles) == SUPPORTED_AGENT_KINDS | {"echo-cli"}
+
+
+def test_fallback_kinds_accept_profiles_and_keep_order(tmp_path: Path) -> None:
+    cfg = _cfg(
+        tmp_path,
+        _ECHO_PROFILE.replace(
+            "  kind: echo-cli", "  kind: codex\n  fallback_kinds: [Echo-CLI, claude, echo-cli]"
+        ),
+    )
+
+    assert cfg.agent.fallback_kinds == ("echo-cli", "claude")
+
+
+@pytest.mark.parametrize("setting", ["fallback_kinds: [missing]", "kind: missing"])
+def test_unknown_kind_errors_list_configured_profiles(
+    tmp_path: Path, setting: str
+) -> None:
+    with pytest.raises(ConfigValidationError) as excinfo:
+        _cfg(tmp_path, _ECHO_PROFILE.replace("kind: echo-cli", setting))
+
+    assert "must be one of" in str(excinfo.value)
+    assert "echo-cli" in str(excinfo.value)
+    assert "codex" in str(excinfo.value)
+    assert "missing" not in excinfo.value.message
+
+
+def test_continuous_improvement_accepts_profile(tmp_path: Path) -> None:
+    cfg = _cfg(
+        tmp_path,
+        _ECHO_PROFILE + "continuous_improvement: {agent_kind: Echo-CLI}\n",
+    )
+
+    assert cfg.continuous_improvement.agent_kind == "echo-cli"
+
+
+def test_continuous_improvement_unknown_kind_lists_profiles(tmp_path: Path) -> None:
+    with pytest.raises(ConfigValidationError) as excinfo:
+        _cfg(
+            tmp_path,
+            _ECHO_PROFILE + "continuous_improvement: {agent_kind: missing}\n",
+        )
+
+    assert "continuous_improvement.agent_kind" in excinfo.value.message
+    assert "echo-cli" in excinfo.value.message
+    assert "codex" in excinfo.value.message
+
+
+def test_continuous_improvement_profile_mutation_roundtrip(tmp_path: Path) -> None:
+    from symphony.workflow import load_workflow
+    from symphony.workflow.mutate import (
+        WorkflowMutationError,
+        set_continuous_improvement_settings,
+    )
+
+    workflow = tmp_path / "WORKFLOW.md"
+    workflow.write_text("---\n" + _ECHO_PROFILE.lstrip() + "---\nbody\n")
+    set_continuous_improvement_settings(workflow, agent_kind=" Echo-CLI ")
+
+    cfg = build_service_config(load_workflow(workflow))
+    assert cfg.continuous_improvement.agent_kind == "echo-cli"
+    assert cfg.agent.kind == "echo-cli"
+    saved = workflow.read_bytes()
+    with pytest.raises(WorkflowMutationError) as excinfo:
+        set_continuous_improvement_settings(workflow, agent_kind="missing")
+    assert "echo-cli" in excinfo.value.message
+    assert "codex" in excinfo.value.message
+    assert workflow.read_bytes() == saved
+
+
+def test_doctor_unknown_kind_lists_profiles(tmp_path: Path) -> None:
+    from dataclasses import replace
+
+    cfg = _cfg(tmp_path, _ECHO_PROFILE)
+    cfg = replace(cfg, agent=replace(cfg.agent, kind="missing"))
+    result = check_agent_cli(cfg)
+
+    assert result.status == "fail"
+    assert "unsupported agent kind 'missing'" in result.message
+    assert "echo-cli" in result.message
+    assert "codex" in result.message
+
+
+@pytest.mark.parametrize("boundary", ["backend", "timeouts"])
+def test_backend_unknown_kind_lists_configured_profiles(
+    tmp_path: Path, boundary: str
+) -> None:
+    from dataclasses import replace
+
+    cfg = _cfg(tmp_path, _ECHO_PROFILE)
+    cfg = replace(cfg, agent=replace(cfg.agent, kind="missing"))
+    with pytest.raises(ConfigValidationError) as excinfo:
+        if boundary == "backend":
+            _build(cfg, tmp_path)
+        else:
+            cfg.backend_timeouts()
+
+    assert "echo-cli" in excinfo.value.message
+    assert "codex" in excinfo.value.message

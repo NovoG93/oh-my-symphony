@@ -18,7 +18,7 @@ from pathlib import Path
 
 from ..errors import SymphonyError
 from ..issue import Issue, normalize_state
-from ..workflow import ServiceConfig, SUPPORTED_AGENT_KINDS, SYMPHONY_BRANCH_PREFIX
+from ..workflow import ServiceConfig, selectable_agent_kinds, SYMPHONY_BRANCH_PREFIX
 from ..utils.auto_merge import AutoMergeResult
 from ..utils.git_sandbox import SANDBOX_WRITE_DENIED, classify_history_failure
 from ..workspace import HISTORY_PUSH_FAILED, CommitOutcome, HistoryGateResult
@@ -849,7 +849,7 @@ async def _open_blocked_rca_for_issue(
     requested_agent = (
         agent_kind or ""
     ).strip().lower() or cfg.agent.kind_for_state(rca_state, issue.agent_kind)
-    if requested_agent not in SUPPORTED_AGENT_KINDS:
+    if requested_agent not in selectable_agent_kinds(cfg.agent.profiles):
         requested_agent = cfg.agent.kind
 
     async with self._blocked_rca_creation_lock:

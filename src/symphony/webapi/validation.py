@@ -10,8 +10,8 @@ from ..errors import ConfigValidationError
 from ..trackers.validate import IDENTIFIER_RE as _IDENTIFIER_RE
 from ..trackers.validate import IDENTIFIER_RULE as _IDENTIFIER_RULE
 from ..workflow import (
-    SUPPORTED_AGENT_KINDS,
     ServiceConfig,
+    selectable_agent_kinds,
     validated_ci_modes,
 )
 from ..workflow.mutate import (
@@ -185,15 +185,16 @@ def _check_blocked_by(raw: Any) -> list[str]:
     return out
 
 
-def _check_agent_kind(raw: Any) -> str:
+def _check_agent_kind(raw: Any, cfg: ServiceConfig) -> str:
     if raw is None:
         return ""
     if not isinstance(raw, str):
         raise WorkflowMutationError("agent_kind must be a string")
     kind = raw.strip().lower()
-    if kind and kind not in SUPPORTED_AGENT_KINDS:
+    kinds = selectable_agent_kinds(cfg.agent.profiles)
+    if kind and kind not in kinds:
         raise WorkflowMutationError(
-            f"unknown agent_kind {kind!r}; supported: {sorted(SUPPORTED_AGENT_KINDS)}"
+            f"unknown agent_kind {kind!r}; supported: {sorted(kinds)}"
         )
     return kind
 
@@ -239,7 +240,7 @@ def _check_budget(raw: Any, key: str) -> int | None:
     return raw
 
 
-def _parse_ci_settings(body: dict[str, Any]) -> dict[str, Any]:
+def _parse_ci_settings(body: dict[str, Any], cfg: ServiceConfig) -> dict[str, Any]:
     unknown = sorted(set(body) - _CI_EDITABLE_KEYS)
     if unknown:
         raise WorkflowMutationError(
@@ -262,7 +263,7 @@ def _parse_ci_settings(body: dict[str, Any]) -> dict[str, Any]:
             raise WorkflowMutationError("max_turns must be an integer")
         updates["max_turns"] = value
     if "agent_kind" in body:
-        updates["agent_kind"] = _check_agent_kind(body["agent_kind"])
+        updates["agent_kind"] = _check_agent_kind(body["agent_kind"], cfg)
     if "modes" in body:
         updates["modes"] = _check_ci_modes(body["modes"])
     if not updates:

@@ -32,7 +32,7 @@ from pathlib import Path
 from typing import Any, AsyncContextManager, Awaitable, Callable, Protocol, cast, runtime_checkable
 
 from ..errors import ConfigValidationError
-from ..workflow import ServiceConfig
+from ..workflow import ServiceConfig, selectable_agent_kinds
 
 
 # Normalized event vocabulary — every backend emits these strings only.
@@ -286,7 +286,6 @@ def build_backend(init: BackendInit) -> AgentBackend:
 
         return cast(AgentBackend, PlainCliBackend(init))
     raise ConfigValidationError(
-        "unknown agent.kind "
-        f"{kind!r}; expected agy, codex, claude, gemini, kiro, opencode, "
-        f"pi, prime-agent, or an agent.profiles name"
+        f"unknown agent.kind {kind!r}; "
+        f"expected one of {sorted(selectable_agent_kinds(init.cfg.agent.profiles))}"
     )

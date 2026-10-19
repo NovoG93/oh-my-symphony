@@ -225,8 +225,8 @@ def _register_workflow_routes(
         request: web.Request,
     ) -> web.Response:
         body = await _read_json(request)
-        updates = _parse_ci_settings(body)
         cfg = ctx.config()
+        updates = _parse_ci_settings(body, cfg)
         await asyncio.to_thread(
             set_continuous_improvement_settings,
             cfg.workflow_path,

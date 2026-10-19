@@ -430,9 +430,9 @@ agent:
 and appends them otherwise. Profile names are lowercased and cannot reuse a
 built-in kind (`agy`, `antigravity`, `codex`, ...): that is a config error,
 not an override. Unknown keys and formats other than `text` are config
-errors. `agent.kind` and `agent.stage_kinds` can select a profile; ticket
-pins, `agent.fallback_kinds` and `continuous_improvement.agent_kind` accept
-built-in kinds only. `symphony doctor` checks the profile command's
+errors. `agent.kind`, `agent.stage_kinds`, ticket pins, chat sessions,
+`agent.fallback_kinds` and `continuous_improvement.agent_kind` can select a
+profile. `symphony doctor` checks the profile command's
 executable. The built-in `agy` and `kiro` kinds run on the same profile
 engine, configured through their own blocks.
 
