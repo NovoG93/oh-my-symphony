@@ -273,15 +273,6 @@ def _sync(
     return 0
 
 
-def _install_skills(target: Path, names: set[str], *, force: bool) -> None:
-    _copy_skills(
-        target,
-        _skill_sources(names),
-        force=force,
-        recovery="rerun 'symphony factory sync <project> --force'",
-    )
-
-
 def _skill_sources(names: set[str]) -> dict[str, Traversable]:
     sources: dict[str, Traversable] = {}
     bundled = files(_BUNDLED_SKILLS_PACKAGE)

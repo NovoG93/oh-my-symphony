@@ -115,11 +115,6 @@ def critical_path_lengths(issues: Sequence[Issue]) -> dict[str, int]:
     return analyze_dependencies(issues).critical_path_lengths
 
 
-def dependency_waves(issues: Sequence[Issue]) -> dict[str, int]:
-    """Topological dispatch wave, with malformed cycles collapsed together."""
-
-    return analyze_dependencies(issues).waves
-
 def sort_candidates(
     issues: Sequence[Issue],
     policy: object | None = "fifo",
