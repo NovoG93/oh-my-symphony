@@ -13,6 +13,7 @@ from typing import Any
 from ..factory.sync import _load_ordered_graph, sync_wayfinder
 from ..trackers.file import FileBoardTracker
 from ..workflow import SUPPORTED_AGENT_KINDS, build_service_config, load_workflow
+from ..workflow.constants import DEFAULT_AGY_COMMAND
 
 _SKILL_SEARCH_ROOTS = (
     Path.home() / ".agents/skills",
@@ -23,7 +24,7 @@ _SKILL_SEARCH_ROOTS = (
 _BUNDLED_SKILLS_PACKAGE = "symphony.factory.bundled_skills"
 _BUNDLED_SKILL_NAMES = {"supergoal", "superdesign", "superpm", "superqa"}
 _BACKEND_BLOCKS = {
-    "agy": "agy:\n  command: agy --print -\n  resume_across_turns: true\n",
+    "agy": f"agy:\n  command: '{DEFAULT_AGY_COMMAND}'\n  resume_across_turns: true\n",
     "claude": (
         "claude:\n"
         "  command: claude -p --output-format stream-json --verbose --permission-mode acceptEdits"
