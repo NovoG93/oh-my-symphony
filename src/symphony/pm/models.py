@@ -612,11 +612,6 @@ class ExchangePort(Protocol):
     ) -> bytes: ...
 
 
-def json_value(value: Any) -> Any:
-    """Convert immutable PM DTOs to JSON-safe values."""
-    return _json(value)
-
-
 def _json(value: Any) -> Any:
     if hasattr(value, "__dataclass_fields__"):
         return {key: _json(item) for key, item in asdict(value).items()}
