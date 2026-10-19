@@ -10,6 +10,8 @@ Versioning: [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.28.0] - 2026-10-20 - Lean core
+
 ### Removed
 - `tui-open.sh` and `tui-open.bat`. Run `symphony tui [WORKFLOW.md]`; it checks the agent CLI and `after_create` hook before starting and names the process holding the server port. `symphony project create|add` no longer copies the launchers.
 - `GEMINI.md`, `GEMINI.project.md`, and `AGENTS.project.md`. Bootstrapped projects get one `AGENTS.md` from `examples/project/AGENTS.md`. Gemini CLI users set `context.fileName` to `AGENTS.md` in `.gemini/settings.json`.
