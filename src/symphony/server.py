@@ -25,6 +25,7 @@ from .logging import get_logger
 from .orchestrator import Orchestrator
 from .webapi import BIND_HOST_KEY, register_web_routes
 from .web_policy import (
+    API_TOKEN_ENV,
     install_route_policies,
     policy_discovery_payload,
     resolve_policy,
@@ -257,8 +258,20 @@ async def run_server(
     # when the server itself is loopback-bound; record the bind address.
     # Resolve once before opening a socket so unsafe or unknown policies fail
     # startup instead of exposing a half-working service.
-    resolve_policy(host)
+    policy = resolve_policy(host)
     app[BIND_HOST_KEY] = host
+    if (
+        host.strip().lower() not in {"", "localhost", "127.0.0.1", "::1", "[::1]"}
+        and policy.mode != "token"
+    ):
+        log.warning(
+            "http_server_without_bearer_on_network_bind",
+            host=host,
+            hint=(
+                f"use token auth with {API_TOKEN_ENV} or bind to 127.0.0.1; "
+                "capability gates remain active"
+            ),
+        )
     runner = web.AppRunner(app)
     await runner.setup()
     site = web.TCPSite(runner, host=host, port=port)

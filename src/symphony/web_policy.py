@@ -438,7 +438,7 @@ async def policy_middleware(request: web.Request, handler):
     grants = policy.grants_for(request)
     if not metadata.capabilities.issubset(grants):
         return _json_error(403, metadata.denial_code, "required capability is not granted")
-    if request.method in MUTATING_METHODS and request.body_exists and request.content_type != "application/json":
+    if request.method in MUTATING_METHODS and request.content_type != "application/json":
         return _json_error(415, "unsupported_media_type", "mutations require application/json")
     return await handler(request)
 

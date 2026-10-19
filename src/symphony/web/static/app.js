@@ -143,6 +143,8 @@
     }
   }
 
+  const MUTATING_METHODS = new Set(['POST', 'PUT', 'PATCH', 'DELETE']);
+
   async function apiRequest(path, { method = 'GET', body, headers = {} } = {}) {
     // A board snapshot can remain visible after polling loses connectivity.
     // Block every mutation at the shared boundary, including controls in a
@@ -152,6 +154,12 @@
       throw new ApiError(t('conn.staleMutationBlocked'), 'stale_board', 503);
     }
     const init = { method, headers: withAuthHeaders(headers) };
+    // JSON content type triggers a CORS preflight for every mutation. Send an
+    // empty JSON object when the action has no payload so it passes the same
+    // server-side CSRF gate as mutations with a body.
+    if (body === undefined && MUTATING_METHODS.has(method.toUpperCase())) {
+      body = '{}';
+    }
     if (body !== undefined) {
       init.body = body;
       init.headers['Content-Type'] = 'application/json';

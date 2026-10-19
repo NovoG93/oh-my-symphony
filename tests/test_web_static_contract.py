@@ -6,6 +6,14 @@ from pathlib import Path
 STATIC_ROOT = Path("src/symphony/web/static")
 
 
+def test_bodyless_mutations_send_json_to_force_cors_preflight() -> None:
+    js = _script_bundle()
+
+    assert "const MUTATING_METHODS = new Set(['POST', 'PUT', 'PATCH', 'DELETE'])" in js
+    assert "if (body === undefined && MUTATING_METHODS.has(method.toUpperCase()))" in js
+    assert "body = '{}'" in js
+
+
 def _script_bundle() -> str:
     """Every script the board ships, concatenated.
 
