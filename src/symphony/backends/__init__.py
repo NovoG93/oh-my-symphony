@@ -13,6 +13,9 @@ uses `gemini -p` one-shot, AGY uses `agy --print "$(cat)"`, Kiro uses
 `kiro-cli chat --no-interactive`, OpenCode uses `opencode run --format json`, Pi
 uses `pi --mode json -p ""`, and Prime Agent uses `prime-agent -p --mode json`.
 
+AGY and Kiro are plain-text CLIs expressed as profile data (`plain_cli.py`);
+WORKFLOW.md `agent.profiles` adds more of them without new Python.
+
 Normalized event vocabulary is shared across backends (see `events.py` style
 constants below). Per-turn backends emit `turn_started` immediately after
 publishing each live child so the orchestrator can replace the process-group
@@ -277,8 +280,13 @@ def build_backend(init: BackendInit) -> AgentBackend:
         from .prime_agent import PrimeAgentBackend
 
         return cast(AgentBackend, PrimeAgentBackend(init))
+    if init.cfg.agent_profile(kind) is not None:
+        # `agent.profiles` entry: plain-text CLI described entirely by data.
+        from .plain_cli import PlainCliBackend
+
+        return cast(AgentBackend, PlainCliBackend(init))
     raise ConfigValidationError(
         "unknown agent.kind "
         f"{kind!r}; expected agy, codex, claude, gemini, kiro, opencode, "
-        f"pi, or prime-agent"
+        f"pi, prime-agent, or an agent.profiles name"
     )

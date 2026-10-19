@@ -17,6 +17,7 @@ Versioning: [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - Committed development records: `.sdlc/`, `.impeccable/`, `HANDOFF.md`, `CONTEXT.md`, `QUALITY-LEDGER.md`, `.quality.md`, `docs/plans/`, `docs/quality/`, `docs/spec/`, `docs/changelog/`, `docs/features/`, and `docs/handoffs/`. The `v0.27.0` tag keeps them; links now point there.
 
 ### Added
+- `agent.profiles` in `WORKFLOW.md` declares plain-text agent CLIs as data (`command`, `format: text`, `unattended_flags`, `continuation_flag`, `continuation_position`, timeouts), selectable by `agent.kind` and `agent.stage_kinds` and checked by `symphony doctor`; built-in `agy` and `kiro` now run as profiles with unchanged config.
 - `docs/prd/v1.0-lean-core.md` and ADR 0006: v1.0 reduces bloat without removing shipped features.
 
 ### Changed
