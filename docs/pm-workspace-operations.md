@@ -81,7 +81,7 @@ Successful admission is cached only against the resolved executable's device/ino
 
 ## Accepted findings and current handling
 
-These IDs preserve the original accepted Low/Medium findings in `.sdlc/work/261004-pm-workspace/evidence.md:176–191` (R32, R33, and R35 round two). Current handling reflects the local hardening changes and their focused regressions; it does not establish final installed lifecycle, performance, or quality approval. N1 process-group cleanup changes are already recorded in the changelog.
+These IDs preserve the original accepted Low/Medium findings (R32, R33, and R35 round two) from the PM Workspace review; that local evidence file was never committed. Current handling reflects the local hardening changes and their focused regressions; it does not establish final installed lifecycle, performance, or quality approval. N1 process-group cleanup changes are already recorded in the changelog.
 
 | Finding | Current behavior or handling |
 |---|---|
