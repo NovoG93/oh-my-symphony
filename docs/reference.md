@@ -1300,7 +1300,7 @@ src/symphony/
   notifications/     Slack state-transition notifications
   tui/               Textual Kanban TUI package
   web/static/        built-in browser app assets
-  webapi.py          web app REST routes + static SPA serving
+  webapi/            web app REST routes (one module per resource) + static SPA serving
   server.py          aiohttp server, health/state/refresh routes
   hub.py             multi-project hub
   projects.py        multi-project registry + managed service metadata

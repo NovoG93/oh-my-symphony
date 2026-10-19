@@ -327,8 +327,9 @@ async def test_chat_numeric_project_choice_uses_server_owned_registration(
             port=10000,
         )
 
-    monkeypatch.setattr(webapi, "_create_or_adopt_registered_project", create_project)
-    monkeypatch.setattr(webapi, "ProjectRegistry", lambda: object())
+    for module in (webapi.chat_routes, webapi.project_routes):
+        monkeypatch.setattr(module, "_create_or_adopt_registered_project", create_project)
+        monkeypatch.setattr(module, "ProjectRegistry", lambda: object())
     state = WorkflowState(board_dir / "WORKFLOW.md")
     cfg, err = state.reload()
     assert err is None and cfg is not None
