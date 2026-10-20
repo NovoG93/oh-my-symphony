@@ -10828,3 +10828,141 @@ def test_kill_without_recorded_identity_stays_ungated(tmp_path, monkeypatch):
     orch._force_eject_zombie(issue.id, entry, cfg)
 
     assert captured == [(4242, None)], "identity=None must keep the kill ungated"
+
+
+def _seed_done_runs(
+    registry: RunRegistry, issue: Issue, count: int, tmp_path: Path
+) -> None:
+    for i in range(count):
+        run_id = registry.acquire_run(
+            issue,
+            workspace_path=tmp_path / f"seed-ws-{i}",
+            attempt=None,
+            attempt_kind="fresh",
+            agent_kind="codex",
+        )
+        assert run_id is not None
+        ok = registry.complete_run(
+            issue_id=issue.id,
+            run_id=run_id,
+            status="normal",
+            state="Done",
+        )
+        assert ok is True
+
+
+def _reopen_tick(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    *,
+    prior_done: int,
+    max_reopens: int,
+    body: str = "",
+) -> tuple[list[str], list[tuple[str, str, str]], list[tuple[str, str]]]:
+    workflow_path = tmp_path / "WORKFLOW.md"
+    cfg = _make_config(
+        workflow_path=workflow_path,
+        tracker_kind="file",
+        active_states=("Todo", "In Progress", "Verify"),
+        terminal_states=("Done", "Blocked", "Cancelled"),
+        auto_triage_actionable_todo=False,
+    )
+    cfg = replace(cfg, agent=replace(cfg.agent, max_reopens=max_reopens))
+    issue = _issue("MT-1", state="In Progress", description=body)
+    orch = _orch()
+    db_path = tmp_path / ".symphony" / "state.db"
+    registry = RunRegistry(db_path)
+    orch._run_registry = registry
+    _seed_done_runs(registry, issue, prior_done, tmp_path)
+
+    monkeypatch.setattr(orch, "_open_run_registry", lambda _cfg: (registry, False))
+    monkeypatch.setattr(orch._workflow_state, "reload", lambda: (cfg, None))
+    dispatched: list[str] = []
+    appended: list[tuple[str, str, str]] = []
+    moved: list[tuple[str, str]] = []
+
+    async def _fetch(_cfg):
+        return [issue]
+
+    async def _archive(_cfg):
+        return None
+
+    def _dispatch(_issue, _cfg, *, attempt, attempt_kind=None):
+        dispatched.append(_issue.identifier)
+
+    def _append(_cfg, _issue, heading, body):
+        appended.append((_issue.identifier, heading, body))
+
+    def _move(_cfg, _issue, target):
+        moved.append((_issue.identifier, target))
+
+    monkeypatch.setattr(orch, "_fetch_candidates", _fetch)
+    monkeypatch.setattr(orch, "_archive_sweep", _archive)
+    monkeypatch.setattr(orch, "_tracker_call_terminal_issues", lambda _cfg: [])
+    monkeypatch.setattr(orch, "_dispatch", _dispatch)
+    monkeypatch.setattr(Orchestrator, "_tracker_call_append_note", staticmethod(_append))
+    monkeypatch.setattr(Orchestrator, "_tracker_call_update_state", staticmethod(_move))
+
+    asyncio.run(orch._on_tick())
+    registry.close()
+    return dispatched, appended, moved
+
+
+def test_reopen_within_budget_dispatches(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    dispatched, appended, moved = _reopen_tick(
+        monkeypatch, tmp_path, prior_done=1, max_reopens=1
+    )
+    assert dispatched == ["MT-1"]
+    assert moved == []
+    assert appended == []
+
+
+def test_reopen_over_budget_is_parked_in_blocked_with_note(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    dispatched, appended, moved = _reopen_tick(
+        monkeypatch, tmp_path, prior_done=2, max_reopens=1
+    )
+    assert dispatched == []
+    assert moved == [("MT-1", "Blocked")]
+    assert len(appended) == 1
+    assert appended[0][0] == "MT-1"
+    assert appended[0][1] == "Reopen Budget"
+    assert "reached Done 2 time(s)" in appended[0][2]
+    assert "agent.max_reopens: 1" in appended[0][2]
+
+
+def test_reopen_approved_section_extends_the_budget(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    body = "## Reopen Approved\nAuthorized by operator."
+    dispatched, appended, moved = _reopen_tick(
+        monkeypatch, tmp_path, prior_done=2, max_reopens=1, body=body
+    )
+    assert dispatched == ["MT-1"]
+    assert moved == []
+    assert appended == []
+
+
+def test_reopen_budget_zero_disables_the_cap(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    dispatched, appended, moved = _reopen_tick(
+        monkeypatch, tmp_path, prior_done=5, max_reopens=0
+    )
+    assert dispatched == ["MT-1"]
+    assert moved == []
+    assert appended == []
+
+
+def test_first_dispatch_never_counts_as_a_reopen(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    dispatched, appended, moved = _reopen_tick(
+        monkeypatch, tmp_path, prior_done=0, max_reopens=1
+    )
+    assert dispatched == ["MT-1"]
+    assert moved == []
+    assert appended == []

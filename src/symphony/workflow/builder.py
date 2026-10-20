@@ -87,6 +87,7 @@ from .constants import (
     DEFAULT_HOOK_TIMEOUT_MS,
     DEFAULT_KIRO_COMMAND,
     DEFAULT_MAX_ATTEMPTS,
+    DEFAULT_MAX_REOPENS,
     DEFAULT_MAX_CONCURRENT_AGENTS,
     DEFAULT_MAX_RETRIES,
     DEFAULT_MAX_RETRY_BACKOFF_MS,
@@ -110,7 +111,7 @@ from .constants import (
     SUPPORTED_WORKSPACE_REUSE_POLICIES,
 )
 from .parser import WorkflowDefinition
-from .presets import board_uses_default_contracts
+from .presets import board_uses_shipped_contracts
 
 
 def _build_prompt_config(raw: Any, base_dir: Path) -> PromptConfig:
@@ -362,6 +363,9 @@ def build_service_config(workflow: WorkflowDefinition) -> ServiceConfig:
             agent_raw.get("max_attempts"),
             DEFAULT_MAX_ATTEMPTS,
             name="agent.max_attempts",
+        ),
+        max_reopens=_validated_nonnegative_or_default(
+            agent_raw.get("max_reopens"), DEFAULT_MAX_REOPENS, name="agent.max_reopens"
         ),
         max_retries=_validated_nonnegative_or_default(
             agent_raw.get("max_retries"),
@@ -1373,11 +1377,11 @@ def _log_stage_contracts_decision(agent: AgentConfig, tracker: TrackerConfig) ->
     offending = [
         state
         for state in tracker.active_states
-        if not board_uses_default_contracts((state,))
+        if not board_uses_shipped_contracts((state,))
     ]
     get_logger().warning(
         "stage_contracts_disabled",
-        reason="board lanes are not the default preset",
+        reason="board lanes are neither the default preset nor the deep preset",
         offending_lanes=offending,
         lanes=list(tracker.active_states),
         hint="set agent.stage_contracts: on to enforce them anyway",

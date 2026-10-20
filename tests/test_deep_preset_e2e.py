@@ -30,10 +30,14 @@ import pytest
 
 import symphony.orchestrator.core as core_mod
 from symphony.cli.doctor import check_deep_preset_merge_contract
+from symphony.intent import IntentAction, IntentFiler, IntentProposal
 from symphony.issue import Issue
 from symphony.orchestrator import Orchestrator, RunningEntry
+from symphony.orchestrator.contracts import evaluate_contract
+from symphony.prompt import build_first_turn_prompt
 from symphony.trackers.file import (
     FileBoardTracker,
+    issue_from_file,
     parse_ticket_file,
     write_ticket_atomic,
 )
@@ -56,7 +60,12 @@ from symphony.workflow import (
 )
 from symphony.workflow.mutate import apply_lane_preset
 from symphony.workflow.preflight import stage_turn_budget_error
-from symphony.workflow.presets import DEEP_PRESET, guess_lane_preset
+from symphony.workflow.presets import (
+    DEEP_PRESET,
+    board_uses_default_contracts,
+    board_uses_shipped_contracts,
+    guess_lane_preset,
+)
 
 
 _DEEP_ACTIVE = DEEP_PRESET.active_states
@@ -139,8 +148,9 @@ class _DeepBackend:
     """Mock backend that walks the ticket file through the deep lanes."""
 
     ticket_path: Path
-    transitions: list[tuple[str, str]]
+    transitions: list[tuple[str, str, dict[str, str]]]
     board_root: Path
+    vault: Path | None = None
     spawn_at_state: str | None = None
     spawned: list[str] = field(default_factory=list)
     calls: list[tuple[str, dict[str, Any]]] = field(default_factory=list)
@@ -158,7 +168,11 @@ class _DeepBackend:
         self.calls.append(("run_turn", {"is_continuation": is_continuation}))
         if not self.transitions:
             return
-        new_state, body = self.transitions.pop(0)
+        new_state, body, vault_files = self.transitions.pop(0)
+        if self.vault is not None:
+            self.vault.mkdir(parents=True, exist_ok=True)
+            for name, text in vault_files.items():
+                (self.vault / name).write_text(text, encoding="utf-8")
         front, _ = parse_ticket_file(self.ticket_path)
         current = str(front.get("state", ""))
         if self.spawn_at_state and current == self.spawn_at_state:
@@ -166,6 +180,7 @@ class _DeepBackend:
         front["state"] = new_state
         front["updated_at"] = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
         write_ticket_atomic(self.ticket_path, front, body)
+
 
     def _spawn_dag(self) -> None:
         """What `deep/plan.md` tells the agent to run via `symphony board new`."""
@@ -190,6 +205,37 @@ class _DeepBackend:
 
     async def stop(self) -> None:
         self.calls.append(("stop", {}))
+
+
+def _request_walk_script(
+    *,
+    review_md: str = "verdict: PASS\n",
+) -> list[tuple[str, str, dict[str, str]]]:
+    return [
+        (
+            "Research",
+            "## Brief\n\nship the thing",
+            {"brief.md": "## Brief\n\nship the thing"},
+        ),
+        (
+            "Plan",
+            "## Research\n\nall clear",
+            {"research.md": "## Research\n\nall clear"},
+        ),
+        (
+            "Review",
+            "## Plan Summary\n\nbuild it",
+            {
+                "plan.md": "## Plan Summary\n\nbuild it",
+                "contracts.md": "## Contracts\n\nclear",
+            },
+        ),
+        (
+            "Done",
+            "## Delivery\n\nall done",
+            {"review.md": review_md},
+        ),
+    ]
 
 
 class _FakeWorkspace:
@@ -310,18 +356,17 @@ def test_deep_request_ticket_walks_intake_to_done_and_spawns_its_dag(
     cfg = _deep_config(board_root)
 
     backends: list[_DeepBackend] = []
-    script = [
-        ("Research", "## Brief\n\nship the thing"),
-        ("Plan", "## Research\n\nevidence"),
-        ("Review", "## Plan Summary\n\nBUILD-1, VERIFY-1"),
-        ("Done", "## Objections\n\nnone; verdict: PASS"),
-    ]
+    script = _request_walk_script()
+
+    workspace_path = tmp_path / "workspace"
+    workspace_path.mkdir()
 
     def _factory(init: Any) -> _DeepBackend:
         backend = _DeepBackend(
             ticket_path=ticket_path,
             transitions=script,
             board_root=board_root,
+            vault=workspace_path / "docs" / "req" / "REQ-A",
             spawn_at_state="Plan",
         )
         backends.append(backend)
@@ -329,8 +374,6 @@ def test_deep_request_ticket_walks_intake_to_done_and_spawns_its_dag(
 
     monkeypatch.setattr(core_mod, "build_backend", _factory)
 
-    workspace_path = tmp_path / "workspace"
-    workspace_path.mkdir()
     orch = Orchestrator(WorkflowState(Path("/tmp/no.md")))
     orch._workspace_manager = _FakeWorkspaceManager(workspace_path)  # type: ignore[assignment]
     issue = Issue(
@@ -340,6 +383,7 @@ def test_deep_request_ticket_walks_intake_to_done_and_spawns_its_dag(
         description="## Brief\n\nship the thing",
         priority=2,
         state="Intake",
+        request="REQ-A",
         created_at=datetime(2026, 1, 1, tzinfo=timezone.utc),
     )
     orch._running[issue.id] = RunningEntry(
@@ -352,11 +396,12 @@ def test_deep_request_ticket_walks_intake_to_done_and_spawns_its_dag(
 
     asyncio.run(orch._run_agent_attempt(issue, attempt=None, cfg=cfg))
 
-    front, _ = parse_ticket_file(ticket_path)
+    front, final_body = parse_ticket_file(ticket_path)
     assert front["state"] == "Done", (
         "deep request ticket did not walk Intake -> Done; ended at "
         f"{front['state']!r}"
     )
+    assert "## Contract Failure" not in final_body
     # One backend rebuild per lane transition: the deep preset genuinely
     # exercises the multi-lane in-run path (which is where F-01 lived).
     assert len(backends) >= 4
@@ -393,3 +438,205 @@ def test_deep_build_ticket_is_released_only_after_the_request_reaches_done(
     released = {i.identifier: i for i in tracker.scan_all()}["BUILD-1"]
     decision = orch._eligibility_decision(released, cfg, owning_retry=False)
     assert decision.disposition is core_mod._EligibilityDisposition.READY
+
+
+def test_deep_review_without_pass_verdict_cannot_release_the_dag(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    board_root = tmp_path / "kanban"
+    board_root.mkdir()
+    ticket_path = board_root / "REQ-1.md"
+    write_ticket_atomic(
+        ticket_path,
+        {
+            "id": "REQ-1",
+            "identifier": "REQ-1",
+            "title": "deep request",
+            "state": "Intake",
+            "priority": 2,
+            "request": "REQ-A",
+            "created_at": "2026-01-01T00:00:00Z",
+        },
+        "## Brief\n\nship the thing",
+    )
+    cfg = _deep_config(board_root)
+
+    backends: list[_DeepBackend] = []
+    script = _request_walk_script(review_md="verdict: BLOCKED\n")
+
+    workspace_path = tmp_path / "workspace"
+    workspace_path.mkdir()
+
+    def _factory(init: Any) -> _DeepBackend:
+        backend = _DeepBackend(
+            ticket_path=ticket_path,
+            transitions=script,
+            board_root=board_root,
+            vault=workspace_path / "docs" / "req" / "REQ-A",
+            spawn_at_state="Plan",
+        )
+        backends.append(backend)
+        return backend
+
+    monkeypatch.setattr(core_mod, "build_backend", _factory)
+
+    orch = Orchestrator(WorkflowState(Path("/tmp/no.md")))
+    orch._workspace_manager = _FakeWorkspaceManager(workspace_path)  # type: ignore[assignment]
+    issue = Issue(
+        id="REQ-1",
+        identifier="REQ-1",
+        title="deep request",
+        description="## Brief\n\nship the thing",
+        priority=2,
+        state="Intake",
+        request="REQ-A",
+        created_at=datetime(2026, 1, 1, tzinfo=timezone.utc),
+    )
+    orch._running[issue.id] = RunningEntry(
+        issue=issue,
+        started_at=datetime.now(timezone.utc),
+        retry_attempt=None,
+        worker_task=None,  # type: ignore[arg-type]
+        workspace_path=workspace_path,
+    )
+
+    asyncio.run(orch._run_agent_attempt(issue, attempt=None, cfg=cfg))
+
+    front, final_body = parse_ticket_file(ticket_path)
+    assert front["state"] == "Review", (
+        f"expected ticket to rewind to Review, but got {front['state']!r}"
+    )
+    assert "## Contract Failure" in final_body
+
+    tracker = FileBoardTracker(_tracker_cfg(board_root))
+    board = {item.identifier: item for item in tracker.scan_all()}
+    assert "BUILD-1" in board
+    decision = orch._eligibility_decision(board["BUILD-1"], cfg, owning_retry=False)
+    assert decision.disposition is not core_mod._EligibilityDisposition.READY
+    assert "blocker unresolved" in decision.reason
+
+
+def test_approved_intent_ticket_walks_the_deep_pipeline(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    board_root = tmp_path / "kanban"
+    board_root.mkdir()
+    cfg = _deep_config(board_root)
+
+    proposal = IntentProposal(
+        slug="widget-feature",
+        title="Widget Feature",
+        track="full",
+        intent=(
+            "## Problem\nNeed a widget.\n\n"
+            "## Success criteria\n- [ ] Widget is built.\n\n"
+            "## Out of scope\nOther stuff."
+        ),
+    )
+    action = IntentAction.from_proposal(proposal)
+    filer = IntentFiler(tmp_path, cfg.tracker)
+    ticket_dict = filer.file(action)
+    identifier = ticket_dict["identifier"]
+    ticket_path = board_root / f"{identifier}.md"
+
+    backends: list[_DeepBackend] = []
+    script = _request_walk_script()
+
+    workspace_path = tmp_path / "workspace"
+    workspace_path.mkdir()
+
+    def _factory(init: Any) -> _DeepBackend:
+        backend = _DeepBackend(
+            ticket_path=ticket_path,
+            transitions=script,
+            board_root=board_root,
+            vault=workspace_path / "docs" / "req" / "widget-feature",
+            spawn_at_state="Plan",
+        )
+        backends.append(backend)
+        return backend
+
+    monkeypatch.setattr(core_mod, "build_backend", _factory)
+
+    orch = Orchestrator(WorkflowState(Path("/tmp/no.md")))
+    orch._workspace_manager = _FakeWorkspaceManager(workspace_path)  # type: ignore[assignment]
+    issue = issue_from_file(ticket_path)
+    assert issue is not None
+    assert issue.state == "Intake"
+    assert issue.request == "widget-feature"
+
+    orch._running[issue.id] = RunningEntry(
+        issue=issue,
+        started_at=datetime.now(timezone.utc),
+        retry_attempt=None,
+        worker_task=None,  # type: ignore[arg-type]
+        workspace_path=workspace_path,
+    )
+
+    asyncio.run(orch._run_agent_attempt(issue, attempt=None, cfg=cfg))
+
+    front, final_body = parse_ticket_file(ticket_path)
+    assert front["state"] == "Done"
+    assert "## Contract Failure" not in final_body
+
+    tracker = FileBoardTracker(cfg.tracker)
+    board = {item.identifier: item for item in tracker.scan_all()}
+    assert {"BUILD-1", "VERIFY-1"} <= set(board)
+
+
+def test_deep_intake_prompt_consumes_the_approved_intent(tmp_path: Path) -> None:
+    workflow_path = _seed_workflow(tmp_path)
+    apply_lane_preset(workflow_path, "deep")
+    cfg = build_service_config(load_workflow(workflow_path))
+
+    proposal = IntentProposal(
+        slug="repair-widget",
+        title="Repair widget",
+        track="full",
+        intent=(
+            "## Problem\nThe widget fails under high load.\n\n"
+            "## Success criteria\n- [ ] Widget handles 1000 req/s.\n\n"
+            "## Out of scope\nA database migration."
+        ),
+    )
+    action = IntentAction.from_proposal(proposal)
+    filer = IntentFiler(tmp_path, cfg.tracker)
+    ticket_dict = filer.file(action)
+    ticket_path = tmp_path / "kanban" / f"{ticket_dict['identifier']}.md"
+    issue = issue_from_file(ticket_path)
+    assert issue is not None
+    assert issue.state == "Intake"
+
+    first_prompt, _env = build_first_turn_prompt(
+        prompt_template=cfg.prompt_template_for_state(issue.state),
+        issue=issue,
+        attempt=None,
+        language=cfg.tui.language,
+        turn_number=1,
+        max_turns=cfg.agent.max_turns,
+        max_attempts=cfg.agent.max_attempts,
+    )
+    assert "The widget fails under high load." in first_prompt
+    assert "- [ ] Widget handles 1000 req/s." in first_prompt
+    assert "A database migration." in first_prompt
+    assert "INTAKE -- turn the raw request into a routed brief" in first_prompt
+
+
+def test_deep_preset_board_enables_the_deep_contract_set(tmp_path: Path) -> None:
+    workflow_path = _seed_workflow(tmp_path)
+    apply_lane_preset(workflow_path, "deep")
+    cfg = build_service_config(load_workflow(workflow_path))
+
+    assert guess_lane_preset(cfg.tracker.active_states) == "deep"
+    assert board_uses_default_contracts(cfg.tracker.active_states) is False
+    assert board_uses_shipped_contracts(cfg.tracker.active_states) is True
+    assert cfg.agent.stage_contracts_enabled(cfg.tracker.active_states) is True
+
+    empty_result = evaluate_contract(
+        producing_state="Intake",
+        ticket_body="",
+        identifier="REQ-1",
+        preset="deep",
+    )
+    assert empty_result.passed is False
+    assert "## Brief" in empty_result.missing

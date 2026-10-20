@@ -3,6 +3,10 @@
 Read: the vault (`brief.md` ... `verification.md`), the merged diff, `docs/llm-wiki/INDEX.md`.
 Write: user-facing docs, `docs/llm-wiki/`, vault `delivery.md`, ticket comments. Do NOT change behavior.
 
+{% if board_health %}Board health from recent orchestrator gates:
+{{ board_health }}
+Turn a recurring failure into one preventive, evidence-backed wiki learning. Do not infer a defect from aggregate counts alone.{% endif %}
+
 Hard gate before starting (Verify must be GREEN):
 
 ```bash

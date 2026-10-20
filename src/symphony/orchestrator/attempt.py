@@ -6,6 +6,7 @@ from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Any, cast
 from . import core as _core_module
+from ..workflow.presets import guess_lane_preset
 if TYPE_CHECKING:
     from ..issue import Issue
     from ..workflow import ServiceConfig
@@ -231,6 +232,7 @@ async def run_agent_attempt(orch, issue: Issue, attempt: int | None, cfg: Servic
                 full_ticket_path=orch._ticket_prompt_path(cfg, issue),
                 artifacts_dir=orch._prompt_artifacts_dir(cfg),
                 extra_context=skill_context,
+                board_health=orch._board_health_for_state(base_cfg, issue.state),
             )
             resumed_checkpoint = False
             checkpoint = running.continuation_checkpoint
@@ -368,12 +370,8 @@ async def run_agent_attempt(orch, issue: Issue, attempt: int | None, cfg: Servic
                             cfg.tracker.active_states
                         ):
                             if prev_phase_state in {
-                                "in progress",
-                                "verify",
-                                "document",
-                                # legacy lane name (pre-rename boards)
-                                "learn",
-                                "done",
+                                "in progress", "verify", "document", "learn", "done",
+                                "intake", "research", "plan", "review", "build", "qa",
                             }:
                                 # IMPORTANT: contract eval reads
                                 # `issue.description`, so we MUST use
@@ -415,8 +413,16 @@ async def run_agent_attempt(orch, issue: Issue, attempt: int | None, cfg: Servic
                                     )
                                     else None
                                 ),
+                                preset=guess_lane_preset(cfg.tracker.active_states),
+                                request=issue.request,
+                                advanced_state=current_state,
+                                app_release=known_app_release,
                             )
                             if not contract.passed:
+                                orch._record_stats_gate(
+                                    issue.identifier, prev_phase_state,
+                                    "contract_failure", tuple(contract.missing),
+                                )
                                 log.warning(
                                     "stage_contract_failed",
                                     issue_id=issue.id,
@@ -907,9 +913,10 @@ async def run_agent_attempt(orch, issue: Issue, attempt: int | None, cfg: Servic
                 # next iteration can detect a phase transition against
                 # the freshly refreshed state below.
                 prev_phase_state = current_state
-                prev_phase_state_raw = (
-                    running.issue.state if running is not None else issue.state
-                ) or ""
+                # Preserve the source lane's turn-start casing. A reconcile
+                # poll may mutate running.issue to the advanced lane while
+                # this model turn is still active.
+                prev_phase_state_raw = issue.state or ""
 
                 # Refresh issue state.
                 refreshed = await orch._refresh_issue_state(cfg, running_issue_id)
@@ -1053,6 +1060,65 @@ async def run_agent_attempt(orch, issue: Issue, attempt: int | None, cfg: Servic
                             target_state=rewind_target or "(none)",
                         )
                     break
+                successful_terminal = state in {
+                    normalize_state(name) for name in cfg.tracker.terminal_states
+                } and state in {"done", "completed"}
+                contract_producing = {
+                    "in progress", "verify", "document", "learn", "done",
+                    "intake", "research", "plan", "review", "build", "qa",
+                }
+                if (
+                    state not in active
+                    and successful_terminal
+                    and (prev_phase_state in contract_producing or cfg.artifacts.require_for_done)
+                    and cfg.agent.stage_contracts_enabled(cfg.tracker.active_states)
+                ):
+                    try:
+                        full_issue = await orch._refresh_issue_full(cfg, running_issue_id)
+                        if full_issue is not None:
+                            issue = full_issue
+                            running.issue = issue
+                        contract = evaluate_contract(
+                            producing_state=prev_phase_state,
+                            ticket_body=issue.description or "",
+                            identifier=issue.identifier,
+                            docs_root=workspace.path / "docs",
+                            artifact_store_root=(
+                                orch._artifact_store.root
+                                if cfg.artifacts.require_for_done and orch._artifact_store is not None
+                                else None
+                            ),
+                            preset=guess_lane_preset(cfg.tracker.active_states),
+                            request=issue.request,
+                            advanced_state=state,
+                            app_release=known_app_release,
+                        )
+                    except Exception as exc:
+                        outcome = "phase_transition_error"
+                        error = str(exc)
+                        return
+                    if not contract.passed:
+                        orch._record_stats_gate(
+                            issue.identifier, prev_phase_state, "contract_failure",
+                            tuple(contract.missing),
+                        )
+                        await asyncio.to_thread(
+                            orch._tracker_call_append_note, cfg, issue,
+                            contract.note_heading, contract.note_body,
+                        )
+                        rewind_state = prev_phase_state_raw or prev_phase_state
+                        await asyncio.to_thread(
+                            orch._tracker_call_update_state, cfg, issue, rewind_state
+                        )
+                        refreshed = await orch._refresh_issue_full(cfg, running_issue_id)
+                        issue = refreshed or issue
+                        issue = replace(issue, state=rewind_state)
+                        running.issue = issue
+                        state = normalize_state(issue.state)
+                        orch._record_stats_transition(
+                            issue.identifier, "done", state
+                        )
+                        debug.rewind_count += 1
                 if state not in active:
                     break
                 state_turn_count = _update_state_turn_counter(debug, state)

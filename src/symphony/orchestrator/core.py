@@ -84,7 +84,7 @@ from ..prompt import (
 from ..runtime_safety import ensure_workflow_repo_is_safe
 from ..service_identity import SERVICE_INSTANCE_ENV, normalize_service_instance_id
 from ..skills import render_skill_block
-from ..stats import StatsStore, stats_store_for
+from ..stats import StatsStore, board_health_summary, stats_store_for
 from ..trackers import TrackerClient, build_tracker_client
 from ..utils.wiki_sweep import sweep as _wiki_sweep_run
 from ..workflow import (
@@ -659,6 +659,7 @@ _BLOCKED_RCA_HOST_RESOLVED_HEADING_RE = re.compile(
     r"^##\s+Blocked\s+(?:Fix|RCA)\s+Resolved\s*$",
     re.IGNORECASE | re.MULTILINE,
 )
+_REOPEN_APPROVED_RE = re.compile(r"^##\s+Reopen Approved\b", re.MULTILINE)
 _BLOCKED_RCA_SOURCE_IDENTIFIER_RE = re.compile(
     r"^-\s*Identifier:\s*`(?P<identifier>[^`]+)`\s*$",
     re.IGNORECASE | re.MULTILINE,
@@ -4343,6 +4344,14 @@ class Orchestrator:
                     mutating_scan_open = False
                 continue
 
+            if await self._hold_reopened_ticket_over_budget(issue, cfg):
+                entry.update(
+                    status="needs_action", code="reopen_budget",
+                    reason="ticket exceeded agent.max_reopens and was parked",
+                    dispatch_outcome="state_changed",
+                )
+                continue
+
             if mutating_scan_open and self._available_slots(cfg) <= 0:
                 # Preserve the legacy loop's first capacity break. Remaining
                 # rows are projected without tracker writes or dispatch checks.
@@ -4489,6 +4498,8 @@ class Orchestrator:
             if self._available_slots(cfg) <= 0:
                 break
             if not self._should_dispatch(issue, cfg):
+                continue
+            if await self._hold_reopened_ticket_over_budget(issue, cfg):
                 continue
             conflict = self._conflict_blocker(issue)
             if conflict is not None:
@@ -7164,6 +7175,9 @@ class Orchestrator:
                 full_ticket_path=self._ticket_prompt_path(cfg, issue),
                 artifacts_dir=self._prompt_artifacts_dir(cfg),
                 extra_context=skill_context,
+                board_health=self._board_health_for_state(
+                    self._workflow_state.current() or cfg, issue.state
+                ),
             )
             await new_client.start_session(
                 initial_prompt=first_prompt,
@@ -8511,6 +8525,81 @@ class Orchestrator:
             to_state=normalize_state(to_state),
         )
 
+    def _record_stats_gate(
+        self, identifier: str, state: str, kind: str, items: tuple[str, ...] = ()
+    ) -> None:
+        if self._stats is not None:
+            self._stats.record_gate(
+                issue=identifier, state=normalize_state(state), kind=kind, items=items
+            )
+
+    def _board_health_for_state(self, cfg: ServiceConfig, state: str) -> str:
+        if normalize_state(state) not in {"document", "learn", "learning"} or self._stats is None:
+            return ""
+        try:
+            done = {normalize_state(item) for item in cfg.tracker.terminal_states}
+            done &= {"done", "completed"}
+            aggregate = self._stats.aggregate(
+                30, done or {"done"}, active_states=cfg.tracker.active_states
+            )
+            return board_health_summary(aggregate)
+        except Exception as exc:
+            log.warning("board_health_failed", error=str(exc))
+            return ""
+
+    def _prior_done_run_count(self, issue: Issue) -> int:
+        registry = self._run_registry
+        if registry is None:
+            return 0
+        records = self._registry_guard(
+            "reopen_history",
+            lambda: registry.recent_runs(issue.id, limit=200, status="normal"),
+            [],
+        )
+        return sum(
+            1
+            for record in records
+            if normalize_state(record.state) in {"done", "completed"}
+        )
+
+    async def _hold_reopened_ticket_over_budget(
+        self, issue: Issue, cfg: ServiceConfig
+    ) -> bool:
+        cap = cfg.agent.max_reopens
+        if cap <= 0:
+            return False
+        prior_done = self._prior_done_run_count(issue)
+        if prior_done <= cap + len(_REOPEN_APPROVED_RE.findall(issue.description or "")):
+            return False
+        target = next(
+            (state for state in cfg.tracker.terminal_states if normalize_state(state) == "blocked"),
+            _rewind_budget_target_state(cfg),
+        )
+        if not target:
+            return False
+        approvals = len(_REOPEN_APPROVED_RE.findall(issue.description or ""))
+        note = (
+            f"This ticket reached Done {prior_done} time(s) and was reopened again "
+            f"(agent.max_reopens: {cap}, approvals: {approvals}). Symphony moved it "
+            f"to {target} instead of dispatching another cycle. To allow one more, "
+            "append a `## Reopen Approved` section and move it back to its lane; "
+            "raise `agent.max_reopens` (0 disables) for more."
+        )
+        try:
+            await asyncio.to_thread(self._tracker_call_append_note, cfg, issue, "Reopen Budget", note)
+            await asyncio.to_thread(self._tracker_call_update_state, cfg, issue, target)
+        except Exception as exc:
+            log.warning("reopen_budget_hold_failed", identifier=issue.identifier, error=str(exc))
+            self._record_tracker_error(issue.id, exc)
+            return False
+        self._clear_tracker_error(issue.id)
+        self._record_stats_gate(issue.identifier, issue.state, "reopen_budget", (str(prior_done),))
+        log.warning(
+            "reopen_budget_exceeded", identifier=issue.identifier, prior_done_runs=prior_done,
+            max_reopens=cap, approvals=approvals, target_state=target,
+        )
+        return True
+
     # ------------------------------------------------------------------
     # worker exit handling (§16.6)
     # ------------------------------------------------------------------
@@ -8620,6 +8709,18 @@ class Orchestrator:
         )
         if entry is None:
             return
+        terminal_cancelled = False
+        cfg = self._workflow_state.current()
+        if reason == "cancelled" and cfg is not None:
+            # Reconcile can cancel a worker because an earlier poll saw a
+            # terminal state. Re-read now so an operator's subsequent reopen
+            # still follows normal recovery and retains the slot-holding retry.
+            refreshed = await self._refresh_issue_state(cfg, issue_id)
+            if refreshed is not None:
+                entry.issue = replace(entry.issue, state=refreshed.state)
+                terminal_cancelled = normalize_state(refreshed.state) in {
+                    normalize_state(state) for state in cfg.tracker.terminal_states
+                }
         if not defer_lease_finish:
             self._finish_run_lease(issue_id, entry, reason, error)
         elapsed = (datetime.now(timezone.utc) - entry.started_at).total_seconds()
@@ -8638,8 +8739,19 @@ class Orchestrator:
                 seconds=elapsed,
             )
 
+        if terminal_cancelled:
+            self._dispatch_state.cancel_pending_retry(issue_id)
+            self._claimed.discard(issue_id)
+            self._persisted_retry_attempts.pop(issue_id, None)
+            self._clear_issue_flags(issue_id, retry_attempt=True)
+            log.info(
+                "terminal_worker_cancelled", issue_id=issue_id,
+                state=entry.issue.state,
+            )
+            await self._notify_observers()
+            return
+
         if reason == "normal":
-            cfg = self._workflow_state.current()
             if entry.known_app_release_finalizer and cfg is not None:
                 refreshed_finalizer = await self._refresh_issue_full(cfg, issue_id)
                 if refreshed_finalizer is not None:
