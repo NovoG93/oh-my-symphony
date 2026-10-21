@@ -112,7 +112,8 @@ git merge-base --is-ancestor develop upstream/dev
 - Rewritten-history boundary: old integrated head `aaf2b72da3b97fb9d0b71fb881fafea38f59de6d` maps to `3e8402080e48ac169a4d21cc63da0e04717f63fa` with identical tree and patch ID; the 21-commit prior range matches under `git range-diff`. The offered range is therefore `3e840208..c6a3947` (191 commits: 141 non-merge, 50 merge; 29 first-parent), avoiding a misleading comparison across the rewrite.
 - Upstream `main` at `796e9de45c777399b02c4ec71fa0e4db4659350b` is three merge commits ahead of `dev` with zero tree diff; `dev` is the selected functional source.
 - Baseline preservation: `8da35d641fb103b84767c31622b240b0d44caa77` is the no-ff merge of the existing 11-commit fork branch into `develop` (parents `7917524b4007ba49afd95ecdaa68275a9ee3e0be` and `5cb758d14f745623a05eb935c4fb541786419906`).
-- Rewritten boundary bridge: `df64c1b` records the tree-equivalent rewritten upstream boundary without changing the fork tree. Integration branch: `feat/sync-upstream-v0.28-review`, currently at `ad31537f325fd1f5585cead0910101f4abb81c67` before M1. Focused and full tests now pass; M1 remains an open no-commit merge pending final independent ledger review. Its exact commit and parent hashes will be recorded in a follow-up ledger commit. M2 promotion is not yet performed.
+- Rewritten boundary bridge: `df64c1b` records the tree-equivalent rewritten upstream boundary without changing the fork tree. Integration branch: `feat/sync-upstream-v0.28-review`.
+- M1: `9a9ea969d9eb12918cf65d30a35e92ec209feb7c`, subject `merge: adapt upstream v0.28 reliability and review`. Parents: integration pre-merge `ad31537f325fd1f5585cead0910101f4abb81c67` and `upstream/dev` `c6a39473373f42393396e47114e2de0cb4cc8c8c`. Focused/full tests and the repository commit hook passed. This docs-only follow-up records M1 because a commit cannot include its own final hash. M2 promotion is not yet performed.
 - Integration method: selective adaptation inside the no-commit M1 merge. Existing fork tree and behavior were preserved, then only the accepted reliability and Human Review gaps were adapted. The index contains no unrelated upstream replacement.
 
 ### M1 conflict inventory
@@ -336,4 +337,4 @@ The table lists every commit in the rewritten source range, including merge comm
 - Focused lifecycle/API/TUI/dispatcher/backend-contract suite after the race fixes: `550 passed, 3 skipped`.
 - Ruff passed; Pyright passed with 0 errors/warnings/informations; i18n passed (625 keys); `uv lock --check` passed; `git diff --check` passed.
 - `symphony doctor ./WORKFLOW.md` was attempted. It refused the protected source-repository workflow and the sandbox blocked local bind/state/workspace writes; this is recorded as an environment limitation, not a doctor pass. No guard was weakened.
-- No push or deployment is authorized or performed. M1/M2 promotion remains gated on independent ledger review, commit/ancestry recording, and the final promotion checks.
+- No push or deployment is authorized or performed. M2 promotion remains gated on refreshing `origin/develop`, recording the exact promotion ancestry, and final Git checks.
