@@ -271,6 +271,19 @@ def _terminal_state_matching(cfg: ServiceConfig, *keywords: str) -> str:
     return ""
 
 
+_SUCCESSFUL_TERMINAL_STATES = frozenset({"done", "completed"})
+
+
+def _is_successful_terminal_state(state: str | None) -> bool:
+    """True for the terminal lane that means "delivered" (Done / Completed).
+
+    Blocked, Cancelled, Archive and Human Review are terminal too, but a
+    lane may reach them without its outputs; only the success lane is
+    stage-contract gated.
+    """
+    return normalize_state(state) in _SUCCESSFUL_TERMINAL_STATES
+
+
 def _human_review_target_state(cfg: ServiceConfig) -> str:
     """Lane for operator attention: `human`-ish, else `block`-ish, else the
     first terminal lane. Empty when the board declares no terminal lane."""

@@ -244,9 +244,9 @@ async def test_chat_session_crud(client: TestClient) -> None:
     assert patched["mode"] == "edit"
     assert patched["context_preserved"] is True  # claude resumes
 
-    resp = await client.delete("/api/v1/chat/session")
+    resp = await client.delete("/api/v1/chat/session", json={})
     assert resp.status == 200
-    resp = await client.delete("/api/v1/chat/session")
+    resp = await client.delete("/api/v1/chat/session", json={})
     assert resp.status == 404
     resp = await client.patch("/api/v1/chat/session", json={"mode": "qa"})
     assert resp.status == 404
@@ -280,17 +280,17 @@ async def test_intent_approval_endpoint_authorizes_idempotently_and_rejects_body
 
     manager._run_intent = approve
     url = f"/api/v1/chat/sessions/{session_id}/intent/{action.action_id}/approve"
-    denied = await client.post(url)
+    denied = await client.post(url, json={})
     assert denied.status == 403
-    denied = await client.post(url, headers={"X-Symphony-Chat-Confirmation": "x" * 64})
+    denied = await client.post(url, json={}, headers={"X-Symphony-Chat-Confirmation": "x" * 64})
     assert denied.status == 403
     bad_body = await client.post(url, json={"unexpected": True}, headers={"X-Symphony-Chat-Confirmation": CONFIRMATION_TOKEN})
     assert bad_body.status == 400
-    first = await client.post(url, headers={"X-Symphony-Chat-Confirmation": CONFIRMATION_TOKEN})
+    first = await client.post(url, json={}, headers={"X-Symphony-Chat-Confirmation": CONFIRMATION_TOKEN})
     assert first.status == 200
-    second = await client.post(url, headers={"X-Symphony-Chat-Confirmation": CONFIRMATION_TOKEN})
+    second = await client.post(url, json={}, headers={"X-Symphony-Chat-Confirmation": CONFIRMATION_TOKEN})
     assert second.status == 200
-    malformed = await client.post(f"/api/v1/chat/sessions/{session_id}/intent/not-an-id/approve", headers={"X-Symphony-Chat-Confirmation": CONFIRMATION_TOKEN})
+    malformed = await client.post(f"/api/v1/chat/sessions/{session_id}/intent/not-an-id/approve", json={}, headers={"X-Symphony-Chat-Confirmation": CONFIRMATION_TOKEN})
     assert malformed.status == 400
 
 
@@ -672,7 +672,7 @@ async def test_chat_sessions_plural_crud_and_singular_alias(
     assert resp.status == 200
     assert (await resp.json())["turn_count"] == 1
 
-    resp = await client.delete(f"/api/v1/chat/sessions/{first}")
+    resp = await client.delete(f"/api/v1/chat/sessions/{first}", json={})
     assert resp.status == 200
     resp = await client.get(f"/api/v1/chat/sessions/{first}")
     assert resp.status == 404
@@ -697,7 +697,7 @@ async def test_chat_stop_waits_for_gated_mode_rebuild(
         )
     )
     await entered.wait()
-    stopping = asyncio.create_task(client.delete(f"/api/v1/chat/sessions/{session_id}"))
+    stopping = asyncio.create_task(client.delete(f"/api/v1/chat/sessions/{session_id}", json={}))
     await asyncio.sleep(0)
     try:
         assert stopping.done() is False

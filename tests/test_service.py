@@ -5,10 +5,12 @@ from __future__ import annotations
 import json
 import os
 import secrets
+from concurrent.futures import ThreadPoolExecutor
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from datetime import datetime, timedelta, timezone
+from multiprocessing import get_context
 from pathlib import Path
-from threading import Thread
+from threading import Event, Thread
 from types import SimpleNamespace
 
 import pytest
@@ -75,6 +77,13 @@ def _record(
         orchestrator_command=["symphony", str(workflow_path), "--port", str(port)],
         service_instance_id=service_instance_id,
     )
+
+
+def _hold_service_lock_in_process(workflow_path: str, ready, release) -> None:
+    with acquire_service_lock(workflow_path):
+        ready.set()
+        if not release.wait(10):
+            raise RuntimeError("timed out waiting to release service lock")
 
 
 def test_record_path_is_inside_workflow_run_directory(tmp_path: Path) -> None:
@@ -1461,6 +1470,128 @@ def test_service_lock_blocks_second_start_for_same_workflow(tmp_path: Path) -> N
                 pass
 
 
+def test_service_lock_reclaims_dead_owner(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    workflow = _workflow(tmp_path)
+    path = service_module.lock_path_for(workflow)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("987654321\n", encoding="utf-8")
+    monkeypatch.setattr(service_module, "is_process_running", lambda pid: False)
+
+    with acquire_service_lock(workflow):
+        assert path.read_text(encoding="utf-8").strip() == str(os.getpid())
+    assert not path.exists()
+
+
+def test_concurrent_service_lock_contender_cannot_reclaim_live_owner(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    workflow = _workflow(tmp_path)
+    entered = Event()
+    release = Event()
+    monkeypatch.setattr(
+        service_module,
+        "is_process_running",
+        lambda pid: pid == os.getpid(),
+    )
+
+    def owner() -> None:
+        with acquire_service_lock(workflow):
+            entered.set()
+            assert release.wait(5)
+
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        owner_future = pool.submit(owner)
+        assert entered.wait(5)
+        with pytest.raises(ServiceLockError):
+            with acquire_service_lock(workflow):
+                pass
+        release.set()
+        owner_future.result(timeout=5)
+
+
+def test_service_lock_guard_serializes_cross_process_reclamation(
+    tmp_path: Path,
+) -> None:
+    workflow = _workflow(tmp_path)
+    lock_path = service_module.lock_path_for(workflow)
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    lock_path.write_text("987654321\n", encoding="utf-8")
+    process_context = get_context("spawn")
+    ready = process_context.Event()
+    release = process_context.Event()
+    process = process_context.Process(
+        target=_hold_service_lock_in_process,
+        args=(str(workflow), ready, release),
+    )
+
+    process.start()
+    try:
+        assert ready.wait(10)
+        assert lock_path.read_text(encoding="utf-8").strip() == str(process.pid)
+        with pytest.raises(ServiceLockError):
+            with acquire_service_lock(workflow):
+                pass
+    finally:
+        release.set()
+        process.join(timeout=10)
+        if process.is_alive():
+            process.terminate()
+            process.join()
+    assert process.exitcode == 0
+
+
+def test_service_lock_preserves_unreadable_owner(tmp_path: Path) -> None:
+    workflow = _workflow(tmp_path)
+    path = service_module.lock_path_for(workflow)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("\n", encoding="utf-8")
+
+    with pytest.raises(ServiceLockError):
+        with acquire_service_lock(workflow):
+            pass
+    assert path.exists()
+
+
+def test_port_owner_hint_ignores_service_record_owned_by_current_process(
+    tmp_path: Path,
+) -> None:
+    workflow = _workflow(tmp_path)
+    save_record(_record(workflow, pid=os.getpid(), port=9999))
+
+    hint = service_module.port_owner_hint(
+        workflow,
+        9999,
+        is_running=lambda _pid: pytest.fail("self PID must not be probed"),
+        is_api_reachable=lambda _host, _port: pytest.fail("must not probe own API"),
+    )
+
+    assert hint is None
+
+
+def test_startup_probe_reaps_early_child_exit(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(service_module, "_IS_WIN32", False)
+    monkeypatch.setattr(service_module.os, "waitpid", lambda pid, options: (pid, 1))
+    monkeypatch.setattr(service_module, "is_process_running", lambda pid: True)
+
+    assert service_module._exited_during_startup(4321)
+
+
+def test_terminate_process_falls_back_to_pid_when_not_group_leader(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    killed: list[tuple[int, int]] = []
+    monkeypatch.setattr(service_module, "is_process_running", lambda pid: True)
+
+    def missing_group(pid: int, sig: int) -> None:
+        raise ProcessLookupError
+
+    monkeypatch.setattr(service_module, "_killpg", missing_group)
+    monkeypatch.setattr(service_module.os, "kill", lambda pid, sig: killed.append((pid, sig)))
+
+    assert service_module.terminate_process(4321)
+    assert killed == [(4321, service_module.signal.SIGTERM)]
+
+
 def test_popen_detached_overwrites_instance_only_in_child_environment(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1511,7 +1642,7 @@ def test_start_generates_and_persists_one_service_instance_id(
 
     monkeypatch.setattr(secrets, "token_urlsafe", _token_urlsafe)
     monkeypatch.setattr(service_module, "_popen_detached", _spawn)
-    monkeypatch.setattr(service_module, "_wait_until", lambda *_args, **_kwargs: True)
+    monkeypatch.setattr(service_module, "_exited_during_startup", lambda _pid: False)
 
     rc = service_main(["start", "--no-systemd", "--skip-doctor", str(workflow)])
 
@@ -1565,7 +1696,7 @@ def test_start_cleans_spawned_process_if_record_save_fails(
         service_module, "_run_doctor_or_print", lambda *args, **kwargs: True
     )
     monkeypatch.setattr(service_module, "_popen_detached", lambda *args, **kwargs: 1234)
-    monkeypatch.setattr(service_module, "_wait_until", lambda *args, **kwargs: True)
+    monkeypatch.setattr(service_module, "_exited_during_startup", lambda _pid: False)
     monkeypatch.setattr(
         service_module,
         "save_record",

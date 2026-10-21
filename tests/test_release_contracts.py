@@ -13,7 +13,9 @@ import yaml
 
 from symphony.orchestrator import release_contracts as release_contracts_module
 from symphony.orchestrator.release_contracts import (
+    inspect_release_contract,
     release_workspace_target_errors,
+    resolve_configured_target_branch,
     resolve_target_release_identity,
     validate_release_contract,
 )
@@ -462,6 +464,34 @@ def test_current_target_with_exact_coverage_and_artifacts_passes(
     assert result.target_sha == _git(release_repo, "rev-parse", "main")
     assert len(result.contract_sha256) == 64
     assert len(result.fingerprint) == 64
+
+
+def test_empty_target_branch_resolves_to_current_branch(release_repo: Path) -> None:
+    assert resolve_configured_target_branch(release_repo, "") == "main"
+    assert resolve_configured_target_branch(release_repo, "  ") == "main"
+    assert resolve_configured_target_branch(release_repo, "release") == "release"
+
+    identity = resolve_target_release_identity(
+        repository_root=release_repo, configured_target_branch=""
+    )
+    assert identity.errors == ()
+    assert identity.target_branch == "main"
+    assert identity.target_sha == _git(release_repo, "rev-parse", "main")
+    assert inspect_release_contract(
+        release_repo / "release-contract.yaml", configured_target_branch=""
+    ) == ()
+    result = validate_release_contract(
+        workspace_root=release_repo,
+        repository_root=release_repo,
+        verifier_ticket="VERIFY-1",
+        configured_target_branch="",
+    )
+    assert result.passed is True
+    assert result.target_branch == "main"
+    assert result.target_sha == identity.target_sha
+
+    _git(release_repo, "checkout", "--detach", "main")
+    assert resolve_configured_target_branch(release_repo, "") == ""
 
 
 def test_historical_green_cannot_approve_a_new_target(release_repo: Path) -> None:

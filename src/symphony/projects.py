@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import errno
 import json
 import os
 import re
@@ -383,7 +384,15 @@ class ProjectTargetExpectation:
 
 def canonical_project_repo(candidate: str | Path) -> Path:
     """Return an existing Git top-level, otherwise the resolved candidate path."""
-    path = Path(candidate).expanduser().resolve()
+    raw = Path(candidate).expanduser()
+    # Path.resolve() stopped reliably raising ELOOP for cyclic symlinks on
+    # Python 3.13. Reject dangling symlink components before canonicalizing.
+    for part in (raw, *raw.parents):
+        if part.is_symlink() and not part.exists():
+            raise OSError(
+                errno.ELOOP, "unresolvable symlink in project path", str(part)
+            )
+    path = raw.resolve()
     if path.exists() and path.is_dir():
         return _git_toplevel(path) or path
     return path

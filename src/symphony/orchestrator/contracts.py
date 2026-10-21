@@ -63,6 +63,19 @@ from ..workflow.presets import (
     board_uses_default_contracts as board_uses_default_contracts,
 )
 
+_DEEP_STATES = frozenset({"intake", "research", "plan", "review", "build", "qa", "verify", "document"})
+_DEEP_SECTIONS = {
+    "intake": ("## Brief",), "research": ("## Research",),
+    "plan": ("## Plan Summary",), "build": ("## Implementation",),
+    "document": ("## Delivery",),
+}
+_DEEP_FILES = {
+    "intake": ("brief.md",), "research": ("research.md",),
+    "plan": ("plan.md", "contracts.md"), "review": ("review.md",),
+    "build": ("claims.md",), "qa": ("qa-report.md",),
+    "verify": ("verification.md",), "document": ("delivery.md",),
+}
+
 
 @dataclass(frozen=True)
 class ContractFailure:
@@ -168,6 +181,10 @@ def evaluate_contract(
     *,
     docs_root: Path | None = None,
     artifact_store_root: Path | None = None,
+    preset: str | None = None,
+    request: str | None = None,
+    advanced_state: str | None = None,
+    app_release: bool = False,
 ) -> ContractResult:
     """Evaluate the producing stage's contract against the ticket body.
 
@@ -182,21 +199,29 @@ def evaluate_contract(
     state = (producing_state or "").strip().lower()
     body = ticket_body or ""
 
-    if state == "in progress":
-        return _evaluate_in_progress_contract(
-            producing_state, body, identifier, docs_root
+    if preset == "deep":
+        return _evaluate_deep_contract(
+            producing_state, state, body, identifier, docs_root, request,
+            advanced_state, app_release,
         )
 
-    if state == "verify":
-        return _evaluate_verify_contract(producing_state, body, identifier, docs_root)
+    advanced = (advanced_state or "").strip().lower()
+    result: ContractResult
+
+    if state == "in progress":
+        result = _evaluate_in_progress_contract(
+            producing_state, body, identifier, docs_root
+        )
+    elif state == "verify":
+        result = _evaluate_verify_contract(producing_state, body, identifier, docs_root)
 
     # "learn" is the pre-rename name of the default board's Document lane;
     # existing boards keep the old lane name, so it stays a supported alias.
-    if state in ("document", "learn"):
-        return _evaluate_document_contract(producing_state, body)
+    elif state in ("document", "learn"):
+        result = _evaluate_document_contract(producing_state, body)
 
-    if state == "done":
-        return _evaluate_done_contract(
+    elif state == "done":
+        result = _evaluate_done_contract(
             producing_state,
             body,
             identifier,
@@ -204,7 +229,54 @@ def evaluate_contract(
             artifact_store_root=artifact_store_root,
         )
 
-    return ContractResult(passed=True)
+    else:
+        result = ContractResult(passed=True)
+    if (
+        artifact_store_root is not None and identifier and advanced == "done"
+        and state != "done"
+        and not _has_collected_artifact(artifact_store_root / identifier / "files")
+    ):
+        missing = [*result.missing,
+            "no collected artifacts (`artifacts.require_for_done` is enabled) — save at least one deliverable file into `.symphony-artifacts/`"]
+        return _build_result(producing_state, missing, warnings=result.warnings, failures=result.failures)
+    return result
+
+
+def _evaluate_deep_contract(
+    producing_state: str, state: str, body: str, identifier: str,
+    docs_root: Path | None, request: str | None, advanced_state: str | None,
+    app_release: bool,
+) -> ContractResult:
+    if state not in _DEEP_STATES:
+        return ContractResult(passed=True)
+    missing = _missing_sections(body, _DEEP_SECTIONS.get(state, ()))
+    if state == "verify" and app_release:
+        return _build_result(producing_state, missing)
+    if docs_root is None or not identifier:
+        return _build_result(producing_state, missing)
+    group = (request or "").strip()
+    vault = docs_root / "req" / group if group else docs_root / identifier
+    texts: dict[str, str] = {}
+    for name in _DEEP_FILES.get(state, ()):
+        try:
+            texts[name] = (vault / name).read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            texts[name] = ""
+        if not texts[name].strip():
+            missing.append(f"vault file `{vault / name}` missing or empty")
+    if state == "review" and (advanced_state or "").lower() == "done":
+        if not re.search(r"^verdict:\s*PASS\s*$", texts.get("review.md", ""), re.M):
+            missing.append(f"`{vault / 'review.md'}` has no `verdict: PASS` line")
+    if state == "build" and texts.get("claims.md", "").strip():
+        if not re.search(r"^##\s.*" + re.escape(identifier) + r"\b", texts["claims.md"], re.M):
+            missing.append(f"`{vault / 'claims.md'}` has no claim for `{identifier}`")
+    if state == "qa" and texts.get("qa-report.md", "").strip():
+        if not re.search(r"^Verdict:\s*(APPROVED|BLOCKED)\s*$", texts["qa-report.md"], re.M):
+            missing.append(f"`{vault / 'qa-report.md'}` has no approved/blocked verdict")
+    if state == "verify" and texts.get("verification.md", "").strip():
+        if not re.search(r"^verdict:\s*(GREEN|RED)\s*$", texts["verification.md"], re.M):
+            missing.append(f"`{vault / 'verification.md'}` has no GREEN/RED verdict")
+    return _build_result(producing_state, missing)
 
 
 def _evaluate_in_progress_contract(
@@ -304,16 +376,17 @@ def _section_present_nonempty(body: str, heading: str) -> bool:
     if not body:
         return False
     pattern = re.compile(
-        r"^##\s+" + re.escape(heading[3:].strip()) + r"\s*:?\s*$",
+        r"^##\s+" + re.escape(heading[3:].strip()) + r"\s*(?::\s*(?P<inline>.*))?$",
         re.IGNORECASE | re.MULTILINE,
     )
     match = pattern.search(body)
     if not match:
         return False
+    inline = match.group("inline") or ""
     after = body[match.end() :]
     next_heading = re.search(r"^##\s+\S", after, re.MULTILINE)
     section_body = after if next_heading is None else after[: next_heading.start()]
-    return bool(section_body.strip())
+    return bool(inline.strip() or section_body.strip())
 
 
 def _has_collected_artifact(path: Path) -> bool:

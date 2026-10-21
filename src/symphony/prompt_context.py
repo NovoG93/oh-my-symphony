@@ -107,6 +107,7 @@ def build_issue_prompt_context(
     *,
     state: str,
     is_rewind: bool = False,
+    board_health: str = "",
 ) -> str:
     """Return the state-relevant ticket description for prompt rendering.
 
@@ -134,7 +135,7 @@ def build_issue_prompt_context(
     elif normalized_state in {"document", "learn", "learning"}:
         # "learn"/"learning" are legacy names of the Document lane.
         _select_latest_matching(selected, sections, _DOCUMENT_LATEST_SECTIONS)
-    elif normalized_state == "in progress":
+    elif normalized_state in {"in progress", "build"}:
         _select_latest_matching(selected, sections, _IN_PROGRESS_LATEST_SECTIONS)
         latest_failure = _latest_section(sections, _FAILURE_SECTIONS)
         if latest_failure is not None:
@@ -151,6 +152,8 @@ def build_issue_prompt_context(
         rendered = section.render()
         if rendered:
             chunks.append(rendered)
+    if board_health and normalized_state in {"document", "learn", "learning"}:
+        chunks.append("## Board Health\n" + board_health.strip())
     if chunks:
         return "\n\n".join(chunks).strip()
     return _clean_preamble(description).strip()

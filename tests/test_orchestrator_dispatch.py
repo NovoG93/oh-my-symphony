@@ -3252,7 +3252,8 @@ def _install_running_entry(orch: Orchestrator, issue: Issue) -> RunningEntry:
     return entry
 
 
-def test_token_totals_track_cache_input_tokens_separately():
+@pytest.mark.parametrize("input_tokens", [10, 100])
+def test_token_totals_track_cache_input_tokens_separately(input_tokens):
     orch = _orch()
     issue = _issue("TOK-1", state="In Progress")
     entry = _install_running_entry(orch, issue)
@@ -3260,7 +3261,7 @@ def test_token_totals_track_cache_input_tokens_separately():
     delta_total, delta_out = orch._apply_token_totals(
         entry,
         {
-            "input_tokens": 10,
+            "input_tokens": input_tokens,
             "cache_input_tokens": 90,
             "output_tokens": 5,
             "total_tokens": 105,
@@ -3271,12 +3272,13 @@ def test_token_totals_track_cache_input_tokens_separately():
 
     assert delta_total == 105
     assert delta_out == 5
-    assert entry.codex_input_tokens == 10
+    assert entry.codex_input_tokens == input_tokens
     assert entry.codex_cache_input_tokens == 90
     assert entry.codex_output_tokens == 5
     assert row["tokens"]["cache_input_tokens"] == 90
     assert row["tokens"]["state_cache_input_tokens"] == 90
     assert snap["codex_totals"]["cache_input_tokens"] == 90
+    assert snap["codex_totals"]["total_tokens"] == 105
 
 
 def test_token_totals_delta_cumulative_reports_without_double_counting():
@@ -10828,3 +10830,253 @@ def test_kill_without_recorded_identity_stays_ungated(tmp_path, monkeypatch):
     orch._force_eject_zombie(issue.id, entry, cfg)
 
     assert captured == [(4242, None)], "identity=None must keep the kill ungated"
+
+
+def _seed_done_runs(
+    registry: RunRegistry, issue: Issue, count: int, tmp_path: Path
+) -> None:
+    for i in range(count):
+        run_id = registry.acquire_run(
+            issue,
+            workspace_path=tmp_path / f"seed-ws-{i}",
+            attempt=None,
+            attempt_kind="fresh",
+            agent_kind="codex",
+        )
+        assert run_id is not None
+        ok = registry.complete_run(
+            issue_id=issue.id,
+            run_id=run_id,
+            status="normal",
+            state="Done",
+        )
+        assert ok is True
+
+
+def _reopen_tick(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    *,
+    prior_done: int,
+    max_reopens: int,
+    body: str = "",
+) -> tuple[list[str], list[tuple[str, str, str]], list[tuple[str, str]]]:
+    workflow_path = tmp_path / "WORKFLOW.md"
+    cfg = _make_config(
+        workflow_path=workflow_path,
+        tracker_kind="file",
+        active_states=("Todo", "In Progress", "Verify"),
+        terminal_states=("Done", "Blocked", "Cancelled"),
+        auto_triage_actionable_todo=False,
+    )
+    cfg = replace(cfg, agent=replace(cfg.agent, max_reopens=max_reopens))
+    issue = _issue("MT-1", state="In Progress", description=body)
+    orch = _orch()
+    db_path = tmp_path / ".symphony" / "state.db"
+    registry = RunRegistry(db_path)
+    orch._run_registry = registry
+    _seed_done_runs(registry, issue, prior_done, tmp_path)
+
+    monkeypatch.setattr(orch, "_open_run_registry", lambda _cfg: (registry, False))
+    monkeypatch.setattr(orch._workflow_state, "reload", lambda: (cfg, None))
+    dispatched: list[str] = []
+    appended: list[tuple[str, str, str]] = []
+    moved: list[tuple[str, str]] = []
+
+    async def _fetch(_cfg):
+        return [issue]
+
+    async def _archive(_cfg):
+        return None
+
+    def _dispatch(_issue, _cfg, *, attempt, attempt_kind=None):
+        dispatched.append(_issue.identifier)
+
+    def _append(_cfg, _issue, heading, body):
+        appended.append((_issue.identifier, heading, body))
+
+    def _move(_cfg, _issue, target):
+        moved.append((_issue.identifier, target))
+
+    monkeypatch.setattr(orch, "_fetch_candidates", _fetch)
+    monkeypatch.setattr(orch, "_archive_sweep", _archive)
+    monkeypatch.setattr(orch, "_tracker_call_terminal_issues", lambda _cfg: [])
+    monkeypatch.setattr(orch, "_dispatch", _dispatch)
+    monkeypatch.setattr(Orchestrator, "_tracker_call_append_note", staticmethod(_append))
+    monkeypatch.setattr(Orchestrator, "_tracker_call_update_state", staticmethod(_move))
+
+    asyncio.run(orch._on_tick())
+    registry.close()
+    return dispatched, appended, moved
+
+
+def test_reopen_within_budget_dispatches(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    dispatched, appended, moved = _reopen_tick(
+        monkeypatch, tmp_path, prior_done=1, max_reopens=1
+    )
+    assert dispatched == ["MT-1"]
+    assert moved == []
+    assert appended == []
+
+
+def test_reopen_over_budget_is_parked_in_blocked_with_note(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    dispatched, appended, moved = _reopen_tick(
+        monkeypatch, tmp_path, prior_done=2, max_reopens=1
+    )
+    assert dispatched == []
+    assert moved == [("MT-1", "Blocked")]
+    assert len(appended) == 1
+    assert appended[0][0] == "MT-1"
+    assert appended[0][1] == "Reopen Budget"
+    assert "reached Done 2 time(s)" in appended[0][2]
+    assert "agent.max_reopens: 1" in appended[0][2]
+
+
+def test_reopen_approved_section_extends_the_budget(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    body = "## Reopen Approved\nAuthorized by operator."
+    dispatched, appended, moved = _reopen_tick(
+        monkeypatch, tmp_path, prior_done=2, max_reopens=1, body=body
+    )
+    assert dispatched == ["MT-1"]
+    assert moved == []
+    assert appended == []
+
+
+def test_reopen_budget_zero_disables_the_cap(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    dispatched, appended, moved = _reopen_tick(
+        monkeypatch, tmp_path, prior_done=5, max_reopens=0
+    )
+    assert dispatched == ["MT-1"]
+    assert moved == []
+    assert appended == []
+
+
+def test_first_dispatch_never_counts_as_a_reopen(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    dispatched, appended, moved = _reopen_tick(
+        monkeypatch, tmp_path, prior_done=0, max_reopens=1
+    )
+    assert dispatched == ["MT-1"]
+    assert moved == []
+    assert appended == []
+
+
+@pytest.mark.parametrize("persist_fails", [False, True])
+def test_on_worker_exit_hit_max_turns_survives_next_tick_prune(monkeypatch, persist_fails):
+    """Per-attempt max_turns without a persisted state must not re-dispatch."""
+    import asyncio
+
+    cfg = _make_config(max_concurrent=1)
+    assert cfg.agent.budget_exhausted_state == "", "precondition"
+    assert "Blocked" not in cfg.tracker.terminal_states, "precondition"
+    orch = _orch()
+    if persist_fails:
+        cfg = replace(
+            cfg, tracker=replace(cfg.tracker, terminal_states=("Done", "Blocked"))
+        )
+
+        def _fail_update(*args):
+            raise OSError("tracker unavailable")
+
+        monkeypatch.setattr(orch, "_tracker_call_update_state", _fail_update)
+    issue = _issue("MT-MAX-PRUNE", state="In Progress")
+    dispatched: list[str] = []
+
+    async def _fetch(_cfg):
+        return [issue]
+
+    async def _archive(_cfg):
+        return None
+
+    def _dispatch(_issue, _cfg, *, attempt, attempt_kind=None):
+        dispatched.append(_issue.identifier)
+
+    async def _run() -> None:
+        orch._loop = asyncio.get_running_loop()
+        entry = _install_running_entry(orch, issue)
+        entry.hit_max_turns = True
+        _stub_workflow_state_returning(orch, cfg, monkeypatch)
+        monkeypatch.setattr(orch, "_fetch_candidates", _fetch)
+        monkeypatch.setattr(orch, "_archive_sweep", _archive)
+        monkeypatch.setattr(orch, "_dispatch", _dispatch)
+
+        await orch._on_worker_exit(issue.id, reason="normal", error=None)
+        assert issue.id in orch._turn_budget_exhausted
+        assert issue.id in orch._claimed
+
+        await orch._on_tick()
+
+        assert dispatched == []
+        assert issue.id in orch._turn_budget_exhausted
+        assert issue.id not in orch._claimed
+
+    asyncio.run(_run())
+
+
+def test_startup_terminal_cleanup_preserves_human_review_workspace(
+    tmp_path: Path, monkeypatch
+):
+    """Human Review is awaiting approval; restart cleanup must not reap it."""
+    workspace = tmp_path / "ws" / "MT-REVIEW"
+    workspace.mkdir(parents=True)
+
+    cfg = _make_config(
+        max_concurrent=1,
+        terminal_states=("Human Review", "Done", "Cancelled", "Blocked"),
+    )
+    issue = _issue("MT-REVIEW", state="Human Review")
+    orch = _orch()
+    monkeypatch.setattr(orch, "_tracker_call_terminal_issues", lambda c: [issue])
+
+    calls: list[str] = []
+
+    class _StubWS:
+        def path_for(self, ident):
+            return workspace
+
+        async def remove(self, p):
+            calls.append(f"remove:{Path(p).name}")
+
+    orch._workspace_manager = _StubWS()  # type: ignore[assignment]
+
+    asyncio.run(orch._startup_terminal_cleanup(cfg))
+
+    assert calls == []
+    assert workspace.exists()
+
+
+# ---------------------------------------------------------------------------
+# quota / usage-limit error classification
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        "turn_failed: codex: You have hit your usage limit for this plan",
+        "429 rate limit exceeded: insufficient_quota; check billing",
+    ],
+)
+def test_quota_error_pins_the_next_fallback_backend_and_retries(error: str) -> None:
+    assert core_module._is_quota_worker_error("turn_error", error) is True
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        "429 too many requests",
+        "429 rate limit exceeded",
+        "rate limit reached; retry after 30 seconds",
+    ],
+)
+def test_transient_rate_limit_retries_on_the_same_backend(error: str) -> None:
+    assert core_module._is_quota_worker_error("turn_error", error) is False

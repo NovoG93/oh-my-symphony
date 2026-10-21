@@ -15,6 +15,7 @@ from aiohttp import web
 from aiohttp.test_utils import TestClient, TestServer
 
 from symphony.orchestrator import Orchestrator
+from symphony import server as server_module
 from symphony.server import build_app
 from symphony.workflow import WorkflowState
 from symphony.webapi import (
@@ -185,6 +186,50 @@ async def test_token_set_gates_mutation_routes_too(
         "/api/v1/refresh", json={}, headers={"Authorization": "Bearer sekrit-token"}
     )
     assert allowed.status == 202
+
+
+async def test_bodyless_mutation_requires_json_content_type(client: TestClient) -> None:
+    response = await client.post("/api/v1/refresh")
+
+    assert response.status == 415
+    assert (await response.json())["error"]["code"] == "unsupported_media_type"
+
+
+async def test_network_bind_without_bearer_warns_while_capability_gates_remain(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    warnings: list[tuple[str, dict[str, object]]] = []
+
+    class Runner:
+        sites: list[object] = []
+
+        async def setup(self) -> None:
+            return None
+
+    class Site:
+        def __init__(self, *_args: object, **_kwargs: object) -> None:
+            pass
+
+        async def start(self) -> None:
+            return None
+
+    monkeypatch.setenv(AUTH_MODE_ENV, "capabilities")
+    monkeypatch.setenv(CAPABILITIES_ENV, "")
+    monkeypatch.setenv(TRUSTED_ORIGINS_ENV, "https://board.example")
+    monkeypatch.delenv(API_TOKEN_ENV, raising=False)
+    monkeypatch.setattr(server_module.web, "AppRunner", lambda _app: Runner())
+    monkeypatch.setattr(server_module.web, "TCPSite", Site)
+    monkeypatch.setattr(
+        server_module.log,
+        "warning",
+        lambda event, **fields: warnings.append((event, fields)),
+    )
+
+    await server_module.run_server(web.Application(), "0.0.0.0", 9999)
+
+    assert len(warnings) == 1
+    assert warnings[0][0] == "http_server_without_bearer_on_network_bind"
+    assert "capability gates remain active" in str(warnings[0][1]["hint"])
 
 
 async def test_health_is_public_and_never_returns_service_probe_credential(

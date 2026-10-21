@@ -40,6 +40,7 @@ from .constants import (
     DEFAULT_COPILOT_COMMAND,
     DEFAULT_KIRO_COMMAND,
     DEFAULT_MAX_ATTEMPTS,
+    DEFAULT_MAX_REOPENS,
     DEFAULT_MAX_RETRIES,
     DEFAULT_MAX_STATE_TURNS,
     DEFAULT_MAX_TOTAL_TURNS,
@@ -48,7 +49,7 @@ from .constants import (
     DEFAULT_WORKSPACE_REUSE_POLICY,
     SUPPORTED_CI_MODES,
 )
-from .presets import board_uses_default_contracts
+from .presets import board_uses_shipped_contracts
 
 
 @dataclass(frozen=True)
@@ -152,6 +153,9 @@ class AgentConfig:
     no_stage_change_action: str = "block"
     # Soft cap for Verify/Document rewinds back into In Progress. 0 disables.
     max_attempts: int = DEFAULT_MAX_ATTEMPTS
+    # Bound fresh dispatch cycles after a ticket has already reached Done.
+    # Zero disables this cap; each explicit Reopen Approved section grants one.
+    max_reopens: int = DEFAULT_MAX_REOPENS
     # Cap on auto-retries scheduled after a worker exits with a non-normal
     # outcome (timeout, crash, transient backend error). On exhaustion the
     # orchestrator stops scheduling further retries, appends an
@@ -292,7 +296,7 @@ class AgentConfig:
             return True
         if mode == "off":
             return False
-        return board_uses_default_contracts(active_states)
+        return board_uses_shipped_contracts(active_states)
 
     def stall_timeout_ms_for_state(self, state: str | None, fallback: int) -> int:
         """Per-state stall budget with fallback to the backend's value."""

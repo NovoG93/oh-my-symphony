@@ -174,6 +174,7 @@ def test_start_falls_back_to_detached_without_systemd(
         service_module, "_popen_detached", lambda cmd, **kw: spawned.append(cmd) or 4242
     )
     monkeypatch.setattr(service_module, "_wait_until", lambda *a, **k: True)
+    monkeypatch.setattr(service_module, "_exited_during_startup", lambda pid: False)
     monkeypatch.setattr(service_module, "_run_doctor_or_print", lambda *a, **k: True)
     wf = _workflow(tmp_path)
 
@@ -197,6 +198,7 @@ def test_start_no_systemd_flag_forces_detached_backend(
         service_module, "_popen_detached", lambda cmd, **kw: spawned.append(cmd) or 4242
     )
     monkeypatch.setattr(service_module, "_wait_until", lambda *a, **k: True)
+    monkeypatch.setattr(service_module, "_exited_during_startup", lambda pid: False)
     monkeypatch.setattr(service_module, "_run_doctor_or_print", lambda *a, **k: True)
     wf = _workflow(tmp_path)
 

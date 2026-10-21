@@ -6,6 +6,14 @@ from pathlib import Path
 STATIC_ROOT = Path("src/symphony/web/static")
 
 
+def test_bodyless_mutations_send_json_to_force_cors_preflight() -> None:
+    js = _script_bundle()
+
+    assert "const MUTATING_METHODS = new Set(['POST', 'PUT', 'PATCH', 'DELETE'])" in js
+    assert "if (body === undefined && MUTATING_METHODS.has(method.toUpperCase()))" in js
+    assert "body = '{}'" in js
+
+
 def _script_bundle() -> str:
     """Every script the board ships, concatenated.
 
@@ -549,7 +557,7 @@ def test_board_request_view_ships_accessible_explainable_schedule_contract() -> 
     assert "getRequestSchedule: (kind, id)" in js
     assert "new URLSearchParams({ kind, id })" in js
     assert "function renderRequestView(scrollEl)" in js
-    assert "function buildScheduleNode(node, index)" in js
+    assert "function buildScheduleNode(" in js
     assert "t('schedule.invalidExecutionOrder')" in js
     assert "'aria-busy': state.requestLoading ? 'true' : 'false'" in js
     assert "Request schedule" in js

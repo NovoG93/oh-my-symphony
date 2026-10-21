@@ -241,7 +241,38 @@ def check_agent_cli(cfg: ServiceConfig) -> CheckResult:
         located = sys.executable
     if located is None:
         return CheckResult(name, "fail", f"{binary!r} not on $PATH (configured: {command!r})")
+    probe = _probe_agent_binary(located)
+    if probe is not None:
+        return CheckResult(name, probe[0], f"{binary} → {located}; {probe[1]}")
     return CheckResult(name, "pass", f"{binary} → {located}")
+
+
+_AGENT_PROBE_TIMEOUT_S = 15
+
+
+def _probe_agent_binary(located: str) -> tuple[Status, str] | None:
+    """Run `<binary> --version`; None when it exits 0."""
+    try:
+        completed = subprocess.run(
+            [located, "--version"],
+            capture_output=True,
+            text=True,
+            timeout=_AGENT_PROBE_TIMEOUT_S,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        return ("fail", f"`{Path(located).name} --version` could not run: {exc}")
+    if completed.returncode == 0:
+        return None
+    tail = " ".join(
+        part.strip() for part in (completed.stderr, completed.stdout) if part.strip()
+    )[-200:]
+    detail = f" — {tail}" if tail else ""
+    return (
+        "warn",
+        f"`{Path(located).name} --version` exited {completed.returncode}{detail}; "
+        "the launcher may be a broken stub (check the symlink target)",
+    )
 
 
 def check_agent_profiles(cfg: ServiceConfig) -> list[CheckResult]:
@@ -297,6 +328,17 @@ def check_agent_profiles(cfg: ServiceConfig) -> list[CheckResult]:
                     res_name,
                     "fail",
                     f"{binary!r} not on $PATH (configured: {command!r})",
+                )
+            )
+            continue
+
+        probe = _probe_agent_binary(located)
+        if probe is not None:
+            results.append(
+                CheckResult(
+                    res_name,
+                    probe[0],
+                    f"{kind} profile {name!r} ({binary} → {located}): {probe[1]}",
                 )
             )
             continue

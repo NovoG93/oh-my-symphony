@@ -8,7 +8,7 @@ from pathlib import Path
 from symphony.prompt import build_first_turn_prompt
 from symphony.issue import Issue
 from symphony.skills import list_skills, normalize_skill_names, render_skill_block
-from symphony.stats import StatsStore, stats_store_for
+from symphony.stats import StatsStore, board_health_summary, stats_store_for
 
 
 # ---------------------------------------------------------------------------
@@ -192,3 +192,83 @@ def test_skill_block_survives_strict_template_rendering(tmp_path: Path) -> None:
     )
     assert "Work T-1." in prompt
     assert "Use {{ curly braces }} literally." in prompt
+
+
+def test_stats_record_gate_and_aggregation(tmp_path: Path) -> None:
+    store = StatsStore(tmp_path / "stats.jsonl")
+    store.record_gate(
+        issue="T-1",
+        state="verify",
+        kind="contract_failure",
+        items=["## Merge Status: clean", "vault file `qa-report.md` missing"],
+    )
+    store.record_gate(
+        issue="T-2",
+        state="in progress",
+        kind="reopen_budget",
+        items=["4"],
+    )
+    store.record_gate(
+        issue="T-3",
+        state="document",
+        kind="backend_fallback",
+        items=[],
+    )
+    agg = store.aggregate(days=7)
+    gates = agg["gates"]
+    assert gates["contract_failure"] == 1
+    assert gates["reopen_budget"] == 1
+    assert gates["backend_fallback"] == 1
+    assert gates["rewinds"] == 0
+
+    misses = gates["top_contract_misses"]
+    assert len(misses) == 2
+    items = {m["item"] for m in misses}
+    assert "## Merge Status" in items
+    assert "qa-report.md" in items
+
+
+def test_stats_dynamic_lane_rewind_counting(tmp_path: Path) -> None:
+    store = StatsStore(tmp_path / "stats.jsonl")
+    # Forward: Todo -> In Progress (index 0 -> 1)
+    store.record_transition(issue="T-1", from_state="Todo", to_state="In Progress")
+    # Forward: In Progress -> Verify (index 1 -> 2)
+    store.record_transition(issue="T-1", from_state="In Progress", to_state="Verify")
+    # Rewind: Verify -> In Progress (index 2 -> 1)
+    store.record_transition(issue="T-1", from_state="Verify", to_state="In Progress")
+
+    agg = store.aggregate(
+        days=7,
+        active_states=("Todo", "In Progress", "Verify", "Document"),
+    )
+    assert agg["gates"]["rewinds"] == 1
+    by_state = {row["state"]: row for row in agg["by_state"]}
+    assert by_state["verify"]["rewinds_out"] == 1
+    assert by_state["in progress"]["rewinds_in"] == 1
+
+
+def test_board_health_summary_empty_when_no_pressure(tmp_path: Path) -> None:
+    store = StatsStore(tmp_path / "stats.jsonl")
+    store.record_transition(issue="T-1", from_state="Todo", to_state="Done")
+    agg = store.aggregate(days=7)
+    assert board_health_summary(agg) == ""
+
+
+def test_board_health_summary_renders_formatted_summary(tmp_path: Path) -> None:
+    store = StatsStore(tmp_path / "stats.jsonl")
+    store.record_transition(issue="T-1", from_state="Verify", to_state="In Progress")
+    store.record_gate(
+        issue="T-1",
+        state="verify",
+        kind="contract_failure",
+        items=["## AC Scorecard: pass"],
+    )
+    agg = store.aggregate(days=30)
+    summary = board_health_summary(agg)
+    assert summary != ""
+    assert "last 30 days:" in summary
+    assert "rewinds=1" in summary
+    assert "contract failures=1" in summary
+    assert "lane `verify`: rewound 1x, contract failed 1x" in summary
+    assert "recurring miss in `verify`: ## AC Scorecard (1x)" in summary
+

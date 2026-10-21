@@ -143,6 +143,8 @@
     }
   }
 
+  const MUTATING_METHODS = new Set(['POST', 'PUT', 'PATCH', 'DELETE']);
+
   async function apiRequest(path, { method = 'GET', body, headers = {} } = {}) {
     // A board snapshot can remain visible after polling loses connectivity.
     // Block every mutation at the shared boundary, including controls in a
@@ -152,6 +154,12 @@
       throw new ApiError(t('conn.staleMutationBlocked'), 'stale_board', 503);
     }
     const init = { method, headers: withAuthHeaders(headers) };
+    // JSON content type triggers a CORS preflight for every mutation. Send an
+    // empty JSON object when the action has no payload so it passes the same
+    // server-side CSRF gate as mutations with a body.
+    if (body === undefined && MUTATING_METHODS.has(method.toUpperCase())) {
+      body = '{}';
+    }
     if (body !== undefined) {
       init.body = body;
       init.headers['Content-Type'] = 'application/json';
@@ -1595,8 +1603,8 @@
     return grid;
   }
 
-  function buildScheduleNode(node, index) {
-    const decision = node.decision || {};
+  function buildScheduleNode(node, index, schedule) {
+    const decision = scheduleDecision(schedule, node);
     const status = decision.status || 'waiting';
     const row = el('li', { class: `request-node status-${status}${node.cycle ? ' cycle-node' : ''}` });
     const wave = node.wave == null ? '—' : String(node.wave);
@@ -1732,7 +1740,7 @@
     panel.appendChild(el('h3', { class: 'request-list-title' }, t('schedule.executionOrder')));
     panel.appendChild(el('p', { class: 'request-list-help' }, t('schedule.executionHelp')));
     const list = el(schedule.execution_valid === false ? 'ul' : 'ol', { class: 'request-node-list', 'aria-label': schedule.execution_valid === false ? t('schedule.invalidExecutionOrder') : t('schedule.executionOrder') });
-    for (const [index, node] of (schedule.nodes || []).entries()) list.appendChild(buildScheduleNode(node, index));
+    for (const [index, node] of (schedule.nodes || []).entries()) list.appendChild(buildScheduleNode(node, index, schedule));
     panel.appendChild(list);
     scrollEl.appendChild(panel);
   }
@@ -2062,6 +2070,78 @@
     }
   }
 
+  function scheduleDecision(schedule, node) {
+    if (!schedule || !schedule.available) return { code: 'snapshot_unavailable', status: 'needs_action' };
+    if (schedule.stale || (node && node.decision_drifted)) return { code: 'decision_stale', status: 'needs_action' };
+    return (node && node.decision) || { code: 'not_evaluated', status: 'waiting' };
+  }
+
+  function buildExecutionSection(detail) {
+    const schedule = detail.scheduling;
+    const node = schedule && schedule.node;
+    const decision = scheduleDecision(schedule, node);
+    const section = el('section', { class: 'drawer-execution', 'aria-label': t('issue.executionStatus') });
+    section.appendChild(el('h3', {}, t('issue.executionStatus')));
+    section.appendChild(el('p', { class: 'execution-reason' }, scheduleReasonLabel(decision)));
+    if (decision.code === 'waiting_global_capacity' || decision.code === 'waiting_state_capacity') {
+      section.appendChild(el('p', { class: 'history-muted' }, t('issue.capacityHelp')));
+    }
+    const blockers = (node && node.blocked_by || []).filter((blocker) => !blocker.resolved);
+    if (blockers.length) {
+      section.appendChild(el('div', { class: 'execution-blocker-label' }, t('issue.unresolvedDependencies')));
+      const links = el('ul', { class: 'execution-blockers' });
+      for (const blocker of blockers) {
+        const item = el('li');
+        if (blocker.state != null) {
+          item.appendChild(el('button', {
+            type: 'button', class: 'btn btn-ghost',
+            onClick: () => openDrawer(blocker.identifier),
+            'aria-label': t('schedule.openTicket', { id: blocker.identifier }),
+          }, blocker.identifier));
+          item.appendChild(el('span', { class: 'history-muted' }, blocker.state));
+        } else {
+          item.appendChild(el('span', {}, t('issue.missingDependency', { id: blocker.identifier })));
+        }
+        links.appendChild(item);
+      }
+      section.appendChild(links);
+      if (blockers.some((blocker) => /^FIX-/i.test(blocker.identifier))) {
+        section.appendChild(el('p', { class: 'history-muted' }, t('issue.fixDependencyHelp')));
+      }
+    }
+    section.appendChild(el('button', {
+      type: 'button', class: 'btn btn-ghost',
+      onClick: async () => {
+        try { await openDrawer(detail.identifier); }
+        catch (err) { showToast(err.message, 'error'); }
+      },
+    }, t('issue.refreshStatus')));
+    if (decision.code === 'decision_stale' || decision.code === 'snapshot_unavailable') {
+      section.appendChild(el('p', { class: 'history-muted' }, t('issue.schedulePendingHelp')));
+    }
+    const budgets = detail.budgets;
+    const limits = el('details', { class: 'execution-limits' });
+    limits.appendChild(el('summary', {}, t('issue.executionLimits')));
+    limits.appendChild(el('p', { class: 'history-muted' }, t('issue.limitScope', { state: budgets && budgets.state || detail.state })));
+    const labels = {
+      attempt_turns: t('issue.limitAttemptTurns'), total_turns: t('issue.limitTotalTurns'),
+      state_tokens: t('issue.limitStateTokens'), retries: t('issue.limitRetries'),
+      rewinds: t('issue.limitRewinds'), reopens: t('issue.limitReopens'),
+    };
+    const list = el('dl', { class: 'execution-limit-list' });
+    for (const budget of budgets && budgets.items || []) {
+      const value = budget.status === 'disabled' ? t('issue.limitDisabled')
+        : budget.remaining == null ? t('issue.limitUnknown', { limit: Number(budget.limit).toLocaleString() })
+          : t('issue.limitRemaining', { remaining: Number(budget.remaining).toLocaleString(), used: Number(budget.used).toLocaleString(), limit: Number(budget.limit).toLocaleString() });
+      list.appendChild(el('dt', {}, labels[budget.name] || budget.name));
+      list.appendChild(el('dd', {}, value));
+    }
+    if (!budgets || !budgets.available) limits.appendChild(el('p', { class: 'history-muted' }, t('issue.limitsUnavailable')));
+    limits.appendChild(list);
+    section.appendChild(limits);
+    return section;
+  }
+
   function buildDrawerContent(detail) {
     const container = el('div', { class: 'drawer-inner' });
 
@@ -2179,6 +2259,7 @@
     container.appendChild(header);
     container.appendChild(titleInput);
     container.appendChild(fieldsGrid);
+    container.appendChild(buildExecutionSection(detail));
     if (detail.attention) {
       container.appendChild(el('div', { class: `drawer-attention attention-${detail.attention.kind || 'info'}` }, [
         el('strong', null, detail.attention.label || t('board.attention')),
@@ -2938,7 +3019,8 @@
   function renderStatsContent(data) {
     const content = document.getElementById('stats-content');
     clearNode(content);
-    const hasEvents = data.totals.turns > 0 || data.totals.runs > 0 || data.by_day.length > 0;
+    const hasGateEvents = Object.values(data.gates || {}).some((value) => typeof value === 'number' && value > 0);
+    const hasEvents = data.totals.turns > 0 || data.totals.runs > 0 || data.by_day.length > 0 || hasGateEvents;
     if (!hasEvents) {
       content.appendChild(el('div', { class: 'empty-state' }, t('stats.noActivity')));
       return;
@@ -4142,6 +4224,15 @@
         el('span', { class: 'chip-label' }, t('chat.intentTrack', { track: action.track })),
         el('code', { class: 'chat-intent-slug' }, action.slug),
       ]),
+      Array.isArray(action.tripwires) && action.tripwires.length
+        ? el('div', { class: 'chat-intent-tripwires', role: 'note' }, [
+          el('strong', null, t('chat.intentTripwires')),
+          el('ul', null, action.tripwires.map((hit) => el('li', null, [
+            el('span', { class: 'chat-intent-tripwire-label' }, `${hit.label}: `),
+            el('code', null, (hit.lines && hit.lines[0]) || ''),
+          ]))),
+        ])
+        : null,
       el('div', { class: 'chat-intent-markdown' }, renderMarkdown(action.intent || '')),
       action.error ? el('p', { class: 'chat-intent-error', role: 'alert' }, truncate(String(action.error), 800)) : null,
       ticket ? el('p', { class: 'chat-intent-ticket' }, t('chat.intentTicket', { id: ticket, title: action.ticket.title || '' })) : null,

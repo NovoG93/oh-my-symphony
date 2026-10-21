@@ -445,6 +445,7 @@ def build_prompt_env(
     compact_issue_context: bool = False,
     full_ticket_path: str | None = None,
     artifacts_dir: str = "",
+    board_health: str = "",
 ) -> dict[str, Any]:
     """§12.1 — input variables for prompt rendering.
 
@@ -490,6 +491,7 @@ def build_prompt_env(
             issue_obj,
             state=issue_dict.get("state") or "",
             is_rewind=is_rewind,
+            board_health=board_health,
         )
     issue_dict["full_ticket_path"] = full_ticket_path or ""
     from .i18n import normalize_language
@@ -507,6 +509,7 @@ def build_prompt_env(
         "token_budget": int(token_budget or 0),
         "rewind_scope": list(rewind_scope) if rewind_scope else [],
         "artifacts_dir": artifacts_dir or "",
+        "board_health": board_health or "",
     }
 
 
@@ -528,6 +531,7 @@ def build_first_turn_prompt(
     full_ticket_path: str | None = None,
     artifacts_dir: str = "",
     extra_context: str = "",
+    board_health: str = "",
 ) -> tuple[str, dict[str, Any]]:
     """Construct the first-turn prompt sent to a worker.
 
@@ -568,6 +572,7 @@ def build_first_turn_prompt(
         compact_issue_context=compact_issue_context,
         full_ticket_path=full_ticket_path,
         artifacts_dir=artifacts_dir,
+        board_health=board_health,
     )
     env["turn_number"] = turn_number
     env["max_turns"] = max_turns

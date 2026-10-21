@@ -19,7 +19,7 @@ from typing import Any
 
 from ..issue import normalize_state, workspace_key
 from ..trackers.file import issue_from_file
-from ..workflow import PrimeAgentConfig
+from ..workflow import PiConfig, PrimeAgentConfig
 from . import BackendInit
 from .pi import PiBackend
 
@@ -31,17 +31,16 @@ class PrimeAgentBackend(PiBackend):
     _resume_flag = "--resume"
 
     def __init__(self, init: BackendInit) -> None:
-        # Defer to PiBackend for all shared lifecycle state, then point
-        # ``self._pi`` at the ``prime_agent`` config section so every
-        # inherited method (run_turn, _consume_stream, …) uses our command
-        # and timeout values.
+        # PiBackend reads its command and turn timeout through
+        # ``_turn_config``, which points at ``prime_agent`` here.
         super().__init__(init)
-        self._pi = (
-            init.resolved_backend_config
-            if isinstance(init.resolved_backend_config, PrimeAgentConfig)
-            else init.cfg.prime_agent
-        )
         self._pi_tracker = init.cfg.tracker
+
+    @staticmethod
+    def _turn_config(init: BackendInit) -> PiConfig | PrimeAgentConfig:
+        if isinstance(init.resolved_backend_config, PrimeAgentConfig):
+            return init.resolved_backend_config
+        return init.cfg.prime_agent
 
     async def initialize(self) -> dict[str, Any]:
         return {"agent": "prime-agent"}

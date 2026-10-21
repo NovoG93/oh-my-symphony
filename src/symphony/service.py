@@ -175,20 +175,97 @@ def acquire_service_lock(workflow_path: str | Path):
     path = lock_path_for(workflow_path)
     path.parent.mkdir(parents=True, exist_ok=True)
     try:
-        fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+        # Serialize stale-lock inspection and PID publication. Without this
+        # short guard, two contenders can both observe a dead PID and one can
+        # unlink the live lock recreated by the other.
+        with _service_lock_guard(path):
+            fd = _open_lock_reclaiming_stale(path)
+            with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                handle.write(f"{os.getpid()}\n")
     except FileExistsError as exc:
         raise ServiceLockError(
-            f"service operation already in progress: {path}"
+            f"service operation already in progress: {path} "
+            f"(owner pid {_lock_owner_pid(path)}); remove it only if no operation is running"
         ) from exc
     try:
-        with os.fdopen(fd, "w", encoding="utf-8") as handle:
-            handle.write(f"{os.getpid()}\n")
         yield path
     finally:
         try:
             path.unlink()
         except FileNotFoundError:
             pass
+
+
+@contextlib.contextmanager
+def _service_lock_guard(path: Path):
+    """Briefly serialize lock creation/reclamation across service contenders."""
+    guard_path = path.with_name(f".{path.name}.guard")
+    fd = os.open(guard_path, os.O_CREAT | os.O_RDWR, 0o600)
+    locked = False
+    try:
+        if _IS_WIN32:
+            import msvcrt
+
+            if os.fstat(fd).st_size == 0:
+                os.write(fd, b"0")
+            os.lseek(fd, 0, os.SEEK_SET)
+            try:
+                getattr(msvcrt, "locking")(fd, getattr(msvcrt, "LK_NBLCK"), 1)
+            except OSError as exc:
+                raise FileExistsError("another process is updating the service lock") from exc
+        else:
+            import fcntl
+
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError as exc:
+                raise FileExistsError("another process is updating the service lock") from exc
+        locked = True
+        yield
+    finally:
+        if locked:
+            if _IS_WIN32:
+                import msvcrt
+
+                os.lseek(fd, 0, os.SEEK_SET)
+                getattr(msvcrt, "locking")(fd, getattr(msvcrt, "LK_UNLCK"), 1)
+            else:
+                import fcntl
+
+                fcntl.flock(fd, fcntl.LOCK_UN)
+        os.close(fd)
+
+
+def _lock_owner_pid(path: Path) -> int | None:
+    try:
+        return int(path.read_text(encoding="utf-8").strip())
+    except (OSError, ValueError):
+        return None
+
+
+def _open_lock_reclaiming_stale(path: Path) -> int:
+    """Create the lock, reclaiming it once when its recorded owner is dead.
+
+    Callers must hold :func:`_service_lock_guard` while using this helper.
+    """
+    flags = os.O_CREAT | os.O_EXCL | os.O_WRONLY
+    try:
+        return os.open(path, flags)
+    except FileExistsError:
+        owner = _lock_owner_pid(path)
+        # Empty or malformed locks may belong to a process between O_EXCL
+        # creation and writing its PID. Preserve those for manual inspection.
+        if owner is None or is_process_running(owner):
+            raise
+        print(
+            f"reclaimed stale lock {path} (owner pid {owner} is not running)",
+            file=sys.stderr,
+        )
+        try:
+            path.unlink()
+        except FileNotFoundError:
+            pass
+        return os.open(path, flags)
 
 
 def _record_to_json(record: ServiceRecord) -> dict[str, Any]:
@@ -324,6 +401,8 @@ def port_owner_hint(
 ) -> str | None:
     record = load_record(workflow_path)
     if record is None or record.port != port:
+        return None
+    if record.orchestrator_pid == os.getpid():
         return None
     alive = is_running or is_process_running
     pid_alive = alive(record.orchestrator_pid)
@@ -573,6 +652,27 @@ def _wait_until(
     return predicate()
 
 
+_START_STABILITY_WINDOW_S: float = 2.0
+
+
+def _exited_during_startup(pid: int, *, interval_s: float = 0.1) -> bool:
+    """Detect an early exit, reaping a direct child so zombies are observed."""
+    deadline = time.monotonic() + _START_STABILITY_WINDOW_S
+    while True:
+        if not _IS_WIN32:
+            try:
+                reaped, _status = os.waitpid(pid, os.WNOHANG)
+            except OSError:  # ChildProcessError when pid is not our child
+                reaped = 0
+            if reaped == pid:
+                return True
+        if not is_process_running(pid):
+            return True
+        if time.monotonic() >= deadline:
+            return False
+        time.sleep(min(interval_s, max(deadline - time.monotonic(), 0.0)))
+
+
 def terminate_process(pid: int | None, *, force: bool = False) -> bool:
     """Best-effort process-tree termination for a service-managed PID."""
     try:
@@ -590,16 +690,23 @@ def terminate_process(pid: int | None, *, force: bool = False) -> bool:
             return True
         _killpg(parsed, sig)
     except ProcessLookupError:
-        return False
+        # A service child may not be a process-group leader. Fall back to its
+        # individual PID when the group lookup fails but the process is live.
+        if not is_process_running(parsed):
+            return False
+        return _kill_single(parsed, sig)
     except PermissionError:
         return False
     except OSError:
-        try:
-            os.kill(parsed, sig)
-        except ProcessLookupError:
-            return False
-        except OSError:
-            return False
+        return _kill_single(parsed, sig)
+    return True
+
+
+def _kill_single(pid: int, sig: int) -> bool:
+    try:
+        os.kill(pid, sig)
+    except OSError:
+        return False
     return True
 
 
@@ -941,7 +1048,7 @@ def _start_locked(args: argparse.Namespace, *, workflow: Path, cfg: Any) -> int:
             log_path=log_path,
             env_overrides={SERVICE_INSTANCE_ENV: service_instance_id},
         )
-        if not _wait_until(lambda: is_process_running(orchestrator_pid), timeout_s=2.0):
+        if _exited_during_startup(orchestrator_pid):
             print(
                 f"service start failed: orchestrator exited early; see {log_path}",
                 file=sys.stderr,

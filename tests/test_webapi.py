@@ -929,7 +929,7 @@ async def test_skip_document_route_and_legacy_skip_learn_alias(
     """`/skip-document` is the route; `/skip-learn` stays a deprecated alias."""
     stub = client.stub  # type: ignore[attr-defined]
 
-    resp = await client.post("/api/v1/issues/SEED-1/skip-document")
+    resp = await client.post("/api/v1/issues/SEED-1/skip-document", json={})
     assert resp.status == 200
     payload = await resp.json()
     assert payload == {
@@ -938,7 +938,7 @@ async def test_skip_document_route_and_legacy_skip_learn_alias(
         "message": "moved SEED-1 to Human Review",
     }
 
-    legacy = await client.post("/api/v1/issues/SEED-1/skip-learn")
+    legacy = await client.post("/api/v1/issues/SEED-1/skip-learn", json={})
     assert legacy.status == 200
     legacy_payload = await legacy.json()
     assert legacy_payload["skipped"] is True
@@ -949,9 +949,9 @@ async def test_skip_document_route_and_legacy_skip_learn_alias(
 async def test_delete_issue_and_running_guard(client: TestClient) -> None:
     stub = client.stub  # type: ignore[attr-defined]
     stub.running_identifiers["SEED-1"] = "iss-1"
-    assert (await client.delete("/api/v1/issues/SEED-1")).status == 409
+    assert (await client.delete("/api/v1/issues/SEED-1", json={})).status == 409
     stub.running_identifiers.clear()
-    assert (await client.delete("/api/v1/issues/SEED-1")).status == 200
+    assert (await client.delete("/api/v1/issues/SEED-1", json={})).status == 200
     assert (await client.get("/api/v1/issues/SEED-1")).status == 404
 
 
@@ -1236,7 +1236,7 @@ async def test_continuous_improvement_status_and_reset(
     assert status["last_verified_branch"] == "dev"
 
     reset_resp = await client.post(
-        "/api/v1/workflow/continuous-improvement/reset-turns"
+        "/api/v1/workflow/continuous-improvement/reset-turns", json={}
     )
 
     assert reset_resp.status == 200
@@ -1278,7 +1278,7 @@ async def test_traversal_identifiers_rejected_on_get_and_delete(
     for payload in ("..%5C..%5Csecret", "..%2e", "a.b", "space name"):
         resp = await client.get(f"/api/v1/issues/{payload}")
         assert resp.status == 400, payload
-        resp = await client.delete(f"/api/v1/issues/{payload}")
+        resp = await client.delete(f"/api/v1/issues/{payload}", json={})
         assert resp.status == 400, payload
 
 
@@ -2647,3 +2647,61 @@ agent: { kind: claude }
     orch = Orchestrator(wf_state, usage_manager=mgr)
     pu = orch.snapshot()["provider_usage"]
     assert pu["claude"]["windows"]["five_hour"]["remaining_percent"] == 58.0
+
+
+@pytest.mark.parametrize("code", ["waiting_global_capacity", "paused", "budget_exhausted"])
+async def test_issue_detail_uses_scheduler_decision_and_detects_changes(client, code):
+    client.stub.schedule_payload = {
+        "available": True, "stale": False, "generated_at": "2026-07-01T00:00:00Z",
+        "entries": [{"identifier": "SEED-1", "status": "waiting", "code": code,
+                     "evaluated_state": "Todo", "evaluated_updated_at": "2026-07-01T00:00:00+00:00"}],
+    }
+    payload = await (await client.get("/api/v1/issues/SEED-1")).json()
+    assert payload["scheduling"]["node"]["decision"]["code"] == code
+    assert payload["scheduling"]["stale"] is False
+    await client.patch("/api/v1/issues/SEED-1", json={"state": "Doing"})
+    changed = await (await client.get("/api/v1/issues/SEED-1")).json()
+    assert changed["scheduling"]["stale"] is True
+    assert changed["scheduling"]["node"]["decision"]["code"] == "decision_stale"
+
+
+async def test_issue_detail_resolves_actual_fix_dependencies_and_missing_cards(client, board_dir):
+    for identifier, state in (("FIX-1", "Doing"), ("FIX-2", "Done")):
+        await client.post("/api/v1/issues", json={"identifier": identifier, "title": identifier, "state": state})
+    path = board_dir / "kanban" / "SEED-1.md"
+    path.write_text(path.read_text().replace("labels: [demo]", "labels: [demo]\nblocked_by: [FIX-1, FIX-2, FIX-MISSING]"))
+    payload = await (await client.get("/api/v1/issues/SEED-1")).json()
+    blockers = {b["identifier"]: b for b in payload["scheduling"]["node"]["blocked_by"]}
+    assert blockers["FIX-1"] == {"identifier": "FIX-1", "state": "Doing", "resolved": False}
+    assert blockers["FIX-2"]["resolved"] is True
+    assert blockers["FIX-MISSING"]["state"] is None
+    assert blockers["FIX-MISSING"]["resolved"] is False
+
+
+@pytest.mark.parametrize("oversized", [False, True])
+async def test_issue_detail_survives_unavailable_schedule_board(client, monkeypatch, oversized):
+    import symphony.webapi as module
+
+    if oversized:
+        monkeypatch.setattr(module, "MAX_DEPENDENCY_NODES", 0)
+    else:
+        def unavailable(*args):
+            raise OSError("board scan unavailable")
+        monkeypatch.setattr(module.FileBoardTracker, "fetch_issues_by_states", unavailable)
+    response = await client.get("/api/v1/issues/SEED-1")
+    assert response.status == 200
+    payload = await response.json()
+    assert payload["description"] == "Seed body."
+    assert payload["scheduling"]["available"] is False
+    assert payload["scheduling"]["node"] is None
+
+
+async def test_issue_detail_survives_budget_projection_failure(client, monkeypatch):
+    async def unavailable(_issue):
+        raise OSError("budget history unavailable")
+    monkeypatch.setattr(client.stub, "issue_budget_snapshot", unavailable, raising=False)
+    response = await client.get("/api/v1/issues/SEED-1")
+    assert response.status == 200
+    payload = await response.json()
+    assert payload["description"] == "Seed body."
+    assert payload["budgets"] == {"available": False, "items": []}

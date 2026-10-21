@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import errno
 import subprocess
 import sys
 from concurrent.futures import ThreadPoolExecutor
@@ -14,6 +15,7 @@ from symphony.projects import (
     Project,
     ProjectError,
     ProjectRegistry,
+    canonical_project_repo,
     create_or_adopt_project,
     project_target_expectation,
 )
@@ -36,6 +38,16 @@ def init_repo(path: Path) -> Path:
         "---\ntracker: {kind: file}\n---\n", encoding="utf-8"
     )
     return path
+
+
+def test_canonical_project_repo_rejects_symlink_loop(tmp_path: Path) -> None:
+    loop = tmp_path / "loop"
+    loop.symlink_to(loop)
+
+    with pytest.raises(OSError) as exc_info:
+        canonical_project_repo(loop)
+
+    assert exc_info.value.errno == errno.ELOOP
 
 
 def source_bundle(path: Path) -> Path:

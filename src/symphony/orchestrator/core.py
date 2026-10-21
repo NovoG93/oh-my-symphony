@@ -84,7 +84,7 @@ from ..prompt import (
 from ..runtime_safety import ensure_workflow_repo_is_safe
 from ..service_identity import SERVICE_INSTANCE_ENV, normalize_service_instance_id
 from ..skills import render_skill_block
-from ..stats import StatsStore, stats_store_for
+from ..stats import StatsStore, board_health_summary, stats_store_for
 from ..trackers import TrackerClient, build_tracker_client
 from ..utils.wiki_sweep import sweep as _wiki_sweep_run
 from ..workflow import (
@@ -154,6 +154,7 @@ from .helpers import (
     resolve_symphony_cli,
     _from_monotonic_to_iso,
     _is_auto_triage_todo_candidate,
+    _is_successful_terminal_state,
     _human_review_target_state,
     _max_turns_exhausted_target_state,
     _is_rewind_transition,  # noqa: F401 - attempt runner seam
@@ -344,8 +345,41 @@ def _worker_error_pause_reason(reason: str, error: str | None) -> str:
     return f"worker error: {clean}; paused for operator inspection"
 
 
+# Errors that mean "this backend's account is out of budget for now": a
+# retry with backoff on the same backend cannot help, but another backend
+# can (2026-09-05 E2E: codex usage limit paused the worker until an operator
+# re-pinned the ticket by hand). Distinct from the transient
+# `_RETRYABLE_WORKER_ERROR_MARKERS` (429 / rate limit), which retry in place.
+_QUOTA_WORKER_ERROR_MARKERS = (
+    "usage limit",
+    "usage_limit",
+    "session limit",
+    "quota",
+    "insufficient_quota",
+    "insufficient credits",
+    "out of credits",
+    "credit balance",
+    "billing",
+    "plan limit",
+    "weekly limit",
+    "monthly limit",
+)
+
+
 def _has_retryable_worker_marker(clean_error: str) -> bool:
     return any(marker in clean_error for marker in _RETRYABLE_WORKER_ERROR_MARKERS)
+
+
+def _is_quota_worker_error(reason: str, error: str | None) -> bool:
+    detail = f"{reason}: {error}" if error else reason
+    clean = _clean_board_error_message(detail).lower()
+    if any(marker in clean for marker in _QUOTA_WORKER_ERROR_MARKERS):
+        return True
+    # Generic limit wording also appears in transient rate-limit errors.
+    # Explicit account/quota markers above still win when both are present.
+    return not _has_retryable_worker_marker(clean) and any(
+        marker in clean for marker in ("limit reached", "limit exceeded")
+    )
 
 
 def _is_opencode_sigterm_retry(agent_kind: str, clean_error: str) -> bool:
@@ -659,6 +693,7 @@ _BLOCKED_RCA_HOST_RESOLVED_HEADING_RE = re.compile(
     r"^##\s+Blocked\s+(?:Fix|RCA)\s+Resolved\s*$",
     re.IGNORECASE | re.MULTILINE,
 )
+_REOPEN_APPROVED_RE = re.compile(r"^##\s+Reopen Approved\b", re.MULTILINE)
 _BLOCKED_RCA_SOURCE_IDENTIFIER_RE = re.compile(
     r"^-\s*Identifier:\s*`(?P<identifier>[^`]+)`\s*$",
     re.IGNORECASE | re.MULTILINE,
@@ -3449,6 +3484,78 @@ class Orchestrator:
                 }
         return None
 
+    async def issue_budget_snapshot(self, issue: Issue) -> dict[str, Any]:
+        """Read current guard counters; missing or truncated history is unknown."""
+        cfg = self._workflow_state.current()
+        if cfg is None:
+            return {"available": False, "items": []}
+        entry = self._running.get(issue.id)
+        debug = self._issue_debug.get(issue.id)
+        generated_at = _utc_iso_z()
+        current_state = (entry.state_at_turn_start or issue.state) if entry else issue.state
+        attempt_turns = entry.turn_count if entry else None
+        total_turns = (
+            (debug.completed_turn_count if debug else 0) + entry.turn_count
+            if entry else debug.completed_turn_count if debug else None
+        )
+        state_tokens = (
+            entry.codex_state_total_tokens
+            if entry and entry.last_reported_total_tokens > 0 else None
+        )
+        rewinds = debug.rewind_count if debug else None
+        retry_used = self._persisted_retry_attempts.get(issue.id)
+        if entry is not None and entry.attempt_kind == "retry":
+            retry_used = entry.retry_attempt
+        elif entry is not None and entry.retry_attempt is None:
+            retry_used = 0
+
+        def item(name: str, limit: int, used: int | None) -> dict[str, Any]:
+            status = "disabled" if limit <= 0 else (
+                "unknown" if used is None else "exhausted" if used >= limit else "remaining"
+            )
+            return {
+                "name": name, "limit": limit, "used": used,
+                "remaining": max(limit - used, 0) if limit > 0 and used is not None else None,
+                "status": status,
+            }
+
+        reopen_used = None
+        registry = self._run_registry
+        if registry is not None:
+            records = await asyncio.to_thread(
+                self._registry_guard,
+                "budget_reopen_history",
+                lambda: registry.recent_runs(issue.id, limit=200, status="normal"),
+                None,
+            )
+            # A full page may omit older runs. Never infer an exact count from it.
+            if (
+                records is not None and len(records) < 200
+                and self._running.get(issue.id) is entry
+            ):
+                prior_done = sum(
+                    1 for record in records if _is_successful_terminal_state(record.state)
+                )
+                reopen_used = max(prior_done - 1, 0)
+                if entry is not None and prior_done:
+                    reopen_used += 1
+        reopen_limit = cfg.agent.max_reopens
+        if reopen_limit > 0:
+            reopen_limit += len(_REOPEN_APPROVED_RE.findall(issue.description or ""))
+        return {
+            "available": True,
+            "generated_at": generated_at,
+            "state": current_state,
+            "items": [
+                item("attempt_turns", cfg.agent.max_turns, attempt_turns),
+                item("total_turns", cfg.agent.max_total_turns, total_turns),
+                item("state_tokens", self._token_budget_for_state(cfg, current_state), state_tokens),
+                item("retries", cfg.agent.max_retries, retry_used),
+                item("rewinds", cfg.agent.max_attempts, rewinds),
+                item("reopens", reopen_limit, reopen_used),
+            ],
+        }
+
     def issue_attention(self, issue: Issue) -> dict[str, str | None] | None:
         if self._issue_is_terminal(issue):
             if normalize_state(issue.state) == "blocked":
@@ -4343,6 +4450,14 @@ class Orchestrator:
                     mutating_scan_open = False
                 continue
 
+            if await self._hold_reopened_ticket_over_budget(issue, cfg):
+                entry.update(
+                    status="needs_action", code="reopen_budget",
+                    reason="ticket exceeded agent.max_reopens and was parked",
+                    dispatch_outcome="state_changed",
+                )
+                continue
+
             if mutating_scan_open and self._available_slots(cfg) <= 0:
                 # Preserve the legacy loop's first capacity break. Remaining
                 # rows are projected without tracker writes or dispatch checks.
@@ -4489,6 +4604,8 @@ class Orchestrator:
             if self._available_slots(cfg) <= 0:
                 break
             if not self._should_dispatch(issue, cfg):
+                continue
+            if await self._hold_reopened_ticket_over_budget(issue, cfg):
                 continue
             conflict = self._conflict_blocker(issue)
             if conflict is not None:
@@ -7164,6 +7281,9 @@ class Orchestrator:
                 full_ticket_path=self._ticket_prompt_path(cfg, issue),
                 artifacts_dir=self._prompt_artifacts_dir(cfg),
                 extra_context=skill_context,
+                board_health=self._board_health_for_state(
+                    self._workflow_state.current() or cfg, issue.state
+                ),
             )
             await new_client.start_session(
                 initial_prompt=first_prompt,
@@ -8511,6 +8631,81 @@ class Orchestrator:
             to_state=normalize_state(to_state),
         )
 
+    def _record_stats_gate(
+        self, identifier: str, state: str, kind: str, items: tuple[str, ...] = ()
+    ) -> None:
+        if self._stats is not None:
+            self._stats.record_gate(
+                issue=identifier, state=normalize_state(state), kind=kind, items=items
+            )
+
+    def _board_health_for_state(self, cfg: ServiceConfig, state: str) -> str:
+        if normalize_state(state) not in {"document", "learn", "learning"} or self._stats is None:
+            return ""
+        try:
+            done = {normalize_state(item) for item in cfg.tracker.terminal_states}
+            done &= {"done", "completed"}
+            aggregate = self._stats.aggregate(
+                30, done or {"done"}, active_states=cfg.tracker.active_states
+            )
+            return board_health_summary(aggregate)
+        except Exception as exc:
+            log.warning("board_health_failed", error=str(exc))
+            return ""
+
+    def _prior_done_run_count(self, issue: Issue) -> int:
+        registry = self._run_registry
+        if registry is None:
+            return 0
+        records = self._registry_guard(
+            "reopen_history",
+            lambda: registry.recent_runs(issue.id, limit=200, status="normal"),
+            [],
+        )
+        return sum(
+            1
+            for record in records
+            if normalize_state(record.state) in {"done", "completed"}
+        )
+
+    async def _hold_reopened_ticket_over_budget(
+        self, issue: Issue, cfg: ServiceConfig
+    ) -> bool:
+        cap = cfg.agent.max_reopens
+        if cap <= 0:
+            return False
+        prior_done = self._prior_done_run_count(issue)
+        if prior_done <= cap + len(_REOPEN_APPROVED_RE.findall(issue.description or "")):
+            return False
+        target = next(
+            (state for state in cfg.tracker.terminal_states if normalize_state(state) == "blocked"),
+            _rewind_budget_target_state(cfg),
+        )
+        if not target:
+            return False
+        approvals = len(_REOPEN_APPROVED_RE.findall(issue.description or ""))
+        note = (
+            f"This ticket reached Done {prior_done} time(s) and was reopened again "
+            f"(agent.max_reopens: {cap}, approvals: {approvals}). Symphony moved it "
+            f"to {target} instead of dispatching another cycle. To allow one more, "
+            "append a `## Reopen Approved` section and move it back to its lane; "
+            "raise `agent.max_reopens` (0 disables) for more."
+        )
+        try:
+            await asyncio.to_thread(self._tracker_call_append_note, cfg, issue, "Reopen Budget", note)
+            await asyncio.to_thread(self._tracker_call_update_state, cfg, issue, target)
+        except Exception as exc:
+            log.warning("reopen_budget_hold_failed", identifier=issue.identifier, error=str(exc))
+            self._record_tracker_error(issue.id, exc)
+            return False
+        self._clear_tracker_error(issue.id)
+        self._record_stats_gate(issue.identifier, issue.state, "reopen_budget", (str(prior_done),))
+        log.warning(
+            "reopen_budget_exceeded", identifier=issue.identifier, prior_done_runs=prior_done,
+            max_reopens=cap, approvals=approvals, target_state=target,
+        )
+        return True
+
     # ------------------------------------------------------------------
     # worker exit handling (§16.6)
     # ------------------------------------------------------------------
@@ -8620,6 +8815,18 @@ class Orchestrator:
         )
         if entry is None:
             return
+        terminal_cancelled = False
+        cfg = self._workflow_state.current()
+        if reason == "cancelled" and cfg is not None:
+            # Reconcile can cancel a worker because an earlier poll saw a
+            # terminal state. Re-read now so an operator's subsequent reopen
+            # still follows normal recovery and retains the slot-holding retry.
+            refreshed = await self._refresh_issue_state(cfg, issue_id)
+            if refreshed is not None:
+                entry.issue = replace(entry.issue, state=refreshed.state)
+                terminal_cancelled = normalize_state(refreshed.state) in {
+                    normalize_state(state) for state in cfg.tracker.terminal_states
+                }
         if not defer_lease_finish:
             self._finish_run_lease(issue_id, entry, reason, error)
         elapsed = (datetime.now(timezone.utc) - entry.started_at).total_seconds()
@@ -8638,8 +8845,19 @@ class Orchestrator:
                 seconds=elapsed,
             )
 
+        if terminal_cancelled:
+            self._dispatch_state.cancel_pending_retry(issue_id)
+            self._claimed.discard(issue_id)
+            self._persisted_retry_attempts.pop(issue_id, None)
+            self._clear_issue_flags(issue_id, retry_attempt=True)
+            log.info(
+                "terminal_worker_cancelled", issue_id=issue_id,
+                state=entry.issue.state,
+            )
+            await self._notify_observers()
+            return
+
         if reason == "normal":
-            cfg = self._workflow_state.current()
             if entry.known_app_release_finalizer and cfg is not None:
                 refreshed_finalizer = await self._refresh_issue_full(cfg, issue_id)
                 if refreshed_finalizer is not None:
@@ -9100,6 +9318,7 @@ class Orchestrator:
                 # auto-continuation and, when the workflow exposes a Blocked
                 # terminal state, persist that state so the web/TUI boards do
                 # not look idle while the ticket is actually operator-blocked.
+                self._mark_budget_exhausted(issue_id)
                 self._claimed.add(issue_id)
                 attempt_cap = cfg.agent.max_turns if cfg is not None else 0
                 target_state = (
@@ -9416,8 +9635,8 @@ class Orchestrator:
         """Move a ticket whose retry budget is exhausted to a terminal state.
 
         Surfaces a board-level ``## Escalation`` note and updates the
-        tracker state to ``Blocked`` (or whichever configured terminal
-        state mentions ``block``/``human``). The ticket no longer cycles
+        tracker state to ``Blocked``, then another block-named terminal,
+        then a human-named terminal if no failure lane exists. The ticket no longer cycles
         through ``_schedule_retry``; an operator inspecting the board
         sees both the state change and the explanatory comment.
 
@@ -9434,11 +9653,23 @@ class Orchestrator:
             self._retry.pop(issue_id, None)
             self._pending_escalations.pop(issue_id, None)
             return
-        target_state = ""
-        for terminal in cfg.tracker.terminal_states:
-            if "block" in terminal.lower() or "human" in terminal.lower():
-                target_state = terminal
+        target_state = next(
+            (
+                state for state in cfg.tracker.terminal_states
+                if normalize_state(state) == "blocked"
+            ),
+            "",
+        )
+        for keyword in ("block", "human"):
+            if target_state:
                 break
+            target_state = next(
+                (
+                    state for state in cfg.tracker.terminal_states
+                    if keyword in state.lower()
+                ),
+                "",
+            )
         if not target_state and cfg.tracker.terminal_states:
             target_state = cfg.tracker.terminal_states[0]
         if not target_state:
@@ -10601,9 +10832,9 @@ class Orchestrator:
                             )
                     continue
                 state = (issue.state or "").strip().lower()
-                if state == "blocked":
+                if state in {"blocked", "human review"}:
                     log.warning(
-                        "startup_terminal_cleanup_preserved_blocked_workspace",
+                        f"startup_terminal_cleanup_preserved_{state.replace(' ', '_')}_workspace",
                         identifier=issue.identifier,
                         path=str(path),
                     )
