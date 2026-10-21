@@ -22,6 +22,16 @@ from symphony.utils.auto_merge import (
 )
 
 
+@pytest.fixture(autouse=True)
+def _isolate_global_git_config(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Keep host-wide Git settings from changing behavior in temporary repos.
+
+    In particular, a global ``core.hooksPath`` bypasses hook fixtures installed
+    under each test repository's ``.git/hooks`` directory.
+    """
+    monkeypatch.setenv("GIT_CONFIG_GLOBAL", os.devnull)
+
+
 def _git(cwd: Path, *args: str) -> None:
     subprocess.run(
         ["git", *args],
