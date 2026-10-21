@@ -318,6 +318,8 @@ def test_doctor_passes_section_20_acceptance_config(monkeypatch: pytest.MonkeyPa
         return orig_which(cmd)
 
     monkeypatch.setattr(shutil, "which", _fake_which)
+    import symphony.cli.doctor as doctor_mod
+    monkeypatch.setattr(doctor_mod, "_probe_agent_binary", lambda _loc: None)
 
     cfg = _parse_workflow(SECTION_20_ACCEPTANCE_YAML)
     results = check_agent_profiles(cfg)

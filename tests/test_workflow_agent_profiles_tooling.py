@@ -438,6 +438,8 @@ def _build_cfg(tmp_path: Path, frontmatter: str) -> ServiceConfig:
 def test_doctor_profile_checks_pass_valid_config(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     # Ensure binary resolution finds a mock binary
     monkeypatch.setattr(shutil, "which", lambda cmd: f"/usr/bin/{cmd}")
+    import symphony.cli.doctor as doctor_mod
+    monkeypatch.setattr(doctor_mod, "_probe_agent_binary", lambda _loc: None)
 
     cfg = _build_cfg(
         tmp_path,
@@ -477,6 +479,8 @@ def test_doctor_profile_checks_pass_valid_config(tmp_path: Path, monkeypatch: py
 
 def test_doctor_profile_checks_warn_on_command_override(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(shutil, "which", lambda cmd: f"/usr/bin/{cmd}")
+    import symphony.cli.doctor as doctor_mod
+    monkeypatch.setattr(doctor_mod, "_probe_agent_binary", lambda _loc: None)
 
     cfg = _build_cfg(
         tmp_path,
@@ -496,6 +500,37 @@ def test_doctor_profile_checks_warn_on_command_override(tmp_path: Path, monkeypa
     custom_res = next(r for r in results if r.name == "agent.profile.custom-codex")
     assert custom_res.status == "warn"
     assert "overrides" in custom_res.message
+
+
+def test_doctor_profile_checks_warns_when_binary_fails_probe(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(shutil, "which", lambda cmd: f"/usr/bin/{cmd}")
+    import symphony.cli.doctor as doctor_mod
+
+    monkeypatch.setattr(
+        doctor_mod,
+        "_probe_agent_binary",
+        lambda _loc: ("warn", "`fake --version` exited 1"),
+    )
+
+    cfg = _build_cfg(
+        tmp_path,
+        """
+        tracker: { kind: file, board_root: ./board }
+        agent: { kind: codex }
+        agent_profiles:
+          broken-profile:
+            kind: codex
+            command: broken-cli app-server
+        codex: { command: codex app-server }
+        """,
+    )
+
+    results = check_agent_profiles(cfg)
+    res = next(r for r in results if r.name == "agent.profile.broken-profile")
+    assert res.status == "warn"
+    assert "`fake --version` exited 1" in res.message
 
 
 def test_doctor_profile_checks_fail_on_missing_executable(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
