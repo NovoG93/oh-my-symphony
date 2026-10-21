@@ -19,6 +19,7 @@ them; ``tests/test_backend_contract.py`` pins the shared behaviour.
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 import shlex
 import time
@@ -32,15 +33,19 @@ from ..logging import get_logger
 from ..utils.git_sandbox import git_roots_env
 from ..workspace import validate_agent_cwd
 from . import (
+    EVENT_MALFORMED,
     EVENT_PROVIDER_USAGE_EXHAUSTED,
     EVENT_SESSION_STARTED,
     EVENT_TURN_FAILED,
     EVENT_TURN_STARTED,
+    MALFORMED_LINE_LIMIT,
+    POST_STREAM_REAP_TIMEOUT_S,
     BackendInit,
     BaseAgentBackend,
-    ProviderCapacityError,
     EventCallback,
+    ProviderCapacityError,
     TurnResult,
+    _is_valid_session_id,
     redact_session_id,
 )
 
@@ -57,6 +62,11 @@ log = get_logger()
 # caps lines at 10 MB; matches the former per-file copies.
 MAX_LINE_BYTES = 10 * 1024 * 1024
 
+# Placeholder ``start_session`` answer for CLIs that mint the session id
+# inside their first output stream (claude, pi family); the real id arrives
+# mid-stream and triggers ``session_started``.
+PENDING_SESSION_ID = "pending"
+
 
 def _utc_iso() -> str:
     return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
@@ -70,11 +80,16 @@ def _stderr_tail_blob(tail: "deque[str]") -> str:
     return joined if len(joined) <= 400 else joined[-400:]
 
 
-async def _reap_process(proc: asyncio.subprocess.Process) -> None:
-    """Tear down a process group or surface ambiguous cleanup."""
+async def _reap_process(proc: asyncio.subprocess.Process) -> int | None:
+    """Tear down a process group or surface ambiguous cleanup.
+
+    Returns the exit status ``terminate_process_tree`` observed (``None``
+    when the transport already recorded it on ``proc.returncode``).
+    """
     result = await terminate_process_tree(proc)
     if result is None and proc.returncode is None:
         raise RuntimeError("backend process cleanup could not be confirmed")
+    return result
 
 
 async def _emit_event(
@@ -273,6 +288,27 @@ class PerTurnCliBackend(BaseAgentBackend):
             await self._emit(EVENT_TURN_STARTED, {})
             if stdin_payload is not None:
                 await self._write_prompt(proc, stdin_payload)
+            return await self._drive_turn(proc)
+        except BaseException:
+            # Prompt writes and stream adapters can fail before the normal
+            # reap. Release the owned process before another turn replaces it.
+            if proc.returncode is None:
+                await self._reap(proc)
+            raise
+        finally:
+            for watcher in watchers:
+                watcher.cancel()
+            if proc.returncode is not None:
+                self._active_proc = None
+
+    async def _drive_turn(self, proc: asyncio.subprocess.Process) -> TurnResult:
+        """Collect the child's stdout, gate on its exit status, complete.
+
+        The base implementation reads stdout to EOF, checks for a zero
+        exit status, and passes the entire text to ``_complete_turn``.
+        ``JsonlStreamBackend`` overrides this with live-stream parsing.
+        """
+        try:
             stdout, stderr, rc = await self._collect(proc)
             self._capture_stderr(stderr or b"")
             if rc != 0:
@@ -291,20 +327,18 @@ class PerTurnCliBackend(BaseAgentBackend):
                 raise TurnFailed(reason)
             return await self._complete_turn(stdout_text, rc)
         except BaseException:
-            # Prompt writes and stream adapters can fail before the normal
-            # reap. Release the owned process before another turn replaces it.
             if proc.returncode is None:
                 await self._reap(proc)
             raise
-        finally:
-            for watcher in watchers:
-                watcher.cancel()
-            if proc.returncode is not None:
-                self._active_proc = None
 
     # ------------------------------------------------------------------
     # skeleton steps
     # ------------------------------------------------------------------
+
+    def _git_roots_env(self) -> dict[str, str]:
+        """Env fragment granting the git dirs a sandbox scoped to ``cwd``
+        would miss. Claude widens the scan to the workspace root."""
+        return git_roots_env(self._cwd)
 
     async def _spawn(
         self, command: str, *, pipe_stdin: bool
@@ -322,7 +356,7 @@ class PerTurnCliBackend(BaseAgentBackend):
                 stderr=asyncio.subprocess.PIPE,
                 # Inherited process env, backend-specific additions, then the
                 # dispatch overlay (the latter is authoritative).
-                env={**os.environ, **git_roots_env(self._cwd), **self._env},
+                env={**os.environ, **self._git_roots_env(), **self._env},
                 limit=MAX_LINE_BYTES,
                 # Own process group so terminate/kill reaches the agent CLI
                 # behind the bash wrapper (POSIX only).
@@ -416,3 +450,271 @@ class PerTurnCliBackend(BaseAgentBackend):
             if event == EVENT_SESSION_STARTED
             else getattr(self, "_opencode_session_id", None),
         )
+
+
+class JsonlStreamBackend(PerTurnCliBackend):
+    """Per-turn CLI whose stdout is one JSON event per line, parsed live.
+
+    claude (``--output-format stream-json``) and the pi family
+    (``--mode json``) share this shape: the CLI mints the session id inside
+    the stream, emits intermediate frames worth forwarding as they arrive,
+    and ends with one terminal event. Two things differ from the bulk-read
+    skeleton and are pinned by ``tests/test_backends_lifecycle.py``:
+
+    - the turn timeout bounds only the stream; once stdout closes the child
+      gets a bounded reap (``POST_STREAM_REAP_TIMEOUT_S``) so a lingering
+      grandchild cannot hang the turn on an untimed wait;
+    - the exit status is interpreted by the adapter together with the
+      terminal event instead of failing the turn outright.
+
+    Subclasses MUST implement:
+      - ``_command_for_turn`` (append ``_resume_args`` for the session flag),
+      - ``_handle_stream_event``: consume one decoded frame; return it when
+        it is the terminal event, ``None`` otherwise,
+      - ``_complete_stream_turn``: interpret terminal event + exit status and
+        emit ``turn_completed`` / ``turn_failed``.
+
+    Class attributes:
+      - ``_resume_flag``: CLI flag that re-enters a captured session.
+      - ``_stderr_settle_s``: seconds to let stderr drain after stdout
+        closes; ``0`` cancels the drain task immediately.
+    """
+
+    _resume_flag = "--resume"
+    _stderr_settle_s: float = 0.0
+
+    def __init__(
+        self, init: BackendInit, *, agent_name: str, turn_timeout_ms: int
+    ) -> None:
+        super().__init__(init, agent_name=agent_name, turn_timeout_ms=turn_timeout_ms)
+        self._resume_on_next_turn = False
+        self._expected_resume_session_id: str | None = None
+        self._resume_session_confirmed = False
+        self._last_message: str = ""
+        # Last bad line when MALFORMED_LINE_LIMIT consecutive lines failed
+        # to parse; _drive_turn turns it into a precise TurnFailed.
+        self._stream_corrupt: str | None = None
+
+    # ------------------------------------------------------------------
+    # subclass hooks
+    # ------------------------------------------------------------------
+
+    async def _handle_stream_event(
+        self, msg: dict[str, Any]
+    ) -> dict[str, Any] | None:
+        raise NotImplementedError
+
+    async def _complete_stream_turn(
+        self,
+        proc: asyncio.subprocess.Process,
+        terminal: dict[str, Any] | None,
+        rc: int | None,
+    ) -> TurnResult:
+        raise NotImplementedError
+
+    # ------------------------------------------------------------------
+    # AgentBackend lifecycle
+    # ------------------------------------------------------------------
+
+    async def start_session(
+        self, *, initial_prompt: str, issue_title: str | None
+    ) -> str:
+        # The CLI mints the session id inside the first stream (claude: the
+        # `system/init` event; pi: the `session` header line). Return a
+        # placeholder; the real id reaches `_observe_session_id` mid-stream
+        # and triggers `session_started`.
+        del initial_prompt, issue_title
+        return PENDING_SESSION_ID
+
+    async def resume_session(self, session_id: str) -> bool:
+        """Select an exact prior session for the next per-turn process."""
+        if self._closed or not _is_valid_session_id(session_id):
+            return False
+        self._session_id = session_id
+        self._expected_resume_session_id = session_id
+        self._resume_session_confirmed = False
+        self._resume_on_next_turn = True
+        return True
+
+    def _resume_args(self, *, is_continuation: bool, resume_across_turns: bool) -> str:
+        """`` <flag> <id>`` when this turn re-enters the captured session."""
+        should_resume = self._resume_on_next_turn or (
+            is_continuation and resume_across_turns
+        )
+        self._resume_on_next_turn = False
+        sid = self._session_id
+        if should_resume and sid and sid != PENDING_SESSION_ID:
+            return f" {self._resume_flag} {shlex.quote(sid)}"
+        return ""
+
+    async def _drive_turn(self, proc: asyncio.subprocess.Process) -> TurnResult:
+        try:
+            try:
+                terminal = await asyncio.wait_for(
+                    self._consume_stream(proc), timeout=self._turn_timeout_ms / 1000.0
+                )
+            except asyncio.TimeoutError as exc:
+                await self._reap(proc)
+                await self._emit(EVENT_TURN_FAILED, {"reason": "turn_timeout"})
+                raise TurnTimeout(f"{self._agent_name} turn timed out") from exc
+
+            rc = await self._reap_after_stream(proc)
+            if self._stderr_settle_s > 0:
+                # The drain task stops with stdout; collect any stderr lines
+                # written just before process exit without hanging on a child
+                # that leaves stderr open.
+                try:
+                    await asyncio.wait_for(
+                        self._drain_stderr(proc), timeout=self._stderr_settle_s
+                    )
+                except asyncio.TimeoutError:
+                    pass
+            if self._stream_corrupt is not None:
+                err_msg = (
+                    f"{self._agent_name} stream unreadable: "
+                    f"{MALFORMED_LINE_LIMIT} consecutive "
+                    f"malformed lines (last: {self._stream_corrupt[:200]!r})"
+                )
+                await self._emit(
+                    EVENT_TURN_FAILED,
+                    {"reason": err_msg, "stderr_tail": list(self._stderr_tail)},
+                )
+                raise TurnFailed(err_msg)
+            return await self._complete_stream_turn(proc, terminal, rc)
+        except BaseException:
+            if proc.returncode is None:
+                await self._reap(proc)
+            raise
+
+    async def _reap_after_stream(
+        self, proc: asyncio.subprocess.Process
+    ) -> int | None:
+        """Bounded reap once stdout closed; never an untimed wait."""
+        rc = await safe_proc_wait(proc, timeout=POST_STREAM_REAP_TIMEOUT_S)
+        if rc is None and proc.returncode is None:
+            # stdout closed but the process lingers — reap the tree
+            # instead of hanging the turn on an unbounded wait.
+            rc = await _reap_process(proc)
+        return rc if rc is not None else proc.returncode
+
+    # ------------------------------------------------------------------
+    # JSONL parsing
+    # ------------------------------------------------------------------
+
+    async def _consume_stream(
+        self, proc: asyncio.subprocess.Process
+    ) -> dict[str, Any] | None:
+        """Read JSON lines; return the terminal event or None."""
+        assert proc.stdout is not None
+        terminal: dict[str, Any] | None = None
+        self._stream_corrupt = None
+        malformed_streak = 0
+        stderr_task = asyncio.create_task(self._drain_stderr(proc))
+        try:
+            while True:
+                try:
+                    line = await proc.stdout.readline()
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:
+                    log.error(
+                        f"{self._agent_name}_stdout_read_error", error=str(exc)
+                    )
+                    break
+                if not line:
+                    break
+                text = line.decode("utf-8", errors="replace").strip()
+                if not text:
+                    continue
+                try:
+                    msg = json.loads(text)
+                except json.JSONDecodeError:
+                    await self._emit(EVENT_MALFORMED, {"raw": text[:500]})
+                    malformed_streak += 1
+                    if malformed_streak >= MALFORMED_LINE_LIMIT:
+                        self._stream_corrupt = text
+                        break
+                    continue
+                malformed_streak = 0
+                if not isinstance(msg, dict):
+                    continue
+                event = await self._handle_stream_event(msg)
+                if event is not None:
+                    terminal = event
+        finally:
+            await self._settle_stderr(stderr_task)
+        return terminal
+
+    async def _settle_stderr(self, stderr_task: "asyncio.Task[None]") -> None:
+        if self._stderr_settle_s > 0:
+            # Give a closed stdout a brief chance to flush stderr
+            # diagnostics; cancelling immediately can lose the auth/network
+            # error that explains a non-zero exit. Do not wait indefinitely
+            # if a child keeps stderr open after stdout closes.
+            try:
+                await asyncio.wait_for(stderr_task, timeout=self._stderr_settle_s)
+                return
+            except asyncio.TimeoutError:
+                pass
+            except (asyncio.CancelledError, Exception):
+                return
+        stderr_task.cancel()
+        try:
+            await stderr_task
+        except (asyncio.CancelledError, Exception):
+            pass
+
+    async def _drain_stderr(self, proc: asyncio.subprocess.Process) -> None:
+        if proc.stderr is None:
+            return
+        while True:
+            try:
+                line = await proc.stderr.readline()
+            except (asyncio.CancelledError, Exception):
+                break
+            if not line:
+                break
+            text = line.decode("utf-8", errors="replace").rstrip()
+            text = redact_session_id(text, self._session_id)
+            if text:
+                self._stderr_tail.append(text)
+            log.debug(f"{self._agent_name}_stderr", line=text)
+
+    async def _observe_session_id(self, session_id: str) -> None:
+        expected = self._expected_resume_session_id
+        if expected is not None:
+            if session_id != expected:
+                reason = f"{self._agent_name} returned a different recovered session"
+                await self._emit(EVENT_TURN_FAILED, {"reason": reason})
+                raise TurnFailed(reason)
+            self._resume_session_confirmed = True
+        if session_id != self._session_id:
+            self._session_id = session_id
+            await self._emit(
+                EVENT_SESSION_STARTED,
+                {"session_id": session_id, "thread_id": session_id},
+            )
+
+    async def _require_resume_confirmation(self) -> None:
+        if self._expected_resume_session_id is None:
+            return
+        if not self._resume_session_confirmed:
+            reason = (
+                f"{self._agent_name} did not confirm the requested recovered session"
+            )
+            await self._emit(EVENT_TURN_FAILED, {"reason": reason})
+            raise TurnFailed(reason)
+        self._expected_resume_session_id = None
+        self._resume_session_confirmed = False
+
+    async def _emit(self, event: str, payload: dict[str, Any]) -> None:
+        await _emit_event(
+            self._on_event,
+            event,
+            payload,
+            usage=self._latest_usage,
+            rate_limits=self.latest_rate_limits,
+            agent_pid=self.pid,
+            redact_session=None if event == EVENT_SESSION_STARTED else self._session_id,
+        )
+
