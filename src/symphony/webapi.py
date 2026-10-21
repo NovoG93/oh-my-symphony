@@ -1466,27 +1466,22 @@ def _register_issue_routes(
                 f"{identifier} has a running worker; wait before confirming review",
             )
 
-        changed = await asyncio.to_thread(
-            tracker.transition_if_current,
-            identifier,
-            "Human Review",
-            done_state,
-        )
-        if not changed:
-            return _json_error(
-                409,
-                "review_confirmation_rejected",
-                f"{identifier} changed before review confirmation could be applied",
-            )
-        await asyncio.to_thread(
-            ctx.stats().record_transition,
-            issue=identifier,
-            from_state="human review",
-            to_state=done_state.lower(),
-        )
-        orchestrator.request_refresh()
+        try:
+            result = await orchestrator.confirm_done(identifier)
+        except FileNotFoundError:
+            return _json_error(404, "issue_not_found", f"unknown issue {identifier}")
+        except ValueError as exc:
+            if "running worker" in str(exc):
+                return _json_error(409, "issue_running", str(exc))
+            return _json_error(409, "review_confirmation_rejected", str(exc))
+        except SymphonyError as exc:
+            return _json_error(409, "review_confirmation_rejected", exc.message)
         return web.json_response(
-            {"identifier": identifier, "state": done_state, "confirmed": True}
+            {
+                "identifier": identifier,
+                "state": result.get("state", done_state),
+                "confirmed": True,
+            }
         )
 
     async def handle_issue_patch(request: web.Request) -> web.Response:
@@ -1550,8 +1545,34 @@ def _register_issue_routes(
                 "state_in_use",
                 f"{identifier} has a running worker; pause or wait before changing state",
             )
-        await asyncio.to_thread(tracker.update_fields, identifier, **fields)
-        if new_state is not None and new_state.lower() != current.state.lower():
+        confirm_review = (
+            new_state is not None
+            and current.state.strip().lower() == "human review"
+            and new_state.strip().lower() == "done"
+        )
+        if confirm_review:
+            non_state_fields = {key: value for key, value in fields.items() if key != "state"}
+            if non_state_fields:
+                await asyncio.to_thread(
+                    tracker.update_fields, identifier, **non_state_fields
+                )
+            try:
+                await orchestrator.confirm_done(identifier)
+            except FileNotFoundError:
+                return _json_error(404, "issue_not_found", f"unknown issue {identifier}")
+            except ValueError as exc:
+                if "running worker" in str(exc):
+                    return _json_error(409, "issue_running", str(exc))
+                return _json_error(409, "review_confirmation_rejected", str(exc))
+            except SymphonyError as exc:
+                return _json_error(409, "review_confirmation_rejected", exc.message)
+        else:
+            await asyncio.to_thread(tracker.update_fields, identifier, **fields)
+        if (
+            not confirm_review
+            and new_state is not None
+            and new_state.lower() != current.state.lower()
+        ):
             await asyncio.to_thread(
                 ctx.stats().record_transition,
                 issue=identifier,

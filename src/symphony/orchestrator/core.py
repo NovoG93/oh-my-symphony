@@ -221,6 +221,9 @@ _RETRYABLE_WORKER_ERROR_MARKERS = (
     "temporarily overloaded",
     "overloaded",
     "service unavailable",
+    # AGY reports transient backend outages with this exact 503 wording.
+    "service is currently unavailable",
+    "unavailable (code 503)",
     "connection error",
     "network error",
     "connection reset",
@@ -944,6 +947,9 @@ class Orchestrator:
         # housekeeping nudge, not a correctness gate). Wraparound at
         # `sys.maxsize` is a non-issue at any realistic ticket throughput.
         self._done_count: int = 0
+        # Manual Human Review completion must serialize the release gates and
+        # final tracker transition just like worker-owned delivery does.
+        self._manual_completion_lock = asyncio.Lock()
         # Throttle the per-tick auto-archive sweep to a multi-minute cadence
         # (ARCHIVE_SWEEP_INTERVAL_SEC). Monotonic clock so a wall-clock jump
         # can't wedge it; None = never swept, so the first tick sweeps once.
@@ -4091,6 +4097,225 @@ class Orchestrator:
                 path=str(workspace_path),
             )
 
+    async def confirm_done(self, identifier: str) -> dict[str, Any]:
+        """Complete a Human Review ticket through the host delivery gates.
+
+        The public web and TUI confirmation surfaces share this lifecycle so
+        a manual state change cannot bypass workspace history, release
+        authority, merge, cleanup, or wiki-sweep handling.
+        """
+        async with self._manual_completion_lock:
+            cfg = self._workflow_state.current()
+            if cfg is None:
+                raise ValueError("workflow is unavailable")
+            found = await asyncio.to_thread(
+                self._tracker_call_fetch_issue_full_by_id, cfg, identifier
+            )
+            if found is None:
+                raise FileNotFoundError(identifier)
+            issue: Issue = found
+            if self.find_running_issue_id(identifier) is not None:
+                raise ValueError(f"{identifier} has a running worker")
+            if normalize_state(issue.state) == "done":
+                return {"identifier": identifier, "state": issue.state, "changed": False}
+            if normalize_state(issue.state) != "human review":
+                raise ValueError(f"{identifier} is not in Human Review")
+
+            done_state = next(
+                (state for state in cfg.tracker.terminal_states if normalize_state(state) == "done"),
+                None,
+            )
+            if done_state is None:
+                raise ValueError("workflow has no Done terminal state")
+            manager = self._workspace_manager
+            if manager is None:
+                raise ValueError("workspace manager is unavailable")
+            workspace = manager.path_for(identifier)
+            if not workspace.is_dir():
+                raise ValueError(
+                    f"workspace is missing for {identifier}; restore it before confirming"
+                )
+
+            def check_release_identity(current: Issue) -> None:
+                # Release authority remains attached to the issue even if a
+                # label is removed before the operator confirms it.
+                has_release_authority = self._release_registry_call(
+                    cfg,
+                    "manual_completion_identity",
+                    lambda registry: (
+                        registry.get_release_gate_for_verifier(identifier) is not None
+                        or registry.get_release_gate(identifier) is not None
+                        or registry.get_release_evidence_identity(identifier) is not None
+                    ),
+                )
+                if _is_release_evidence_issue(current) or has_release_authority:
+                    raise ValueError(
+                        "release evidence must finish through its authorized verifier/finalizer run"
+                    )
+
+            check_release_identity(issue)
+            run_id = self._release_registry_call(
+                cfg,
+                "manual_completion_acquire",
+                lambda registry: registry.acquire_run(
+                    issue,
+                    workspace_path=workspace,
+                    attempt=None,
+                    attempt_kind="manual-confirmation",
+                    agent_kind="operator",
+                ),
+            )
+            if not run_id:
+                raise ValueError(f"{identifier} has an active run lease")
+
+            heartbeat_error: Exception | None = None
+            heartbeat_stop = asyncio.Event()
+
+            def check_ownership() -> None:
+                if heartbeat_error is not None:
+                    raise SymphonyError(
+                        "manual completion lease renewal failed"
+                    ) from heartbeat_error
+                owned = self._release_registry_call(
+                    cfg,
+                    "manual_completion_heartbeat",
+                    lambda registry: registry.heartbeat(
+                        issue_id=issue.id, run_id=run_id
+                    ),
+                )
+                if not owned:
+                    raise SymphonyError("manual completion lost its run lease")
+
+            async def renew_lease() -> None:
+                nonlocal heartbeat_error
+                while not heartbeat_stop.is_set():
+                    try:
+                        check_ownership()
+                    except Exception as exc:
+                        heartbeat_error = exc
+                        return
+                    try:
+                        await asyncio.wait_for(
+                            heartbeat_stop.wait(),
+                            timeout=min(cfg.poll_interval_ms / 1000, 30),
+                        )
+                    except asyncio.TimeoutError:
+                        pass
+
+            heartbeat_task = asyncio.create_task(renew_lease())
+            completed = False
+            try:
+                check_ownership()
+                current_issue = await asyncio.to_thread(
+                    self._tracker_call_fetch_issue_full_by_id, cfg, identifier
+                )
+                if current_issue is None:
+                    raise FileNotFoundError(identifier)
+                if current_issue.id != issue.id:
+                    raise ValueError(f"{identifier} changed identity during confirmation")
+                if normalize_state(current_issue.state) == "done":
+                    return {
+                        "identifier": identifier,
+                        "state": current_issue.state,
+                        "changed": False,
+                    }
+                if normalize_state(current_issue.state) != "human review":
+                    raise ValueError(f"{identifier} is no longer in Human Review")
+                check_release_identity(current_issue)
+                issue = current_issue
+                check_ownership()
+
+                debug = self._issue_debug.setdefault(issue.id, _IssueDebug())
+                debug.last_workspace = workspace
+                if cfg.agent.auto_commit_on_done:
+                    history = await finalize_delivery_history(
+                        workspace,
+                        identifier=identifier,
+                        title=issue.title,
+                        state=issue.state,
+                        push=cfg.agent.auto_merge_push_target,
+                    )
+                    if not history.durable or history.status == HISTORY_PUSH_FAILED:
+                        debug.last_error = (
+                            f"history gate failed ({history.status}): {history.detail}"
+                        )
+                        raise ValueError(debug.last_error)
+                check_ownership()
+                # History finalization can take long enough for an operator
+                # or another board client to change the lane. Re-read before
+                # any merge side effect, and use the tracker's atomic
+                # conditional transition where it supports one below.
+                latest_issue = await asyncio.to_thread(
+                    self._tracker_call_fetch_issue_full_by_id, cfg, identifier
+                )
+                if latest_issue is None:
+                    raise FileNotFoundError(identifier)
+                if latest_issue.id != issue.id:
+                    raise ValueError(f"{identifier} changed identity during confirmation")
+                if normalize_state(latest_issue.state) != "human review":
+                    raise ValueError(f"{identifier} is no longer in Human Review")
+                check_release_identity(latest_issue)
+                check_ownership()
+                issue = latest_issue
+                if not await self._auto_merge_done_gate_or_block(
+                    cfg, issue, workspace, debug_target=debug
+                ):
+                    raise ValueError(
+                        "merge gate failed; workspace preserved; inspect the ticket"
+                    )
+                check_ownership()
+                latest_issue = await asyncio.to_thread(
+                    self._tracker_call_fetch_issue_full_by_id, cfg, identifier
+                )
+                if latest_issue is None:
+                    raise FileNotFoundError(identifier)
+                if latest_issue.id != issue.id:
+                    raise ValueError(f"{identifier} changed identity during confirmation")
+                if normalize_state(latest_issue.state) != "human review":
+                    raise ValueError(f"{identifier} is no longer in Human Review")
+                check_release_identity(latest_issue)
+                check_ownership()
+                issue = latest_issue
+                transitioned = await asyncio.to_thread(
+                    self._tracker_call_transition_if_current,
+                    cfg,
+                    issue,
+                    "Human Review",
+                    done_state,
+                )
+                if not transitioned:
+                    raise ValueError(f"{identifier} is no longer in Human Review")
+                self._dispatch_state.cancel_pending_retry(issue.id)
+                self._dispatch_state.claimed.discard(issue.id)
+                check_ownership()
+                await self._after_done_then_remove_per_policy(
+                    cfg,
+                    workspace,
+                    identifier=identifier,
+                    title=issue.title,
+                    debug_target=debug,
+                )
+                check_ownership()
+                await self._maybe_run_wiki_sweep(cfg, identifier=identifier)
+                completed = True
+                return {"identifier": identifier, "state": done_state, "changed": True}
+            finally:
+                heartbeat_stop.set()
+                await heartbeat_task
+                self._release_registry_call(
+                    cfg,
+                    "manual_completion_finish",
+                    lambda registry: registry.complete_run(
+                        issue_id=issue.id,
+                        run_id=run_id,
+                        status=(
+                            "manual_confirm_done" if completed else "manual_confirm_failed"
+                        ),
+                    ),
+                )
+                self.request_refresh()
+                await self._notify_observers()
+
     async def _auto_merge_done_gate_or_block(
         self,
         cfg: "ServiceConfig",
@@ -5009,6 +5234,42 @@ class Orchestrator:
         # instead of a misleading "moved to X" Slack ping. Lenient by
         # design: dispatch_notification swallows network errors.
         _notify_state_transition(cfg, issue, target_state)
+
+    def _tracker_call_transition_if_current(
+        self,
+        cfg: ServiceConfig,
+        issue: Issue,
+        expected_state: str,
+        target_state: str,
+    ) -> bool:
+        """Transition a ticket only while its persisted lane still matches.
+
+        FileBoardTracker provides an atomic compare-and-transition under its
+        ticket lock. Other adapters get a fresh read immediately before the
+        update, which avoids overwriting changes already visible to the host.
+        """
+        client = build_tracker_client(cfg)
+        try:
+            conditional = getattr(client, "transition_if_current", None)
+            if callable(conditional):
+                changed = bool(
+                    conditional(issue.identifier, expected_state, target_state)
+                )
+            else:
+                latest = client.fetch_issue_full_by_id(issue.identifier)
+                if latest is None or normalize_state(latest.state) != normalize_state(
+                    expected_state
+                ):
+                    return False
+                client.update_state(latest, target_state)
+                issue = latest
+                changed = True
+        finally:
+            client.close()
+        if changed:
+            self._record_stats_transition(issue.identifier, issue.state, target_state)
+            _notify_state_transition(cfg, issue, target_state)
+        return changed
 
     @staticmethod
     def _tracker_call_append_note(

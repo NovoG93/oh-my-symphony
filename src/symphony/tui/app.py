@@ -649,15 +649,15 @@ class KanbanApp(App):
             )
             return
         self.run_worker(
-            self._confirm_done_issue(cfg, issue),
+            self._confirm_done_issue(issue),
             thread=False,
             exclusive=False,
             group="confirm_done",
         )
 
-    async def _confirm_done_issue(self, cfg: ServiceConfig, issue: Issue) -> None:
+    async def _confirm_done_issue(self, issue: Issue) -> None:
         try:
-            await asyncio.to_thread(self._call_update_state, cfg, issue, "Done")
+            await self._orch.confirm_done(issue.identifier)
         except Exception as exc:
             log.warning(
                 "tui_confirm_done_failed", identifier=issue.identifier, error=str(exc)

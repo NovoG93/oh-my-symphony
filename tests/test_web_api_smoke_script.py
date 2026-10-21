@@ -12,6 +12,7 @@ from aiohttp.test_utils import TestClient, TestServer
 
 from symphony.orchestrator import Orchestrator
 from symphony.server import build_app
+from symphony.trackers.file import FileBoardTracker
 from symphony.workflow import WorkflowState
 
 
@@ -91,6 +92,18 @@ class _StubOrchestrator:
 
     def issue_attention(self, _issue: Any) -> dict[str, str] | None:
         return None
+
+    async def confirm_done(self, identifier: str) -> dict[str, Any]:
+        cfg = self._workflow_state.current()
+        assert cfg is not None
+        tracker = FileBoardTracker(cfg.tracker)
+        changed = await asyncio.to_thread(
+            tracker.transition_if_current, identifier, "Human Review", "Done"
+        )
+        if not changed:
+            raise ValueError("issue changed before confirmation")
+        self.request_refresh()
+        return {"identifier": identifier, "state": "Done", "changed": True}
 
 
 def _load_smoke_module():
