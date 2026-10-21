@@ -20,6 +20,7 @@ from aiohttp.test_utils import TestClient, TestServer
 
 from symphony.orchestrator import Orchestrator
 from symphony.server import build_app
+from symphony.trackers.file import FileBoardTracker
 from symphony.utils.auto_merge import AutoMergeResult
 from symphony.utils.git_ops import GitOpResult
 from symphony.webapi import (
@@ -74,6 +75,7 @@ class _StubOrchestrator:
         self.reset_ci_calls = 0
         self.recover_calls: list[dict[str, str | None]] = []
         self.skip_calls: list[str] = []
+        self.confirm_done_calls: list[str] = []
         self.schedule_payload: dict[str, Any] = {
             "schema_version": 1,
             "available": True,
@@ -150,6 +152,22 @@ class _StubOrchestrator:
     async def skip_document(self, identifier: str) -> tuple[bool, str]:
         self.skip_calls.append(identifier)
         return True, f"moved {identifier} to Human Review"
+
+    async def confirm_done(self, identifier: str) -> dict[str, Any]:
+        self.confirm_done_calls.append(identifier)
+        cfg = self._workflow_state.current()
+        assert cfg is not None
+        tracker = FileBoardTracker(cfg.tracker)
+        issue = await asyncio.to_thread(tracker.fetch_issue_full_by_id, identifier)
+        if issue is None:
+            raise FileNotFoundError(identifier)
+        changed = await asyncio.to_thread(
+            tracker.transition_if_current, identifier, "Human Review", "Done"
+        )
+        if not changed:
+            raise ValueError("issue changed before confirmation")
+        self.request_refresh()
+        return {"identifier": identifier, "state": "Done", "changed": True}
 
     def request_refresh(self) -> bool:
         self.refresh_calls += 1
@@ -820,6 +838,7 @@ async def test_confirm_review_moves_idle_ticket_to_done_and_requests_refresh(
     }
     assert "state: Done" in ticket.read_text(encoding="utf-8")
     assert client.stub.refresh_calls == 1  # type: ignore[attr-defined]
+    assert client.stub.confirm_done_calls == ["SEED-1"]  # type: ignore[attr-defined]
 
 
 async def test_confirm_review_rejects_stale_state_without_mutating(
@@ -849,6 +868,47 @@ async def test_confirm_review_rejects_running_ticket(
     assert response.status == 409
     assert (await response.json())["error"]["code"] == "issue_running"
     assert "state: Human Review" in ticket.read_text(encoding="utf-8")
+
+
+async def test_confirm_review_returns_conflict_when_delivery_gate_fails(
+    client: TestClient, board_dir: Path
+) -> None:
+    ticket = board_dir / "kanban" / "SEED-1.md"
+    ticket.write_text(
+        TICKET.replace("state: Todo", "state: Human Review"), encoding="utf-8"
+    )
+
+    async def reject_confirmation(_identifier: str) -> dict[str, Any]:
+        raise ValueError("history gate failed (commit_failed)")
+
+    client.stub.confirm_done = reject_confirmation  # type: ignore[attr-defined]
+    response = await client.post("/api/v1/issues/SEED-1/confirm-review", json={})
+
+    assert response.status == 409
+    payload = await response.json()
+    assert payload["error"]["code"] == "review_confirmation_rejected"
+    assert "history gate failed" in payload["error"]["message"]
+    assert "state: Human Review" in ticket.read_text(encoding="utf-8")
+
+
+async def test_patch_human_review_to_done_uses_confirmation_lifecycle_and_keeps_other_fields(
+    client: TestClient, board_dir: Path
+) -> None:
+    ticket = board_dir / "kanban" / "SEED-1.md"
+    ticket.write_text(
+        TICKET.replace("state: Todo", "state: Human Review"), encoding="utf-8"
+    )
+
+    response = await client.patch(
+        "/api/v1/issues/SEED-1", json={"state": "Done", "title": "approved title"}
+    )
+
+    assert response.status == 200
+    assert (await response.json())["updated"] == ["state", "title"]
+    detail = await (await client.get("/api/v1/issues/SEED-1")).json()
+    assert detail["state"] == "Done"
+    assert detail["title"] == "approved title"
+    assert client.stub.confirm_done_calls == ["SEED-1"]  # type: ignore[attr-defined]
 
 
 async def test_patch_rejects_running_state_change_without_mutating_file(

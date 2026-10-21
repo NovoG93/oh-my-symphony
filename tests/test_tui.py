@@ -1204,7 +1204,7 @@ async def test_archive_hotkey_refuses_active_state_card(monkeypatch: Any) -> Non
 
 
 @pytest.mark.asyncio
-async def test_confirm_done_hotkey_calls_update_state_on_human_review_card(
+async def test_confirm_done_hotkey_uses_orchestrator_lifecycle_for_human_review_card(
     monkeypatch: Any,
 ) -> None:
     cfg = _make_config(
@@ -1213,15 +1213,14 @@ async def test_confirm_done_hotkey_calls_update_state_on_human_review_card(
     review_issue = _issue("SMA-100", state="Human Review")
     _stub_tracker(monkeypatch, [], [review_issue])
 
-    moved: list[tuple[str, str]] = []
+    confirmed: list[str] = []
 
-    monkeypatch.setattr(
-        KanbanApp,
-        "_call_update_state",
-        staticmethod(
-            lambda _cfg, issue, target: moved.append((issue.identifier, target))
-        ),
-    )
+    async def confirm_done(self: _StubOrchestrator, identifier: str) -> dict[str, Any]:
+        del self
+        confirmed.append(identifier)
+        return {"identifier": identifier, "state": "Done", "changed": True}
+
+    monkeypatch.setattr(_StubOrchestrator, "confirm_done", confirm_done, raising=False)
 
     app = KanbanApp(_StubOrchestrator(), _StaticWorkflowState(cfg))  # type: ignore[arg-type]
     async with app.run_test(size=(160, 30)) as pilot:
@@ -1238,7 +1237,7 @@ async def test_confirm_done_hotkey_calls_update_state_on_human_review_card(
         await pilot.pause()
         await asyncio.sleep(0.05)
         await pilot.pause()
-    assert moved == [("SMA-100", "Done")]
+    assert confirmed == ["SMA-100"]
 
 
 @pytest.mark.asyncio
