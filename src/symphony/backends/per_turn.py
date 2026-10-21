@@ -290,8 +290,11 @@ class PerTurnCliBackend(BaseAgentBackend):
                 )
                 raise TurnFailed(reason)
             return await self._complete_turn(stdout_text, rc)
-        except asyncio.CancelledError:
-            await self._reap(proc)
+        except BaseException:
+            # Prompt writes and stream adapters can fail before the normal
+            # reap. Release the owned process before another turn replaces it.
+            if proc.returncode is None:
+                await self._reap(proc)
             raise
         finally:
             for watcher in watchers:

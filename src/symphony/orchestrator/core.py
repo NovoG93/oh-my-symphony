@@ -345,8 +345,41 @@ def _worker_error_pause_reason(reason: str, error: str | None) -> str:
     return f"worker error: {clean}; paused for operator inspection"
 
 
+# Errors that mean "this backend's account is out of budget for now": a
+# retry with backoff on the same backend cannot help, but another backend
+# can (2026-09-05 E2E: codex usage limit paused the worker until an operator
+# re-pinned the ticket by hand). Distinct from the transient
+# `_RETRYABLE_WORKER_ERROR_MARKERS` (429 / rate limit), which retry in place.
+_QUOTA_WORKER_ERROR_MARKERS = (
+    "usage limit",
+    "usage_limit",
+    "session limit",
+    "quota",
+    "insufficient_quota",
+    "insufficient credits",
+    "out of credits",
+    "credit balance",
+    "billing",
+    "plan limit",
+    "weekly limit",
+    "monthly limit",
+)
+
+
 def _has_retryable_worker_marker(clean_error: str) -> bool:
     return any(marker in clean_error for marker in _RETRYABLE_WORKER_ERROR_MARKERS)
+
+
+def _is_quota_worker_error(reason: str, error: str | None) -> bool:
+    detail = f"{reason}: {error}" if error else reason
+    clean = _clean_board_error_message(detail).lower()
+    if any(marker in clean for marker in _QUOTA_WORKER_ERROR_MARKERS):
+        return True
+    # Generic limit wording also appears in transient rate-limit errors.
+    # Explicit account/quota markers above still win when both are present.
+    return not _has_retryable_worker_marker(clean) and any(
+        marker in clean for marker in ("limit reached", "limit exceeded")
+    )
 
 
 def _is_opencode_sigterm_retry(agent_kind: str, clean_error: str) -> bool:

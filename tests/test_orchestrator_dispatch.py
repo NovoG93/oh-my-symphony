@@ -11052,3 +11052,31 @@ def test_startup_terminal_cleanup_preserves_human_review_workspace(
 
     assert calls == []
     assert workspace.exists()
+
+
+# ---------------------------------------------------------------------------
+# quota / usage-limit error classification
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        "turn_failed: codex: You have hit your usage limit for this plan",
+        "429 rate limit exceeded: insufficient_quota; check billing",
+    ],
+)
+def test_quota_error_pins_the_next_fallback_backend_and_retries(error: str) -> None:
+    assert core_module._is_quota_worker_error("turn_error", error) is True
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        "429 too many requests",
+        "429 rate limit exceeded",
+        "rate limit reached; retry after 30 seconds",
+    ],
+)
+def test_transient_rate_limit_retries_on_the_same_backend(error: str) -> None:
+    assert core_module._is_quota_worker_error("turn_error", error) is False
