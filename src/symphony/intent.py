@@ -3,6 +3,14 @@
 Intent proposals are deliberately process-local.  The transcript is not an
 authority store: only an :class:`IntentAction` held by the running server may
 be approved by the later Chat integration.
+
+Every proposal is scanned with the sdlc-kit trip-wire heuristics
+(``tools/tripwire.sh``: migrations, data deletion, public API, security
+paths, infra/config). Hits never block the operator — they are shown on the
+card and recorded on the ticket and in ``intent.md`` so the pipeline's Review
+lane treats them as mandatory objection candidates — but a hit downgrades a
+``micro`` track to ``full``, exactly as the kit's stage 1 requires a
+trip-wire-clean intent for the micro track.
 """
 
 from __future__ import annotations
@@ -40,6 +48,60 @@ IntentStatus = Literal[
 _ALLOWED_KEYS = frozenset({"slug", "title", "track", "intent"})
 _REQUIRED_HEADINGS = ("Problem", "Success criteria", "Out of scope")
 
+# sdlc-kit `tools/tripwire.sh` patterns, verbatim (extended regex, case-
+# insensitive). A hit is a question for the reviewer, not a conviction.
+TRIPWIRE_PATTERNS: tuple[tuple[str, str], ...] = (
+    ("migration/schema", r"migrat|schema change|ALTER TABLE|CREATE TABLE|DROP TABLE|[.]sql"),
+    ("data deletion", r"DELETE FROM|DROP |TRUNCATE|destructive|backfill|rm -rf"),
+    ("public API", r"public API|breaking change|API contract|openapi|swagger|/api/v[0-9]"),
+    ("security paths", r"auth|secret|credential|password|token|permission|session"),
+    (
+        "infra/config",
+        r"Dockerfile|docker-compose|[.]github/workflows|terraform|helm|kubernetes|k8s|nginx|systemd|deploy",
+    ),
+)
+_TRIPWIRE_COMPILED: tuple[tuple[str, re.Pattern[str]], ...] = tuple(
+    (label, re.compile(pattern, re.IGNORECASE)) for label, pattern in TRIPWIRE_PATTERNS
+)
+TRIPWIRE_MAX_LINES = 3
+
+
+@dataclass(frozen=True)
+class TripwireHit:
+    """One trip-wire category that matched, with up to three matching lines."""
+
+    label: str
+    lines: tuple[str, ...]
+
+    def as_dict(self) -> dict[str, Any]:
+        return {"label": self.label, "lines": list(self.lines)}
+
+
+def scan_tripwires(text: str) -> tuple[TripwireHit, ...]:
+    """Heuristic trip-wire scan of an intent body (kit `tools/tripwire.sh`)."""
+
+    hits: list[TripwireHit] = []
+    lines = [line.strip() for line in (text or "").splitlines()]
+    for label, pattern in _TRIPWIRE_COMPILED:
+        matched = [line for line in lines if line and pattern.search(line)]
+        if matched:
+            hits.append(TripwireHit(label=label, lines=tuple(matched[:TRIPWIRE_MAX_LINES])))
+    return tuple(hits)
+
+
+def render_tripwire_section(hits: tuple[TripwireHit, ...]) -> str:
+    """`## Trip-wires` markdown for the ticket body and `intent.md`."""
+
+    if not hits:
+        return "## Trip-wires\n\n- none (heuristic scan; the Review lane still judges)\n"
+    rows = "\n".join(f"- {hit.label}: `{line}`" for hit in hits for line in hit.lines)
+    return (
+        "## Trip-wires\n\n"
+        "Heuristic hits from the sdlc-kit scan. Each one is a mandatory "
+        "objection candidate for the Review lane, not a conviction.\n\n"
+        f"{rows}\n"
+    )
+
 
 class IntentParseError(ChatIntentActionError):
     """An agent response did not contain a valid strict intent proposal."""
@@ -53,6 +115,16 @@ class IntentProposal:
     title: str
     track: Literal["micro", "full"]
     intent: str
+    tripwires: tuple[TripwireHit, ...] = ()
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "slug": self.slug,
+            "title": self.title,
+            "track": self.track,
+            "intent": self.intent,
+            "tripwires": [hit.as_dict() for hit in self.tripwires],
+        }
 
 
 @dataclass
@@ -68,6 +140,7 @@ class IntentAction:
     status: IntentStatus = "pending"
     ticket: dict[str, Any] | None = None
     error: str | None = None
+    tripwires: tuple[TripwireHit, ...] = ()
     task: Any = field(default=None, repr=False, compare=False)
 
     @classmethod
@@ -82,6 +155,7 @@ class IntentAction:
             track=proposal.track,
             intent=proposal.intent,
             expires_at=created + INTENT_ACTION_TTL,
+            tripwires=proposal.tripwires,
         )
 
     def is_expired(self, *, now: datetime | None = None) -> bool:
@@ -105,7 +179,11 @@ class IntentAction:
             "ticket": self.ticket,
             "error": self.error,
             "expires_at": _utc(self.expires_at).isoformat(),
+            "tripwires": [hit.as_dict() for hit in self.tripwires],
         }
+
+    def as_dict(self) -> dict[str, Any]:
+        return self.snapshot()
 
 
 def _utc(value: datetime) -> datetime:
@@ -153,12 +231,18 @@ def _validate_proposal(value: Any) -> IntentProposal:
         raise IntentParseError("intent track must be micro or full")
     if not isinstance(intent, str) or not intent.strip() or len(intent.encode("utf-8")) > MAX_INTENT_BODY_LENGTH:
         raise IntentParseError("intent body is empty or too large")
-    _validate_markdown_contract(intent)
+    body = intent.strip()
+    _validate_markdown_contract(body)
+    tripwires = scan_tripwires(body)
+    if tripwires and track == "micro":
+        # Kit stage 1: the micro track requires a trip-wire-clean intent.
+        track = "full"
     return IntentProposal(
         slug=slug,
         title=title.strip(),
         track=cast(Literal["micro", "full"], track),
-        intent=intent.strip(),
+        intent=body,
+        tripwires=tripwires,
     )
 
 
@@ -220,6 +304,46 @@ def _provenance_value(value: str | None) -> str:
         return ""
     clean = "".join(character if ord(character) >= 32 else " " for character in value)
     return clean[:128]
+
+
+def render_ticket_description(
+    action: IntentAction | IntentProposal, *, approved_at: str, session_id: str
+) -> str:
+    """The request ticket body: the intent plus its track and approval facts."""
+
+    return (
+        f"{action.intent}\n\n"
+        f"{render_tripwire_section(action.tripwires)}\n"
+        f"## Track\n\n{action.track}\n\n"
+        "## Approval\n\n"
+        f"- Approved at: {approved_at}\n"
+        f"- Chat session: {session_id}\n"
+        f"- Intent artifact: .sdlc/work/{action.slug}/intent.md\n"
+    )
+
+
+def render_intent_markdown(
+    action: IntentAction | IntentProposal,
+    *,
+    approved_at: str,
+    session_id: str,
+    ticket_identifier: str,
+) -> str:
+    """The durable `intent.md` record in the sdlc-kit stage-1 shape."""
+
+    return (
+        f"# Intent: {action.slug}\n\n"
+        f"- Date: {approved_at[:10]}\n"
+        f"- Title: {action.title}\n"
+        f"- Track: {action.track}\n"
+        f"- Requested by: chat session {session_id}\n\n"
+        f"{action.intent}\n\n"
+        f"{render_tripwire_section(action.tripwires)}\n"
+        "## Approval\n\n"
+        f"- Approved at: {approved_at}\n"
+        f"- Ticket: {ticket_identifier}\n"
+        "- Gate: intent (the only human gate; later stages run unattended)\n"
+    )
 
 
 class IntentFiler:
@@ -287,7 +411,9 @@ class IntentFiler:
             prefix="REQ",
             title=action.title,
             state=state,
-            description=action.intent,
+            description=render_ticket_description(
+                action, approved_at=approval_time, session_id=session_id or ""
+            ),
             request=action.slug,
         )
         return {"id": ticket_id, "identifier": ticket_id, "title": action.title, "path": str(ticket_path), "request": action.slug}

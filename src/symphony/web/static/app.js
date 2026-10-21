@@ -4223,6 +4223,15 @@
         el('span', { class: 'chip-label' }, t('chat.intentTrack', { track: action.track })),
         el('code', { class: 'chat-intent-slug' }, action.slug),
       ]),
+      Array.isArray(action.tripwires) && action.tripwires.length
+        ? el('div', { class: 'chat-intent-tripwires', role: 'note' }, [
+          el('strong', null, t('chat.intentTripwires')),
+          el('ul', null, action.tripwires.map((hit) => el('li', null, [
+            el('span', { class: 'chat-intent-tripwire-label' }, `${hit.label}: `),
+            el('code', null, (hit.lines && hit.lines[0]) || ''),
+          ]))),
+        ])
+        : null,
       el('div', { class: 'chat-intent-markdown' }, renderMarkdown(action.intent || '')),
       action.error ? el('p', { class: 'chat-intent-error', role: 'alert' }, truncate(String(action.error), 800)) : null,
       ticket ? el('p', { class: 'chat-intent-ticket' }, t('chat.intentTicket', { id: ticket, title: action.ticket.title || '' })) : null,

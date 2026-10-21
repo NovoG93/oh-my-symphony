@@ -530,6 +530,7 @@
     'chat.intentTicket': 'Filed as {id} · {title}',
     'chat.intentApprovedToast': 'Intent filed successfully',
     'chat.intentConfirmationUnavailable': 'This browser cannot approve this intent',
+    'chat.intentTripwires': 'Trip-wires (heuristic): check these before approving; a hit forces the full track',
 
     // -- Settings page ----------------------------------------------------
     'settings.pageDescription': 'Tune how Symphony plans, dispatches, and presents your board.',
@@ -1180,6 +1181,7 @@
     'chat.intentTicket': '{id} · {title}(으)로 등록됨',
     'chat.intentApprovedToast': '의도가 성공적으로 등록되었습니다',
     'chat.intentConfirmationUnavailable': '이 브라우저에서는 이 의도를 승인할 수 없습니다',
+    'chat.intentTripwires': '트립와이어(휴리스틱): 승인 전에 확인하세요; 감지되면 전체 트랙으로 진행합니다',
 
     'settings.pageDescription': 'Symphony가 보드를 계획하고 작업을 배정하며 표시하는 방식을 조정합니다.',
     'settings.automation': '자동화',
