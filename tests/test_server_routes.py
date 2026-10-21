@@ -185,7 +185,7 @@ async def test_refresh_get_returns_405_with_error_envelope(client: TestClient) -
 async def test_refresh_post_returns_202_with_queued_envelope(
     client: TestClient,
 ) -> None:
-    resp = await client.post("/api/v1/refresh")
+    resp = await client.post("/api/v1/refresh", json={})
     assert resp.status == 202
     payload = await resp.json()
     assert payload["queued"] is True
@@ -197,8 +197,8 @@ async def test_refresh_post_returns_202_with_queued_envelope(
 async def test_refresh_post_marks_coalesced_on_second_call(
     client: TestClient,
 ) -> None:
-    await client.post("/api/v1/refresh")
-    resp = await client.post("/api/v1/refresh")
+    await client.post("/api/v1/refresh", json={})
+    resp = await client.post("/api/v1/refresh", json={})
     payload = await resp.json()
     assert payload["coalesced"] is True
 
@@ -217,7 +217,7 @@ async def test_refresh_post_with_invalid_json_returns_400(
 
 
 async def test_refresh_post_with_empty_body_succeeds(client: TestClient) -> None:
-    resp = await client.post("/api/v1/refresh", data="")
+    resp = await client.post("/api/v1/refresh", data="", headers={"Content-Type": "application/json"})
     assert resp.status == 202
 
 
@@ -237,14 +237,14 @@ async def test_issue_route_returns_404_when_absent(client: TestClient) -> None:
 
 
 async def test_pause_route_returns_404_when_not_running(client: TestClient) -> None:
-    resp = await client.post("/api/v1/UNKNOWN-99/pause")
+    resp = await client.post("/api/v1/UNKNOWN-99/pause", json={})
     assert resp.status == 404
     payload = await resp.json()
     assert payload["error"]["code"] == "issue_not_running"
 
 
 async def test_pause_route_pauses_running_worker(client: TestClient) -> None:
-    resp = await client.post("/api/v1/MT-1/pause")
+    resp = await client.post("/api/v1/MT-1/pause", json={})
     assert resp.status == 200
     payload = await resp.json()
     assert payload["issue_identifier"] == "MT-1"
@@ -257,8 +257,8 @@ async def test_pause_route_pauses_running_worker(client: TestClient) -> None:
 async def test_pause_then_pause_again_reports_already_paused(
     client: TestClient,
 ) -> None:
-    await client.post("/api/v1/MT-1/pause")
-    resp = await client.post("/api/v1/MT-1/pause")
+    await client.post("/api/v1/MT-1/pause", json={})
+    resp = await client.post("/api/v1/MT-1/pause", json={})
     payload = await resp.json()
     assert payload["paused"] is True
     assert payload["changed"] is False
@@ -266,8 +266,8 @@ async def test_pause_then_pause_again_reports_already_paused(
 
 
 async def test_resume_route_releases_paused_worker(client: TestClient) -> None:
-    await client.post("/api/v1/MT-1/pause")
-    resp = await client.post("/api/v1/MT-1/resume")
+    await client.post("/api/v1/MT-1/pause", json={})
+    resp = await client.post("/api/v1/MT-1/resume", json={})
     assert resp.status == 200
     payload = await resp.json()
     assert payload["paused"] is False
@@ -283,7 +283,7 @@ async def test_resume_route_releases_paused_retry_worker() -> None:
     client = TestClient(server)
     await client.start_server()
     try:
-        resp = await client.post("/api/v1/MT-1/resume")
+        resp = await client.post("/api/v1/MT-1/resume", json={})
         assert resp.status == 200
         payload = await resp.json()
         assert payload["issue_identifier"] == "MT-1"
@@ -304,7 +304,7 @@ async def test_resume_route_releases_idle_paused_file_issue() -> None:
     client = TestClient(server)
     await client.start_server()
     try:
-        resp = await client.post("/api/v1/RCA-1/resume")
+        resp = await client.post("/api/v1/RCA-1/resume", json={})
         assert resp.status == 200
         payload = await resp.json()
         assert payload["issue_identifier"] == "RCA-1"
@@ -319,7 +319,7 @@ async def test_resume_route_releases_idle_paused_file_issue() -> None:
 async def test_resume_route_returns_404_for_unknown_identifier(
     client: TestClient,
 ) -> None:
-    resp = await client.post("/api/v1/UNKNOWN-99/resume")
+    resp = await client.post("/api/v1/UNKNOWN-99/resume", json={})
     assert resp.status == 404
     payload = await resp.json()
     assert payload["error"]["code"] == "issue_not_resumable"

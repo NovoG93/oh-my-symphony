@@ -69,3 +69,39 @@ git log --first-parent develop..upstream/dev
 git merge-base develop upstream/dev
 git merge-base --is-ancestor develop upstream/dev
 ```
+
+## Integration record (v0.25.0 / dev synchronization)
+
+- Remote `upstream`: `https://github.com/cskwork/oh-my-symphony` (fetch; push is `DISABLED`).
+- Remote `origin`: `https://github.com/NovoG93/oh-my-symphony` (fetch/push).
+- Base: `aaf2b72da3b97fb9d0b71fb881fafea38f59de6d`.
+- Integrated ref: `upstream/dev` at `f69e7cd7540296aedac856c9a7338653a47e6bb2` (`v0.25.0`).
+- Branch: `feat/sync-upstream-v0.25-hardening`.
+- Total upstream commits in range: 73 commits.
+- Integration strategy: Selective Adaptation over blind merge.
+  - Fork invariants preserved: Named Profiles & Tiered Routing (`TIER-001`/`TIER-002`), Usage Pools & Quotas (`ProviderUsageManager`), Copilot backend, and inline phase transitions.
+  - Upstream's monolithic decomposition of `core.py` (which depends on the deferred `_AgentPhaseState` machine) was intentionally deferred.
+
+### Enumeration of adapted upstream commits:
+1. `86d8b73` / `4286425`: CSRF gate on body-less mutations in `web_policy.py`, service startup zombie detection with `waitpid(WNOHANG)`, stale lock reclamation, `killpg` fallback to `os.kill`. (Committed: `edcda42`)
+2. `0126a2a`: Codex v2 token subset double-counting fix. (Committed: `edcda42`)
+3. `3f71d30`: Release binder target branch resolution. (Committed: `edcda42`)
+4. `d67428e`: Symlink loop protection on Python 3.13+. (Committed: `edcda42`)
+5. `56ff023`: Done->reopen budget cap with `agent.max_reopens` and `## Reopen Approved`. (Committed: `4b44e86`)
+6. `f46a026` / `ed389a3`: Mechanical Done contract enforcement, deep preset artifact validation, and inline heading regex support. (Committed: `4b44e86`)
+7. `babeba4`: Dynamic lane rewind detection, gate metrics fold, and autonomous learning loop via `board_health`. (Committed: `4b44e86`)
+8. `58a9537`: Release dispatch slots on terminal worker cancellation. (Committed: `4b44e86`)
+9. `5e97ba5`: Jira structured ADF notes and idempotent `append_note_once`. (Committed: `4760449`)
+10. `c025fa0`: Issue budget snapshots (`/api/v1/issues/{id}` budgets/scheduling) and Codex cache token telemetry. (Committed: `5618e87`)
+11. `34fe676`: Doctor agent binary and profile probing with `--version`. (Committed: `58d1128`)
+12. `e828324`: Intent gate trip-wire heuristics scan and track downgrade. (Committed: `311250e`)
+13. `fd5a7f6`: Kahn's algorithm topological order, iterative cycle DFS, and robust `except BaseException` per-turn process reap. (Committed: `180b634`)
+14. `6512e5a`: TUI grouped `HelpScreen` modal on `?`, CLI subcommand list in `--help`, and fast reject for mistyped subcommands. (Committed: `d2923bb`)
+15. `d51bfa2`: `JsonlStreamBackend` shared streaming skeleton for Claude Code and Pi while preserving all fork usage probes and model injection. (Committed: `e7a9f2c`)
+
+### Full Evidence & Quality Gates:
+- Full test suite: **3004 passed, 15 skipped in 202.24s (0:03:22)**.
+- Type check: `pyright` **0 errors, 0 warnings, 0 informations**.
+- Code quality & linter: `ruff check src tests` **All checks passed!** (0 errors).
+- Doctor preflight: `symphony doctor ./WORKFLOW.md` **PASS** (expected protected source repository warning only).
+- Pre-commit hook: smart pytest selector running single, targeted, or complete pytest depending on staged changes.
