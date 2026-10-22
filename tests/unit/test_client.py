@@ -33,6 +33,15 @@ async def test_upstream_host_header_override_is_forwarded():
     await c.list_projects()
 
 
+async def test_upstream_host_header_defaults_to_base_url_host():
+    def handler(req):
+        assert req.headers["host"] == "symphony"
+        return httpx.Response(200, json={"projects": []})
+
+    c = _client(handler)
+    await c.list_projects()
+
+
 async def test_api_token_is_forwarded_to_raw_artifact_download():
     def handler(req):
         assert req.headers["authorization"] == "Bearer api-token"
