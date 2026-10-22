@@ -5,11 +5,12 @@ from symphony.mcp.client import SymphonyClient
 from symphony.mcp.errors import NotFound, UpstreamError, ValidationError
 
 
-def _client(handler, *, api_token=None) -> SymphonyClient:
+def _client(handler, *, api_token=None, host_header=None) -> SymphonyClient:
     return SymphonyClient(
         "http://symphony",
         transport=httpx.MockTransport(handler),
         api_token=api_token,
+        host_header=host_header,
     )
 
 
@@ -23,12 +24,26 @@ async def test_api_token_is_forwarded_but_mcp_token_is_not():
     await c.list_projects()
 
 
+async def test_upstream_host_header_override_is_forwarded():
+    def handler(req):
+        assert req.headers["host"] == "workmate-ai.home.arpa"
+        return httpx.Response(200, json={"projects": []})
+
+    c = _client(handler, host_header="workmate-ai.home.arpa")
+    await c.list_projects()
+
+
 async def test_api_token_is_forwarded_to_raw_artifact_download():
     def handler(req):
         assert req.headers["authorization"] == "Bearer api-token"
+        assert req.headers["host"] == "workmate-ai.home.arpa"
         return httpx.Response(200, content=b"hello", headers={"content-type": "text/plain"})
 
-    c = _client(handler, api_token="api-token")
+    c = _client(
+        handler,
+        api_token="api-token",
+        host_header="workmate-ai.home.arpa",
+    )
     assert (await c.get_artifact_file("TASK-1", "qa.md"))["content"] == b"hello"
 
 

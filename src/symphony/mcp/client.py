@@ -21,12 +21,16 @@ class SymphonyClient:
         timeout: float = 30.0,
         transport: httpx.AsyncBaseTransport | None = None,
         api_token: str | None = None,
+        host_header: str | None = None,
     ) -> None:
         self._base_url = base_url.rstrip("/")
         self._timeout = timeout
         self._api_token = api_token
         self._client = httpx.AsyncClient(
-            base_url=self._base_url, timeout=timeout, transport=transport
+            base_url=self._base_url,
+            timeout=timeout,
+            transport=transport,
+            headers={"Host": host_header} if host_header else None,
         )
 
     async def aclose(self) -> None:

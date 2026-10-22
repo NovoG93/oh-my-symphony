@@ -79,6 +79,7 @@ def build_mcp(settings: Settings) -> FastMCP:
         settings.symphony_base_url,
         settings.timeout_seconds,
         api_token=settings.symphony_api_token,
+        host_header=settings.symphony_upstream_host_header,
     )
     policy = Policy(settings.allowed_projects, allow_control=settings.allow_control)
     idem = IdempotencyStore(settings.idempotency_db)

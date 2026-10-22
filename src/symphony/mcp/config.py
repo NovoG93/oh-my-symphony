@@ -12,6 +12,7 @@ class Settings:
     host: str = "0.0.0.0"
     port: int = 8080
     symphony_base_url: str = "http://127.0.0.1:9999"
+    symphony_upstream_host_header: str | None = None
     # Credential for the downstream Symphony REST API.  This is deliberately
     # separate from ``token``, which authenticates callers of this MCP
     # gateway and must never be forwarded upstream.
@@ -73,6 +74,7 @@ def load() -> Settings:
         host=os.environ.get("SYMPHONY_MCP_HOST", "0.0.0.0"),
         port=int(os.environ.get("SYMPHONY_MCP_PORT", "8080")),
         symphony_base_url=os.environ.get("SYMPHONY_BASE_URL", "http://127.0.0.1:9999"),
+        symphony_upstream_host_header=os.environ.get("SYMPHONY_UPSTREAM_HOST_HEADER") or None,
         symphony_api_token=_read_api_token(),
         timeout_seconds=float(os.environ.get("SYMPHONY_MCP_TIMEOUT", "30")),
         token=_read_token(),

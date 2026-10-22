@@ -81,6 +81,7 @@ MCP gateway. Restart both services after changing their respective settings.
 | `SYMPHONY_MCP_HOST` | `0.0.0.0` | MCP bind address |
 | `SYMPHONY_MCP_PORT` | `8080` | MCP listen port |
 | `SYMPHONY_BASE_URL` | `http://127.0.0.1:9999` | upstream Symphony base URL |
+| `SYMPHONY_UPSTREAM_HOST_HEADER` | unset | optional exact upstream `Host` header, for loopback connections to APIs that enforce a trusted hostname |
 | `SYMPHONY_MCP_TOKEN` | unset | gateway bearer (takes precedence over file) |
 | `SYMPHONY_MCP_TOKEN_FILE` | `~/.config/symphony-mcp/token` | gateway bearer file |
 | `SYMPHONY_API_TOKEN` | unset | downstream API bearer (takes precedence over file) |
@@ -94,6 +95,13 @@ such as `oh-my-symphony,another-project`. Control
 tools (`cancel`, `update`, `recover-blocked`, and `skip-document`) remain off
 unless `SYMPHONY_MCP_ALLOW_CONTROL=1` (or another true value) is explicitly
 configured. Keep this setting off for read-only clients.
+
+When the upstream binds to a non-loopback address and requires an exact
+trusted hostname, a gateway may keep `SYMPHONY_BASE_URL` pointed at loopback
+while setting `SYMPHONY_UPSTREAM_HOST_HEADER` to that hostname alone (no
+scheme or port). This changes the HTTP `Host` header sent upstream; it does
+not change the network destination or weaken the upstream trusted-origin
+policy. Configure it in the gateway's systemd unit or drop-in.
 
 ## Install and start
 
